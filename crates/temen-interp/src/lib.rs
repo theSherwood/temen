@@ -1087,7 +1087,7 @@ pub type CapRequests = Arc<Mutex<BTreeMap<u64, CapRequest>>>;
 /// punts to the embedder, filed in `requests` under its completion id.
 fn declared_host_cap(name: &str, requests: &CapRequests) -> OffloadHostProc {
     let (name, requests) = (name.to_string(), Arc::clone(requests));
-    Box::new(move |op, args| {
+    Box::new(move |op, args, _out| {
         let (name, requests, args) = (name.clone(), Arc::clone(&requests), args.to_vec());
         OffloadOutcome::Host(Box::new(move |completer: Completer| {
             let id = completer.id();
@@ -14710,17 +14710,17 @@ fn wake_zeroed_pipes(sched: &SchedRef, (zeroed_w, zeroed_r): ZeroedPipes) {
     }
 }
 
-/// #2645 — a tree-walker dispatch's results: its own, or, when it handed back an unlocked host
-/// procedure's call ([`UnlockedCall`]), what that call answers, run now that the vCPU holds no host.
-fn unlocked_results(
-    results: Vec<i64>,
+/// #2645 — when a tree-walker dispatch handed back an unlocked host procedure's call
+/// ([`UnlockedCall`]), run it into the call's result slots now that the vCPU holds no host.
+fn run_unlocked(
     unlocked: Option<UnlockedCall>,
     args: &[i64],
+    out: &mut [i64],
     mem: &mut Option<Mem>,
-) -> Result<Vec<i64>, Trap> {
+) -> Result<(), Trap> {
     match unlocked {
-        Some(call) => call.run(args, mem.as_mut().map(|m| m as &mut dyn GuestMem)),
-        None => Ok(results),
+        Some(call) => call.run(args, out, mem.as_mut().map(|m| m as &mut dyn GuestMem)),
+        None => Ok(()),
     }
 }
 
@@ -17263,10 +17263,9 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     // Args/results cross as i64 slots (the shared host-dispatch ABI).
                     // Synchronous in the reference (the async/submit-complete ABI is §12).
                     let h = get_i32(&frames[top].vals, *handle)?;
-                    let mut argv = Vec::with_capacity(args.len());
-                    for a in args {
-                        argv.push(get(&frames[top].vals, *a)?.i64());
-                    }
+                    // #2319 — the call's arg and result slots, on this stack when they fit.
+                    let (mut arg_stack, mut arg_heap) = ([0; CALL_STACK_SLOTS], Vec::new());
+                    let argv = arg_slots(&mut arg_stack, &mut arg_heap, &frames[top].vals, args)?;
                     // §3.6 slice 3 — caller-side parking: a call through a live-callee offer
                     // does not dispatch here. It enqueues on the callee's inbound queue, wakes
                     // the callee's `svc.wait` (if parked), and parks THIS fiber until the
@@ -17277,7 +17276,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         hg.live_impl_of(h, *type_id)
                     };
                     if let Some(target) = live {
-                        live_call!(target, *op, argv, *sig);
+                        live_call!(target, *op, argv.to_vec(), *sig);
                     }
                     // CALLS.md increment 3 (slice 1): an **instanced** offer runs its sub-run with
                     // the caller powerbox lock narrowed to the two `cap`-slot translation edges —
@@ -17296,7 +17295,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         // this vCPU's registry over the provider's world (`continue 'frames` on a
                         // switch, `-EAGAIN` on a busy instance), or fall through to the byte-identical
                         // 3a `drive_arc` sub-run when it declines (durable caller/provider, `ref.func`).
-                        animate_instanced_offer!(&entry, *op, &argv);
+                        animate_instanced_offer!(&entry, *op, argv);
                         // 6a — the sub-run is retired: the macro handles every non-durable
                         // case (switch / -EAGAIN / park / trap); reaching here is an unknown-op
                         // or arity miss — the retired path's CapFault, fail-closed.
@@ -17312,11 +17311,15 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     // no delivered value, so a host-answered call declines before its embedder
                     // sees it. A pool job runs inline under a tape on either face.
                     let face = (!hg.records_caps()).then_some(&mut pending_id);
-                    let results = hg.cap_dispatch_slots_deferring(
+                    let n_results = call_sig(&cur_types, *sig).results.len();
+                    let (mut res_stack, mut res_heap) = ([0; CALL_STACK_SLOTS], Vec::new());
+                    let results = call_slots(&mut res_stack, &mut res_heap, n_results);
+                    hg.cap_dispatch_slots_deferring(
                         *type_id,
                         *op,
                         h,
-                        &argv,
+                        argv,
+                        &mut *results,
                         gm,
                         face,
                         Some(&mut unlocked),
@@ -17446,7 +17449,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     let t = ParkTransients::drain(&mut hg);
                     let domain = hg.domain_id() as usize;
                     drop(hg);
-                    let results = unlocked_results(results, unlocked, &argv, mem)?;
+                    run_unlocked(unlocked, argv, results, mem)?;
                     if closed {
                         sched.cap_revoke(domain, h, CAP_REVOKED);
                     }
@@ -17484,13 +17487,13 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         Decision::None => {}
                     }
                     if !eintr_done {
-                        let results = match refused {
-                            Some(e) => vec![e],
+                        let results: &[i64] = match &refused {
+                            Some(e) => std::slice::from_ref(e),
                             None => results,
                         };
                         push_results(
                             &mut frames[top].vals,
-                            &results,
+                            results,
                             &call_sig(&cur_types, *sig).results,
                         );
                     }
@@ -17539,10 +17542,9 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         args,
                         ..
                     } = &**c;
-                    let mut argv = Vec::with_capacity(args.len());
-                    for a in args {
-                        argv.push(get(&frames[top].vals, *a)?.i64());
-                    }
+                    // #2319 — the call's arg and result slots, on this stack when they fit.
+                    let (mut arg_stack, mut arg_heap) = ([0; CALL_STACK_SLOTS], Vec::new());
+                    let argv = arg_slots(&mut arg_stack, &mut arg_heap, &frames[top].vals, args)?;
                     // §3.6 slice 4 — a slot bound (e.g. by `import.attach`) to a live-callee
                     // offer routes like the direct form: enqueue on the callee, park this
                     // fiber until the reply. Same backpressure and race story as slice 3.
@@ -17551,7 +17553,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         hg.import_live_target(*import)
                     };
                     if let Some((target, base_op)) = live {
-                        live_call!(target, base_op + *op, argv, *sig);
+                        live_call!(target, base_op + *op, argv.to_vec(), *sig);
                     }
                     // CALLS.md increment 3 (slice 1): an instanced offer bound to this slot runs
                     // with the narrowed powerbox lock (see the `call.cap` arm). Probe reproduces the
@@ -17565,7 +17567,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     if let Some((entry, eff_op)) = inst_offer {
                         // CALLS.md 4a — animate the handler in-loop (see the `call.cap` arm), or
                         // fall through to the byte-identical 3a `drive_arc` sub-run on a decline.
-                        animate_instanced_offer!(&entry, eff_op, &argv);
+                        animate_instanced_offer!(&entry, eff_op, argv);
                         // 6a — the sub-run is retired: the macro handles every non-durable
                         // case (switch / -EAGAIN / park / trap); reaching here is an unknown-op
                         // or arity miss — the retired path's CapFault, fail-closed.
@@ -17576,11 +17578,15 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     // §3.5: the reserved import dispatch packs `(slot | consumer_op << 16)`.
                     let packed = *import | (*op << 16);
                     let mut unlocked = None;
-                    let results = hg.cap_dispatch_slots_deferring(
+                    let n_results = call_sig(&cur_types, *sig).results.len();
+                    let (mut res_stack, mut res_heap) = ([0; CALL_STACK_SLOTS], Vec::new());
+                    let results = call_slots(&mut res_stack, &mut res_heap, n_results);
+                    hg.cap_dispatch_slots_deferring(
                         temen_ir::CAP_IMPORT_TYPE_ID,
                         packed,
                         0,
-                        &argv,
+                        argv,
+                        &mut *results,
                         gm,
                         None,
                         Some(&mut unlocked),
@@ -17594,7 +17600,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     // placeholder with nothing to say why, and dropping a pipe park is a false EOF.
                     let t = ParkTransients::drain(&mut hg);
                     drop(hg);
-                    let results = unlocked_results(results, unlocked, &argv, mem)?;
+                    run_unlocked(unlocked, argv, results, mem)?;
                     t.fire_wakes(sched);
                     let mut eintr_done = false;
                     let mut refused = None;
@@ -17625,13 +17631,13 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         Decision::None => {}
                     }
                     if !eintr_done {
-                        let results = match refused {
-                            Some(e) => vec![e],
+                        let results: &[i64] = match &refused {
+                            Some(e) => std::slice::from_ref(e),
                             None => results,
                         };
                         push_results(
                             &mut frames[top].vals,
-                            &results,
+                            results,
                             &call_sig(&cur_types, *sig).results,
                         );
                     }
@@ -17642,10 +17648,9 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     let temen_ir::CallSym {
                         import, sig, args, ..
                     } = &**c;
-                    let mut argv = Vec::with_capacity(args.len());
-                    for a in args {
-                        argv.push(get(&frames[top].vals, *a)?.i64());
-                    }
+                    // #2319 — the call's arg and result slots, on this stack when they fit.
+                    let (mut arg_stack, mut arg_heap) = ([0; CALL_STACK_SLOTS], Vec::new());
+                    let argv = arg_slots(&mut arg_stack, &mut arg_heap, &frames[top].vals, args)?;
                     // §3.6 slice 4 (parity with `call.import`): a symbolic slot the instance bound
                     // to a **live-callee** offer routes through caller-parking, not the generic
                     // dispatch — enqueue on the callee, park this fiber until the reply. CallSym is
@@ -17656,7 +17661,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         hg.import_live_target(*import)
                     };
                     if let Some((target, base_op)) = live {
-                        live_call!(target, base_op, argv, *sig);
+                        live_call!(target, base_op, argv.to_vec(), *sig);
                     }
                     // CALLS.md increment 3 (slice 1): a symbolic slot bound to an instanced offer
                     // runs with the narrowed powerbox lock. CallSym is "a flat call.import (op 0)",
@@ -17670,7 +17675,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     if let Some((entry, eff_op)) = inst_offer {
                         // CALLS.md 4a — animate the handler in-loop (see the `call.cap` arm), or
                         // fall through to the byte-identical 3a `drive_arc` sub-run on a decline.
-                        animate_instanced_offer!(&entry, eff_op, &argv);
+                        animate_instanced_offer!(&entry, eff_op, argv);
                         // 6a — the sub-run is retired: the macro handles every non-durable
                         // case (switch / -EAGAIN / park / trap); reaching here is an unknown-op
                         // or arity miss — the retired path's CapFault, fail-closed.
@@ -17679,11 +17684,15 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     let gm = mem.as_mut().map(|m| m as &mut dyn GuestMem);
                     let mut hg = HostCall::lock(host, sched);
                     let mut unlocked = None;
-                    let results = hg.cap_dispatch_slots_deferring(
+                    let n_results = call_sig(&cur_types, *sig).results.len();
+                    let (mut res_stack, mut res_heap) = ([0; CALL_STACK_SLOTS], Vec::new());
+                    let results = call_slots(&mut res_stack, &mut res_heap, n_results);
+                    hg.cap_dispatch_slots_deferring(
                         temen_ir::CAP_IMPORT_TYPE_ID,
                         *import,
                         0,
-                        &argv,
+                        argv,
+                        &mut *results,
                         gm,
                         None,
                         Some(&mut unlocked),
@@ -17700,7 +17709,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     let _ = hg.take_stdin_parked(); // no stdin parking here (see call.import)
                     let t = ParkTransients::drain(&mut hg);
                     drop(hg);
-                    let results = unlocked_results(results, unlocked, &argv, mem)?;
+                    run_unlocked(unlocked, argv, results, mem)?;
                     t.fire_wakes(sched);
                     let mut eintr_done = false;
                     let mut refused = None;
@@ -17731,13 +17740,13 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         Decision::None => {}
                     }
                     if !eintr_done {
-                        let results = match refused {
-                            Some(e) => vec![e],
+                        let results: &[i64] = match &refused {
+                            Some(e) => std::slice::from_ref(e),
                             None => results,
                         };
                         push_results(
                             &mut frames[top].vals,
-                            &results,
+                            results,
                             &call_sig(&cur_types, *sig).results,
                         );
                     }
@@ -17753,10 +17762,9 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         args,
                     } = &**c;
                     let h = get_i32(&frames[top].vals, *handle)?;
-                    let mut argv = Vec::with_capacity(args.len());
-                    for a in args {
-                        argv.push(get(&frames[top].vals, *a)?.i64());
-                    }
+                    // #2319 — the call's arg and result slots, on this stack when they fit.
+                    let (mut arg_stack, mut arg_heap) = ([0; CALL_STACK_SLOTS], Vec::new());
+                    let argv = arg_slots(&mut arg_stack, &mut arg_heap, &frames[top].vals, args)?;
                     // CALLS.md increment 3 (slice 1): a dynamic-mode call on an instanced offer runs
                     // with the narrowed powerbox lock. Probe interns the self shape `ty` (as the
                     // generic dyn path does) then checks the handle; a miss falls through unchanged.
@@ -17769,7 +17777,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     if let Some((entry, eff_op)) = inst_offer {
                         // CALLS.md 4a — animate the handler in-loop (see the `call.cap` arm), or
                         // fall through to the byte-identical 3a `drive_arc` sub-run on a decline.
-                        animate_instanced_offer!(&entry, eff_op, &argv);
+                        animate_instanced_offer!(&entry, eff_op, argv);
                         // 6a — the sub-run is retired: the macro handles every non-durable
                         // case (switch / -EAGAIN / park / trap); reaching here is an unknown-op
                         // or arity miss — the retired path's CapFault, fail-closed.
@@ -17779,11 +17787,15 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     let mut hg = HostCall::lock(host, sched);
                     let packed = *ty | (*op << 16);
                     let mut unlocked = None;
-                    let results = hg.cap_dispatch_slots_deferring(
+                    let n_results = call_sig(&cur_types, *sig).results.len();
+                    let (mut res_stack, mut res_heap) = ([0; CALL_STACK_SLOTS], Vec::new());
+                    let results = call_slots(&mut res_stack, &mut res_heap, n_results);
+                    hg.cap_dispatch_slots_deferring(
                         temen_ir::CAP_DYN_TYPE_ID,
                         packed,
                         h,
-                        &argv,
+                        argv,
+                        &mut *results,
                         gm,
                         None,
                         Some(&mut unlocked),
@@ -17795,7 +17807,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                                     // #1621 four rounds to find.
                     let t = ParkTransients::drain(&mut hg);
                     drop(hg);
-                    let results = unlocked_results(results, unlocked, &argv, mem)?;
+                    run_unlocked(unlocked, argv, results, mem)?;
                     t.fire_wakes(sched);
                     let mut eintr_done = false;
                     let mut refused = None;
@@ -17826,13 +17838,13 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         Decision::None => {}
                     }
                     if !eintr_done {
-                        let results = match refused {
-                            Some(e) => vec![e],
+                        let results: &[i64] = match &refused {
+                            Some(e) => std::slice::from_ref(e),
                             None => results,
                         };
                         push_results(
                             &mut frames[top].vals,
-                            &results,
+                            results,
                             &call_sig(&cur_types, *sig).results,
                         );
                     }
@@ -17841,39 +17853,45 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 // coverage — all through the shared dispatch entry (op packs `selfop | idx << 8`).
                 Inst::ExportHandle { export } => {
                     let mut hg = host.lock_unpoisoned();
-                    let results = hg.cap_dispatch_slots(
+                    let mut results = [0];
+                    hg.cap_dispatch_slots(
                         temen_ir::CAP_SELF_TYPE_ID,
                         8 | (*export << 8),
                         0,
                         &[],
+                        &mut results,
                         None,
                     )?;
-                    let r = *results.first().ok_or(Trap::CapFault)?;
+                    let r = results[0];
                     frames[top].vals.push(Reg::from_i32(r as i32));
                 }
                 Inst::CapSelfTypeId { ty } => {
                     let mut hg = host.lock_unpoisoned();
-                    let results = hg.cap_dispatch_slots(
+                    let mut results = [0];
+                    hg.cap_dispatch_slots(
                         temen_ir::CAP_SELF_TYPE_ID,
                         6 | (*ty << 8),
                         0,
                         &[],
+                        &mut results,
                         None,
                     )?;
-                    let r = *results.first().ok_or(Trap::CapFault)?;
+                    let r = results[0];
                     frames[top].vals.push(Reg::from_i32(r as i32));
                 }
                 Inst::CapSelfCovers { handle, ty } => {
                     let h = get_i32(&frames[top].vals, *handle)?;
                     let mut hg = host.lock_unpoisoned();
-                    let results = hg.cap_dispatch_slots(
+                    let mut results = [0];
+                    hg.cap_dispatch_slots(
                         temen_ir::CAP_SELF_TYPE_ID,
                         7 | (*ty << 8),
                         0,
                         &[h as i64],
+                        &mut results,
                         None,
                     )?;
-                    let r = *results.first().ok_or(Trap::CapFault)?;
+                    let r = results[0];
                     frames[top].vals.push(Reg::from_i32(r as i32));
                 }
                 // Phase-2 `import.attach` (IMPORTS.md): rebind rebindable slot `import` to the
@@ -17892,14 +17910,16 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         .import_binding(*import)
                         .filter(|b| b.bound)
                         .map(|b| b.handle);
-                    let results = hg.cap_dispatch_slots(
+                    let mut results = [0];
+                    hg.cap_dispatch_slots(
                         temen_ir::CAP_IMPORT_ATTACH_TYPE_ID,
                         *import,
                         0,
                         &[h as i64],
+                        &mut results,
                         None,
                     )?;
-                    let status = *results.first().ok_or(Trap::Malformed)?;
+                    let status = results[0];
                     let domain = hg.domain_id() as usize;
                     drop(hg);
                     if status == 0 {
@@ -23915,10 +23935,11 @@ impl Completions {
 }
 
 /// An **embedder-registered host-capability handler** (iface [`cap_id::HOST_PROC`]): given the `op`,
-/// the slot-encoded `i64` args, and the guest window (`None` if the module has no memory), it runs
-/// the operation and returns its result slots — or a [`Trap`] (e.g. `Trap::Exit`). This is how a
-/// host adds a capability (e.g. a WASI shim) **without** touching this crate: the semantics
-/// live in the closure, reached only through a granted handle (the §3c masked/type-checked table).
+/// the slot-encoded `i64` args, the call's result slots, and the guest window (`None` if the module
+/// has no memory), it runs the operation and writes its results ([`put_results`]) — or returns a
+/// [`Trap`] (e.g. `Trap::Exit`). This is how a host adds a capability (e.g. a WASI shim) **without**
+/// touching this crate: the semantics live in the closure, reached only through a granted handle (the
+/// §3c masked/type-checked table).
 ///
 /// The last parameter is the §4b [`RegionMinter`] escape hatch — `Some` **only** for a handler
 /// registered mmap-capable ([`ProcHandler::Minting`]), `None` for a plain one ([`ProcHandler::Sync`])
@@ -23928,11 +23949,44 @@ pub type HostProc = Box<
     dyn FnMut(
             u32,
             &[i64],
+            &mut [i64],
             Option<&mut dyn GuestMem>,
             Option<&mut dyn RegionMinter>,
-        ) -> Result<Vec<i64>, Trap>
+        ) -> Result<(), Trap>
         + Send,
 >;
+
+/// #2319 — write a capability call's results into `out`, the result slots the call declares, which
+/// arrive zeroed (#2361): as many as fit. A `call.cap`'s signature is the guest's own (the verifier
+/// checks it against nothing), so the guest decides how many slots `out` has, and a handler writes
+/// through this rather than indexing `out`: a result the call doesn't declare is dropped, and a slot
+/// the op doesn't fill reads zero, on every engine. The mirror of how handlers read their args
+/// (`args.get(i)`, a missing one reading zero).
+pub fn put_results(out: &mut [i64], results: &[i64]) -> Result<(), Trap> {
+    for (o, r) in out.iter_mut().zip(results) {
+        *o = *r;
+    }
+    Ok(())
+}
+
+/// #2319 — how many arg or result slots a call keeps on an interpreter's stack ([`call_slots`]).
+const CALL_STACK_SLOTS: usize = 8;
+
+/// #2319 — `n` zeroed slots for a call's args or results, the caller's side of [`put_results`]: in
+/// `stack` when they fit, which covers every call the tree makes, else in `heap`. Both interpreters
+/// keep a call's slots here, so a call allocates nothing for them.
+fn call_slots<'a>(
+    stack: &'a mut [i64; CALL_STACK_SLOTS],
+    heap: &'a mut Vec<i64>,
+    n: usize,
+) -> &'a mut [i64] {
+    if n <= CALL_STACK_SLOTS {
+        &mut stack[..n]
+    } else {
+        heap.resize(n, 0);
+        heap
+    }
+}
 
 /// FORK.md PR 5 / #863 — a host proc's **fork factory**: mints what a `fork()` twin's powerbox
 /// carries for this capability. The runtime can never fork a `HostProc` itself (the closure's
@@ -24039,8 +24093,9 @@ pub type OffloadWork = Box<dyn FnOnce() -> i64 + Send + 'static>;
 /// eval loop gets `Pending(id)` and waits without the host lock; every other caller runs the job
 /// inline, byte-identical to a synchronous handler (decline-never-diverge, INVARIANTS.md 9).
 pub enum OffloadOutcome {
-    /// Completed inline — result slots exactly as a plain [`HostProc`] would return them.
-    Done(Result<Vec<i64>, Trap>),
+    /// Completed inline, its results written to the call's slots exactly as a plain [`HostProc`]
+    /// writes them.
+    Done(Result<(), Trap>),
     /// Would block: run this job off the vCPU thread. The call's declared signature must have at
     /// most one result (checked at the delivery site; more is a `CapFault`, fail-closed).
     Offload(OffloadWork),
@@ -24099,11 +24154,13 @@ impl Drop for Completer {
 }
 
 /// §12 — the **offloadable** registration's handler shape ([`ProcHandler::Offloadable`]):
-/// scalars in, [`OffloadOutcome`] out. Compared to a plain [`HostProc`] it *loses* powers — no
+/// scalars and the call's result slots in, [`OffloadOutcome`] out — a call it completes inline
+/// writes its results there ([`put_results`]), one it punts leaves them. Compared to a plain
+/// [`HostProc`] it *loses* powers — no
 /// guest window, no region minter — because a punted job outlives the dispatch and the pool must
 /// never touch the window (buffers are read at submit and written at completion on the vCPU
 /// thread — the ring's own discipline, kept as the registration contract).
-pub type OffloadHostProc = Box<dyn FnMut(u32, &[i64]) -> OffloadOutcome + Send>;
+pub type OffloadHostProc = Box<dyn FnMut(u32, &[i64], &mut [i64]) -> OffloadOutcome + Send>;
 
 /// A **live stream tee** ([`Host::set_stream_tee`]): called with each write to the run's stdout or
 /// stderr, and which of the two it went to, as the guest produces it, additively to the normal
@@ -24231,8 +24288,9 @@ impl HostProcGrant {
 /// call that waits (a JS capability answered on a page, I/O) then holds nothing back but its own
 /// task. The provider makes its own state safe to share: the handler may run on several threads at
 /// once.
-pub type UnlockedHostProc =
-    Arc<dyn Fn(u32, &[i64], Option<&mut dyn GuestMem>) -> Result<Vec<i64>, Trap> + Send + Sync>;
+pub type UnlockedHostProc = Arc<
+    dyn Fn(u32, &[i64], &mut [i64], Option<&mut dyn GuestMem>) -> Result<(), Trap> + Send + Sync,
+>;
 
 /// #2645 — a call to an unlocked host procedure that a dispatch handed back instead of running
 /// ([`Host::cap_dispatch_slots_deferring`]), for its caller to [`run`](Self::run) once it has let go
@@ -24243,9 +24301,15 @@ pub struct UnlockedCall {
 }
 
 impl UnlockedCall {
-    /// Run the call: `args` are the ones the dispatch was given, `mem` the caller's window.
-    pub fn run(self, args: &[i64], mem: Option<&mut dyn GuestMem>) -> Result<Vec<i64>, Trap> {
-        (self.handler)(self.op, args, mem)
+    /// Run the call: `args` are the ones the dispatch was given, `out` the call's result slots, `mem`
+    /// the caller's window.
+    pub fn run(
+        self,
+        args: &[i64],
+        out: &mut [i64],
+        mem: Option<&mut dyn GuestMem>,
+    ) -> Result<(), Trap> {
+        (self.handler)(self.op, args, out, mem)
     }
 }
 
@@ -28897,13 +28961,14 @@ impl Host {
     fn punt_or_inline(
         &mut self,
         job: OffloadWork,
+        out: &mut [i64],
         pending: Option<&mut Option<u64>>,
-    ) -> Result<Vec<i64>, Trap> {
+    ) -> Result<(), Trap> {
         // §12 W1: under a tape (recording or replaying) a pool job runs **inline** regardless of
         // the face, so the taped result is the real one and a replay never punts (moved here from
         // the face selection so a #1366 host-completed punt — which has no job — can still park).
         if self.cap_record.is_some() || self.cap_replay.is_some() {
-            return Ok(vec![job()]);
+            return put_results(out, &[job()]);
         }
         match pending {
             Some(slot) => {
@@ -28914,9 +28979,9 @@ impl Host {
                     .get_or_insert_with(|| OffloadPool::new(OFFLOAD_POOL_THREADS));
                 pool.dispatch(Box::new(move || comps.complete(id, job())));
                 *slot = Some(id);
-                Ok(Vec::new())
+                Ok(())
             }
-            None => Ok(vec![job()]),
+            None => put_results(out, &[job()]),
         }
     }
 
@@ -28934,7 +28999,7 @@ impl Host {
         args: &[i64],
         submit: HostCompletion,
         pending: Option<&mut Option<u64>>,
-    ) -> Result<Vec<i64>, Trap> {
+    ) -> Result<(), Trap> {
         let Some(slot) = pending.filter(|_| !self.durable) else {
             return Err(Trap::CapFault);
         };
@@ -28945,7 +29010,7 @@ impl Host {
             .is_some()
             .then(|| (type_id, op, handle, args.to_vec()));
         *slot = Some(self.completions.submit_host_owned(record, submit));
-        Ok(Vec::new())
+        Ok(())
     }
 
     /// #1366 — push a [`CapRecord`] onto this host's cap tape if it is recording (no-op otherwise):
@@ -29024,21 +29089,21 @@ impl Host {
     /// `get(idx) -> [handle, type_id]` (out-of-range index is fail-closed). The interpreter calls this
     /// for its `CapSelf*` ops, and the JIT routes them through the `call.cap` thunk with the reserved
     /// [`CAP_SELF_TYPE_ID`] — so the two stay in lockstep over one implementation.
-    fn self_dispatch(&self, op: u32, args: &[i64]) -> Result<Vec<i64>, Trap> {
+    fn self_dispatch(&self, op: u32, args: &[i64], out: &mut [i64]) -> Result<(), Trap> {
         let caps = self.self_caps();
         match op {
-            0 => Ok(vec![caps.len() as i64]),
+            0 => put_results(out, &[caps.len() as i64]),
             1 => {
                 let idx = *args.first().ok_or(Trap::Malformed)?;
                 let (handle, type_id) = usize::try_from(idx)
                     .ok()
                     .and_then(|i| caps.get(i).copied())
                     .ok_or(Trap::Malformed)?;
-                Ok(vec![handle as i64, type_id as i64])
+                put_results(out, &[handle as i64, type_id as i64])
             }
             // §6 `self.attest`: the domain's platform-vouched provenance, packed as
             // `tier | (window_exposed << 8) | (freeze_exposed << 9)` — the non-interposable trust anchor.
-            4 => Ok(vec![self.attestation.packed() as i64]),
+            4 => put_results(out, &[self.attestation.packed() as i64]),
             // §3.1 `self.provenance(handle) -> i32` (IMPORTS.md): the binding's provenance
             // class — `0` = **platform-terminated** (host-native vtable), `d ≥ 1` =
             // **ancestor-terminated** (a wired guest impl terminating `d` domain boundaries up:
@@ -29049,14 +29114,15 @@ impl Host {
             5 => {
                 let h = *args.first().ok_or(Trap::Malformed)? as i32;
                 if let Ok(e) = self.resolve_offer(h) {
-                    return Ok(vec![e.depth as i64]);
+                    return put_results(out, &[e.depth as i64]);
                 }
                 // Not a wired offer: any live binding is platform-terminated (the vtable is
                 // host-native); dead/forged stays an inert CapFault via the canonical resolve.
                 let expect = self.table[(h as u32 as usize) & (CAP - 1)].type_id;
-                self.resolve(h, expect).map(|_| vec![0])
+                self.resolve(h, expect)?;
+                put_results(out, &[0])
             }
-            CAP_SELF_PARALLELISM => Ok(vec![self.parallelism()]),
+            CAP_SELF_PARALLELISM => put_results(out, &[self.parallelism()]),
             _ => Err(Trap::Malformed),
         }
     }
@@ -29790,7 +29856,7 @@ impl Host {
                 Some(g) => (g.grant, g.process),
                 None => (
                     HostProcGrant::new(
-                        ProcHandler::Sync(Box::new(|_op, _args, _mem, _minter| {
+                        ProcHandler::Sync(Box::new(|_op, _args, _out, _mem, _minter| {
                             Err(Trap::CapFault)
                         })),
                         CapState::Stateless,
@@ -34565,28 +34631,44 @@ impl Host {
         })
     }
 
-    /// Dispatch a `call.cap` (§3c): resolve the handle, then run the mock operation.
-    /// Returns the op's result values (negative-errno encoded in an `i64` for the
-    /// fallible ops, §3e D42), or a `Trap` for escape/exit. `mem` backs buffer args.
-    /// Dispatch a `call.cap` (§3c): resolve the handle in the host-owned table, then run
-    /// the bound capability op. Public and **slot-based** (`i64` per scalar; `i32` in
-    /// the low bits) so both backends drive the same handlers without per-arg type tags
-    /// — the interpreter converts its `Value`s, a JIT passes its slots directly. `mem`
-    /// is `None` when the module declares no memory (buffer ops then return `-EFAULT`).
+    /// Dispatch a `call.cap` (§3c): resolve the handle in the host-owned table, then run the bound
+    /// capability op, which writes its results into `out` ([`put_results`]): the call's declared
+    /// result slots, zeroed by the caller (#2361). Results are negative-errno encoded in an `i64`
+    /// for the fallible ops (§3e D42); a `Trap` is for escape or exit. Public and **slot-based**
+    /// (`i64` per scalar; `i32` in the low bits) so every engine drives the same handlers without
+    /// per-arg type tags — the interpreters convert their values, a JIT passes its slots directly.
+    /// `mem` is `None` when the module declares no memory (buffer ops then return `-EFAULT`).
     pub fn cap_dispatch_slots(
         &mut self,
         type_id: u32,
         op: u32,
         handle: i32,
         args: &[i64],
+        out: &mut [i64],
+        mem: Option<&mut dyn GuestMem>,
+    ) -> Result<(), Trap> {
+        self.cap_dispatch_slots_deferring(type_id, op, handle, args, out, mem, None, None)
+    }
+
+    /// [`Host::cap_dispatch_slots`] into `n` result slots of its own, for a caller that wants them
+    /// owned: a test, or a call off any hot path. A guest's call declares its `n`; so does this one.
+    pub fn cap_call(
+        &mut self,
+        type_id: u32,
+        op: u32,
+        handle: i32,
+        args: &[i64],
+        n: usize,
         mem: Option<&mut dyn GuestMem>,
     ) -> Result<Vec<i64>, Trap> {
-        self.cap_dispatch_slots_deferring(type_id, op, handle, args, mem, None, None)
+        let mut out = vec![0; n];
+        self.cap_dispatch_slots(type_id, op, handle, args, &mut out, mem)?;
+        Ok(out)
     }
 
     /// The **deferring dispatch face**: identical to [`Host::cap_dispatch_slots`] except for the
     /// calls it can leave for its caller to finish once the caller has let go of the host, each on a
-    /// face the caller offers. On either, the result slots are a placeholder the caller discards.
+    /// face the caller offers. On either, the dispatch writes no result: the caller fills `out`.
     ///
     /// - `pending` (§12 parking-on-blocking): an offloadable handler's punt returns at once with
     ///   `*pending = Some(completion_id)` (the job already handed to the offload pool) instead of
@@ -34595,22 +34677,23 @@ impl Host {
     ///   slot.
     /// - `unlocked` (#2645): a call to an unlocked host procedure ([`ProcHandler::Unlocked`])
     ///   returns at once with `*unlocked = Some(call)` instead of running. Drop the host lock, then
-    ///   [`UnlockedCall::run`] with the same arguments and window: its results are the call's.
+    ///   [`UnlockedCall::run`] with the same arguments, result slots and window.
     ///
     /// A face the caller does not offer gets byte-identical inline semantics
     /// (decline-never-diverge, INVARIANTS.md 9). Under a W1 tape a pool punt and an unlocked call
     /// run inline, so the recorded crossing carries the real result.
-    #[allow(clippy::too_many_arguments)] // the call's own five, and the two faces a caller offers
+    #[allow(clippy::too_many_arguments)] // the call's own six, and the two faces a caller offers
     pub fn cap_dispatch_slots_deferring(
         &mut self,
         type_id: u32,
         op: u32,
         handle: i32,
         args: &[i64],
+        out: &mut [i64],
         mem: Option<&mut dyn GuestMem>,
         pending: Option<&mut Option<u64>>,
         unlocked: Option<&mut Option<UnlockedCall>>,
-    ) -> Result<Vec<i64>, Trap> {
+    ) -> Result<(), Trap> {
         // §12: under a W1 tape, force punts inline (`pending = None` downstream) — a `Pending`
         // placeholder on the tape would replay as a phantom result; the inline run records the
         // real one (the same reasoning as the parked-stdin tape suppression below).
@@ -34653,12 +34736,12 @@ impl Host {
         {
             let idx = op >> 8;
             return match op & 0xFF {
-                6 => Ok(vec![self.self_type_id(idx)? as i32 as i64]),
+                6 => put_results(out, &[self.self_type_id(idx)? as i32 as i64]),
                 7 => {
                     let h = *args.first().ok_or(Trap::CapFault)? as i32;
-                    Ok(vec![self.self_covers(h, idx)?])
+                    put_results(out, &[self.self_covers(h, idx)?])
                 }
-                8 => Ok(vec![self.reify_export(idx)? as i64]),
+                8 => put_results(out, &[self.reify_export(idx)? as i64]),
                 // §3.6 svc.poll/svc.wait — and FORK.md's clone_caller (op 11) — reaching host-side
                 // dispatch = a backend tier without the eval-loop servicing arm (only the eval loop
                 // can run guest handler code / read `serve_run`): a probeable `-EINVAL`, never a
@@ -34675,7 +34758,7 @@ impl Host {
                 | CAP_SELF_PIPE
                     if op >> 8 == 0 =>
                 {
-                    Ok(vec![EINVAL])
+                    put_results(out, &[EINVAL])
                 }
                 _ => Err(Trap::CapFault),
             };
@@ -34717,8 +34800,18 @@ impl Host {
                         Some(m) => Some(&mut **m),
                         None => None,
                     };
-                    let _ =
-                        self.cap_dispatch_slots_inner(type_id, op, handle, args, rerun, None, None);
+                    // Its results are the tape's, so the rerun's go nowhere.
+                    let mut discard = vec![0; out.len()];
+                    let _ = self.cap_dispatch_slots_inner(
+                        type_id,
+                        op,
+                        handle,
+                        args,
+                        &mut discard,
+                        rerun,
+                        None,
+                        None,
+                    );
                 }
                 // Re-apply any guest-window writes the cap made (a buffer-filling `read`), then
                 // return the recorded result slots — no live host needed.
@@ -34728,7 +34821,7 @@ impl Host {
                     }
                 }
                 self.cap_consumed += 1;
-                return rec.result;
+                return rec.result.and_then(|r| put_results(out, &r));
             }
             // Record: run live through a `RecordingMem` so any guest-window writes are captured,
             // then log the crossing for a future replay.
@@ -34744,6 +34837,7 @@ impl Host {
                         op,
                         handle,
                         args,
+                        out,
                         Some(&mut rec_mem),
                         pending.as_deref_mut(),
                         None,
@@ -34756,6 +34850,7 @@ impl Host {
                         op,
                         handle,
                         args,
+                        out,
                         None,
                         pending.as_deref_mut(),
                         None,
@@ -34777,7 +34872,7 @@ impl Host {
                         op,
                         handle,
                         args: args.to_vec(),
-                        result: result.clone(),
+                        result: result.map(|()| out.to_vec()),
                         mem_writes,
                     });
                     self.cap_consumed += 1;
@@ -34785,7 +34880,7 @@ impl Host {
             }
             return result;
         }
-        self.cap_dispatch_slots_inner(type_id, op, handle, args, mem, pending, unlocked)
+        self.cap_dispatch_slots_inner(type_id, op, handle, args, out, mem, pending, unlocked)
     }
 
     /// The live capability dispatch (§3c) — resolve the handle in the host table and run the op. The
@@ -34799,10 +34894,11 @@ impl Host {
         op: u32,
         handle: i32,
         args: &[i64],
+        out: &mut [i64],
         mem: Option<&mut dyn GuestMem>,
         pending: Option<&mut Option<u64>>,
         unlocked: Option<&mut Option<UnlockedCall>>,
-    ) -> Result<Vec<i64>, Trap> {
+    ) -> Result<(), Trap> {
         // Phase-2 `import.attach` (IMPORTS.md): (re)bind rebindable import slot `op` to the handle
         // in `args[0]`. The new handle must resolve **live under the slot's declared interface
         // type_id** (the §3c mask + type + generation check) — attach swaps which *object* the slot
@@ -34826,7 +34922,7 @@ impl Host {
             if let Some(req) = self.import_reqs.get(slot).cloned().flatten() {
                 let (req_names, req_sigs) = &*req;
                 let Some(tid) = self.type_id_of(new_handle) else {
-                    return Ok(vec![EINVAL]); // dead/forged — probeable, never a trap
+                    return put_results(out, &[EINVAL]); // dead/forged — probeable, never a trap
                 };
                 let exact = tid == self.intern_interface(req_names, req_sigs);
                 let cover = if exact {
@@ -34838,7 +34934,7 @@ impl Host {
                     })
                 };
                 let Some(remap) = cover else {
-                    return Ok(vec![EINVAL]); // does not cover — fail closed, probeable
+                    return put_results(out, &[EINVAL]); // does not cover — fail closed, probeable
                 };
                 let b = &mut self.import_bindings[slot];
                 b.type_id = tid;
@@ -34846,15 +34942,15 @@ impl Host {
                 b.handle = new_handle;
                 b.bound = true;
                 self.import_remaps[slot] = Some(remap);
-                return Ok(vec![0]);
+                return put_results(out, &[0]);
             }
             if self.resolve(new_handle, b.type_id).is_err() {
-                return Ok(vec![EINVAL]);
+                return put_results(out, &[EINVAL]);
             }
             let b = &mut self.import_bindings[slot];
             b.handle = new_handle;
             b.bound = true;
-            return Ok(vec![0]);
+            return put_results(out, &[0]);
         }
         // §7 reflection: the reserved pseudo-`type_id` has no handle to resolve — service it directly
         // (read-only over this domain's own powerbox). This is the JIT's entry point for `self.*`.
@@ -34868,19 +34964,20 @@ impl Host {
             // out of bounds, `-EINVAL` on bad UTF-8 / unknown name).
             if op == 2 {
                 let Some(mem) = mem else {
-                    return Ok(vec![EFAULT]);
+                    return put_results(out, &[EFAULT]);
                 };
                 let ptr = *args.first().unwrap_or(&0) as u64;
                 let len = *args.get(1).unwrap_or(&0) as u64;
                 let Some(bytes) = mem.read_bytes(ptr, len) else {
-                    return Ok(vec![EFAULT]);
+                    return put_results(out, &[EFAULT]);
                 };
                 let Ok(name) = std::str::from_utf8(&bytes) else {
-                    return Ok(vec![EINVAL]);
+                    return put_results(out, &[EINVAL]);
                 };
-                return Ok(vec![self
-                    .resolve_cap_name(name)
-                    .map_or(EINVAL, |h| h as i64)]);
+                return put_results(
+                    out,
+                    &[self.resolve_cap_name(name).map_or(EINVAL, |h| h as i64)],
+                );
             }
             // op 3 = `label(handle, buf_ptr, buf_cap) -> len | 0 | -EFAULT` (F9): write the handle's
             // human-readable label into the window (the reverse of op 2). Returns the label's full
@@ -34891,18 +34988,18 @@ impl Host {
                 let ptr = *args.get(1).unwrap_or(&0) as u64;
                 let cap = *args.get(2).unwrap_or(&0) as u64;
                 let Some(label) = self.cap_label(h).map(|s| s.to_string()) else {
-                    return Ok(vec![0]); // no label for this handle
+                    return put_results(out, &[0]); // no label for this handle
                 };
                 let len = label.len() as u64;
                 if len <= cap {
                     let Some(mem) = mem else {
-                        return Ok(vec![EFAULT]);
+                        return put_results(out, &[EFAULT]);
                     };
                     if mem.write_bytes(ptr, label.as_bytes()).is_none() {
-                        return Ok(vec![EFAULT]);
+                        return put_results(out, &[EFAULT]);
                     }
                 }
-                return Ok(vec![len as i64]);
+                return put_results(out, &[len as i64]);
             }
             // op 17 = `list(buf_ptr, buf_cap) -> len | -EFAULT` (#1109): enumerate this domain's
             // **named** grants as packed rows `{ handle: i32 LE, type_id: u32 LE, name_len: u32 LE,
@@ -34930,13 +35027,13 @@ impl Host {
                 let len = buf.len() as u64;
                 if len <= cap {
                     let Some(mem) = mem else {
-                        return Ok(vec![EFAULT]);
+                        return put_results(out, &[EFAULT]);
                     };
                     if mem.write_bytes(ptr, &buf).is_none() {
-                        return Ok(vec![EFAULT]);
+                        return put_results(out, &[EFAULT]);
                     }
                 }
-                return Ok(vec![len as i64]);
+                return put_results(out, &[len as i64]);
             }
             // op 18 = `schema(type_id, buf_ptr, buf_cap) -> len | -EINVAL | -EFAULT` (#1109): dump
             // interface `type_id`'s canonical op names + signatures as packed rows `{ name_len: u32
@@ -34951,7 +35048,7 @@ impl Host {
                 let ptr = *args.get(1).unwrap_or(&0) as u64;
                 let cap = *args.get(2).unwrap_or(&0) as u64;
                 let Some(ops) = self.iface_schema(tid) else {
-                    return Ok(vec![EINVAL]);
+                    return put_results(out, &[EINVAL]);
                 };
                 // The wire's type bytes (temen-encode `op::T_*`), restated: reflection output must
                 // match what an encoder/decoder of the same module would say.
@@ -34978,15 +35075,15 @@ impl Host {
                 let len = buf.len() as u64;
                 if len <= cap {
                     let Some(mem) = mem else {
-                        return Ok(vec![EFAULT]);
+                        return put_results(out, &[EFAULT]);
                     };
                     if mem.write_bytes(ptr, &buf).is_none() {
-                        return Ok(vec![EFAULT]);
+                        return put_results(out, &[EFAULT]);
                     }
                 }
-                return Ok(vec![len as i64]);
+                return put_results(out, &[len as i64]);
             }
-            return self.self_dispatch(op, args);
+            return self.self_dispatch(op, args, out);
         }
         // ISSUES.md I41 (graceful revocation): a call through a handle that was once granted and
         // has since been revoked completes with the **same probeable errno** the §3.6
@@ -35000,7 +35097,7 @@ impl Host {
             Ok(b) => b,
             Err(t) => {
                 return if self.handle_revoked(handle) {
-                    Ok(vec![CAP_REVOKED])
+                    put_results(out, &[CAP_REVOKED])
                 } else {
                     Err(t)
                 }
@@ -35023,11 +35120,11 @@ impl Host {
             // §3.6 slice 3: a live-callee offer is serviced by the eval loop (enqueue + park —
             // host-side dispatch cannot park). Reaching it here means a backend tier without
             // the servicing arm: answer probeable, never trap.
-            Binding::LiveImpl(_) => Ok(vec![EINVAL]),
+            Binding::LiveImpl(_) => put_results(out, &[EINVAL]),
             // #1440: freeze authority is pure authority, like `Module` — the freeze path consults it,
             // nothing calls it. An `EINVAL` rather than a trap keeps it probeable (INVARIANTS #5:
             // traps are for forgery, and the handle here is genuine).
-            Binding::FreezeAuthority => Ok(vec![EINVAL]),
+            Binding::FreezeAuthority => put_results(out, &[EINVAL]),
             // PROCESS.md §5: a window minter is spawn *evidence* (a detached spawn's budget), not
             // a dispatch target — inert probeable refusal.
             // §3.6 slice 1: `Stream.close` is **real** — the guest-side revocation act (D37
@@ -35041,9 +35138,11 @@ impl Host {
             // every backend routes through this one dispatch.
             Binding::Stream { .. } if op == 2 => {
                 self.close(handle);
-                Ok(vec![0])
+                put_results(out, &[0])
             }
-            Binding::Stream { role, sink } => self.stream_op(role, sink, op, args, mem),
+            Binding::Stream { role, sink } => {
+                put_results(out, &[self.stream_op(role, sink, op, args, mem)?])
+            }
             // FORK.md §8.6 — closing a pipe **write** end decrements the shared writer count; when it
             // reaches 0 (every write end gone) the pipe is at EOF, so flag its readers to wake (they
             // re-read → EOF). Closing a **read** end decrements the reader count; when it reaches 0
@@ -35058,9 +35157,11 @@ impl Host {
                     self.pipe_wake_writers = Some(self.pipe_gid(pipe));
                 }
                 self.close(handle);
-                Ok(vec![0])
+                put_results(out, &[0])
             }
-            Binding::PipeEnd { pipe, write } => self.pipe_op(pipe, write, op, args, mem),
+            Binding::PipeEnd { pipe, write } => {
+                put_results(out, &[self.pipe_op(pipe, write, op, args, mem)?])
+            }
             // A wired interface offer (IMPORTS.md §3.2): run op `op`'s function — **v1 pure
             // dispatch**. The op executes as a fresh reference run over the offer's own function
             // table with **no window and an empty powerbox**: it computes over its arguments alone,
@@ -35123,11 +35224,11 @@ impl Host {
                                     Ok(g) => g,
                                     Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
                                     Err(std::sync::TryLockError::WouldBlock) => {
-                                        return Ok(vec![EAGAIN]);
+                                        return put_results(out, &[EAGAIN]);
                                     }
                                 };
                                 if st.busy {
-                                    return Ok(vec![EAGAIN]);
+                                    return put_results(out, &[EAGAIN]);
                                 }
                                 st.busy = true;
                                 st.busy_owner = 0;
@@ -35200,7 +35301,7 @@ impl Host {
                                 st.busy = false;
                                 st.busy_owner = 0;
                             }
-                            return outcome;
+                            return outcome.and_then(|r| put_results(out, &r));
                         }
                         // Checkout: reserve the instance under one brief lock, then release it. A
                         // busy instance (any owner) or a momentarily-held short critical section is
@@ -35210,11 +35311,11 @@ impl Host {
                                 Ok(g) => g,
                                 Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
                                 Err(std::sync::TryLockError::WouldBlock) => {
-                                    return Ok(vec![EAGAIN]);
+                                    return put_results(out, &[EAGAIN]);
                                 }
                             };
                             if st.busy {
-                                return Ok(vec![EAGAIN]);
+                                return put_results(out, &[EAGAIN]);
                             }
                             st.busy = true;
                             // Host-side tier: no cooperative owner. An eval-loop peer sharing this
@@ -35276,7 +35377,7 @@ impl Host {
                             st.busy = false;
                             st.busy_owner = 0;
                         }
-                        outcome
+                        outcome.and_then(|r| put_results(out, &r))
                     }
                     // v1 **pure** offer: windowless, empty powerbox — arguments in, results out,
                     // capped at the flat per-call budget (there is no provider domain to drain;
@@ -35306,7 +35407,7 @@ impl Host {
                         let mut result_slots: Vec<i64> =
                             res?.iter().map(|v| val_to_slot(*v)).collect();
                         translate_cap_slots(&mut ephemeral, self, &sig.results, &mut result_slots)?;
-                        Ok(result_slots)
+                        put_results(out, &result_slots)
                     }
                 }
             }
@@ -35329,15 +35430,15 @@ impl Host {
                     return match unlocked {
                         Some(slot) => {
                             *slot = Some(call);
-                            Ok(Vec::new()) // the caller runs it
+                            Ok(()) // the caller runs it
                         }
-                        None => call.run(args, mem),
+                        None => call.run(args, out, mem),
                     };
                 }
                 let mut f = match self.host_procs.get_mut(idx as usize) {
                     Some(e) => std::mem::replace(
                         &mut e.handler,
-                        ProcHandler::Sync(Box::new(|_, _, _, _| Err(Trap::CapFault))),
+                        ProcHandler::Sync(Box::new(|_, _, _, _, _| Err(Trap::CapFault))),
                     ),
                     None => return Err(Trap::CapFault),
                 };
@@ -35348,25 +35449,26 @@ impl Host {
                 let mut punted: Option<OffloadWork> = None;
                 let mut hosted: Option<HostCompletion> = None;
                 let r = match &mut f {
-                    ProcHandler::Sync(f) => f(op, args, mem, None),
-                    ProcHandler::Minting(f) => f(op, args, mem, Some(self)),
-                    ProcHandler::Unlocked(f) => f(op, args, mem), // run above; never taken out
-                    ProcHandler::Offloadable(f) | ProcHandler::HostAnswered(f) => match f(op, args)
-                    {
-                        OffloadOutcome::Done(r) => r,
-                        OffloadOutcome::Offload(job) => {
-                            punted = Some(job);
-                            Ok(Vec::new()) // replaced below
+                    ProcHandler::Sync(f) => f(op, args, out, mem, None),
+                    ProcHandler::Minting(f) => f(op, args, out, mem, Some(self)),
+                    ProcHandler::Unlocked(f) => f(op, args, out, mem), // run above; never taken out
+                    ProcHandler::Offloadable(f) | ProcHandler::HostAnswered(f) => {
+                        match f(op, args, out) {
+                            OffloadOutcome::Done(r) => r,
+                            OffloadOutcome::Offload(job) => {
+                                punted = Some(job);
+                                Ok(()) // replaced below
+                            }
+                            OffloadOutcome::Host(submit) => {
+                                hosted = Some(submit);
+                                Ok(()) // replaced below
+                            }
                         }
-                        OffloadOutcome::Host(submit) => {
-                            hosted = Some(submit);
-                            Ok(Vec::new()) // replaced below
-                        }
-                    },
+                    }
                 };
                 self.host_procs[idx as usize].handler = f;
                 match (punted, hosted) {
-                    (Some(job), _) => self.punt_or_inline(job, pending),
+                    (Some(job), _) => self.punt_or_inline(job, out, pending),
                     (None, Some(submit)) => {
                         self.punt_host(type_id, op, handle, args, submit, pending)
                     }
@@ -35382,90 +35484,96 @@ impl Host {
                 // op 0: now(clock_id) -> i64 nanoseconds (deterministic, increasing).
                 let now = self.clock_ns;
                 self.clock_ns = self.clock_ns.wrapping_add(1);
-                Ok(vec![now])
+                put_results(out, &[now])
             }
             Binding::SharedRegion(region) => {
                 // §13: alias the host-backed region into the window. `map` (op 0) at several offsets
                 // aliases the same bytes; loads/stores then go through the ordinary masked path.
                 let Some(backing) = self.region(region).cloned() else {
-                    return Ok(vec![EINVAL]);
+                    return put_results(out, &[EINVAL]);
                 };
                 // #1936 — `post(off, badge)` mints a handle and touches no window.
                 if op == 6 {
                     let off = *args.first().unwrap_or(&0) as u64;
                     let badge = *args.get(1).unwrap_or(&0) as u64;
-                    return Ok(vec![self.mint_post(region, backing.size(), off, badge)]);
+                    return put_results(out, &[self.mint_post(region, backing.size(), off, badge)]);
                 }
                 let Some(mem) = mem else {
-                    return Ok(vec![EINVAL]);
+                    return put_results(out, &[EINVAL]);
                 };
                 // #1909 — neither op commits a page of the window's own, but either may give one
                 // back: an alias replaces it, and an `unmap` reaches any page of the window.
-                Ok(vec![match op {
-                    0 => {
-                        let win_off = *args.first().unwrap_or(&0) as u64;
-                        let region_off = *args.get(1).unwrap_or(&0) as u64;
-                        let len = *args.get(2).unwrap_or(&0) as u64;
-                        let prot = *args.get(3).unwrap_or(&0) as i32;
-                        // #2268 — every page becomes the next page of one alias of the region.
-                        let page = mem.page_size().max(1) as u64;
-                        let alias = PageClass::alias(
-                            region,
-                            win_off / page,
-                            region_off,
-                            page,
-                            prot & PROT_WRITE != 0,
-                        );
-                        let change = ClassChange::Every(alias);
-                        self.page_op(mem, win_off, len, Commits::Nothing, change, |h, m| {
-                            h.region_map(m, win_off, region_off, len, prot, region, backing)
-                        })
-                    }
-                    1 => {
-                        let win_off = *args.first().unwrap_or(&0) as u64;
-                        let len = *args.get(1).unwrap_or(&0) as u64;
-                        let gone = ClassChange::Every(PageClass::Own(0));
-                        self.page_op(mem, win_off, len, Commits::Nothing, gone, |h, m| {
-                            let r = m.unmap(win_off, len);
-                            // As `region_map`'s: the hook hears of a span only once the op took
-                            // it, so a span outside the window never reaches it (#2400).
-                            if let (0, Some(hook)) = (r, &h.region_hook) {
-                                hook(win_off, len, None);
-                            }
-                            r
-                        })
-                    }
-                    2 => backing.size() as i64,
-                    3 => mem.region_page_size(),
-                    5 => self.close_region(handle, region, mem),
-                    _ => EINVAL,
-                }])
+                put_results(
+                    out,
+                    &[match op {
+                        0 => {
+                            let win_off = *args.first().unwrap_or(&0) as u64;
+                            let region_off = *args.get(1).unwrap_or(&0) as u64;
+                            let len = *args.get(2).unwrap_or(&0) as u64;
+                            let prot = *args.get(3).unwrap_or(&0) as i32;
+                            // #2268 — every page becomes the next page of one alias of the region.
+                            let page = mem.page_size().max(1) as u64;
+                            let alias = PageClass::alias(
+                                region,
+                                win_off / page,
+                                region_off,
+                                page,
+                                prot & PROT_WRITE != 0,
+                            );
+                            let change = ClassChange::Every(alias);
+                            self.page_op(mem, win_off, len, Commits::Nothing, change, |h, m| {
+                                h.region_map(m, win_off, region_off, len, prot, region, backing)
+                            })
+                        }
+                        1 => {
+                            let win_off = *args.first().unwrap_or(&0) as u64;
+                            let len = *args.get(1).unwrap_or(&0) as u64;
+                            let gone = ClassChange::Every(PageClass::Own(0));
+                            self.page_op(mem, win_off, len, Commits::Nothing, gone, |h, m| {
+                                let r = m.unmap(win_off, len);
+                                // As `region_map`'s: the hook hears of a span only once the op took
+                                // it, so a span outside the window never reaches it (#2400).
+                                if let (0, Some(hook)) = (r, &h.region_hook) {
+                                    hook(win_off, len, None);
+                                }
+                                r
+                            })
+                        }
+                        2 => backing.size() as i64,
+                        3 => mem.region_page_size(),
+                        5 => self.close_region(handle, region, mem),
+                        _ => EINVAL,
+                    }],
+                )
             }
             Binding::RegionPost { region, off, badge } => {
                 // #1936 — a post signals and closes, and nothing else: it can't map, read or write
                 // its region. The wake is the engine's, so the word is left for it.
                 let Some(backing) = self.region(region).cloned() else {
-                    return Ok(vec![EINVAL]);
+                    return put_results(out, &[EINVAL]);
                 };
-                Ok(vec![match op {
-                    7 => {
-                        self.region_wake = Some(signal_post(&backing, off.into(), badge));
-                        0
-                    }
-                    5 => {
-                        self.close(handle);
-                        self.release_hold(region);
-                        0
-                    }
-                    _ => EINVAL,
-                }])
+                put_results(
+                    out,
+                    &[match op {
+                        7 => {
+                            self.region_wake = Some(signal_post(&backing, off.into(), badge));
+                            0
+                        }
+                        5 => {
+                            self.close(handle);
+                            self.release_hold(region);
+                            0
+                        }
+                        _ => EINVAL,
+                    }],
+                )
             }
             Binding::Budget(node) => {
                 // §15 / PROCESS.md §5, #1944: a node of the run's budget tree. A node's ceilings cap its
                 // whole subtree; a use charges the node that pays and every ancestor.
                 let tree = Arc::clone(&self.budgets);
                 let Some(room) = tree.room(node) else {
-                    return Ok(vec![EINVAL]);
+                    return put_results(out, &[EINVAL]);
                 };
                 match op {
                     0 => {
@@ -35481,7 +35589,7 @@ impl Host {
                         let lane = match *args.get(4).unwrap_or(&-1) {
                             a if a < 0 => my_cap,
                             a if my_cap < 0 || a <= my_cap => a,
-                            _ => return Ok(vec![EINVAL]), // a lane wider than the holder's own cap
+                            _ => return put_results(out, &[EINVAL]), // a lane wider than the holder's own cap
                         };
                         let ask = [
                             *args.first().unwrap_or(&0),
@@ -35492,25 +35600,31 @@ impl Host {
                             *args.get(5).unwrap_or(&-1), // #2268 — omitted ⇒ unbounded (the chain caps it)
                         ];
                         let Some(child) = tree.split(node, ask) else {
-                            return Ok(vec![EINVAL]);
+                            return put_results(out, &[EINVAL]);
                         };
                         // A full handle table (-EMFILE) leaves the minted node unreferenced: nothing
                         // can charge it, and it deducted nothing.
-                        Ok(vec![
-                            match self.try_grant(cap_id::BUDGET, Binding::Budget(child)) {
-                                Some(h) => h as i64,
-                                None => EMFILE,
-                            },
-                        ])
+                        put_results(
+                            out,
+                            &[
+                                match self.try_grant(cap_id::BUDGET, Binding::Budget(child)) {
+                                    Some(h) => h as i64,
+                                    None => EMFILE,
+                                },
+                            ],
+                        )
                     }
                     // read(field) -> room | -EINVAL: `0` fuel, `1` mem, `2` spawn (the §15 monitoring
                     // readout), `3` channel and `5` maps — the room left along the chain, the least
                     // any level has left (`-1` when every level is unbounded) — and `4` lane, this
                     // node's own.
-                    1 => Ok(vec![match *args.first().unwrap_or(&-1) {
-                        f @ 0..=5 => room[f as usize],
-                        _ => EINVAL,
-                    }]),
+                    1 => put_results(
+                        out,
+                        &[match *args.first().unwrap_or(&-1) {
+                            f @ 0..=5 => room[f as usize],
+                            _ => EINVAL,
+                        }],
+                    ),
                     2 => {
                         // transfer(dst, fuel, mem, spawn) -> 0 | -errno (#1289 R2's top-up, #1944):
                         // raise the ceilings of `dst`, a node under this one that the caller also
@@ -35520,18 +35634,21 @@ impl Host {
                         // and `lane` are not moved.
                         let dst_h = *args.first().unwrap_or(&-1) as i32;
                         let Ok(Binding::Budget(dst)) = self.resolve(dst_h, cap_id::BUDGET) else {
-                            return Ok(vec![EINVAL]);
+                            return put_results(out, &[EINVAL]);
                         };
                         let by = [
                             *args.get(1).unwrap_or(&0),
                             *args.get(2).unwrap_or(&0),
                             *args.get(3).unwrap_or(&0),
                         ];
-                        Ok(vec![if tree.raise(node, dst, by) {
-                            0
-                        } else {
-                            EINVAL // `dst` is not under this node (itself, a peer, an ancestor)
-                        }])
+                        put_results(
+                            out,
+                            &[if tree.raise(node, dst, by) {
+                                0
+                            } else {
+                                EINVAL // `dst` is not under this node (itself, a peer, an ancestor)
+                            }],
+                        )
                     }
                     // close() -> 0 (#2384): give the handle up, as a `Stream`'s or a region's is
                     // ([`Host::close`]): a later use answers `-EBADF`. The node stays in the tree,
@@ -35540,9 +35657,9 @@ impl Host {
                     // child holds its own, or its table fills with them.
                     3 => {
                         self.close(handle);
-                        Ok(vec![0])
+                        put_results(out, &[0])
                     }
-                    _ => Ok(vec![EINVAL]),
+                    _ => put_results(out, &[EINVAL]),
                 }
             }
             Binding::AddressSpace { base, size } => {
@@ -35556,7 +35673,7 @@ impl Host {
                     let off = *args.first().unwrap_or(&0) as u64;
                     let size_log2 = *args.get(1).unwrap_or(&-1);
                     if !(0..64).contains(&size_log2) {
-                        return Ok(vec![EINVAL]);
+                        return put_results(out, &[EINVAL]);
                     }
                     let child = 1u64 << size_log2;
                     // child fits, `off` is child-aligned (power-of-two sub-window, D19), and the whole
@@ -35565,19 +35682,24 @@ impl Host {
                         && off & (child - 1) == 0
                         && off.checked_add(child).is_some_and(|end| end <= size);
                     if !fits {
-                        return Ok(vec![EINVAL]);
+                        return put_results(out, &[EINVAL]);
                     }
                     // Guest-minting: a full handle table yields -EMFILE, never a panic (§3c / audit #1).
-                    return Ok(vec![match self.try_grant(
-                        cap_id::ADDRESS_SPACE,
-                        Binding::AddressSpace {
-                            base: base + off,
-                            size: child,
-                        },
-                    ) {
-                        Some(h) => h as i64,
-                        None => EMFILE,
-                    }]);
+                    return put_results(
+                        out,
+                        &[
+                            match self.try_grant(
+                                cap_id::ADDRESS_SPACE,
+                                Binding::AddressSpace {
+                                    base: base + off,
+                                    size: child,
+                                },
+                            ) {
+                                Some(h) => h as i64,
+                                None => EMFILE,
+                            },
+                        ],
+                    );
                 }
                 if op == 5 {
                     // create_region(len) -> region handle — a **guest-minted** §13/§14 `SharedRegion`
@@ -35590,11 +35712,11 @@ impl Host {
                     // the room. The per-region cap stays as the anti-bomb bound on one mint.
                     let len = *args.first().unwrap_or(&0);
                     if len <= 0 || len > MAX_MINTED_REGION {
-                        return Ok(vec![EINVAL]);
+                        return put_results(out, &[EINVAL]);
                     }
                     let cost = region_cost(len as u64, len as u64);
                     if !self.budgets.add(self.own_budget, &cost, Fits::All) {
-                        return Ok(vec![ENOMEM]);
+                        return put_results(out, &[ENOMEM]);
                     }
                     // #2306 — a backing the host cannot make is the guest's errno, its charge
                     // handed back.
@@ -35602,7 +35724,7 @@ impl Host {
                         Ok(backing) => backing,
                         Err(errno) => {
                             self.budgets.refund_set(self.own_budget, &cost);
-                            return Ok(vec![errno]);
+                            return put_results(out, &[errno]);
                         }
                     };
                     let backing: RegionBacking = Arc::new(ChargedRegion {
@@ -35612,9 +35734,12 @@ impl Host {
                     });
                     // Guest-minting: a full handle table yields -EMFILE, never a panic (§3c / audit
                     // #1); the region goes with the refusal, and its charge with it.
-                    return Ok(vec![self
-                        .try_grant_shared_region_backed(backing)
-                        .map_or(EMFILE, |h| h as i64)]);
+                    return put_results(
+                        out,
+                        &[self
+                            .try_grant_shared_region_backed(backing)
+                            .map_or(EMFILE, |h| h as i64)],
+                    );
                 }
                 // map/unmap/protect/page_size (§3e) — bounded to `[0, size)` and shifted by `base`
                 // (a buffer/range straddling the sub-range boundary is -EINVAL). The whole-window
@@ -35623,10 +35748,10 @@ impl Host {
                 // JIT's flat window via its own impl), and *it* does the real bounding — keeping the
                 // two in differential lockstep.
                 let Some(mem) = mem else {
-                    return Ok(vec![EINVAL]);
+                    return put_results(out, &[EINVAL]);
                 };
                 if op == 3 {
-                    return Ok(vec![mem.page_size()]);
+                    return put_results(out, &[mem.page_size()]);
                 }
                 let off = *args.first().unwrap_or(&0) as u64;
                 let len = *args.get(1).unwrap_or(&0) as u64;
@@ -35634,7 +35759,7 @@ impl Host {
                 // The decisive confinement check: the range must be wholly within this sub-window.
                 // (`size == u64::MAX` admits everything but overflow — mem bounds, as above.)
                 if off.checked_add(len).is_none_or(|end| end > size) {
-                    return Ok(vec![EINVAL]);
+                    return put_results(out, &[EINVAL]);
                 }
                 // #1909 — a `map` or `protect` that leaves pages readable or writable can commit
                 // them, so it may grow the window ([`Host::page_op`] meters it).
@@ -35645,27 +35770,30 @@ impl Host {
                 // own, an `unmap` (or a `protect` to nothing, which ends an alias) inaccessible.
                 let own = ClassChange::Every(PageClass::own(prot));
                 let gone = ClassChange::Every(PageClass::Own(0));
-                Ok(vec![match op {
-                    0 => {
-                        let every = commits(Commits::Every);
-                        self.page_op(mem, at, len, every, own, |_, m| m.map(at, len, prot))
-                    }
-                    1 => self.page_op(mem, at, len, Commits::Nothing, gone, |_, m| {
-                        m.unmap(at, len)
-                    }),
-                    2 => {
-                        let commit = commits(Commits::Own);
-                        let change = if access {
-                            ClassChange::Protect(prot)
-                        } else {
-                            gone
-                        };
-                        self.page_op(mem, at, len, commit, change, |_, m| {
-                            m.protect(at, len, prot)
-                        })
-                    }
-                    _ => EINVAL,
-                }])
+                put_results(
+                    out,
+                    &[match op {
+                        0 => {
+                            let every = commits(Commits::Every);
+                            self.page_op(mem, at, len, every, own, |_, m| m.map(at, len, prot))
+                        }
+                        1 => self.page_op(mem, at, len, Commits::Nothing, gone, |_, m| {
+                            m.unmap(at, len)
+                        }),
+                        2 => {
+                            let commit = commits(Commits::Own);
+                            let change = if access {
+                                ClassChange::Protect(prot)
+                            } else {
+                                gone
+                            };
+                            self.page_op(mem, at, len, commit, change, |_, m| {
+                                m.protect(at, len, prot)
+                            })
+                        }
+                        _ => EINVAL,
+                    }],
+                )
             }
             // Every engine services the spawn ops in its own executor (spawning a child vCPU needs
             // what the generic dispatch can't reach), and no guest call reaches here: every engine
@@ -35675,7 +35803,7 @@ impl Host {
             // closed handle, so a live one answers with nothing (#2433: it once returned the carve
             // range).
             Binding::Instantiator => match op {
-                0 => Ok(vec![]),
+                0 => put_results(out, &[]),
                 _ => Err(Trap::CapFault),
             },
             // §14 `ModuleLoader` (iface 7): op 0 `from_bytes(ptr, len) -> module_handle | -errno`.
@@ -35685,16 +35813,16 @@ impl Host {
             Binding::ModuleLoader => match op {
                 0 => {
                     let Some(mem) = mem else {
-                        return Ok(vec![EFAULT]);
+                        return put_results(out, &[EFAULT]);
                     };
                     let ptr = *args.first().unwrap_or(&0) as u64;
                     let len = *args.get(1).unwrap_or(&0) as u64;
                     let Some(bytes) = mem.read_bytes(ptr, len) else {
-                        return Ok(vec![EFAULT]);
+                        return put_results(out, &[EFAULT]);
                     };
-                    Ok(vec![self.module_from_bytes(&bytes)])
+                    put_results(out, &[self.module_from_bytes(&bytes)])
                 }
-                _ => Ok(vec![EINVAL]),
+                _ => put_results(out, &[EINVAL]),
             },
             // A §14 `Module` handle confers instantiation authority (a spawn names it) and has no
             // callable op. Its op 0 looked an export up by name, to pick a child's entry; a child
@@ -35711,27 +35839,33 @@ impl Host {
                     // compile(ptr, len) -> code_handle | -errno. The blob is borrowed from guest
                     // memory; with no window there is nothing to read (-EFAULT, like Stream).
                     let Some(mem) = mem else {
-                        return Ok(vec![EFAULT]);
+                        return put_results(out, &[EFAULT]);
                     };
                     let ptr = *args.first().unwrap_or(&0) as u64;
                     let len = *args.get(1).unwrap_or(&0) as u64;
                     let Some(bytes) = mem.read_bytes(ptr, len) else {
-                        return Ok(vec![EFAULT]);
+                        return put_results(out, &[EFAULT]);
                     };
-                    Ok(vec![match self.jit_compile(handle, &bytes)? {
-                        Ok(c) => c.handle as i64,
-                        Err(e) => e,
-                    }])
+                    put_results(
+                        out,
+                        &[match self.jit_compile(handle, &bytes)? {
+                            Ok(c) => c.handle as i64,
+                            Err(e) => e,
+                        }],
+                    )
                 }
                 1 => Err(Trap::CapFault),
                 2 => {
                     // release(code_handle) -> 0 | -EINVAL. A forged/already-released handle is a
                     // non-fatal errno (guest-reachable in a loop; must not trap).
                     let ch = *args.first().unwrap_or(&0) as i32;
-                    Ok(vec![match self.jit_release(ch) {
-                        Ok(()) => 0,
-                        Err(_) => EINVAL,
-                    }])
+                    put_results(
+                        out,
+                        &[match self.jit_release(ch) {
+                            Ok(()) => 0,
+                            Err(_) => EINVAL,
+                        }],
+                    )
                 }
                 5 => {
                     // compile_linked(ir_ptr, ir_len, symtab_ptr, symtab_len) -> code_handle |
@@ -35740,34 +35874,37 @@ impl Host {
                     // symbol-table buffer before verify. Both buffers are borrowed from the
                     // window; with no window there is nothing to read (-EFAULT, like op 0).
                     let Some(mem) = mem else {
-                        return Ok(vec![EFAULT]);
+                        return put_results(out, &[EFAULT]);
                     };
                     let ir_ptr = *args.first().unwrap_or(&0) as u64;
                     let ir_len = *args.get(1).unwrap_or(&0) as u64;
                     let st_ptr = *args.get(2).unwrap_or(&0) as u64;
                     let st_len = *args.get(3).unwrap_or(&0) as u64;
                     let Some(ir) = mem.read_bytes(ir_ptr, ir_len) else {
-                        return Ok(vec![EFAULT]);
+                        return put_results(out, &[EFAULT]);
                     };
                     let Some(symtab) = mem.read_bytes(st_ptr, st_len) else {
-                        return Ok(vec![EFAULT]);
+                        return put_results(out, &[EFAULT]);
                     };
-                    Ok(vec![
-                        match self.jit_compile_linked(handle, &ir, &symtab, Some(mem))? {
-                            Ok(c) => c.handle as i64,
-                            Err(e) => e,
-                        },
-                    ])
+                    put_results(
+                        out,
+                        &[
+                            match self.jit_compile_linked(handle, &ir, &symtab, Some(mem))? {
+                                Ok(c) => c.handle as i64,
+                                Err(e) => e,
+                            },
+                        ],
+                    )
                 }
                 6 => {
                     // unit_info(ir, ir_len, buf, cap) -> len | -errno (#2167): what a loader needs to
                     // place a link unit's data. No window, nothing to read (-EFAULT, like op 0).
                     let Some(mem) = mem else {
-                        return Ok(vec![EFAULT]);
+                        return put_results(out, &[EFAULT]);
                     };
-                    Ok(vec![self.jit_unit_info(handle, mem, args)?])
+                    put_results(out, &[self.jit_unit_info(handle, mem, args)?])
                 }
-                _ => Ok(vec![EINVAL]),
+                _ => put_results(out, &[EINVAL]),
             },
             // A `CompiledCode` handle has no directly callable ops (like `Module`): it is only
             // *named* in `Jit.invoke`/`release`.
@@ -35797,12 +35934,12 @@ impl Host {
                     // face, inline on the sync face — today's semantics, byte-identical).
                     let st = &self.blockings[idx as usize];
                     if st.block_for.is_zero() && st.rendezvous.is_none() {
-                        return Ok(vec![st.run(arg)]);
+                        return put_results(out, &[st.run(arg)]);
                     }
                     let st = Arc::clone(st);
-                    self.punt_or_inline(Box::new(move || st.run(arg)), pending)
+                    self.punt_or_inline(Box::new(move || st.run(arg)), out, pending)
                 }
-                _ => Ok(vec![EINVAL]),
+                _ => put_results(out, &[EINVAL]),
             },
         }
     }
@@ -35817,8 +35954,8 @@ impl Host {
         op: u32,
         args: &[i64],
         mem: Option<&mut dyn GuestMem>,
-    ) -> Result<Vec<i64>, Trap> {
-        let ret = |v: i64| Ok(vec![v]);
+    ) -> Result<i64, Trap> {
+        let ret = |v: i64| Ok(v);
         match op {
             0 => {
                 // read(buf, len) -> bytes read (>=0) or -errno; only stdin is readable.
@@ -35955,9 +36092,9 @@ impl Host {
         op: u32,
         args: &[i64],
         mem: Option<&mut dyn GuestMem>,
-    ) -> Result<Vec<i64>, Trap> {
+    ) -> Result<i64, Trap> {
         use std::sync::atomic::Ordering::SeqCst;
-        let ret = |v: i64| Ok(vec![v]);
+        let ret = |v: i64| Ok(v);
         // Clone the shared Arcs out so the `&mut self` flag writes below don't alias `self.pipes`.
         let Some((fifo_arc, writers_arc, readers_arc, gid, _, one_shot_eof)) =
             self.pipes.get(pipe as usize).cloned()
@@ -39361,6 +39498,20 @@ fn get(vals: &[Reg], v: ValIdx) -> Result<Reg, Trap> {
     vals.get(v as usize).copied().ok_or(Trap::Malformed)
 }
 
+/// #2319 — a call's `args`, read from `vals` into its arg slots ([`call_slots`]).
+fn arg_slots<'a>(
+    stack: &'a mut [i64; CALL_STACK_SLOTS],
+    heap: &'a mut Vec<i64>,
+    vals: &[Reg],
+    args: &[ValIdx],
+) -> Result<&'a [i64], Trap> {
+    let argv = call_slots(stack, heap, args.len());
+    for (s, a) in argv.iter_mut().zip(args) {
+        *s = get(vals, *a)?.i64();
+    }
+    Ok(argv)
+}
+
 // Typed operand reads: pull the needed scalar out of the (untyped) value slot. The executing
 // instruction's static type picks which getter to call, so the bit pattern is interpreted
 // correctly without a per-value tag. `Malformed` on an out-of-range index, as before.
@@ -39557,13 +39708,13 @@ mod region_minter_tests {
         let mut host = Host::new();
         // Op 0: mint a 64-byte region and hand back its handle — the shape an mmap-capable fs uses.
         let h = host.grant_host_proc(HostProcGrant::new(
-            ProcHandler::Minting(Box::new(|op, _args, _mem, minter| {
+            ProcHandler::Minting(Box::new(|op, _args, out, _mem, minter| {
                 if op == 0 {
                     let backing: RegionBacking = Arc::new(VecBacking(Mutex::new(vec![7u8; 64])));
                     let minter = minter.expect("a region-registered handler is handed the minter");
-                    Ok(vec![minter.grant_region(backing) as i64])
+                    put_results(out, &[minter.grant_region(backing) as i64])
                 } else {
-                    Ok(vec![-22])
+                    put_results(out, &[-22])
                 }
             })),
             CapState::Stateless,
@@ -39575,7 +39726,7 @@ mod region_minter_tests {
 
         // Dispatch op 0 → the handler mints via the `RegionMinter` and returns the region handle.
         let out = host
-            .cap_dispatch_slots(cap_id::HOST_PROC, 0, h, &[], None)
+            .cap_call(cap_id::HOST_PROC, 0, h, &[], 1, None)
             .expect("host_proc_region dispatch");
         let region_h = out[0];
         assert!(
@@ -39601,11 +39752,11 @@ mod region_minter_tests {
     fn region_and_plain_host_proc_are_distinct_handles_under_the_same_iface() {
         let mut host = Host::new();
         let plain = host.grant_host_proc(HostProcGrant::new(
-            ProcHandler::Sync(Box::new(|_, _, _, _| Ok(vec![0]))),
+            ProcHandler::Sync(Box::new(|_, _, out, _, _| put_results(out, &[0]))),
             CapState::Stateless,
         ));
         let region = host.grant_host_proc(HostProcGrant::new(
-            ProcHandler::Minting(Box::new(|_, _, _, _| Ok(vec![0]))),
+            ProcHandler::Minting(Box::new(|_, _, out, _, _| put_results(out, &[0]))),
             CapState::Stateless,
         ));
         assert!(plain >= 0 && region >= 0 && plain != region);
@@ -39648,7 +39799,7 @@ mod growth_tests {
             GROWTH as i64,
             (PROT_READ | PROT_WRITE) as i64,
         ];
-        let r = child.cap_dispatch_slots(cap_id::ADDRESS_SPACE, 0, space, &args, Some(&mut mem));
+        let r = child.cap_call(cap_id::ADDRESS_SPACE, 0, space, &args, 1, Some(&mut mem));
         assert_eq!(r, Ok(vec![0]), "the growth fits the ceiling");
         (parent, node, child, mem, space)
     }
@@ -39844,7 +39995,7 @@ mod growth_tests {
         let (parent, node, mut child, mut mem, space) = grown_child(2 * GROWTH as i64);
         let mut none = |at: u64| {
             let args = [at as i64, GROWTH as i64, 0];
-            child.cap_dispatch_slots(cap_id::ADDRESS_SPACE, 2, space, &args, Some(&mut mem))
+            child.cap_call(cap_id::ADDRESS_SPACE, 2, space, &args, 1, Some(&mut mem))
         };
         assert_eq!(none(1 << 17), Ok(vec![0]));
         assert_eq!(
@@ -39905,7 +40056,7 @@ mod growth_tests {
         let (mut root, mut mem, space) = root((WINDOW + GROWTH) as i64);
         let mut grow = |at: u64| {
             let args = [at as i64, GROWTH as i64, (PROT_READ | PROT_WRITE) as i64];
-            root.cap_dispatch_slots(cap_id::ADDRESS_SPACE, 0, space, &args, Some(&mut mem))
+            root.cap_call(cap_id::ADDRESS_SPACE, 0, space, &args, 1, Some(&mut mem))
         };
         assert_eq!(grow(WINDOW), Ok(vec![0]), "the growth fits the grant");
         assert_eq!(grow(WINDOW + GROWTH), Ok(vec![ENOMEM]), "past it");
@@ -39929,7 +40080,7 @@ mod growth_tests {
         let run = BudgetTree::RUN_NODE;
         let op = |root: &mut Host, mem: &mut Mem, op: u32, at: u64, len: u64, prot: i32| {
             let args = [at as i64, len as i64, prot as i64];
-            root.cap_dispatch_slots(cap_id::ADDRESS_SPACE, op, space, &args, Some(mem))
+            root.cap_call(cap_id::ADDRESS_SPACE, op, space, &args, 1, Some(mem))
                 .expect("dispatch")[0]
         };
         let held = |root: &Host| (back.len() - WINDOW, used(root, run) - WINDOW as i64);
@@ -40114,7 +40265,14 @@ mod exec_maps_tests {
         let mut parent = Host::new();
         let root = parent.grant_budget(-1, -1, -1);
         let budget = parent
-            .cap_dispatch_slots(cap_id::BUDGET, 0, root, &[-1, -1, -1, -1, -1, maps], None)
+            .cap_call(
+                cap_id::BUDGET,
+                0,
+                root,
+                &[-1, -1, -1, -1, -1, maps],
+                1,
+                None,
+            )
             .expect("split")[0] as i32;
         let node = parent.budget_node(budget).expect("a live budget");
         let mut child = Host::new();
@@ -40245,7 +40403,7 @@ mod full_table_tests {
         let mh = host.grant_module(&cmd);
         let command = host.exec_module(ExecCmd::Granted(mh)).expect("resolves");
         let personality = host.grant_host_proc(HostProcGrant::new(
-            ProcHandler::Sync(Box::new(|_, _, _, _| Ok(vec![0]))),
+            ProcHandler::Sync(Box::new(|_, _, out, _, _| put_results(out, &[0]))),
             CapState::Stateless,
         ));
         // A personality that keeps descriptors across exec, as temen-posix's does.
@@ -40257,7 +40415,7 @@ mod full_table_tests {
             "the new image's own grants leave no room for every end"
         );
         assert_eq!(
-            host.cap_dispatch_slots(cap_id::HOST_PROC, 0, personality, &[], None),
+            host.cap_call(cap_id::HOST_PROC, 0, personality, &[], 1, None),
             Ok(vec![0]),
             "the caller keeps its personality"
         );
@@ -40436,7 +40594,7 @@ mod host_buffer_tests {
         let mut win = vec![7u8; 4096];
         let mut write = |h: &mut Host, len: i64| {
             let mut wm = WindowMem::new(&mut win, 4096);
-            h.cap_dispatch_slots(cap_id::STREAM, 1, out, &[0, len], Some(&mut wm))
+            h.cap_call(cap_id::STREAM, 1, out, &[0, len], 1, Some(&mut wm))
                 .expect("dispatch")[0]
         };
         assert_eq!(write(&mut h, 3000), 3000);
@@ -40506,7 +40664,7 @@ mod region_charge_tests {
     }
 
     fn mint(host: &mut Host, space: i32, len: u64) -> i64 {
-        let r = host.cap_dispatch_slots(cap_id::ADDRESS_SPACE, 5, space, &[len as i64], None);
+        let r = host.cap_call(cap_id::ADDRESS_SPACE, 5, space, &[len as i64], 1, None);
         r.expect("create_region")[0]
     }
 
@@ -40564,7 +40722,7 @@ mod region_charge_tests {
 
     /// `SharedRegion` op `op` on `h` with `args`, over `mem`.
     fn region_op(host: &mut Host, h: i64, op: u32, args: &[i64], mem: &mut Mem) -> i64 {
-        let r = host.cap_dispatch_slots(cap_id::SHARED_REGION, op, h as i32, args, Some(mem));
+        let r = host.cap_call(cap_id::SHARED_REGION, op, h as i32, args, 1, Some(mem));
         r.expect("a region op")[0]
     }
 
@@ -41133,11 +41291,12 @@ mod fork_powerbox_tests {
         let mut window = vec![0u8; reserved as usize];
         let mut mem = WindowMem::new(&mut window, reserved);
         let mut map = |off: u64| {
-            image.host.cap_dispatch_slots(
+            image.host.cap_call(
                 cap_id::ADDRESS_SPACE,
                 0,
                 space,
                 &[off as i64, 4096, 3],
+                1,
                 Some(&mut mem),
             )
         };
@@ -41188,7 +41347,7 @@ mod fork_powerbox_tests {
     fn fork_refuses_a_domain_with_a_factory_less_host_proc() {
         let mut host = Host::new();
         host.grant_host_proc(HostProcGrant::new(
-            ProcHandler::Sync(Box::new(|_, _, _, _| Ok(vec![0]))),
+            ProcHandler::Sync(Box::new(|_, _, out, _, _| put_results(out, &[0]))),
             CapState::Stateless,
         ));
         assert!(
@@ -41198,12 +41357,12 @@ mod fork_powerbox_tests {
         // And a mixed table is all-or-nothing: one factory-less entry poisons the fork.
         host.grant_host_proc(
             HostProcGrant::new(
-                ProcHandler::Sync(Box::new(|_, _, _, _| Ok(vec![1]))),
+                ProcHandler::Sync(Box::new(|_, _, out, _, _| put_results(out, &[1]))),
                 CapState::Stateless,
             )
             .forkable(Arc::new(|_pid| {
                 Some(ForkedProc::shared(
-                    ProcHandler::Sync(Box::new(|_, _, _, _| Ok(vec![1]))),
+                    ProcHandler::Sync(Box::new(|_, _, out, _, _| put_results(out, &[1]))),
                     CapState::Stateless,
                 ))
             })),
@@ -41225,10 +41384,10 @@ mod fork_powerbox_tests {
             let counter = Arc::clone(&counter);
             move || -> HostProc {
                 let counter = Arc::clone(&counter);
-                Box::new(move |_op, _args, _mem, _| {
+                Box::new(move |_op, _args, out, _mem, _| {
                     let mut c = counter.lock_unpoisoned();
                     *c += 1;
-                    Ok(vec![*c])
+                    put_results(out, &[*c])
                 })
             }
         };
@@ -41249,12 +41408,12 @@ mod fork_powerbox_tests {
         // Same handle value resolves in the twin, through the factory-minted fresh closure.
         let mut twin = twin;
         assert_eq!(
-            host.cap_dispatch_slots(cap_id::HOST_PROC, 0, h, &[], None),
+            host.cap_call(cap_id::HOST_PROC, 0, h, &[], 1, None),
             Ok(vec![1]),
             "parent's first call"
         );
         assert_eq!(
-            twin.cap_dispatch_slots(cap_id::HOST_PROC, 0, h, &[], None),
+            twin.cap_call(cap_id::HOST_PROC, 0, h, &[], 1, None),
             Ok(vec![2]),
             "the twin's call went through its own closure onto the SAME shared state (fork shares fds)"
         );
@@ -41276,12 +41435,12 @@ mod fork_powerbox_tests {
         let mut parent = Host::new();
         parent.grant_host_proc(
             HostProcGrant::new(
-                ProcHandler::Sync(Box::new(|_, _, _, _| Ok(vec![0]))),
+                ProcHandler::Sync(Box::new(|_, _, out, _, _| put_results(out, &[0]))),
                 captured(1),
             )
             .forkable(Arc::new(move |_pid| {
                 Some(ForkedProc::shared(
-                    ProcHandler::Sync(Box::new(|_, _, _, _| Ok(vec![0]))),
+                    ProcHandler::Sync(Box::new(|_, _, out, _, _| put_results(out, &[0]))),
                     captured(9),
                 ))
             })),
@@ -41303,10 +41462,10 @@ mod fork_powerbox_tests {
             let counter = Arc::clone(&counter);
             move || -> HostProc {
                 let counter = Arc::clone(&counter);
-                Box::new(move |_op, _args, _mem, _| {
+                Box::new(move |_op, _args, out, _mem, _| {
                     let mut c = counter.lock_unpoisoned();
                     *c += 1;
-                    Ok(vec![*c])
+                    put_results(out, &[*c])
                 })
             }
         };
@@ -41326,12 +41485,12 @@ mod fork_powerbox_tests {
             .regrant_into_child(h, &mut child)
             .expect("a forkable host_proc re-grants into a child");
         assert_eq!(
-            parent.cap_dispatch_slots(cap_id::HOST_PROC, 0, h, &[], None),
+            parent.cap_call(cap_id::HOST_PROC, 0, h, &[], 1, None),
             Ok(vec![1]),
             "parent's first call"
         );
         assert_eq!(
-            child.cap_dispatch_slots(cap_id::HOST_PROC, 0, ch, &[], None),
+            child.cap_call(cap_id::HOST_PROC, 0, ch, &[], 1, None),
             Ok(vec![2]),
             "the child's re-granted proc shares the parent's state (inherited libc / fd table)"
         );
@@ -41341,7 +41500,7 @@ mod fork_powerbox_tests {
         );
         // A factory-less host proc is an opaque closure that cannot be carried into a child.
         let opaque = parent.grant_host_proc(HostProcGrant::new(
-            ProcHandler::Sync(Box::new(|_, _, _, _| Ok(vec![0]))),
+            ProcHandler::Sync(Box::new(|_, _, out, _, _| put_results(out, &[0]))),
             CapState::Stateless,
         ));
         assert!(
@@ -41351,7 +41510,7 @@ mod fork_powerbox_tests {
         // #2373 — as does a provider with no room for the child's copy.
         let full = parent.grant_host_proc(
             HostProcGrant::new(
-                ProcHandler::Sync(Box::new(|_, _, _, _| Ok(vec![0]))),
+                ProcHandler::Sync(Box::new(|_, _, out, _, _| put_results(out, &[0]))),
                 CapState::Stateless,
             )
             .forkable(Arc::new(|_pid| None)),
@@ -41368,7 +41527,7 @@ mod fork_powerbox_tests {
     #[test]
     fn an_offloadable_host_proc_goes_with_a_child_and_a_twin() {
         let offload = || -> OffloadHostProc {
-            Box::new(|_op, args| {
+            Box::new(|_op, args, _out| {
                 let x = args[0];
                 OffloadOutcome::Offload(Box::new(move || x + 1))
             })
@@ -41391,11 +41550,12 @@ mod fork_powerbox_tests {
                 0,
                 handle,
                 &[x],
+                &mut [0],
                 None,
                 Some(&mut id),
                 None,
             );
-            assert_eq!(r, Ok(vec![]), "a punted call answers later");
+            assert_eq!(r, Ok(()), "a punted call answers later");
             host.completions().wait(id.expect("the call punts"))
         };
         assert_eq!(call(&mut parent, h, 1), 2, "the parent's own call");
@@ -43136,7 +43296,14 @@ mod channel_budget_tests {
         let mut parent = Host::new();
         let b = parent.grant_budget_channel(-1, -1, -1, 4 * PIPE_CAP as i64);
         let node = parent
-            .cap_dispatch_slots(cap_id::BUDGET, 0, b, &[-1, -1, -1, PIPE_CAP as i64], None)
+            .cap_call(
+                cap_id::BUDGET,
+                0,
+                b,
+                &[-1, -1, -1, PIPE_CAP as i64],
+                1,
+                None,
+            )
             .expect("split")[0] as i32;
         let mut child = Host::new();
         parent.give_child_budget(
@@ -43150,7 +43317,7 @@ mod channel_budget_tests {
         assert!(child.try_grant_pipe().is_some(), "one pipe fits the node");
         assert!(child.try_grant_pipe().is_none(), "a second exceeds it");
         let room = |h: &mut Host, b: i32| {
-            h.cap_dispatch_slots(cap_id::BUDGET, 1, b, &[3], None)
+            h.cap_call(cap_id::BUDGET, 1, b, &[3], 1, None)
                 .expect("read")[0]
         };
         assert_eq!(room(&mut parent, node), 0);
@@ -43313,7 +43480,9 @@ mod signal_door_claim_tests {
         Arc::new(move |_pid| {
             calls.fetch_add(1, Ordering::SeqCst);
             Some(ForkedProc {
-                handler: ProcHandler::Sync(Box::new(|_op, _args, _mem, _reg| Ok(vec![0]))),
+                handler: ProcHandler::Sync(Box::new(|_op, _args, out, _mem, _reg| {
+                    put_results(out, &[0])
+                })),
                 signal: claims_door.then(|| {
                     let door: Arc<dyn SignalSource + Send + Sync> = Arc::new(NoSignals);
                     (door, Arc::new(AtomicBool::new(false)))
@@ -43340,7 +43509,9 @@ mod signal_door_claim_tests {
         for &d in doors {
             h.grant_host_proc(
                 HostProcGrant::new(
-                    ProcHandler::Sync(Box::new(|_op, _args, _mem, _reg| Ok(vec![0]))),
+                    ProcHandler::Sync(Box::new(|_op, _args, out, _mem, _reg| {
+                        put_results(out, &[0])
+                    })),
                     CapState::Stateless,
                 )
                 .forkable(factory(d, calls)),
@@ -43407,7 +43578,7 @@ mod signal_door_claim_tests {
     fn a_provider_with_no_room_refuses_the_fork_and_abandons_the_twins_before_it() {
         let shared = || {
             ForkedProc::shared(
-                ProcHandler::Sync(Box::new(|_, _, _, _| Ok(vec![0]))),
+                ProcHandler::Sync(Box::new(|_, _, out, _, _| put_results(out, &[0]))),
                 CapState::Stateless,
             )
         };
@@ -43417,7 +43588,7 @@ mod signal_door_claim_tests {
         let gone = Arc::clone(&abandoned);
         h.grant_host_proc(
             HostProcGrant::new(
-                ProcHandler::Sync(Box::new(|_, _, _, _| Ok(vec![0]))),
+                ProcHandler::Sync(Box::new(|_, _, out, _, _| put_results(out, &[0]))),
                 CapState::Stateless,
             )
             .forkable(Arc::new(move |_pid| {
@@ -43433,7 +43604,7 @@ mod signal_door_claim_tests {
         let fits = Arc::clone(&room);
         h.grant_host_proc(
             HostProcGrant::new(
-                ProcHandler::Sync(Box::new(|_, _, _, _| Ok(vec![0]))),
+                ProcHandler::Sync(Box::new(|_, _, out, _, _| put_results(out, &[0]))),
                 CapState::Stateless,
             )
             .forkable(Arc::new(move |_pid| {
@@ -43442,7 +43613,7 @@ mod signal_door_claim_tests {
         );
         h.grant_host_proc(
             HostProcGrant::new(
-                ProcHandler::Sync(Box::new(|_, _, _, _| Ok(vec![0]))),
+                ProcHandler::Sync(Box::new(|_, _, out, _, _| put_results(out, &[0]))),
                 CapState::Stateless,
             )
             .forkable(factory(false, &calls)),
@@ -43479,7 +43650,7 @@ mod signal_door_claim_tests {
         let gone = Arc::clone(&abandoned);
         let first = h.grant_host_proc(
             HostProcGrant::new(
-                ProcHandler::Sync(Box::new(|_, _, _, _| Ok(vec![0]))),
+                ProcHandler::Sync(Box::new(|_, _, out, _, _| put_results(out, &[0]))),
                 CapState::Stateless,
             )
             .forkable(Arc::new(move |_pid| {
@@ -43489,7 +43660,7 @@ mod signal_door_claim_tests {
                         gone.fetch_add(1, Ordering::SeqCst);
                     })),
                     ..ForkedProc::shared(
-                        ProcHandler::Sync(Box::new(|_, _, _, _| Ok(vec![0]))),
+                        ProcHandler::Sync(Box::new(|_, _, out, _, _| put_results(out, &[0]))),
                         CapState::Stateless,
                     )
                 })
@@ -43497,7 +43668,7 @@ mod signal_door_claim_tests {
         );
         let full = h.grant_host_proc(
             HostProcGrant::new(
-                ProcHandler::Sync(Box::new(|_, _, _, _| Ok(vec![0]))),
+                ProcHandler::Sync(Box::new(|_, _, out, _, _| put_results(out, &[0]))),
                 CapState::Stateless,
             )
             .forkable(Arc::new(|_pid| None)),
@@ -43566,7 +43737,7 @@ mod offload_pool_tests {
         let long = Mutex::new(Some(long));
         let mut host = Host::new();
         let h = host.grant_host_proc(HostProcGrant::new(
-            ProcHandler::Offloadable(Box::new(move |_op, _args| {
+            ProcHandler::Offloadable(Box::new(move |_op, _args, _out| {
                 let long = long.lock().unwrap().take().expect("one call");
                 OffloadOutcome::Offload(Box::new(move || {
                     long();
@@ -43581,11 +43752,12 @@ mod offload_pool_tests {
             0,
             h,
             &[0],
+            &mut [0],
             None,
             Some(&mut id),
             None,
         );
-        assert_eq!(r, Ok(vec![]), "the call punts");
+        assert_eq!(r, Ok(()), "the call punts");
         assert!(id.is_some());
         let started = std::time::Instant::now();
         drop(host);

@@ -14,6 +14,7 @@ use temen_durable::{
     arm_freeze_after, begin_thaw, init_durable_window, read_thaw_state, transform_module,
     transform_module_assume_confined, write_state, STATE_NORMAL, STATE_UNWINDING,
 };
+use temen_interp::put_results;
 use temen_interp::{
     run_capture_reserved_with_host, Host, HostProcGrant, ProcHandler, Trap, Value,
     DEFAULT_SHADOW_STRIDE,
@@ -1161,7 +1162,7 @@ fn consumed_park_host(freeze: bool) -> (Host, i32) {
     let mut h = Host::new();
     h.set_durable(true);
     let hf = h.grant_host_proc(HostProcGrant::new(
-        ProcHandler::Sync(Box::new(move |_op, _args, mem, _| {
+        ProcHandler::Sync(Box::new(move |_op, _args, out, mem, _| {
             if freeze {
                 if let Some(m) = mem {
                     let word = m
@@ -1172,7 +1173,7 @@ fn consumed_park_host(freeze: bool) -> (Host, i32) {
                         .expect("the freeze word is in the window");
                 }
             }
-            Ok(vec![0])
+            put_results(out, &[0])
         })),
         temen_interp::CapState::Stateless,
     ));

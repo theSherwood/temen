@@ -179,7 +179,7 @@ fn a_kill_is_not_slept_through_while_a_call_waits() {
     std::thread::spawn(move || {
         let mut host = Host::new();
         let h = host.grant_host_proc(HostProcGrant::new(
-            ProcHandler::Offloadable(Box::new(move |_op, _args| {
+            ProcHandler::Offloadable(Box::new(move |_op, _args, _out| {
                 let gate = Arc::clone(&gate);
                 OffloadOutcome::Offload(Box::new(move || {
                     let (open, rung) = &*gate;

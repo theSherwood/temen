@@ -298,7 +298,7 @@ fn naps_keep_real_time_while_the_root_waits_on_the_world() {
     let setup = || {
         let mut h = Host::new();
         let call = h.grant_host_proc(HostProcGrant::new(
-            ProcHandler::Offloadable(Box::new(|_op, _args| {
+            ProcHandler::Offloadable(Box::new(|_op, _args, _out| {
                 OffloadOutcome::Offload(Box::new(|| {
                     std::thread::sleep(CALL_TIME);
                     0

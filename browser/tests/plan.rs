@@ -102,9 +102,9 @@ fn run_two(grants_a: &[&str], grants_b: &[&str]) -> (i64, Vec<i64>) {
         let log = Arc::clone(&log);
         move || -> HostProc {
             let log = Arc::clone(&log);
-            Box::new(move |_op, args: &[i64], _mem, _| {
+            Box::new(move |_op, args: &[i64], out: &mut [i64], _mem, _| {
                 log.lock().unwrap().push(args[0]);
-                Ok(vec![0])
+                temen_interp::put_results(out, &[0])
             })
         }
     };

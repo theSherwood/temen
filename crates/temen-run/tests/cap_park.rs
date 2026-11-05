@@ -51,6 +51,7 @@
 
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
+use temen_interp::put_results;
 
 use temen_interp::{bytecode::CoopEvent, HostProcGrant, ProcHandler};
 use temen_interp::{
@@ -425,7 +426,7 @@ fn module_of(src: &str) -> Module {
 /// `tick` (op 0): count a tick and ring the bell. Forkable, so a spawn can grant it to a child.
 fn tick_proc(ticks: &Arc<Ticks>) -> temen_interp::HostProc {
     let t = Arc::clone(ticks);
-    Box::new(move |_op, _args, _mem, _minter| Ok(vec![t.tick()]))
+    Box::new(move |_op, _args, out, _mem, _minter| put_results(out, &[t.tick()]))
 }
 
 /// Who answers a `wait` call (#2495).
@@ -446,7 +447,7 @@ enum Answer {
 /// can grant it to a child (#2424).
 fn wait_proc(ticks: &Arc<Ticks>, answer: Answer) -> OffloadHostProc {
     let t = Arc::clone(ticks);
-    Box::new(move |op, args| {
+    Box::new(move |op, args, _out| {
         let (t, n) = (Arc::clone(&t), args.first().copied().unwrap_or(0) as u64);
         let wait = move || match op {
             1 => t.started(n),
@@ -957,7 +958,7 @@ block 0 (vh: i32) {
     let mut host = Host::new();
     let gate = Arc::clone(&let_go);
     let h = host.grant_host_proc(HostProcGrant::new(
-        ProcHandler::Offloadable(Box::new(move |_op, _args| {
+        ProcHandler::Offloadable(Box::new(move |_op, _args, _out| {
             let gate = Arc::clone(&gate);
             OffloadOutcome::Offload(Box::new(move || {
                 let (open, rung) = &*gate;
@@ -1009,7 +1010,7 @@ fn answering_inside() -> (Host, Vec<Value>) {
     let mut h = Host::new();
     let to_file = Arc::clone(&filed);
     let call = h.grant_host_proc(HostProcGrant::new(
-        ProcHandler::Offloadable(Box::new(move |_op, args| {
+        ProcHandler::Offloadable(Box::new(move |_op, args, _out| {
             let (filed, a) = (Arc::clone(&to_file), args[0]);
             OffloadOutcome::Host(Box::new(move |c: Completer| {
                 *filed.lock().unwrap() = Some((c, a, Instant::now()));
@@ -1018,20 +1019,20 @@ fn answering_inside() -> (Host, Vec<Value>) {
         CapState::Stateless,
     ));
     let answer = h.grant_host_proc(HostProcGrant::new(
-        ProcHandler::Sync(Box::new(move |_op, _args, mem, _minter| {
+        ProcHandler::Sync(Box::new(move |_op, _args, out, mem, _minter| {
             let parked = filed
                 .lock()
                 .unwrap()
                 .take_if(|(_, _, at)| at.elapsed() >= PARKING);
             let Some((c, a, _)) = parked else {
-                return Ok(vec![0]);
+                return put_results(out, &[0]);
             };
             mem.expect("a window")
                 .write_bytes(16388, &1u32.to_le_bytes())
                 .expect("in the window");
             std::thread::sleep(SETTLE);
             c.complete(a + 100);
-            Ok(vec![1])
+            put_results(out, &[1])
         })),
         CapState::Stateless,
     ));
@@ -1372,14 +1373,14 @@ fn unlocked_wait_powerbox() -> (Host, Vec<Value>) {
     let mut h = Host::new();
     let waits = Arc::clone(&ticks);
     let wait = h.grant_host_proc(HostProcGrant::new(
-        ProcHandler::Unlocked(Arc::new(move |_op, args, _mem| {
-            Ok(vec![waits.wait_for(args[0] as u64)])
+        ProcHandler::Unlocked(Arc::new(move |_op, args, out, _mem| {
+            put_results(out, &[waits.wait_for(args[0] as u64)])
         })),
         CapState::Stateless,
     ));
     let probe = h.grant_host_proc(HostProcGrant::new(
-        ProcHandler::Sync(Box::new(move |op, _args, _mem, _minter| {
-            Ok(vec![if op == 0 { ticks.begun() } else { ticks.tick() }])
+        ProcHandler::Sync(Box::new(move |op, _args, out, _mem, _minter| {
+            put_results(out, &[if op == 0 { ticks.begun() } else { ticks.tick() }])
         })),
         CapState::Stateless,
     ));
@@ -1477,16 +1478,17 @@ fn an_unlocked_call_reads_and_writes_its_window_on_every_engine() {
     let setup = || {
         let mut h = Host::new();
         let upper = h.grant_host_proc(HostProcGrant::new(
-            ProcHandler::Unlocked(Arc::new(|_op, args, mem| {
+            ProcHandler::Unlocked(Arc::new(|_op, args, out, mem| {
                 let mem = mem.ok_or(temen_interp::Trap::CapFault)?;
                 let (ptr, len) = (args[0] as u64, args[1] as u64);
                 let Some(mut bytes) = mem.read_bytes(ptr, len) else {
-                    return Ok(vec![-14]); // -EFAULT
+                    return put_results(out, &[-14]); // -EFAULT
                 };
                 bytes.make_ascii_uppercase();
-                Ok(vec![mem
-                    .write_bytes(ptr, &bytes)
-                    .map_or(-14, |()| len as i64)])
+                put_results(
+                    out,
+                    &[mem.write_bytes(ptr, &bytes).map_or(-14, |()| len as i64)],
+                )
             })),
             CapState::Stateless,
         ));

@@ -217,7 +217,7 @@ block 2 () {
 fn fuel_host(child: &temen_ir::Module, fuel: i64) -> (Host, [i32; 3]) {
     let (mut host, mut h) = host(child, 1 << 20);
     h[2] = host
-        .cap_dispatch_slots(cap_id::BUDGET, 0, h[2], &[fuel, -1, -1], None)
+        .cap_call(cap_id::BUDGET, 0, h[2], &[fuel, -1, -1], 1, None)
         .expect("split")[0] as i32;
     (host, h)
 }
@@ -505,7 +505,7 @@ fn a_detached_spawn_trapping_on_its_grant_records_charges_nothing() {
         "the record out of the window traps: {jo:?}"
     );
     let room = host
-        .cap_dispatch_slots(cap_id::BUDGET, 1, h[2], &[1], None)
+        .cap_call(cap_id::BUDGET, 1, h[2], &[1], 1, None)
         .expect("read")[0];
     assert_eq!(room, 1 << 20, "the trap handed the window back");
 }
@@ -522,7 +522,7 @@ fn two_interleaved_detached_spawns_each_get_their_own_lane_and_budget() {
     let root = host.grant_budget(-1, -1, -1);
     let (a, b) = {
         let mut split = |mem: i64, lane: i64| {
-            host.cap_dispatch_slots(cap_id::BUDGET, 0, root, &[-1, mem, -1, -1, lane], None)
+            host.cap_call(cap_id::BUDGET, 0, root, &[-1, mem, -1, -1, lane], 1, None)
                 .expect("split")[0] as i32
         };
         (split(1 << 20, 1), split(1 << 19, 2))
@@ -589,7 +589,7 @@ fn two_interleaved_detached_spawns_each_get_their_own_lane_and_budget() {
         let budget = h
             .resolve_cap_name("budget")
             .expect("the child holds a budget");
-        h.cap_dispatch_slots(cap_id::BUDGET, 1, budget, &[1], None)
+        h.cap_call(cap_id::BUDGET, 1, budget, &[1], 1, None)
             .expect("read")[0]
     };
     assert_eq!(
@@ -1063,7 +1063,7 @@ block 0 (v0: i32, v1: i32, v2: i32) {{
 
 /// The `mem` room left along `budget`'s chain (Budget op 1, field 1).
 fn mem_room(host: &mut Host, budget: i32) -> i64 {
-    host.cap_dispatch_slots(cap_id::BUDGET, 1, budget, &[1], None)
+    host.cap_call(cap_id::BUDGET, 1, budget, &[1], 1, None)
         .expect("read")[0]
 }
 
@@ -1199,7 +1199,7 @@ fn a_childs_thread_joining_a_grandchild_gives_back_the_childs_lane_on_the_jit() 
             let g = host.grant_module(&grandchild);
             host.register_cap_name("grandchild", g);
             h[2] = host
-                .cap_dispatch_slots(cap_id::BUDGET, 0, h[2], &[-1, 1 << 20, -1, -1, 1], None)
+                .cap_call(cap_id::BUDGET, 0, h[2], &[-1, 1 << 20, -1, -1, 1], 1, None)
                 .expect("split")[0] as i32;
             (host, h)
         };

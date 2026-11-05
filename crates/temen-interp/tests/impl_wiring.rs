@@ -288,22 +288,16 @@ fn a_wired_op_executes_through_the_generic_dispatch() {
         .expect("offer");
     let tid = h.resolve_offer(handle).unwrap().type_id;
     // op 0 = add(a, b).
-    assert_eq!(
-        h.cap_dispatch_slots(tid, 0, handle, &[40, 2], None),
-        Ok(vec![42])
-    );
+    assert_eq!(h.cap_call(tid, 0, handle, &[40, 2], 1, None), Ok(vec![42]));
     // op 1 = identity.
-    assert_eq!(
-        h.cap_dispatch_slots(tid, 1, handle, &[7], None),
-        Ok(vec![7])
-    );
+    assert_eq!(h.cap_call(tid, 1, handle, &[7], 1, None), Ok(vec![7]));
     // Fail-closed legs: op past the list, wrong arity.
     assert!(matches!(
-        h.cap_dispatch_slots(tid, 2, handle, &[1], None),
+        h.cap_call(tid, 2, handle, &[1], 1, None),
         Err(Trap::CapFault)
     ));
     assert!(matches!(
-        h.cap_dispatch_slots(tid, 0, handle, &[1], None),
+        h.cap_call(tid, 0, handle, &[1], 1, None),
         Err(Trap::CapFault)
     ));
 }
@@ -321,7 +315,7 @@ fn a_wired_impl_is_windowless_and_powerboxless() {
         .expect("offer");
     let tid = h.resolve_offer(handle).unwrap().type_id;
     assert!(
-        h.cap_dispatch_slots(tid, 0, handle, &[0], None).is_err(),
+        h.cap_call(tid, 0, handle, &[0], 1, None).is_err(),
         "a load inside a windowless impl must trap"
     );
 }
@@ -393,7 +387,7 @@ fn an_offer_regrants_into_a_child_one_hop_deeper() {
     assert_eq!(entry.depth, 2, "one re-grant hop past the wiring domain");
     let tid = entry.type_id;
     assert_eq!(
-        child.cap_dispatch_slots(tid, 0, ch, &[40, 2], None),
+        child.cap_call(tid, 0, ch, &[40, 2], 1, None),
         Ok(vec![42]),
         "the adopted offer executes from the child's table"
     );
@@ -528,7 +522,7 @@ fn provenance_reports_platform_vs_ancestor_terminated() {
         .expect("offer");
 
     let prov = |h: &mut Host, cap: i32| {
-        h.cap_dispatch_slots(temen_ir::CAP_SELF_TYPE_ID, 5, 0, &[cap as i64], None)
+        h.cap_call(temen_ir::CAP_SELF_TYPE_ID, 5, 0, &[cap as i64], 1, None)
     };
     assert_eq!(prov(&mut parent, clock), Ok(vec![0]), "platform-terminated");
     assert_eq!(
@@ -590,7 +584,7 @@ fn an_instanced_offer_keeps_exporter_domain_state_across_calls() {
     // The counter lives in the provider's window, not the caller's — successive calls see it.
     for want in 1..=3i64 {
         assert_eq!(
-            h.cap_dispatch_slots(tid, 0, offer, &[], None),
+            h.cap_call(tid, 0, offer, &[], 1, None),
             Ok(vec![want]),
             "provider state persists across dispatches"
         );
@@ -643,21 +637,18 @@ fn a_regranted_instanced_offer_shares_one_service_instance() {
     let mut parent = Host::new();
     let offer = parent.wire_offer_proc(&provider, &[0]).expect("offer");
     let ptid = parent.resolve_offer(offer).unwrap().type_id;
-    assert_eq!(
-        parent.cap_dispatch_slots(ptid, 0, offer, &[], None),
-        Ok(vec![1])
-    );
+    assert_eq!(parent.cap_call(ptid, 0, offer, &[], 1, None), Ok(vec![1]));
 
     let (mut child, _, _) = spawn_child(&mut parent, &[("counter".into(), offer)]).expect("spawn");
     let ch = child.resolve_cap_name("counter").expect("named");
     let ctid = child.resolve_offer(ch).unwrap().type_id;
     assert_eq!(
-        child.cap_dispatch_slots(ctid, 0, ch, &[], None),
+        child.cap_call(ctid, 0, ch, &[], 1, None),
         Ok(vec![2]),
         "the child drives the same instance the parent bumped"
     );
     assert_eq!(
-        parent.cap_dispatch_slots(ptid, 0, offer, &[], None),
+        parent.cap_call(ptid, 0, offer, &[], 1, None),
         Ok(vec![3]),
         "and the parent sees the child's bump"
     );
@@ -696,12 +687,12 @@ fn a_cap_argument_is_translated_across_the_offer_boundary() {
     // The provider reads *its* Clock (a fresh, independent instance in the provider's table,
     // deterministic from 0), proving it resolved the translated cap and called through it.
     assert_eq!(
-        h.cap_dispatch_slots(tid, 0, offer, &[clock as i64], None),
+        h.cap_call(tid, 0, offer, &[clock as i64], 1, None),
         Ok(vec![0]),
         "the provider called Clock.now through the translated cap"
     );
     assert_eq!(
-        h.cap_dispatch_slots(tid, 0, offer, &[clock as i64], None),
+        h.cap_call(tid, 0, offer, &[clock as i64], 1, None),
         Ok(vec![1]),
         "and the provider's own clock advances across calls"
     );
@@ -717,7 +708,7 @@ fn a_forged_cap_argument_fails_closed() {
     let offer = h.wire_offer_proc(&provider, &[0]).expect("offer");
     let tid = h.resolve_offer(offer).unwrap().type_id;
     assert_eq!(
-        h.cap_dispatch_slots(tid, 0, offer, &[0xDEAD_BEEFu32 as i32 as i64], None),
+        h.cap_call(tid, 0, offer, &[0xDEAD_BEEFu32 as i32 as i64], 1, None),
         Err(Trap::CapFault),
         "a forged cap argument is inert — CapFault before dispatch"
     );
@@ -743,7 +734,7 @@ fn a_cap_result_is_translated_back_to_the_caller() {
     let tid = h.resolve_offer(offer).unwrap().type_id;
     let clock = h.grant_clock();
     let out = h
-        .cap_dispatch_slots(tid, 0, offer, &[clock as i64], None)
+        .cap_call(tid, 0, offer, &[clock as i64], 1, None)
         .expect("dispatch");
     let returned = out[0] as i32;
     assert_ne!(
@@ -752,7 +743,7 @@ fn a_cap_result_is_translated_back_to_the_caller() {
     );
     // The returned handle resolves as a Clock in the caller's table and is callable.
     assert_eq!(
-        h.cap_dispatch_slots(cap_id::CLOCK, 0, returned, &[], None),
+        h.cap_call(cap_id::CLOCK, 0, returned, &[], 1, None),
         Ok(vec![0]),
         "the translated-back cap is a live Clock in the caller's own table"
     );
@@ -789,7 +780,7 @@ fn a_wrap_holds_and_forwards_a_real_capability() {
     h.grant_impl_cap(offer, out, "out").expect("grantable");
     let tid = h.resolve_offer(offer).unwrap().type_id;
     assert_eq!(
-        h.cap_dispatch_slots(tid, 0, offer, &[], None),
+        h.cap_call(tid, 0, offer, &[], 1, None),
         Ok(vec![2]),
         "the provider's write through the forwarded stream reports 2 bytes"
     );
@@ -813,7 +804,7 @@ fn an_instanced_offer_runs_on_a_flat_deterministic_budget() {
     // No reserve to drain: many calls, all identically priced, instance state accumulating.
     for i in 1..=8i64 {
         assert_eq!(
-            h.cap_dispatch_slots(tid, 0, offer, &[], None),
+            h.cap_call(tid, 0, offer, &[], 1, None),
             Ok(vec![i]),
             "call {i} served on the flat budget — nothing drained, nothing to top up"
         );
@@ -879,7 +870,7 @@ fn a_cyclic_offer_call_is_a_probeable_eagain_not_a_deadlock() {
         .expect("the offer re-grants into its own provider");
     let tid = h.resolve_offer(offer).unwrap().type_id;
     assert_eq!(
-        h.cap_dispatch_slots(tid, 0, offer, &[], None),
+        h.cap_call(tid, 0, offer, &[], 1, None),
         Ok(vec![-11]),
         "the re-entrant inner call answers -EAGAIN (busy instance), threaded back — no hang"
     );
@@ -1075,11 +1066,12 @@ fn grouped_attach_runs_the_coverage_walk_and_refreshes_the_remap() {
     // A non-covering attach (a plain module grant is no guest impl) fails closed, probeable.
     let bogus = child.grant_module(&cm);
     let r = child
-        .cap_dispatch_slots(
+        .cap_call(
             temen_ir::CAP_IMPORT_ATTACH_TYPE_ID,
             0,
             0,
             &[bogus as i64],
+            1,
             None,
         )
         .expect("attach dispatch itself succeeds");
@@ -1089,11 +1081,12 @@ fn grouped_attach_runs_the_coverage_walk_and_refreshes_the_remap() {
     // The discovered offer covers the subset requirement: attach binds + remaps [0 -> 1].
     let disc = child.resolve_cap_name("later").expect("discovered");
     let r = child
-        .cap_dispatch_slots(
+        .cap_call(
             temen_ir::CAP_IMPORT_ATTACH_TYPE_ID,
             0,
             0,
             &[disc as i64],
+            1,
             None,
         )
         .expect("attach dispatch");

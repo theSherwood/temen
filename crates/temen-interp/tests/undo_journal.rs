@@ -10,6 +10,7 @@
 //! journaling armed must not perturb the run), the bulk-op span coverage that `watch_accesses` buys,
 //! and the level-2 coalescing bound (#1558) that makes aging the journal safe.
 
+use temen_interp::put_results;
 use temen_interp::{bytecode::ScheduledDebugRun, HostProcGrant, ProcHandler};
 
 /// `iters` rewrites of one hot cell, then two distinct cells, then a 4 KiB `mem.fill`. The three
@@ -284,10 +285,10 @@ fn counting_host() -> (temen_interp::Host, i32) {
     host.record_caps();
     let n = Arc::new(Mutex::new(0i64));
     let h = host.grant_host_proc(HostProcGrant::new(
-        ProcHandler::Sync(Box::new(move |_op, _args, _mem, _minter| {
+        ProcHandler::Sync(Box::new(move |_op, _args, out, _mem, _minter| {
             let mut g = n.lock().unwrap();
             *g += 1;
-            Ok(vec![*g])
+            put_results(out, &[*g])
         })),
         temen_interp::CapState::Stateless,
     ));
@@ -353,10 +354,10 @@ fn stateful_counter_host(
     let cap = Arc::clone(&n);
     let (get, set) = (Arc::clone(&n), Arc::clone(&n));
     let h = host.grant_host_proc(HostProcGrant::new(
-        ProcHandler::Sync(Box::new(move |_op, _args, _mem, _minter| {
+        ProcHandler::Sync(Box::new(move |_op, _args, out, _mem, _minter| {
             let mut g = cap.lock().unwrap();
             *g += 1;
-            Ok(vec![*g])
+            put_results(out, &[*g])
         })),
         temen_interp::CapState::Captured {
             capture: Box::new(move || get.lock().unwrap().to_le_bytes().to_vec()),
@@ -462,7 +463,7 @@ fn undoing_across_an_answer_takes_it_where_the_run_did() {
         let made = Arc::clone(&calls);
         let mut host = temen_interp::Host::new();
         let h = host.grant_host_proc(HostProcGrant::new(
-            ProcHandler::Offloadable(Box::new(move |_op, args| {
+            ProcHandler::Offloadable(Box::new(move |_op, args, _out| {
                 let (first, n) = (made.fetch_add(1, Ordering::SeqCst) == 0, args[0]);
                 temen_interp::OffloadOutcome::Offload(Box::new(move || {
                     if first {

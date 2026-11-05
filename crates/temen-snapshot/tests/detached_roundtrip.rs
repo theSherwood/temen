@@ -402,7 +402,7 @@ fn a_child_whose_restore_fails_refuses_the_parents() {
 #[test]
 fn a_budget_node_the_parent_and_child_share_is_one_node_after_a_thaw() {
     use temen_interp::cap_id;
-    let read = |h: &mut Host, b: i32| h.cap_dispatch_slots(cap_id::BUDGET, 1, b, &[1], None);
+    let read = |h: &mut Host, b: i32| h.cap_call(cap_id::BUDGET, 1, b, &[1], 1, None);
     let (p, c) = (parent(), child());
     let (window, mut chost) = frozen_root(&c);
     let mut host = Host::new();
@@ -410,7 +410,7 @@ fn a_budget_node_the_parent_and_child_share_is_one_node_after_a_thaw() {
     host.grant_durable_module(&c);
     let root = host.grant_budget(-1, 1 << 20, -1);
     let paid = host
-        .cap_dispatch_slots(cap_id::BUDGET, 0, root, &[-1, 1 << 18, -1], None)
+        .cap_call(cap_id::BUDGET, 0, root, &[-1, 1 << 18, -1], 1, None)
         .unwrap()[0] as i32;
     assert!(
         host.budget_mem_take(paid, 1 << 17),
@@ -421,7 +421,7 @@ fn a_budget_node_the_parent_and_child_share_is_one_node_after_a_thaw() {
         .resolve_cap_name("budget")
         .expect("the child's budget");
     let mine = chost
-        .cap_dispatch_slots(cap_id::BUDGET, 0, cb, &[-1, 1 << 16, -1], None)
+        .cap_call(cap_id::BUDGET, 0, cb, &[-1, 1 << 16, -1], 1, None)
         .unwrap()[0] as i32;
     assert!(mine >= 0, "the child splits a node of its own");
     host.set_child_generations(vec![1, 1]);

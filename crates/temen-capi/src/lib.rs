@@ -379,7 +379,11 @@ pub unsafe extern "C" fn temen_imports_provide_host_proc(
         move |_, _| -> Option<(HostProc, temen_interp::CapState)> {
             let ctx = ctx;
             let h: HostProc = Box::new(
-                move |op, args, mem, _minter: Option<&mut dyn temen_interp::RegionMinter>| {
+                move |op,
+                      args,
+                      out: &mut [i64],
+                      mem,
+                      _minter: Option<&mut dyn temen_interp::RegionMinter>| {
                     // Force whole-`ctx` capture (the `Send`/`Sync` wrapper), not the disjoint `ctx.0` field
                     // (a bare `*mut c_void`, which isn't `Send`) — Rust 2021 edition capture.
                     let ctx = ctx;
@@ -411,7 +415,9 @@ pub unsafe extern "C" fn temen_imports_provide_host_proc(
                         return Err(Trap::CapFault);
                     }
                     let n = (n as usize).min(buf.len());
-                    Ok(buf[..n].to_vec())
+                    // The C contract keeps its own `TEMEN_MAX_RESULTS`-slot buffer, whatever the call
+                    // declares; the call's slots take what fits (#2319).
+                    temen_interp::put_results(out, &buf[..n])
                 },
             );
             Some((h, temen_interp::CapState::Uncaptured))

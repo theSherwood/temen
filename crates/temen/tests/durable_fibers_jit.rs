@@ -22,6 +22,7 @@ use temen_durable::{
     arm_freeze_after, begin_thaw, init_durable_window, transform_module,
     transform_module_assume_confined, write_state, STATE_UNWINDING,
 };
+use temen_interp::put_results;
 use temen_interp::{
     run_capture_reserved_with_host, FrozenFiber as InterpFrozen, Host, HostProcGrant, ProcHandler,
     Value,
@@ -125,9 +126,9 @@ fn jit_durable_fiber_switch_routes_shadow_sp_per_context() {
     let sink = Arc::clone(&probes);
     let mut host = Host::new();
     let hf = host.grant_host_proc(HostProcGrant::new(
-        ProcHandler::Sync(Box::new(move |_op, args, _mem, _| {
+        ProcHandler::Sync(Box::new(move |_op, args, out, _mem, _| {
             sink.lock().unwrap().push(args[0] as u64);
-            Ok(vec![0])
+            put_results(out, &[0])
         })),
         temen_interp::CapState::Stateless,
     ));

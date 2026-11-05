@@ -10,18 +10,18 @@ const MIB: i64 = 1024 * KIB;
 
 /// `split(-1, mem, -1)` of `holder`: a child node capped on `mem` only.
 fn split(h: &mut Host, holder: i32, mem: i64) -> i32 {
-    h.cap_dispatch_slots(cap_id::BUDGET, 0, holder, &[-1, mem, -1], None)
+    h.cap_call(cap_id::BUDGET, 0, holder, &[-1, mem, -1], 1, None)
         .expect("split")[0] as i32
 }
 
 /// `read(mem)`: the room left along `b`'s chain.
 fn room(h: &mut Host, b: i32) -> i64 {
-    h.cap_dispatch_slots(cap_id::BUDGET, 1, b, &[1], None)
+    h.cap_call(cap_id::BUDGET, 1, b, &[1], 1, None)
         .expect("read")[0]
 }
 
 fn transfer(h: &mut Host, holder: i32, dst: i32, mem: i64) -> i64 {
-    h.cap_dispatch_slots(cap_id::BUDGET, 2, holder, &[dst as i64, 0, mem, 0], None)
+    h.cap_call(cap_id::BUDGET, 2, holder, &[dst as i64, 0, mem, 0], 1, None)
         .expect("transfer")[0]
 }
 
@@ -224,7 +224,7 @@ fn concurrent_charges_never_overdraw_a_shared_ancestor() {
 
 /// `read(fuel)`: the fuel room left along `b`'s chain.
 fn fuel_room(h: &mut Host, b: i32) -> i64 {
-    h.cap_dispatch_slots(cap_id::BUDGET, 1, b, &[0], None)
+    h.cap_call(cap_id::BUDGET, 1, b, &[0], 1, None)
         .expect("read")[0]
 }
 
@@ -235,7 +235,7 @@ fn fuel_is_drawn_in_chunks_charged_to_every_level_and_refunded_unburned() {
     let mut h = Host::new();
     let root = h.grant_budget(1000, -1, -1);
     let node = h
-        .cap_dispatch_slots(cap_id::BUDGET, 0, root, &[100, -1, -1], None)
+        .cap_call(cap_id::BUDGET, 0, root, &[100, -1, -1], 1, None)
         .expect("split")[0] as i32;
     let mut child = Host::new();
     h.give_child_budget(
@@ -318,7 +318,7 @@ fn a_guest_sees_the_runs_own_grant_except_its_fuel() {
     let _ = h.begin_activation(10, RootWindow::default());
     let b = h.grant_budget(-1, -1, -1);
     let read = |h: &mut Host, field: i64| {
-        h.cap_dispatch_slots(cap_id::BUDGET, 1, b, &[field], None)
+        h.cap_call(cap_id::BUDGET, 1, b, &[field], 1, None)
             .expect("read")[0]
     };
     assert_eq!(
@@ -356,7 +356,7 @@ fn a_guest_does_not_see_the_activation_limit_that_bounds_its_draws() {
         "the activation's limit is not the guest's to read"
     );
     let sub = h
-        .cap_dispatch_slots(cap_id::BUDGET, 0, b, &[-1, -1, -1], None)
+        .cap_call(cap_id::BUDGET, 0, b, &[-1, -1, -1], 1, None)
         .expect("split")[0] as i32;
     assert_eq!(fuel_room(&mut h, sub), -1, "nor does it clamp a split");
 

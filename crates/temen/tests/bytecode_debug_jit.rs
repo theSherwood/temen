@@ -601,7 +601,7 @@ block 0 (vh: i64) {
         let (mut host, jit, codes) = compiled(m, &[unit]);
         let held = std::sync::Arc::clone(&held);
         let proc = host.grant_host_proc(HostProcGrant::new(
-            ProcHandler::Offloadable(Box::new(move |_, _| {
+            ProcHandler::Offloadable(Box::new(move |_, _, _out| {
                 let held = std::sync::Arc::clone(&held);
                 temen_interp::OffloadOutcome::Host(Box::new(move |c| held.lock().unwrap().push(c)))
             })),

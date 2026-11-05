@@ -433,7 +433,7 @@ fn a_freeze_request_the_root_never_polled_leaves_the_run_unfrozen() {
     let mut h = Host::new();
     h.set_durable(true);
     let hf = h.grant_host_proc(HostProcGrant::new(
-        ProcHandler::Sync(Box::new(move |_op, _args, _mem, _| {
+        ProcHandler::Sync(Box::new(move |_op, _args, _out, _mem, _| {
             fc.request_freeze();
             Err(temen_interp::Trap::CapFault)
         })),

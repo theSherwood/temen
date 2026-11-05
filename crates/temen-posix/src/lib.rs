@@ -28,6 +28,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+use temen_interp::put_results;
 use temen_interp::{
     cap_id, CapState, ForkedProc, GuestMem, Host, HostBuffer, HostCharge, HostProc, HostProcFork,
     HostProcGrant, NamedCapGrant, NodeRef, OpParks, ProcHandler, SignalSource, Trap, TABLE_ENTRY,
@@ -3227,7 +3228,7 @@ pub fn net_cap_factory(posix: &Posix) -> impl Fn() -> (HostProc, CapState) + Sen
 /// (connect / bind / accept / shutdown / resolve). An unknown op is a clean `CapFault`.
 fn net_handler(world: Arc<Mutex<World>>, proc_: Arc<Mutex<Proc>>) -> HostProc {
     Box::new(
-        move |op, args, mem, _minter: Option<&mut dyn temen_interp::RegionMinter>| {
+        move |op, args, out, mem, _minter: Option<&mut dyn temen_interp::RegionMinter>| {
             let mut w = world.lock().unwrap_or_else(|e| e.into_inner());
             let mut p = proc_.lock().unwrap_or_else(|e| e.into_inner());
             let mut st = Ctx {
@@ -3235,14 +3236,15 @@ fn net_handler(world: Arc<Mutex<World>>, proc_: Arc<Mutex<Proc>>) -> HostProc {
                 p: &mut p,
                 wake_after: Vec::new(),
             };
-            match op {
+            let r = match op {
                 NET_CONNECT => st.net_connect(args, mem),
                 NET_BIND => st.net_bind(args, mem),
                 NET_ACCEPT => st.net_accept(args, mem),
-                NET_SHUTDOWN => Ok(vec![st.net_shutdown(args)]),
+                NET_SHUTDOWN => Ok(st.net_shutdown(args)),
                 NET_RESOLVE => st.net_resolve(args, mem),
                 _ => Err(Trap::CapFault),
-            }
+            };
+            put_results(out, &[r?])
         },
     )
 }
@@ -3339,13 +3341,20 @@ fn new_proc(heap_base: u64, heap_end: u64) -> Proc {
     p
 }
 
+/// Whether `TEMEN_PX_TRACE` asks for a trace of every syscall: read once, since each lookup takes the
+/// process's environment lock and the handler asked twice a call (#2319).
+fn px_trace() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("TEMEN_PX_TRACE").is_some())
+}
+
 /// Build the POSIX [`HostProc`] handler for one process: the shared [`World`] + this process's
 /// [`Proc`]. Dispatches on the op number; an unknown op on this handle is a `CapFault` (as for any
 /// capability). Both locks are taken at dispatch top in the canonical order (world, then proc — see
 /// [`World`]), exactly the blanket-lock scope the pre-split single mutex had.
 fn handler(world: Arc<Mutex<World>>, proc_: Arc<Mutex<Proc>>) -> HostProc {
     Box::new(
-        move |op, args, mem, _minter: Option<&mut dyn temen_interp::RegionMinter>| {
+        move |op, args, out, mem, _minter: Option<&mut dyn temen_interp::RegionMinter>| {
             let mut w = world.lock().unwrap_or_else(|e| e.into_inner());
             let mut p = proc_.lock().unwrap_or_else(|e| e.into_inner());
             let mut st = Ctx {
@@ -3353,7 +3362,7 @@ fn handler(world: Arc<Mutex<World>>, proc_: Arc<Mutex<Proc>>) -> HostProc {
                 p: &mut p,
                 wake_after: Vec::new(),
             };
-            if std::env::var_os("TEMEN_PX_TRACE").is_some() {
+            if px_trace() {
                 if op == OP_WRITE {
                     let txt = mem
                         .as_ref()
@@ -3377,15 +3386,15 @@ fn handler(world: Arc<Mutex<World>>, proc_: Arc<Mutex<Proc>>) -> HostProc {
             let res = match op {
                 OP_WRITE => st.write(args, mem),
                 OP_READ => st.read(args, mem),
-                OP_MALLOC => Ok(vec![st.malloc(args)]),
+                OP_MALLOC => Ok(st.malloc(args)),
                 OP_FREE => {
                     st.free(args);
-                    Ok(vec![0])
+                    Ok(0)
                 }
                 OP_EXIT => Err(Trap::Exit(args.first().copied().unwrap_or(0) as i32)),
                 OP_OPEN => st.open(args, mem),
-                OP_CLOSE => Ok(vec![st.close(args)]),
-                OP_LSEEK => Ok(vec![st.lseek(args)]),
+                OP_CLOSE => Ok(st.close(args)),
+                OP_LSEEK => Ok(st.lseek(args)),
                 OP_UNLINK => st.unlink(args, mem),
                 OP_MKDIR => st.mkdir(args, mem),
                 OP_RENAME => st.rename(args, mem),
@@ -3395,11 +3404,11 @@ fn handler(world: Arc<Mutex<World>>, proc_: Arc<Mutex<Proc>>) -> HostProc {
                 OP_STATP => st.statp(args, mem),
                 OP_OPENDIR => st.opendir(args, mem),
                 OP_READDIR => st.readdir(args, mem),
-                OP_CLOSEDIR => Ok(vec![st.closedir(args)]),
-                OP_ARGC => Ok(vec![st.p.args.len() as i64]),
+                OP_CLOSEDIR => Ok(st.closedir(args)),
+                OP_ARGC => Ok(st.p.args.len() as i64),
                 OP_ARGV => st.argv(args, mem),
                 OP_EXEC_LOOKUP => st.exec_lookup(args, mem),
-                OP_EXEC_STDOUT => Ok(vec![st.w.exec_stdout_handle as i64]),
+                OP_EXEC_STDOUT => Ok(st.w.exec_stdout_handle as i64),
                 OP_EXEC_STDIN => st.exec_stdin(args, mem),
                 OP_EXEC_WIN => st.exec_win(args),
                 OP_PIPE => st.pipe(args, mem),
@@ -3412,17 +3421,17 @@ fn handler(world: Arc<Mutex<World>>, proc_: Arc<Mutex<Proc>>) -> HostProc {
                 OP_TCSETATTR => st.tcsetattr(args, mem),
                 OP_TCGETWINSIZE => st.tcgetwinsize(args, mem),
                 OP_TTYNAME => st.ttyname(args, mem),
-                OP_DUP2 => Ok(vec![st.dup2(args)]),
-                OP_DUP => Ok(vec![st.dup(args)]),
-                OP_FCNTL => Ok(vec![st.fcntl(args)]),
+                OP_DUP2 => Ok(st.dup2(args)),
+                OP_DUP => Ok(st.dup(args)),
+                OP_FCNTL => Ok(st.fcntl(args)),
                 OP_WAITPID => st.waitpid(args, mem),
                 OP_WAIT => st.waitpid(&[-1, *args.first().unwrap_or(&0), 0], mem),
-                OP_SIGNAL => Ok(vec![st.signal(args)]),
-                OP_KILL => Ok(vec![st.kill(args)]),
-                OP_SIGCHECK => Ok(vec![st.sigcheck()]),
+                OP_SIGNAL => Ok(st.signal(args)),
+                OP_KILL => Ok(st.kill(args)),
+                OP_SIGCHECK => Ok(st.sigcheck()),
                 OP_SIGPROCMASK => st.sigprocmask(args, mem),
                 OP_SIGACTION => st.sigaction(args, mem),
-                OP_SIGALTSTACK => Ok(vec![st.sigaltstack(args)]),
+                OP_SIGALTSTACK => Ok(st.sigaltstack(args)),
                 OP_GETCWD => st.getcwd(args, mem),
                 OP_CHDIR => st.chdir(args, mem),
                 OP_GETENV => st.getenv(args, mem),
@@ -3430,18 +3439,18 @@ fn handler(world: Arc<Mutex<World>>, proc_: Arc<Mutex<Proc>>) -> HostProc {
                 OP_GETENV_R => st.getenv_r(args, mem),
                 OP_UNSETENV => st.unsetenv(args, mem),
                 OP_ENVIRON => st.environ(args, mem),
-                OP_CLOCK => Ok(vec![st.clock(args)]),
-                OP_GETPID => Ok(vec![st.p.pid as i64]),
-                OP_SETPGID => Ok(vec![st.setpgid(args)]),
-                OP_GETPGID => Ok(vec![st.getpgid(args)]),
-                OP_TCGETPGRP => Ok(vec![st.tcgetpgrp(args)]),
-                OP_TCSETPGRP => Ok(vec![st.tcsetpgrp(args)]),
-                OP_ISATTY => Ok(vec![st.isatty(args)]),
-                OP_GETPPID => Ok(vec![st.p.ppid as i64]),
-                OP_FORK => Ok(vec![st.fork_request()]),
+                OP_CLOCK => Ok(st.clock(args)),
+                OP_GETPID => Ok(st.p.pid as i64),
+                OP_SETPGID => Ok(st.setpgid(args)),
+                OP_GETPGID => Ok(st.getpgid(args)),
+                OP_TCGETPGRP => Ok(st.tcgetpgrp(args)),
+                OP_TCSETPGRP => Ok(st.tcsetpgrp(args)),
+                OP_ISATTY => Ok(st.isatty(args)),
+                OP_GETPPID => Ok(st.p.ppid as i64),
+                OP_FORK => Ok(st.fork_request()),
                 _ => Err(Trap::CapFault),
             };
-            if std::env::var_os("TEMEN_PX_TRACE").is_some() && op == OP_READ {
+            if px_trace() && op == OP_READ {
                 eprintln!("[px] read -> {res:?}");
             }
             // Fire a deferred cross-process wake (see [`Ctx::wake_after`]) only after both guards
@@ -3475,7 +3484,7 @@ fn handler(world: Arc<Mutex<World>>, proc_: Arc<Mutex<Proc>>) -> HostProc {
                     }
                 });
             }
-            res
+            put_results(out, &[res?])
         },
     )
 }
@@ -3849,16 +3858,16 @@ impl Ctx<'_> {
     /// stdout/stderr; a `File` fd writes into its memfs file at the offset (extending it), advancing it;
     /// a `PipeWrite` fd appends to its shared buffer. `Stdin`, a `PipeRead`, a read-only file, and an
     /// unopened fd are `-EBADF`.
-    fn write(&mut self, args: &[i64], mem: Option<&mut dyn GuestMem>) -> Result<Vec<i64>, Trap> {
+    fn write(&mut self, args: &[i64], mem: Option<&mut dyn GuestMem>) -> Result<i64, Trap> {
         let mem = mem.ok_or(Trap::Malformed)?;
         let fd = *args.first().ok_or(Trap::Malformed)?;
         let buf = *args.get(1).ok_or(Trap::Malformed)? as u64;
         let len = (*args.get(2).ok_or(Trap::Malformed)?).max(0) as u64;
         if len == 0 {
-            return Ok(vec![0]);
+            return Ok(0);
         }
         let data = mem.read_bytes(buf, len).ok_or(Trap::Malformed)?;
-        Ok(vec![self.sink_write(fd, &data)])
+        Ok(self.sink_write(fd, &data))
     }
 
     /// Write `data` to fd `fd`'s current binding, returning the count or `-EBADF`: the `Stdout`/`Stderr`
@@ -3935,7 +3944,7 @@ impl Ctx<'_> {
     /// `read(fd, buf, len) -> n | -errno`: the `Stdin` sentinel drains preloaded stdin; a `File` fd reads
     /// its memfs file from the offset, advancing it (`0` at EOF); a `PipeRead` fd drains its shared buffer
     /// (`0` when empty). `Stdout`/`Stderr`, a `PipeWrite`, and an unopened fd are `-EBADF`.
-    fn read(&mut self, args: &[i64], mem: Option<&mut dyn GuestMem>) -> Result<Vec<i64>, Trap> {
+    fn read(&mut self, args: &[i64], mem: Option<&mut dyn GuestMem>) -> Result<i64, Trap> {
         let mem = mem.ok_or(Trap::Malformed)?;
         let fd = *args.first().ok_or(Trap::Malformed)?;
         let buf = *args.get(1).ok_or(Trap::Malformed)? as u64;
@@ -3955,7 +3964,7 @@ impl Ctx<'_> {
             // `bg`-continued reader whose stop fire lagged one dispatch consumed the next typed
             // line before parking (POSIX stops BEFORE the I/O; the `bg` probe caught the steal).
             if self.p.stopped_sig.is_some() {
-                return Ok(vec![ERESTART]);
+                return Ok(ERESTART);
             }
             // #797 interactive rung 2 — mint the tag from THIS process's own token (handle
             // values are per-powerbox; the world's is the root namespace's). A process without
@@ -3966,7 +3975,7 @@ impl Ctx<'_> {
                 .as_ref()
                 .map(|t| t.get())
                 .unwrap_or_else(|| self.w.terminal.as_ref().unwrap().input_handle);
-            return Ok(vec![PX_TAG_BASE - h as i64]);
+            return Ok(PX_TAG_BASE - h as i64);
         }
         enum Src {
             Stdin,
@@ -3985,7 +3994,7 @@ impl Ctx<'_> {
             // #972 — an adopted core pipe end: redirect the shim to the core cap-call read
             // (blocking/EINTR/EOF). No bytes move here; a non-shim caller sees a large negative
             // "error" and fails closed.
-            Some(FdEntry::CorePipe(t)) => return Ok(vec![PX_TAG_BASE - t.get() as i64]),
+            Some(FdEntry::CorePipe(t)) => return Ok(PX_TAG_BASE - t.get() as i64),
             _ => Src::Bad,
         };
         let chunk: Vec<u8> = match src {
@@ -4000,7 +4009,7 @@ impl Ctx<'_> {
             }
             Src::File => match self.file_read(fd as usize, len) {
                 Ok(c) => c,
-                Err(e) => return Ok(vec![e]),
+                Err(e) => return Ok(e),
             },
             Src::Pipe(p) => {
                 let mut g = p.lock().unwrap_or_else(|e| e.into_inner());
@@ -4018,7 +4027,7 @@ impl Ctx<'_> {
                     let mut g = s.rx.lock().unwrap_or_else(|e| e.into_inner());
                     let chunk = g[..len.min(g.len())].to_vec();
                     if chunk.is_empty() && !s.peer_write_closed.load(Ordering::Acquire) {
-                        return Ok(vec![EAGAIN]);
+                        return Ok(EAGAIN);
                     }
                     g.consume(chunk.len());
                     chunk
@@ -4031,15 +4040,15 @@ impl Ctx<'_> {
                 let mut tmp = vec![0u8; len.min(RECV_CHUNK)];
                 let n = d.lock().unwrap_or_else(|e| e.into_inner()).recv(&mut tmp);
                 if n < 0 {
-                    return Ok(vec![n]);
+                    return Ok(n);
                 }
                 tmp.truncate(n as usize);
                 tmp
             }
-            Src::Bad => return Ok(vec![EBADF]),
+            Src::Bad => return Ok(EBADF),
         };
         mem.write_bytes(buf, &chunk).ok_or(Trap::Malformed)?;
-        Ok(vec![chunk.len() as i64])
+        Ok(chunk.len() as i64)
     }
 
     /// Borrow the entry at `fd` if it is a valid, open fd (`fd >= 0` and the slot is `Some`).
@@ -4053,14 +4062,14 @@ impl Ctx<'_> {
     /// `open(path_ptr, path_len, flags) -> fd | -errno`: open (or `O_CREAT`) a memfs file, returning a
     /// fresh fd. `O_TRUNC` clears it, `O_APPEND` seeks to the end; a missing file without `O_CREAT` is
     /// `-ENOENT`, a non-UTF-8 path `-EINVAL`.
-    fn open(&mut self, args: &[i64], mem: Option<&mut dyn GuestMem>) -> Result<Vec<i64>, Trap> {
+    fn open(&mut self, args: &[i64], mem: Option<&mut dyn GuestMem>) -> Result<i64, Trap> {
         let mem = mem.ok_or(Trap::Malformed)?;
         let ptr = *args.first().ok_or(Trap::Malformed)? as u64;
         let plen = (*args.get(1).ok_or(Trap::Malformed)?).max(0) as u64;
         let flags = *args.get(2).ok_or(Trap::Malformed)?;
         let bytes = mem.read_bytes(ptr, plen).ok_or(Trap::Malformed)?;
         let Ok(path) = String::from_utf8(bytes) else {
-            return Ok(vec![EINVAL]);
+            return Ok(EINVAL);
         };
         let path = self.resolve(&path);
         // #802 language differential — `/dev/fd/N` and `/dev/std{in,out,err}` (bash builds with
@@ -4071,23 +4080,23 @@ impl Ctx<'_> {
         if let Some(target) = dev_fd_target(&path) {
             let dup = match self.fd(target) {
                 Some(entry) => entry.dup_clone(),
-                None => return Ok(vec![EBADF]),
+                None => return Ok(EBADF),
             };
-            return Ok(vec![self.alloc_fd(dup)]);
+            return Ok(self.alloc_fd(dup));
         }
         let exists = self.w.files.contains_key(&path);
         if !exists && flags & O_CREAT == 0 {
-            return Ok(vec![ENOENT]);
+            return Ok(ENOENT);
         }
         if !self.fd_room() {
-            return Ok(vec![EMFILE]); // before the open creates or truncates anything
+            return Ok(EMFILE); // before the open creates or truncates anything
         }
         // Creating a file and truncating one are both writes, and only those two: opening an
         // existing file for reading must not restamp its mtime, or every `stat` would report the
         // last *reader* instead of the last writer. #2306: a name the payer has no room for is
         // refused, as a full disk refuses one.
         if (!exists || flags & O_TRUNC != 0) && !self.w.file_create(path.clone()) {
-            return Ok(vec![ENOSPC]);
+            return Ok(ENOSPC);
         }
         let pos = if flags & O_APPEND != 0 {
             self.w.file_len(&path)
@@ -4096,13 +4105,11 @@ impl Ctx<'_> {
         };
         let acc = flags & O_ACCMODE;
         let writable = acc == O_WRONLY || acc == O_RDWR;
-        Ok(vec![self.alloc_fd(FdEntry::File(Arc::new(Mutex::new(
-            OpenFile {
-                path,
-                pos,
-                writable,
-            },
-        ))))])
+        Ok(self.alloc_fd(FdEntry::File(Arc::new(Mutex::new(OpenFile {
+            path,
+            pos,
+            writable,
+        })))))
     }
 
     /// `close(fd) -> 0 | -errno`: release any open fd (a file, a pipe end, or a stdio sentinel — a shell
@@ -4212,34 +4219,30 @@ impl Ctx<'_> {
     /// `pipe(fds_ptr) -> 0 | -errno`: create an in-personality byte FIFO and store the read and write fds
     /// (`[i32; 2]`, little-endian) at `fds_ptr`. Both ends share one [`PipeBuf`]; the write end is the
     /// higher fd, matching Linux (which allocates the read end first). Non-blocking (see [`PipeBuf`]).
-    fn pipe(&mut self, args: &[i64], mem: Option<&mut dyn GuestMem>) -> Result<Vec<i64>, Trap> {
+    fn pipe(&mut self, args: &[i64], mem: Option<&mut dyn GuestMem>) -> Result<i64, Trap> {
         let mem = mem.ok_or(Trap::Malformed)?;
         let ptr = *args.first().ok_or(Trap::Malformed)? as u64;
         let buf: PipeBuf = Arc::new(Mutex::new(HostBuffer::new(self.w.payer())));
         let rfd = self.alloc_fd(FdEntry::PipeRead(Arc::clone(&buf)));
         if rfd < 0 {
-            return Ok(vec![rfd]);
+            return Ok(rfd);
         }
         let wfd = self.alloc_fd(FdEntry::PipeWrite(buf));
         if wfd < 0 {
             self.p.fds[rfd as usize] = None;
-            return Ok(vec![wfd]);
+            return Ok(wfd);
         }
         let mut out = Vec::with_capacity(8);
         out.extend_from_slice(&(rfd as i32).to_le_bytes());
         out.extend_from_slice(&(wfd as i32).to_le_bytes());
         mem.write_bytes(ptr, &out).ok_or(Trap::Malformed)?;
-        Ok(vec![0])
+        Ok(0)
     }
 
     /// #797 — `tcgetattr(fd, attr_ptr) -> 0 | -errno`: fill the 32-byte personality termios
     /// (`{lflag, cc[8], vmin, vtime}` as 4 LE i64s) for a terminal fd (stdio, with the terminal
     /// enabled); `-ENOTTY` otherwise.
-    fn tcgetattr(
-        &mut self,
-        args: &[i64],
-        mem: Option<&mut dyn GuestMem>,
-    ) -> Result<Vec<i64>, Trap> {
+    fn tcgetattr(&mut self, args: &[i64], mem: Option<&mut dyn GuestMem>) -> Result<i64, Trap> {
         let mem = mem.ok_or(Trap::Malformed)?;
         let fd = *args.first().ok_or(Trap::Malformed)?;
         let ptr = *args.get(1).ok_or(Trap::Malformed)? as u64;
@@ -4247,7 +4250,7 @@ impl Ctx<'_> {
         // duplicated-sentinel rule `isatty`/`tcgetpgrp` follow, not a literal 0..=2.
         let is_term = self.fd_is_terminal(fd);
         let Some(t) = self.w.terminal.as_ref().filter(|_| is_term) else {
-            return Ok(vec![ENOTTY]);
+            return Ok(ENOTTY);
         };
         let mut out = Vec::with_capacity(32);
         out.extend_from_slice(&t.lflag.to_le_bytes());
@@ -4255,17 +4258,13 @@ impl Ctx<'_> {
         out.extend_from_slice(&t.vmin.to_le_bytes());
         out.extend_from_slice(&t.vtime.to_le_bytes());
         mem.write_bytes(ptr, &out).ok_or(Trap::Malformed)?;
-        Ok(vec![0])
+        Ok(0)
     }
 
     /// #797 — `tcsetattr(fd, attr_ptr) -> 0 | -errno`: apply the 32-byte termios immediately
     /// (TCSANOW; drain/flush `when` semantics are a shim concern for now). A line buffered in
     /// canonical mode stays buffered across a switch to raw — it flushes with the next feed.
-    fn tcsetattr(
-        &mut self,
-        args: &[i64],
-        mem: Option<&mut dyn GuestMem>,
-    ) -> Result<Vec<i64>, Trap> {
+    fn tcsetattr(&mut self, args: &[i64], mem: Option<&mut dyn GuestMem>) -> Result<i64, Trap> {
         let mem = mem.ok_or(Trap::Malformed)?;
         let fd = *args.first().ok_or(Trap::Malformed)?;
         let ptr = *args.get(1).ok_or(Trap::Malformed)? as u64;
@@ -4274,23 +4273,19 @@ impl Ctx<'_> {
         // duplicated-sentinel rule `isatty`/`tcgetpgrp` follow, not a literal 0..=2.
         let is_term = self.fd_is_terminal(fd);
         let Some(t) = self.w.terminal.as_mut().filter(|_| is_term) else {
-            return Ok(vec![ENOTTY]);
+            return Ok(ENOTTY);
         };
         t.lflag = i64::from_le_bytes(bytes[0..8].try_into().unwrap());
         t.cc.copy_from_slice(&bytes[8..16]);
         t.vmin = i64::from_le_bytes(bytes[16..24].try_into().unwrap());
         t.vtime = i64::from_le_bytes(bytes[24..32].try_into().unwrap());
-        Ok(vec![0])
+        Ok(0)
     }
 
     /// #797 — `tcgetwinsize(fd, ws_ptr) -> 0 | -errno`: `{i32 row; i32 col}` (the `TIOCGWINSZ`
     /// shape); `-ENOTTY` off-terminal. Updated by the embedder's [`Posix::set_winsize`], which
     /// also fires SIGWINCH at the foreground group.
-    fn tcgetwinsize(
-        &mut self,
-        args: &[i64],
-        mem: Option<&mut dyn GuestMem>,
-    ) -> Result<Vec<i64>, Trap> {
+    fn tcgetwinsize(&mut self, args: &[i64], mem: Option<&mut dyn GuestMem>) -> Result<i64, Trap> {
         let mem = mem.ok_or(Trap::Malformed)?;
         let fd = *args.first().ok_or(Trap::Malformed)?;
         let ptr = *args.get(1).ok_or(Trap::Malformed)? as u64;
@@ -4298,13 +4293,13 @@ impl Ctx<'_> {
         // duplicated-sentinel rule `isatty`/`tcgetpgrp` follow, not a literal 0..=2.
         let is_term = self.fd_is_terminal(fd);
         let Some(t) = self.w.terminal.as_ref().filter(|_| is_term) else {
-            return Ok(vec![ENOTTY]);
+            return Ok(ENOTTY);
         };
         let mut out = Vec::with_capacity(8);
         out.extend_from_slice(&t.rows.to_le_bytes());
         out.extend_from_slice(&t.cols.to_le_bytes());
         mem.write_bytes(ptr, &out).ok_or(Trap::Malformed)?;
-        Ok(vec![0])
+        Ok(0)
     }
 
     /// #972 — `pipe_adopt(read_h, write_h, fds_ptr) -> 0 | -errno`: record two guest-minted core
@@ -4312,17 +4307,13 @@ impl Ctx<'_> {
     /// `[read_fd, write_fd]` (`i32`×2, read end first — POSIX order) at `fds_ptr`. Pure
     /// bookkeeping: the handles are numbers to this table (never exercised here — a garbage
     /// handle fails the guest's own later cap-call, not this op). Negative handles are `-EINVAL`.
-    fn pipe_adopt(
-        &mut self,
-        args: &[i64],
-        mem: Option<&mut dyn GuestMem>,
-    ) -> Result<Vec<i64>, Trap> {
+    fn pipe_adopt(&mut self, args: &[i64], mem: Option<&mut dyn GuestMem>) -> Result<i64, Trap> {
         let mem = mem.ok_or(Trap::Malformed)?;
         let rh = *args.first().ok_or(Trap::Malformed)?;
         let wh = *args.get(1).ok_or(Trap::Malformed)?;
         let ptr = *args.get(2).ok_or(Trap::Malformed)? as u64;
         if rh < 0 || wh < 0 || rh > i32::MAX as i64 || wh > i32::MAX as i64 {
-            return Ok(vec![EINVAL]);
+            return Ok(EINVAL);
         }
         let rfd = self.alloc_fd(FdEntry::CorePipe(Arc::new(CorePipeToken::new(rh as i32))));
         let wfd = self.alloc_fd(FdEntry::CorePipe(Arc::new(CorePipeToken::new(wh as i32))));
@@ -4330,7 +4321,7 @@ impl Ctx<'_> {
         out.extend_from_slice(&(rfd as i32).to_le_bytes());
         out.extend_from_slice(&(wfd as i32).to_le_bytes());
         mem.write_bytes(ptr, &out).ok_or(Trap::Malformed)?;
-        Ok(vec![0])
+        Ok(0)
     }
 
     /// `dup2(oldfd, newfd) -> newfd | -errno`: re-point `newfd` at `oldfd`'s object, closing whatever
@@ -4395,7 +4386,7 @@ impl Ctx<'_> {
     /// `WNOHANG`, a matching own child that has not exited yet is `0`, as POSIX specifies: pollers
     /// (`osproc.running`, nifmake's job loop) read `-ECHILD` as "no such child" and give up on it.
     /// `-ECHILD` when there is no such child.
-    fn waitpid(&mut self, args: &[i64], mem: Option<&mut dyn GuestMem>) -> Result<Vec<i64>, Trap> {
+    fn waitpid(&mut self, args: &[i64], mem: Option<&mut dyn GuestMem>) -> Result<i64, Trap> {
         let mem = mem.ok_or(Trap::Malformed)?;
         let pid = *args.first().ok_or(Trap::Malformed)?;
         let status_ptr = *args.get(1).unwrap_or(&0) as u64;
@@ -4474,7 +4465,7 @@ impl Ctx<'_> {
                     mem.write_bytes(status_ptr, &status.to_le_bytes())
                         .ok_or(Trap::Malformed)?;
                 }
-                return Ok(vec![tpid as i64]);
+                return Ok(tpid as i64);
             }
         }
         let Some(p) = reaped else {
@@ -4493,7 +4484,7 @@ impl Ctx<'_> {
                             || (pid < -1 && group == Some(tp.pgid)))
                 });
                 if running {
-                    return Ok(vec![0]);
+                    return Ok(0);
                 }
             }
             // #799 — blocking `waitpid`: nothing to reap and the caller did not opt out
@@ -4554,7 +4545,7 @@ impl Ctx<'_> {
                     }
                 }
             }
-            return Ok(vec![ECHILD]);
+            return Ok(ECHILD);
         };
         let status: i32 = match self.w.procs.remove(&p) {
             Some(ProcEntry::Zombie { status: st, .. }) => st,
@@ -4564,7 +4555,7 @@ impl Ctx<'_> {
             mem.write_bytes(status_ptr, &status.to_le_bytes())
                 .ok_or(Trap::Malformed)?;
         }
-        Ok(vec![p as i64])
+        Ok(p as i64)
     }
 
     /// `signal(signum, handler) -> prev_handler | -errno`: record `signum`'s disposition (`SIG_DFL`/
@@ -4784,20 +4775,20 @@ impl Ctx<'_> {
     /// gates on), `-ENOTTY` off it, `-ERANGE` when `buf` is too small for the name + NUL. The
     /// `isatty` companion — unlike the old shim fake (`/dev/tty` for any fd), this is honest for a
     /// non-terminal fd.
-    fn ttyname(&mut self, args: &[i64], mem: Option<&mut dyn GuestMem>) -> Result<Vec<i64>, Trap> {
+    fn ttyname(&mut self, args: &[i64], mem: Option<&mut dyn GuestMem>) -> Result<i64, Trap> {
         let mem = mem.ok_or(Trap::Malformed)?;
         let fd = *args.first().ok_or(Trap::Malformed)?;
         let ptr = *args.get(1).ok_or(Trap::Malformed)? as u64;
         let buflen = (*args.get(2).ok_or(Trap::Malformed)?).max(0) as u64;
         if !self.fd_is_terminal(fd) {
-            return Ok(vec![ENOTTY]);
+            return Ok(ENOTTY);
         }
         let name = b"/dev/tty\0"; // 9 bytes incl. the NUL
         if buflen < name.len() as u64 {
-            return Ok(vec![ERANGE]);
+            return Ok(ERANGE);
         }
         mem.write_bytes(ptr, name).ok_or(Trap::Malformed)?;
-        Ok(vec![0])
+        Ok(0)
     }
 
     /// [`OP_FORK`] (#799) — request the return-twice clone through the caller-request door and
@@ -4963,11 +4954,7 @@ impl Ctx<'_> {
     /// the current mask to `oldset` first (when non-null), then applies `set` per `how`. `SIGKILL`/`SIGSTOP`
     /// are silently kept unblocked ([`UNMASKABLE`]). A bad `how` (with a non-null `set`) is `-EINVAL`. The
     /// mask is a `u64` `sigset_t` read/written as 8 little-endian bytes.
-    fn sigprocmask(
-        &mut self,
-        args: &[i64],
-        mem: Option<&mut dyn GuestMem>,
-    ) -> Result<Vec<i64>, Trap> {
+    fn sigprocmask(&mut self, args: &[i64], mem: Option<&mut dyn GuestMem>) -> Result<i64, Trap> {
         let how = *args.first().unwrap_or(&0);
         let set_ptr = *args.get(1).unwrap_or(&0) as u64;
         let oldset_ptr = *args.get(2).unwrap_or(&0) as u64;
@@ -4983,7 +4970,7 @@ impl Ctx<'_> {
                 SIG_BLOCK => self.p.sig_mask | set,
                 SIG_UNBLOCK => self.p.sig_mask & !set,
                 SIG_SETMASK => set,
-                _ => return Ok(vec![EINVAL]),
+                _ => return Ok(EINVAL),
             };
             self.p.sig_mask = new & !UNMASKABLE; // SIGKILL/SIGSTOP can never be blocked
             self.p.arm_signals(); // #796 L2 — unblocking may free a held signal for async delivery
@@ -4993,7 +4980,7 @@ impl Ctx<'_> {
                 self.wake_after.push(f);
             }
         }
-        Ok(vec![0])
+        Ok(0)
     }
 
     /// `sigaction(signum, act, oldact) -> 0 | -errno` (#796): the richer `signal`. Records `signum`'s
@@ -5001,22 +4988,18 @@ impl Ctx<'_> {
     /// first (when non-null). The `struct sigaction` ABI is 24 bytes: `sa_handler` (i64@0), `sa_mask`
     /// (u64@8), `sa_flags` (i64@16). Out-of-range `signum` is `-EINVAL`. (The poll model does not yet
     /// auto-block `sa_mask` while the handler runs, nor honor `SA_RESTART` — those land with L2/L1.)
-    fn sigaction(
-        &mut self,
-        args: &[i64],
-        mem: Option<&mut dyn GuestMem>,
-    ) -> Result<Vec<i64>, Trap> {
+    fn sigaction(&mut self, args: &[i64], mem: Option<&mut dyn GuestMem>) -> Result<i64, Trap> {
         let signum = *args.first().unwrap_or(&0);
         let act_ptr = *args.get(1).unwrap_or(&0) as u64;
         let oldact_ptr = *args.get(2).unwrap_or(&0) as u64;
         if !(1..=63).contains(&signum) {
-            return Ok(vec![EINVAL]);
+            return Ok(EINVAL);
         }
         let s = signum as i32;
         // #796 default actions — POSIX forbids changing SIGKILL/SIGSTOP's action (probing with a
         // null `act` is allowed).
         if act_ptr != 0 && (s == SIGKILL || s == SIGSTOP) {
-            return Ok(vec![EINVAL]);
+            return Ok(EINVAL);
         }
         let mem = mem.ok_or(Trap::Malformed)?;
         if oldact_ptr != 0 {
@@ -5046,97 +5029,97 @@ impl Ctx<'_> {
                 }
             }
         }
-        Ok(vec![0])
+        Ok(0)
     }
 
     /// `unlink(path_ptr, path_len) -> 0 | -errno`: remove a memfs file. Already-open fds keep their
     /// (now-detached) contents via the file map only until closed — POSIX unlink-while-open nuance is a
     /// follow-up; here a removed path simply reads as absent to a fresh `open`. Missing file is `-ENOENT`.
-    fn unlink(&mut self, args: &[i64], mem: Option<&mut dyn GuestMem>) -> Result<Vec<i64>, Trap> {
+    fn unlink(&mut self, args: &[i64], mem: Option<&mut dyn GuestMem>) -> Result<i64, Trap> {
         let mem = mem.ok_or(Trap::Malformed)?;
         let ptr = *args.first().ok_or(Trap::Malformed)? as u64;
         let plen = (*args.get(1).ok_or(Trap::Malformed)?).max(0) as u64;
         let bytes = mem.read_bytes(ptr, plen).ok_or(Trap::Malformed)?;
         let Ok(path) = String::from_utf8(bytes) else {
-            return Ok(vec![EINVAL]);
+            return Ok(EINVAL);
         };
         let path = self.resolve(&path);
-        Ok(vec![if self.w.file_remove(&path).is_some() {
+        Ok(if self.w.file_remove(&path).is_some() {
             0
         } else {
             ENOENT
-        }])
+        })
     }
 
     /// `mkdir(path, plen, mode) -> 0 | -errno`: record an explicit empty directory. `mode` is ignored.
     /// `-EEXIST` if the path is already a file or directory; `-ENOENT` if the parent isn't a directory
     /// (`create_dir`, not `create_dir_all` — the std layer creates parents itself); `-EINVAL` for a
     /// non-UTF-8 path.
-    fn mkdir(&mut self, args: &[i64], mem: Option<&mut dyn GuestMem>) -> Result<Vec<i64>, Trap> {
+    fn mkdir(&mut self, args: &[i64], mem: Option<&mut dyn GuestMem>) -> Result<i64, Trap> {
         let mem = mem.ok_or(Trap::Malformed)?;
         let ptr = *args.first().ok_or(Trap::Malformed)? as u64;
         let plen = (*args.get(1).ok_or(Trap::Malformed)?).max(0) as u64;
         let bytes = mem.read_bytes(ptr, plen).ok_or(Trap::Malformed)?;
         let Ok(path) = String::from_utf8(bytes) else {
-            return Ok(vec![EINVAL]);
+            return Ok(EINVAL);
         };
         let path = self.resolve(&path);
         let norm = path.trim_end_matches('/').to_string();
         if norm.is_empty() {
-            return Ok(vec![EEXIST]); // the root always exists
+            return Ok(EEXIST); // the root always exists
         }
         if self.w.files.contains_key(&norm) || self.is_dir(&norm) {
-            return Ok(vec![EEXIST]);
+            return Ok(EEXIST);
         }
         let parent = match norm.rfind('/') {
             Some(0) | None => "/",
             Some(i) => &norm[..i],
         };
         if !self.is_dir(parent) {
-            return Ok(vec![ENOENT]);
+            return Ok(ENOENT);
         }
         if !self.w.table(&norm) {
-            return Ok(vec![ENOSPC]); // #2306 — no room for the name
+            return Ok(ENOSPC); // #2306 — no room for the name
         }
         self.w.explicit_dirs.insert(norm);
-        Ok(vec![0])
+        Ok(0)
     }
 
     /// `rmdir(path, plen) -> 0 | -errno`: remove an empty directory. `-ENOTDIR` if it's a file, `-ENOENT`
     /// if it isn't a directory, `-ENOTEMPTY` if it still has children (an implicit dir always does),
     /// `-EINVAL` for the root or a non-UTF-8 path.
-    fn rmdir(&mut self, args: &[i64], mem: Option<&mut dyn GuestMem>) -> Result<Vec<i64>, Trap> {
+    fn rmdir(&mut self, args: &[i64], mem: Option<&mut dyn GuestMem>) -> Result<i64, Trap> {
         let mem = mem.ok_or(Trap::Malformed)?;
         let ptr = *args.first().ok_or(Trap::Malformed)? as u64;
         let plen = (*args.get(1).ok_or(Trap::Malformed)?).max(0) as u64;
         let bytes = mem.read_bytes(ptr, plen).ok_or(Trap::Malformed)?;
         let Ok(path) = String::from_utf8(bytes) else {
-            return Ok(vec![EINVAL]);
+            return Ok(EINVAL);
         };
         let path = self.resolve(&path);
         let norm = path.trim_end_matches('/').to_string();
         if norm.is_empty() {
-            return Ok(vec![EINVAL]); // cannot remove the root
+            return Ok(EINVAL); // cannot remove the root
         }
         if self.w.files.contains_key(&norm) {
-            return Ok(vec![ENOTDIR]);
+            return Ok(ENOTDIR);
         }
         if !self.is_dir(&norm) {
-            return Ok(vec![ENOENT]);
+            return Ok(ENOENT);
         }
         if !self.dir_children(&norm).is_empty() {
-            return Ok(vec![ENOTEMPTY]);
+            return Ok(ENOTEMPTY);
         }
         if self.w.explicit_dirs.remove(&norm) {
             self.w.untable(&norm);
         }
-        Ok(vec![0])
+        Ok(0)
     }
 
     /// `rename(old, olen, new, nlen) -> 0 | -errno`: move a file key (overwriting any existing target
     /// file) or a directory (re-keying every file and explicit subdir under it). `-ENOENT` if `old`
     /// doesn't exist; `-EINVAL` for a non-UTF-8 path.
-    fn rename(&mut self, args: &[i64], mem: Option<&mut dyn GuestMem>) -> Result<Vec<i64>, Trap> {
+    fn rename(&mut self, args: &[i64], mem: Option<&mut dyn GuestMem>) -> Result<i64, Trap> {
         let mem = mem.ok_or(Trap::Malformed)?;
         let old_ptr = *args.first().ok_or(Trap::Malformed)? as u64;
         let old_len = (*args.get(1).ok_or(Trap::Malformed)?).max(0) as u64;
@@ -5146,7 +5129,7 @@ impl Ctx<'_> {
         let new_bytes = mem.read_bytes(new_ptr, new_len).ok_or(Trap::Malformed)?;
         let (Ok(old), Ok(new)) = (String::from_utf8(old_bytes), String::from_utf8(new_bytes))
         else {
-            return Ok(vec![EINVAL]);
+            return Ok(EINVAL);
         };
         let old_n = self.resolve(old.trim_end_matches('/'));
         let new_n = self.resolve(new.trim_end_matches('/'));
@@ -5159,7 +5142,7 @@ impl Ctx<'_> {
                 + self.w.explicit_dirs.contains(&new_n) as u64;
             let gone = TABLE_ENTRY + old_n.len() as u64 + replaced * come;
             if come > gone && !self.w.grow_tables(come - gone) {
-                return Ok(vec![ENOSPC]);
+                return Ok(ENOSPC);
             }
             let v = self.w.files.remove(&old_n).expect("checked above");
             self.w.files.insert(new_n.clone(), v);
@@ -5170,7 +5153,7 @@ impl Ctx<'_> {
                 .bytes()
                 .saturating_sub(gone.saturating_sub(come));
             self.w.tables.resize(names);
-            return Ok(vec![0]);
+            return Ok(0);
         }
         // Directory: re-key every file and explicit subdir under `old_n`, plus the marker itself.
         if self.is_dir(&old_n) {
@@ -5194,7 +5177,7 @@ impl Ctx<'_> {
             // the names cost once moved.
             let longer = new_n.len().saturating_sub(old_n.len()) * (moved.len() + dirs.len());
             if !self.w.grow_tables(longer as u64) {
-                return Ok(vec![ENOSPC]);
+                return Ok(ENOSPC);
             }
             for k in moved {
                 let v = self.w.files.remove(&k).unwrap();
@@ -5211,9 +5194,9 @@ impl Ctx<'_> {
             }
             let names = self.w.tables_cost();
             self.w.tables.resize(names);
-            return Ok(vec![0]);
+            return Ok(0);
         }
-        Ok(vec![ENOENT])
+        Ok(ENOENT)
     }
 
     // ---- net ops (POSIX.md §5a) — the `net` capability's dispatch targets ----------------------
@@ -5251,11 +5234,7 @@ impl Ctx<'_> {
     /// target listener's pending queue (`-ECONNREFUSED` if no listener holds the port); beyond
     /// loopback → the embedder's [`NetDelegate`] or `-ECONNREFUSED` (fail closed). Writes the
     /// connection's local address into `laddr_out`.
-    fn net_connect(
-        &mut self,
-        args: &[i64],
-        mem: Option<&mut dyn GuestMem>,
-    ) -> Result<Vec<i64>, Trap> {
+    fn net_connect(&mut self, args: &[i64], mem: Option<&mut dyn GuestMem>) -> Result<i64, Trap> {
         let mem = mem.ok_or(Trap::Malformed)?;
         let ptr = *args.first().ok_or(Trap::Malformed)? as u64;
         let alen = (*args.get(1).ok_or(Trap::Malformed)?).max(0) as u64;
@@ -5263,22 +5242,22 @@ impl Ctx<'_> {
         let cap = (*args.get(3).unwrap_or(&0)).max(0) as u64;
         let blob = mem.read_bytes(ptr, alen).ok_or(Trap::Malformed)?;
         let Some(dst) = NetAddr::parse(&blob) else {
-            return Ok(vec![EINVAL]);
+            return Ok(EINVAL);
         };
         if dst.is_loopback() {
             let Some(q) = self.w.net_listeners.get(&dst.port).map(Arc::clone) else {
-                return Ok(vec![ECONNREFUSED]);
+                return Ok(ECONNREFUSED);
             };
             // #2306 — a listener's backlog is bounded, as Linux's is.
             if q.lock().unwrap_or_else(|e| e.into_inner()).len() >= SOMAXCONN {
-                return Ok(vec![ECONNREFUSED]);
+                return Ok(ECONNREFUSED);
             }
             let Some(port) = self.net_alloc_ephemeral() else {
-                return Ok(vec![EAGAIN]);
+                return Ok(EAGAIN);
             };
             let (client, server) = mem_pair(NetAddr::loopback(port), dst, self.w.payer());
             if let Err(e) = Self::net_write_addr(mem, out, cap, &client.local)? {
-                return Ok(vec![e]);
+                return Ok(e);
             }
             let fd = self.alloc_fd(FdEntry::NetSock(client));
             if fd >= 0 {
@@ -5286,10 +5265,10 @@ impl Ctx<'_> {
                     .unwrap_or_else(|e| e.into_inner())
                     .push_back(server);
             }
-            return Ok(vec![fd]);
+            return Ok(fd);
         }
         let Some(d) = self.w.net_delegate.as_mut() else {
-            return Ok(vec![ECONNREFUSED]);
+            return Ok(ECONNREFUSED);
         };
         match d.connect(&dst) {
             Ok(stream) => {
@@ -5300,13 +5279,11 @@ impl Ctx<'_> {
                     addr: [0; 16],
                 };
                 if let Err(e) = Self::net_write_addr(mem, out, cap, &local)? {
-                    return Ok(vec![e]);
+                    return Ok(e);
                 }
-                Ok(vec![self.alloc_fd(FdEntry::NetStream(Arc::new(
-                    Mutex::new(stream),
-                )))])
+                Ok(self.alloc_fd(FdEntry::NetStream(Arc::new(Mutex::new(stream)))))
             }
-            Err(e) => Ok(vec![if e < 0 { e } else { ECONNREFUSED }]),
+            Err(e) => Ok(if e < 0 { e } else { ECONNREFUSED }),
         }
     }
 
@@ -5314,7 +5291,7 @@ impl Ctx<'_> {
     /// in this slice (`-EACCES` beyond — the delegate-granted real-listener path is the noted
     /// follow-up); `:0` assigns an ephemeral port; a held port is `-EADDRINUSE`. Writes the actual
     /// bound address (so the guest learns its ephemeral port).
-    fn net_bind(&mut self, args: &[i64], mem: Option<&mut dyn GuestMem>) -> Result<Vec<i64>, Trap> {
+    fn net_bind(&mut self, args: &[i64], mem: Option<&mut dyn GuestMem>) -> Result<i64, Trap> {
         let mem = mem.ok_or(Trap::Malformed)?;
         let ptr = *args.first().ok_or(Trap::Malformed)? as u64;
         let alen = (*args.get(1).ok_or(Trap::Malformed)?).max(0) as u64;
@@ -5322,24 +5299,24 @@ impl Ctx<'_> {
         let cap = (*args.get(3).unwrap_or(&0)).max(0) as u64;
         let blob = mem.read_bytes(ptr, alen).ok_or(Trap::Malformed)?;
         let Some(req) = NetAddr::parse(&blob) else {
-            return Ok(vec![EINVAL]);
+            return Ok(EINVAL);
         };
         if !req.is_loopback() {
-            return Ok(vec![EACCES]);
+            return Ok(EACCES);
         }
         let port = if req.port == 0 {
             match self.net_alloc_ephemeral() {
                 Some(port) => port,
-                None => return Ok(vec![EADDRINUSE]),
+                None => return Ok(EADDRINUSE),
             }
         } else if self.w.net_listeners.contains_key(&req.port) {
-            return Ok(vec![EADDRINUSE]);
+            return Ok(EADDRINUSE);
         } else {
             req.port
         };
         let bound = NetAddr { port, ..req };
         if let Err(e) = Self::net_write_addr(mem, out, cap, &bound)? {
-            return Ok(vec![e]);
+            return Ok(e);
         }
         let pending = Arc::new(Mutex::new(VecDeque::new()));
         let fd = self.alloc_fd(FdEntry::NetListener(MemListener {
@@ -5349,36 +5326,32 @@ impl Ctx<'_> {
         if fd >= 0 {
             self.w.net_listeners.insert(port, pending);
         }
-        Ok(vec![fd])
+        Ok(fd)
     }
 
     /// `accept(fd, peer_out, cap) -> fd | -EAGAIN | -errno`: pop the next pending memnet connection
     /// off the listener's queue (`-EAGAIN` when none — a cooperative guest cannot block on itself),
     /// writing the peer's address.
-    fn net_accept(
-        &mut self,
-        args: &[i64],
-        mem: Option<&mut dyn GuestMem>,
-    ) -> Result<Vec<i64>, Trap> {
+    fn net_accept(&mut self, args: &[i64], mem: Option<&mut dyn GuestMem>) -> Result<i64, Trap> {
         let mem = mem.ok_or(Trap::Malformed)?;
         let fd = *args.first().ok_or(Trap::Malformed)?;
         let out = *args.get(1).unwrap_or(&0) as u64;
         let cap = (*args.get(2).unwrap_or(&0)).max(0) as u64;
         let q = match self.fd(fd) {
             Some(FdEntry::NetListener(l)) => Arc::clone(&l.pending),
-            Some(_) => return Ok(vec![ENOTSOCK]),
-            None => return Ok(vec![EBADF]),
+            Some(_) => return Ok(ENOTSOCK),
+            None => return Ok(EBADF),
         };
         if !self.fd_room() {
-            return Ok(vec![EMFILE]); // the connection stays queued, as Linux leaves it
+            return Ok(EMFILE); // the connection stays queued, as Linux leaves it
         }
         let Some(sock) = q.lock().unwrap_or_else(|e| e.into_inner()).pop_front() else {
-            return Ok(vec![EAGAIN]);
+            return Ok(EAGAIN);
         };
         if let Err(e) = Self::net_write_addr(mem, out, cap, &sock.peer)? {
-            return Ok(vec![e]);
+            return Ok(e);
         }
-        Ok(vec![self.alloc_fd(FdEntry::NetSock(sock))])
+        Ok(self.alloc_fd(FdEntry::NetSock(sock)))
     }
 
     /// `shutdown(fd, how) -> 0 | -errno` (`0` read / `1` write / `2` both, the Linux values): a
@@ -5411,11 +5384,7 @@ impl Ctx<'_> {
     /// `resolve(name, nlen, out, cap) -> nbytes | -errno`: `localhost` → the v4 loopback; anything
     /// else → the delegate or `-ENOENT` (fail closed). Writes the address blobs back-to-back when
     /// they fit; the total byte length is returned either way (size-then-fetch, like `getenv_r`).
-    fn net_resolve(
-        &mut self,
-        args: &[i64],
-        mem: Option<&mut dyn GuestMem>,
-    ) -> Result<Vec<i64>, Trap> {
+    fn net_resolve(&mut self, args: &[i64], mem: Option<&mut dyn GuestMem>) -> Result<i64, Trap> {
         let mem = mem.ok_or(Trap::Malformed)?;
         let ptr = *args.first().ok_or(Trap::Malformed)? as u64;
         let nlen = (*args.get(1).ok_or(Trap::Malformed)?).max(0) as u64;
@@ -5423,7 +5392,7 @@ impl Ctx<'_> {
         let cap = (*args.get(3).unwrap_or(&0)).max(0) as u64;
         let bytes = mem.read_bytes(ptr, nlen).ok_or(Trap::Malformed)?;
         let Ok(name) = String::from_utf8(bytes) else {
-            return Ok(vec![EINVAL]);
+            return Ok(EINVAL);
         };
         let addrs: Vec<NetAddr> = if name == "localhost" {
             vec![NetAddr::loopback(0)]
@@ -5431,16 +5400,16 @@ impl Ctx<'_> {
             match self.w.net_delegate.as_mut() {
                 Some(d) => match d.resolve(&name) {
                     Ok(v) => v,
-                    Err(e) => return Ok(vec![if e < 0 { e } else { ENOENT }]),
+                    Err(e) => return Ok(if e < 0 { e } else { ENOENT }),
                 },
-                None => return Ok(vec![ENOENT]),
+                None => return Ok(ENOENT),
             }
         };
         let blob: Vec<u8> = addrs.iter().flat_map(NetAddr::encode).collect();
         if out != 0 && blob.len() as u64 <= cap {
             mem.write_bytes(out, &blob).ok_or(Trap::Malformed)?;
         }
-        Ok(vec![blob.len() as i64])
+        Ok(blob.len() as i64)
     }
 
     /// The immediate child **names** of directory `path` in the flat memfs — the distinct first
@@ -5509,24 +5478,24 @@ impl Ctx<'_> {
     /// (`{ i64 st_mode; i64 st_size; }`, 16 bytes) for a memfs path. A file key is `S_IFREG` with its
     /// byte length; a directory (a prefix of some key, or `"/"`) is `S_IFDIR` size 0; anything else is
     /// `-ENOENT`. A non-UTF-8 path is `-EINVAL`.
-    fn stat(&mut self, args: &[i64], mem: Option<&mut dyn GuestMem>) -> Result<Vec<i64>, Trap> {
+    fn stat(&mut self, args: &[i64], mem: Option<&mut dyn GuestMem>) -> Result<i64, Trap> {
         let mem = mem.ok_or(Trap::Malformed)?;
         let ptr = *args.first().ok_or(Trap::Malformed)? as u64;
         let plen = (*args.get(1).ok_or(Trap::Malformed)?).max(0) as u64;
         let buf = *args.get(2).ok_or(Trap::Malformed)? as u64;
         let bytes = mem.read_bytes(ptr, plen).ok_or(Trap::Malformed)?;
         let Ok(path) = String::from_utf8(bytes) else {
-            return Ok(vec![EINVAL]);
+            return Ok(EINVAL);
         };
         let path = self.resolve(&path);
         let Some((mode, size, _mtime)) = self.stat_of_path(&path) else {
-            return Ok(vec![ENOENT]);
+            return Ok(ENOENT);
         };
         let mut out = Vec::with_capacity(16);
         out.extend_from_slice(&mode.to_le_bytes());
         out.extend_from_slice(&size.to_le_bytes());
         mem.write_bytes(buf, &out).ok_or(Trap::Malformed)?;
-        Ok(vec![0])
+        Ok(0)
     }
 
     /// `fstat(fd, buf) -> 0 | -errno`: fill a Linux/amd64 `struct stat` for an open fd.
@@ -5538,7 +5507,7 @@ impl Ctx<'_> {
     ///
     /// A non-file fd (a pipe, a socket, stdio) stats as a FIFO with size 0 rather than failing:
     /// `fstat` on a pipe is legal POSIX. An unknown fd is `EBADF`.
-    fn fstat(&mut self, args: &[i64], mem: Option<&mut dyn GuestMem>) -> Result<Vec<i64>, Trap> {
+    fn fstat(&mut self, args: &[i64], mem: Option<&mut dyn GuestMem>) -> Result<i64, Trap> {
         let mem = mem.ok_or(Trap::Malformed)?;
         let fd = *args.first().ok_or(Trap::Malformed)?;
         let buf = (*args.get(1).ok_or(Trap::Malformed)?) as u64;
@@ -5555,10 +5524,10 @@ impl Ctx<'_> {
                 }
             }
             Some(_) => (S_IFIFO | 0o600, 0, 0),
-            None => return Ok(vec![EBADF]),
+            None => return Ok(EBADF),
         };
         write_linux_stat(mem, buf, mode, size, mtime)?;
-        Ok(vec![0])
+        Ok(0)
     }
 
     /// `statp(path_ptr, path_len, buf) -> 0 | -errno`: [`Self::stat`]'s answer in [`Self::fstat`]'s
@@ -5566,46 +5535,46 @@ impl Ctx<'_> {
     ///
     /// Same resolution, same layout writer, different entry: no second notion of what a path stats
     /// as, and no second copy of the Linux offsets.
-    fn statp(&mut self, args: &[i64], mem: Option<&mut dyn GuestMem>) -> Result<Vec<i64>, Trap> {
+    fn statp(&mut self, args: &[i64], mem: Option<&mut dyn GuestMem>) -> Result<i64, Trap> {
         let mem = mem.ok_or(Trap::Malformed)?;
         let ptr = *args.first().ok_or(Trap::Malformed)? as u64;
         let plen = (*args.get(1).ok_or(Trap::Malformed)?).max(0) as u64;
         let buf = (*args.get(2).ok_or(Trap::Malformed)?) as u64;
         let bytes = mem.read_bytes(ptr, plen).ok_or(Trap::Malformed)?;
         let Ok(path) = String::from_utf8(bytes) else {
-            return Ok(vec![EINVAL]);
+            return Ok(EINVAL);
         };
         let path = self.resolve(&path);
         let Some((mode, size, mtime)) = self.stat_of_path(&path) else {
-            return Ok(vec![ENOENT]);
+            return Ok(ENOENT);
         };
         write_linux_stat(mem, buf, mode, size, mtime)?;
-        Ok(vec![0])
+        Ok(0)
     }
 
     /// `opendir(path_ptr, path_len) -> dir | -errno`: snapshot a directory's immediate children and
     /// return a `DIR*`-analog handle for `readdir`/`closedir`. A regular file is `-ENOTDIR`; a path
     /// with no children that isn't the root is `-ENOENT`; a non-UTF-8 path is `-EINVAL`.
-    fn opendir(&mut self, args: &[i64], mem: Option<&mut dyn GuestMem>) -> Result<Vec<i64>, Trap> {
+    fn opendir(&mut self, args: &[i64], mem: Option<&mut dyn GuestMem>) -> Result<i64, Trap> {
         let mem = mem.ok_or(Trap::Malformed)?;
         let ptr = *args.first().ok_or(Trap::Malformed)? as u64;
         let plen = (*args.get(1).ok_or(Trap::Malformed)?).max(0) as u64;
         let bytes = mem.read_bytes(ptr, plen).ok_or(Trap::Malformed)?;
         let Ok(path) = String::from_utf8(bytes) else {
-            return Ok(vec![EINVAL]);
+            return Ok(EINVAL);
         };
         let path = self.resolve(&path);
         if self.w.files.contains_key(&path) {
-            return Ok(vec![ENOTDIR]);
+            return Ok(ENOTDIR);
         }
         if !self.is_dir(&path) {
-            return Ok(vec![ENOENT]);
+            return Ok(ENOENT);
         }
         let entries = self.dir_children(&path);
         // #2306 — the snapshot is charged until it is closed.
         let mut held = HostCharge::new(self.w.payer());
         if !held.resize(TABLE_ENTRY + names_cost(&entries)) {
-            return Ok(vec![ENOSPC]);
+            return Ok(ENOSPC);
         }
         let stream = DirStream {
             entries,
@@ -5622,14 +5591,14 @@ impl Ctx<'_> {
                 self.p.dirs.len() - 1
             }
         };
-        Ok(vec![idx as i64])
+        Ok(idx as i64)
     }
 
     /// `readdir(dir, name_ptr, name_cap) -> namelen | 0 | -errno`: write the next entry's name
     /// (NUL-terminated, C's `dirent.d_name` convention) into the caller's buffer and advance. Returns
     /// the name length (excluding the NUL) on success, `0` at end of stream, `-EBADF` for a stale
     /// handle, `-ERANGE` if the name + NUL won't fit `name_cap`.
-    fn readdir(&mut self, args: &[i64], mem: Option<&mut dyn GuestMem>) -> Result<Vec<i64>, Trap> {
+    fn readdir(&mut self, args: &[i64], mem: Option<&mut dyn GuestMem>) -> Result<i64, Trap> {
         let mem = mem.ok_or(Trap::Malformed)?;
         let dir = *args.first().ok_or(Trap::Malformed)?;
         let name_ptr = *args.get(1).ok_or(Trap::Malformed)? as u64;
@@ -5638,20 +5607,20 @@ impl Ctx<'_> {
             .ok()
             .and_then(|i| self.p.dirs.get_mut(i)?.as_mut())
         else {
-            return Ok(vec![EBADF]);
+            return Ok(EBADF);
         };
         let Some(name) = stream.entries.get(stream.pos) else {
-            return Ok(vec![0]); // end of stream
+            return Ok(0); // end of stream
         };
         let mut bytes = name.clone().into_bytes();
         let namelen = bytes.len() as i64;
         bytes.push(0); // NUL
         if bytes.len() as u64 > cap {
-            return Ok(vec![ERANGE]);
+            return Ok(ERANGE);
         }
         stream.pos += 1;
         mem.write_bytes(name_ptr, &bytes).ok_or(Trap::Malformed)?;
-        Ok(vec![namelen])
+        Ok(namelen)
     }
 
     /// `closedir(dir) -> 0 | -errno`: release a directory stream. A stale handle is `-EBADF`.
@@ -5671,46 +5640,42 @@ impl Ctx<'_> {
     /// `argv(i, buf, cap) -> len | -errno`: write argument `i` (NUL-terminated) into the caller's
     /// buffer and return its length (excluding the NUL). An out-of-range index is `-EINVAL`; a name
     /// that won't fit `cap` is `-ERANGE`. (`argc` is a fieldless op: `self.p.args.len()`.)
-    fn argv(&mut self, args: &[i64], mem: Option<&mut dyn GuestMem>) -> Result<Vec<i64>, Trap> {
+    fn argv(&mut self, args: &[i64], mem: Option<&mut dyn GuestMem>) -> Result<i64, Trap> {
         let mem = mem.ok_or(Trap::Malformed)?;
         let i = *args.first().ok_or(Trap::Malformed)?;
         let buf = *args.get(1).ok_or(Trap::Malformed)? as u64;
         let cap = (*args.get(2).ok_or(Trap::Malformed)?).max(0) as u64;
         let Some(arg) = usize::try_from(i).ok().and_then(|i| self.p.args.get(i)) else {
-            return Ok(vec![EINVAL]);
+            return Ok(EINVAL);
         };
         let mut bytes = arg.clone().into_bytes();
         let len = bytes.len() as i64;
         bytes.push(0);
         if bytes.len() as u64 > cap {
-            return Ok(vec![ERANGE]);
+            return Ok(ERANGE);
         }
         mem.write_bytes(buf, &bytes).ok_or(Trap::Malformed)?;
-        Ok(vec![len])
+        Ok(len)
     }
 
     /// `exec_lookup(name_ptr, name_len) -> module_handle | -1`: resolve a command name against the PATH
     /// registry (STAGE1.md §5). Returns the granted `Module` handle (a small non-negative i32) or `-1`
     /// when the name is absent — the shell's "command not found". A non-UTF-8 name is likewise `-1` (an
     /// unfindable command, not a trap).
-    fn exec_lookup(
-        &mut self,
-        args: &[i64],
-        mem: Option<&mut dyn GuestMem>,
-    ) -> Result<Vec<i64>, Trap> {
+    fn exec_lookup(&mut self, args: &[i64], mem: Option<&mut dyn GuestMem>) -> Result<i64, Trap> {
         let mem = mem.ok_or(Trap::Malformed)?;
         let ptr = *args.first().ok_or(Trap::Malformed)? as u64;
         let len = (*args.get(1).ok_or(Trap::Malformed)?).max(0) as u64;
         let bytes = mem.read_bytes(ptr, len).ok_or(Trap::Malformed)?;
         let Ok(name) = std::str::from_utf8(&bytes) else {
-            return Ok(vec![-1]);
+            return Ok(-1);
         };
         // A host command has no module to spawn: to this route it is not there.
         let h = match self.w.commands.iter().find(|(n, _)| n == name) {
             Some((_, Command::Module { handle, .. })) => *handle as i64,
             _ => -1,
         };
-        Ok(vec![h])
+        Ok(h)
     }
 
     /// #801 — `exec_resolve(path_ptr, path_len) -> module_handle | -errno`: resolve a filesystem
@@ -5718,19 +5683,15 @@ impl Ctx<'_> {
     /// a registered executable is `-EACCES` (no exec bit); an absent path is `-ENOENT`; a
     /// non-UTF-8 path is `-EINVAL`. The errno split is what the guest `execvp` PATH walk keys on
     /// (POSIX: remember an EACCES, keep searching on ENOENT).
-    fn exec_resolve(
-        &mut self,
-        args: &[i64],
-        mem: Option<&mut dyn GuestMem>,
-    ) -> Result<Vec<i64>, Trap> {
+    fn exec_resolve(&mut self, args: &[i64], mem: Option<&mut dyn GuestMem>) -> Result<i64, Trap> {
         let mem = mem.ok_or(Trap::Malformed)?;
         let ptr = *args.first().ok_or(Trap::Malformed)? as u64;
         let len = (*args.get(1).ok_or(Trap::Malformed)?).max(0) as u64;
         let bytes = mem.read_bytes(ptr, len).ok_or(Trap::Malformed)?;
         let Ok(path) = String::from_utf8(bytes) else {
-            return Ok(vec![EINVAL]);
+            return Ok(EINVAL);
         };
-        Ok(vec![match self.resolve_exec_path(&path) {
+        Ok(match self.resolve_exec_path(&path) {
             Ok((ExecTarget::Command(h), _)) => h as i64,
             // A built program has no handle to report: a guest that drives `__vm_exec_module`
             // itself promotes it through its own `ModuleLoader` (`from_bytes`). No exec follows
@@ -5741,7 +5702,7 @@ impl Ctx<'_> {
                 EACCES
             }
             Err(e) => e,
-        }])
+        })
     }
 
     /// #1609 — the **path → registered command** policy, shared by [`OP_EXEC_RESOLVE`] (which
@@ -5786,9 +5747,9 @@ impl Ctx<'_> {
     /// [`OP_WAIT4`] — `wait4(pid, status, options, rusage)`: [`Self::waitpid`] with the syscall's
     /// fourth argument, which must be NULL (see [`OP_WAIT4`] for why a non-NULL one is refused
     /// rather than ignored).
-    fn wait4(&mut self, args: &[i64], mem: Option<&mut dyn GuestMem>) -> Result<Vec<i64>, Trap> {
+    fn wait4(&mut self, args: &[i64], mem: Option<&mut dyn GuestMem>) -> Result<i64, Trap> {
         if *args.get(3).unwrap_or(&0) != 0 {
-            return Ok(vec![EINVAL]);
+            return Ok(EINVAL);
         }
         self.waitpid(&args[..3.min(args.len())], mem)
     }
@@ -5801,29 +5762,29 @@ impl Ctx<'_> {
     ///
     /// On success this **never returns** (the image-replace destroys the continuation); the
     /// `-ENOSYS` below is the no-door placeholder, the `fork` precedent.
-    fn execve(&mut self, args: &[i64], mem: Option<&mut dyn GuestMem>) -> Result<Vec<i64>, Trap> {
+    fn execve(&mut self, args: &[i64], mem: Option<&mut dyn GuestMem>) -> Result<i64, Trap> {
         let mem = mem.ok_or(Trap::Malformed)?;
         // #1768 — no engine to serve the image-replace (no caller-request door): refuse up front,
         // before anything is resolved, staged or written. POSIX: a failed `execve` returns to an
         // unchanged caller.
         let Some(req) = self.p.park_req.clone() else {
-            return Ok(vec![ENOSYS]);
+            return Ok(ENOSYS);
         };
         let path_ptr = *args.first().ok_or(Trap::Malformed)? as u64;
         let argv_ptr = *args.get(1).ok_or(Trap::Malformed)? as u64;
         let envp_ptr = *args.get(2).ok_or(Trap::Malformed)? as u64;
         let path = match read_guest_path(mem, path_ptr) {
             Ok(p) => p,
-            Err(e) => return Ok(vec![e]),
+            Err(e) => return Ok(e),
         };
         match self.stage_exec(&path, argv_ptr, envp_ptr, mem) {
-            Err(e) => Ok(vec![e]),
+            Err(e) => Ok(e),
             // A host command runs here, to completion, and the process exits with its status: what
             // an image-replace with the command would come to, with no image to replace.
             Ok(Staged::Host(run, argv)) => Err(Trap::Exit(run(&argv, &mut ProcessFiles(self)))),
             Ok(Staged::Image(cmd)) => {
                 req(temen_interp::ParkEvent::ExecSelf { cmd });
-                Ok(vec![ENOSYS])
+                Ok(ENOSYS)
             }
         }
     }
@@ -5918,33 +5879,33 @@ impl Ctx<'_> {
     /// name, and the exec it starts with staged on it ([`Self::stage_exec`], against the working
     /// directory the actions leave). The engine mints the process and hands it the staged state
     /// ([`SignalDoor::spawn_commit`]), so this process is untouched whatever happens next.
-    fn pspawn(&mut self, args: &[i64], mem: Option<&mut dyn GuestMem>) -> Result<Vec<i64>, Trap> {
+    fn pspawn(&mut self, args: &[i64], mem: Option<&mut dyn GuestMem>) -> Result<i64, Trap> {
         let mem = mem.ok_or(Trap::Malformed)?;
         let Some(req) = self.p.park_req.clone() else {
-            return Ok(vec![ENOSYS]);
+            return Ok(ENOSYS);
         };
         // #2345 — as `fork`: no room in the table for the new process's entry.
         if self.w.procs.len() >= PID_MAX {
-            return Ok(vec![EAGAIN]);
+            return Ok(EAGAIN);
         }
         let at = *args.first().ok_or(Trap::Malformed)? as u64;
         let Some(&[path_ptr, argv_ptr, envp_ptr, acts_ptr, nacts]) =
             read_guest_words(mem, at, 5).as_deref()
         else {
-            return Ok(vec![EFAULT]);
+            return Ok(EFAULT);
         };
         if nacts > PSPAWN_MAX_ACTIONS {
-            return Ok(vec![EINVAL]);
+            return Ok(EINVAL);
         }
         let Some(acts) = read_guest_words(mem, acts_ptr, nacts * 4) else {
-            return Ok(vec![EFAULT]);
+            return Ok(EFAULT);
         };
         let path = match read_guest_path(mem, path_ptr) {
             Ok(p) => p,
-            Err(e) => return Ok(vec![e]),
+            Err(e) => return Ok(e),
         };
         let Some(mut child) = self.p.fork() else {
-            return Ok(vec![EAGAIN]);
+            return Ok(EAGAIN);
         };
         let mut cx = Ctx {
             w: &mut *self.w,
@@ -5960,24 +5921,24 @@ impl Ctx<'_> {
                 PSPAWN_DUP2 => {
                     let r = cx.dup2(&[fd, arg]);
                     if r < 0 {
-                        return Ok(vec![r]);
+                        return Ok(r);
                     }
                 }
                 PSPAWN_CHDIR => match read_guest_path(mem, a[3]) {
                     Ok(dir) => {
                         let cwd = cx.join_cwd(&dir);
                         if !cx.p.chdir(cwd) {
-                            return Ok(vec![ENOMEM]);
+                            return Ok(ENOMEM);
                         }
                     }
-                    Err(e) => return Ok(vec![e]),
+                    Err(e) => return Ok(e),
                 },
-                _ => return Ok(vec![EINVAL]),
+                _ => return Ok(EINVAL),
             }
         }
         let staged = match cx.stage_exec(&path, argv_ptr, envp_ptr, mem) {
             Ok(s) => s,
-            Err(e) => return Ok(vec![e]),
+            Err(e) => return Ok(e),
         };
         match staged {
             // A host command runs to completion now, over the files the new process sees, as it
@@ -5995,12 +5956,12 @@ impl Ctx<'_> {
                     },
                 );
                 let _ = self.p.deliver_signal(SIGCHLD);
-                Ok(vec![pid as i64])
+                Ok(pid as i64)
             }
             Staged::Image(cmd) => {
                 self.p.pending_spawn = Some(Box::new(child));
                 req(temen_interp::ParkEvent::SpawnSelf { cmd });
-                Ok(vec![ENOSYS])
+                Ok(ENOSYS)
             }
         }
     }
@@ -6008,7 +5969,7 @@ impl Ctx<'_> {
     /// `exec_win(module_handle) -> size_log2 | -1`: the declared window of the registered command with
     /// this handle, so the shell carves its spawn to match (§14: carve == declared memory). `-1` when
     /// the handle is not a registered command.
-    fn exec_win(&mut self, args: &[i64]) -> Result<Vec<i64>, Trap> {
+    fn exec_win(&mut self, args: &[i64]) -> Result<i64, Trap> {
         let handle = *args.first().ok_or(Trap::Malformed)? as i32;
         let wl = self
             .w
@@ -6022,7 +5983,7 @@ impl Ctx<'_> {
                 _ => None,
             })
             .unwrap_or(-1);
-        Ok(vec![wl])
+        Ok(wl)
     }
 
     /// `exec_stdin(ptr, len) -> stream_handle`: push the guest bytes `[ptr, len)` — the input the shell
@@ -6031,13 +5992,9 @@ impl Ctx<'_> {
     /// when no input pipe was wired (a shell built without filter support). The FIFO is drained by the
     /// child's `read`s (empty ⇒ EOF); it is empty on entry because the previous, synchronous spawn ran
     /// its child to completion.
-    fn exec_stdin(
-        &mut self,
-        args: &[i64],
-        mem: Option<&mut dyn GuestMem>,
-    ) -> Result<Vec<i64>, Trap> {
+    fn exec_stdin(&mut self, args: &[i64], mem: Option<&mut dyn GuestMem>) -> Result<i64, Trap> {
         let Some(fifo) = self.w.exec_stdin_fifo.clone() else {
-            return Ok(vec![-1]);
+            return Ok(-1);
         };
         let mem = mem.ok_or(Trap::Malformed)?;
         let ptr = *args.first().ok_or(Trap::Malformed)? as u64;
@@ -6046,7 +6003,7 @@ impl Ctx<'_> {
         let mut q = fifo.lock().unwrap_or_else(|e| e.into_inner());
         q.clear(); // defensively drop any residue from an aborted prior filter
         q.extend(bytes);
-        Ok(vec![self.w.exec_stdin_handle as i64])
+        Ok(self.w.exec_stdin_handle as i64)
     }
 
     /// Allocate the lowest free fd for `entry`, extending the table if needed.
@@ -6193,35 +6150,35 @@ impl Ctx<'_> {
     /// `getcwd(buf, size) -> buf | 0`: copy the current directory (NUL-terminated, C `getcwd`'s
     /// contract) into the caller's window buffer; return `buf` on success, `-ERANGE` if the path plus
     /// its NUL won't fit `size`. `size == 0` with any path is `-EINVAL` (POSIX).
-    fn getcwd(&mut self, args: &[i64], mem: Option<&mut dyn GuestMem>) -> Result<Vec<i64>, Trap> {
+    fn getcwd(&mut self, args: &[i64], mem: Option<&mut dyn GuestMem>) -> Result<i64, Trap> {
         let mem = mem.ok_or(Trap::Malformed)?;
         let buf = *args.first().ok_or(Trap::Malformed)? as u64;
         let size = (*args.get(1).ok_or(Trap::Malformed)?).max(0) as u64;
         if size == 0 {
-            return Ok(vec![EINVAL]);
+            return Ok(EINVAL);
         }
         let mut bytes = self.p.cwd.clone().into_bytes();
         bytes.push(0); // NUL terminator
         if bytes.len() as u64 > size {
-            return Ok(vec![ERANGE]);
+            return Ok(ERANGE);
         }
         mem.write_bytes(buf, &bytes).ok_or(Trap::Malformed)?;
-        Ok(vec![buf as i64])
+        Ok(buf as i64)
     }
 
     /// `chdir(path, len) -> 0 | -errno`: set the working directory. The memfs is flat, so any UTF-8
     /// path is accepted as-is (no existence check — a follow-up, POSIX.md §6); a non-UTF-8 path is
     /// `-EINVAL`.
-    fn chdir(&mut self, args: &[i64], mem: Option<&mut dyn GuestMem>) -> Result<Vec<i64>, Trap> {
+    fn chdir(&mut self, args: &[i64], mem: Option<&mut dyn GuestMem>) -> Result<i64, Trap> {
         let mem = mem.ok_or(Trap::Malformed)?;
         let ptr = *args.first().ok_or(Trap::Malformed)? as u64;
         let plen = (*args.get(1).ok_or(Trap::Malformed)?).max(0) as u64;
         let bytes = mem.read_bytes(ptr, plen).ok_or(Trap::Malformed)?;
         let Ok(path) = String::from_utf8(bytes) else {
-            return Ok(vec![EINVAL]);
+            return Ok(EINVAL);
         };
         let cwd = self.join_cwd(&path);
-        Ok(vec![if self.p.chdir(cwd) { 0 } else { ENOMEM }])
+        Ok(if self.p.chdir(cwd) { 0 } else { ENOMEM })
     }
 
     /// `getenv(name, len) -> ptr | 0`: look up an environment variable and return a **stable** window
@@ -6229,19 +6186,19 @@ impl Ctx<'_> {
     /// (C `NULL`) if unset. The copy is materialized in the arena once and cached (`env_ptrs`), so a
     /// repeated lookup returns the same pointer; `0` (out of heap) if the arena can't hold it. A
     /// non-UTF-8 name is treated as unset (`0`).
-    fn getenv(&mut self, args: &[i64], mem: Option<&mut dyn GuestMem>) -> Result<Vec<i64>, Trap> {
+    fn getenv(&mut self, args: &[i64], mem: Option<&mut dyn GuestMem>) -> Result<i64, Trap> {
         let mem = mem.ok_or(Trap::Malformed)?;
         let ptr = *args.first().ok_or(Trap::Malformed)? as u64;
         let nlen = (*args.get(1).ok_or(Trap::Malformed)?).max(0) as u64;
         let bytes = mem.read_bytes(ptr, nlen).ok_or(Trap::Malformed)?;
         let Ok(name) = String::from_utf8(bytes) else {
-            return Ok(vec![0]); // a name we can't represent can't be set
+            return Ok(0); // a name we can't represent can't be set
         };
         if let Some(&cached) = self.p.env_ptrs.get(&name) {
-            return Ok(vec![cached as i64]);
+            return Ok(cached as i64);
         }
         let Some(value) = self.p.env.vars.get(&name).cloned() else {
-            return Ok(vec![0]); // unset → NULL
+            return Ok(0); // unset → NULL
         };
         let mut vb = value.into_bytes();
         vb.push(0); // NUL terminator
@@ -6249,24 +6206,24 @@ impl Ctx<'_> {
                     // with no room in the arena.
         let entry = TABLE_ENTRY + name.len() as u64;
         if !self.p.grow_tables(entry) {
-            return Ok(vec![0]);
+            return Ok(0);
         }
         let Some(dst) = self.arena_bump(vb.len() as u64) else {
             self.p.shrink_tables(entry);
-            return Ok(vec![0]); // no room → behave as if unset (best effort)
+            return Ok(0); // no room → behave as if unset (best effort)
         };
         if mem.write_bytes(dst, &vb).is_none() {
             self.p.shrink_tables(entry);
             return Err(Trap::Malformed);
         }
         self.p.env_ptrs.insert(name, dst);
-        Ok(vec![dst as i64])
+        Ok(dst as i64)
     }
 
     /// `setenv(name, nlen, value, vlen, overwrite) -> 0 | -errno`: set (or, when `overwrite == 0` and
     /// the name already exists, leave) an environment variable. Invalidates any cached `getenv` pointer
     /// for the name so the next `getenv` materializes the new value. A non-UTF-8 name/value is `-EINVAL`.
-    fn setenv(&mut self, args: &[i64], mem: Option<&mut dyn GuestMem>) -> Result<Vec<i64>, Trap> {
+    fn setenv(&mut self, args: &[i64], mem: Option<&mut dyn GuestMem>) -> Result<i64, Trap> {
         let mem = mem.ok_or(Trap::Malformed)?;
         let nptr = *args.first().ok_or(Trap::Malformed)? as u64;
         let nlen = (*args.get(1).ok_or(Trap::Malformed)?).max(0) as u64;
@@ -6278,23 +6235,23 @@ impl Ctx<'_> {
         let nb = mem.read_bytes(nptr, nlen).ok_or(Trap::Malformed)?;
         let vb = mem.read_bytes(vptr, vlen).ok_or(Trap::Malformed)?;
         let (Ok(name), Ok(value)) = (String::from_utf8(nb), String::from_utf8(vb)) else {
-            return Ok(vec![EINVAL]);
+            return Ok(EINVAL);
         };
         if overwrite == 0 && self.p.env.vars.contains_key(&name) {
-            return Ok(vec![0]); // keep the existing value
+            return Ok(0); // keep the existing value
         }
         if !Env::set(&mut self.p.env, self.w.payer(), false, name.clone(), value) {
-            return Ok(vec![ENOMEM]); // #2345: no room for it
+            return Ok(ENOMEM); // #2345: no room for it
         }
         self.p.uncache_env(&name); // stale cached pointer no longer reflects the value
-        Ok(vec![0])
+        Ok(0)
     }
 
     /// `getenv_r(name, nlen, buf, cap) -> nbytes | -1`: the value's byte length, written into
     /// `[buf, cap)` when it fits (no NUL — the caller owns the copy); `-1` if unset. A `cap` too small
     /// (or `buf == 0`) still returns the length, so the caller can size a buffer and retry — no arena,
     /// so it never contends with the guest's own heap. A non-UTF-8 name reads as unset.
-    fn getenv_r(&mut self, args: &[i64], mem: Option<&mut dyn GuestMem>) -> Result<Vec<i64>, Trap> {
+    fn getenv_r(&mut self, args: &[i64], mem: Option<&mut dyn GuestMem>) -> Result<i64, Trap> {
         let mem = mem.ok_or(Trap::Malformed)?;
         let nptr = *args.first().ok_or(Trap::Malformed)? as u64;
         let nlen = (*args.get(1).ok_or(Trap::Malformed)?).max(0) as u64;
@@ -6302,55 +6259,55 @@ impl Ctx<'_> {
         let cap = (*args.get(3).ok_or(Trap::Malformed)?).max(0) as u64;
         let nb = mem.read_bytes(nptr, nlen).ok_or(Trap::Malformed)?;
         let Ok(name) = String::from_utf8(nb) else {
-            return Ok(vec![-1]);
+            return Ok(-1);
         };
         let Some(value) = self.p.env.vars.get(&name) else {
-            return Ok(vec![-1]); // unset
+            return Ok(-1); // unset
         };
         let vb = value.as_bytes();
         if buf != 0 && (vb.len() as u64) <= cap {
             mem.write_bytes(buf, vb).ok_or(Trap::Malformed)?;
         }
-        Ok(vec![vb.len() as i64])
+        Ok(vb.len() as i64)
     }
 
     /// `unsetenv(name, nlen) -> 0 | -EINVAL`: remove a variable (absent = success no-op).
-    fn unsetenv(&mut self, args: &[i64], mem: Option<&mut dyn GuestMem>) -> Result<Vec<i64>, Trap> {
+    fn unsetenv(&mut self, args: &[i64], mem: Option<&mut dyn GuestMem>) -> Result<i64, Trap> {
         let mem = mem.ok_or(Trap::Malformed)?;
         let nptr = *args.first().ok_or(Trap::Malformed)? as u64;
         let nlen = (*args.get(1).ok_or(Trap::Malformed)?).max(0) as u64;
         let nb = mem.read_bytes(nptr, nlen).ok_or(Trap::Malformed)?;
         let Ok(name) = String::from_utf8(nb) else {
-            return Ok(vec![EINVAL]);
+            return Ok(EINVAL);
         };
         if !Env::remove(&mut self.p.env, self.w.payer(), &name) {
-            return Ok(vec![ENOMEM]); // #2345: a shared environment's copy has no room
+            return Ok(ENOMEM); // #2345: a shared environment's copy has no room
         }
         self.p.uncache_env(&name);
-        Ok(vec![0])
+        Ok(0)
     }
 
     /// `environ(index, buf, cap) -> len | -1`: the `index`-th `KEY=VALUE` (keys **sorted** for a
     /// deterministic order), written into `[buf, cap)` when it fits (size-then-fetch like `getenv_r`);
     /// `-1` once `index` is past the last variable.
-    fn environ(&mut self, args: &[i64], mem: Option<&mut dyn GuestMem>) -> Result<Vec<i64>, Trap> {
+    fn environ(&mut self, args: &[i64], mem: Option<&mut dyn GuestMem>) -> Result<i64, Trap> {
         let mem = mem.ok_or(Trap::Malformed)?;
         let index = *args.first().ok_or(Trap::Malformed)?;
         let buf = *args.get(1).ok_or(Trap::Malformed)? as u64;
         let cap = (*args.get(2).ok_or(Trap::Malformed)?).max(0) as u64;
         if index < 0 {
-            return Ok(vec![-1]);
+            return Ok(-1);
         }
         let mut keys: Vec<&String> = self.p.env.vars.keys().collect();
         keys.sort();
         let Some(key) = keys.get(index as usize) else {
-            return Ok(vec![-1]); // past the end
+            return Ok(-1); // past the end
         };
         let entry = format!("{key}={}", self.p.env.vars[*key]).into_bytes();
         if buf != 0 && (entry.len() as u64) <= cap {
             mem.write_bytes(buf, &entry).ok_or(Trap::Malformed)?;
         }
-        Ok(vec![entry.len() as i64])
+        Ok(entry.len() as i64)
     }
 
     /// `clock(clock_id) -> nanos`: `clock_id == 1` → monotonic (nanos since this personality started),
@@ -6421,6 +6378,19 @@ mod tests {
     use temen_text::parse_module;
 
     /// A forked process's handler, which this personality always mints synchronous.
+    /// Call a handler with one result slot, as these tests read it (#2319).
+    fn px(
+        h: &mut HostProc,
+        op: u32,
+        args: &[i64],
+        mem: Option<&mut dyn GuestMem>,
+        minter: Option<&mut dyn temen_interp::RegionMinter>,
+    ) -> Result<Vec<i64>, Trap> {
+        let mut out = vec![0];
+        h(op, args, &mut out, mem, minter)?;
+        Ok(out)
+    }
+
     fn sync(h: &mut ProcHandler) -> &mut HostProc {
         match h {
             ProcHandler::Sync(f) => f,
@@ -6510,12 +6480,27 @@ mod tests {
         win[0..4].copy_from_slice(b"/sub");
         let mut mem = temen_interp::WindowMem::new(&mut win, 256);
         assert_eq!(
-            sync(&mut first.handler)(OP_CHDIR, &[0, 4], Some(&mut mem), None).unwrap()[0],
+            px(
+                sync(&mut first.handler),
+                OP_CHDIR,
+                &[0, 4],
+                Some(&mut mem),
+                None
+            )
+            .unwrap()[0],
             0,
             "chdir through the first entry"
         );
         assert!(
-            sync(&mut second.handler)(OP_GETCWD, &[64, 64], Some(&mut mem), None).unwrap()[0] > 0,
+            px(
+                sync(&mut second.handler),
+                OP_GETCWD,
+                &[64, 64],
+                Some(&mut mem),
+                None
+            )
+            .unwrap()[0]
+                > 0,
             "getcwd through the second entry"
         );
         let got = &win[64..][..win[64..].iter().position(|&b| b == 0).unwrap_or(0)];
@@ -6543,10 +6528,10 @@ mod tests {
                 p: &mut p,
                 wake_after: Vec::new(),
             };
-            let fd = st.open(&[0, 2, 0], Some(&mut mem)).unwrap()[0];
+            let fd = st.open(&[0, 2, 0], Some(&mut mem)).unwrap();
             assert!(fd >= 3, "a fresh fd past the stdio sentinels");
             // Advance the description to offset 5 through the parent.
-            assert_eq!(st.read(&[fd, 100, 5], Some(&mut mem)).unwrap()[0], 5);
+            assert_eq!(st.read(&[fd, 100, 5], Some(&mut mem)).unwrap(), 5);
             fd
         };
         p.cwd = "/parent".to_string();
@@ -6590,7 +6575,7 @@ mod tests {
                 p: &mut twin,
                 wake_after: Vec::new(),
             };
-            assert_eq!(tc.read(&[fd, 120, 6], Some(&mut mem)).unwrap()[0], 6);
+            assert_eq!(tc.read(&[fd, 120, 6], Some(&mut mem)).unwrap(), 6);
         }
         assert_eq!(
             mem.read_bytes(120, 6).unwrap(),
@@ -6605,7 +6590,7 @@ mod tests {
                 wake_after: Vec::new(),
             };
             assert_eq!(
-                pc.read(&[fd, 130, 8], Some(&mut mem)).unwrap()[0],
+                pc.read(&[fd, 130, 8], Some(&mut mem)).unwrap(),
                 0,
                 "the twin's read moved the shared offset to EOF for the parent"
             );
@@ -6638,11 +6623,11 @@ mod tests {
         win[0..2].copy_from_slice(b"/f");
         let mut mem = temen_interp::WindowMem::new(&mut win, 256);
         ctx!(posix, w_g, p_g, st);
-        let fd = st.open(&[0, 2, 0], Some(&mut mem)).unwrap()[0];
+        let fd = st.open(&[0, 2, 0], Some(&mut mem)).unwrap();
         let dup = st.dup(&[fd]);
         assert!(dup >= 0 && dup != fd);
-        assert_eq!(st.read(&[fd, 100, 5], Some(&mut mem)).unwrap()[0], 5);
-        assert_eq!(st.read(&[dup, 120, 6], Some(&mut mem)).unwrap()[0], 6);
+        assert_eq!(st.read(&[fd, 100, 5], Some(&mut mem)).unwrap(), 5);
+        assert_eq!(st.read(&[dup, 120, 6], Some(&mut mem)).unwrap(), 6);
         assert_eq!(
             mem.read_bytes(120, 6).unwrap(),
             b" world",
@@ -6662,7 +6647,14 @@ mod tests {
         let mut forked = cap_fork_factory(&posix)(7).expect("the twin fits");
         // The twin installs a handler for signal 10 through its own dispatch.
         assert_eq!(
-            sync(&mut forked.handler)(OP_SIGNAL, &[10, 0x77], None, None).unwrap(),
+            px(
+                sync(&mut forked.handler),
+                OP_SIGNAL,
+                &[10, 0x77],
+                None,
+                None
+            )
+            .unwrap(),
             vec![0]
         );
         {
@@ -6681,7 +6673,7 @@ mod tests {
             );
         }
         assert_eq!(
-            sync(&mut forked.handler)(OP_SIGCHECK, &[], None, None).unwrap(),
+            px(sync(&mut forked.handler), OP_SIGCHECK, &[], None, None).unwrap(),
             vec![0x77],
             "the twin's own sigcheck delivers the pid-targeted signal"
         );
@@ -6696,28 +6688,35 @@ mod tests {
         let (_h, posix) = grant(&mut host, HEAP_BASE, HEAP_END, Vec::new());
         let mut root_handler = handler(Arc::clone(&posix.world), Arc::clone(&posix.root));
         assert_eq!(
-            root_handler(OP_GETPID, &[], None, None).unwrap(),
+            px(&mut root_handler, OP_GETPID, &[], None, None).unwrap(),
             vec![1],
             "the root is pid 1"
         );
         let mut forked = cap_fork_factory(&posix)(9).expect("the twin fits");
         assert_eq!(
-            sync(&mut forked.handler)(OP_GETPID, &[], None, None).unwrap(),
+            px(sync(&mut forked.handler), OP_GETPID, &[], None, None).unwrap(),
             vec![9],
             "a twin's getpid is the pid fork() returned to its parent"
         );
         // Self-kill by own pid: handler + raise + sigcheck, all through the twin's dispatch.
         assert_eq!(
-            sync(&mut forked.handler)(OP_SIGNAL, &[12, 0x99], None, None).unwrap(),
+            px(
+                sync(&mut forked.handler),
+                OP_SIGNAL,
+                &[12, 0x99],
+                None,
+                None
+            )
+            .unwrap(),
             vec![0]
         );
         assert_eq!(
-            sync(&mut forked.handler)(OP_KILL, &[9, 12], None, None).unwrap(),
+            px(sync(&mut forked.handler), OP_KILL, &[9, 12], None, None).unwrap(),
             vec![0],
             "kill(own pid) short-circuits to self — no deadlock on the table entry"
         );
         assert_eq!(
-            sync(&mut forked.handler)(OP_SIGCHECK, &[], None, None).unwrap(),
+            px(sync(&mut forked.handler), OP_SIGCHECK, &[], None, None).unwrap(),
             vec![0x99]
         );
     }
@@ -6740,20 +6739,17 @@ mod tests {
         win[128..136].copy_from_slice(&64u64.to_le_bytes()); // {path, argv, envp, actions, 0}
         let mut mem = temen_interp::WindowMem::new(&mut win, 256);
         ctx!(posix, w_g, p_g, st);
-        let pid = st.pspawn(&[128], Some(&mut mem)).unwrap()[0];
+        let pid = st.pspawn(&[128], Some(&mut mem)).unwrap();
         assert_eq!(pid, 1001, "the allocator skips the twin's occupied pid");
         assert_eq!(st.kill(&[pid, 15]), 0, "a zombie exists until reaped");
         assert_eq!(
-            st.waitpid(&[pid, 0, 0], Some(&mut mem)).unwrap()[0],
+            st.waitpid(&[pid, 0, 0], Some(&mut mem)).unwrap(),
             pid,
             "waitpid reaps the zombie from the table"
         );
         assert_eq!(st.kill(&[pid, 15]), ESRCH, "reaped ⇒ the pid is gone");
         // The live twin at 1000 is NOT reapable through this op (core reap owns fork twins).
-        assert_eq!(
-            st.waitpid(&[1000, 0, 0], Some(&mut mem)).unwrap()[0],
-            ECHILD
-        );
+        assert_eq!(st.waitpid(&[1000, 0, 0], Some(&mut mem)).unwrap(), ECHILD);
     }
 
     /// #863 slice 2 — a deliverable pid-targeted `kill` pokes the TARGET's run wake, and only
@@ -6769,11 +6765,25 @@ mod tests {
         let mut forked = cap_fork_factory(&posix)(7).expect("the twin fits");
         // Deliverability on the twin: caught handler + registered signal stack.
         assert_eq!(
-            sync(&mut forked.handler)(OP_SIGNAL, &[10, 0x77], None, None).unwrap(),
+            px(
+                sync(&mut forked.handler),
+                OP_SIGNAL,
+                &[10, 0x77],
+                None,
+                None
+            )
+            .unwrap(),
             vec![0]
         );
         assert_eq!(
-            sync(&mut forked.handler)(OP_SIGALTSTACK, &[0x500, 0x100], None, None).unwrap(),
+            px(
+                sync(&mut forked.handler),
+                OP_SIGALTSTACK,
+                &[0x500, 0x100],
+                None,
+                None
+            )
+            .unwrap(),
             vec![0]
         );
         let (door, _armed) = forked.signal.as_ref().expect("the twin has its own door");
@@ -6785,7 +6795,7 @@ mod tests {
         // Signal 11 has no handler on the twin: pending is set but nothing is deliverable — no wake
         // (the fire is async — a detached thread — so give a false positive a moment to appear).
         assert_eq!(
-            root_handler(OP_KILL, &[7, 11], None, None).unwrap(),
+            px(&mut root_handler, OP_KILL, &[7, 11], None, None).unwrap(),
             vec![0]
         );
         std::thread::sleep(std::time::Duration::from_millis(30));
@@ -6796,7 +6806,7 @@ mod tests {
         // Signal 10 is caught + unmasked + stack registered: the wake fires — from a detached
         // thread, after the dispatch's locks dropped (slice 3), so poll for it.
         assert_eq!(
-            root_handler(OP_KILL, &[7, 10], None, None).unwrap(),
+            px(&mut root_handler, OP_KILL, &[7, 10], None, None).unwrap(),
             vec![0]
         );
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -6823,7 +6833,7 @@ mod tests {
         {
             ctx!(posix, w_g, p_g, st);
             assert_eq!(
-                st.waitpid(&[7, 0, 0], Some(&mut mem)).unwrap()[0],
+                st.waitpid(&[7, 0, 0], Some(&mut mem)).unwrap(),
                 ECHILD,
                 "a still-running twin is not reapable through this op"
             );
@@ -6840,7 +6850,7 @@ mod tests {
             "an exited-unreaped twin is a zombie — kill succeeds"
         );
         assert_eq!(
-            st.waitpid(&[7, 100, 0], Some(&mut mem)).unwrap()[0],
+            st.waitpid(&[7, 100, 0], Some(&mut mem)).unwrap(),
             7,
             "waitpid reaps the exited fork twin"
         );
@@ -6886,7 +6896,7 @@ mod tests {
             // (Install handlers through the table procs directly — unit-level.)
         }
         assert_eq!(
-            sync(&mut t7.handler)(OP_SIGNAL, &[10, 0x71], None, None).unwrap(),
+            px(sync(&mut t7.handler), OP_SIGNAL, &[10, 0x71], None, None).unwrap(),
             vec![0]
         );
         {
@@ -6899,7 +6909,7 @@ mod tests {
             assert_eq!(st.kill(&[-77, 10]), ESRCH, "an empty group");
         }
         assert_eq!(
-            sync(&mut t7.handler)(OP_SIGCHECK, &[], None, None).unwrap(),
+            px(sync(&mut t7.handler), OP_SIGCHECK, &[], None, None).unwrap(),
             vec![0x71],
             "group member 7's own doorbell rang"
         );
@@ -6929,7 +6939,7 @@ mod tests {
             1,
             "any stdio fd names the one proto-terminal"
         );
-        let file_fd = st.open(&[0, 2, 65], Some(&mut mem)).unwrap()[0]; // O_CREATE|O_WRITE
+        let file_fd = st.open(&[0, 2, 65], Some(&mut mem)).unwrap(); // O_CREATE|O_WRITE
         assert_eq!(
             st.tcgetpgrp(&[file_fd]),
             ENOTTY,
@@ -6938,8 +6948,8 @@ mod tests {
         assert_eq!(st.tcsetpgrp(&[1, 0]), EINVAL, "a non-positive pgid");
         assert_eq!(st.tcsetpgrp(&[1, 42]), EPERM, "an unoccupied group");
         // Foreground I/O rings nothing.
-        assert_eq!(st.write(&[1, 0, 2], Some(&mut mem)).unwrap()[0], 2);
-        assert_eq!(st.read(&[0, 100, 2], Some(&mut mem)).unwrap()[0], 2);
+        assert_eq!(st.write(&[1, 0, 2], Some(&mut mem)).unwrap(), 2);
+        assert_eq!(st.read(&[0, 100, 2], Some(&mut mem)).unwrap(), 2);
         assert_eq!(st.p.sig_pending, 0, "foreground terminal I/O is silent");
         // Move the root into its own group 9 and foreground the twin's group 1: root backgrounded.
         // CATCH the job-control signals first — a caught TTOU/TTIN takes the pending path (the
@@ -6955,7 +6965,7 @@ mod tests {
         // Proto-terminal (no termios): a background write rings caught SIGTTOU (the L0 doorbell — the
         // #1198 TOSTOP gate applies only to a real termios terminal), a background read rings SIGTTIN.
         assert_eq!(
-            st.write(&[1, 0, 2], Some(&mut mem)).unwrap()[0],
+            st.write(&[1, 0, 2], Some(&mut mem)).unwrap(),
             2,
             "the write proceeds"
         );
@@ -6965,7 +6975,7 @@ mod tests {
             "a background terminal write rings caught SIGTTOU"
         );
         assert_eq!(
-            st.read(&[0, 100, 2], Some(&mut mem)).unwrap()[0],
+            st.read(&[0, 100, 2], Some(&mut mem)).unwrap(),
             2,
             "the read proceeds"
         );
@@ -6978,7 +6988,7 @@ mod tests {
         // stop (bookkeeping-only here — a unit Ctx has no core stop closure installed).
         assert_eq!(st.signal(&[SIGTTOU as i64, SIG_DFL]), 0x70);
         st.p.sig_pending = 0;
-        assert_eq!(st.write(&[1, 0, 2], Some(&mut mem)).unwrap()[0], 2);
+        assert_eq!(st.write(&[1, 0, 2], Some(&mut mem)).unwrap(), 2);
         assert_eq!(
             st.p.stopped_sig,
             Some(SIGTTOU),
@@ -7003,7 +7013,7 @@ mod tests {
             "the caller's own group is occupied"
         );
         st.p.sig_pending = 0;
-        assert_eq!(st.write(&[1, 0, 2], Some(&mut mem)).unwrap()[0], 2);
+        assert_eq!(st.write(&[1, 0, 2], Some(&mut mem)).unwrap(), 2);
         assert_eq!(st.p.sig_pending, 0, "foreground once more — no doorbell");
         // A write to the FILE from the background never rings (not the terminal).
         assert_eq!(st.setpgid(&[0, 1]), 0); // background again (fg is 9... self now group 1)
@@ -7012,7 +7022,7 @@ mod tests {
             EPERM,
             "group 9 is now unoccupied — EPERM"
         );
-        assert_eq!(st.write(&[file_fd, 0, 2], Some(&mut mem)).unwrap()[0], 2);
+        assert_eq!(st.write(&[file_fd, 0, 2], Some(&mut mem)).unwrap(), 2);
         assert_eq!(
             st.p.sig_pending & (1 << SIGTTOU),
             0,
@@ -7047,20 +7057,34 @@ mod tests {
 
         // SIGCHLD (17): default-ignore — discarded, no fire, nothing pends.
         assert_eq!(
-            root_handler(OP_KILL, &[7, 17], None, None).unwrap(),
+            px(&mut root_handler, OP_KILL, &[7, 17], None, None).unwrap(),
             vec![0]
         );
         // SIG_IGN'd SIGUSR2 (12): discarded at generation — a reset to SIG_DFL finds nothing.
         assert_eq!(
-            sync(&mut forked.handler)(OP_SIGNAL, &[12, SIG_IGN], None, None).unwrap(),
+            px(
+                sync(&mut forked.handler),
+                OP_SIGNAL,
+                &[12, SIG_IGN],
+                None,
+                None
+            )
+            .unwrap(),
             vec![SIG_DFL]
         );
         assert_eq!(
-            root_handler(OP_KILL, &[7, 12], None, None).unwrap(),
+            px(&mut root_handler, OP_KILL, &[7, 12], None, None).unwrap(),
             vec![0]
         );
         assert_eq!(
-            sync(&mut forked.handler)(OP_SIGNAL, &[12, SIG_DFL], None, None).unwrap(),
+            px(
+                sync(&mut forked.handler),
+                OP_SIGNAL,
+                &[12, SIG_DFL],
+                None,
+                None
+            )
+            .unwrap(),
             vec![SIG_IGN]
         );
         std::thread::sleep(std::time::Duration::from_millis(30));
@@ -7073,12 +7097,18 @@ mod tests {
         // Masked SIGTERM (15): held pending; the unblock runs the default action.
         mem.write_bytes(64, &(1u64 << 15).to_le_bytes()).unwrap();
         assert_eq!(
-            sync(&mut forked.handler)(OP_SIGPROCMASK, &[SIG_BLOCK, 64, 0], Some(&mut mem), None)
-                .unwrap(),
+            px(
+                sync(&mut forked.handler),
+                OP_SIGPROCMASK,
+                &[SIG_BLOCK, 64, 0],
+                Some(&mut mem),
+                None
+            )
+            .unwrap(),
             vec![0]
         );
         assert_eq!(
-            root_handler(OP_KILL, &[7, 15], None, None).unwrap(),
+            px(&mut root_handler, OP_KILL, &[7, 15], None, None).unwrap(),
             vec![0]
         );
         std::thread::sleep(std::time::Duration::from_millis(30));
@@ -7088,8 +7118,14 @@ mod tests {
             "a masked fatal signal is held"
         );
         assert_eq!(
-            sync(&mut forked.handler)(OP_SIGPROCMASK, &[SIG_UNBLOCK, 64, 0], Some(&mut mem), None)
-                .unwrap(),
+            px(
+                sync(&mut forked.handler),
+                OP_SIGPROCMASK,
+                &[SIG_UNBLOCK, 64, 0],
+                Some(&mut mem),
+                None
+            )
+            .unwrap(),
             vec![0]
         );
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -7103,7 +7139,14 @@ mod tests {
         // The core's task completion now fires the exit hook (crash status 128 — what a
         // `ThreadFault` self-termination produces); the personality's bookkeeping wins.
         (forked.exit.take().expect("the twin has an exit hook"))(128);
-        let r = root_handler(OP_WAITPID, &[7, 100, 0], Some(&mut mem), None).unwrap();
+        let r = px(
+            &mut root_handler,
+            OP_WAITPID,
+            &[7, 100, 0],
+            Some(&mut mem),
+            None,
+        )
+        .unwrap();
         assert_eq!(r, vec![7], "the killed twin is reapable");
         let status = i32::from_le_bytes(mem.read_bytes(100, 4).unwrap().try_into().unwrap());
         assert_eq!(status & 0x7f, 15, "WIFSIGNALED: the terminating signal");
@@ -7123,7 +7166,7 @@ mod tests {
             s.store(if stopped { 1 } else { -1 }, Ordering::SeqCst);
         }));
         assert_eq!(
-            root_handler(OP_KILL, &[8, SIGSTOP as i64], None, None).unwrap(),
+            px(&mut root_handler, OP_KILL, &[8, SIGSTOP as i64], None, None).unwrap(),
             vec![0]
         );
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -7132,7 +7175,7 @@ mod tests {
             std::thread::yield_now();
         }
         assert_eq!(
-            root_handler(OP_KILL, &[8, 15], None, None).unwrap(),
+            px(&mut root_handler, OP_KILL, &[8, 15], None, None).unwrap(),
             vec![0]
         );
         std::thread::sleep(std::time::Duration::from_millis(30));
@@ -7142,7 +7185,7 @@ mod tests {
             "a stopped process holds a fatal signal"
         );
         assert_eq!(
-            root_handler(OP_KILL, &[8, SIGCONT as i64], None, None).unwrap(),
+            px(&mut root_handler, OP_KILL, &[8, SIGCONT as i64], None, None).unwrap(),
             vec![0]
         );
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -7168,11 +7211,11 @@ mod tests {
             k.fetch_add(1, Ordering::SeqCst);
         }));
         assert_eq!(
-            root_handler(OP_KILL, &[9, SIGSTOP as i64], None, None).unwrap(),
+            px(&mut root_handler, OP_KILL, &[9, SIGSTOP as i64], None, None).unwrap(),
             vec![0]
         );
         assert_eq!(
-            root_handler(OP_KILL, &[9, SIGKILL as i64], None, None).unwrap(),
+            px(&mut root_handler, OP_KILL, &[9, SIGKILL as i64], None, None).unwrap(),
             vec![0]
         );
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -7186,12 +7229,20 @@ mod tests {
 
         // SIGKILL/SIGSTOP dispositions are immutable.
         assert_eq!(
-            sync(&mut forked3.handler)(OP_SIGNAL, &[SIGKILL as i64, 0x77], None, None).unwrap(),
+            px(
+                sync(&mut forked3.handler),
+                OP_SIGNAL,
+                &[SIGKILL as i64, 0x77],
+                None,
+                None
+            )
+            .unwrap(),
             vec![EINVAL]
         );
         mem.write_bytes(128, &[0u8; 24]).unwrap();
         assert_eq!(
-            sync(&mut forked3.handler)(
+            px(
+                sync(&mut forked3.handler),
                 OP_SIGACTION,
                 &[SIGSTOP as i64, 128, 0],
                 Some(&mut mem),
@@ -7201,7 +7252,8 @@ mod tests {
             vec![EINVAL]
         );
         assert_eq!(
-            sync(&mut forked3.handler)(
+            px(
+                sync(&mut forked3.handler),
                 OP_SIGACTION,
                 &[SIGKILL as i64, 0, 128],
                 Some(&mut mem),
@@ -7237,7 +7289,7 @@ mod tests {
 
         // Default-disposition SIGTSTP: the twin stops; the closure fires (detached thread — poll).
         assert_eq!(
-            root_handler(OP_KILL, &[7, SIGTSTP as i64], None, None).unwrap(),
+            px(&mut root_handler, OP_KILL, &[7, SIGTSTP as i64], None, None).unwrap(),
             vec![0]
         );
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -7249,7 +7301,14 @@ mod tests {
             std::thread::yield_now();
         }
         // WUNTRACED reports the stop, once.
-        let r = root_handler(OP_WAITPID, &[-1, 100, WUNTRACED], Some(&mut mem), None).unwrap();
+        let r = px(
+            &mut root_handler,
+            OP_WAITPID,
+            &[-1, 100, WUNTRACED],
+            Some(&mut mem),
+            None,
+        )
+        .unwrap();
         assert_eq!(
             r,
             vec![7],
@@ -7259,27 +7318,41 @@ mod tests {
         assert_eq!(status & 0xff, 0x7f, "the stopped marker");
         assert_eq!((status >> 8) & 0xff, SIGTSTP, "the stopping signal");
         assert_eq!(
-            root_handler(OP_WAITPID, &[-1, 100, WUNTRACED], Some(&mut mem), None).unwrap(),
+            px(
+                &mut root_handler,
+                OP_WAITPID,
+                &[-1, 100, WUNTRACED],
+                Some(&mut mem),
+                None
+            )
+            .unwrap(),
             vec![ECHILD],
             "report-once"
         );
         // While stopped: an ordinary signal is HELD — the twin's sigcheck stays empty.
         assert_eq!(
-            sync(&mut forked.handler)(OP_SIGNAL, &[10, 0x77], None, None).unwrap(),
+            px(
+                sync(&mut forked.handler),
+                OP_SIGNAL,
+                &[10, 0x77],
+                None,
+                None
+            )
+            .unwrap(),
             vec![0]
         );
         assert_eq!(
-            root_handler(OP_KILL, &[7, 10], None, None).unwrap(),
+            px(&mut root_handler, OP_KILL, &[7, 10], None, None).unwrap(),
             vec![0]
         );
         assert_eq!(
-            sync(&mut forked.handler)(OP_SIGCHECK, &[], None, None).unwrap(),
+            px(sync(&mut forked.handler), OP_SIGCHECK, &[], None, None).unwrap(),
             vec![0],
             "a stopped process delivers nothing"
         );
         // SIGCONT: the closure fires f(false); WCONTINUED reports once; the held 10 now delivers.
         assert_eq!(
-            root_handler(OP_KILL, &[7, SIGCONT as i64], None, None).unwrap(),
+            px(&mut root_handler, OP_KILL, &[7, SIGCONT as i64], None, None).unwrap(),
             vec![0]
         );
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -7290,32 +7363,53 @@ mod tests {
             );
             std::thread::yield_now();
         }
-        let r = root_handler(OP_WAITPID, &[-1, 100, WCONTINUED], Some(&mut mem), None).unwrap();
+        let r = px(
+            &mut root_handler,
+            OP_WAITPID,
+            &[-1, 100, WCONTINUED],
+            Some(&mut mem),
+            None,
+        )
+        .unwrap();
         assert_eq!(r, vec![7], "waitpid(-1, WCONTINUED) reports the continue");
         let status = i32::from_le_bytes(mem.read_bytes(100, 4).unwrap().try_into().unwrap());
         assert_eq!(status, 0xffff, "the continued status word");
         assert_eq!(
-            root_handler(OP_WAITPID, &[-1, 100, WCONTINUED], Some(&mut mem), None).unwrap(),
+            px(
+                &mut root_handler,
+                OP_WAITPID,
+                &[-1, 100, WCONTINUED],
+                Some(&mut mem),
+                None
+            )
+            .unwrap(),
             vec![ECHILD],
             "report-once"
         );
         assert_eq!(
-            sync(&mut forked.handler)(OP_SIGCHECK, &[], None, None).unwrap(),
+            px(sync(&mut forked.handler), OP_SIGCHECK, &[], None, None).unwrap(),
             vec![0x77],
             "the held signal delivers after the continue"
         );
         // A CAUGHT SIGTSTP never stops: ordinary pending.
         assert_eq!(
-            sync(&mut forked.handler)(OP_SIGNAL, &[SIGTSTP as i64, 0x99], None, None).unwrap(),
+            px(
+                sync(&mut forked.handler),
+                OP_SIGNAL,
+                &[SIGTSTP as i64, 0x99],
+                None,
+                None
+            )
+            .unwrap(),
             vec![0]
         );
         dir.store(0, Ordering::SeqCst);
         assert_eq!(
-            root_handler(OP_KILL, &[7, SIGTSTP as i64], None, None).unwrap(),
+            px(&mut root_handler, OP_KILL, &[7, SIGTSTP as i64], None, None).unwrap(),
             vec![0]
         );
         assert_eq!(
-            sync(&mut forked.handler)(OP_SIGCHECK, &[], None, None).unwrap(),
+            px(sync(&mut forked.handler), OP_SIGCHECK, &[], None, None).unwrap(),
             vec![0x99],
             "caught TSTP takes the pending path"
         );
@@ -7781,11 +7875,7 @@ block 0 (vph: i32) {\n\
         let mut mem = temen_interp::WindowMem::new(&mut win, WIN as u64);
 
         // pipe(fds@0) → 0, and stores [rfd=3, wfd=4] (the first free fds after stdio 0/1/2).
-        assert_eq!(
-            st.pipe(&[0], Some(&mut mem)).unwrap(),
-            vec![0],
-            "pipe returns 0"
-        );
+        assert_eq!(st.pipe(&[0], Some(&mut mem)).unwrap(), 0, "pipe returns 0");
         let got = mem.read_bytes(0, 8).unwrap();
         let rfd = i32::from_le_bytes(got[0..4].try_into().unwrap()) as i64;
         let wfd = i32::from_le_bytes(got[4..8].try_into().unwrap()) as i64;
@@ -7794,12 +7884,12 @@ block 0 (vph: i32) {\n\
         // write "hello" to the write end, then drain it from the read end.
         assert_eq!(
             st.write(&[wfd, 16, 5], Some(&mut mem)).unwrap(),
-            vec![5],
+            5,
             "pipe write"
         );
         assert_eq!(
             st.read(&[rfd, 64, 5], Some(&mut mem)).unwrap(),
-            vec![5],
+            5,
             "pipe read count"
         );
         assert_eq!(
@@ -7809,18 +7899,18 @@ block 0 (vph: i32) {\n\
         );
         assert_eq!(
             st.read(&[rfd, 64, 5], Some(&mut mem)).unwrap(),
-            vec![0],
+            0,
             "empty pipe reads 0 (EOF)"
         );
         // Reading a write end / writing a read end is -EBADF (wrong direction).
         assert_eq!(
             st.read(&[wfd, 64, 5], Some(&mut mem)).unwrap(),
-            vec![EBADF],
+            EBADF,
             "read a write end is EBADF"
         );
         assert_eq!(
             st.write(&[rfd, 16, 5], Some(&mut mem)).unwrap(),
-            vec![EBADF],
+            EBADF,
             "write a read end is EBADF"
         );
         // A pipe is not seekable.
@@ -7834,12 +7924,12 @@ block 0 (vph: i32) {\n\
         assert_eq!(st.dup2(&[wfd, 8]), 8, "dup2 returns newfd");
         assert_eq!(
             st.write(&[8, 16, 5], Some(&mut mem)).unwrap(),
-            vec![5],
+            5,
             "write via the dup'd end"
         );
         assert_eq!(
             st.read(&[rfd, 64, 5], Some(&mut mem)).unwrap(),
-            vec![5],
+            5,
             "the original read end sees it"
         );
         assert_eq!(
@@ -7880,7 +7970,7 @@ block 0 (vph: i32) {\n\
         assert_eq!(st.close(&[1]), 0, "close(1) succeeds");
         assert_eq!(
             st.write(&[1, 16, 5], Some(&mut mem)).unwrap(),
-            vec![EBADF],
+            EBADF,
             "write to a closed fd 1 is EBADF"
         );
         assert_eq!(st.close(&[1]), EBADF, "double close is EBADF");
@@ -7934,7 +8024,7 @@ block 0 (vph: i32) {\n\
         {
             ctx!(posix, w_g, p_g, st);
             let mut mem = temen_interp::WindowMem::new(&mut win, WIN as u64);
-            assert_eq!(st.execve(&call, Some(&mut mem)).unwrap(), vec![ENOSYS]);
+            assert_eq!(st.execve(&call, Some(&mut mem)).unwrap(), ENOSYS);
         }
         assert!(
             win[args_base..args_base + 64].iter().all(|&b| b == 0),
@@ -7954,7 +8044,7 @@ block 0 (vph: i32) {\n\
         {
             ctx!(posix, w_g, p_g, st);
             let mut mem = temen_interp::WindowMem::new(&mut win, WIN as u64);
-            assert_eq!(st.execve(&call, Some(&mut mem)).unwrap(), vec![ENOSYS]);
+            assert_eq!(st.execve(&call, Some(&mut mem)).unwrap(), ENOSYS);
         }
         assert_eq!(
             *seen.lock().unwrap(),
@@ -8037,10 +8127,10 @@ block 0 (vph: i32) {\n\
             let mut mem = temen_interp::WindowMem::new(&mut win, WIN as u64);
             assert_eq!(
                 st.pipe_adopt(&[11, 12, 100_500], Some(&mut mem)).unwrap(),
-                vec![0]
+                0
             );
             // No door: refused up front.
-            assert_eq!(st.pspawn(&[100_000], Some(&mut mem)).unwrap(), vec![ENOSYS]);
+            assert_eq!(st.pspawn(&[100_000], Some(&mut mem)).unwrap(), ENOSYS);
         }
         assert!(posix.root.lock().unwrap().pending_spawn.is_none());
 
@@ -8051,7 +8141,7 @@ block 0 (vph: i32) {\n\
         let spawn = |win: &mut Vec<u8>| -> i64 {
             ctx!(posix, w_g, p_g, st);
             let mut mem = temen_interp::WindowMem::new(win, WIN as u64);
-            st.pspawn(&[100_000], Some(&mut mem)).unwrap()[0]
+            st.pspawn(&[100_000], Some(&mut mem)).unwrap()
         };
         // Refusals stage nothing and ask for nothing.
         put(&mut win, 101_000, &[PSPAWN_DUP2, 9, 0, 0]);
@@ -8158,7 +8248,7 @@ block 0 (vph: i32) {\n\
                 "execve" => st.execve(&[100_000, 100_200, 0], Some(&mut mem)),
                 _ => st.exec_resolve(&[100_000, path.len() as i64], Some(&mut mem)),
             };
-            r.unwrap()[0]
+            r.unwrap()
         };
 
         assert_eq!(run("/out/notes", "execve"), EACCES, "not an executable");
@@ -8239,7 +8329,7 @@ block 0 (vph: i32) {\n\
             ctx!(posix, w_g, p_g, st);
             let mut mem = temen_interp::WindowMem::new(&mut win, WIN as u64);
             st.exec_resolve(&[100_000, path.len() as i64], Some(&mut mem))
-                .unwrap()[0]
+                .unwrap()
         };
         assert_eq!(resolve("/work/bin/c"), 5);
         assert_eq!(resolve("bin/c"), ENOENT, "from `/`, `bin/c` is `/bin/c`");
@@ -8602,18 +8692,18 @@ block 0 (vph: i32) {\n\
         // setenv("K", "v1", overwrite=1): name@0 len 1, value staged separately — reuse offset 8 with "v1".
         Env::set(&mut st.p.env, None, true, "K".into(), "v1".into());
         // getenv("K") materializes "v1\0" and caches the pointer.
-        let p1 = st.getenv(&[0, 1], Some(&mut mem)).unwrap()[0];
+        let p1 = st.getenv(&[0, 1], Some(&mut mem)).unwrap();
         assert!(p1 > 0, "getenv returns a non-null arena pointer");
         // setenv("K", "v2", overwrite=1): name@0 len1, value@8 len2.
-        let r = st.setenv(&[0, 1, 8, 2, 1], Some(&mut mem)).unwrap()[0];
+        let r = st.setenv(&[0, 1, 8, 2, 1], Some(&mut mem)).unwrap();
         assert_eq!(r, 0, "setenv succeeds");
         // getenv("K") now re-materializes at a *fresh* pointer holding "v2\0".
-        let p2 = st.getenv(&[0, 1], Some(&mut mem)).unwrap()[0];
+        let p2 = st.getenv(&[0, 1], Some(&mut mem)).unwrap();
         assert_ne!(p2, p1, "setenv invalidated the cached getenv pointer");
         let got = mem.read_bytes(p2 as u64, 3).unwrap();
         assert_eq!(got, b"v2\0", "getenv reflects the setenv'd value");
         // overwrite=0 on an existing name is a no-op (keeps "v2").
-        let r0 = st.setenv(&[0, 1, 8, 2, 0], Some(&mut mem)).unwrap()[0];
+        let r0 = st.setenv(&[0, 1, 8, 2, 0], Some(&mut mem)).unwrap();
         assert_eq!(r0, 0, "setenv(overwrite=0) on existing name returns 0");
         assert_eq!(
             st.p.env.vars.get("K").map(String::as_str),
@@ -8641,24 +8731,24 @@ block 0 (vph: i32) {\n\
 
         // Relative, from the default cwd `/` — the exact shape hexer asked for.
         win_write(&mut mem, 0, b"m.s.idx.nif");
-        let fd = st.open(&[0, 11, 0], Some(&mut mem)).unwrap()[0];
+        let fd = st.open(&[0, 11, 0], Some(&mut mem)).unwrap();
         assert!(fd >= 0, "a relative open resolves against `/`: {fd}");
 
         // Absolute paths are passed through byte-identical, so everything that worked still does.
         win_write(&mut mem, 100, b"/m.s.idx.nif");
-        assert!(st.open(&[100, 12, 0], Some(&mut mem)).unwrap()[0] >= 0);
+        assert!(st.open(&[100, 12, 0], Some(&mut mem)).unwrap() >= 0);
 
         // `chdir` now actually moves: the same relative name resolves somewhere else afterwards.
         win_write(&mut mem, 200, b"/sub");
-        assert_eq!(st.chdir(&[200, 4], Some(&mut mem)).unwrap()[0], 0);
+        assert_eq!(st.chdir(&[200, 4], Some(&mut mem)).unwrap(), 0);
         win_write(&mut mem, 300, b"deep.txt");
-        let fd2 = st.open(&[300, 8, 0], Some(&mut mem)).unwrap()[0];
+        let fd2 = st.open(&[300, 8, 0], Some(&mut mem)).unwrap();
         assert!(fd2 >= 0, "relative open follows the new cwd: {fd2}");
         // ...and the old relative name no longer resolves, which is the half that proves `chdir`
         // is doing something rather than that both names happen to exist.
         win_write(&mut mem, 400, b"m.s.idx.nif");
         assert_eq!(
-            st.open(&[400, 11, 0], Some(&mut mem)).unwrap()[0],
+            st.open(&[400, 11, 0], Some(&mut mem)).unwrap(),
             ENOENT,
             "`/sub/m.s.idx.nif` does not exist"
         );
@@ -8666,7 +8756,7 @@ block 0 (vph: i32) {\n\
         // `..` folds, and cannot climb above the root.
         win_write(&mut mem, 500, b"../m.s.idx.nif");
         assert!(
-            st.open(&[500, 14, 0], Some(&mut mem)).unwrap()[0] >= 0,
+            st.open(&[500, 14, 0], Some(&mut mem)).unwrap() >= 0,
             "`..` folds"
         );
         assert_eq!(
@@ -8685,7 +8775,7 @@ block 0 (vph: i32) {\n\
         assert_eq!(st.resolve("/g"), "/g");
         win_write(&mut mem, 600, b"/g");
         assert!(
-            st.open(&[600, 2, 0], Some(&mut mem)).unwrap()[0] >= 0,
+            st.open(&[600, 2, 0], Some(&mut mem)).unwrap() >= 0,
             "the `\"g\"` seed is reachable as `/g` — one entry, not two"
         );
     }
@@ -8708,9 +8798,9 @@ block 0 (vph: i32) {\n\
         let mut mem = temen_interp::WindowMem::new(&mut win, WIN as u64);
         ctx!(posix, w_g, p_g, st);
 
-        let fd = st.open(&[0, 6, 0], Some(&mut mem)).unwrap()[0];
+        let fd = st.open(&[0, 6, 0], Some(&mut mem)).unwrap();
         assert!(fd >= 0, "open succeeded: {fd}");
-        assert_eq!(st.fstat(&[fd, 500], Some(&mut mem)).unwrap()[0], 0);
+        assert_eq!(st.fstat(&[fd, 500], Some(&mut mem)).unwrap(), 0);
         let size = i64::from_le_bytes(
             mem.read_bytes(500 + STAT_SIZE_OFF as u64, 8)
                 .unwrap()
@@ -8739,8 +8829,8 @@ block 0 (vph: i32) {\n\
         );
 
         // A non-file fd is legal to fstat (POSIX): a FIFO, size 0. An unknown fd is EBADF.
-        assert_eq!(st.fstat(&[1, 500], Some(&mut mem)).unwrap()[0], 0);
-        assert_eq!(st.fstat(&[999, 500], Some(&mut mem)).unwrap()[0], EBADF);
+        assert_eq!(st.fstat(&[1, 500], Some(&mut mem)).unwrap(), 0);
+        assert_eq!(st.fstat(&[999, 500], Some(&mut mem)).unwrap(), EBADF);
     }
 
     /// #1609 — **`st_mtim` orders the memfs's writes**, which is the whole of what a build tool's
@@ -8768,7 +8858,7 @@ block 0 (vph: i32) {\n\
                 win[..p.len()].copy_from_slice(p.as_bytes());
                 let mut mem = temen_interp::WindowMem::new(&mut win, WIN as u64);
                 let plen = p.len() as i64;
-                assert_eq!(st.statp(&[0, plen, 500], Some(&mut mem)).unwrap()[0], 0);
+                assert_eq!(st.statp(&[0, plen, 500], Some(&mut mem)).unwrap(), 0);
                 i64::from_le_bytes(
                     mem.read_bytes(500 + STAT_MTIME_OFF as u64, 8)
                         .unwrap()
@@ -8795,7 +8885,7 @@ block 0 (vph: i32) {\n\
         {
             win[..8].copy_from_slice(b"/src.nim");
             let mut mem = temen_interp::WindowMem::new(&mut win, WIN as u64);
-            let fd = st.open(&[0, 8, 0], Some(&mut mem)).unwrap()[0];
+            let fd = st.open(&[0, 8, 0], Some(&mut mem)).unwrap();
             assert!(fd >= 0, "open /src.nim for reading: {fd}");
         }
         assert_eq!(mtime!("/src.nim"), src, "a read-only open is not a write");
@@ -8881,7 +8971,7 @@ block 0 (vph: i32) {\n\
         let mut mem = temen_interp::WindowMem::new(&mut win, WIN as u64);
         ctx!(posix, w_g, p_g, st);
 
-        assert_eq!(st.statp(&[0, 6, 500], Some(&mut mem)).unwrap()[0], 0);
+        assert_eq!(st.statp(&[0, 6, 500], Some(&mut mem)).unwrap(), 0);
         let mode = u32::from_le_bytes(
             mem.read_bytes(500 + STAT_MODE_OFF as u64, 4)
                 .unwrap()
@@ -8901,7 +8991,7 @@ block 0 (vph: i32) {\n\
         // `open` + `fstat` + `close` could not have served.
         win[..4].copy_from_slice(b"/tmp");
         let mut mem = temen_interp::WindowMem::new(&mut win, WIN as u64);
-        assert_eq!(st.statp(&[0, 4, 500], Some(&mut mem)).unwrap()[0], 0);
+        assert_eq!(st.statp(&[0, 4, 500], Some(&mut mem)).unwrap(), 0);
         let mode = u32::from_le_bytes(
             mem.read_bytes(500 + STAT_MODE_OFF as u64, 4)
                 .unwrap()
@@ -8914,14 +9004,14 @@ block 0 (vph: i32) {\n\
         // different layouts of one lookup, not two notions of what a path is.
         win[..6].copy_from_slice(b"/tmp/a");
         let mut mem = temen_interp::WindowMem::new(&mut win, WIN as u64);
-        assert_eq!(st.stat(&[0, 6, 600], Some(&mut mem)).unwrap()[0], 0);
+        assert_eq!(st.stat(&[0, 6, 600], Some(&mut mem)).unwrap(), 0);
         let short_size = i64::from_le_bytes(mem.read_bytes(608, 8).unwrap().try_into().unwrap());
         assert_eq!(short_size, 5, "OP_STAT keeps its 16-byte convention");
 
         // A path that is neither file nor directory is ENOENT, not a zeroed struct.
         win[..3].copy_from_slice(b"/no");
         let mut mem = temen_interp::WindowMem::new(&mut win, WIN as u64);
-        assert_eq!(st.statp(&[0, 3, 500], Some(&mut mem)).unwrap()[0], ENOENT);
+        assert_eq!(st.statp(&[0, 3, 500], Some(&mut mem)).unwrap(), ENOENT);
     }
 
     #[test]
@@ -8945,24 +9035,24 @@ block 0 (vph: i32) {\n\
         };
 
         // stat("/tmp/a", statbuf@200) → regular file, size 5.
-        assert_eq!(st.stat(&[0, 6, 200], Some(&mut mem)).unwrap()[0], 0);
+        assert_eq!(st.stat(&[0, 6, 200], Some(&mut mem)).unwrap(), 0);
         assert_eq!(rd(&mem, 200), S_IFREG | 0o644, "st_mode: regular file");
         assert_eq!(rd(&mem, 208), 5, "st_size: the file's byte length");
 
         // stat("/tmp") → directory.
-        assert_eq!(st.stat(&[100, 4, 200], Some(&mut mem)).unwrap()[0], 0);
+        assert_eq!(st.stat(&[100, 4, 200], Some(&mut mem)).unwrap(), 0);
         assert_eq!(rd(&mem, 200), S_IFDIR | 0o755, "st_mode: directory");
 
         // stat of an absent path → -ENOENT.
         win_write(&mut mem, 400, b"/nope");
-        assert_eq!(st.stat(&[400, 5, 200], Some(&mut mem)).unwrap()[0], ENOENT);
+        assert_eq!(st.stat(&[400, 5, 200], Some(&mut mem)).unwrap(), ENOENT);
 
         // opendir("/tmp") → children {a, b, sub} (the subdir listed once), sorted, then `0` at end.
-        let dir = st.opendir(&[100, 4], Some(&mut mem)).unwrap()[0];
+        let dir = st.opendir(&[100, 4], Some(&mut mem)).unwrap();
         assert!(dir >= 0, "opendir returns a stream handle");
         let mut got = Vec::new();
         loop {
-            let n = st.readdir(&[dir, 300, 64], Some(&mut mem)).unwrap()[0];
+            let n = st.readdir(&[dir, 300, 64], Some(&mut mem)).unwrap();
             if n == 0 {
                 break;
             }
@@ -8973,7 +9063,7 @@ block 0 (vph: i32) {\n\
         assert_eq!(st.closedir(&[dir]), EBADF, "double closedir is -EBADF");
 
         // opendir of a regular file → -ENOTDIR.
-        assert_eq!(st.opendir(&[0, 6], Some(&mut mem)).unwrap()[0], ENOTDIR);
+        assert_eq!(st.opendir(&[0, 6], Some(&mut mem)).unwrap(), ENOTDIR);
     }
 
     #[test]
@@ -9003,28 +9093,22 @@ block 0 (vph: i32) {\n\
         };
 
         // mkdir("/data/sub") → 0; again → -EEXIST; over a file → -EEXIST; missing parent → -ENOENT.
-        assert_eq!(st.mkdir(&[0, 9, 0o777], Some(&mut mem)).unwrap()[0], 0);
-        assert_eq!(st.mkdir(&[0, 9, 0o777], Some(&mut mem)).unwrap()[0], EEXIST);
-        assert_eq!(
-            st.mkdir(&[16, 10, 0o777], Some(&mut mem)).unwrap()[0],
-            EEXIST
-        );
-        assert_eq!(
-            st.mkdir(&[32, 7, 0o777], Some(&mut mem)).unwrap()[0],
-            ENOENT
-        );
+        assert_eq!(st.mkdir(&[0, 9, 0o777], Some(&mut mem)).unwrap(), 0);
+        assert_eq!(st.mkdir(&[0, 9, 0o777], Some(&mut mem)).unwrap(), EEXIST);
+        assert_eq!(st.mkdir(&[16, 10, 0o777], Some(&mut mem)).unwrap(), EEXIST);
+        assert_eq!(st.mkdir(&[32, 7, 0o777], Some(&mut mem)).unwrap(), ENOENT);
 
         // The new empty dir stats as a directory and joins its parent's listing.
-        assert_eq!(st.stat(&[0, 9, 512], Some(&mut mem)).unwrap()[0], 0);
+        assert_eq!(st.stat(&[0, 9, 512], Some(&mut mem)).unwrap(), 0);
         assert_eq!(
             rd(&mem, 512),
             S_IFDIR | 0o755,
             "mkdir'd path stats as a directory"
         );
-        let dir = st.opendir(&[48, 5], Some(&mut mem)).unwrap()[0];
+        let dir = st.opendir(&[48, 5], Some(&mut mem)).unwrap();
         let mut got = Vec::new();
         loop {
-            let n = st.readdir(&[dir, 600, 64], Some(&mut mem)).unwrap()[0];
+            let n = st.readdir(&[dir, 600, 64], Some(&mut mem)).unwrap();
             if n == 0 {
                 break;
             }
@@ -9038,35 +9122,32 @@ block 0 (vph: i32) {\n\
         );
 
         // rmdir: -ENOTEMPTY on a populated dir, -ENOTDIR on a file, success on the empty explicit dir.
-        assert_eq!(st.rmdir(&[48, 5], Some(&mut mem)).unwrap()[0], ENOTEMPTY);
-        assert_eq!(st.rmdir(&[16, 10], Some(&mut mem)).unwrap()[0], ENOTDIR);
-        assert_eq!(st.rmdir(&[0, 9], Some(&mut mem)).unwrap()[0], 0);
-        assert_eq!(st.stat(&[0, 9, 512], Some(&mut mem)).unwrap()[0], ENOENT);
+        assert_eq!(st.rmdir(&[48, 5], Some(&mut mem)).unwrap(), ENOTEMPTY);
+        assert_eq!(st.rmdir(&[16, 10], Some(&mut mem)).unwrap(), ENOTDIR);
+        assert_eq!(st.rmdir(&[0, 9], Some(&mut mem)).unwrap(), 0);
+        assert_eq!(st.stat(&[0, 9, 512], Some(&mut mem)).unwrap(), ENOENT);
 
         // rename a file: /data/seed → /data/renamed (contents follow, old name gone).
-        assert_eq!(st.rename(&[16, 10, 64, 13], Some(&mut mem)).unwrap()[0], 0);
-        assert_eq!(st.stat(&[16, 10, 512], Some(&mut mem)).unwrap()[0], ENOENT);
-        assert_eq!(st.stat(&[64, 13, 512], Some(&mut mem)).unwrap()[0], 0);
+        assert_eq!(st.rename(&[16, 10, 64, 13], Some(&mut mem)).unwrap(), 0);
+        assert_eq!(st.stat(&[16, 10, 512], Some(&mut mem)).unwrap(), ENOENT);
+        assert_eq!(st.stat(&[64, 13, 512], Some(&mut mem)).unwrap(), 0);
         assert_eq!(rd(&mem, 520), 1, "renamed file keeps its 1-byte contents");
 
         // rename a directory subtree: /data/d → /data/e (its file moves with it).
-        assert_eq!(st.rename(&[80, 7, 96, 7], Some(&mut mem)).unwrap()[0], 0);
+        assert_eq!(st.rename(&[80, 7, 96, 7], Some(&mut mem)).unwrap(), 0);
         assert_eq!(
-            st.stat(&[112, 13, 512], Some(&mut mem)).unwrap()[0],
+            st.stat(&[112, 13, 512], Some(&mut mem)).unwrap(),
             0,
             "/data/e/inner exists"
         );
         assert_eq!(
-            st.stat(&[128, 13, 512], Some(&mut mem)).unwrap()[0],
+            st.stat(&[128, 13, 512], Some(&mut mem)).unwrap(),
             ENOENT,
             "old subtree gone"
         );
 
         // rename of a missing source → -ENOENT.
-        assert_eq!(
-            st.rename(&[32, 7, 96, 7], Some(&mut mem)).unwrap()[0],
-            ENOENT
-        );
+        assert_eq!(st.rename(&[32, 7, 96, 7], Some(&mut mem)).unwrap(), ENOENT);
     }
 
     #[test]
@@ -9084,7 +9165,7 @@ block 0 (vph: i32) {\n\
         ctx!(posix, w_g, p_g, st);
 
         // bind :0 → listener fd + the actual bound addr (ephemeral port) written at 100.
-        let lfd = st.net_bind(&[0, 7, 100, 32], Some(&mut mem)).unwrap()[0];
+        let lfd = st.net_bind(&[0, 7, 100, 32], Some(&mut mem)).unwrap();
         assert!(lfd >= 0, "bind returns a listener fd");
         let bound = mem.read_bytes(100, 7).unwrap();
         assert_eq!(bound[0], 4, "bound family");
@@ -9092,18 +9173,15 @@ block 0 (vph: i32) {\n\
         assert!(port >= 49152, "ephemeral port assigned: {port}");
 
         // accept before any connect → -EAGAIN.
-        assert_eq!(
-            st.net_accept(&[lfd, 0, 0], Some(&mut mem)).unwrap()[0],
-            EAGAIN
-        );
+        assert_eq!(st.net_accept(&[lfd, 0, 0], Some(&mut mem)).unwrap(), EAGAIN);
 
         // connect to the bound port (blob at 200) → client fd, local addr written at 300.
         win_write(&mut mem, 200, &[4u8, bound[1], bound[2], 127, 0, 0, 1]);
-        let cfd = st.net_connect(&[200, 7, 300, 32], Some(&mut mem)).unwrap()[0];
+        let cfd = st.net_connect(&[200, 7, 300, 32], Some(&mut mem)).unwrap();
         assert!(cfd >= 0, "connect returns a socket fd");
 
         // accept → server fd; the written peer addr matches the client's local addr.
-        let sfd = st.net_accept(&[lfd, 400, 32], Some(&mut mem)).unwrap()[0];
+        let sfd = st.net_accept(&[lfd, 400, 32], Some(&mut mem)).unwrap();
         assert!(sfd >= 0, "accept returns a socket fd");
         assert_eq!(
             mem.read_bytes(400, 7).unwrap(),
@@ -9113,20 +9191,20 @@ block 0 (vph: i32) {\n\
 
         // client → server bytes through the ordinary write/read ops.
         win_write(&mut mem, 500, b"ping");
-        assert_eq!(st.write(&[cfd, 500, 4], Some(&mut mem)).unwrap()[0], 4);
-        assert_eq!(st.read(&[sfd, 600, 16], Some(&mut mem)).unwrap()[0], 4);
+        assert_eq!(st.write(&[cfd, 500, 4], Some(&mut mem)).unwrap(), 4);
+        assert_eq!(st.read(&[sfd, 600, 16], Some(&mut mem)).unwrap(), 4);
         assert_eq!(mem.read_bytes(600, 4).unwrap(), b"ping");
         // server → client.
         win_write(&mut mem, 500, b"pong!");
-        assert_eq!(st.write(&[sfd, 500, 5], Some(&mut mem)).unwrap()[0], 5);
-        assert_eq!(st.read(&[cfd, 600, 16], Some(&mut mem)).unwrap()[0], 5);
+        assert_eq!(st.write(&[sfd, 500, 5], Some(&mut mem)).unwrap(), 5);
+        assert_eq!(st.read(&[cfd, 600, 16], Some(&mut mem)).unwrap(), 5);
         assert_eq!(mem.read_bytes(600, 5).unwrap(), b"pong!");
 
         // Empty with a live peer → -EAGAIN; after the client closes → 0 (EOF).
-        assert_eq!(st.read(&[sfd, 600, 16], Some(&mut mem)).unwrap()[0], EAGAIN);
+        assert_eq!(st.read(&[sfd, 600, 16], Some(&mut mem)).unwrap(), EAGAIN);
         assert_eq!(st.close(&[cfd]), 0);
         assert_eq!(
-            st.read(&[sfd, 600, 16], Some(&mut mem)).unwrap()[0],
+            st.read(&[sfd, 600, 16], Some(&mut mem)).unwrap(),
             0,
             "EOF after close"
         );
@@ -9134,33 +9212,33 @@ block 0 (vph: i32) {\n\
         // Refusals: no listener on a random port; bind beyond loopback; bind on the held port.
         win_write(&mut mem, 700, &[4u8, 0x39, 0x30, 127, 0, 0, 1]); // port 12345
         assert_eq!(
-            st.net_connect(&[700, 7, 0, 0], Some(&mut mem)).unwrap()[0],
+            st.net_connect(&[700, 7, 0, 0], Some(&mut mem)).unwrap(),
             ECONNREFUSED
         );
         win_write(&mut mem, 700, &[4u8, 0x50, 0x00, 8, 8, 8, 8]); // 8.8.8.8:80
         assert_eq!(
-            st.net_bind(&[700, 7, 0, 0], Some(&mut mem)).unwrap()[0],
+            st.net_bind(&[700, 7, 0, 0], Some(&mut mem)).unwrap(),
             EACCES
         );
         assert_eq!(
-            st.net_connect(&[700, 7, 0, 0], Some(&mut mem)).unwrap()[0],
+            st.net_connect(&[700, 7, 0, 0], Some(&mut mem)).unwrap(),
             ECONNREFUSED,
             "non-loopback connect with no delegate fails closed"
         );
         win_write(&mut mem, 700, &[4u8, bound[1], bound[2], 127, 0, 0, 1]);
         assert_eq!(
-            st.net_bind(&[700, 7, 0, 0], Some(&mut mem)).unwrap()[0],
+            st.net_bind(&[700, 7, 0, 0], Some(&mut mem)).unwrap(),
             EADDRINUSE
         );
 
         // Shutdown-write on the server end → its peer... (client closed) writing now is -EPIPE.
         assert_eq!(st.net_shutdown(&[sfd, 1]), 0);
         win_write(&mut mem, 500, b"x");
-        assert_eq!(st.write(&[sfd, 500, 1], Some(&mut mem)).unwrap()[0], EPIPE);
+        assert_eq!(st.write(&[sfd, 500, 1], Some(&mut mem)).unwrap(), EPIPE);
 
         // Closing the listener releases the port: a rebind of the same port now succeeds.
         assert_eq!(st.close(&[lfd]), 0);
-        assert!(st.net_bind(&[700, 7, 0, 0], Some(&mut mem)).unwrap()[0] >= 0);
+        assert!(st.net_bind(&[700, 7, 0, 0], Some(&mut mem)).unwrap() >= 0);
     }
 
     #[test]
@@ -9207,13 +9285,13 @@ block 0 (vph: i32) {\n\
 
         // resolve("localhost") → the loopback blob, no delegate involved.
         win_write(&mut mem, 0, b"localhost");
-        let n = st.net_resolve(&[0, 9, 100, 32], Some(&mut mem)).unwrap()[0];
+        let n = st.net_resolve(&[0, 9, 100, 32], Some(&mut mem)).unwrap();
         assert_eq!(n, 7);
         assert_eq!(mem.read_bytes(100, 7).unwrap(), &[4u8, 0, 0, 127, 0, 0, 1]);
 
         // resolve("example.com") → the delegate's answer.
         win_write(&mut mem, 0, b"example.com");
-        let n = st.net_resolve(&[0, 11, 100, 32], Some(&mut mem)).unwrap()[0];
+        let n = st.net_resolve(&[0, 11, 100, 32], Some(&mut mem)).unwrap();
         assert_eq!(n, 7);
         assert_eq!(
             mem.read_bytes(100, 7).unwrap(),
@@ -9222,11 +9300,11 @@ block 0 (vph: i32) {\n\
 
         // connect(93.184.216.34:80) → a delegate-backed stream; send/recv round-trip the script.
         win_write(&mut mem, 200, &[4u8, 80, 0, 93, 184, 216, 34]);
-        let fd = st.net_connect(&[200, 7, 0, 0], Some(&mut mem)).unwrap()[0];
+        let fd = st.net_connect(&[200, 7, 0, 0], Some(&mut mem)).unwrap();
         assert!(fd >= 0, "delegate connect returns a socket fd");
         win_write(&mut mem, 300, b"GET /");
-        assert_eq!(st.write(&[fd, 300, 5], Some(&mut mem)).unwrap()[0], 5);
-        let n = st.read(&[fd, 400, 64], Some(&mut mem)).unwrap()[0];
+        assert_eq!(st.write(&[fd, 300, 5], Some(&mut mem)).unwrap(), 5);
+        let n = st.read(&[fd, 400, 64], Some(&mut mem)).unwrap();
         assert_eq!(mem.read_bytes(400, n as u64).unwrap(), b"HTTP/1.1 200 OK");
     }
 
@@ -9247,11 +9325,11 @@ block 0 (vph: i32) {\n\
         ctx!(posix, w_g, p_g, st);
 
         assert_eq!(st.p.args.len() as i64, 3, "argc");
-        assert_eq!(st.argv(&[1, 0, 64], Some(&mut mem)).unwrap()[0], 2); // "-c" len 2
+        assert_eq!(st.argv(&[1, 0, 64], Some(&mut mem)).unwrap(), 2); // "-c" len 2
         assert_eq!(mem.read_bytes(0, 3).unwrap(), b"-c\0");
-        assert_eq!(st.argv(&[2, 100, 64], Some(&mut mem)).unwrap()[0], 7); // "echo hi"
+        assert_eq!(st.argv(&[2, 100, 64], Some(&mut mem)).unwrap(), 7); // "echo hi"
         assert_eq!(mem.read_bytes(100, 8).unwrap(), b"echo hi\0");
-        assert_eq!(st.argv(&[9, 0, 64], Some(&mut mem)).unwrap()[0], EINVAL);
+        assert_eq!(st.argv(&[9, 0, 64], Some(&mut mem)).unwrap(), EINVAL);
     }
 
     #[test]
@@ -9376,11 +9454,11 @@ block 0 () {\n\
         let mut mem = temen_interp::WindowMem::new(&mut win, 256);
         {
             ctx!(posix, w_g, p_g, st);
-            let fd = st.open(&[0, 2, O_CREAT | O_RDWR], Some(&mut mem)).unwrap()[0];
+            let fd = st.open(&[0, 2, O_CREAT | O_RDWR], Some(&mut mem)).unwrap();
             assert!(fd >= 0);
             assert_eq!(st.lseek(&[fd, 1 << 40, SEEK_SET]), 1 << 40);
             let write = |st: &mut Ctx, fd, mem: &mut temen_interp::WindowMem| {
-                st.write(&[fd, 0, 200], Some(mem)).unwrap()[0]
+                st.write(&[fd, 0, 200], Some(mem)).unwrap()
             };
             assert_eq!(write(&mut st, fd, &mut mem), ENOSPC, "a far write");
             assert_eq!(
@@ -9389,11 +9467,11 @@ block 0 () {\n\
                 "past what an offset holds"
             );
             assert_eq!(
-                st.read(&[fd, 0, 8], Some(&mut mem)).unwrap()[0],
+                st.read(&[fd, 0, 8], Some(&mut mem)).unwrap(),
                 0,
                 "a read past the end"
             );
-            assert_eq!(st.pipe(&[100], Some(&mut mem)).unwrap()[0], 0);
+            assert_eq!(st.pipe(&[100], Some(&mut mem)).unwrap(), 0);
             let w = i32::from_le_bytes(mem.read_bytes(104, 4).unwrap().try_into().unwrap());
             let queued = std::iter::repeat_with(|| write(&mut st, w as i64, &mut mem))
                 .take_while(|&n| n == 200)
@@ -9433,7 +9511,7 @@ block 0 () {\n\
         {
             ctx!(posix, w_g, p_g, st);
             let mut set = |st: &mut Ctx, name: i64, len: i64| {
-                st.setenv(&[name, 4, 64, len, 1], Some(&mut mem)).unwrap()[0]
+                st.setenv(&[name, 4, 64, len, 1], Some(&mut mem)).unwrap()
             };
             assert_eq!(set(&mut st, 0, 20 << 10), 0, "a variable that fits");
             let held = host.channel_used();
@@ -9506,14 +9584,14 @@ block 0 () {\n\
             );
             let (full, held) = (host.channel_used(), st.p.held);
             assert_eq!(st.dup(&[1]), EMFILE, "no room for a descriptor's slot");
-            let open = st.open(&[0, 2, O_CREAT | O_RDWR], Some(&mut mem)).unwrap()[0];
+            let open = st.open(&[0, 2, O_CREAT | O_RDWR], Some(&mut mem)).unwrap();
             assert_eq!(open, EMFILE, "an open refused for one");
             assert!(!st.w.files.contains_key("/d"), "makes no file");
-            let chdir = st.chdir(&[0, 200], Some(&mut mem)).unwrap()[0];
+            let chdir = st.chdir(&[0, 200], Some(&mut mem)).unwrap();
             assert_eq!(chdir, ENOMEM, "nor for a longer directory");
             assert_eq!(st.p.cwd, "/");
             let getenv = |st: &mut Ctx, mem: &mut temen_interp::WindowMem| {
-                st.getenv(&[255, 1], Some(mem)).unwrap()[0]
+                st.getenv(&[255, 1], Some(mem)).unwrap()
             };
             assert_eq!(getenv(&mut st, &mut mem), 0, "nor for a getenv's copy");
             assert_eq!(host.channel_used(), full, "a refusal charges nothing");
@@ -9555,7 +9633,7 @@ block 0 () {\n\
         let execve = |posix: &Posix, win: &mut Vec<u8>| {
             ctx!(posix, w_g, p_g, st);
             let mut mem = temen_interp::WindowMem::new(win, WIN as u64);
-            st.execve(&call, Some(&mut mem)).unwrap()[0]
+            st.execve(&call, Some(&mut mem)).unwrap()
         };
         host.set_grant(-1, held + (6 << 10), -1, -1);
         assert_eq!(execve(&posix, &mut win), ENOMEM, "no room for both copies");
@@ -9590,13 +9668,13 @@ block 0 () {\n\
         let fork = cap_fork_factory(&posix);
         {
             ctx!(posix, w_g, p_g, st);
-            assert_eq!(st.mkdir(&[0, 2, 0], Some(&mut mem)).unwrap()[0], 0);
+            assert_eq!(st.mkdir(&[0, 2, 0], Some(&mut mem)).unwrap(), 0);
             for n in 0..20 {
                 let name = format!("/d/{n:0>40}");
                 assert!(st.w.table(&name));
                 st.w.files.insert(name, MemFile::default());
             }
-            assert!(st.opendir(&[0, 2], Some(&mut mem)).unwrap()[0] >= 0);
+            assert!(st.opendir(&[0, 2], Some(&mut mem)).unwrap() >= 0);
         }
         let held = host.channel_used();
         let mut twin = fork(7).expect("room for its copies");
@@ -9636,7 +9714,7 @@ block 0 () {\n\
         ctx!(posix, w_g, p_g, st);
         assert_eq!(st.kill(&[i64::MIN, 0]), ESRCH);
         assert_eq!(
-            st.waitpid(&[i64::MIN, 0, 0], Some(&mut mem)).unwrap()[0],
+            st.waitpid(&[i64::MIN, 0, 0], Some(&mut mem)).unwrap(),
             ECHILD
         );
         let own = i64::from(st.p.pgid);
@@ -9663,7 +9741,7 @@ block 0 () {\n\
         assert_eq!(st.p.fds.len(), FD_MAX, "the table stops at the bound");
         assert_eq!(st.dup(&[1]), EMFILE);
         assert_eq!(
-            st.open(&[0, 2, O_CREAT | O_RDWR], Some(&mut mem)).unwrap()[0],
+            st.open(&[0, 2, O_CREAT | O_RDWR], Some(&mut mem)).unwrap(),
             EMFILE
         );
         assert!(
@@ -9671,7 +9749,7 @@ block 0 () {\n\
             "the refused open made no file"
         );
         st.p.fds[FD_MAX - 2] = None;
-        assert_eq!(st.pipe(&[100], Some(&mut mem)).unwrap()[0], EMFILE);
+        assert_eq!(st.pipe(&[100], Some(&mut mem)).unwrap(), EMFILE);
         assert!(
             st.p.fds[FD_MAX - 2].is_none(),
             "a pipe is both ends or none"
@@ -9701,26 +9779,26 @@ block 0 () {\n\
         };
         {
             ctx!(posix, w_g, p_g, st);
-            assert_eq!(st.mkdir(&[0, 2, 0], Some(&mut mem)).unwrap()[0], 0);
+            assert_eq!(st.mkdir(&[0, 2, 0], Some(&mut mem)).unwrap(), 0);
             let a = st
                 .open(&[2, 4, O_CREAT | O_WRONLY], Some(&mut mem))
-                .unwrap()[0];
+                .unwrap();
             assert!(a >= 0);
             assert_eq!(
-                st.rename(&[2, 4, 6, 5], Some(&mut mem)).unwrap()[0],
+                st.rename(&[2, 4, 6, 5], Some(&mut mem)).unwrap(),
                 0,
                 "/d/a → /d/bb"
             );
-            let dir = st.opendir(&[0, 2], Some(&mut mem)).unwrap()[0];
+            let dir = st.opendir(&[0, 2], Some(&mut mem)).unwrap();
             assert!(dir >= 0);
             assert_eq!(
-                st.rename(&[0, 2, 11, 2], Some(&mut mem)).unwrap()[0],
+                st.rename(&[0, 2, 11, 2], Some(&mut mem)).unwrap(),
                 0,
                 "/d → /e"
             );
             let long = st
                 .open(&[13, 11, O_CREAT | O_WRONLY], Some(&mut mem))
-                .unwrap()[0];
+                .unwrap();
             assert_eq!(long, ENOSPC, "a name with no room left: {long}");
             assert_eq!(st.closedir(&[dir]), 0);
         }

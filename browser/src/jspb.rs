@@ -24,6 +24,7 @@
 
 use std::cell::Cell;
 use std::sync::Arc;
+use temen_interp::put_results;
 
 use temen_interp::{
     CapState, ForkedProc, GuestMem, Host, HostProcFork, HostProcGrant, ProcHandler,
@@ -74,8 +75,9 @@ pub(crate) fn grant_js_caps(host: &mut Host, names: &[String]) -> Vec<(String, i
         .iter()
         .enumerate()
         .map(|(slot, name)| {
-            let call: UnlockedHostProc =
-                Arc::new(move |op, args, mem| Ok(vec![dispatch(slot as u32, op, args, mem)]));
+            let call: UnlockedHostProc = Arc::new(move |op, args, out, mem| {
+                put_results(out, &[dispatch(slot as u32, op, args, mem)])
+            });
             let twin = Arc::clone(&call);
             let fork: HostProcFork = Arc::new(move |_pid| {
                 Some(ForkedProc::shared(

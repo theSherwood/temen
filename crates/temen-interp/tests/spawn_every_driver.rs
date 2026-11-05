@@ -481,7 +481,7 @@ fn detached_tree_setup(
             unreachable!("detached_setup hands the budget third")
         };
         let node = h
-            .cap_dispatch_slots(cap_id::BUDGET, 0, root, &[-1, node_mem, -1], None)
+            .cap_call(cap_id::BUDGET, 0, root, &[-1, node_mem, -1], 1, None)
             .expect("split")[0] as i32;
         assert!(h.budget_mem_take(root, root_used), "the root's own use");
         if !pay_root {
@@ -560,7 +560,7 @@ fn detached_fuel_setup(child: &Module, fuel: i64) -> impl Fn() -> (Host, Vec<Val
             unreachable!("detached_setup hands the budget third")
         };
         let node = h
-            .cap_dispatch_slots(cap_id::BUDGET, 0, root, &[fuel, -1, -1], None)
+            .cap_call(cap_id::BUDGET, 0, root, &[fuel, -1, -1], 1, None)
             .expect("split")[0];
         args[2] = Value::I32(node as i32);
         (h, args)
@@ -1191,7 +1191,7 @@ fn a_detached_childs_pipes_are_capped_by_its_budget() {
             unreachable!("detached_setup hands the budget third")
         };
         let node = h
-            .cap_dispatch_slots(cap_id::BUDGET, 0, root, &[-1, -1, -1, PIPE_CAP], None)
+            .cap_call(cap_id::BUDGET, 0, root, &[-1, -1, -1, PIPE_CAP], 1, None)
             .expect("split")[0];
         args[2] = Value::I32(node as i32);
         (h, args)

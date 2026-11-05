@@ -16,6 +16,7 @@ use std::sync::Arc;
 use temen_durable::{
     begin_thaw, init_durable_window, read_state, transform_module, STATE_UNWINDING,
 };
+use temen_interp::put_results;
 use temen_interp::{run_capture_reserved_with_host, Host, HostProcGrant, ProcHandler, Trap, Value};
 use temen_ir::Memory;
 
@@ -68,7 +69,7 @@ fn run(
     host.set_durable(true);
     let calls = Arc::new(AtomicI64::new(0));
     let hf = host.grant_host_proc(HostProcGrant::new(
-        ProcHandler::Sync(Box::new(move |_op, _args, mem, _| {
+        ProcHandler::Sync(Box::new(move |_op, _args, out, mem, _| {
             let n = calls.fetch_add(1, Ordering::Relaxed) + 1;
             if Some(n) == freeze_on {
                 let mem = mem.expect("a window");
@@ -79,7 +80,7 @@ fn run(
                 mem.write_bytes(word, &STATE_UNWINDING.to_le_bytes())
                     .expect("the freeze word is mapped");
             }
-            Ok(vec![made + n])
+            put_results(out, &[made + n])
         })),
         temen_interp::CapState::Stateless,
     ));

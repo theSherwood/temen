@@ -55,7 +55,7 @@ fn blocking_call_fails_closed_once_a_freeze_has_landed() {
 
     // Freeze landed (UNWINDING): entering a new blocking offload would stall the STW, so refuse.
     set_state(&mut mem, STATE_UNWINDING);
-    let refused = host.cap_dispatch_slots(cap_id::BLOCKING, 0, h, &[7], Some(&mut mem));
+    let refused = host.cap_call(cap_id::BLOCKING, 0, h, &[7], 1, Some(&mut mem));
     assert!(
         matches!(refused, Err(Trap::ThreadFault)),
         "freeze landed → blocking call must fail closed, got {refused:?}",
@@ -63,7 +63,7 @@ fn blocking_call_fails_closed_once_a_freeze_has_landed() {
 
     // No freeze (NORMAL): the same call runs and returns its one deterministic result.
     set_state(&mut mem, STATE_NORMAL);
-    let ran = host.cap_dispatch_slots(cap_id::BLOCKING, 0, h, &[7], Some(&mut mem));
+    let ran = host.cap_call(cap_id::BLOCKING, 0, h, &[7], 1, Some(&mut mem));
     assert!(
         matches!(&ran, Ok(v) if v.len() == 1),
         "no freeze → blocking call must run, got {ran:?}",
@@ -80,7 +80,7 @@ fn blocking_call_runs_when_not_durable_even_if_the_freeze_word_looks_like_unwind
     let mut mem = VecMem(vec![0u8; 8192], ARENA);
     set_state(&mut mem, STATE_UNWINDING); // a coincidental guest byte pattern, not a freeze word
 
-    let ran = host.cap_dispatch_slots(cap_id::BLOCKING, 0, h, &[7], Some(&mut mem));
+    let ran = host.cap_call(cap_id::BLOCKING, 0, h, &[7], 1, Some(&mut mem));
     assert!(
         matches!(&ran, Ok(v) if v.len() == 1),
         "non-durable: the bytes are guest data, the blocking call must run, got {ran:?}",
@@ -97,7 +97,7 @@ fn blocking_call_runs_in_a_window_without_an_arena() {
     let mut mem = VecMem(vec![0u8; 8192], ShadowArena::EMPTY);
     set_state(&mut mem, STATE_UNWINDING);
 
-    let ran = host.cap_dispatch_slots(cap_id::BLOCKING, 0, h, &[7], Some(&mut mem));
+    let ran = host.cap_call(cap_id::BLOCKING, 0, h, &[7], 1, Some(&mut mem));
     assert!(
         matches!(&ran, Ok(v) if v.len() == 1),
         "no arena: no freeze word, the blocking call must run, got {ran:?}",

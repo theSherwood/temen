@@ -28,6 +28,7 @@ mod rec;
 
 use std::sync::{Arc, Mutex};
 use temen_interp::bytecode::{ModuleEmitter, ModuleOffer, ProgramEmit, TierUpConfig};
+use temen_interp::put_results;
 use temen_interp::{
     bytecode, CapState, ForkedProc, Host, HostProc, HostProcFork, HostProcGrant, ParkEvent,
     ProcHandler, SignalSource, Trap, Value,
@@ -1417,7 +1418,7 @@ fn grant_proc_doors(host: &mut Host) -> i32 {
     let door = Arc::new(ParkDoor::default());
     let exited: Arc<Mutex<Option<i64>>> = Arc::default();
     let (ask, status) = (Arc::clone(&door), Arc::clone(&exited));
-    let doors: HostProc = Box::new(move |op, args, _, _| {
+    let doors: HostProc = Box::new(move |op, args, out, _, _| {
         let (park, r) = match (op, *status.lock().unwrap()) {
             (0, _) => (Some(ParkEvent::ForkSelf), ENOSYS),
             (_, Some(s)) => (None, s),
@@ -1426,7 +1427,7 @@ fn grant_proc_doors(host: &mut Host) -> i32 {
         if let (Some(ev), Some(req)) = (park, ask.0.lock().unwrap().clone()) {
             req(ev);
         }
-        Ok(vec![r])
+        put_results(out, &[r])
     });
     // The twin's own door, as a per-process personality mints one (its park door is its own), and an
     // exit hook that records its status.
@@ -1437,7 +1438,7 @@ fn grant_proc_doors(host: &mut Host) -> i32 {
             signal: Some((source, Arc::default())),
             exit: Some(Arc::new(move |s| *exited.lock().unwrap() = Some(s))),
             ..ForkedProc::shared(
-                ProcHandler::Sync(Box::new(|_, _, _, _| Ok(vec![ENOSYS]))),
+                ProcHandler::Sync(Box::new(|_, _, out, _, _| put_results(out, &[ENOSYS]))),
                 CapState::Stateless,
             )
         })

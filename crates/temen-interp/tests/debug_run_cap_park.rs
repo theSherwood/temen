@@ -7,6 +7,7 @@
 
 use std::sync::{Arc, Mutex};
 use temen_interp::bytecode::{SchedStop, ScheduledDebugRun};
+use temen_interp::put_results;
 use temen_interp::{Completer, Host, HostProcGrant, OffloadOutcome, ProcHandler, Value};
 
 /// Two `HOST_PROC` (iface 13) calls: op 0 answers inline, op 1 is host-completed; composite
@@ -54,10 +55,10 @@ fn recording_host(recorded: &Recorded) -> (Host, i32) {
     host.record_caps();
     let rec = Arc::clone(recorded);
     let h = host.grant_host_proc(HostProcGrant::new(
-        ProcHandler::Offloadable(Box::new(move |op, args| {
+        ProcHandler::Offloadable(Box::new(move |op, args, out| {
             let a = *args.first().unwrap_or(&0);
             if op == 0 {
-                return OffloadOutcome::Done(Ok(vec![a + 100]));
+                return OffloadOutcome::Done(put_results(out, &[a + 100]));
             }
             let rec = Arc::clone(&rec);
             OffloadOutcome::Host(Box::new(move |c| rec.lock().unwrap().push((c, a))))

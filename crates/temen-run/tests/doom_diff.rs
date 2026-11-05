@@ -11,6 +11,7 @@
 //! via `DOOM_TEMEN` / `DOOM_WAD` / `DOOM_NATIVE_FRAMES`; the defaults match the demo scripts' cache.
 //! Run:  `cargo test -p temen-run --test doom_diff -- --ignored --nocapture`
 
+use temen_interp::put_results;
 use temen_interp::{bytecode, Host, HostProcGrant, ProcHandler, StreamRole};
 
 fn env_or(key: &str, default: &str) -> String {
@@ -79,16 +80,16 @@ fn doom_frame_hashes_match_native() {
     // 0 open(name,len,flags)->fd; 1 read(fd,buf,len)->n; 3 seek(fd,whence,off)->pos; 4 close.
     let mut cursors: Vec<u64> = Vec::new();
     let h = host.grant_host_proc(HostProcGrant::new(
-        ProcHandler::Sync(Box::new(move |op, a, mem, _| match op {
+        ProcHandler::Sync(Box::new(move |op, a, out, mem, _| match op {
             0 => {
                 let name = mem
                     .and_then(|m| m.read_bytes(a[0] as u64, a[1] as u64))
                     .unwrap_or_default();
                 if String::from_utf8_lossy(&name).contains(".wad") {
                     cursors.push(0);
-                    Ok(vec![(cursors.len() - 1) as i64])
+                    put_results(out, &[(cursors.len() - 1) as i64])
                 } else {
-                    Ok(vec![-2]) // ENOENT → fopen NULL → Doom uses defaults
+                    put_results(out, &[-2]) // ENOENT → fopen NULL → Doom uses defaults
                 }
             }
             1 => {
@@ -100,7 +101,7 @@ fn doom_frame_hashes_match_native() {
                         .unwrap();
                 }
                 cursors[fd] = end;
-                Ok(vec![(end - cur) as i64])
+                put_results(out, &[(end - cur) as i64])
             }
             3 => {
                 let (fd, whence, off) = (a[0] as usize, a[1], a[2]);
@@ -110,10 +111,10 @@ fn doom_frame_hashes_match_native() {
                     _ => 0,
                 };
                 cursors[fd] = (base + off).max(0) as u64;
-                Ok(vec![cursors[fd] as i64])
+                put_results(out, &[cursors[fd] as i64])
             }
-            2 => Ok(vec![a[2]]), // write: discard-accept (config/savegame), non-fatal
-            _ => Ok(vec![0]),
+            2 => put_results(out, &[a[2]]), // write: discard-accept (config/savegame), non-fatal
+            _ => put_results(out, &[0]),
         })),
         temen_interp::CapState::Stateless,
     ));

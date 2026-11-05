@@ -7,6 +7,7 @@
 //! resumes it. All single-vCPU: the point is that the domain keeps serving.
 
 use std::sync::Arc;
+use temen_interp::put_results;
 use temen_interp::{run_with_host, Host, HostProcGrant, ProcHandler, Reply, StreamRole, Value};
 
 fn module(text: &str) -> Arc<temen_ir::Module> {
@@ -356,12 +357,12 @@ fn a_handler_punt_parks_the_dispatch_not_the_serve_loop() {
     let mut host = Host::new();
     host.set_self_module(&m);
     let h = host.grant_host_proc(HostProcGrant::new(
-        ProcHandler::Offloadable(Box::new(move |op, _args| {
+        ProcHandler::Offloadable(Box::new(move |op, _args, out| {
             if op == 1 {
                 let (mx, cv) = &*gate_rel;
                 *mx.lock().unwrap() = true;
                 cv.notify_all();
-                return temen_interp::OffloadOutcome::Done(Ok(vec![0]));
+                return temen_interp::OffloadOutcome::Done(put_results(out, &[0]));
             }
             let g = Arc::clone(&gate_job);
             temen_interp::OffloadOutcome::Offload(Box::new(move || {

@@ -1631,7 +1631,7 @@ mod cap {
             Some(&mut wm)
         };
 
-        match host.cap_dispatch_slots(type_id, op, handle, arg_slots, gm) {
+        match host.cap_call(type_id, op, handle, arg_slots, 1, gm) {
             Ok(res) => {
                 if n_results != 0 {
                     let out = std::slice::from_raw_parts_mut(results, n_results as usize);

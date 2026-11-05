@@ -102,7 +102,7 @@ fn a_descriptor_the_pool_cannot_hold_is_refused_with_emfile() {
     win[..4].copy_from_slice(b"data");
     let mut wm = WindowMem::new(&mut win, 4096);
     let mut call = |op, args: &[i64]| {
-        host.cap_dispatch_slots(cap_id::HOST_PROC, op, fs_h, args, Some(&mut wm))
+        host.cap_call(cap_id::HOST_PROC, op, fs_h, args, 1, Some(&mut wm))
             .expect("dispatch")[0]
     };
     let open = [0i64, 4, O_READ | O_WRITE, 0];
