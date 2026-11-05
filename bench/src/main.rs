@@ -50,6 +50,9 @@
 //!   - the JIT and wasm lanes run each kernel at [`LAYOUTS`] code layouts (#2634, #2749): a loop
 //!     that straddles a 64-byte line can run 2× slower on either engine, so each lane is the mean
 //!     over layouts that step the loop across a whole line, and the table shows the JIT's spread.
+//!   - the binary itself builds with every function aligned to 64 bytes (`.cargo/config.toml`,
+//!     #2779). Otherwise any change to the size of code in it moves the host code a lane runs,
+//!     such as the `call.cap` thunk, within its cache line: `hostcall` moved ~15% that way.
 //!   - every hand-written kernel's loop header exits on its `br_if`'s taken edge and falls through
 //!     to the body, the shape temen's C frontend and wasm transpiler emit (#2754). The JIT now lays
 //!     a loop out that way whichever edge its producer put the body on (#2758).
@@ -2347,6 +2350,15 @@ fn print_csv(results: &[(Resolved, Raw)]) {
 }
 
 fn main() {
+    // #2779 — `.cargo/config.toml` aligns every function to 64 bytes, but cargo drops it when
+    // `RUSTFLAGS` is set. A build without it leaves these two aligned only by chance (1 in 16).
+    let at = [bench_thunk as *const (), measure as *const ()];
+    if at.iter().any(|&f| f as usize % 64 != 0) {
+        eprintln!(
+            "warning: built without .cargo/config.toml's function alignment (is RUSTFLAGS set?): \
+             a lane through host code can move with unrelated code (#2779)"
+        );
+    }
     let args: Vec<String> = std::env::args().skip(1).collect();
     let csv = args.iter().any(|a| a == "--csv");
     // `--from-wasm`: get each compute kernel's Temen IR by transpiling its WAT (the same bytes Wasmtime
