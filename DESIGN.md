@@ -614,7 +614,9 @@ back-references — clearer, maps directly to the verifier's type vector.
 **Module structure:** section-based (magic + version; type section incl. interface/
 handle-operation signatures; imports = expected capability handles; window decl;
 function bodies; data; exports). **All declarations precede all bodies**, so each
-function body is independently verifiable + compilable (lazy/parallel JIT).
+function body is independently verifiable + compilable (lazy/parallel JIT). Each body
+follows its length in bytes (wire v17), so a decoder finds every body without decoding
+the ones before it, and a large module's bodies decode and verify on threads (#2596).
 
 **Instructions:** typed opcodes; constants inline; loads/stores carry access width
 + address operand (masking is implicit semantics, JIT-inserted); C11 atomics (§12);

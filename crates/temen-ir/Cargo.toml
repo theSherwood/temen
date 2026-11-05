@@ -5,3 +5,9 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 publish = false
+
+[features]
+# Share indexed work, a module's function bodies to decode or verify, among the host's threads
+# (`par`, #2596). Without it the crate is `no_std` and runs that work in order, as the in-sandbox
+# builds of the crates over it need.
+std = []

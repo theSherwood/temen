@@ -8,8 +8,3 @@ publish = false
 
 [dependencies]
 temen-ir.workspace = true
-
-[features]
-# Check a large module's function bodies on the host's threads (#2596). Without it the crate is
-# `no_std` and checks them in order, as an in-sandbox build of a crate that depends on it needs.
-std = []

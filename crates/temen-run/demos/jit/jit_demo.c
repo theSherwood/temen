@@ -78,7 +78,7 @@ static long interp(Ins *prog, long a, long b) {
 // The binary layout mirrors `crates/temen-encode` (LEB128 + one-byte opcodes): the 16-byte TEMEN wire header (WIRE.md: magic +
 // u16 kind/u16 version/u32 flags), a memory descriptor, a data-segment count, a §7 import count (0 here —
 // this unit is self-contained), a function count, then per function its
-// params/results/blocks, each block its parent (v14), params, captures (v14), instruction count,
+// body's length (v17) and its params/results/blocks, each block its parent (v14), params, captures (v14), instruction count,
 // instructions, terminator.
 // Values are block-local indices (params first, then each instruction's result).
 
@@ -110,6 +110,22 @@ static void sleb(char *buf, long v) {
   }
 }
 
+// v17 (#2596): a function body follows its length in bytes. The body is written before its length
+// is known, so the length is a four-byte LEB128 placeholder, patched when the body ends (a padded
+// LEB128 decodes as any other).
+static long body_begin(char *buf) {
+  long at = n_out;
+  for (int k = 0; k < 4; k++)
+    eb(buf, 0);
+  return at;
+}
+
+static void body_end(char *buf, long at) {
+  unsigned long n = (unsigned long)(n_out - at - 4);
+  for (int k = 0; k < 4; k++)
+    buf[at + k] = (char)(((n >> (7 * k)) & 0x7f) | (k < 3 ? 0x80 : 0));
+}
+
 // Emit a one-function module — the unit's entry, `(i64, i64) -> (i64)` (the fixed shape
 // `__vm_jit_invoke2` calls) — computing the bytecode program as straight-line IR.
 //
@@ -130,7 +146,7 @@ static long emit_unit(Ins *prog, char *buf, int abi_sp) {
   eb(buf, 'T'); eb(buf, 'E'); eb(buf, 'M'); eb(buf, 'E'); eb(buf, 'N');
   eb(buf, 0); eb(buf, 0); eb(buf, 0);
   eb(buf, 0); eb(buf, 0);                 // kind = module
-  eb(buf, (16) & 0xff); eb(buf, (16) >> 8); // version (u16)
+  eb(buf, (17) & 0xff); eb(buf, (17) >> 8); // version (u16)
   eb(buf, 0); eb(buf, 0); eb(buf, 0); eb(buf, 0); // flags
   // Memory descriptor: present, size_log2 17. The validator's memory-match precondition
   // requires the blob to declare the SAME window as this module — chibicc keeps a small
@@ -145,6 +161,7 @@ static long emit_unit(Ins *prog, char *buf, int abi_sp) {
   eb(buf, 0); // no interfaces (v6 interface section)
   eb(buf, 0); // no impl exports (v5 impl-export section)
   eb(buf, 1); // one function
+  long body = body_begin(buf);
   // params (nparams × i64), results (i64) — type tag 1 = i64.
   eb(buf, nparams);
   for (int k = 0; k < nparams; k++)
@@ -163,7 +180,7 @@ static long emit_unit(Ins *prog, char *buf, int abi_sp) {
   for (int i = 0; prog[i].op != OP_END; i++)
     ni++;
   uleb(buf, ni);
-  // The straight-line body. Opcodes mirror temen-encode (v16): an i64 binop with an immediate is
+  // The straight-line body. Opcodes mirror temen-encode (v17): an i64 binop with an immediate is
   // 0x40 + BinOp index (add = 0x40, mul = 0x42), then a uleb operand index and an sleb immediate; one
   // of two values is 0x4F, then the BinOp index (add = 0, mul = 2) and two uleb operand indices.
   long acc = a_idx;
@@ -186,6 +203,7 @@ static long emit_unit(Ins *prog, char *buf, int abi_sp) {
   eb(buf, 0x83);
   uleb(buf, 1);
   uleb(buf, acc);
+  body_end(buf, body);
   return n_out;
 }
 

@@ -19,8 +19,6 @@
 #![cfg_attr(not(test), no_std)]
 
 extern crate alloc;
-#[cfg(feature = "std")]
-extern crate std;
 use alloc::collections::BTreeSet;
 use alloc::vec::Vec;
 
@@ -223,7 +221,8 @@ pub fn verify_module(m: &Module) -> Result<(), VerifyError> {
 /// [`verify_module`], checking function bodies on up to `threads` threads (#2596). Every check is the
 /// same, and so is the answer: the module-level checks run in order on the calling thread, and the
 /// error from the bodies is the one an in-order pass meets first ([`verify_funcs`]). A build without
-/// the `std` feature checks the bodies in order on the calling thread, whatever `threads` says.
+/// `temen-ir`'s `std` feature checks the bodies in order on the calling thread, whatever `threads`
+/// says.
 pub fn verify_module_on(m: &Module, threads: usize) -> Result<(), VerifyError> {
     // A declared window must have a representable size (`1 << size_log2`, with the
     // mask `size - 1` well-defined). `size_log2 == 63` is the largest window.
@@ -481,99 +480,42 @@ fn iface_well_formed(ts: &[temen_ir::TypeEntry], t: u32) -> bool {
     }
 }
 
-/// How many threads [`verify_module`] checks `m`'s function bodies on: the host's, for a module with
-/// enough code to repay starting them (#2596), else one. A host that reports no parallelism (wasm)
-/// gets one.
+/// How many threads [`verify_module`] checks `m`'s function bodies on: the host's, for a module of at
+/// least 16K instructions, about half a millisecond of checking against the tens of microseconds
+/// threads take to start (#2596), else one.
 fn threads_for(m: &Module) -> usize {
-    /// Instructions worth starting threads for: about half a millisecond of checking, against the
-    /// tens of microseconds threads take to start.
-    #[cfg(feature = "std")]
-    const WORTH_THREADS: usize = 1 << 14;
-    #[cfg(feature = "std")]
-    if m.funcs
+    let insts: usize = m
+        .funcs
         .iter()
         .flat_map(|f| &f.blocks)
         .map(|b| b.insts.len())
-        .sum::<usize>()
-        >= WORTH_THREADS
-    {
-        // Asked once: on Linux the answer reads the process's cgroup limits from files.
-        static HOST: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-        return *HOST.get_or_init(|| std::thread::available_parallelism().map_or(1, |n| n.get()));
-    }
-    let _ = m;
-    1
+        .sum();
+    temen_ir::par::threads(insts >= 1 << 14)
 }
 
-/// Every function body ([`verify_func`]), shared among up to `threads` threads (#2596). Each thread
-/// takes the next unchecked function in index order and stops at its first failure, and none takes a
-/// function past the lowest one seen to fail. So every function below the lowest failing one is
-/// checked, and that function's error is the one returned, as an in-order pass would return it.
+/// Every function body ([`verify_func`]), shared among up to `threads` threads (#2596). The error is
+/// the lowest-numbered failing function's, the one an in-order pass meets first
+/// ([`temen_ir::par::try_each`]).
 fn verify_funcs(m: &Module, threads: usize) -> Result<(), VerifyError> {
-    use core::sync::atomic::{AtomicUsize, Ordering::Relaxed};
     let has_memory = m.memory.is_some();
     let fn_results: Vec<usize> = m.funcs.iter().map(|f| f.results.len()).collect();
-    let (next, failed) = (AtomicUsize::new(0), AtomicUsize::new(usize::MAX));
-    let share = || -> Option<(usize, VerifyError)> {
-        let mut scratch = Scratch {
-            fn_results: fn_results.clone(),
-            ..Scratch::default()
-        };
-        loop {
-            let fi = next.fetch_add(1, Relaxed);
-            if fi >= m.funcs.len() || fi > failed.load(Relaxed) {
-                return None;
-            }
-            let checked = verify_func(
-                fi as u32,
-                &m.funcs[fi],
-                &m.funcs,
-                &m.imports,
-                &m.types,
-                m.impl_exports.len(),
-                has_memory,
-                &mut scratch,
-            );
-            if let Err(e) = checked {
-                failed.fetch_min(fi, Relaxed);
-                return Some((fi, e));
-            }
-        }
+    let scratch = || Scratch {
+        fn_results: fn_results.clone(),
+        ..Scratch::default()
     };
-    match on_threads(threads.min(m.funcs.len()), &share) {
-        Some((_, e)) => Err(e),
-        None => Ok(()),
-    }
-}
-
-/// `share` run on the calling thread and on up to `threads - 1` more, with the lowest-numbered
-/// failure any of them found. A thread the host cannot start leaves its share to the others.
-#[cfg(feature = "std")]
-fn on_threads<E: Send>(
-    threads: usize,
-    share: &(impl Fn() -> Option<(usize, E)> + Sync),
-) -> Option<(usize, E)> {
-    if threads <= 1 {
-        return share();
-    }
-    std::thread::scope(|scope| {
-        let helpers: Vec<_> = (1..threads)
-            .filter_map(|_| std::thread::Builder::new().spawn_scoped(scope, share).ok())
-            .collect();
-        let mine = share();
-        helpers
-            .into_iter()
-            .map(|h| h.join().unwrap_or_else(|p| std::panic::resume_unwind(p)))
-            .chain([mine])
-            .flatten()
-            .min_by_key(|&(fi, _)| fi)
-    })
-}
-
-/// `share`, on the calling thread: a build without the `std` feature has no others.
-#[cfg(not(feature = "std"))]
-fn on_threads<E>(_: usize, share: &impl Fn() -> Option<(usize, E)>) -> Option<(usize, E)> {
-    share()
+    let check = |scratch: &mut Scratch, fi: usize| {
+        verify_func(
+            fi as u32,
+            &m.funcs[fi],
+            &m.funcs,
+            &m.imports,
+            &m.types,
+            m.impl_exports.len(),
+            has_memory,
+            scratch,
+        )
+    };
+    temen_ir::par::try_each(m.funcs.len(), threads, scratch, check).map(drop)
 }
 
 /// What [`verify_func`] keeps from one function of a module to the next, so the functions share one

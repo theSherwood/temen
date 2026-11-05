@@ -12,6 +12,9 @@
 //! NaN policy (D58): a computed float lane's NaN bit pattern is unpinned — rows carry
 //! `nan_lanes`, and those lanes compare as "is a NaN"; everything else is bit-exact.
 
+#[path = "support/opcode_pin.rs"]
+mod opcode_pin;
+
 use temen_interp::{bytecode, run, run_capture_reserved, Host, Trap, Value};
 use temen_ir::{Block, Func, Inst, Memory, Module, Terminator, VShape, ValType};
 use temen_jit::{compile, JitOutcome, TrapKind};
@@ -406,10 +409,7 @@ fn spec_simd_encoding_conformance() {
         let mut base = m.clone();
         base.funcs[0].blocks[0].insts[0] = Inst::ConstI32(0);
         let base_bytes = encode_module(&base);
-        let i = bytes
-            .iter()
-            .zip(&base_bytes)
-            .position(|(a, b)| a != b)
+        let i = opcode_pin::first_divergence(&m, &bytes, &base_bytes, encode_module)
             .unwrap_or_else(|| panic!("no divergence vs const baseline for {}", row.id));
         match row.encoding {
             Enc::Prefixed(p, sub) => {
