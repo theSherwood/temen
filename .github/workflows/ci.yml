@@ -441,9 +441,12 @@ jobs:
         with: { workspaces: bench }
       # `cargo run` builds the chibicc fork itself (for the `alu_c` kernel); make + cc are
       # preinstalled on ubuntu-latest. If the frontend can't build, that kernel is skipped.
+      # `env -u RUSTFLAGS`: cargo ignores `bench/.cargo/config.toml`'s rustflags (every function
+      # aligned to 64 bytes, #2779) while the workflow-wide `RUSTFLAGS` is set. The
+      # excluded-crates job still builds the bench with `-D warnings`.
       - name: bench --check vs committed baseline
         working-directory: bench
-        run: cargo run --release -- --check baseline.txt --tol 0.4
+        run: env -u RUSTFLAGS cargo run --release -- --check baseline.txt --tol 0.4
 
   excluded-crates-compile:
     name: excluded crates compile (every workspace-excluded crate)
@@ -1539,7 +1542,8 @@ jobs:
           rustup toolchain install nightly --profile minimal --component rust-src
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with: { workspaces: bench }
+      # `env -u RUSTFLAGS`: as in the `bench` job, so `bench/.cargo/config.toml` applies (#2779).
       - name: rustbench
         working-directory: bench
-        run: cargo run --release --bin rustbench
+        run: env -u RUSTFLAGS cargo run --release --bin rustbench
 
