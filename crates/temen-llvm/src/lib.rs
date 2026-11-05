@@ -13301,6 +13301,37 @@ fn lower_vm_builtin(
             ctx.bind_dest(&c.dest, r);
             Ok(true)
         }
+        // #1936 — a notification's post: `long __vm_post(int region, long off, long badge)` mints a
+        // post to the notification at `off` of the region (SharedRegion op 6), and
+        // `long __vm_signal(int post)` signals it (op 7). Both are `call.cap`s on the live handle, the
+        // dynamic mode the region ops use, so they declare no manifest import.
+        "__vm_post" | "__vm_signal" => {
+            use ValType::I64;
+            let handle = ctx.operand_i32(vm_arg(c, 0)?)?;
+            let (op, args) = match name {
+                "__vm_post" => (
+                    6,
+                    vec![
+                        ctx.operand_i64(vm_arg(c, 1)?)?, // off
+                        ctx.operand_i64(vm_arg(c, 2)?)?, // badge
+                    ],
+                ),
+                _ => (7, vec![]),
+            };
+            let sig = ctx.intern_sig(temen_ir::FuncType {
+                params: vec![I64; args.len()],
+                results: vec![I64],
+            });
+            let r = ctx.push(Inst::CapCall(Box::new(temen_ir::CapCall {
+                type_id: SHARED_REGION_TYPE_ID,
+                op,
+                sig,
+                handle,
+                args: args.into(),
+            })));
+            ctx.bind_dest(&c.dest, r);
+            Ok(true)
+        }
         // ---- §12 fibers (stack switching) ----
         "__vm_fiber_new" => {
             // arg0 is a function pointer (an `i64` funcref); `cont.new` wants the `i32` funcref.

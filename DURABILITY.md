@@ -1486,6 +1486,7 @@ The table rides whole (v52, #2360): every slot's generation counter, then each *
 | `FreezeAuthority` (#1440, v26; one scope since v44) | — (all-or-nothing over the holder's detached progeny) | `grant_freeze_authority` — a thawed parent holds the same authority over its thawed children it held at freeze |
 | `PipeEnd { pipe, write }` (#1680, v32) | the pipe's artifact number (first appearance in the domain's table, by slot) and which end | Section 9 carries each pipe's bytes; `Host::restore_durable_pipes` rebuilds it with the cut's end counts and a fresh id, and the end re-opens on it. Durable only for a pipe the tree minted with every end inside the cut: an embedder-fed pipe refuses (`NonDurableKind::Pipe`), one with an end outside the cut refuses `FreezeError::PipeCrossesCut` (the boundary, #1680 slice 2) |
 | `SharedRegion { region }` (#2025, v39) | the region's number in the depth-0 artifact's Section 11 | the depth-0 restore rebuilds each region once (`Host::rebuild_region`: the embedder's region factory, else a heap backing) with the frozen bytes; each domain adopts the ones it names (`Host::adopt_region`) and its handles and `Backed` pages re-open on them, so a region shared across the tree stays shared. Durable only for a region whose holders are all inside the cut (D-region, §12.3) |
+| `RegionPost { region, off, badge }` (#1936, v55) | the region's number in Section 11, as a `SharedRegion` handle's, then the notification's offset and the post's badge | re-opens on the region the domain adopted for that number, as a region handle does. Its notification's bits and sequence are region bytes, which the region carries, and a waiter parked on the sequence word is a futex waiter, whose wait re-issues on the thaw. Durable on the region's terms |
 | `Budget { node }` (#1502, v22; `lane` D66, v28; node form #1944, v37) | the node's number in the depth-0 artifact's Section 10, which carries every node a handle of the whole cut reaches (the root's and every detached descendant's, which name the same numbers), parents first: its parent, its six **ceilings** (fuel, mem, spawn, channel, lane, maps — v41; `-1` = unbounded) and what its subtree has **used** (its `channel` use carried as 0, since the thaw re-charges every pipe it rebuilds; #1944 slice 3, v38. Its `maps` use too, since each process's mappings are its own: the thaw re-charges every window, vCPU and region it rebuilds, #2268, v41, within the process's pools, refusing what they have no room for, #2318. A thread hands its `spawn` back as it unwinds, and the thaw that re-creates it charges it again, #2001). A ceiling caps a subtree and is never a stock (INVARIANTS #3) | `Host::restore_durable_budgets` re-mints the nodes into the thawing run's tree with their links and charges, and the handle re-opens on its node. The thaw's **budget hook** (`set_budget_thaw_hook`) may lower a node's ceilings, never raise them; no hook ⇒ verbatim. A node a parent and its detached child share is rebuilt once, so it stays shared |
 
 **Not durable in v1** — carry out-of-line host state or native pointers; their
@@ -1665,6 +1666,15 @@ the handle the uninterrupted run takes (#2619). A record no handle names any mor
 its spawner detached (op 10) — rides unjoinable at slot 0 and thaws with no handle naming it; a vCPU
 that finished after its detach does not ride, since nothing can join it. The restore refuses an
 artifact whose joinable records name a slot the table never issued, or two records one slot.
+
+### 12.5c Section 14 — End post (v55, #1936)
+
+A detached child's end post (the post its spawner granted it as `end`, kept with its host and out of
+its table) rides beside its handles: its region's number in Section 11, the notification's offset and
+the badge, elided when the domain has none. The region is one the domain holds, so the cut's holder
+rule counts it and the restore adopts it with the domain's other regions; the thawed child's end then
+signals its spawner's notification as the uninterrupted run's would. A freeze ends no child, so it
+signals nothing.
 
 ### 12.6 Round-trip / equivalence contract
 
