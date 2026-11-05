@@ -29,9 +29,9 @@ use core::ffi::c_void;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 use temen_interp::{
-    cap_id, run_capture_reserved_with_host, run_with_host, run_with_host_fast, CallerHost,
-    CapPageMap, GuestMem, Host, HostProc, HostProcGrant, LiveTarget, NodeRef, ProcHandler,
-    RegionBacking, Reply, RootWindow, StreamRole, Trap, UnlockedCall,
+    cap_id, host_page_size, run_capture_reserved_with_host, run_with_host, run_with_host_fast,
+    CallerHost, CapPageMap, GuestMem, Host, HostProc, HostProcGrant, LiveTarget, NodeRef,
+    ProcHandler, RegionBacking, Reply, RootWindow, StreamRole, Trap, UnlockedCall,
 };
 // `SharedBacking` is implemented by the per-OS shared-mapping backing (unix `ShmBacking`, windows
 // `WinShmBacking`) the JIT aliases into the window for §13.
@@ -4033,30 +4033,6 @@ fn grant_child(
     }
 }
 
-/// The **host** page size: the protection granularity for `map`/`unmap`/`protect`, matching the
-/// interpreter (`temen_interp`) and the JIT (`temen-jit`) on the same host so all three agree
-/// page-for-page (§4 "pin page size", host-page default). `sysconf(_SC_PAGESIZE)` on unix,
-/// `GetSystemInfo` on windows.
-#[cfg(unix)]
-fn host_page_size() -> u64 {
-    // SAFETY: sysconf is always safe; _SC_PAGESIZE is positive.
-    match unsafe { libc::sysconf(libc::_SC_PAGESIZE) } {
-        p if p > 0 => p as u64,
-        _ => 4096,
-    }
-}
-#[cfg(windows)]
-fn host_page_size() -> u64 {
-    use windows_sys::Win32::System::SystemInformation::{GetSystemInfo, SYSTEM_INFO};
-    // SAFETY: GetSystemInfo only writes its out-param; always safe.
-    let mut si: SYSTEM_INFO = unsafe { core::mem::zeroed() };
-    unsafe { GetSystemInfo(&mut si) };
-    match si.dwPageSize as u64 {
-        0 => 4096,
-        p => p,
-    }
-}
-
 /// #2645 — the window an unlocked host procedure's call ([`UnlockedCall`]) runs over on a JIT run
 /// whose vCPUs share the domain's host under a lock ([`cap_thunk_locked`]): the JIT's window, each
 /// access under that lock. The window's pages are hardware-protected, and every page-protection
@@ -4156,7 +4132,7 @@ pub struct MprotectWindow {
     base: *mut u8,
     mapped: u64,
     reserved: u64,
-    /// Host page size (`host_page_size()`), the protection granularity (matches `temen_interp`).
+    /// Host page size ([`host_page_size`], the interpreter's own), the protection granularity.
     page: u64,
     /// Page index ⇒ explicit [`PageState`]; absent ⇒ region default (rw in
     /// `[0, mapped)`, unmapped in the reserved tail). Mirrors `temen_interp`'s page map so the two
