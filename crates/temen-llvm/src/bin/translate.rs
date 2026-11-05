@@ -31,7 +31,7 @@ fn try_main() -> Result<(), String> {
     let args: Vec<String> = env::args().skip(1).collect();
     if args.is_empty() || args.iter().any(|a| a == "-h" || a == "--help") {
         eprintln!(
-            "usage: temen-llvm-translate <input.ll|input.bc> -o <out> [--binary] [--host-page <bytes>] [--stub-externs] [--link-unit] [--null-guard]\n\
+            "usage: temen-llvm-translate <input.ll|input.bc> -o <out> [--binary] [--host-page <bytes>] [--stub-externs] [--link-unit] [--null-guard] [--keep <name,...>]\n\
              \n  Translates legalized LLVM IR (textual .ll, or .bc via llvm-dis) to an TEMEN-IR module written to <out>:\n\
              \n    text (.temt) by default, binary (.temen) when -o ends in .temen or --binary,\n\
              \n    or a binary object/link unit (.temeno, v9 object dialect). Exports ride in-band\n\
@@ -56,7 +56,11 @@ fn try_main() -> Result<(), String> {
              \n  a non-durable guest, which reserves nothing.\n\
              \n  --shadow-region <bytes> sizes each of those regions (a power of two, default and\n\
              \n  minimum 4096). A context's call chain must fit its region to freeze, so a guest\n\
-             \n  that recurses deep needs a wider one."
+             \n  that recurses deep needs a wider one.\n\
+             \n  --keep <name,...> (#2790) packages a runnable image: only the named exports (plus\n\
+             \n  `_start` and `_child`) stay exports, the rest become diagnostic names, and every\n\
+             \n  function nothing kept reaches is emptied to a trap (function 0 is kept). Name every\n\
+             \n  export a host looks up. Without it, every defined function stays an export."
         );
         return Err("no input file".into());
     }
@@ -70,6 +74,7 @@ fn try_main() -> Result<(), String> {
     let mut child_entry = false;
     let mut shadow_contexts: Option<u32> = None;
     let mut shadow_stride = temen_ir::durable_abi::DEFAULT_SHADOW_STRIDE;
+    let mut keep: Option<Vec<String>> = None;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -113,6 +118,17 @@ fn try_main() -> Result<(), String> {
                     .parse()
                     .map_err(|e| format!("--shadow-region: {e}"))?
             }
+            // #2790: ship only the named entry points and the code they reach.
+            "--keep" => {
+                let names = it
+                    .next()
+                    .ok_or("--keep needs a comma-separated name list")?;
+                let names = names
+                    .split(',')
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string);
+                keep.get_or_insert_with(Vec::new).extend(names);
+            }
             _ if a.starts_with('-') => return Err(format!("unknown flag `{a}`")),
             _ => {
                 if input.replace(a.clone()).is_some() {
@@ -131,6 +147,11 @@ fn try_main() -> Result<(), String> {
     // A link unit carries link forms only the object dialect (and text) can hold.
     if link_unit && binary && !object {
         return Err("--link-unit writes a link unit: use a .temeno or text output".into());
+    }
+    if keep.is_some() && (link_unit || object) {
+        return Err(
+            "--keep packages a runnable image: a link unit keeps everything it publishes".into(),
+        );
     }
 
     // Translate the input. A `.ll` extension takes the in-house **textual** reader (no `llvm-dis`,
@@ -151,13 +172,26 @@ fn try_main() -> Result<(), String> {
         temen_llvm::translate_bc_path_with_options(&input, opts)
     }
     .map_err(|e| format!("translate `{input}`: {e:?}"))?;
+    let mut module = translated.module;
+    if let Some(keep) = &keep {
+        let names: Vec<&str> = keep.iter().map(String::as_str).collect();
+        let kept = temen_ir::keep_entries(&mut module, &names)
+            .map_err(|e| format!("--keep `{input}`: {e:?}"))?;
+        eprintln!(
+            "temen-llvm-translate: {} exports kept, {} demoted to names; {} of {} functions emptied",
+            module.exports.len(),
+            kept.demoted,
+            kept.stubbed,
+            module.funcs.len(),
+        );
+    }
 
     let module_bytes = if object {
-        temen_encode::encode_unit(&translated.module)
+        temen_encode::encode_unit(&module)
     } else if binary {
-        temen_encode::encode_module(&translated.module)
+        temen_encode::encode_module(&module)
     } else {
-        temen_text::print_module(&translated.module).into_bytes()
+        temen_text::print_module(&module).into_bytes()
     };
     fs::write(&out, &module_bytes).map_err(|e| format!("write `{out}`: {e}"))?;
 

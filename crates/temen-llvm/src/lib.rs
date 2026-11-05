@@ -2034,7 +2034,16 @@ fn const_bytes(
             }
             let v = const_reloc(other, globals, funcs, types, link)?;
             match v.base {
-                None => Ok(v.off.to_le_bytes()[..width as usize].to_vec()),
+                // A whole module's function pointer is its index already, but the data image must
+                // still say which words are function indices (`data_funcref_slots`, #1830): the
+                // functions they name are taken, as a `ref.func`'s are, so a walk of what can run
+                // starts from them (#2790). The slot loop records it as it does a link unit's.
+                None => {
+                    if let Some(name) = func_leaf(other, funcs).filter(|_| width >= 4) {
+                        relocs.push((at, CBase::Func(name), 0));
+                    }
+                    Ok(v.off.to_le_bytes()[..width as usize].to_vec())
+                }
                 // The linker writes a whole 8-byte address (a function's index into its low 4).
                 Some(base) if width == 8 => {
                     relocs.push((at, base, v.off));
@@ -2045,6 +2054,23 @@ fn const_bytes(
                 )),
             }
         }
+    }
+}
+
+/// The defined function a constant is the address of, through pointer casts and nothing else: the
+/// initializer leaf a whole module's data image holds as that function's index (§3c). An address
+/// with arithmetic on it names no function.
+fn func_leaf(c: &Constant, funcs: &HashMap<String, u32>) -> Option<String> {
+    use Constant as K;
+    match c {
+        K::GlobalReference { name, .. } => {
+            let n = name_str(name);
+            funcs.contains_key(&n).then_some(n)
+        }
+        K::PtrToInt(x) => func_leaf(x.operand.as_ref(), funcs),
+        K::IntToPtr(x) => func_leaf(x.operand.as_ref(), funcs),
+        K::BitCast(x) => func_leaf(x.operand.as_ref(), funcs),
+        _ => None,
     }
 }
 

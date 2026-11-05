@@ -4,10 +4,11 @@
 //! output, the module still verifies, the demoted name survives an encode/decode round-trip (it
 //! ships), and only what [`Module::resolve_export`](temen_ir::Module::resolve_export) can reach
 //! changes. `_start` is always kept — it is the powerbox-entry *marker*
-//! ([`temen_run::is_named_powerbox_entry`]), semantics, not observability.
+//! ([`temen_run::is_named_powerbox_entry`]), semantics, not observability. [`temen_run::keep_entries`]
+//! (#2790) then empties what no kept entry reaches, moving no index.
 
 use temen_ir::{FuncName, Module};
-use temen_run::{demote_exports, is_named_powerbox_entry, run_powerbox};
+use temen_run::{demote_exports, is_named_powerbox_entry, keep_entries, run_powerbox};
 use temen_text::parse_module;
 use temen_verify::verify_module;
 
@@ -156,4 +157,73 @@ fn the_child_export_is_always_kept() {
         temen_ir::child_image(&m).is_some_and(|image| image.is_ok()),
         "the host still builds its child image"
     );
+}
+
+/// Whether `f`'s body is the trap [`keep_entries`] leaves in a function nothing reaches.
+fn emptied(f: &temen_ir::Func) -> bool {
+    matches!(f.blocks.as_slice(), [b] if b.insts.is_empty()
+        && matches!(b.term, temen_ir::Terminator::Unreachable))
+}
+
+/// #2790: `_start` (0) calls 1 and takes 6's address; `tick` (2) calls 3; 5 calls 4, and only an
+/// export no host names leads to 5. Every function is exported, as the translator exports them.
+fn reactor_module() -> Module {
+    let ret = |n: i32| {
+        format!("func () -> (i32) {{\nblock 0 () {{\n  v0 = i32.const {n}\n  return v0\n  }}\n}}\n")
+    };
+    let calls = |f: u32| {
+        format!("func () -> (i32) {{\nblock 0 () {{\n  v0 = call {f} ()\n  return v0\n  }}\n}}\n")
+    };
+    let names = ["_start", "f1", "tick", "f3", "f4", "helper", "f6"];
+    let mut src: String = names
+        .iter()
+        .enumerate()
+        .map(|(i, n)| format!("export {i} func \"{n}\" {i}\n"))
+        .collect();
+    src += "func () -> (i32) {\nblock 0 () {\n  v0 = call 1 ()\n  v1 = ref.func 6\n  return v0\n  }\n}\n";
+    src += &ret(1);
+    src += &calls(3);
+    src += &ret(3);
+    src += &ret(4);
+    src += &calls(4);
+    src += &ret(6);
+    let m = parse_module(&src).expect("parse text IR");
+    verify_module(&m).expect("verify");
+    m
+}
+
+/// The kept entries, and what they reach through calls and `ref.func`, keep their code; the rest is
+/// emptied in place, so every index still names the function it did.
+#[test]
+fn keep_entries_empties_only_what_no_kept_entry_reaches() {
+    let mut m = reactor_module();
+    let n = m.funcs.len();
+    let kept = keep_entries(&mut m, &["tick"]).expect("keep");
+    assert_eq!((kept.demoted, kept.stubbed), (5, 2));
+    assert_eq!(m.funcs.len(), n, "no function moves");
+    let names: Vec<&str> = m.exports.iter().map(|e| e.name.as_str()).collect();
+    assert_eq!(names, ["_start", "tick"]);
+    for f in [0, 1, 2, 3, 6] {
+        assert!(!emptied(&m.funcs[f]), "function {f} is reachable");
+    }
+    for f in [4, 5] {
+        assert!(emptied(&m.funcs[f]), "function {f} is not");
+    }
+    verify_module(&m).expect("still verifies");
+}
+
+/// A host that names no entry runs function 0, so function 0 and what it calls stay without any
+/// export.
+#[test]
+fn keep_entries_keeps_function_0() {
+    let mut m = parse_module(
+        "func () -> (i32) {\nblock 0 () {\n  v0 = call 1 ()\n  return v0\n  }\n}\n\
+         func () -> (i32) {\nblock 0 () {\n  v0 = i32.const 1\n  return v0\n  }\n}\n\
+         func () -> (i32) {\nblock 0 () {\n  v0 = i32.const 2\n  return v0\n  }\n}\n",
+    )
+    .expect("parse text IR");
+    let kept = keep_entries(&mut m, &[]).expect("keep");
+    assert_eq!((kept.demoted, kept.stubbed), (0, 1));
+    assert!(!emptied(&m.funcs[0]) && !emptied(&m.funcs[1]) && emptied(&m.funcs[2]));
+    verify_module(&m).expect("still verifies");
 }

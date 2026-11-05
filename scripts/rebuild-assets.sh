@@ -194,13 +194,15 @@ if want fixtures; then
   T="$(mktemp -d)"
   TR="$REPO/crates/temen-llvm/target/release/temen-llvm-translate"
   FAILED=""
-  for g in gradient:display/gradient.c fsread:display/fsread.c bounce:display/bounce.c \
-           life:display/life.c mandelzoom:display/mandelzoom.c hello_onramp:hello.c; do
-    name="${g%%:*}"
+  # Each guest with the exports its host looks up (#2790): a program its `main`, a reactor `tick`.
+  for g in gradient:display/gradient.c:main fsread:display/fsread.c:main,tick \
+           bounce:display/bounce.c:main,tick life:display/life.c:main,tick \
+           mandelzoom:display/mandelzoom.c:main,tick hello_onramp:hello.c:main; do
+    IFS=: read -r name src keep <<< "$g"
     F="browser/tests/fixtures/$name.temen"
-    clang -O2 -emit-llvm -c -fno-vectorize -fno-slp-vectorize "crates/temen-run/demos/${g#*:}" \
+    clang -O2 -emit-llvm -c -fno-vectorize -fno-slp-vectorize "crates/temen-run/demos/$src" \
         -o "$T/$name.bc" \
-      && "$TR" "$T/$name.bc" -o "$F" --host-page 65536 \
+      && "$TR" "$T/$name.bc" -o "$F" --host-page 65536 --keep "$keep" \
       && validate "$F" || FAILED="$FAILED $name"
   done
   cargo test -p temen --test c_frontend -- --ignored --exact gen_browser_setjmp_fixture \
@@ -309,7 +311,9 @@ if want lua_snapshot; then
       CORELL=""; for f in $CORE $LIBS; do CORELL="$CORELL $f.ll"; done
       llvm-link -S $CORELL harness.ll guest_stdio.ll guest_time.ll guest_shim.ll guest_trig.ll \
                 guest_snprintf.ll guest_libm.ll guest_strtod.ll -o lua_snapshot.ll
-      "$TR" lua_snapshot.ll -o "$REPO/browser/web/assets/lua_snapshot.temen" --host-page 65536 --null-guard
+      # The warm card runs `warmup` once, then `eval_run` per Run (#2790).
+      "$TR" lua_snapshot.ll -o "$REPO/browser/web/assets/lua_snapshot.temen" --host-page 65536 --null-guard \
+        --keep main,warmup,eval_run
     ) && { validate browser/web/assets/lua_snapshot.temen \
              && note "lua_snapshot ✓" || note "lua_snapshot ✗ (rebuilt but failed re-validate)"; } \
        || note "lua_snapshot ✗ (clang/llvm-link over the Lua core?)"

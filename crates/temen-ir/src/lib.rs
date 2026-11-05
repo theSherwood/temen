@@ -7388,6 +7388,80 @@ pub fn stub_unreachable_funcs(
     Ok(StubbedFuncs { stubbed })
 }
 
+/// **Demote** non-entry-point exports to diagnostic names (#907, the `.dynsym`/`.symtab` split — the
+/// `temen-strip` packaging step). Translate exports *every* defined function by its symbol name, so a
+/// shipped `.temen` carries thousands of export entries nothing ever resolves; only the ones in `keep`
+/// (plus, always, `_start`, the powerbox-entry *marker* ([`is_named_powerbox_entry`]), and
+/// `_child`, where the host's child image of the program starts ([`CHILD_EXPORT`])) are semantic.
+/// Each export not kept is removed from [`Module::exports`] and its name recorded in
+/// [`DebugInfo::func_names`] instead — the strippable, verifier-ignored §6 name waist that
+/// backtraces and the wasm-JIT emitter's name section already read — so demotion changes **no**
+/// diagnostic output, only what [`Module::resolve_export`] can reach. An existing `func_names` entry
+/// (a `-g` source name) is never overwritten. Returns the number of exports demoted.
+///
+/// Only sound as an explicit **per-artifact** choice: an embedder that calls a function by its
+/// export name (a reactor's `tick`, say) names it in `keep`, and a linking artifact must keep
+/// everything it publishes.
+pub fn demote_exports(module: &mut Module, keep: &[&str]) -> usize {
+    // `_start` (the powerbox-entry marker) and `_child` (#2219: the host builds the program's child
+    // image from it) are semantics the host resolves — always kept, never demotable to a diagnostic
+    // name. (#1094: the `__null_guard` marker is retired; the NULL guard is unconditional now, so
+    // no export needs preserving for it — a stale one in an old asset is inert.)
+    let semantic = |name: &str| name == "_start" || name == CHILD_EXPORT;
+    let kept: Vec<Export> = module
+        .exports
+        .iter()
+        .filter(|e| semantic(&e.name) || keep.contains(&e.name.as_str()))
+        .cloned()
+        .collect();
+    let demoted: Vec<FuncName> = module
+        .exports
+        .iter()
+        .filter(|e| !semantic(&e.name) && !keep.contains(&e.name.as_str()))
+        .map(|e| FuncName {
+            func: e.func,
+            name: e.name.clone(),
+        })
+        .collect();
+    let n = demoted.len();
+    if n == 0 {
+        return 0;
+    }
+    module.exports = kept;
+    let di = module.debug_info.get_or_insert_with(Default::default);
+    let named: alloc::collections::BTreeSet<u32> = di.func_names.iter().map(|f| f.func).collect();
+    di.func_names
+        .extend(demoted.into_iter().filter(|f| !named.contains(&f.func)));
+    n
+}
+
+/// What [`keep_entries`] did.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct KeptEntries {
+    /// Exports moved to diagnostic names ([`demote_exports`]).
+    pub demoted: usize,
+    /// Function bodies emptied, because nothing kept can reach them ([`stub_unreachable_funcs`]).
+    pub stubbed: usize,
+}
+
+/// A shipped image's **entry points, and only the code they reach** (#2790): [`demote_exports`]
+/// keeps the exports named in `keep` (with `_start` and `_child`, always), then
+/// [`stub_unreachable_funcs`] empties every function that those, the data image's function pointers
+/// and the module's `ref.func`s cannot reach. Function 0 is a root too: a host that names no entry
+/// runs it.
+///
+/// Translate exports every function it defines, so every function is a root and no code is ever
+/// dead; demoting first is what lets the reachability walk find the code nothing calls. Indices do
+/// not move ([`stub_unreachable_funcs`] says why), so a function pointer keeps selecting the function
+/// it did. Only sound per artifact, as [`demote_exports`] is: `keep` names every export a host
+/// looks up (a reactor's `tick`, a warm snapshot's `warmup` and `eval_run`).
+pub fn keep_entries(m: &mut Module, keep: &[&str]) -> Result<KeptEntries, GcError> {
+    let demoted = demote_exports(m, keep);
+    let entry: &[FuncIdx] = if m.funcs.is_empty() { &[] } else { &[0] };
+    let StubbedFuncs { stubbed } = stub_unreachable_funcs(m, entry)?;
+    Ok(KeptEntries { demoted, stubbed })
+}
+
 /// The body of a function nothing reaches: one diverging block with the function's parameters. The
 /// signature stays (the table's slot check reads it), so the only way to arrive is a forged index,
 /// and arriving traps. What [`stub_unreachable_funcs`] leaves, and what [`link`] copies in place of
