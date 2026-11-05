@@ -73,7 +73,7 @@ fn the_pool_refuses_every_window_past_it_and_takes_back_what_ends() {
         .fork_powerbox_jit(9, 0, DECLARED)
         .expect("the lease handed its window back");
     assert!(hold().is_none(), "the process holds the window");
-    twin.release_memory();
+    let _ = twin.release_memory();
     roots.extend(hold());
     assert_eq!(roots.len() as u64, slots, "the process handed it back");
     // Runs that end hand back what their trees hold, so the pool is whole again.

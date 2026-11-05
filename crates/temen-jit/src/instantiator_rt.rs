@@ -289,7 +289,7 @@ unsafe fn file_task(
     n_results: usize,
     chain: Vec<(usize, i64)>,
     retained_ctx: usize,
-    teardown: crate::child_exec::Teardown,
+    (ended, teardown): (crate::child_exec::Ended, crate::child_exec::Teardown),
     // #1361 step 4, #2043 — where it goes in this nursery's child table: a spawn's next handle, or
     // the slot a thaw's freeze recorded.
     place: Place,
@@ -364,7 +364,7 @@ unsafe fn file_task(
         )
     };
     let mut task = match task {
-        Ok(t) => t,
+        Ok(t) => t.on_end(ended),
         Err(teardown) => {
             unfile();
             teardown(false);
@@ -436,11 +436,25 @@ unsafe fn granted_teardown(
     lane: i64,
     window: Option<(i32, u64, u64)>,
     fuel: Option<Box<crate::FuelCell>>,
-) -> crate::child_exec::Teardown {
+) -> (crate::child_exec::Ended, crate::child_exec::Teardown) {
     let (ctx, parent_ctx) = (SendRaw(gc_ctx), SendRaw(rt.grant_ctx()));
     let lane_give = rt.grant_lane_give.load(Ordering::Acquire);
     let mem_give = rt.grant_budget_mem_give.load(Ordering::Acquire);
-    Box::new(move |captured| {
+    let ended_hook = rt.grant_child_ended.load(Ordering::Acquire);
+    // #1936 — the child's end, which the task tells its powerbox before its teardown frees it.
+    let end_ctx = SendRaw(gc_ctx);
+    let ended: crate::child_exec::Ended = Box::new(move || {
+        let ctx = end_ctx;
+        if ended_hook != 0 {
+            // SAFETY: the hook was registered with this nursery for its children's powerboxes, and
+            // the powerbox is live until the teardown below releases it, which runs after this.
+            unsafe {
+                let ended: crate::ChildEnded = core::mem::transmute(ended_hook);
+                ended(ctx.0);
+            }
+        }
+    });
+    let teardown = Box::new(move |captured| {
         let (ctx, parent_ctx) = (ctx, parent_ctx);
         // #1944 slice 3 — the child's fuel cell goes back as its task ends (or a freeze unwinds it):
         // what it drew and did not burn returns to its budget chain.
@@ -455,7 +469,8 @@ unsafe fn granted_teardown(
             give_back(parent_ctx.0, ctx.0, lane_give, mem_give, lane, window);
             release(ctx.0);
         }
-    })
+    });
+    (ended, teardown)
 }
 
 /// Hand a detached child's lane, window bytes and first vCPU back to its parent, and what its window
@@ -560,6 +575,8 @@ pub(crate) struct Nursery {
     grant_budget_mem_take: std::sync::atomic::AtomicUsize,
     /// #1587 — [`crate::BudgetMemGiver`]: returns a taken quota when the OS-thread spawn fails.
     grant_budget_mem_give: std::sync::atomic::AtomicUsize,
+    /// #1936 — [`crate::ChildEnded`]: a detached child's domain ended.
+    grant_child_ended: std::sync::atomic::AtomicUsize,
     /// D66 — [`crate::LaneGiver`]: a reaped child task returns its lane to the parent.
     grant_lane_give: std::sync::atomic::AtomicUsize,
     /// Spawn pre-mapped region hooks ([`crate::PremapAdmit`] / [`crate::PremapStage`] /
@@ -672,6 +689,7 @@ impl Nursery {
             grant_build_detached: std::sync::atomic::AtomicUsize::new(0),
             grant_budget_mem_take: std::sync::atomic::AtomicUsize::new(0),
             grant_budget_mem_give: std::sync::atomic::AtomicUsize::new(0),
+            grant_child_ended: std::sync::atomic::AtomicUsize::new(0),
             grant_lane_give: std::sync::atomic::AtomicUsize::new(0),
             grant_premap_admit: std::sync::atomic::AtomicUsize::new(0),
             grant_premap_stage: std::sync::atomic::AtomicUsize::new(0),
@@ -757,6 +775,10 @@ impl Nursery {
         self.grant_premap_admit.store(pa, Ordering::Release);
         self.grant_premap_stage.store(ps, Ordering::Release);
         self.grant_premap_apply.store(pp, Ordering::Release);
+        self.grant_child_ended.store(
+            hooks.map_or(0, |h| h.child_ended as usize),
+            Ordering::Release,
+        );
         self.grant_held_tail
             .store(hooks.map_or(0, |h| h.held_tail as usize), Ordering::Release);
         self.grant_budget_node.store(
@@ -1309,7 +1331,7 @@ impl Nursery {
         let n_results = funcs.first().map_or(1, |f| f.results.len());
         let code = std::sync::Arc::new(code);
         register_serve(self, gc.ctx, &code);
-        let teardown = granted_teardown(self, release, gc.ctx, gc.lane_cap, window, child_fuel);
+        let powerbox = granted_teardown(self, release, gc.ctx, gc.lane_cap, window, child_fuel);
         let thaw_off = shadow.thaw_state_off(0) as usize;
         // #2025 — its §13 pages, aliased back onto their regions once its window exists, by the
         // same host hook that applies a spawn's pre-map.
@@ -1351,7 +1373,7 @@ impl Nursery {
             n_results,
             self.lane_chain_of(&gc),
             gc.retained_ctx as usize,
-            teardown,
+            powerbox,
             // #2465 — one detached (op 10) before the cut: no handle reaches it, and the nursery
             // lets it go once it has ended, as at its detach.
             if joinable {
@@ -1556,7 +1578,7 @@ unsafe fn spawn_detached_child(
     let freezing = parent_freezing();
     let code = std::sync::Arc::new(code);
     register_serve(rt, gc.ctx, &code);
-    let teardown = granted_teardown(rt, release, gc.ctx, gc.lane_cap, Some(lease), fuel);
+    let powerbox = granted_teardown(rt, release, gc.ctx, gc.lane_cap, Some(lease), fuel);
     let premap_ctx = SendRaw(gc.ctx);
     let shadow = code.shadow;
     let paged = !gc.pages.is_null();
@@ -1623,7 +1645,7 @@ unsafe fn spawn_detached_child(
         n_results,
         rt.lane_chain_of(gc),
         gc.retained_ctx as usize,
-        teardown,
+        powerbox,
         Place::Issue,
         durable.map(|a| {
             DurableCell::new(

@@ -311,7 +311,11 @@ use temen_ir::Module;
 /// v54 (#2738): a serve trio's completion cell holds a live call's reply as INVARIANTS #8 shapes it:
 /// `0`, then the handler's results (a count, then each slot), or `1`, then a transport failure's
 /// errno.
-const FORMAT_VERSION: u16 = 54;
+/// v55 (#1936): `B_REGION_POST` (18) carries a post to a notification in a §13 region (its region's
+/// number, the notification's offset, the badge), and Section 14 (`TAG_END`) a detached child's end
+/// post, its region numbered alike. An artifact with neither is byte-identical to v54 but for the
+/// version field.
+const FORMAT_VERSION: u16 = 55;
 /// Window-image page granularity (§12.3). The window length is a power of two `≥ PAGE`, so
 /// every page is exactly `PAGE` bytes (no partial tail). Tied to the interpreter's capture
 /// granularity so a captured prot map lines up with the image, one entry per page.
@@ -356,6 +360,9 @@ const TAG_TWINS: u64 = 12;
 /// Section 13 (v53, #2043): the domain's child-handle table's counters. Emitted only when the domain
 /// spawned.
 const TAG_CHILDREN: u64 = 13;
+/// Section 14 (v55, #1936): the domain's end post — its region's artifact number (Section 11), the
+/// notification's offset and the badge. Emitted only when the domain has one.
+const TAG_END: u64 = 14;
 /// A Section 12 record's kind: a live twin a personality forked, which its own table reaps.
 const TWIN_LIVE: u8 = 0;
 /// A live twin a servicer's `clone_caller` forked, which the servicer's `wait` reaps (v50, #2571).
@@ -403,6 +410,9 @@ const B_PIPE_END: u8 = 15;
 const B_SHARED_REGION: u8 = 16;
 /// v40 (#2054): a stdio stream its spawner re-granted (§7c) — `B_STREAM`'s role byte follows.
 const B_STREAM_INHERITED: u8 = 17;
+/// v55 (#1936): a post to a notification in a §13 region — the region's artifact number (Section
+/// 11), then the notification's offset and the post's badge.
+const B_REGION_POST: u8 = 18;
 
 const PROT_RW: u8 = 0;
 const PROT_RO: u8 = 1;
@@ -637,12 +647,11 @@ pub fn freeze(module: &Module, window: &[u8], host: &Host) -> Result<Vec<u8>, Fr
     }
     // #2025: without a page map a region's mapping cannot be told from private bytes, so a region
     // handle declines here; [`freeze_with_prots`] carries it.
-    if let Some(region) = host.capture_durable_handles().ok().and_then(|hs| {
-        hs.iter().find_map(|h| match h.binding {
-            DurableBinding::SharedRegion { region } => Some(region),
-            _ => None,
-        })
-    }) {
+    if let Some(region) = host
+        .capture_durable_handles()
+        .ok()
+        .and_then(|hs| hs.iter().find_map(|h| h.binding.region()))
+    {
         return Err(FreezeError::RegionNotCaptured(RegionNotCaptured {
             region,
             why: RegionRefusal::NoPageMap,
@@ -787,6 +796,12 @@ fn freeze_at(
     let pipes = number_pipes(&host.capture_durable_pipes(), &mut handles)?;
     number_budgets(&cut.budgets, &mut handles);
     number_regions(&cut.regions, host, &mut handles, &mut image)?;
+    let end = host
+        .end_post()
+        .map(|(region, off, badge)| {
+            region_number(&cut.regions, host, region).map(|n| (n, off, badge))
+        })
+        .transpose()?;
     let root_sp = host.frozen_root_sp().unwrap_or(
         module
             .memory
@@ -1034,6 +1049,15 @@ fn freeze_at(
         });
     }
 
+    // Section 14 — the domain's end post (#1936, v55), its region by number. Elided when it has none.
+    if let Some((region, off, badge)) = end {
+        section(&mut out, TAG_END, |b| {
+            write_uleb(b, region as u64);
+            write_uleb(b, off as u64);
+            write_uleb(b, badge);
+        });
+    }
+
     Ok(out)
 }
 
@@ -1104,10 +1128,8 @@ fn number_cut_regions(host: &Host, image: &Image<'_>) -> Result<Vec<DurableRegio
         let handles = h.capture_durable_handles().unwrap_or_default();
         handles
             .iter()
-            .filter_map(|h| match h.binding {
-                DurableBinding::SharedRegion { region } => Some(region),
-                _ => None,
-            })
+            .filter_map(|h| h.binding.region())
+            .chain(h.end_post().map(|(region, ..)| region))
             .chain(prots.iter().filter_map(|p| match *p {
                 PageProt::Backed { region, .. } => Some(region),
                 _ => None,
@@ -1151,15 +1173,9 @@ fn number_regions(
     root: &mut [DurableHandle],
     image: &mut Image<'_>,
 ) -> Result<(), FreezeError> {
-    let refused = |region, why| FreezeError::RegionNotCaptured(RegionNotCaptured { region, why });
-    let number = |id: u32| {
-        host.region_key(id)
-            .and_then(|key| regions.iter().position(|r| r.key == key))
-            .map(|n| n as u32)
-            .ok_or(refused(id, RegionRefusal::Unknown))
-    };
+    let number = |id: u32| region_number(regions, host, id);
     for h in root.iter_mut() {
-        if let DurableBinding::SharedRegion { region } = &mut h.binding {
+        if let Some(region) = h.binding.region_mut() {
             *region = number(*region)?;
         }
     }
@@ -1170,6 +1186,17 @@ fn number_regions(
         }
     }
     Ok(())
+}
+
+/// #2025 — the number of the region `host` holds as `id` among the cut's `regions`.
+fn region_number(regions: &[DurableRegion], host: &Host, id: u32) -> Result<u32, FreezeError> {
+    host.region_key(id)
+        .and_then(|key| regions.iter().position(|r| r.key == key))
+        .map(|n| n as u32)
+        .ok_or(FreezeError::RegionNotCaptured(RegionNotCaptured {
+            region: id,
+            why: RegionRefusal::Unknown,
+        }))
 }
 
 /// #1944 — the budget nodes a freeze carries: every node the cut's domains name — the root's handles
@@ -1484,6 +1511,19 @@ fn decode_named(body: Option<&[u8]>) -> Result<Vec<Option<DurableNamedCap>>, Res
     Ok(out)
 }
 
+/// Decode Section 14 ([`TAG_END`], v55): the domain's end post, `(region number, off, badge)`. A
+/// zero badge is malformed: no post signals nothing.
+fn decode_end(body: &[u8]) -> Result<(u32, u32, u64), RestoreError> {
+    let mut r = Reader::new(body);
+    let region = u32::try_from(r.uleb()?).map_err(|_| RestoreError::Malformed)?;
+    let off = u32::try_from(r.uleb()?).map_err(|_| RestoreError::Malformed)?;
+    let badge = r.uleb()?;
+    if badge == 0 || !r.at_end() {
+        return Err(RestoreError::Malformed);
+    }
+    Ok((region, off, badge))
+}
+
 /// Decode Section 11 ([`TAG_REGIONS`], v39): each region's bytes, by artifact number. Absent ⇒ no
 /// region rides; present but empty is non-canonical. A region is a whole number of pages, as every
 /// region a host grants or a guest mints is.
@@ -1656,6 +1696,7 @@ fn restore_at(
     let mut regions_body = None;
     let mut twins_body = None;
     let mut children_body = None;
+    let mut end_body = None;
     while !r.at_end() {
         let tag = r.uleb()?;
         let len = r.uleb()? as usize;
@@ -1675,6 +1716,7 @@ fn restore_at(
             TAG_REGIONS => regions_body = Some(body),
             TAG_TWINS => twins_body = Some(body),
             TAG_CHILDREN => children_body = Some(body),
+            TAG_END => end_body = Some(body),
             // Fail closed on an unknown tag (#915/§8). The version gate above already pins
             // `version == FORMAT_VERSION`, so no artifact this build emits can carry one — silently
             // skipping it was dead "forward-compat" that only opened a canonicality hole (a
@@ -1956,13 +1998,17 @@ fn restore_at(
     }
     // #2025: every region handle names a region of the cut. This domain holds each region it names
     // under one new id, adopted in number order, and each number is rewritten to it.
-    for h in &handles {
-        if let DurableBinding::SharedRegion { region } = h.binding {
-            if region as usize >= cut.regions.len() {
-                return Err(RestoreError::Malformed);
-            }
-            region_named.insert(region);
+    // #1936 — and so does the domain's end post, which Section 14 carries apart from its handles.
+    let end = end_body.map(decode_end).transpose()?;
+    for region in handles
+        .iter()
+        .filter_map(|h| h.binding.region())
+        .chain(end.map(|(region, ..)| region))
+    {
+        if region as usize >= cut.regions.len() {
+            return Err(RestoreError::Malformed);
         }
+        region_named.insert(region);
     }
     let region_ids: BTreeMap<u32, u32> = region_named
         .into_iter()
@@ -1972,7 +2018,7 @@ fn restore_at(
         })
         .collect();
     for h in handles.iter_mut() {
-        if let DurableBinding::SharedRegion { region } = &mut h.binding {
+        if let Some(region) = h.binding.region_mut() {
             *region = region_ids[region];
         }
     }
@@ -1982,6 +2028,9 @@ fn restore_at(
         }
     }
     host.restore_durable_handles(&generations, &handles);
+    if let Some((region, off, badge)) = end {
+        host.restore_end_post(region_ids[&region], off, badge);
+    }
 
     // ---- Control state (§12.4): seed the residue (decoded above) for the thaw, so the next
     // (REWINDING) run re-creates the fibers, re-spawns the vCPUs and delivers the completed
@@ -2663,6 +2712,12 @@ fn write_binding(b: &mut Vec<u8>, binding: &DurableBinding) {
             b.push(B_SHARED_REGION);
             write_uleb(b, region as u64);
         }
+        DurableBinding::RegionPost { region, off, badge } => {
+            b.push(B_REGION_POST);
+            write_uleb(b, region as u64);
+            write_uleb(b, off as u64);
+            write_uleb(b, badge);
+        }
         DurableBinding::JitTable { idx } => {
             b.push(B_JIT_TABLE);
             write_uleb(b, idx as u64);
@@ -2728,6 +2783,14 @@ fn read_binding(r: &mut Reader) -> Result<DurableBinding, RestoreError> {
         },
         B_SHARED_REGION => DurableBinding::SharedRegion {
             region: u32::try_from(r.uleb()?).map_err(|_| RestoreError::Malformed)?,
+        },
+        B_REGION_POST => DurableBinding::RegionPost {
+            region: u32::try_from(r.uleb()?).map_err(|_| RestoreError::Malformed)?,
+            off: u32::try_from(r.uleb()?).map_err(|_| RestoreError::Malformed)?,
+            badge: match r.uleb()? {
+                0 => return Err(RestoreError::Malformed), // op 6 mints no post that signals nothing
+                b => b,
+            },
         },
         B_PIPE_END => DurableBinding::PipeEnd {
             pipe: u32::try_from(r.uleb()?).map_err(|_| RestoreError::Malformed)?,

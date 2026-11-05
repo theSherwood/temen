@@ -1560,3 +1560,195 @@ fn rewinding_a_reactor_past_a_region_map_leaves_the_region_alone() {
         "and reads the moment's bytes"
     );
 }
+
+/// #1936 — the creating guest of [`SRC`], with a post: it maps its region, mints a post to the
+/// notification at region byte 32 (badge 5) and signals it, reads the clock (where `FLIP` lands the
+/// freeze), signals it again, and returns `1000·bits + sequence` read back through its mapping, plus
+/// what the two signals answered.
+const POSTING: &str = "memory 18 shadow 16448 65536
+func (i32, i32) -> (i64) {
+block 0 (vas: i32, vclk: i32) {
+  vlen = i64.const 65536
+  vrh = call.cap 5 5 (i64) -> (i64) vas (vlen)
+  vr = i32.wrap_i64 vrh
+  br 1(vr, vclk)
+}
+block 1 (vr: i32, vc: i32) {
+  voff = i64.const 131072
+  vroff = i64.const 0
+  vlen = i64.const 65536
+  vprot = i64.const 3
+  vm = call.cap 4 0 (i64, i64, i64, i64) -> (i64) vr (voff, vroff, vlen, vprot)
+  vpo = i64.const 32
+  vpb = i64.const 5
+  vph = call.cap 4 6 (i64, i64) -> (i64) vr (vpo, vpb)
+  vp = i32.wrap_i64 vph
+  vs1 = call.cap 4 7 () -> (i64) vp ()
+FLIP
+  vz = i32.const 0
+  vt = call.cap 2 0 (i32) -> (i64) vc (vz)
+  vs2 = call.cap 4 7 () -> (i64) vp ()
+  vba = i64.const 131104
+  vbits = i64.load vba
+  vqa = i64.const 131112
+  vseq = i32.load vqa
+  vseq64 = i64.extend_i32_u vseq
+  vk = i64.const 1000
+  vb1000 = i64.mul vbits vk
+  vr2 = i64.add vb1000 vseq64
+  vss = i64.add vs1 vs2
+  vr3 = i64.add vr2 vss
+  return vr3
+  }
+}
+";
+
+/// **#1936 — a post rides a freeze as its region does.** The artifact carries it beside the region it
+/// posts to, the restore re-opens it on the region the thaw adopted, a re-freeze is byte-identical,
+/// and the thaw's signal goes through it: the bits hold its badge and the sequence counts both
+/// signals, the one before the cut carried in the region's bytes.
+#[test]
+fn a_post_rides_a_freeze() {
+    let want = Ok(vec![Value::I64(5 * 1000 + 2)]);
+    let (mut control, args) = creating_host();
+    let win = init_durable_window(WINDOW, TEST_ARENA);
+    let (base, ..) = run(
+        &instrument(POSTING, false),
+        0,
+        &mut control,
+        &args,
+        &win,
+        None,
+    );
+    assert_eq!(base, want, "uninterrupted run");
+
+    let m = instrument(POSTING, true);
+    let (mut fhost, args) = creating_host();
+    let (res, snap, prots) = run(&m, 0, &mut fhost, &args, &win, None);
+    assert!(res.is_ok(), "a freeze, not a refusal: {res:?}");
+    assert_eq!(read_state(&snap, TEST_ARENA), STATE_UNWINDING, "frozen");
+    let posts = fhost
+        .capture_durable_handles()
+        .expect("durable")
+        .iter()
+        .filter(|h| matches!(h.binding, DurableBinding::RegionPost { badge: 5, .. }))
+        .count();
+    assert_eq!(posts, 1, "the post rides as a post");
+
+    let artifact = freeze_with_prots(&m, &snap, &prots, SIZE_LOG2, &fhost).expect("rides");
+    let mut thost = Host::new();
+    thost.set_durable(true);
+    let (rwin, rprots, _) = restore_with_prots(&artifact, &m, &mut thost).expect("restores");
+    assert_eq!(
+        freeze_with_prots(&m, &rwin, &rprots, SIZE_LOG2, &thost).expect("re-freeze"),
+        artifact,
+        "canonical re-freeze byte-identical"
+    );
+    let mut twin = rwin;
+    begin_thaw(&mut twin, TEST_ARENA, 0);
+    let (thawed, ..) = run(&m, 0, &mut thost, &args, &twin, Some(&rprots));
+    assert_eq!(thawed, want, "the thaw signals through the restored post");
+}
+
+/// [`SHARING_PARENT`], naming an end post for its child: before the spawn it mints a post to the
+/// notification at region byte 32 (badge 9) and grants it as `end`, and after the join it adds
+/// `100000·bits` read back through its mapping. Its spawn record carries the one grant record at
+/// 65664, its name at 65696 ([`with_end_rec`]). With `flip` it requests the freeze after the spawn,
+/// which lands at the `map` that follows, with the child live.
+fn ending_parent(flip: bool) -> String {
+    let post = "  vpo = i64.const 32\n  vpb = i64.const 9\n\
+                \x20 vph = call.cap 4 6 (i64, i64) -> (i64) vrh (vpo, vpb)\n  vp = i32.wrap_i64 vph\n";
+    let grant = rec::grant("g", 65664, 65696, 3, "vp");
+    let spawn = "  vsp = i64.const 65536\n";
+    let tail = "  vs = i64.add vr vy2\n  return vs\n";
+    let read = "  vs = i64.add vr vy2\n  vba = i64.const 131104\n  vbits = i64.load vba\n\
+                \x20 vhk = i64.const 100000\n  vbh = i64.mul vbits vhk\n  vs2 = i64.add vs vbh\n\
+                \x20 return vs2\n";
+    let map = "  vm = call.cap 4 0 (i64, i64, i64, i64) -> (i64) vrh (vwin, gz, vlen, vprot)\n";
+    let cut = if flip {
+        format!("{}\n{map}", self::flip())
+    } else {
+        map.to_string()
+    };
+    assert!(
+        SHARING_PARENT.contains(spawn)
+            && SHARING_PARENT.contains(tail)
+            && SHARING_PARENT.contains(map)
+    );
+    SHARING_PARENT
+        .replace(spawn, &format!("{post}{grant}{spawn}"))
+        .replace(map, &cut)
+        .replace(tail, read)
+}
+
+/// [`with_spawn_rec`]'s record with the grant list [`ending_parent`] lays, and the name `end`.
+fn with_end_rec(src: &str) -> String {
+    let spawn = SpawnRec {
+        size_log2: 18,
+        child_off: AT as u64,
+        grants_ptr: 65664,
+        grants_n: 1,
+        ..SpawnRec::default()
+    };
+    format!("{src}{}data 65696 \"end\"\n", rec::segment(65536, &spawn))
+}
+
+/// **#1936 — a detached child's end post rides a freeze**, beside its handles (Section 14), its
+/// region numbered as theirs: the thawed child's end signals its parent's notification as the
+/// uninterrupted run's does, and a re-freeze is byte-identical.
+#[test]
+fn a_detached_childs_end_post_rides_a_freeze() {
+    let want = Ok(vec![Value::I64(SHARED_WANT + 9 * 100000)]);
+    let child = confined(SHARING_CHILD);
+    let (mut host, args) = sharing_host(&child, heap_region());
+    let win = init_durable_window(WINDOW, TEST_ARENA);
+    let uninterrupted = confined(&with_end_rec(&ending_parent(false)));
+    let (base, ..) = run(&uninterrupted, 0, &mut host, &args, &win, None);
+    assert_eq!(base, want, "uninterrupted run");
+
+    let parent = confined(&with_end_rec(&ending_parent(true)));
+    let (mut fhost, args) = sharing_host(&child, heap_region());
+    let (res, snap, prots) = run(&parent, 0, &mut fhost, &args, &win, None);
+    assert!(res.is_ok(), "a freeze, not a refusal: {res:?}");
+    let captured = fhost.captured_detached();
+    assert_eq!(captured.len(), 1, "the child rides live");
+    assert!(
+        captured[0].host.lock().unwrap().end_post().is_some(),
+        "the frozen child holds its end post"
+    );
+
+    let artifact = freeze_with_prots(&parent, &snap, &prots, SIZE_LOG2, &fhost).expect("rides");
+    let restored = || {
+        let mut thost = Host::new();
+        thost.set_durable(true);
+        thost.grant_durable_module(&child);
+        let (rwin, rprots, _) =
+            restore_with_prots(&artifact, &parent, &mut thost).expect("restores");
+        (thost, rwin, rprots)
+    };
+    let (mut again, rwin, rprots) = restored();
+    let recaptured = again
+        .take_thawed_detached()
+        .into_iter()
+        .map(|t| temen_interp::CapturedDetached {
+            parent_task: t.parent_task,
+            slot: t.slot,
+            window: t.window,
+            reserved_log2: t.reserved_log2,
+            host: Arc::new(std::sync::Mutex::new(t.host)),
+            module: Arc::new(child.clone()),
+            launch: t.launch,
+        })
+        .collect();
+    again.set_captured_detached(recaptured);
+    assert_eq!(
+        freeze_with_prots(&parent, &rwin, &rprots, SIZE_LOG2, &again).expect("re-freeze"),
+        artifact,
+        "canonical re-freeze byte-identical"
+    );
+    let (mut thost, rwin, rprots) = restored();
+    let mut twin = rwin;
+    begin_thaw(&mut twin, TEST_ARENA, 0);
+    let (thawed, ..) = run(&parent, 0, &mut thost, &args, &twin, Some(&rprots));
+    assert_eq!(thawed, want, "the thawed child's end signals its end post");
+}
