@@ -11,8 +11,8 @@ use core::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 /// `each(state, i)` for every `i` in `0..n`, shared among up to `threads` threads, each thread with
 /// its own `state` from `init`. The results come back in index order. On a failure, the error is
 /// that of the lowest failing `i`, the one an in-order loop meets first: each thread takes the next
-/// `i` in order and stops at its first failure, and none takes an `i` past the lowest one seen to
-/// fail, so every `i` below the lowest failing one runs.
+/// `i` in order and stops at its first failure, and none takes an `i` past a failure already
+/// recorded. Every recorded failure is at or above the lowest, so every `i` below it runs.
 pub fn try_each<S, T: Send, E: Send>(
     n: usize,
     threads: usize,
@@ -31,10 +31,10 @@ pub fn try_each<S, T: Send, E: Send>(
             match each(&mut state, i) {
                 Ok(t) => done.push((i, t)),
                 Err(e) => {
-                    // A compare-exchange loop, not `fetch_min`: the LLVM on-ramp, which builds this
-                    // crate into guests (temen-link), has no `atomicrmw umin`.
-                    let lower = |f: usize| (i < f).then_some(i);
-                    let _ = failed.fetch_update(Relaxed, Relaxed, lower);
+                    // A store, not `fetch_min`: the LLVM on-ramp, which builds this crate into
+                    // guests (temen-link), has no `atomicrmw umin`. A higher failure stored over a
+                    // lower one only lets the other threads run further.
+                    failed.store(i, Relaxed);
                     return (done, Some((i, e)));
                 }
             }
