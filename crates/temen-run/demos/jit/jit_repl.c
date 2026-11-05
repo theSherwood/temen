@@ -87,6 +87,22 @@ static void sleb(char *buf, long v) {
   }
 }
 
+// v17 (#2596): a function body follows its length in bytes. The body is written before its length
+// is known, so the length is a four-byte LEB128 placeholder, patched when the body ends (a padded
+// LEB128 decodes as any other).
+static long body_begin(char *buf) {
+  long at = n_out;
+  for (int k = 0; k < 4; k++)
+    eb(buf, 0);
+  return at;
+}
+
+static void body_end(char *buf, long at) {
+  unsigned long n = (unsigned long)(n_out - at - 4);
+  for (int k = 0; k < 4; k++)
+    buf[at + k] = (char)(((n >> (7 * k)) & 0x7f) | (k < 3 ? 0x80 : 0));
+}
+
 static long emit_unit(char *buf) {
   n_out = 0;
   // Header: the unified TEMEN wire header (WIRE.md) — 16 bytes, little-endian:
@@ -95,7 +111,7 @@ static long emit_unit(char *buf) {
   eb(buf, 'T'); eb(buf, 'E'); eb(buf, 'M'); eb(buf, 'E'); eb(buf, 'N');
   eb(buf, 0); eb(buf, 0); eb(buf, 0);
   eb(buf, 0); eb(buf, 0);                 // kind = module
-  eb(buf, (16) & 0xff); eb(buf, (16) >> 8); // version (u16)
+  eb(buf, (17) & 0xff); eb(buf, (17) >> 8); // version (u16)
   eb(buf, 0); eb(buf, 0); eb(buf, 0); eb(buf, 0); // flags
   // Memory descriptor: present, size_log2 17 — must match this module's window (the validator's
   // memory-match precondition), which chibicc keeps at the 64 KiB default for a small program.
@@ -109,6 +125,7 @@ static long emit_unit(char *buf) {
   eb(buf, 0); // no interfaces (v6 interface section)
   eb(buf, 0); // no impl exports (v5 impl-export section)
   eb(buf, 1); // one function
+  long body = body_begin(buf);
   // params (a, b) : i64, i64 ; results : i64 (type tag 1 = i64).
   eb(buf, 2);
   eb(buf, 1);
@@ -137,6 +154,7 @@ static long emit_unit(char *buf) {
   eb(buf, 0x83);
   uleb(buf, 1);
   uleb(buf, 3);
+  body_end(buf, body);
   return n_out;
 }
 

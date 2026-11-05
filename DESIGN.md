@@ -280,14 +280,18 @@ each point as:
   type was checked, a vmctx cell, the demand-paged access table (#2164), a callee's address, the entry
   value of a callee-saved register, the caller's `sret` area, …);
 - the flags of the last compare;
-- the spill slots, keyed by their offset from the entry `rsp`;
+- the spill slots, keyed by their offset from the entry `rsp` (an unbounded set, not a fixed cap: an
+  unrolled large copy spills hundreds of confined window indices — one chibicc function spills 532,
+  #2784 — and a cap would drop the overflow and read each later reload as an unconfined index);
 - whether the stack-overflow check has run on every path to this point.
 
 A block's out-state can differ by edge: the edge where a fn-table type check holds carries what it
-proves, and the taken edge of `cmp idx, K; jb` carries `idx ∈ [0, K)` (a `Bounded` fact — how a
-demand-paged child bounds its access-table index, #2164, since `off < declared` gates the
+proves, and an unsigned `cmp idx, K` against a constant carries `idx ∈ [0, K)` (a `Bounded` fact) on
+the edge it proves — the taken edge of `jb`/`jbe`, or the **fall-through** of `jae`/`ja`. The first
+is how a demand-paged child bounds its access-table index (#2164: `off < declared` gates the
 `table[off >> page_shift]` read; the shift keeps the bound, and the read must land in the table's
-`pages + 1` bytes).
+`pages + 1` bytes); the second is how Cranelift's `br_table`/array bounds check lays out the in-range
+code (`cmp idx, len; jae default`, #2784).
 
 Only a check is trusted. An untrusted fixpoint proposes a state for each block. One linear pass then
 verifies that the entry contract implies the entry block's state, that every edge's out-state implies
@@ -303,10 +307,11 @@ keep theirs.
 
 **The rules the transfer must get exactly right**, each a published escape class or a hole a review
 found (#2603):
-- Only a 64-bit write carries a fact; a narrower one clobbers its destination. A 32-bit `mov r, imm`
-  and a 32-bit `cmp`/`cmov` pair are the exact exceptions. CVE-2021-32629 was a 32-bit spill
-  reloaded with sign extension into code that relied on the zero-extended upper half, so a narrow
-  spill or reload restores nothing.
+- Only a 64-bit write carries a fact; a narrower one clobbers its destination. The exact exceptions
+  are a 32-bit `mov r, imm`, a 32-bit `cmp`/`cmov` pair, and a 32-bit reg-reg `mov` (it zero-extends,
+  so it keeps a bounded source's bound, clamped to `2^32` — a spilled/moved window index stays
+  confined, #2784). CVE-2021-32629 was a 32-bit spill reloaded with sign extension into code that
+  relied on the zero-extended upper half, so a *narrower* spill or reload restores nothing.
 - A `cmov` confines only when it tests the flags of a `cmp` against a known bound, with no flag write
   in between, and its condition takes the compared value only while it is below that bound.
 - No constant is read from bytes a relocation patches. D63's bound is a constant-pool operand, since
@@ -614,7 +619,9 @@ back-references — clearer, maps directly to the verifier's type vector.
 **Module structure:** section-based (magic + version; type section incl. interface/
 handle-operation signatures; imports = expected capability handles; window decl;
 function bodies; data; exports). **All declarations precede all bodies**, so each
-function body is independently verifiable + compilable (lazy/parallel JIT).
+function body is independently verifiable + compilable (lazy/parallel JIT). Each body
+follows its length in bytes (wire v17), so a decoder finds every body without decoding
+the ones before it, and a large module's bodies decode and verify on threads (#2596).
 
 **Instructions:** typed opcodes; constants inline; loads/stores carry access width
 + address operand (masking is implicit semantics, JIT-inserted); C11 atomics (§12);

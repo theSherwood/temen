@@ -27,11 +27,11 @@ name = "temen-strip"
 path = "src/bin/temen_strip.rs"
 
 [dependencies]
-temen-ir.workspace = true
+# A start decodes and verifies a large module's function bodies on the host's threads (#2596).
+temen-ir = { workspace = true, features = ["std"] }
 temen-text.workspace = true
 temen-encode.workspace = true
-# A start verifies a large module's function bodies on the host's threads (#2596).
-temen-verify = { workspace = true, features = ["std"] }
+temen-verify.workspace = true
 # §4 durability × §22 guest-JIT: the durable instrumentation pass, run on submitted units in a durable
 # domain (grant_jit_durable). Tooling-tier (temen-durable → temen-ir only), so no TCB layering concern.
 temen-durable.workspace = true

@@ -88,7 +88,7 @@ static void emit_header(char *buf) {
   eb(buf, 'T'); eb(buf, 'E'); eb(buf, 'M'); eb(buf, 'E'); eb(buf, 'N');
   eb(buf, 0); eb(buf, 0); eb(buf, 0);
   eb(buf, 0); eb(buf, 0);                 // kind = module
-  eb(buf, (16) & 0xff); eb(buf, (16) >> 8); // version (u16)
+  eb(buf, (17) & 0xff); eb(buf, (17) >> 8); // version (u16)
   eb(buf, 0); eb(buf, 0); eb(buf, 0); eb(buf, 0); // flags
   eb(buf, 1);  // memory present
   eb(buf, 17); // size_log2 = 17 (must match this module's 128 KiB window, #1059 NULL guard)
@@ -106,6 +106,22 @@ static void emit_i64_pair_sig(char *buf) {
   eb(buf, 1);
 }
 
+// v17 (#2596): a function body follows its length in bytes. The body is written before its length
+// is known, so the length is a four-byte LEB128 placeholder, patched when the body ends (a padded
+// LEB128 decodes as any other).
+static long body_begin(char *buf) {
+  long at = n_out;
+  for (int k = 0; k < 4; k++)
+    eb(buf, 0);
+  return at;
+}
+
+static void body_end(char *buf, long at) {
+  unsigned long n = (unsigned long)(n_out - at - 4);
+  for (int k = 0; k < 4; k++)
+    buf[at + k] = (char)(((n >> (7 * k)) & 0x7f) | (k < 3 ? 0x80 : 0));
+}
+
 // `service(a, b) = a*a + b` — a self-contained unit (no imports). Opcodes: 0x42 = i64.mul,
 // 0x40 = i64.add, 0x83 = return. Values: v0,v1 = params; v2 = mul; v3 = add.
 static long emit_service(char *buf) {
@@ -115,6 +131,7 @@ static long emit_service(char *buf) {
   eb(buf, 0); // 0 interfaces (v6)
   eb(buf, 0); // 0 impl exports (v5 impl-export section)
   eb(buf, 1); // 1 function
+  long body = body_begin(buf);
   emit_i64_pair_sig(buf);
   eb(buf, 1); // 1 block
   eb(buf, 0); // its parent: none, it is the entry (v14)
@@ -134,6 +151,7 @@ static long emit_service(char *buf) {
   eb(buf, 0x83);  // return v3
   uleb(buf, 1);
   uleb(buf, 3);
+  body_end(buf, body);
   return n_out;
 }
 
@@ -156,6 +174,7 @@ static long emit_client(char *buf) {
   emit_i64_pair_sig(buf); //   (i64, i64) -> (i64)
   eb(buf, 0);             // 0 impl exports (v5 impl-export section)
   eb(buf, 1);             // 1 function
+  long body = body_begin(buf);
   emit_i64_pair_sig(buf);
   eb(buf, 1); // 1 block
   eb(buf, 0); // its parent: none, it is the entry (v14)
@@ -179,6 +198,7 @@ static long emit_client(char *buf) {
   eb(buf, 0x83); // return v4
   uleb(buf, 1);
   uleb(buf, 4);
+  body_end(buf, body);
   return n_out;
 }
 

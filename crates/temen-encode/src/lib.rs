@@ -406,7 +406,10 @@ pub mod wire {
 // `IntCmpImm`): an op whose right operand is a constant carries it, instead of naming a constant
 // instruction. They take the families' one-byte opcodes, and the register forms move to one opcode
 // per family and an op byte.
-const VERSION: u16 = 16;
+// v17 (#2596) prefixes each function body with its length in bytes, so a decoder finds every body
+// without decoding the ones before it, and decodes them on threads. An emitter that writes a body
+// before it knows the length may pad the length's LEB128 (a placeholder it patches).
+const VERSION: u16 = 17;
 
 // The object dialect is its own header `kind` (`wire::KIND_OBJECT`), not a flag bit.
 
@@ -450,7 +453,7 @@ pub enum DecodeError {
     BadTypeTag(u8),
     /// An import name's length-prefixed bytes were not valid UTF-8.
     BadUtf8,
-    /// Bytes remained after a complete module was decoded.
+    /// Bytes remained after a complete module, or a complete function body (v17), was decoded.
     TrailingBytes,
     /// A debug-info `TypeDef` kind byte was not one of the known variants.
     BadTypeDefKind(u8),
@@ -733,8 +736,13 @@ fn encode_impl(m: &Module, dialect: Dialect) -> Vec<u8> {
         write_uleb(&mut out, e.threaded as u64);
     }
     write_uleb(&mut out, m.funcs.len() as u64);
+    // v17 (#2596): each body after its length.
+    let mut body = Vec::new();
     for f in &m.funcs {
-        encode_func(&mut out, f, object);
+        body.clear();
+        encode_func(&mut body, f, object);
+        write_uleb(&mut out, body.len() as u64);
+        out.extend_from_slice(&body);
     }
     // Optional strippable debug section (DEBUGGING.md §6/§2a). Written only when present, so a
     // module without debug info encodes byte-identically to before (snapshot digests, round-trip
@@ -2326,8 +2334,16 @@ fn decode_impl(bytes: &[u8], allow_object: bool) -> Result<Module, DecodeError> 
             threaded,
         });
     }
+    // v17 (#2596): each body after its length. The lengths come first, so every body is found
+    // without decoding the ones before it; then the bodies decode, on threads for a large module.
     let nfuncs = c.count()?;
-    let funcs = c.list(nfuncs, |s| &mut s.funcs, |c| decode_func(c, object))?;
+    let mut bodies: Vec<&[u8]> = Vec::new();
+    for _ in 0..nfuncs {
+        let n = c.count()?;
+        bodies.push(c.take(n)?);
+    }
+    let bytes: usize = bodies.iter().map(|b| b.len()).sum();
+    let funcs = decode_funcs(&bodies, object, temen_ir::par::threads(bytes >= 1 << 16))?;
     // Optional strippable debug section (mirrors the encoder): present iff bytes remain after the
     // funcs. Strippable and untrusted-for-escape (§2a) — the verifier ignores it.
     let debug_info = if c.at_end() {
@@ -2535,6 +2551,26 @@ fn decode_debug_info(c: &mut Cursor) -> Result<DebugInfo, DecodeError> {
         tls_root,
         lib_files,
     })
+}
+
+/// A module's function bodies, each decoded from its own bytes ([`decode_func`]), which it must use
+/// up, shared among up to `threads` threads (#2596). A module gets the host's threads for 64 KiB of
+/// bodies or more, about half a millisecond of decoding. The error is the lowest-numbered failing
+/// body's, the one an in-order decode meets first ([`temen_ir::par::try_each`]).
+fn decode_funcs<'a>(
+    bodies: &[&'a [u8]],
+    object: bool,
+    threads: usize,
+) -> Result<Vec<Func>, DecodeError> {
+    let each = |c: &mut Cursor<'a>, i: usize| {
+        (c.bytes, c.pos) = (bodies[i], 0);
+        let f = decode_func(c, object)?;
+        match c.at_end() {
+            true => Ok(f),
+            false => Err(DecodeError::TrailingBytes),
+        }
+    };
+    temen_ir::par::try_each(bodies.len(), threads, || Cursor::new(&[]), each)
 }
 
 fn decode_func(c: &mut Cursor, object: bool) -> Result<Func, DecodeError> {
@@ -3019,7 +3055,6 @@ struct Cursor<'a> {
 /// One buffer for each kind of list the decoder builds per function, block, edge or call.
 #[derive(Default)]
 struct Spare {
-    funcs: Vec<Func>,
     blocks: Vec<Block>,
     captures: Vec<(BlockIdx, ValIdx)>,
     insts: Vec<Inst>,
@@ -4314,5 +4349,112 @@ mod list_tests {
                 }
             }
         }
+    }
+}
+
+/// v17 (#2596): each function body is prefixed by its length and decoded from its own bytes.
+#[cfg(test)]
+mod body_length_tests {
+    use super::*;
+    use temen_ir::{Block, Terminator};
+
+    /// `n` constants, then a return: a body that grows with `n`.
+    fn consts(n: usize) -> Func {
+        Func {
+            params: vec![],
+            results: vec![],
+            blocks: vec![Block {
+                parent: 0,
+                captures: vec![],
+                params: vec![],
+                insts: (0..n).map(|i| Inst::ConstI32(i as i32)).collect(),
+                term: Terminator::Return(vec![]),
+            }],
+        }
+    }
+
+    fn body(f: &Func) -> Vec<u8> {
+        let mut out = Vec::new();
+        encode_func(&mut out, f, false);
+        out
+    }
+
+    fn module(funcs: Vec<Func>) -> Module {
+        Module {
+            funcs,
+            ..Module::default()
+        }
+    }
+
+    #[test]
+    fn a_body_must_be_exactly_its_length() {
+        let good = body(&consts(3));
+        let mut long = good.clone();
+        long.push(0);
+        let short = &good[..good.len() - 1];
+        for threads in [1, 4] {
+            let funcs = decode_funcs(&[&good], false, threads).expect("decodes");
+            assert_eq!(funcs, vec![consts(3)]);
+            assert_eq!(
+                decode_funcs(&[&long], false, threads),
+                Err(DecodeError::TrailingBytes)
+            );
+            assert_eq!(
+                decode_funcs(&[short], false, threads),
+                Err(DecodeError::UnexpectedEof)
+            );
+        }
+    }
+
+    /// Bodies 1 and 3 of 5 fail differently; every thread count reports body 1's error, as an
+    /// in-order decode does.
+    #[test]
+    fn the_lowest_failing_body_is_the_error() {
+        let good = body(&consts(2));
+        let mut long = good.clone();
+        long.push(0);
+        let short = &good[..good.len() - 1];
+        let bodies: [&[u8]; 5] = [&good, &long, &good, short, &good];
+        for threads in [1, 2, 3, 4, 8] {
+            assert_eq!(
+                decode_funcs(&bodies, false, threads),
+                Err(DecodeError::TrailingBytes),
+                "{threads} threads"
+            );
+        }
+    }
+
+    /// An emitter that writes a body before it knows its length pads the length's LEB128 to four
+    /// bytes and patches it; the decoder takes the padded length as it takes any other.
+    #[test]
+    fn a_padded_body_length_decodes() {
+        let m = module(vec![consts(1), consts(200), consts(0)]);
+        // The module up to its function section: the module with no functions, less its count.
+        let mut bytes = encode_module(&module(vec![]));
+        bytes.pop();
+        write_uleb(&mut bytes, m.funcs.len() as u64);
+        for f in &m.funcs {
+            let b = body(f);
+            let n = b.len();
+            bytes.extend([
+                0x80 | (n & 0x7f) as u8,
+                0x80 | ((n >> 7) & 0x7f) as u8,
+                0x80 | ((n >> 14) & 0x7f) as u8,
+                ((n >> 21) & 0x7f) as u8,
+            ]);
+            bytes.extend(b);
+        }
+        assert_eq!(decode_module(&bytes), Ok(m));
+    }
+
+    /// A module with enough bodies for the host's threads decodes to what it encoded.
+    #[test]
+    fn a_large_module_round_trips() {
+        let m = module((0..600).map(|i| consts(i % 197)).collect());
+        assert!(
+            encode_module(&m).len() >= 1 << 16,
+            "large enough for threads"
+        );
+        assert_eq!(decode_module(&encode_module(&m)), Ok(m));
     }
 }

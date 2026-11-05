@@ -5,10 +5,12 @@
 //! so an `temen-encode` renumbering or family-base move is a red test, not a silent
 //! format break.
 //!
-//! Opcode location needs no knowledge of the container layout: the wire format has
-//! **counts, not byte-length prefixes** (see `encode_module`/`encode_func`), so a
-//! baseline module differing *only* in the single instruction encodes byte-identically
-//! up to the instruction's first byte — the first divergent byte IS the opcode.
+//! Opcode location: a baseline module differing *only* in the single instruction encodes
+//! byte-identically up to the function's body, which follows its length (wire v17). Past the
+//! length, the first byte at which the bodies differ IS the opcode ([`opcode_pin`]).
+
+#[path = "support/opcode_pin.rs"]
+mod opcode_pin;
 
 use temen::encode::{decode_module, encode_module};
 use temen_ir::{Inst, Module};
@@ -31,10 +33,7 @@ fn check(id: &str, encoding: Enc, m: &Module) {
         Inst::ConstI32(0)
     };
     let base_bytes = encode_module(&base);
-    let i = bytes
-        .iter()
-        .zip(&base_bytes)
-        .position(|(a, b)| a != b)
+    let i = opcode_pin::first_divergence(m, &bytes, &base_bytes, encode_module)
         .unwrap_or_else(|| panic!("no divergence vs const baseline for {id}"));
     match encoding {
         Enc::Byte(b) => assert_eq!(
