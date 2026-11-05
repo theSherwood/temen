@@ -441,18 +441,32 @@ unsafe fn granted_teardown(
     let lane_give = rt.grant_lane_give.load(Ordering::Acquire);
     let mem_give = rt.grant_budget_mem_give.load(Ordering::Acquire);
     let ended_hook = rt.grant_child_ended.load(Ordering::Acquire);
-    // #1936 — the child's end, which the task tells its powerbox before its teardown frees it.
+    let signal_hook = rt.grant_child_end_signal.load(Ordering::Acquire);
+    // #1936 — the child's end, which the task tells its powerbox before its teardown frees it; and
+    // its end post, which the task signals once the end is published (#2800).
     let end_ctx = SendRaw(gc_ctx);
     let ended: crate::child_exec::Ended = Box::new(move || {
         let ctx = end_ctx;
-        if ended_hook != 0 {
-            // SAFETY: the hook was registered with this nursery for its children's powerboxes, and
-            // the powerbox is live until the teardown below releases it, which runs after this.
-            unsafe {
-                let ended: crate::ChildEnded = core::mem::transmute(ended_hook);
-                ended(ctx.0);
-            }
+        if ended_hook == 0 {
+            return None;
         }
+        // SAFETY: the hook was registered with this nursery for its children's powerboxes, and the
+        // powerbox is live until the teardown below releases it, which runs after this.
+        let post = SendRaw(unsafe {
+            let ended: crate::ChildEnded = core::mem::transmute(ended_hook);
+            ended(ctx.0)
+        });
+        (!post.0.is_null()).then(|| -> crate::child_exec::EndSignal {
+            Box::new(move || {
+                let post = post;
+                // SAFETY: the signal hook came in one `GrantChildHooks` with the end hook, so it is
+                // registered too, and `post` is what the end hook answered, signalled here once.
+                unsafe {
+                    let signal: crate::ChildEndSignal = core::mem::transmute(signal_hook);
+                    signal(post.0);
+                }
+            })
+        })
     });
     let teardown = Box::new(move |captured| {
         let (ctx, parent_ctx) = (ctx, parent_ctx);
@@ -575,8 +589,10 @@ pub(crate) struct Nursery {
     grant_budget_mem_take: std::sync::atomic::AtomicUsize,
     /// #1587 — [`crate::BudgetMemGiver`]: returns a taken quota when the OS-thread spawn fails.
     grant_budget_mem_give: std::sync::atomic::AtomicUsize,
-    /// #1936 — [`crate::ChildEnded`]: a detached child's domain ended.
+    /// #1936 — [`crate::ChildEnded`]: a detached child's domain ended; and [`crate::ChildEndSignal`]
+    /// signals its end post once the end is published (#2800).
     grant_child_ended: std::sync::atomic::AtomicUsize,
+    grant_child_end_signal: std::sync::atomic::AtomicUsize,
     /// D66 — [`crate::LaneGiver`]: a reaped child task returns its lane to the parent.
     grant_lane_give: std::sync::atomic::AtomicUsize,
     /// Spawn pre-mapped region hooks ([`crate::PremapAdmit`] / [`crate::PremapStage`] /
@@ -690,6 +706,7 @@ impl Nursery {
             grant_budget_mem_take: std::sync::atomic::AtomicUsize::new(0),
             grant_budget_mem_give: std::sync::atomic::AtomicUsize::new(0),
             grant_child_ended: std::sync::atomic::AtomicUsize::new(0),
+            grant_child_end_signal: std::sync::atomic::AtomicUsize::new(0),
             grant_lane_give: std::sync::atomic::AtomicUsize::new(0),
             grant_premap_admit: std::sync::atomic::AtomicUsize::new(0),
             grant_premap_stage: std::sync::atomic::AtomicUsize::new(0),
@@ -777,6 +794,10 @@ impl Nursery {
         self.grant_premap_apply.store(pp, Ordering::Release);
         self.grant_child_ended.store(
             hooks.map_or(0, |h| h.child_ended as usize),
+            Ordering::Release,
+        );
+        self.grant_child_end_signal.store(
+            hooks.map_or(0, |h| h.child_end_signal as usize),
             Ordering::Release,
         );
         self.grant_held_tail

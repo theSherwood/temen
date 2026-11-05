@@ -3948,7 +3948,9 @@ fn drive_over_cell(
             let mut h = r.domain.host.lock_unpoisoned();
             // The run is over: no reader, writer or waiter is left to wake. An end post is still
             // signalled, so its bits are there for whoever reads the region next.
-            let _ = h.release_memory();
+            if let Some(end) = h.release_memory() {
+                let _ = end.signal();
+            }
             h.release_pipe_ends();
             h.svc_payers.clear();
         }
@@ -9017,12 +9019,8 @@ fn reap(s: &mut Sched, mut v: Box<VCpu>, reason: Trap) -> Vec<u64> {
     // A detached child killed here ends as surely as one reaching `Done`: its window's bytes go
     // back to the budget that paid for them (lock order sched → host), and what it grew (#1909).
     // Every vCPU of the dying domain passes here; the first hands it back, with the window of a
-    // process that paid for its own (#2106), and signals its end post (#1936), whose waiters wake
-    // before this vCPU stops counting as live, so none of them reads the run as deadlocked.
+    // process that paid for its own (#2106), and takes its end post (#1936), signalled below.
     let end = v.domain.host.lock_unpoisoned().release_memory();
-    if let Some(w) = end {
-        notify_locked(s, w.key(), u32::MAX);
-    }
     if let Some((cell, lease)) = v.window_lease.take() {
         cell.lock_unpoisoned().release_detached(lease);
     }
@@ -9046,6 +9044,11 @@ fn reap(s: &mut Sched, mut v: Box<VCpu>, reason: Trap) -> Vec<u64> {
     }
     if !retired {
         s.results.insert(id, outcome);
+    }
+    // #1936, #2800 — the end post once the end is published, so a waiter it wakes polls the end,
+    // and before this vCPU stops counting as live, so none of them reads the run as deadlocked.
+    if let Some(end) = end {
+        notify_locked(s, end.signal().key(), u32::MAX);
     }
     end_hold_member(s, id); // #2455
     s.live -= 1;
@@ -9566,9 +9569,6 @@ fn kill_withheld(s: &mut Sched, domain: usize, host: &Arc<Mutex<Host>>) {
     };
     let w = s.withheld.remove(&id).expect("found just above");
     let end = host.lock_unpoisoned().release_memory();
-    if let Some(end) = end {
-        notify_locked(s, end.key(), u32::MAX);
-    }
     if let Some((cell, lease)) = w.lease {
         cell.lock_unpoisoned().release_detached(lease);
     }
@@ -9582,6 +9582,10 @@ fn kill_withheld(s: &mut Sched, domain: usize, host: &Arc<Mutex<Host>>) {
         ..w.outcome
     };
     s.results.insert(id, outcome);
+    // #1936, #2800 — its end post once its end is published.
+    if let Some(end) = end {
+        notify_locked(s, end.signal().key(), u32::MAX);
+    }
 }
 
 /// #1584 / §13.4 4c-bis — bring every park the scheduler owns through a freeze, for either trigger
@@ -10382,7 +10386,7 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 } else {
                     let mut h = v.domain.host.lock_unpoisoned();
                     // #1909, #2106 — and its window goes, with what it held. #1936 — and its end
-                    // post is signalled, its waiters woken below.
+                    // post is taken, signalled below once the end is published.
                     (h.release_memory(), h.release_pipe_ends())
                 };
                 // #1217 — a finishing client child releases the parked `svc.wait` of every
@@ -10479,11 +10483,6 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 for pipe in &pipe_epipes {
                     wake_pipe_writers_locked(&mut s, *pipe);
                 }
-                // #1936 — under the lock that retires this vCPU, so a waiter it wakes is runnable
-                // before the run can read it as deadlocked.
-                if end.is_some_and(|end| notify_locked(&mut s, end.key(), u32::MAX) > 0) {
-                    sched.work.notify_all();
-                }
                 // #2480 — a call a fiber of the ended domain is parked on wakes no one: it leaves
                 // the wait set, as a dying domain's does at its teardown, so the run's deadlock
                 // verdict does not wait for its answer.
@@ -10558,6 +10557,12 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                     s.withheld.insert(id, w);
                 } else if !retired {
                     s.results.insert(id, outcome);
+                }
+                // #1936, #2800 — the end post once the end is published (its `poll` and `join`
+                // see it), under the lock that retires this vCPU, so a waiter it wakes is runnable
+                // before the run can read it as deadlocked.
+                if let Some(end) = end {
+                    notify_locked(&mut s, end.signal().key(), u32::MAX);
                 }
                 end_hold_member(&mut s, id);
                 s.live -= 1;
@@ -20796,6 +20801,24 @@ fn signal_post(backing: &RegionBacking, off: u64, badge: u64) -> RegionWake {
     }
 }
 
+/// #1936, #2800 — a domain's end post, taken as the domain ends ([`Host::release_memory`]) and
+/// signalled once the end is published: after the spawner's `poll` and `join` can see it, so a
+/// waiter it wakes finds the end it was told of, and while the domain still counts as live, so none
+/// of its waiters is read as deadlocked. It holds the post's region, which the domain no longer does.
+#[must_use = "an end post is signalled once its domain's end is published"]
+pub struct EndPost {
+    backing: RegionBacking,
+    off: u64,
+    badge: u64,
+}
+
+impl EndPost {
+    /// Signal it, as a post's `signal` does ([`signal_post`]): the word whose waiters to wake.
+    pub fn signal(self) -> RegionWake {
+        signal_post(&self.backing, self.off, self.badge)
+    }
+}
+
 /// §4 / S4 — a host-served **pipe's** shared FIFO backing. `Arc<Mutex<…>>` so a pipe end can be
 /// **re-granted into a §14 child** (the child's `Host` clones the `Arc`, aliasing the same queue) and
 /// so concurrent parent/child access — the interpreter runs children on its M:N executor — is
@@ -30328,17 +30351,19 @@ impl Host {
     /// root, and its processes) keeps its regions for the embedder: it reads them after the run, and
     /// a reactor's next call finds them where they were. Every engine calls this where a domain ends,
     /// under its lock, so it is also where the domain is marked [`Self::ended`] (#2220), and where its
-    /// end post is signalled (#1936): the word to wake is answered, once, for the engine to wake its
-    /// waiters on, as a post's `signal` leaves it.
-    #[must_use = "a domain's end post leaves its waiters to wake"]
-    pub fn release_memory(&mut self) -> Option<RegionWake> {
+    /// end post is taken (#1936): it is answered, once and unsignalled, for the engine to signal once
+    /// the end is published ([`EndPost`], #2800).
+    #[must_use = "a domain's end post is the engine's to signal once the end is published"]
+    pub fn release_memory(&mut self) -> Option<EndPost> {
         self.ended = true;
-        let wake = self.end.take().and_then(|(region, off, badge)| {
-            let wake = self
-                .region(region)
-                .map(|b| signal_post(b, off.into(), badge));
+        let end = self.end.take().and_then(|(region, off, badge)| {
+            let end = self.region(region).map(|b| EndPost {
+                backing: Arc::clone(b),
+                off: off.into(),
+                badge,
+            });
             self.release_hold(region);
-            wake
+            end
         });
         let held = std::mem::take(&mut self.grown) + std::mem::take(&mut self.own_window);
         if held > 0 {
@@ -30351,7 +30376,7 @@ impl Host {
         if self.own_budget != BudgetTree::RUN_NODE {
             self.regions.clear();
         }
-        wake
+        end
     }
 
     /// #1936 — [`Self::release_memory`] without the end post: what this domain holds goes back, and
@@ -30399,7 +30424,7 @@ impl Host {
                 .drop_restored(&child.launch, &child.window, false);
             wakes.extend(woken);
         }
-        wakes.extend(self.release_memory());
+        wakes.extend(self.release_memory().map(EndPost::signal));
         wakes
     }
 

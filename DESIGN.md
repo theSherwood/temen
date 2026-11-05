@@ -2641,7 +2641,9 @@ One mechanism for every sharing relationship: host↔guest, guest↔guest
   transient (`RegionWake`), and each engine wakes its futex waiters on it by the
   key it gives a region word. A spawn names a child's **end post** as a grant
   called `end`: the child never holds it, and the child's end signals it, however
-  it ends (§14).
+  it ends (§14). It is the end's last act (#2800): its spawner's `poll` and
+  `join` already see the end, so a waiter that takes its bits and polls never
+  reads the child as running.
 
 ---
 

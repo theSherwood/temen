@@ -79,7 +79,13 @@ type LimitedEntry =
     extern "C" fn(*const i64, *mut i64, *mut u8, *const core::ffi::c_void, *mut i64, u64);
 
 /// #1936 — a task's one-shot end: its domain ended, and no freeze captured it ([`crate::ChildEnded`]).
-pub(crate) type Ended = Box<dyn FnOnce() + Send>;
+/// It answers the signal of the domain's end post, if it has one, for the task to give once its end
+/// is published (#2800).
+pub(crate) type Ended = Box<dyn FnOnce() -> Option<EndSignal> + Send>;
+
+/// #2800 — the signal of a domain's end post ([`crate::ChildEndSignal`]): given once its end is
+/// published, so a waiter it wakes finds the end, and before the task leaves the run's live count.
+pub(crate) type EndSignal = Box<dyn FnOnce() + Send>;
 
 /// A task's one-shot teardown: release the child powerbox, return its lane and its window's bytes.
 /// Its argument says whether a freeze captured the child (#1971): a child that unwound for a freeze
@@ -166,12 +172,11 @@ impl ChildTask {
         self
     }
 
-    /// #1936 — the task's domain has ended, and no freeze captured it: tell its powerbox, once,
-    /// before the task leaves the run's live count or its join can see the end.
-    fn end(&mut self) {
-        if let Some(ended) = self.ended.take() {
-            ended();
-        }
+    /// #1936 — the task's domain has ended, and no freeze captured it: tell its powerbox, once, while
+    /// it is live. Answers its end post's signal, for the caller to give once the end is published
+    /// and before the task leaves the run's live count (#2800).
+    fn end(&mut self) -> Option<EndSignal> {
+        self.ended.take().and_then(|ended| ended())
     }
 
     /// Build a task around a compiled detached child. `init` seeds the fresh window (data segments,
@@ -1255,9 +1260,7 @@ impl ChildExec {
         // learn of the end, as its window's do in `teardown`.
         task.rt.table().release_charges();
         // #1936 — and its powerbox hears of it, unless its root already ended (`settle`).
-        if !captured {
-            task.end();
-        }
+        let end = if captured { None } else { task.end() };
         if let Some(t) = task.teardown.take() {
             t(captured);
         }
@@ -1265,6 +1268,10 @@ impl ChildExec {
         let trap = task.vm.ended().unwrap_or(0);
         let result = task.results.first().copied().unwrap_or(0);
         done.publish(result, trap, self.domain());
+        // #2800 — its end post once the end is published, while the task still counts as live.
+        if let Some(signal) = end {
+            signal();
+        }
         let retiring = task.retiring;
         drop(task);
         // `settle` dropped a retiring task's live count when its root returned.
@@ -1295,9 +1302,13 @@ impl ChildExec {
         }
         if !task.root_unwound() {
             // #1936 — the domain ends with its root, as the oracle's does, so its powerbox hears
-            // of it now, while the task still counts as live.
-            task.end();
+            // of it now, while the task still counts as live; and its end post once the end is
+            // published (#2800).
+            let end = task.end();
             task.done.publish(result, trap, self.domain());
+            if let Some(signal) = end {
+                signal();
+            }
         }
         if let Some(d) = self.domain() {
             d.child_finished();
