@@ -13,8 +13,6 @@
 #[path = "../../temen-interp/tests/support/rec.rs"]
 mod rec;
 
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
 use std::time::Duration;
 
 use temen_interp::{run, Trap, Value};
@@ -88,11 +86,11 @@ fn jit_with_watchdog(src: &str, delay: Duration) -> JitOutcome {
     let m = parse_module(src).expect("parse");
     verify_module(&m).expect("verify");
 
-    let interrupt = Arc::new(AtomicU64::new(0));
+    let interrupt = temen_jit::Interrupt::new();
     let wd = interrupt.clone();
     let watchdog = std::thread::spawn(move || {
         std::thread::sleep(delay);
-        wd.store(1, Ordering::SeqCst); // request the kill
+        wd.fire(); // request the kill
     });
 
     // The guest makes no `call.cap`, so the thunk is never invoked — a null ctx is never read.
@@ -102,7 +100,7 @@ fn jit_with_watchdog(src: &str, delay: Duration) -> JitOutcome {
         &[0i64],
         temen_run::cap_thunk,
         core::ptr::null_mut(),
-        Arc::as_ptr(&interrupt),
+        &interrupt,
     )
     .expect("jit compiles");
     watchdog.join().unwrap();
@@ -167,14 +165,14 @@ fn jit_armed_finite_run_completes_normally() {
     let interp = run(&m, 0, &[Value::I32(1000)], &mut fuel).expect("interp ok");
     assert_eq!(interp, vec![Value::I32(0)], "countdown returns 0");
 
-    let interrupt = Arc::new(AtomicU64::new(0)); // armed, but we never set it
+    let interrupt = temen_jit::Interrupt::new(); // armed, but we never set it
     let jit = compile_and_run_with_host_interruptible(
         &m,
         0,
         &[1000i64],
         temen_run::cap_thunk,
         core::ptr::null_mut(),
-        Arc::as_ptr(&interrupt),
+        &interrupt,
     )
     .expect("jit compiles");
     assert_eq!(

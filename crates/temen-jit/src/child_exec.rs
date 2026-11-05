@@ -38,7 +38,7 @@ use std::cell::Cell;
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use temen_fiber::{Fiber, State};
 
@@ -53,19 +53,6 @@ use crate::{mem, vcpu_tls, CompiledModule, TrapKind, VmCtx};
 /// low bound rides in as the child's `stack_limit`), so a child that recurses past it traps
 /// `StackOverflow` cleanly instead of relying on the OS guard.
 const TASK_STACK: usize = 1 << 18;
-
-/// The teardown-join backstop: how often [`ChildExec::shutdown_and_join`] re-checks that the task
-/// table has drained, in case a completion's `quiescent` notify is lost in the teardown churn. The
-/// pool runs **no** cadence (#2757): a parked task is re-offered only by a wake — a `notify`, a
-/// kill, a vCPU's or a child's end, teardown, its freeze doorbell ([`Wake`]) — or by its own
-/// deadline (#2012: [`Entry::deadline`]).
-///
-/// Two stores still fire no wake: the host's kill-path store into the epoch cell, and
-/// [`crate::FreezeController::request_freeze`]'s into the root's freeze word. They reach a parked
-/// task only through the run's root vCPU, which re-checks them on `os_thread_rt::KILL_RECHECK`,
-/// ends, and re-offers every parked task at teardown. So vCPUs keep that re-check until those
-/// stores fire wakes of their own (#2757, slice 3).
-const TEARDOWN_RECHECK: Duration = Duration::from_millis(20);
 
 /// #2722 — process-wide count of child-executor residencies ([`ChildExec::run_once`]): each time a
 /// pool worker resumes a task's fiber. A parked task advances it only when something genuinely
@@ -778,6 +765,27 @@ impl ChildExec {
         self.wake_parked(&mut g, which);
     }
 
+    /// #2757 — wake the vCPUs parked in every task's domain, each to re-check what it waits on,
+    /// once the caller has woken the run's own (`Domain::wake_own_parked`): a task domain's futex
+    /// waits and lanes are its hub's, woken with them, so only its joiners are left. Under the
+    /// executor's lock, which a task domain's wake may take after its own: never the other way round.
+    fn wake_task_vcpus(g: &ExecState) {
+        for d in g.tasks.values().filter_map(|e| e.dom.as_ref()) {
+            d.wake_joiners();
+        }
+    }
+
+    /// #2757 — a task's park, or a killed task's end, may have left the run quiescent: wake the
+    /// vCPU parks that decide the deadlock verdict, on the run's domain and in every task's, as a
+    /// vCPU's own park needs not (it decides the verdict itself). Tasks are not re-offered: a task
+    /// cannot decide the verdict, and one re-offered would only park again.
+    fn wake_vcpus_if_quiescent(&self, g: &ExecState) {
+        if let Some(d) = self.domain().filter(|d| !d.peers_live()) {
+            d.wake_own_parked();
+            Self::wake_task_vcpus(g);
+        }
+    }
+
     /// Make the parked tasks `which` names runnable.
     fn wake_parked(self: &Arc<Self>, g: &mut ExecState, which: Wake) {
         match which {
@@ -790,6 +798,12 @@ impl ChildExec {
                 for e in g.tasks.values_mut().filter(|e| e.task.is_none()) {
                     e.woken = true;
                 }
+            }
+            Wake::Run => {
+                for e in g.tasks.values_mut().filter(|e| e.task.is_none()) {
+                    e.woken = true;
+                }
+                Self::wake_task_vcpus(g);
             }
             // #2757 — the one task a store names: latched the same way, and its own parked vCPUs
             // woken, since the store may end their waits too.
@@ -811,7 +825,7 @@ impl ChildExec {
             .filter(|(id, e)| {
                 e.parked
                     && match which {
-                        Wake::All => true,
+                        Wake::All | Wake::Run => true,
                         Wake::Task(task) => **id == task,
                         Wake::Due(now) => e.deadline.is_some_and(|d| d <= now),
                         Wake::Resolved => e.task.as_ref().is_some_and(|t| t.slot.park_resolved()),
@@ -903,11 +917,10 @@ impl ChildExec {
             let (id, mut task) = {
                 let mut g = lock(&self.state);
                 let id = loop {
-                    // #2757 — a parked task is re-offered only by a wake (a `notify`, a kill, a
-                    // vCPU's or a child's end, teardown, its freeze doorbell) or by its own deadline
-                    // (#2012), fired as it passes. A store that can end a park must fire a wake:
-                    // `TEARDOWN_RECHECK` names the two that still reach parked tasks only through
-                    // the root vCPU. #1991 — a worker fires due deadlines before each task it takes,
+                    // #2757 — a parked task is re-offered only by a wake (a `notify`, a kill or a
+                    // freeze through the run's doors, a vCPU's or a child's end, teardown, its freeze
+                    // doorbell) or by its own deadline (#2012), fired as it passes: the pool runs
+                    // no cadence. #1991 — a worker fires due deadlines before each task it takes,
                     // not only when idle, so they come due however busy the pool is.
                     self.due(&mut g, Instant::now());
                     if let Some(id) = self.pick(&mut g) {
@@ -1021,6 +1034,7 @@ impl ChildExec {
                             if let Some(d) = self.domain() {
                                 d.task_parked();
                             }
+                            self.wake_vcpus_if_quiescent(&g);
                         }
                         if let Some(d) = deadline {
                             g.next_due = Some(g.next_due.map_or(d, |n| n.min(d)));
@@ -1058,6 +1072,7 @@ impl ChildExec {
                         if let Some(d) = self.domain() {
                             d.kill_in_flight(false);
                         }
+                        self.wake_vcpus_if_quiescent(&g);
                     }
                     if g.tasks.is_empty() {
                         self.quiescent.notify_all();
@@ -1316,12 +1331,9 @@ impl ChildExec {
                 self.clone().worker_loop(0);
                 g = lock(&self.state);
             }
+            // The task table's one removal notifies `quiescent` under this lock (#2757).
             while !g.tasks.is_empty() {
-                g = self
-                    .quiescent
-                    .wait_timeout(g, TEARDOWN_RECHECK)
-                    .unwrap_or_else(|e| e.into_inner())
-                    .0;
+                g = self.quiescent.wait(g).unwrap_or_else(|e| e.into_inner());
             }
             self.cv.notify_all();
             std::mem::take(&mut g.workers)
@@ -1338,6 +1350,9 @@ pub(crate) enum Wake {
     /// Every one: what changed may be any park's predicate — a vCPU's or a child's end, a host
     /// park's key, an answer from outside, teardown.
     All,
+    /// #2757 — every one, and every vCPU parked in a task's domain too: a store that can end any
+    /// park of the run fired, its kill door or a freeze.
+    Run,
     /// #2757 — the one task a store that can end its park names: its kill, its freeze doorbell.
     /// Its own parked vCPUs are woken with it.
     Task(u64),

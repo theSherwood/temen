@@ -196,6 +196,11 @@ fn ring_child(done: &ChildDone, kid: Option<&std::sync::Arc<Nursery>>) {
 }
 
 impl Child {
+    /// #2757 — the child's completion cell, which a joining vCPU parks on.
+    pub(crate) fn done(&self) -> &std::sync::Arc<ChildDone> {
+        &self.done
+    }
+
     /// What [`ring_child`] needs of this child, taken out of its table so the ring holds no lock.
     fn ring_target(&self) -> (std::sync::Arc<ChildDone>, Option<std::sync::Arc<Nursery>>) {
         (std::sync::Arc::clone(&self.done), self.kid.clone())
@@ -821,7 +826,7 @@ impl Nursery {
     ) -> crate::InstanceAddrs {
         crate::InstanceAddrs {
             cap_ctx: gc.ctx,
-            epoch: self.epoch_addr as *const core::sync::atomic::AtomicU64,
+            epoch: self.epoch_addr as *const crate::Interrupt,
             fuel: fuel as *mut crate::FuelCell,
             sched: self.futex_sched as *const core::ffi::c_void,
             nursery: kid.map_or(core::ptr::null(), |k| {
@@ -949,6 +954,13 @@ impl Nursery {
     ///
     /// #1361 step 4 — a frozen run's teardown then takes the harvest: every unjoined durable detached
     /// child, with its powerbox handed over (see [`crate::DetachedHarvest`]). Empty unless `froze`.
+    /// #2757 — re-offer every parked child task, for a store that may end any of their parks (a
+    /// kill of the run). A run with a thread domain reaches them through it instead
+    /// (`Domain::wake_run`), which has this executor.
+    pub(crate) fn wake_tasks(&self) {
+        self.child_exec.wake_locked(crate::child_exec::Wake::All);
+    }
+
     pub(crate) fn join_children(&self, froze: bool) -> Vec<crate::DetachedHarvest> {
         // D66 — drive the executor to quiescence: parked tasks are poisoned so they unwind, and
         // unless this is a freeze every running task ends with the run; then the workers are joined.
@@ -2162,9 +2174,9 @@ pub(crate) unsafe fn join_named(
     let result = (|| -> i64 {
         // Park on the completion cell until the child's OS thread fills it (S1c async children). A durable
         // child ran synchronously, so its cell is already `Some` and this returns without waiting; an
-        // async (op-0/5/8/11/13) child parks here until its thread publishes the outcome, with a bounded
-        // re-check so a §5 host interrupt on the parent's `epoch_addr` still unwinds a waiter (the child
-        // bakes that same cell, so it unwinds too).
+        // async (op-0/5/8/11/13) child parks here until its thread publishes the outcome. A §5 kill of
+        // the parent (the child bakes that same door, so it unwinds too), a freeze and the domain's
+        // end wake the wait (#2757).
         let mut st = done.state.lock().unwrap_or_else(|e| e.into_inner());
         let mut _pg = None;
         let (result, trap) = loop {
@@ -2228,11 +2240,14 @@ pub(crate) unsafe fn join_named(
                     crate::fiber_rt::fiber_event_park(fib, None, crate::fiber_rt::ParkOn::Child);
                     done.state.lock().unwrap_or_else(|e| e.into_inner())
                 }
+                // #2757 — nothing re-checks on a timer: the child's publish, a kill or a freeze
+                // (the run's wake on its doors), the domain's end and the run falling quiescent
+                // each notify this cell (`Domain::wake_own_parked`). A freeze seen
+                // above has rung the child's doorbell, and the join then waits for its publish.
                 None => {
-                    done.cv
-                        .wait_timeout(st, std::time::Duration::from_millis(20))
-                        .unwrap_or_else(|e| e.into_inner())
-                        .0
+                    let st = done.cv.wait(st).unwrap_or_else(|e| e.into_inner());
+                    crate::os_thread_rt::woke();
+                    st
                 }
             };
         };

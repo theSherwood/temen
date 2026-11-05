@@ -2018,10 +2018,11 @@ its own threading model (1:1, M:N, async/await, goroutines, actors) on top.
   **all three production/reference tiers**: the tree-walk oracle parks into `svc_waiters`;
   the cooperative bytecode driver (which also backs the wasm-jit's `InterpDriven` fold)
   parks the resumer's task as `BlockedOnFiber` and burns zero fuel while idle; and the
-  Cranelift JIT parks the resumer's **OS thread** on the domain condvar
-  (`fiber_resume_block`) and re-resumes, woken by any `notify`/teardown broadcast and
-  bounded by the `KILL_RECHECK` re-poll (so a timed wait's deadline, a kill, or a freeze
-  is observed with no timer thread). The deterministic explorer keeps the `FIBER_PARKED`
+  Cranelift JIT parks the resumer's **OS thread** on the fiber's futex wait cell, or on the
+  run's ring when the fiber's park has none (`fiber_resume_block`), and re-resumes, woken by whatever can end the fiber's park — a
+  `notify` that claims its cell, a host key's or an outside answer's ring, a kill, a freeze,
+  teardown — and bounded only by the fiber's own deadline, with no timer thread and no
+  re-poll on a timer (#2757). The deterministic explorer keeps the `FIBER_PARKED`
   downgrade (the guest loop absorbs it — determinism untouched), as does the JIT
   **OS-thread-parallel** driver variant (its idle is a small remaining follow-up); the bytecode
   parallel driver idles as the cooperative one does, on the pump's rules (#1414 3e). A
@@ -2032,8 +2033,7 @@ its own threading model (1:1, M:N, async/await, goroutines, actors) on top.
   freeze-on-quiesce could not fire, and the run burned its fuel instead of freezing. It never "blocks the domain"
   (§12 below) — the guest issues it only when it has nothing else to run (mechanism,
   not policy), and other vCPUs keep running; teardown/exit/trap free an idle resumer
-  (the `svc_waiters` sweep on the oracle; the `KILL_RECHECK`/broadcast re-poll on the
-  JIT). *The one guest-facing blocking primitive on the scheduler park/idle core — kept
+  (the `svc_waiters` sweep on the oracle; the run's wake on the JIT, #2757). *The one guest-facing blocking primitive on the scheduler park/idle core — kept
   advisory precisely to stay off the §18 determinism surface.*
 - **Per-vCPU TLS register (`vcpu.tls.get`/`vcpu.tls.set`).** One ambient i64 of
   per-vCPU state, **read at the execution point** — so a fiber that migrated to
@@ -2353,7 +2353,9 @@ primitive still wants a second consumer.
   1:1 vCPU's OS thread and an event-parked fiber queue the same kind of cell, and the
   wake is latched in that cell rather than inferred from shared state, so a waiter reports
   woken iff a `notify` claimed it. Two representations behind one key is how the JIT once
-  woke three OS waiters while reporting one (#1615, invariant #15).
+  woke three OS waiters while reporting one (#1615, invariant #15). The JIT also wakes only
+  the threads it claims: each OS waiter sleeps on its own cell, where one condvar for the run
+  once woke them all to re-check (#2757).
 
 ### Memory model
 - **C/C++11 model** (relaxed / acquire / release / acq_rel / seq_cst; RMWs; thread
@@ -4037,7 +4039,7 @@ stealing exists to recover.
 | R5 | `mem_base` is passed at a task's *first* entry only; the switch carries it thereafter | a wrong base at entry runs the child against another window — a #2 break. The interp↔JIT window-image differential in every nesting test is the net |
 
 **What it structurally replaces on the JIT** (`instantiator_rt.rs` / `os_thread_rt.rs`):
-`futex_wait`'s OS condvar park with its `KILL_RECHECK` loop over four conditions (kill cell, freeze
+`futex_wait`'s OS condvar park with its re-check loop over four conditions (kill cell, freeze
 word, teardown, `peers_live`) becomes a scheduler park whose four conditions are **wake sources**
 (kill ⇒ wake all; freeze ⇒ wake all with `dstate = UNWINDING`; teardown ⇒ subtree sweep; deadline ⇒
 timer), and `peers_live` becomes the interpreter's `run_deadlocked` predicate. `join` becomes a park on
@@ -4106,8 +4108,9 @@ existing "inside a fiber ⇒ park the fiber" arm unchanged (INVARIANTS #15: no s
 re-checks its own predicate in the loop it already has: a vCPU exit, a child's end, the §5 kill path
 and teardown re-offer every parked task, a `notify` only those whose futex wait it claimed (#1991:
 the rest would re-check and park again, and with many tasks that was most of a busy run's work), and
-a worker sweeps the parked set on the bounded `KILL_RECHECK` cadence and fires passed deadlines,
-before each task it takes, at a quantum's end and when it wakes idle. No per-task waker, no second
+a worker fires passed deadlines before each task it takes, at a quantum's end and when it wakes
+idle: the pool runs no cadence (#2722), and the kill door and a freeze wake it like any other store
+that can end a park (#2757). No per-task waker, no second
 deadline store, no second
 runnable queue: the executor's whole state is a task map, a FIFO and the per-domain lane counts. Every
 resume is gated on the task's lane chain with `temen_ir::lanes` — the oracle's arithmetic — held

@@ -49,7 +49,6 @@
 //! it waits for nothing but what it waits on. And its window copies are the ones a locked call makes,
 //! on every engine.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -969,11 +968,11 @@ block 0 (vh: i32) {
         })),
         CapState::Stateless,
     ));
-    let interrupt = Arc::new(AtomicU64::new(0));
+    let interrupt = temen_jit::Interrupt::new();
     let kill = Arc::clone(&interrupt);
     let watchdog = std::thread::spawn(move || {
         std::thread::sleep(Duration::from_millis(50));
-        kill.store(1, Ordering::SeqCst);
+        kill.fire();
     });
     let started = Instant::now();
     let outcome = temen_jit::compile_and_run_with_host_interruptible(
@@ -982,7 +981,7 @@ block 0 (vh: i32) {
         &[i64::from(h)],
         temen_run::cap_thunk,
         &mut host as *mut Host as *mut core::ffi::c_void,
-        Arc::as_ptr(&interrupt),
+        &interrupt,
     )
     .expect("the JIT compiles it");
     let took = started.elapsed();

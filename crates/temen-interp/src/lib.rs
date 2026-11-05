@@ -23719,15 +23719,27 @@ impl Completions {
         }
     }
 
-    /// [`wait`](Completions::wait) for at most `d`: `None` if `id` has not arrived by then. What a
-    /// waiter that must also watch for its run's end waits with (#2047).
-    pub fn wait_timeout(&self, id: u64, d: std::time::Duration) -> Option<i64> {
-        let g = self.mx.lock_unpoisoned();
-        let (mut g, _) = self
-            .cv
-            .wait_timeout_while(g, d, |s| !s.ready.contains_key(&id))
-            .unwrap_or_else(|e| e.into_inner());
-        g.ready.remove(&id)
+    /// [`wait`](Completions::wait), until `stop()` holds instead: `None` then, with `id`'s answer
+    /// left for the sweep. What a waiter that must also watch for its run's kill or end waits with
+    /// (#2047). `stop` is checked under the store's lock, and again at each [`Self::rouse`], which
+    /// whatever sets it calls once it has (#2757): nothing re-checks on a timer.
+    pub fn wait_until(&self, id: u64, stop: &dyn Fn() -> bool) -> Option<i64> {
+        let mut g = self.mx.lock_unpoisoned();
+        loop {
+            if let Some(r) = g.ready.remove(&id) {
+                return Some(r);
+            }
+            if stop() {
+                return None;
+            }
+            g = self.cv.wait(g).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+
+    /// Wake every waiter on this store, to check its `stop` ([`Self::wait_until`]).
+    pub fn rouse(&self) {
+        let _g = self.mx.lock_unpoisoned();
+        self.cv.notify_all();
     }
 
     /// Block until one of `calls` (each a store and an id minted there) has its answer in, or

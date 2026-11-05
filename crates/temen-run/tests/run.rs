@@ -297,7 +297,7 @@ fn demo(name: &str) -> PathBuf {
 /// path, seen once on Linux CI where it hung the job for >1 h) fails *fast* with a captured thread
 /// dump instead of blocking CI for hours. Two layers:
 ///   1. `TEMEN_DEADLINE_MS` arms the §5 detect-and-kill, so a *guest-side* wedge — a spinning **or**
-///      futex-parked worker (`KILL_RECHECK` wakes a parked vCPU) — is unwound and the process exits
+///      futex-parked worker (the kill door wakes a parked vCPU) — is unwound and the process exits
 ///      non-zero with the runner's own kill diagnostic.
 ///   2. A host-side process timeout is the backstop for any stall the guest kill can't reach: on
 ///      expiry it best-effort dumps every thread's backtrace (`gdb -p` — the exact root-cause data

@@ -16,8 +16,6 @@
     all(windows, target_arch = "x86_64")
 ))]
 
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
 use std::time::Duration;
 
 use temen_jit::{compile_and_run_with_host_interruptible, JitOutcome, TrapKind};
@@ -30,11 +28,11 @@ use temen_verify::verify_module;
 fn run_killed(src: &str, delay_ms: u64) -> JitOutcome {
     let m = parse_module(src).expect("parse");
     verify_module(&m).expect("verify");
-    let interrupt = Arc::new(AtomicU64::new(0));
+    let interrupt = temen_jit::Interrupt::new();
     let wd = interrupt.clone();
     let watchdog = std::thread::spawn(move || {
         std::thread::sleep(Duration::from_millis(delay_ms));
-        wd.store(1, Ordering::SeqCst); // request the domain kill
+        wd.fire(); // request the domain kill
     });
     // The guest makes no `call.cap`, so the thunk is never invoked (null ctx never read).
     let outcome = compile_and_run_with_host_interruptible(
@@ -43,7 +41,7 @@ fn run_killed(src: &str, delay_ms: u64) -> JitOutcome {
         &[0i64],
         temen_run::cap_thunk,
         core::ptr::null_mut(),
-        Arc::as_ptr(&interrupt),
+        &interrupt,
     )
     .expect("jit compiles");
     watchdog.join().unwrap();
@@ -122,5 +120,41 @@ block 1 (v6: i64) {
         run_killed(src, 100),
         JitOutcome::Trapped(TrapKind::OutOfFuel),
         "a sibling parked in an infinite futex wait must be woken and killed"
+    );
+}
+
+/// #2757 — a kill reaches a vCPU in a **timed** wait at once, not at the wait's own deadline. The
+/// root is the run's only vCPU and sleeps 10 s, so nothing else runs to notice the kill: before the
+/// kill door woke parked vCPUs, the timed wait slept to its deadline and the run ended 10 s in. The
+/// door wakes it; it returns as woken and traps `OutOfFuel` at the loop's next poll.
+#[test]
+fn killpath_wakes_a_lone_vcpu_in_a_long_timed_wait() {
+    let src = "memory 16
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  v1 = i64.const 16384
+  v2 = i32.const 0
+  v3 = i64.const 10000000000
+  v4 = i32.atomic.wait v1 v2 v3
+  br 1(v0)
+}
+block 1 (v5: i64) {
+  v6 = i64.const 1
+  v7 = i64.add v5 v6
+  br 1(v7)
+  }
+}
+";
+    // The kill comes once the root has long since parked (its compile is far quicker than this).
+    let started = std::time::Instant::now();
+    assert_eq!(
+        run_killed(src, 300),
+        JitOutcome::Trapped(TrapKind::OutOfFuel),
+        "the kill ends the run"
+    );
+    let took = started.elapsed();
+    assert!(
+        took < Duration::from_secs(5),
+        "the kill reached the timed wait at once, not at its 10 s deadline: took {took:?}"
     );
 }

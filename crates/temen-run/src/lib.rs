@@ -322,7 +322,11 @@ unsafe fn cap_wait(
     if fiber {
         return fiber_cap_wait(comps, id, vm);
     }
-    temen_jit::wait_outside(vm, |d| comps.wait_timeout(id, d)).unwrap_or(0)
+    let roused = std::sync::Arc::clone(comps);
+    temen_jit::wait_outside(vm, Box::new(move || roused.rouse()), |stop| {
+        comps.wait_until(id, stop)
+    })
+    .unwrap_or(0)
 }
 
 /// F3 (FIBER_PARK.md) — the fiber-park completion wait: register the fiber's cell (an answer
@@ -7131,23 +7135,23 @@ impl RunConfig {
     }
 }
 
-/// Run `f` with the §5 kill-path armed when `deadline` is `Some`: a watchdog thread sets an interrupt
-/// cell after `deadline` (the JIT polls it at back-edges → detect-and-kill), and wakes early when `f`
-/// returns so a fast run is never delayed. `None` ⇒ no watchdog. Mirrors `run_powerbox_cfg`'s arming.
+/// Run `f` with the §5 kill-path armed when `deadline` is `Some`: a watchdog thread fires a kill door
+/// after `deadline` (the JIT polls its cell at back-edges, and the door wakes its parked vCPUs →
+/// detect-and-kill), and wakes early when `f` returns so a fast run is never delayed. `None` ⇒ no
+/// watchdog. Mirrors `run_powerbox_cfg`'s arming.
 fn with_deadline<T>(
     deadline: Option<std::time::Duration>,
-    f: impl FnOnce(Option<&std::sync::Arc<std::sync::atomic::AtomicU64>>) -> T,
+    f: impl FnOnce(Option<&std::sync::Arc<temen_jit::Interrupt>>) -> T,
 ) -> T {
-    use std::sync::atomic::{AtomicU64, Ordering};
     match deadline.filter(|d| !d.is_zero()) {
         None => f(None),
         Some(d) => {
-            let interrupt = std::sync::Arc::new(AtomicU64::new(0));
+            let interrupt = temen_jit::Interrupt::new();
             let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
             let wd = interrupt.clone();
             let handle = std::thread::spawn(move || {
                 if done_rx.recv_timeout(d).is_err() {
-                    wd.store(1, Ordering::SeqCst);
+                    wd.fire();
                 }
             });
             let out = f(Some(&interrupt));
@@ -7217,11 +7221,10 @@ fn jit_run(
                 init_mem,
                 snapshot_cap,
             };
-            let ip = interrupt.map(std::sync::Arc::as_ptr);
             let jit = jit_proc::drives_jit(&jit_proc::host_calls(m), host);
             let r = unsafe {
                 jit_proc::with_cap_ctx(host, jit_proc::locked(m), |cc| {
-                    jit_proc::compile_image(cc, m, func, ip, jit, fuel, None)
+                    jit_proc::compile_image(cc, m, func, interrupt, jit, fuel, None)
                         .and_then(|cm| jit_proc::run_image(cc, cm, None, start))
                 })
             };

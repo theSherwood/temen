@@ -178,10 +178,10 @@ pub(crate) struct Tree {
     bell: (Mutex<()>, Condvar),
     /// Bumped by every ring — what a waiter snapshots before its op and waits to see change.
     rings: AtomicU64,
-    /// The tree's kill-path cell: the run's watchdog cell when a deadline is armed, else the tree's
-    /// own. Every image a twin runs polls it (so teardown can stop a running twin), and so does a
-    /// root image that can fork.
-    interrupt: Arc<AtomicU64>,
+    /// The tree's kill door: the run's watchdog's when a deadline is armed, else the tree's own.
+    /// Every image a twin runs polls it (so teardown can stop a running twin), and so does a root
+    /// image that can fork.
+    interrupt: Arc<temen_jit::Interrupt>,
     /// Whether the run armed a deadline (then every image polls the cell, the root's included).
     deadline: bool,
     /// #1944 slice 3 — the run's fuel chain when `Limits.fuel` bounds the run (`None`: un-metered).
@@ -209,7 +209,7 @@ struct TreeState {
 
 impl Tree {
     fn new(
-        interrupt: Option<&Arc<AtomicU64>>,
+        interrupt: Option<&Arc<temen_jit::Interrupt>>,
         fuel: Option<Arc<dyn temen_jit::BudgetNode>>,
         code: Option<&JitCodeCache>,
     ) -> Arc<Tree> {
@@ -223,9 +223,7 @@ impl Tree {
             torn_down: AtomicBool::new(false),
             bell: (Mutex::new(()), Condvar::new()),
             rings: AtomicU64::new(0),
-            interrupt: interrupt
-                .cloned()
-                .unwrap_or_else(|| Arc::new(AtomicU64::new(0))),
+            interrupt: interrupt.cloned().unwrap_or_else(temen_jit::Interrupt::new),
             deadline: interrupt.is_some(),
             fuel,
             code: code.cloned().unwrap_or_default(),
@@ -237,9 +235,9 @@ impl Tree {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// The kill-path cell an image of process `pid` polls, if any (see [`Self::interrupt`]).
-    fn interrupt_for(&self, pid: u64, forks: bool) -> Option<*const AtomicU64> {
-        (self.deadline || forks || pid != ROOT_PID).then_some(Arc::as_ptr(&self.interrupt))
+    /// The kill door an image of process `pid` polls, if any (see [`Self::interrupt`]).
+    fn interrupt_for(&self, pid: u64, forks: bool) -> Option<&Arc<temen_jit::Interrupt>> {
+        (self.deadline || forks || pid != ROOT_PID).then_some(&self.interrupt)
     }
 
     /// Where an instance of shared code runs in this tree: over the powerbox `cc` names, polling
@@ -248,12 +246,12 @@ impl Tree {
     fn addrs(
         &self,
         cc: CapCtx,
-        interrupt: Option<*const AtomicU64>,
+        interrupt: Option<&Arc<temen_jit::Interrupt>>,
         fuel: *mut temen_jit::FuelCell,
     ) -> InstanceAddrs {
         InstanceAddrs {
             cap_ctx: cc.ptr(),
-            epoch: interrupt.unwrap_or(std::ptr::null()),
+            epoch: interrupt.map_or(std::ptr::null(), Arc::as_ptr),
             fuel,
             ..InstanceAddrs::NONE
         }
@@ -288,22 +286,17 @@ impl Tree {
         })
     }
 
-    /// Block until the bell rings past `seen`, the tree is torn down, the kill-path fires, or `stop`
-    /// holds. Wakes at a bounded cadence too, so a kill-path store or a `stop` (which ring nothing)
-    /// is observed.
+    /// Block until the bell rings past `seen`, the tree is torn down, the kill door fires, or `stop`
+    /// holds. Each of those rings the bell (#2757): the door and the end of the waiter's own domain
+    /// through the waker [`wait_for_bell`] registers, teardown itself. Nothing re-checks on a timer.
     fn wait(&self, seen: u64, stop: impl Fn() -> bool) {
         let mut g = self.bell.0.lock().unwrap_or_else(|e| e.into_inner());
         while self.rings.load(Ordering::SeqCst) == seen
             && !self.torn_down.load(Ordering::SeqCst)
-            && self.interrupt.load(Ordering::SeqCst) == 0
+            && !self.interrupt.fired()
             && !stop()
         {
-            g = self
-                .bell
-                .1
-                .wait_timeout(g, std::time::Duration::from_millis(20))
-                .unwrap_or_else(|e| e.into_inner())
-                .0;
+            g = self.bell.1.wait(g).unwrap_or_else(|e| e.into_inner());
         }
     }
 
@@ -590,7 +583,7 @@ impl Tree {
         self.torn_down.store(true, Ordering::SeqCst);
         let threads = std::mem::take(&mut self.lock().threads);
         if !threads.is_empty() {
-            self.interrupt.store(1, Ordering::SeqCst);
+            self.interrupt.fire();
             self.ring();
         }
         for t in threads {
@@ -930,7 +923,7 @@ unsafe fn compile(
     entry: FuncIdx,
     jit: bool,
     plan: Option<ForkPlan>,
-    interrupt: Option<*const AtomicU64>,
+    interrupt: Option<&Arc<temen_jit::Interrupt>>,
     tree: &Tree,
     fuel: *mut temen_jit::FuelCell,
     digest: Option<[u8; 32]>,
@@ -1035,7 +1028,7 @@ pub(crate) unsafe fn compile_image(
     cc: CapCtx,
     module: &Module,
     entry: FuncIdx,
-    interrupt: Option<*const AtomicU64>,
+    interrupt: Option<&Arc<temen_jit::Interrupt>>,
     jit: bool,
     fuel: Option<*mut temen_jit::FuelCell>,
     kept: Option<(&temen_jit::CodeDir, [u8; 32])>,
@@ -1309,6 +1302,16 @@ pub(crate) unsafe fn wait_for_bell(vm: &VmCtx, bell: u64) -> bool {
     let Some(proc) = proc_of(vm) else {
         return false;
     };
+    // #2757 — a kill of the run or the end of this process's domain rings the bell for this wait.
+    let tree = Arc::downgrade(&proc.tree);
+    let _woken = temen_jit::wake_on_run_event(
+        vm,
+        Box::new(move || {
+            if let Some(t) = tree.upgrade() {
+                t.ring();
+            }
+        }),
+    );
     proc.tree.wait(bell, || vm.ended().is_some());
     if blocked_wait_interrupted(vm.epoch as usize, vm) {
         vm.raise(TrapKind::OutOfFuel as i64);
@@ -1398,7 +1401,7 @@ pub(crate) unsafe fn run_root(
     func: FuncIdx,
     slots: &[i64],
     host: &mut Host,
-    interrupt: Option<&Arc<AtomicU64>>,
+    interrupt: Option<&Arc<temen_jit::Interrupt>>,
     init_mem: Option<&[u8]>,
     snapshot_cap: Option<usize>,
     fuel: Option<Arc<dyn temen_jit::BudgetNode>>,

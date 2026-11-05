@@ -47,7 +47,7 @@
 //! never stores.
 
 use core::ffi::c_void;
-use core::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, Ordering};
 
 /// The per-instance context (see the module docs). `#[repr(C)]`: compiled code addresses the fields
 /// at the fixed offsets below.
@@ -59,8 +59,9 @@ pub struct VmCtx {
     /// The `call.cap` thunk's opaque ctx: the instance's powerbox (`*mut Host`, `*const Mutex<Host>`,
     /// or a child's own), handed to every `call.cap` as the thunk's first argument.
     pub cap_ctx: *mut c_void,
-    /// The §5 kill-path interrupt cell a compile with epoch checks polls (null when not armed).
-    pub epoch: *const AtomicU64,
+    /// The §5 kill door whose cell a compile with epoch checks polls (null when not armed). The cell
+    /// is the door's first field, so compiled code loads it through this pointer as a `u64`.
+    pub epoch: *const crate::Interrupt,
     /// The counted-fuel cell a compile with fuel checks charges (null when not armed).
     pub fuel: *mut crate::FuelCell,
     /// #932 — the host `armed` flag a compile with signal checks polls (null when not armed).
@@ -98,7 +99,7 @@ pub struct VmCtx {
 #[derive(Clone, Copy, Debug)]
 pub struct InstanceAddrs {
     pub cap_ctx: *mut c_void,
-    pub epoch: *const AtomicU64,
+    pub epoch: *const crate::Interrupt,
     pub fuel: *mut crate::FuelCell,
     pub sig_armed: *const AtomicBool,
     pub sig_ctx: *mut c_void,
