@@ -205,6 +205,8 @@ fn a_link_unit_exports_only_external_names() {
 
 /// Without the option, the same library keeps today's whole-module form: every defined function
 /// exported, no data symbols, and its addresses baked (no link forms left for a linker to fill in).
+/// The function pointers its table holds are recorded as funcref slots, as in any module whose data
+/// holds a function index (#1830, #2790).
 #[test]
 fn without_the_option_a_unit_is_unchanged() {
     let lib = temen_llvm::translate_ll_str_with_options(LIB, Default::default())
@@ -216,7 +218,19 @@ fn without_the_option_a_unit_is_unchanged() {
     assert!(
         lib.data_exports.is_empty() && lib.data_ptrs.is_empty() && lib.data_funcrefs.is_empty()
     );
-    assert!(lib.data_funcref_slots.is_empty());
+    // `@lib_table`'s second and third entries are function indices; its first is a data address.
+    let word = |at: u64| {
+        let d = lib
+            .data
+            .iter()
+            .find(|d| d.offset <= at && at + 4 <= d.offset + d.bytes.len() as u64)
+            .expect("a slot lies in the data image");
+        let i = (at - d.offset) as usize;
+        u32::from_le_bytes(d.bytes[i..i + 4].try_into().unwrap())
+    };
+    let named: Vec<u32> = lib.data_funcref_slots.iter().map(|&at| word(at)).collect();
+    let index = |name: &str| lib.resolve_export(name).expect("exported");
+    assert_eq!(named, [index("lib_add"), index("helper")]);
 }
 
 /// A link unit reaches the powerbox like any unit: its `vm_page_size` import is bound when the
