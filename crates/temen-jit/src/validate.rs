@@ -501,10 +501,16 @@ pub(crate) mod x86 {
     /// whether the prologue's stack-overflow check (`emit_stack_check`, I5) has run on every path
     /// here. `checked` starts false, is set on the safe edge of the recognized check, and meets by
     /// AND, so it holds only where the check dominates — the condition a `call` is required to meet.
+    /// `copies[r] = Some(off)` says register `r` holds the 8-byte value the frame slot at entry-relative
+    /// offset `off` holds — the block-local identity `transfer_block` tracks (two reloads of one spill
+    /// are one value), carried across an edge so a `cmp` of a register at a block's entry and a
+    /// `cmov` of a reload of the same spill inside it are one value to the D63 rule (#2788 — Cranelift
+    /// rematerializes a reload at a loop header, where every edge into it has just reloaded the slot).
     #[derive(Clone, PartialEq, Eq)]
     struct State {
         regs: [Fact; 16],
         slots: Vec<Slot>,
+        copies: [Option<i16>; 16],
         checked: bool,
     }
 
@@ -515,6 +521,7 @@ pub(crate) mod x86 {
             State {
                 regs: [Fact::Unknown; 16],
                 slots: Vec::new(),
+                copies: [None; 16],
                 checked: false,
             }
         }
@@ -537,6 +544,7 @@ pub(crate) mod x86 {
             State {
                 regs,
                 slots: Vec::new(),
+                copies: [None; 16],
                 checked: false,
             }
         }
@@ -555,10 +563,17 @@ pub(crate) mod x86 {
                     slots.push(Slot { off: s.off, fact });
                 }
             }
+            // A register stays tied to a slot only if it is tied to that slot on both paths.
+            let copies = std::array::from_fn(|r| {
+                (self.copies[r] == other.copies[r])
+                    .then_some(self.copies[r])
+                    .flatten()
+            });
             // The check dominates a point only if it dominates on both incoming paths.
             State {
                 regs,
                 slots,
+                copies,
                 checked: self.checked && other.checked,
             }
         }
@@ -632,6 +647,12 @@ pub(crate) mod x86 {
                 .slots
                 .iter()
                 .all(|s| out.slot_get(s.off).meet(s.fact) == s.fact)
+            // A register-slot tie, like `checked`, may be asserted only where the out-state has it.
+            && inn
+                .copies
+                .iter()
+                .zip(&out.copies)
+                .all(|(i, o)| i.is_none() || i == o)
             // `checked` is a fact too: a proposal may assert it only where the out-state has it.
             && (!inn.checked || out.checked)
     }
@@ -1492,6 +1513,17 @@ pub(crate) mod x86 {
         // The symbolic value each 8-byte frame slot holds, by entry-relative offset, while nothing
         // writes it: two reloads of one spill are one value to the `cmov` rule.
         let mut slot_vals: Vec<(i64, Sym)> = Vec::new();
+        // The identity the in-state carries across the edge (`State::copies`): a register tied to a
+        // slot holds the slot's value, so the slot starts as that register's value, and registers
+        // tied to one slot start as one value.
+        for (r, tie) in state.copies.iter().enumerate() {
+            if let Some(off) = tie.map(i64::from) {
+                match slot_vals.iter().find(|&&(o, _)| o == off) {
+                    Some(&(_, s)) => sym[r] = s,
+                    None => slot_vals.push((off, sym[r])),
+                }
+            }
+        }
         let last = insns.last().map(|&(p, _)| p);
         for &(pos, d) in insns {
             let mut loaded_type_id = None;
@@ -1725,7 +1757,12 @@ pub(crate) mod x86 {
                     set(&mut state, reg::RSP, rsp);
                     match dst {
                         Some(r) => set(&mut state, r, f),
-                        None => state.clear_slots(), // `pop [mem]`: a frame store, address after the pop
+                        // `pop [mem]`: a frame store whose address is taken after the pop, so forget
+                        // every slot — and every slot identity, which `State::copies` carries out.
+                        None => {
+                            state.clear_slots();
+                            slot_vals.clear();
+                        }
                     }
                 }
                 Eff::StoreReg { .. }
@@ -1903,6 +1940,14 @@ pub(crate) mod x86 {
                 sc_cmp = false;
             }
         }
+        // Carry the identity out: a register that still holds a frame slot's value (the slot's
+        // symbolic value, which every write to the register or the slot replaces) stays tied to it.
+        state.copies = std::array::from_fn(|r| {
+            slot_vals
+                .iter()
+                .find(|&&(_, s)| s == sym[r])
+                .and_then(|&(o, _)| i16::try_from(o).ok())
+        });
         // Two terminating branches refine one out-edge.
         let mut taken = state.clone();
         let mut fall = state;
@@ -4922,6 +4967,103 @@ pub(crate) mod x86 {
                 "a spilled confined index past slot 32 was dropped: {:?}",
                 findings(&b)
             );
+        }
+
+        /// #2788: the D63 sequence Cranelift emits at a loop header after rematerializing a reload —
+        /// `cmp r9, K` of the index **as it enters the block**, then a fresh reload of the same spill
+        /// into the register the `cmov` selects from. The two are one value only because every edge
+        /// into the block has just reloaded `r9` from that slot, so the register-slot tie must cross
+        /// the edge (`State::copies`). `path_b` is the second edge into the join.
+        fn reload_join(path_b: &[u8]) -> Vec<u8> {
+            let mut b = vec![
+                0x48, 0x83, 0xec, 0x18, // [00] sub rsp, 0x18
+                0x4c, 0x89, 0x44, 0x24,
+                0x08, // [04] mov [rsp+8], r8      (spill a guest index)
+                0x49, 0xba, 0, 0, 0, 0, 0x20, 0, 0, 0, // [09] mov r10, 0x20_0000_0000 (guard)
+                0x4d, 0x85, 0xc0, // [13] test r8, r8
+                0x0f, 0x84, 0x0a, 0, 0, 0, // [16] je +0x0a → path B
+                0x4c, 0x8b, 0x4c, 0x24, 0x08, // [1c] path A: mov r9, [rsp+8]
+                0xe9, // [21] jmp → the join
+            ];
+            b.extend((path_b.len() as i32).to_le_bytes());
+            b.extend(path_b); // [26] path B, falling through into the join
+            b.extend([
+                0x49, 0x81, 0xf9, 0xf0, 0xff, 0xff, 0x7f, // join: cmp r9, 0x7fff_fff0
+                0x4c, 0x8b, 0x4c, 0x24, 0x08, // mov r9, [rsp+8]   (the rematerialized reload)
+                0x4c, 0x89, 0xc8, // mov rax, r9
+                0x49, 0x0f, 0x43, 0xc2, // cmovae rax, r10
+                0x8b, 0x04, 0x07, // mov eax, [rdi + rax]
+                0x48, 0x83, 0xc4, 0x18, // add rsp, 0x18
+                0xc3, // ret
+            ]);
+            b
+        }
+
+        /// Both edges reload `r9` from the spill, so the join's `cmp r9` and its `cmov` of a fresh
+        /// reload are one value, and the access is D63-confined.
+        #[test]
+        fn transfer_a_reload_tie_crosses_a_join() {
+            let reload = [0x4c, 0x8b, 0x4c, 0x24, 0x08]; // mov r9, [rsp+8]
+            let f = findings(&reload_join(&reload));
+            assert!(f.is_empty(), "a tie both edges establish was lost: {f:?}");
+        }
+
+        /// The tie is carried only where every edge establishes it: if one edge leaves a different
+        /// value in `r9`, or overwrites the slot after reloading it, the compared and selected values
+        /// may differ, and the access is unconfined.
+        #[test]
+        fn transfer_a_reload_tie_needs_every_edge() {
+            let other = [0x49, 0x89, 0xc9]; // mov r9, rcx
+            assert!(has(&findings(&reload_join(&other)), "unconfined index"));
+            let overwritten = [
+                0x4c, 0x8b, 0x4c, 0x24, 0x08, // mov r9, [rsp+8]
+                0x48, 0x89, 0x4c, 0x24,
+                0x08, // mov [rsp+8], rcx  (the slot no longer holds r9)
+            ];
+            assert!(has(
+                &findings(&reload_join(&overwritten)),
+                "unconfined index"
+            ));
+            // The same overwrite by a `pop [mem]`, whose address is taken after the pop.
+            let popped = [
+                0x4c, 0x8b, 0x4c, 0x24, 0x08, // mov r9, [rsp+8]
+                0x51, // push rcx
+                0x8f, 0x44, 0x24, 0x08, // pop qword [rsp+8]  (rcx into the slot)
+            ];
+            assert!(has(&findings(&reload_join(&popped)), "unconfined index"));
+        }
+
+        /// The tie is a fact `verify` checks, not one it trusts: a proposal that claims `r9` is tied
+        /// to the spill at a join one edge does not establish it on is rejected at that edge.
+        #[test]
+        fn verify_rejects_a_tie_an_edge_does_not_carry() {
+            let other = [0x49, 0x89, 0xc9]; // mov r9, rcx — path B leaves another value in r9
+            let bytes = reload_join(&other);
+            let ctx = Ctx {
+                bytes: &bytes,
+                relocs: &[],
+                guest: G,
+                frame: Frame::UNKNOWN,
+            };
+            let mut fs = Vec::new();
+            let cfg = Cfg::build(ctx, &mut fs);
+            assert!(fs.is_empty(), "{fs:?}");
+            let mut lie = propose(&cfg, ctx);
+            let join = cfg
+                .leaders
+                .iter()
+                .position(|&l| l == 0x26 + other.len())
+                .expect("the join is a block");
+            let mut s = lie[join].clone().expect("the join is reached");
+            assert_eq!(
+                s.copies[9], None,
+                "the honest proposal ties nothing at the join"
+            );
+            s.copies[9] = Some(-0x10); // the spill `[rsp+8]`, after `sub rsp, 0x18`
+            lie[join] = Some(s);
+            let mut f = Vec::new();
+            verify(&cfg, &lie, ctx, &mut f);
+            assert!(has(&f, "does not hold on the edge"), "{f:?}");
         }
 
         /// Hole 7's `lea` form: a 32-bit `lea` truncates the address, so `lea eax, [rsp + 8]` is no

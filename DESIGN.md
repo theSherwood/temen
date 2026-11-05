@@ -280,6 +280,9 @@ each point as:
   type was checked, a vmctx cell, the demand-paged access table (#2164), a callee's address, the entry
   value of a callee-saved register, the caller's `sret` area, …);
 - the flags of the last compare;
+- which registers hold a spill slot's value: the identity the transfer tracks within a block (two
+  reloads of one spill are one value), carried across edges, so a `cmov` of a reload Cranelift
+  rematerializes at a loop header is one value with the `cmp` of the register it reloads (#2788);
 - the spill slots, keyed by their offset from the entry `rsp` (an unbounded set, not a fixed cap: an
   unrolled large copy spills hundreds of confined window indices — one chibicc function spills 532,
   #2784 — and a cap would drop the overflow and read each later reload as an unconfined index);
