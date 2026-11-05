@@ -121,7 +121,7 @@ fn a_write_with_no_room_is_not_teed() {
     let mut win = vec![7u8; 4096];
     let mut write = |host: &mut Host, len: i64| {
         let mut wm = WindowMem::new(&mut win, 4096);
-        host.cap_dispatch_slots(cap_id::STREAM, 1, out, &[0, len], Some(&mut wm))
+        host.cap_call(cap_id::STREAM, 1, out, &[0, len], 1, Some(&mut wm))
             .expect("dispatch")[0]
     };
     let teed = |seen: &Seen| {

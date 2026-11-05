@@ -10327,6 +10327,24 @@ fn process_stopped(envs: &[Domain], t: &TaskSlot) -> bool {
 /// The root activation's id in a vCPU's resume chain (it has no fiber handle).
 const ROOT_FIBER: usize = usize::MAX;
 
+/// #2319 — how many arg or result slots a `call.cap` keeps on the engine's stack ([`call_slots`]).
+const CALL_STACK_SLOTS: usize = 8;
+
+/// #2319 — `n` zeroed slots for a call's args or results: in `stack` when they fit, which covers
+/// every call the tree makes, else in `heap`. A call allocates nothing for its slots.
+fn call_slots<'a>(
+    stack: &'a mut [i64; CALL_STACK_SLOTS],
+    heap: &'a mut Vec<i64>,
+    n: usize,
+) -> &'a mut [i64] {
+    if n <= CALL_STACK_SLOTS {
+        &mut stack[..n]
+    } else {
+        heap.resize(n, 0);
+        heap
+    }
+}
+
 /// One vCPU's continuation: its active `Vm` and its resume `chain`. A `thread.spawn` creates a fresh
 /// `VTask`; the scheduler runs them cooperatively over one shared `Mem` (single-threaded, so shared
 /// memory is sequentially consistent — the determinate programs the oracle uses give the same result
@@ -20407,10 +20425,15 @@ impl Vm {
                     } else {
                         r!(*handle).i32()
                     };
-                    let mut argv: Vec<i64> = Vec::with_capacity(args.len());
-                    for a in args.iter() {
-                        argv.push(r!(*a).i64());
+                    // #2319 — the call's arg and result slots, on this stack when they fit.
+                    let (mut arg_stack, mut arg_heap) = ([0; CALL_STACK_SLOTS], Vec::new());
+                    let argv = call_slots(&mut arg_stack, &mut arg_heap, args.len());
+                    for (s, a) in argv.iter_mut().zip(args.iter()) {
+                        *s = r!(*a).i64();
                     }
+                    let argv: &[i64] = argv;
+                    let (mut res_stack, mut res_heap) = ([0; CALL_STACK_SLOTS], Vec::new());
+                    let res = call_slots(&mut res_stack, &mut res_heap, results.len());
                     // #2361 — the call defines every result it declares: whatever lands below (the
                     // host's results, an errno, a parked call's delivery) lands over zeros, as the
                     // oracle and the Cranelift JIT define them.
@@ -20510,7 +20533,7 @@ impl Vm {
                             callee: target.callee,
                             export: target.export,
                             op: *op,
-                            args: argv,
+                            args: argv.to_vec(),
                             sig,
                             dst: *dst,
                         }));
@@ -20530,12 +20553,13 @@ impl Vm {
                     // Under one lock the flags are what they always meant to be: extra return values
                     // of this dispatch, unreachable by any other vCPU.
                     let mut unlocked = None;
-                    let (res, parks) = host.with(|p| {
+                    let (r, parks) = host.with(|p| {
                         let r = p.cap_dispatch_slots_deferring(
                             *type_id,
                             *op,
                             h,
-                            &argv,
+                            argv,
+                            &mut *res,
                             gm,
                             Some(&mut pending_id),
                             Some(&mut unlocked),
@@ -20549,13 +20573,11 @@ impl Vm {
                     // #2645 — an unlocked host procedure runs now, the domain's host let go: on the
                     // parallel driver its other tasks make their host calls meanwhile. It raised no
                     // park, so the rest of this arm only delivers its results.
-                    let res = match unlocked {
-                        Some(call) => {
-                            call.run(&argv, sole.as_mut().map(|m| m as &mut dyn GuestMem))
-                        }
-                        None => res,
-                    };
-                    let res = res?;
+                    r?;
+                    if let Some(call) = unlocked {
+                        call.run(argv, res, sole.as_mut().map(|m| m as &mut dyn GuestMem))?;
+                    }
+                    let res: &[i64] = res;
                     // §12 parking-on-blocking: a punted offloadable dispatch. The `with` scope
                     // above already released the shared-host lock. The exactly-`i64` case is
                     // surfaced as [`Outcome::CapPending`] so the DRIVER chooses the wait shape
@@ -20625,7 +20647,7 @@ impl Vm {
                             continue;
                         }
                         if self.abandon_for_freeze(mem, host) {
-                            self.set_results(base + *dst as usize, &res, results);
+                            self.set_results(base + *dst as usize, res, results);
                             pc += 1;
                             continue;
                         }
@@ -20650,7 +20672,7 @@ impl Vm {
                             super::ParkEvent::TaskExit(_) | super::ParkEvent::TaskExitAny
                         ) && self.abandon_for_freeze(mem, host)
                         {
-                            self.set_results(base + *dst as usize, &res, results);
+                            self.set_results(base + *dst as usize, res, results);
                             pc += 1;
                             continue;
                         }
@@ -20740,7 +20762,7 @@ impl Vm {
                             self.regs[base + *dst as usize] = Reg::from_i64(temen_ir::errno::EINTR);
                             pc += 1;
                         } else if self.abandon_for_freeze(mem, host) {
-                            self.set_results(base + *dst as usize, &res, results);
+                            self.set_results(base + *dst as usize, res, results);
                             pc += 1;
                         } else if let Some(pipe) = pipe_read_park {
                             self.module = module;
@@ -20758,7 +20780,7 @@ impl Vm {
                             });
                         }
                     } else {
-                        self.set_results(base + *dst as usize, &res, results);
+                        self.set_results(base + *dst as usize, res, results);
                         pc += 1;
                         // #1198 — this syscall STOPPED its own domain (a background terminal read/write
                         // hit `tty_background_check` → SIGTTIN/SIGTTOU default-action stop; or a `^Z`
@@ -20903,14 +20925,26 @@ impl Vm {
                 Op::CapSelfExt { op, handle, dst } => {
                     // §3.5 self-namespace extensions — through the shared &mut dispatch entry
                     // (interning / reification mutate host state), same as the tree-walker.
-                    let argv: Vec<i64> = match handle {
-                        Some(h) => vec![r!(*h).i32() as i64],
-                        None => Vec::new(),
+                    let h_arg;
+                    let argv: &[i64] = match handle {
+                        Some(h) => {
+                            h_arg = [r!(*h).i32() as i64];
+                            &h_arg
+                        }
+                        None => &[],
                     };
-                    let res = host.with(|p| {
-                        p.cap_dispatch_slots(temen_ir::CAP_SELF_TYPE_ID, *op, 0, &argv, None)
+                    let mut res = [0];
+                    host.with(|p| {
+                        p.cap_dispatch_slots(
+                            temen_ir::CAP_SELF_TYPE_ID,
+                            *op,
+                            0,
+                            argv,
+                            &mut res,
+                            None,
+                        )
                     })?;
-                    r!(*dst) = Reg::from_i32(*res.first().ok_or(Trap::CapFault)? as i32);
+                    r!(*dst) = Reg::from_i32(res[0] as i32);
                     pc += 1;
                 }
                 // §12 fiber ops escape to `drive` (which owns the registry / resume chain). Each

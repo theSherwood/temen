@@ -12,6 +12,7 @@
 //! root's region. The fibers suspend rather than return so neither slot is recycled mid-run.
 
 use std::sync::{Arc, Mutex};
+use temen_interp::put_results;
 use temen_interp::{bytecode, Host, HostProcGrant, ProcHandler, Value, DEFAULT_SHADOW_STRIDE};
 use temen_text::parse_module;
 use temen_verify::verify_module;
@@ -66,9 +67,9 @@ fn bytecode_durable_fiber_switch_routes_shadow_sp_per_context() {
     let mut host = Host::new();
     host.set_durable(true);
     let hf = host.grant_host_proc(HostProcGrant::new(
-        ProcHandler::Sync(Box::new(move |_op, args, _mem, _| {
+        ProcHandler::Sync(Box::new(move |_op, args, out, _mem, _| {
             sink.lock().unwrap().push(args[0] as u64);
-            Ok(vec![0])
+            put_results(out, &[0])
         })),
         temen_interp::CapState::Stateless,
     ));

@@ -6,6 +6,7 @@ use temen_durable::{
     arm_freeze_after, begin_thaw, init_durable_window, transform_module,
     transform_module_assume_confined, write_state, STATE_UNWINDING,
 };
+use temen_interp::put_results;
 use temen_interp::{
     run_capture_reserved_with_host, Attestation, FrozenDetached, Host, HostProcGrant, ProcHandler,
     Reply, Value,
@@ -1910,7 +1911,7 @@ fn a_named_host_cap_round_trips_through_the_codec() {
     let mut host = Host::new();
     host.grant_clock();
     let h = host.grant_host_proc(HostProcGrant::new(
-        ProcHandler::Sync(Box::new(|_op, _args, _mem, _| Ok(vec![0]))),
+        ProcHandler::Sync(Box::new(|_op, _args, out, _mem, _| put_results(out, &[0]))),
         temen_interp::CapState::Captured {
             capture: Box::new(|| b"cursor=7".to_vec()),
             restore: Box::new(|_| {}),
@@ -1928,7 +1929,7 @@ fn a_named_host_cap_round_trips_through_the_codec() {
         log.lock().unwrap().push((name.to_string(), state.to_vec()));
         Some(temen_interp::NamedCapGrant {
             grant: HostProcGrant::new(
-                ProcHandler::Sync(Box::new(|_op, _args, _mem, _| Ok(vec![99]))),
+                ProcHandler::Sync(Box::new(|_op, _args, out, _mem, _| put_results(out, &[99]))),
                 temen_interp::CapState::Stateless,
             ),
             process: None,
@@ -1942,7 +1943,7 @@ fn a_named_host_cap_round_trips_through_the_codec() {
         "the registrar was handed the captured name and the provider's state"
     );
     assert_eq!(
-        thost.cap_dispatch_slots(temen_interp::cap_id::HOST_PROC, 0, h, &[], None),
+        thost.cap_call(temen_interp::cap_id::HOST_PROC, 0, h, &[], 1, None),
         Ok(vec![99]),
         "the guest-held handle value still reaches the re-granted capability"
     );
@@ -1968,7 +1969,7 @@ fn a_memfs_round_trips_through_the_codec_with_its_files_and_cursors() {
     }
     use temen_fs::{FS_OPEN, FS_READ, FS_SEEK, FS_WRITE, O_CREATE, O_READ, O_WRITE};
     let vm_fs = |host: &mut Host, h: i32, args: &[i64], mem: &mut VecMem| -> i64 {
-        host.cap_dispatch_slots(temen_interp::cap_id::HOST_PROC, 0, h, args, Some(mem))
+        host.cap_call(temen_interp::cap_id::HOST_PROC, 0, h, args, 1, Some(mem))
             .expect("vm_fs call")[0]
     };
 
@@ -2033,7 +2034,7 @@ fn restore_refuses_an_artifact_naming_a_cap_the_embedder_does_not_serve() {
     let mut host = Host::new();
     host.grant_clock();
     let h = host.grant_host_proc(HostProcGrant::new(
-        ProcHandler::Sync(Box::new(|_op, _args, _mem, _| Ok(vec![0]))),
+        ProcHandler::Sync(Box::new(|_op, _args, out, _mem, _| put_results(out, &[0]))),
         temen_interp::CapState::Stateless,
     ));
     host.register_cap_name("fs", h);
@@ -2055,7 +2056,7 @@ fn freeze_still_refuses_an_unnamed_host_cap() {
     let mut host = Host::new();
     host.grant_clock();
     host.grant_host_proc(HostProcGrant::new(
-        ProcHandler::Sync(Box::new(|_op, _args, _mem, _| Ok(vec![0]))),
+        ProcHandler::Sync(Box::new(|_op, _args, out, _mem, _| put_results(out, &[0]))),
         temen_interp::CapState::Stateless,
     )); // never named
     let win = init_durable_window(WINDOW, TEST_ARENA);
@@ -2078,7 +2079,7 @@ fn a_cap_free_domain_elides_the_named_section() {
     let mut with = Host::new();
     with.grant_clock();
     let h = with.grant_host_proc(HostProcGrant::new(
-        ProcHandler::Sync(Box::new(|_op, _args, _mem, _| Ok(vec![0]))),
+        ProcHandler::Sync(Box::new(|_op, _args, out, _mem, _| put_results(out, &[0]))),
         temen_interp::CapState::Stateless,
     ));
     with.register_cap_name("fs", h);
@@ -2111,7 +2112,7 @@ fn budget_host() -> (Host, i32, i64) {
 }
 
 fn read_mem(host: &mut Host, h: i32) -> i64 {
-    host.cap_dispatch_slots(cap_id::BUDGET, 1, h, &[1], None)
+    host.cap_call(cap_id::BUDGET, 1, h, &[1], 1, None)
         .expect("the guest-held handle still dispatches")[0]
 }
 
@@ -2135,7 +2136,7 @@ fn a_budget_survives_freeze_and_thaw_with_its_remaining_intact() {
         "the thawed domain holds what was left at freeze — what it minted stays minted (#3)"
     );
     assert_eq!(
-        thost.cap_dispatch_slots(cap_id::BUDGET, 1, h, &[3], None),
+        thost.cap_call(cap_id::BUDGET, 1, h, &[3], 1, None),
         Ok(vec![-1]),
         "an unbounded channel round-trips through the codec"
     );
@@ -2166,7 +2167,7 @@ fn the_thaw_hook_may_attenuate_a_carried_budget() {
         "the mem ceiling halved, less the 4096 charged"
     );
     assert_eq!(
-        thost.cap_dispatch_slots(cap_id::BUDGET, 1, h, &[3], None),
+        thost.cap_call(cap_id::BUDGET, 1, h, &[3], 1, None),
         Ok(vec![512]),
         "channel bounded by the hook"
     );
@@ -2225,7 +2226,7 @@ fn a_budget_tree_rides_the_artifact_with_its_links_and_charges() {
     let inst = instrument(SRC);
     let (mut host, root, _) = budget_host();
     let child = host
-        .cap_dispatch_slots(cap_id::BUDGET, 0, root, &[0, 1 << 19, 0], None)
+        .cap_call(cap_id::BUDGET, 0, root, &[0, 1 << 19, 0], 1, None)
         .expect("split")[0] as i32;
     assert!(host.budget_mem_take(child, 8192), "the child's window");
     let win = init_durable_window(WINDOW, TEST_ARENA);

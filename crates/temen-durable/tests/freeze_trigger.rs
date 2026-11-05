@@ -12,6 +12,7 @@ use std::sync::Arc;
 use temen_durable::{
     arm_freeze_after, init_durable_window, read_state, transform_module, STATE_UNWINDING,
 };
+use temen_interp::put_results;
 use temen_interp::{run_capture_reserved_with_host, Host, HostProcGrant, ProcHandler, Value};
 use temen_ir::{Memory, Module};
 
@@ -72,9 +73,9 @@ fn run_armed(n: i64) -> (u64, bool) {
     let mut host = Host::new();
     host.set_durable(true);
     let hf = host.grant_host_proc(HostProcGrant::new(
-        ProcHandler::Sync(Box::new(move |_op, _args, _mem, _| {
+        ProcHandler::Sync(Box::new(move |_op, _args, out, _mem, _| {
             sink.fetch_add(1, Ordering::Relaxed);
-            Ok(vec![0])
+            put_results(out, &[0])
         })),
         temen_interp::CapState::Stateless,
     ));
@@ -132,9 +133,9 @@ fn an_unarmed_durable_run_is_untouched() {
     let mut host = Host::new();
     host.set_durable(true);
     let hf = host.grant_host_proc(HostProcGrant::new(
-        ProcHandler::Sync(Box::new(move |_op, _args, _mem, _| {
+        ProcHandler::Sync(Box::new(move |_op, _args, out, _mem, _| {
             sink.fetch_add(1, Ordering::Relaxed);
-            Ok(vec![0])
+            put_results(out, &[0])
         })),
         temen_interp::CapState::Stateless,
     ));

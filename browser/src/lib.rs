@@ -24,6 +24,7 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::alloc::Layout;
+use temen_interp::put_results;
 
 use temen_interp::{
     bytecode, Host, HostProcGrant, PreparedModule, ProcHandler, StreamRole, Trap, Value,
@@ -2679,16 +2680,20 @@ impl OnrampCaps {
             "display" => {
                 let frame = std::sync::Arc::clone(&self.frame);
                 Some(Box::new(
-                    move |op, args: &[i64], mem: Option<&mut dyn temen_interp::GuestMem>, _| {
+                    move |op,
+                          args: &[i64],
+                          out: &mut [i64],
+                          mem: Option<&mut dyn temen_interp::GuestMem>,
+                          _| {
                         if op != 0 {
-                            return Ok(vec![-1]); // only present(0) is defined
+                            return put_results(out, &[-1]); // only present(0) is defined
                         }
                         let ptr = args.first().copied().unwrap_or(0);
                         let w = args.get(1).copied().unwrap_or(0);
                         let h = args.get(2).copied().unwrap_or(0);
                         // Bound the dimensions so a bad (or hostile) call can't ask us to read/allocate wildly.
                         if !(1..=8192).contains(&w) || !(1..=8192).contains(&h) {
-                            return Ok(vec![-1]);
+                            return put_results(out, &[-1]);
                         }
                         let n = (w as u64) * (h as u64) * 4;
                         match mem.and_then(|m| m.read_bytes(ptr as u64, n)) {
@@ -2698,9 +2703,9 @@ impl OnrampCaps {
                                     height: h as u32,
                                     rgba,
                                 });
-                                Ok(vec![0])
+                                put_results(out, &[0])
                             }
-                            None => Ok(vec![-1]), // ptr/len outside the window
+                            None => put_results(out, &[-1]), // ptr/len outside the window
                         }
                     },
                 ))
@@ -2708,22 +2713,29 @@ impl OnrampCaps {
             // `keyboard` — the input waist (Doom slice 2): `poll()` dequeues one packed event, or `-1`.
             "keyboard" => {
                 let q = std::sync::Arc::clone(&self.keys);
-                Some(Box::new(move |op, _args: &[i64], _mem, _| {
-                    if op != 0 {
-                        return Ok(vec![-1]); // only poll(0) is defined
-                    }
-                    Ok(vec![q.lock().unwrap().pop_front().map_or(-1, |e| e as i64)])
-                }))
+                Some(Box::new(
+                    move |op, _args: &[i64], out: &mut [i64], _mem, _| {
+                        if op != 0 {
+                            return put_results(out, &[-1]); // only poll(0) is defined
+                        }
+                        put_results(
+                            out,
+                            &[q.lock().unwrap().pop_front().map_or(-1, |e| e as i64)],
+                        )
+                    },
+                ))
             }
             // `mouse` — the pointer waist (the Uxn card's Varvara Mouse device): the keyboard's twin.
             "mouse" => {
                 let q = std::sync::Arc::clone(&self.mouse);
-                Some(Box::new(move |op, _args: &[i64], _mem, _| {
-                    if op != 0 {
-                        return Ok(vec![-1]); // only poll(0) is defined
-                    }
-                    Ok(vec![q.lock().unwrap().pop_front().unwrap_or(-1)])
-                }))
+                Some(Box::new(
+                    move |op, _args: &[i64], out: &mut [i64], _mem, _| {
+                        if op != 0 {
+                            return put_results(out, &[-1]); // only poll(0) is defined
+                        }
+                        put_results(out, &[q.lock().unwrap().pop_front().unwrap_or(-1)])
+                    },
+                ))
             }
             // `webgpu` — a GPU render surface, serviced (in the browser) against `navigator.gpu` via
             // the `webgpu_op` host import (`src/webgpu.rs`). The guest ships a WGSL shader once (op 0)
@@ -2734,23 +2746,27 @@ impl OnrampCaps {
             // here with the rest so a thaw's registrar can re-grant it: a browser artifact names it.
             #[cfg(target_arch = "wasm32")]
             "webgpu" => Some(Box::new(
-                move |op, args: &[i64], mem: Option<&mut dyn temen_interp::GuestMem>, _| {
+                move |op,
+                      args: &[i64],
+                      out: &mut [i64],
+                      mem: Option<&mut dyn temen_interp::GuestMem>,
+                      _| {
                     match op {
                         // set_shader(wgsl_ptr, wgsl_len) → 0 (compiled) / -1 (bad ptr or compile error)
                         0 => {
                             let ptr = args.first().copied().unwrap_or(0);
                             let len = args.get(1).copied().unwrap_or(0);
                             if !(0..=1 << 20).contains(&len) {
-                                return Ok(vec![-1]);
+                                return put_results(out, &[-1]);
                             }
                             let Some(wgsl) = mem.and_then(|m| m.read_bytes(ptr as u64, len as u64))
                             else {
-                                return Ok(vec![-1]);
+                                return put_results(out, &[-1]);
                             };
                             // SAFETY: wasm-only import; `wgsl` outlives the synchronous call.
                             let r =
                                 unsafe { webgpu::webgpu_op(0, 0, 0, 0, wgsl.as_ptr(), wgsl.len()) };
-                            Ok(vec![r])
+                            put_results(out, &[r])
                         }
                         // present(frame, w, h) → 0
                         1 => {
@@ -2758,9 +2774,9 @@ impl OnrampCaps {
                             let b = args.get(1).copied().unwrap_or(0);
                             let c = args.get(2).copied().unwrap_or(0);
                             let r = unsafe { webgpu::webgpu_op(1, a, b, c, core::ptr::null(), 0) };
-                            Ok(vec![r])
+                            put_results(out, &[r])
                         }
-                        _ => Ok(vec![-1]),
+                        _ => put_results(out, &[-1]),
                     }
                 },
             )),
@@ -2778,7 +2794,11 @@ impl OnrampCaps {
                     std::sync::Arc::clone(cursors),
                 );
                 Some(Box::new(
-                    move |op, args: &[i64], mem: Option<&mut dyn temen_interp::GuestMem>, _| {
+                    move |op,
+                          args: &[i64],
+                          out: &mut [i64],
+                          mem: Option<&mut dyn temen_interp::GuestMem>,
+                          _| {
                         let mut cursors = cursors.lock().unwrap();
                         match op {
                             0 => {
@@ -2787,15 +2807,16 @@ impl OnrampCaps {
                                     .unwrap_or_default();
                                 if String::from_utf8_lossy(&requested).contains(name.as_str()) {
                                     cursors.push(0);
-                                    Ok(vec![(cursors.len() - 1) as i64]) // fd = index into `cursors`
+                                    put_results(out, &[(cursors.len() - 1) as i64])
+                                // fd = index into `cursors`
                                 } else {
-                                    Ok(vec![-2]) // ENOENT → the guest's fopen returns NULL (defaults/skips)
+                                    put_results(out, &[-2]) // ENOENT → the guest's fopen returns NULL (defaults/skips)
                                 }
                             }
                             1 => {
                                 let (buf, want) = (args[1] as u64, args[2] as u64);
                                 let Some(&cur) = cursors.get(args[0] as usize) else {
-                                    return Ok(vec![-1]);
+                                    return put_results(out, &[-1]);
                                 };
                                 let end = (cur + want).min(data.len() as u64);
                                 if end > cur {
@@ -2805,12 +2826,12 @@ impl OnrampCaps {
                                     }
                                 }
                                 cursors[args[0] as usize] = end;
-                                Ok(vec![(end - cur) as i64])
+                                put_results(out, &[(end - cur) as i64])
                             }
                             3 => {
                                 let (whence, off) = (args[1], args[2]);
                                 let Some(cur) = cursors.get(args[0] as usize).copied() else {
-                                    return Ok(vec![-1]);
+                                    return put_results(out, &[-1]);
                                 };
                                 let base = match whence {
                                     1 => cur as i64,
@@ -2818,10 +2839,10 @@ impl OnrampCaps {
                                     _ => 0,
                                 };
                                 cursors[args[0] as usize] = (base + off).max(0) as u64;
-                                Ok(vec![cursors[args[0] as usize] as i64])
+                                put_results(out, &[cursors[args[0] as usize] as i64])
                             }
-                            2 => Ok(vec![args.get(2).copied().unwrap_or(0)]), // write: discard-accept
-                            _ => Ok(vec![0]),                                 // close et al.
+                            2 => put_results(out, &[args.get(2).copied().unwrap_or(0)]), // write: discard-accept
+                            _ => put_results(out, &[0]), // close et al.
                         }
                     },
                 ))
@@ -2843,8 +2864,9 @@ impl OnrampCaps {
             // rather than answers if it ever is.
             Some(temen_interp::ForkedProc::shared(
                 ProcHandler::Sync(
-                    caps.handler(&name)
-                        .unwrap_or_else(|| Box::new(|_op, _args, _mem, _| Err(Trap::CapFault))),
+                    caps.handler(&name).unwrap_or_else(|| {
+                        Box::new(|_op, _args, _out, _mem, _| Err(Trap::CapFault))
+                    }),
                 ),
                 caps.cap_state(&name),
             ))
@@ -8652,7 +8674,7 @@ pub extern "C" fn temen_mem_profile(
     let handle = {
         let mut scratch = run_host();
         scratch.grant_host_proc(HostProcGrant::new(
-            ProcHandler::Sync(Box::new(|_, _, _, _| Ok(vec![]))),
+            ProcHandler::Sync(Box::new(|_, _, _out, _, _| Ok(()))),
             temen_interp::CapState::Stateless,
         ))
     };
@@ -8697,14 +8719,14 @@ pub extern "C" fn temen_mem_profile(
     let mut host = run_host();
     let mut n: u64 = 0; // the profile's event clock (hooks carry none; forward-only)
     let h = host.grant_host_proc(HostProcGrant::new(
-        ProcHandler::Sync(Box::new(move |op, args, _mem, _| {
+        ProcHandler::Sync(Box::new(move |op, args, _out, _mem, _| {
             if let Some(ev) = decode_mem_event(op, args) {
                 n += 1;
                 feed.lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .observe(n, 0, ev);
             }
-            Ok(vec![])
+            Ok(())
         })),
         // The profile observes; the guest reads nothing back from it.
         temen_interp::CapState::Stateless,
@@ -8972,7 +8994,7 @@ pub fn reflect_exec(m: &temen_ir::Module, arg: i64) -> (i32, i64) {
     let _ = host.grant_exit(); // handle 1, type_id 1
                                // handle 2, type_id 13
     let _ = host.grant_host_proc(HostProcGrant::new(
-        ProcHandler::Sync(Box::new(|_op, _args, _mem, _| Ok(vec![0]))),
+        ProcHandler::Sync(Box::new(|_op, _args, out, _mem, _| put_results(out, &[0]))),
         temen_interp::CapState::Stateless,
     ));
     let arity = m.funcs.first().map_or(0, |f| f.params.len());

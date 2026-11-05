@@ -1470,9 +1470,10 @@ fn cc1_imports(files: Vec<(String, Vec<u8>)>, dirs: Vec<String>) -> temen_run::I
         let h: temen_interp::HostProc = Box::new(
             move |_slot_op: u32,
                   args: &[i64],
+                  out: &mut [i64],
                   mem: Option<&mut dyn temen_interp::GuestMem>,
                   minter: Option<&mut dyn temen_interp::RegionMinter>| {
-                inner(args[0] as u32, &args[1..], mem, minter)
+                inner(args[0] as u32, &args[1..], out, mem, minter)
             },
         );
         Some((h, handle.cap_state()))

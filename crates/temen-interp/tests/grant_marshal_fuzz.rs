@@ -14,6 +14,7 @@
 //!      re-grant. A forged handle (one the parent never granted) is refused — `can_regrant` holds — and a
 //!      wholly-valid list is never falsely refused.
 
+use temen_interp::put_results;
 use temen_interp::{
     read_grant_records, read_slice, ForkedProc, Host, HostProc, HostProcGrant, Lease, ProcHandler,
     Trap, WINDOW_RUNS,
@@ -48,10 +49,10 @@ impl Rng {
 /// handle is re-grantable, so any other handle in a record is a forgery the marshal must refuse.
 fn parent_host() -> (Host, i32) {
     let mut host = Host::new();
-    let handler: HostProc = Box::new(|_op, _args, _mem, _| Ok(vec![0]));
+    let handler: HostProc = Box::new(|_op, _args, out, _mem, _| put_results(out, &[0]));
     let fork = std::sync::Arc::new(|_pid: u64| {
         Some(ForkedProc::shared(
-            ProcHandler::Sync(Box::new(|_op, _args, _mem, _| Ok(vec![0]))),
+            ProcHandler::Sync(Box::new(|_op, _args, out, _mem, _| put_results(out, &[0]))),
             temen_interp::CapState::Stateless,
         ))
     });

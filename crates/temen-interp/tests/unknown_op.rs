@@ -35,7 +35,7 @@ fn an_op_past_a_seeded_shape_is_a_cap_fault_on_the_one_shared_dispatch() {
         for op in [n, n + 1, 999] {
             assert!(
                 matches!(
-                    h.cap_dispatch_slots(id, op, handle, &[7], None),
+                    h.cap_call(id, op, handle, &[7], 1, None),
                     Err(Trap::CapFault)
                 ),
                 "{name}: op {op} is past its {n}-op shape and must CapFault",
@@ -52,11 +52,11 @@ fn exit_terminates_only_on_its_one_op() {
     let mut h = Host::new();
     let exit = h.grant_exit();
     assert!(matches!(
-        h.cap_dispatch_slots(cap_id::EXIT, 0, exit, &[7], None),
+        h.cap_call(cap_id::EXIT, 0, exit, &[7], 1, None),
         Err(Trap::Exit(7))
     ));
     assert!(matches!(
-        h.cap_dispatch_slots(cap_id::EXIT, 1, exit, &[7], None),
+        h.cap_call(cap_id::EXIT, 1, exit, &[7], 1, None),
         Err(Trap::CapFault)
     ));
 }
@@ -104,12 +104,8 @@ fn clock_still_ignores_its_op_number_until_it_is_seeded() {
     );
     let mut h = Host::new();
     let clock = h.grant_clock();
-    let a = h
-        .cap_dispatch_slots(cap_id::CLOCK, 0, clock, &[], None)
-        .unwrap();
-    let b = h
-        .cap_dispatch_slots(cap_id::CLOCK, 999, clock, &[], None)
-        .unwrap();
+    let a = h.cap_call(cap_id::CLOCK, 0, clock, &[], 1, None).unwrap();
+    let b = h.cap_call(cap_id::CLOCK, 999, clock, &[], 1, None).unwrap();
     assert_eq!(
         b[0],
         a[0] + 1,
@@ -134,12 +130,12 @@ fn a_host_binding_past_a_seeded_shape_leaves_the_slot_unbound() {
     // `call.import` dispatches as `(CAP_IMPORT_TYPE_ID, slot | consumer_op << 16)`; a flat binding
     // takes consumer op 0.
     assert!(matches!(
-        h.cap_dispatch_slots(temen_ir::CAP_IMPORT_TYPE_ID, 0, 0, &[3], None),
+        h.cap_call(temen_ir::CAP_IMPORT_TYPE_ID, 0, 0, &[3], 1, None),
         Err(Trap::Exit(3))
     ));
     assert!(
         matches!(
-            h.cap_dispatch_slots(temen_ir::CAP_IMPORT_TYPE_ID, 1, 0, &[3], None),
+            h.cap_call(temen_ir::CAP_IMPORT_TYPE_ID, 1, 0, &[3], 1, None),
             Err(Trap::CapFault)
         ),
         "a slot bound past the interface's shape is unbound, never a live exit"

@@ -27,6 +27,7 @@
 #[path = "support/grant_hooks.rs"]
 mod grant_hooks_mod;
 use grant_hooks_mod::grant_hooks;
+use temen_interp::put_results;
 
 use std::process::Command;
 
@@ -161,15 +162,16 @@ fn exec_host(out_h: i32, echo_h: i32) -> temen_interp::HostProc {
     Box::new(
         move |op: u32,
               args: &[i64],
+              out: &mut [i64],
               mem: Option<&mut dyn GuestMem>,
               _minter: Option<&mut dyn temen_interp::RegionMinter>| match op {
-            0 => Ok(vec![out_h as i64]),
+            0 => put_results(out, &[out_h as i64]),
             1 => {
                 let mem = mem.ok_or(Trap::Malformed)?;
                 let ptr = *args.first().ok_or(Trap::Malformed)? as u64;
                 let len = (*args.get(1).ok_or(Trap::Malformed)?).max(0) as u64;
                 let name = mem.read_bytes(ptr, len).ok_or(Trap::Malformed)?;
-                Ok(vec![if name == b"echo" { echo_h as i64 } else { -1 }])
+                put_results(out, &[if name == b"echo" { echo_h as i64 } else { -1 }])
             }
             _ => Err(Trap::CapFault),
         },

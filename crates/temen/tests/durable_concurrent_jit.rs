@@ -16,6 +16,7 @@ use temen_durable::{
     begin_thaw, init_durable_window, read_state, transform_module_assume_confined, STATE_NORMAL,
     STATE_UNWINDING,
 };
+use temen_interp::put_results;
 use temen_interp::{Host, HostProcGrant, ProcHandler};
 use temen_ir::{Memory, Module};
 use temen_jit::{
@@ -106,12 +107,12 @@ fn concurrent_freeze_from(inst: &Module, from: FreezeFrom) -> Option<FreezeOutco
     let clk = host.grant_clock();
     // The root calls this once it has spawned its children; it flips the flag the controller waits on.
     let hf = host.grant_host_proc(HostProcGrant::new(
-        ProcHandler::Sync(Box::new(move |_op, _args, _mem, _| {
+        ProcHandler::Sync(Box::new(move |_op, _args, out, _mem, _| {
             match &at_signal {
                 Some(fc) => fc.request_freeze(),
                 None => sig.store(true, Ordering::SeqCst),
             }
-            Ok(vec![0])
+            put_results(out, &[0])
         })),
         temen_interp::CapState::Stateless,
     ));
@@ -181,7 +182,9 @@ fn thaw(
     let tclk = thost.grant_clock();
     // The host fn is granted (handle order preserved) but never called on the thaw path.
     let _ = thost.grant_host_proc(HostProcGrant::new(
-        ProcHandler::Sync(Box::new(|_op: u32, _a: &[i64], _m, _| Ok(vec![0]))),
+        ProcHandler::Sync(Box::new(|_op: u32, _a: &[i64], out: &mut [i64], _m, _| {
+            put_results(out, &[0])
+        })),
         temen_interp::CapState::Stateless,
     ));
     // Concurrent children `call.cap` from their own OS threads: the serialized thunk (#1166).
@@ -1202,7 +1205,9 @@ fn run_mv_fresh(inst: &Module) -> (JitOutcome, Vec<u8>) {
     host.clock_ns = 42;
     let clk = host.grant_clock();
     let _ = host.grant_host_proc(HostProcGrant::new(
-        ProcHandler::Sync(Box::new(|_op: u32, _a: &[i64], _m, _| Ok(vec![0]))),
+        ProcHandler::Sync(Box::new(|_op: u32, _a: &[i64], out: &mut [i64], _m, _| {
+            put_results(out, &[0])
+        })),
         temen_interp::CapState::Stateless,
     ));
     // Concurrent children `call.cap` from their own OS threads: the serialized thunk (#1166).

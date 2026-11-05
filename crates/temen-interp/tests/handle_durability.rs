@@ -12,6 +12,7 @@
 //! across a restore ⇒ every guest-held handle stays valid. (The full freeze→serialize→
 //! restore→thaw run lands with the snapshot-codec slice that wires this to the window image.)
 
+use temen_interp::put_results;
 use temen_interp::{
     cap_id, DurableBinding, DurableHandle, Host, HostProcGrant, Lease, NonDurableKind, ProcHandler,
     StreamRole, WINDOW_RUNS,
@@ -130,7 +131,7 @@ fn drain_non_durable_makes_a_domain_snapshottable() {
     a.grant_clock(); // slot 0 — durable
     a.grant_blocking(std::time::Duration::ZERO, None); // slot 1 — non-durable
     a.grant_host_proc(HostProcGrant::new(
-        ProcHandler::Sync(Box::new(|_op, _args, _mem, _| Ok(vec![0]))),
+        ProcHandler::Sync(Box::new(|_op, _args, out, _mem, _| put_results(out, &[0]))),
         temen_interp::CapState::Stateless,
     )); // slot 2 — non-durable
 
@@ -180,7 +181,7 @@ fn drain_non_durable_kills_stale_handle_values() {
 
     // The drained handle completes with `-EBADF` at the use site (freed slot ⇒ resolve fails
     // before the op runs; the once-issued generation makes it the revocation errno, not a trap).
-    let r = a.cap_dispatch_slots(cap_id::BLOCKING, 0, ring, &[], None);
+    let r = a.cap_call(cap_id::BLOCKING, 0, ring, &[], 1, None);
     assert!(
         matches!(&r, Ok(v) if v.as_slice() == [-9]),
         "a drained handle is a revoked-once-valid generation, got {r:?}"
@@ -240,7 +241,7 @@ fn empty_table_captures_empty_and_capacity_is_table_size() {
 fn a_named_host_cap_is_durable_and_an_unnamed_one_is_not() {
     let mut named = Host::new();
     let h = named.grant_host_proc(HostProcGrant::new(
-        ProcHandler::Sync(Box::new(|_op, _args, _mem, _| Ok(vec![7]))),
+        ProcHandler::Sync(Box::new(|_op, _args, out, _mem, _| put_results(out, &[7]))),
         temen_interp::CapState::Stateless,
     ));
     named.register_cap_name("fs", h);
@@ -252,7 +253,7 @@ fn a_named_host_cap_is_durable_and_an_unnamed_one_is_not() {
 
     let mut unnamed = Host::new();
     unnamed.grant_host_proc(HostProcGrant::new(
-        ProcHandler::Sync(Box::new(|_op, _args, _mem, _| Ok(vec![7]))),
+        ProcHandler::Sync(Box::new(|_op, _args, out, _mem, _| put_results(out, &[7]))),
         temen_interp::CapState::Stateless,
     ));
     let err = unnamed
@@ -267,7 +268,7 @@ fn a_named_host_cap_is_durable_and_an_unnamed_one_is_not() {
 fn a_named_host_cap_with_uncaptured_state_is_not_durable() {
     let mut host = Host::new();
     let h = host.grant_host_proc(HostProcGrant::new(
-        ProcHandler::Sync(Box::new(|_op, _args, _mem, _| Ok(vec![7]))),
+        ProcHandler::Sync(Box::new(|_op, _args, out, _mem, _| put_results(out, &[7]))),
         temen_interp::CapState::Uncaptured,
     ));
     host.register_cap_name("posix", h);
@@ -285,14 +286,14 @@ fn capture_named_carries_the_providers_state() {
     let mut a = Host::new();
 
     let stateless = a.grant_host_proc(HostProcGrant::new(
-        ProcHandler::Sync(Box::new(|_op, _args, _mem, _| Ok(vec![0]))),
+        ProcHandler::Sync(Box::new(|_op, _args, out, _mem, _| put_results(out, &[0]))),
         temen_interp::CapState::Stateless,
     ));
     a.register_cap_name("display", stateless);
 
     let c = std::sync::Arc::clone(&cursors);
     let stateful = a.grant_host_proc(HostProcGrant::new(
-        ProcHandler::Sync(Box::new(|_op, _args, _mem, _| Ok(vec![0]))),
+        ProcHandler::Sync(Box::new(|_op, _args, out, _mem, _| put_results(out, &[0]))),
         temen_interp::CapState::Captured {
             capture: Box::new(move || c.lock().unwrap().clone()),
             restore: Box::new(|_| {}),
@@ -317,7 +318,7 @@ fn capture_named_carries_the_providers_state() {
 fn a_registrar_re_grants_named_caps_and_the_handles_still_dispatch() {
     let mut a = Host::new();
     let h = a.grant_host_proc(HostProcGrant::new(
-        ProcHandler::Sync(Box::new(|_op, _args, _mem, _| Ok(vec![1]))),
+        ProcHandler::Sync(Box::new(|_op, _args, out, _mem, _| put_results(out, &[1]))),
         temen_interp::CapState::Captured {
             capture: Box::new(|| vec![42]),
             restore: Box::new(|_| {}),
@@ -338,8 +339,8 @@ fn a_registrar_re_grants_named_caps_and_the_handles_still_dispatch() {
         let answer = state.first().copied().unwrap_or(0) as i64;
         Some(temen_interp::NamedCapGrant {
             grant: HostProcGrant::new(
-                ProcHandler::Sync(Box::new(move |_op: u32, _args: &[i64], _mem, _| {
-                    Ok(vec![answer])
+                ProcHandler::Sync(Box::new(move |_op: u32, _args: &[i64], out, _mem, _| {
+                    put_results(out, &[answer])
                 })),
                 temen_interp::CapState::Stateless,
             ),
@@ -357,7 +358,7 @@ fn a_registrar_re_grants_named_caps_and_the_handles_still_dispatch() {
     );
     // The guest's handle value survives the restore and reaches the re-granted handler.
     assert_eq!(
-        b.cap_dispatch_slots(cap_id::HOST_PROC, 0, h, &[], None),
+        b.cap_call(cap_id::HOST_PROC, 0, h, &[], 1, None),
         Ok(vec![42]),
         "the re-granted capability answers on the pinned handle"
     );
@@ -370,7 +371,7 @@ fn a_registrar_re_grants_named_caps_and_the_handles_still_dispatch() {
 #[test]
 fn a_restored_named_cap_is_as_forkable_as_its_registrar_says() {
     fn answer() -> temen_interp::HostProc {
-        Box::new(|_op, _args, _mem, _| Ok(vec![7]))
+        Box::new(|_op, _args, out, _mem, _| put_results(out, &[7]))
     }
     fn factory() -> temen_interp::HostProcFork {
         std::sync::Arc::new(|_pid| {
@@ -423,7 +424,7 @@ fn a_restored_named_cap_is_as_forkable_as_its_registrar_says() {
         if let Some((mut ch, _inst, _as)) = child {
             let granted = ch.resolve_cap_name("display").expect("granted by name");
             assert_eq!(
-                ch.cap_dispatch_slots(cap_id::HOST_PROC, 0, granted, &[], None),
+                ch.cap_call(cap_id::HOST_PROC, 0, granted, &[], 1, None),
                 Ok(vec![7]),
                 "the child's copy reaches a handler the factory minted"
             );
@@ -442,7 +443,7 @@ fn a_restored_named_cap_keeps_the_shape_it_was_granted() {
     let requests = CapRequests::default();
     let grant = move |name: &str| match name {
         "pool" => HostProcGrant::new(
-            ProcHandler::Offloadable(Box::new(|_op, _args| {
+            ProcHandler::Offloadable(Box::new(|_op, _args, _out| {
                 OffloadOutcome::Offload(Box::new(|| 7))
             })),
             CapState::Stateless,
@@ -450,8 +451,8 @@ fn a_restored_named_cap_keeps_the_shape_it_was_granted() {
         "ui" => HostProcGrant::declared("ui", &requests),
         "mmap" => HostProcGrant::new(
             // Answers whether it was handed the minter.
-            ProcHandler::Minting(Box::new(|_op, _args, _mem, minter| {
-                Ok(vec![minter.is_some() as i64])
+            ProcHandler::Minting(Box::new(|_op, _args, out, _mem, minter| {
+                put_results(out, &[minter.is_some() as i64])
             })),
             CapState::Stateless,
         ),
@@ -490,7 +491,7 @@ fn a_restored_named_cap_keeps_the_shape_it_was_granted() {
         "the declared one still parks on the embedder"
     );
     assert_eq!(
-        b.cap_dispatch_slots(cap_id::HOST_PROC, 0, mmap, &[], None),
+        b.cap_call(cap_id::HOST_PROC, 0, mmap, &[], 1, None),
         Ok(vec![1]),
         "the minting one is still handed the minter"
     );
@@ -503,7 +504,7 @@ fn a_restored_named_cap_keeps_the_shape_it_was_granted() {
 fn a_restore_refuses_a_name_the_embedder_does_not_serve() {
     let mut a = Host::new();
     let h = a.grant_host_proc(HostProcGrant::new(
-        ProcHandler::Sync(Box::new(|_op, _args, _mem, _| Ok(vec![1]))),
+        ProcHandler::Sync(Box::new(|_op, _args, out, _mem, _| put_results(out, &[1]))),
         temen_interp::CapState::Stateless,
     ));
     a.register_cap_name("fs", h);
@@ -522,7 +523,7 @@ fn a_restore_refuses_a_name_the_embedder_does_not_serve() {
     picky.set_named_cap_registrar(Box::new(|name, _state, _payer| {
         (name == "display").then(|| temen_interp::NamedCapGrant {
             grant: HostProcGrant::new(
-                ProcHandler::Sync(Box::new(|_op, _args, _mem, _| Ok(vec![0]))),
+                ProcHandler::Sync(Box::new(|_op, _args, out, _mem, _| put_results(out, &[0]))),
                 temen_interp::CapState::Stateless,
             ),
             process: None,
@@ -582,13 +583,13 @@ fn a_handle_closed_before_the_freeze_answers_ebadf_after_it() {
     b.restore_durable_handles(&generations, &captured);
     assert_eq!(b.slot_generations(), generations, "the table rides whole");
     assert_eq!(
-        b.cap_dispatch_slots(cap_id::CLOCK, 0, clk, &[], None),
+        b.cap_call(cap_id::CLOCK, 0, clk, &[], 1, None),
         Ok(vec![-9]),
         "the closed handle answers -EBADF, as before the freeze"
     );
     let forged = clk + (1 << 10); // the next generation, which slot 1 never issued
     assert_eq!(
-        b.cap_dispatch_slots(cap_id::CLOCK, 0, forged, &[], None),
+        b.cap_call(cap_id::CLOCK, 0, forged, &[], 1, None),
         Err(temen_interp::Trap::CapFault),
         "a generation the slot never issued is still a forgery"
     );
@@ -615,7 +616,7 @@ fn a_grant_after_the_thaw_issues_a_newer_generation() {
         "the thawed grant issues the uninterrupted run's handle, not the closed one's value"
     );
     assert_eq!(
-        b.cap_dispatch_slots(cap_id::CLOCK, 0, closed, &[], None),
+        b.cap_call(cap_id::CLOCK, 0, closed, &[], 1, None),
         Ok(vec![-9]),
         "and the closed handle is still closed"
     );
@@ -637,7 +638,7 @@ fn restore_resets_a_slot_the_frozen_run_never_granted() {
     b.restore_durable_handles(&generations, &captured);
     assert_eq!(b.slot_generations(), [1], "slot 1 is back to never granted");
     assert_eq!(
-        b.cap_dispatch_slots(cap_id::CLOCK, 0, stray, &[], None),
+        b.cap_call(cap_id::CLOCK, 0, stray, &[], 1, None),
         Err(temen_interp::Trap::CapFault),
         "the embedder's own pre-restore handle names nothing the guest was granted"
     );
@@ -654,13 +655,13 @@ use temen_interp::DurableBudget;
 
 /// `split(fuel, mem, spawn)` of `holder`: the child node's handle.
 fn split(host: &mut Host, holder: i32, ask: [i64; 3]) -> i32 {
-    host.cap_dispatch_slots(cap_id::BUDGET, 0, holder, &ask, None)
+    host.cap_call(cap_id::BUDGET, 0, holder, &ask, 1, None)
         .expect("split")[0] as i32
 }
 
 /// `read(field)` of `h`: the room left along its chain.
 fn read(host: &mut Host, h: i32, field: i64) -> i64 {
-    host.cap_dispatch_slots(cap_id::BUDGET, 1, h, &[field], None)
+    host.cap_call(cap_id::BUDGET, 1, h, &[field], 1, None)
         .expect("read")[0]
 }
 
@@ -758,7 +759,7 @@ fn a_drain_keeps_a_budget() {
         "nothing to drain: a Budget is durable"
     );
     assert_eq!(
-        a.cap_dispatch_slots(cap_id::BUDGET, 1, h, &[2], None),
+        a.cap_call(cap_id::BUDGET, 1, h, &[2], 1, None),
         Ok(vec![3]),
         "the budget is untouched by the drain"
     );

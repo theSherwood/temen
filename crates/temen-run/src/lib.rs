@@ -578,18 +578,13 @@ unsafe fn cap_thunk_impl(
     };
     let mut gm = gm;
     let view = gm.as_mut().map(|g| &mut **g as &mut dyn GuestMem);
-    // A deferred call's placeholder results are empty, so nothing below writes them, and it raised
-    // no park.
-    let r =
-        host.cap_dispatch_slots_deferring(type_id, op, handle, arg_slots, view, pending, unlocked);
+    // The dispatch writes its results straight into the call's result slots, which the compiled
+    // code zeroed (#2361, #2319). A deferred call writes none there, and it raised no park.
+    let out = result_slots(results, n_results);
+    let r = host
+        .cap_dispatch_slots_deferring(type_id, op, handle, arg_slots, out, view, pending, unlocked);
     match r {
-        Ok(res) => {
-            if n_results != 0 {
-                let out = std::slice::from_raw_parts_mut(results, n_results as usize);
-                for (o, r) in out.iter_mut().zip(res) {
-                    *o = r;
-                }
-            }
+        Ok(()) => {
             // Every transient the op left is drained, acted on or not: one left set would land on a
             // later call.
             let parks = host.take_park_transients();
@@ -825,15 +820,8 @@ pub unsafe extern "C" fn cap_thunk_locked(
             } else {
                 std::slice::from_raw_parts(args, n_args as usize)
             };
-            match call.run(arg_slots, view) {
-                Ok(res) if n_results != 0 => {
-                    let out = std::slice::from_raw_parts_mut(results, n_results as usize);
-                    for (o, r) in out.iter_mut().zip(res) {
-                        *o = r;
-                    }
-                }
-                Ok(_) => {}
-                Err(t) => vm.raise(t.code()),
+            if let Err(t) = call.run(arg_slots, result_slots(results, n_results), view) {
+                vm.raise(t.code());
             }
             return;
         }
@@ -2429,8 +2417,9 @@ unsafe fn fast_dispatch(
     vm: &temen_jit::VmCtx,
 ) -> i64 {
     let host = &mut *(ctx as *mut Host);
-    match host.cap_dispatch_slots(type_id, op, handle, args, None) {
-        Ok(res) => res.first().copied().unwrap_or(0),
+    let mut out = [0];
+    match host.cap_dispatch_slots(type_id, op, handle, args, &mut out, None) {
+        Ok(()) => out[0],
         Err(t) => {
             vm.raise(t.code()); // #1735: the host's own trap, as `cap_thunk` reports it
             0
@@ -8248,7 +8237,7 @@ impl Instance {
         let handle = {
             let mut scratch = Host::new();
             scratch.grant_host_proc(HostProcGrant::new(
-                ProcHandler::Sync(Box::new(|_, _, _, _| Ok(vec![]))),
+                ProcHandler::Sync(Box::new(|_, _, _out, _, _| Ok(()))),
                 temen_interp::CapState::Stateless,
             ))
         };
@@ -8285,10 +8274,14 @@ impl Instance {
         let mut hook = (hooks.make)();
         let handle = h.grant_host_proc(HostProcGrant::new(
             ProcHandler::Sync(Box::new(
-                move |op, args, _mem, _minter: Option<&mut dyn temen_interp::RegionMinter>| {
+                move |op,
+                      args,
+                      _out,
+                      _mem,
+                      _minter: Option<&mut dyn temen_interp::RegionMinter>| {
                     let ev = decode_mem_event(op, args).ok_or(Trap::Malformed)?;
                     hook(ev)?;
-                    Ok(vec![])
+                    Ok(())
                 },
             )), // The hook observes; the guest reads nothing back from it.
             temen_interp::CapState::Stateless,

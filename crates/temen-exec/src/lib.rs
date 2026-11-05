@@ -201,9 +201,13 @@ pub fn scripted_exec_handler(
         Box::new(
             move |op: u32,
                   args: &[i64],
+                  out: &mut [i64],
                   mem: Option<&mut dyn GuestMem>,
                   _minter: Option<&mut dyn temen_interp::RegionMinter>| {
-                Ok(vec![scripted_dispatch(&table, &mut jobs, op, args, mem)])
+                temen_interp::put_results(
+                    out,
+                    &[scripted_dispatch(&table, &mut jobs, op, args, mem)],
+                )
             },
         ) as HostProc
     }

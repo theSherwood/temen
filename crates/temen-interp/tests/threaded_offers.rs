@@ -323,12 +323,12 @@ fn the_host_side_tier_admits_a_threaded_instance() {
     let tid = h.resolve_offer(offer).unwrap().type_id;
 
     assert_eq!(
-        h.cap_dispatch_slots(tid, 0, offer, &[16424, 5], None),
+        h.cap_call(tid, 0, offer, &[16424, 5], 1, None),
         Ok(vec![5]),
         "store(16424, 5) — addr above the #1094 NULL guard — ran host-side over the shared cell"
     );
     assert_eq!(
-        h.cap_dispatch_slots(tid, 1, offer, &[16424], None),
+        h.cap_call(tid, 1, offer, &[16424], 1, None),
         Ok(vec![5]),
         "load(16424) sees the store — one persistent instance, gate reopened"
     );

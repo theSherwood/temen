@@ -83,8 +83,14 @@ fn bind(m: &temen_ir::Module, host: &mut Host) -> Option<WasiOut> {
 /// terminates the domain with the given code (a non-error [`Trap::Exit`]).
 fn handler(out: WasiOut) -> HostProc {
     Box::new(
-        move |op, args, mem, _minter: Option<&mut dyn temen_interp::RegionMinter>| match op {
-            OP_FD_WRITE => fd_write(&out, args, mem),
+        move |op,
+              args,
+              slots: &mut [i64],
+              mem,
+              _minter: Option<&mut dyn temen_interp::RegionMinter>| match op {
+            OP_FD_WRITE => {
+                fd_write(&out, args, mem).and_then(|r| temen_interp::put_results(slots, &r))
+            }
             OP_PROC_EXIT => Err(Trap::Exit(args.first().copied().unwrap_or(0) as i32)),
             _ => Err(Trap::CapFault), // unknown WASI op on this handle
         },

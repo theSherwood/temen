@@ -41,9 +41,9 @@ use temen_browser::{
 use temen_browser::{
     stage_child_program, temen_alloc, temen_coop_cap_len, temen_coop_cap_ptr,
     temen_coop_deliver_cap, temen_coop_idle_timer, temen_coop_module, temen_coop_pass_time,
-    temen_coop_program_wasm_len, temen_coop_program_wasm_ptr, temen_coop_read,
-    temen_coop_read_ptr, temen_coop_run_for, COOP_LEAF_OFF, COOP_LEAF_ROOT, COOP_LEAF_SUSPENDS,
-    COOP_NO_REGIONS, COOP_RUN_CAP_PARK, COOP_RUN_IDLE, COOP_RUN_PAUSED, COOP_RUN_RESUME,
+    temen_coop_program_wasm_len, temen_coop_program_wasm_ptr, temen_coop_read, temen_coop_read_ptr,
+    temen_coop_run_for, COOP_LEAF_OFF, COOP_LEAF_ROOT, COOP_LEAF_SUSPENDS, COOP_NO_REGIONS,
+    COOP_RUN_CAP_PARK, COOP_RUN_IDLE, COOP_RUN_PAUSED, COOP_RUN_RESUME,
 };
 use temen_interp::{Host, StreamRole};
 use wasmi::{
@@ -6495,7 +6495,11 @@ fn coop_run_idles_with_its_timer_while_an_answer_is_owed() {
         COOP_NO_REGIONS,
     );
     assert_eq!(opened, 0, "opens");
-    assert_eq!(temen_coop_run(), COOP_RUN_CAP_PARK, "the thread's call is told");
+    assert_eq!(
+        temen_coop_run(),
+        COOP_RUN_CAP_PARK,
+        "the thread's call is told"
+    );
     // SAFETY: the request words stay live until the next deliver/run/close.
     let words =
         unsafe { std::slice::from_raw_parts(temen_coop_cap_ptr(), temen_coop_cap_len()) }.to_vec();
@@ -6507,7 +6511,11 @@ fn coop_run_idles_with_its_timer_while_an_answer_is_owed() {
     assert_eq!(idle(), 1_000_000, "the root's timer");
     assert_eq!(idle(), 1_000_000, "no time has passed");
     temen_coop_pass_time(1_000_000);
-    assert_eq!(idle(), -1, "the root's wait timed out: it waits on the thread");
+    assert_eq!(
+        idle(),
+        -1,
+        "the root's wait timed out: it waits on the thread"
+    );
     assert_eq!(temen_coop_deliver_cap(words[0] as u64, pong(7)), 1);
     assert_eq!(temen_coop_run(), COOP_RUN_DONE, "status {}", temen_status());
     assert_eq!(temen_coop_value(), 20_000 + pong(7));
@@ -6551,7 +6559,11 @@ fn coop_run_hands_the_page_the_time_to_a_lone_wait() {
     );
     assert_eq!(opened, 0, "opens");
     let idle = || {
-        assert_eq!(temen_coop_run(), COOP_RUN_IDLE, "the run waits on its timer");
+        assert_eq!(
+            temen_coop_run(),
+            COOP_RUN_IDLE,
+            "the run waits on its timer"
+        );
         temen_coop_idle_timer()
     };
     assert_eq!(idle(), 1_000_000, "the wait's timer");

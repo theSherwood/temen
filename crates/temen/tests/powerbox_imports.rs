@@ -8,6 +8,7 @@
 //! Gated `#![cfg(unix)]` like the other JIT differential suites.
 #![cfg(unix)]
 
+use temen_interp::put_results;
 use temen_run::{
     instantiate, instantiate_with_imports, Backend, HostCap, Imports, Outcome, RunConfig, Value,
 };
@@ -54,7 +55,7 @@ fn arbitrary_named_host_capabilities_bind_and_run() {
             "add_seven",
             HostCap::host_proc(0, |_, _| {
                 Some((
-                    Box::new(|_op, args, _mem, _| Ok(vec![args[0] + 7])),
+                    Box::new(|_op, args, out, _mem, _| put_results(out, &[args[0] + 7])),
                     temen_interp::CapState::Stateless,
                 ))
             }),
@@ -63,7 +64,7 @@ fn arbitrary_named_host_capabilities_bind_and_run() {
             "triple",
             HostCap::host_proc(0, |_, _| {
                 Some((
-                    Box::new(|_op, args, _mem, _| Ok(vec![args[0] * 3])),
+                    Box::new(|_op, args, out, _mem, _| put_results(out, &[args[0] * 3])),
                     temen_interp::CapState::Stateless,
                 ))
             }),
@@ -113,14 +114,17 @@ fn module_bindings_share_one_instance() {
             "kv",
             HostCap::host_proc(0, |_, _| {
                 let mut cell = 0i64;
-                let h: temen_interp::HostProc = Box::new(move |op, args, _mem, _| {
-                    Ok(vec![match op {
-                        0 => {
-                            cell = args[0];
-                            0
-                        }
-                        _ => cell,
-                    }])
+                let h: temen_interp::HostProc = Box::new(move |op, args, out, _mem, _| {
+                    put_results(
+                        out,
+                        &[match op {
+                            0 => {
+                                cell = args[0];
+                                0
+                            }
+                            _ => cell,
+                        }],
+                    )
                 });
                 // The cell is guest-observable and nothing serializes it.
                 Some((h, temen_interp::CapState::Uncaptured))
@@ -149,7 +153,7 @@ fn unbound_name_fails_closed() {
         "add_seven",
         HostCap::host_proc(0, |_, _| {
             Some((
-                Box::new(|_op, args, _mem, _| Ok(vec![args[0]])),
+                Box::new(|_op, args, out, _mem, _| put_results(out, &[args[0]])),
                 temen_interp::CapState::Stateless,
             ))
         }),

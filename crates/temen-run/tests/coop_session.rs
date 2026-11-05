@@ -38,7 +38,7 @@ fn ask(filed: &Filed) -> HostCap {
     HostCap::custom(cap_id::HOST_PROC, 1, move |h, _| {
         let filed = Arc::clone(&filed);
         h.grant_host_proc(HostProcGrant::new(
-            ProcHandler::Offloadable(Box::new(move |_op, args| {
+            ProcHandler::Offloadable(Box::new(move |_op, args, _out| {
                 let a = *args.first().unwrap_or(&0);
                 let filed = Arc::clone(&filed);
                 OffloadOutcome::Host(Box::new(move |c| filed.lock().unwrap().push((c, a))))

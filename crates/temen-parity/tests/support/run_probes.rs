@@ -15,6 +15,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
+use temen_interp::put_results;
 
 use temen_durable::transform_module_assume_confined;
 use temen_interp::{
@@ -127,13 +128,13 @@ pub fn named_proc(name: &str, e: &Embedder) -> Option<HostProc> {
     let s = Arc::clone(&e.stopper);
     Some(match name {
         capability_probe::ZERO => capability_probe::zero(),
-        "plus100" => Box::new(|_op, args, _mem, _minter| Ok(vec![plus_100(args)])),
-        "stop" => Box::new(move |_op, _args, _mem, _minter| {
+        "plus100" => Box::new(|_op, args, out, _mem, _minter| put_results(out, &[plus_100(args)])),
+        "stop" => Box::new(move |_op, _args, out, _mem, _minter| {
             s.set(true);
-            Ok(vec![0])
+            put_results(out, &[0])
         }),
-        "continued" => Box::new(move |_op, _args, _mem, _minter| {
-            Ok(vec![i64::from(s.continued.load(Ordering::SeqCst))])
+        "continued" => Box::new(move |_op, _args, out, _mem, _minter| {
+            put_results(out, &[i64::from(s.continued.load(Ordering::SeqCst))])
         }),
         _ => return None,
     })
@@ -707,7 +708,7 @@ block 0 (vh: i32) {
 fn host_answered() -> (Host, Vec<Value>) {
     let mut host = Host::new();
     let h = host.grant_host_proc(HostProcGrant::new(
-        ProcHandler::Offloadable(Box::new(|_op, args| {
+        ProcHandler::Offloadable(Box::new(|_op, args, _out| {
             let a = plus_100(args);
             OffloadOutcome::Host(Box::new(move |c| {
                 std::thread::spawn(move || {
@@ -726,7 +727,7 @@ fn host_answered() -> (Host, Vec<Value>) {
 fn offloaded() -> (Host, Vec<Value>) {
     let mut host = Host::new();
     let h = host.grant_host_proc(HostProcGrant::new(
-        ProcHandler::Offloadable(Box::new(|_op, args| {
+        ProcHandler::Offloadable(Box::new(|_op, args, _out| {
             let a = plus_100(args);
             OffloadOutcome::Offload(Box::new(move || a))
         })),

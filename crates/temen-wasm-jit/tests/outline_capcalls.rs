@@ -12,6 +12,7 @@
 //! (The emitted↔interpreter cross-tier bridge is proven by `cross_tier.rs`; the full end-to-end with a
 //! real `display` cap on the f64 Mandelbrot guest is proven by the browser JIT-reactor test.)
 
+use temen_interp::put_results;
 use temen_interp::{bytecode, Host, HostProcGrant, ProcHandler, Value};
 use temen_wasm_jit::{compile_module_reactor, outline_cap_calls};
 
@@ -44,9 +45,9 @@ fn parse(src: &str) -> temen_ir::Module {
 fn run(m: &temen_ir::Module) -> Vec<Value> {
     let mut host = Host::new();
     let handle = host.grant_host_proc(HostProcGrant::new(
-        ProcHandler::Sync(Box::new(|op, args, _mem, _| {
+        ProcHandler::Sync(Box::new(|op, args, out, _mem, _| {
             assert_eq!(op, 0, "the guest calls op 0");
-            Ok(vec![args[0] + args[1]])
+            put_results(out, &[args[0] + args[1]])
         })),
         temen_interp::CapState::Stateless,
     ));

@@ -17,6 +17,7 @@
 
 use std::sync::Arc;
 use std::time::Duration;
+use temen_interp::put_results;
 
 use temen_interp::{
     bytecode, run_with_host, Host, HostProcGrant, OffloadHostProc, OffloadOutcome, ProcHandler,
@@ -124,7 +125,7 @@ block 0 (vsp: i64, varg: i64) {
 "#;
 
 fn punting_handler() -> OffloadHostProc {
-    Box::new(|_op, args| {
+    Box::new(|_op, args, _out| {
         let a = *args.first().unwrap_or(&0);
         OffloadOutcome::Offload(Box::new(move || a + 100))
     })
@@ -306,12 +307,12 @@ block 0 (vsp: i64, varg: i64) {
 
 fn gated_handler() -> OffloadHostProc {
     let gate = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
-    Box::new(move |op, args| {
+    Box::new(move |op, args, out| {
         if op == 1 {
             let (mx, cv) = &*gate;
             *mx.lock().unwrap() = true;
             cv.notify_all();
-            return OffloadOutcome::Done(Ok(vec![0]));
+            return OffloadOutcome::Done(put_results(out, &[0]));
         }
         let a = *args.first().unwrap_or(&0);
         if a == 0 {
@@ -380,7 +381,7 @@ fn root_return_abandons_a_cap_parked_fiber_identically_on_all_three() {
     let mk = || {
         let mut h = Host::new();
         let hh = h.grant_host_proc(HostProcGrant::new(
-            ProcHandler::Offloadable(Box::new(|_op, args| {
+            ProcHandler::Offloadable(Box::new(|_op, args, _out| {
                 let a = *args.first().unwrap_or(&0);
                 OffloadOutcome::Offload(Box::new(move || {
                     std::thread::sleep(Duration::from_millis(100));

@@ -22,6 +22,7 @@ mod fork_twin;
 mod paged_detached;
 
 use detached_thaw::rec;
+use temen_interp::put_results;
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -802,9 +803,9 @@ block 0 (vsp: i64, varg: i64) {
             h.set_signal_source(stopper.clone(), Default::default());
             let s = stopper.clone();
             let stop = h.grant_host_proc(HostProcGrant::new(
-                ProcHandler::Sync(Box::new(move |_op, _args, _mem, _minter| {
+                ProcHandler::Sync(Box::new(move |_op, _args, out, _mem, _minter| {
                     s.set(true);
-                    Ok(vec![0])
+                    put_results(out, &[0])
                 })),
                 CapState::Stateless,
             ));

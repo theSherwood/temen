@@ -2,6 +2,7 @@
 //! stepping, IR-value / window inspection, and a backtrace across a call — driven through the
 //! host-side `Inspector`. These pin the S4 per-op seam + S5 driver model end-to-end.
 
+use temen_interp::put_results;
 use temen_interp::{
     Host, HostProcGrant, Inspector, IrPc, ProcHandler, SourceLoc, Stop, StopReason, StreamRole,
     Value, VarValue, WatchKind,
@@ -837,10 +838,10 @@ fn captape_replays_host_proc_inputs_for_faithful_seek() {
     // A nondeterministic host capability: each call returns an incrementing counter.
     let mut n = 100i64;
     let hf = host.grant_host_proc(HostProcGrant::new(
-        ProcHandler::Sync(Box::new(move |_op, _args, _mem, _| {
+        ProcHandler::Sync(Box::new(move |_op, _args, out, _mem, _| {
             let v = n;
             n += 1;
-            Ok(vec![v])
+            put_results(out, &[v])
         })),
         temen_interp::CapState::Stateless,
     ));

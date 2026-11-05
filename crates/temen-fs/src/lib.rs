@@ -1306,12 +1306,14 @@ impl MemFsHandle {
         Box::new(
             move |op: u32,
                   args: &[i64],
+                  out: &mut [i64],
                   mem: Option<&mut dyn GuestMem>,
                   _minter: Option<&mut dyn temen_interp::RegionMinter>| {
-                Ok(vec![st
+                let r = st
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
-                    .handle(op, args, mem)])
+                    .handle(op, args, mem);
+                temen_interp::put_results(out, &[r])
             },
         ) as HostProc
     }
@@ -1453,13 +1455,14 @@ pub fn vm_fs_handler(fs: &MemFsHandle) -> HostProc {
     Box::new(
         move |_slot_op: u32,
               args: &[i64],
+              out: &mut [i64],
               mem: Option<&mut dyn GuestMem>,
               minter: Option<&mut dyn temen_interp::RegionMinter>| {
             let (op, rest) = args
                 .split_first()
                 .map(|(o, r)| (*o as u32, r))
                 .unwrap_or((0, &[][..]));
-            inner(op, rest, mem, minter)
+            inner(op, rest, out, mem, minter)
         },
     )
 }
@@ -1607,7 +1610,11 @@ mod tests {
     #[test]
     fn a_captured_store_restores_its_descriptors_and_their_sharing() {
         let call = |fs: &mut HostProc, op: u32, args: &[i64], mem: &mut VecMem| -> i64 {
-            fs(op, args, Some(mem), None).expect("host fn")[0]
+            {
+                let mut out = [0];
+                fs(op, args, &mut out, Some(mem), None).expect("host fn");
+                out[0]
+            }
         };
         let a = MemFsHandle::seeded(&[("keep".into(), b"k".to_vec())], &["empty".into()]);
         let mut fs = a.handler();
@@ -1676,7 +1683,11 @@ mod tests {
     #[test]
     fn closing_a_file_copies_its_shared_mappings_back() {
         let call = |fs: &mut HostProc, op: u32, args: &[i64], mem: &mut VecMem| -> i64 {
-            fs(op, args, Some(mem), None).expect("host fn")[0]
+            {
+                let mut out = [0];
+                fs(op, args, &mut out, Some(mem), None).expect("host fn");
+                out[0]
+            }
         };
         let store = MemFsHandle::seeded(&[("f".into(), b"AAAA".to_vec())], &[]);
         let mut fs = store.handler();
@@ -1713,7 +1724,11 @@ mod tests {
         let (_store, mut fs, host) = bound(1 << 20);
         let mut mem = VecMem(vec![0u8; 8192]);
         mem.0[0] = b'f';
-        let mut call = |op: u32, args: &[i64]| fs(op, args, Some(&mut mem), None).expect("op")[0];
+        let mut call = |op: u32, args: &[i64]| {
+            let mut out = [0];
+            fs(op, args, &mut out, Some(&mut mem), None).expect("op");
+            out[0]
+        };
         let fd = call(FS_OPEN, &[0, 1, O_READ | O_WRITE | O_CREATE]);
         assert!(fd >= 0);
         assert_eq!(
@@ -1754,7 +1769,11 @@ mod tests {
         let mut mem = VecMem(vec![0u8; 4096]);
         mem.0[..6].copy_from_slice(b"d/f000");
         let mut call = |op: u32, args: &[i64], mem: &mut VecMem| {
-            let r = fs(op, args, Some(mem), None).expect("op")[0];
+            let r = {
+                let mut out = [0];
+                fs(op, args, &mut out, Some(mem), None).expect("op");
+                out[0]
+            };
             let st = store.0.lock().unwrap();
             assert_eq!(
                 st.tables.bytes(),
@@ -1890,7 +1909,11 @@ mod tests {
         mem.0[..6].copy_from_slice(b"base/2");
         mem.0[16..21].copy_from_slice(b"hello");
         let call = |fs: &mut HostProc, op: u32, args: &[i64], mem: &mut VecMem| -> i64 {
-            fs(op, args, Some(mem), None).expect("host fn")[0]
+            {
+                let mut out = [0];
+                fs(op, args, &mut out, Some(mem), None).expect("host fn");
+                out[0]
+            }
         };
 
         // Create + write a new file through the granted handler (O_CREATE|O_WRITE).
@@ -1928,7 +1951,11 @@ mod tests {
         let mut phase_a: HostProc = factory().0;
         let mut phase_b: HostProc = factory().0;
         let call = |fs: &mut HostProc, op: u32, args: &[i64], mem: &mut VecMem| -> i64 {
-            fs(op, args, Some(mem), None).expect("host fn")[0]
+            {
+                let mut out = [0];
+                fs(op, args, &mut out, Some(mem), None).expect("host fn");
+                out[0]
+            }
         };
 
         // Phase A: create "x" (O_CREATE|O_WRITE) and write "hi".

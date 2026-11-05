@@ -86,7 +86,14 @@ fn list_enumerates_named_grants_with_handle_and_type_id() {
     let mut mem = VecMem(vec![0u8; 4096]);
     // Size pass: cap 0 ⇒ length only, nothing written.
     let need = h
-        .cap_dispatch_slots(temen_ir::CAP_SELF_TYPE_ID, 17, 0, &[64, 0], Some(&mut mem))
+        .cap_call(
+            temen_ir::CAP_SELF_TYPE_ID,
+            17,
+            0,
+            &[64, 0],
+            1,
+            Some(&mut mem),
+        )
         .expect("list size")[0];
     assert!(need > 0, "one named grant => non-empty listing");
     assert!(
@@ -95,11 +102,12 @@ fn list_enumerates_named_grants_with_handle_and_type_id() {
     );
     // Fill pass.
     let got = h
-        .cap_dispatch_slots(
+        .cap_call(
             temen_ir::CAP_SELF_TYPE_ID,
             17,
             0,
             &[64, need],
+            1,
             Some(&mut mem),
         )
         .expect("list fill")[0];
@@ -127,21 +135,23 @@ fn schema_returns_canonical_names_and_wire_type_bytes() {
     );
     let mut mem = VecMem(vec![0u8; 4096]);
     let need = h
-        .cap_dispatch_slots(
+        .cap_call(
             temen_ir::CAP_SELF_TYPE_ID,
             18,
             0,
             &[tid as i64, 0, 0],
+            1,
             Some(&mut mem),
         )
         .expect("schema size")[0];
     assert!(need > 0);
     let got = h
-        .cap_dispatch_slots(
+        .cap_call(
             temen_ir::CAP_SELF_TYPE_ID,
             18,
             0,
             &[tid as i64, 0, need],
+            1,
             Some(&mut mem),
         )
         .expect("schema fill")[0];
@@ -158,19 +168,21 @@ fn schema_returns_canonical_names_and_wire_type_bytes() {
 
     // The pre-seeded builtin reads back its canonical named shape.
     let need = h
-        .cap_dispatch_slots(
+        .cap_call(
             temen_ir::CAP_SELF_TYPE_ID,
             18,
             0,
             &[cap_id::STREAM as i64, 0, 0],
+            1,
             Some(&mut mem),
         )
         .expect("stream schema size")[0];
-    h.cap_dispatch_slots(
+    h.cap_call(
         temen_ir::CAP_SELF_TYPE_ID,
         18,
         0,
         &[cap_id::STREAM as i64, 0, need],
+        1,
         Some(&mut mem),
     )
     .expect("stream schema fill");
@@ -184,11 +196,12 @@ fn schema_returns_canonical_names_and_wire_type_bytes() {
 
     // An id with no schema (a handle-typed builtin) is a probeable -EINVAL, never a trap.
     let r = h
-        .cap_dispatch_slots(
+        .cap_call(
             temen_ir::CAP_SELF_TYPE_ID,
             18,
             0,
             &[cap_id::INSTANTIATOR as i64, 0, 0],
+            1,
             Some(&mut mem),
         )
         .expect("no schema is probeable")[0];

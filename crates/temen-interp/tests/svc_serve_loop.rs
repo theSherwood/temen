@@ -164,7 +164,7 @@ fn a_non_serving_tier_refuses_both_svc_ops_probeably() {
     let mut host = Host::new();
     for op in [CAP_SELF_SVC_POLL, temen_interp::CAP_SELF_SVC_WAIT] {
         let r = host
-            .cap_dispatch_slots(temen_ir::CAP_SELF_TYPE_ID, op, 0, &[], None)
+            .cap_call(temen_ir::CAP_SELF_TYPE_ID, op, 0, &[], 1, None)
             .expect("refusal, not a trap");
         assert_eq!(r, vec![-22], "probeable -EINVAL for svc op {op}");
     }
