@@ -864,7 +864,10 @@ the slot once, always checks and calls one record. A slot of two separately writ
 dispatch pair one install's type id with another's code (#2680).
 - `funcref<Sig>` value = a function index (a plain integer).
 - `ref.func <funcidx>` → `funcref<Sig_funcidx>` (the index; direct, no check).
-- `call <funcidx>(args)` → fully static direct call (verifier checks funcidx + types).
+- `call <funcidx>(args)` → fully static direct call (verifier checks funcidx + types). The
+  Cranelift JIT calls the code the callee's record holds, read through slot `funcidx`, which names
+  that record for the table's life (#2594). The target is still the host's, never a guest value,
+  and the record's code word is what lets a function compile at its first call.
 - `call.dyn <Sig>(fref, args)` — **always runtime-checks** (D38, wasm parity;
   JIT devirtualization is a later optimization, not MVP):
   ```

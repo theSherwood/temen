@@ -65,8 +65,9 @@ use cranelift_codegen::ir::types::{
 };
 use cranelift_codegen::ir::{
     AbiParam, AtomicRmwOp as ClifRmwOp, BlockArg, BlockCall, ConstantData, Endianness, ExtFuncData,
-    ExternalName, FuncRef, Function, InstBuilder, JumpTableData, MemFlags, Signature, SourceLoc,
-    StackSlotData, StackSlotKind, Type, UserExternalName, UserFuncName, Value, ValueLabel,
+    ExternalName, FuncRef, Function, InstBuilder, JumpTableData, MemFlags, SigRef, Signature,
+    SourceLoc, StackSlotData, StackSlotKind, Type, UserExternalName, UserFuncName, Value,
+    ValueLabel,
 };
 use cranelift_codegen::settings::{self, Configurable};
 use cranelift_codegen::CompiledCode;
@@ -425,27 +426,27 @@ impl FnTable {
     }
 }
 
-/// The records of a compile's own functions, slot `i` = function `i`, each with the finalized address
-/// of its code (`ids[i]`).
-fn own_records(
-    funcs: &[Func],
-    distinct: &[FuncType],
-    module: &JITModule,
-    ids: &[FuncId],
-) -> Vec<FnRecord> {
+/// The type id of each of a compile's own functions, which slot `i` of its table carries for the
+/// table's life.
+fn own_type_ids(funcs: &[Func], distinct: &[FuncType]) -> Vec<u32> {
     funcs
         .iter()
-        .zip(ids)
-        .map(|(f, &id)| {
+        .map(|f| {
             let ty = FuncType {
                 params: f.params.clone(),
                 results: f.results.clone(),
             };
-            FnRecord::new(
-                type_id_of(distinct, &ty),
-                module.get_finalized_function(id) as u64,
-            )
+            type_id_of(distinct, &ty)
         })
+        .collect()
+}
+
+/// The records of a compile's own functions, slot `i` = function `i`: its type id (`own[i]`) and the
+/// finalized address of its code (`ids[i]`).
+fn own_records(own: &[u32], module: &JITModule, ids: &[FuncId]) -> Vec<FnRecord> {
+    own.iter()
+        .zip(ids)
+        .map(|(&ty, &id)| FnRecord::new(ty, module.get_finalized_function(id) as u64))
         .collect()
 }
 
@@ -3950,6 +3951,7 @@ impl CompiledModule {
         // geometry it re-proves window accesses against (memoryless module ⇒ `None`, no window to
         // confine), the fn table's size, and the contract a `call.dyn` of each type reaches.
         let dyn_contracts = type_contracts(&distinct);
+        let own = own_type_ids(&m.funcs, &distinct);
         let guest = validate::Guest {
             window: (mask != 0).then(|| validate::WindowLayout {
                 mask,
@@ -3958,6 +3960,7 @@ impl CompiledModule {
             }),
             table: table_len as u64,
             types: &dyn_contracts,
+            own: &own,
         };
         let base_bytes = define_funcs(
             &mut module,
@@ -3989,7 +3992,7 @@ impl CompiledModule {
                     fuel_addr != 0,
                     threads,                // spawned vCPUs run this code beside the root
                     (table_len as u64) - 1, // the (possibly B2-reserved) table mask, baked per call site
-                    None,                   // top-level: `ref.func N` = module-0 slot N (no remap)
+                    FuncSlots::Own,
                     fi as u32,
                     srcloc_map.as_ref(),
                     var_labels,
@@ -4214,7 +4217,7 @@ impl CompiledModule {
         // padded (to `table_len`, possibly B2-reserved beyond the module), host-owned.
         // `call.dyn` masks the guest index into this; padding/reserved slots trap until
         // `install` fills them.
-        let fn_table = FnTable::new(own_records(&m.funcs, &distinct, &module, &ids), table_len);
+        let fn_table = FnTable::new(own_records(&own, &module, &ids), table_len);
 
         let tramp_code = module.get_finalized_function(tramp);
         // I36 slice 3: resolve the handler trampolines now that code is finalized.
@@ -5683,6 +5686,8 @@ impl CompiledModule {
             }),
             table: self.fn_table_mask + 1,
             types: &dyn_contracts,
+            // A unit's direct calls are linked: its code reads no slot without a type check.
+            own: &[],
         };
         let extra_bytes = define_funcs(
             &mut *module,
@@ -5707,7 +5712,7 @@ impl CompiledModule {
                     self.fuel, // charges the running instance's fuel cell, as the parent's functions do
                     self.threads, // as the parent module's functions
                     self.fn_table_mask, // the parent's table mask, NOT derived from this unit's size
-                    ref_slots.as_deref(), // remap `ref.func N` -> the unit's auto-installed slot
+                    FuncSlots::Unit(ref_slots.as_deref()),
                     0,
                     None, // extra/installed units carry no source-loc map (W5 JIT/DWARF)
                     None, // …nor value-label points (Stage 3a)
@@ -6964,6 +6969,7 @@ fn define_funcs(
                     window: guest.window,
                     table: guest.table,
                     types: guest.types.to_vec(),
+                    own: guest.own.to_vec(),
                     contract: callee(ids[next].as_u32()),
                     sret_results: sret(next),
                 });
@@ -7550,11 +7556,7 @@ block 2 (v7: i32) {
             "the compile defined no functions to check"
         );
         for (i, c) in caps.iter().enumerate() {
-            let guest = validate::Guest {
-                window: c.window,
-                table: c.table,
-                types: &c.types,
-            };
+            let guest = c.guest();
             let frame = validate::Frame {
                 stack_args: c.contract.and_then(|k| k.pops),
                 sret_results: c.sret_results,
@@ -7696,11 +7698,7 @@ block 2 (v7: i32) {
             "the compile defined no functions to check"
         );
         for (i, c) in caps.iter().enumerate() {
-            let guest = validate::Guest {
-                window: c.window,
-                table: c.table,
-                types: &c.types,
-            };
+            let guest = c.guest();
             let frame = validate::Frame {
                 stack_args: c.contract.and_then(|k| k.pops),
                 sret_results: c.sret_results,
@@ -7736,11 +7734,7 @@ block 2 (v7: i32) {
             "the compile defined no functions to check"
         );
         for (i, c) in caps.iter().enumerate() {
-            let guest = validate::Guest {
-                window: c.window,
-                table: c.table,
-                types: &c.types,
-            };
+            let guest = c.guest();
             let frame = validate::Frame {
                 stack_args: c.contract.and_then(|k| k.pops),
                 sret_results: c.sret_results,
@@ -8077,6 +8071,7 @@ fn compile_child_windowed(
     // #2603 — the §14 child's own window, fn table and types, which the validator checks its code
     // against.
     let dyn_contracts = type_contracts(&distinct);
+    let own = own_type_ids(funcs, &distinct);
     let guest = validate::Guest {
         window: (mask != 0).then(|| validate::WindowLayout {
             mask,
@@ -8086,6 +8081,7 @@ fn compile_child_windowed(
         }),
         table: fn_table_mask + 1,
         types: &dyn_contracts,
+        own: &own,
     };
     let base_bytes = define_funcs(
         &mut module,
@@ -8110,7 +8106,7 @@ fn compile_child_windowed(
                 fuel_addr != 0, // counted fuel: the child charges its own budget cell (else un-metered)
                 true,           // a §14 child always runs beside its parent, which may tear it down
                 fn_table_mask,  // the child's own (reserved) table mask
-                None,           // §14 child: own window/table, `ref.func N` = slot N (no remap)
+                FuncSlots::Own, // §14 child: its own window and table
                 0,
                 None, // nested-child units carry no source-loc map (W5 JIT/DWARF)
                 None, // …nor value-label points (Stage 3a)
@@ -8218,7 +8214,7 @@ fn compile_child_windowed(
             None => (None, None),
         };
 
-    let fn_table = FnTable::new(own_records(funcs, &distinct, &module, &ids), table_len);
+    let fn_table = FnTable::new(own_records(&own, &module, &ids), table_len);
 
     let code = module.get_finalized_function(tramp);
     let code_limited = module.get_finalized_function(tramp_limited);
@@ -8895,6 +8891,30 @@ impl Exits {
     }
 }
 
+/// Where the functions a compile defines sit in the table its code dispatches through (§3c).
+#[derive(Clone, Copy)]
+enum FuncSlots<'a> {
+    /// Function `i` is slot `i` for the table's life: a module's or a §14 child's own functions,
+    /// which `install` never takes and `uninstall` refuses. So `ref.func i` names slot `i`, and a
+    /// direct call reads its callee's code word through that slot (#2594).
+    Own,
+    /// A §22 unit's functions (`define_extra`), unit-local indices the table names only where the
+    /// unit was installed: `slots[i]` for function `i` when it names its own functions (DESIGN.md §22
+    /// "unit-own funcref"), else nowhere. A guest can uninstall those slots, so the unit's direct
+    /// calls are linked to their callees.
+    Unit(Option<&'a [u32]>),
+}
+
+impl FuncSlots<'_> {
+    /// The slot that names function `func`: what its funcref is.
+    fn slot(self, func: u32) -> u32 {
+        match self {
+            FuncSlots::Unit(Some(slots)) => *slots.get(func as usize).unwrap_or(&func),
+            _ => func,
+        }
+    }
+}
+
 /// Per-function lowering context shared across blocks.
 struct Lower<'a> {
     /// Holds `mem_base` (the window base) for load/store lowering and call threading.
@@ -8923,15 +8943,9 @@ struct Lower<'a> {
     guard_offset: u64,
     /// The function-table index mask (`next_pow2(nfuncs) - 1`) for `call.dyn`.
     fn_table_mask: u64,
-    /// **Submitted-unit `ref.func` remap** (DESIGN.md §22 "unit-own funcref"). For a top-level
-    /// compile this is `None` and `ref.func N` lowers to the bare index `N` (module-0 slot N). For a
-    /// guest-submitted unit that takes its own functions' addresses, `define_extra` auto-installs the
-    /// unit's functions into reserved `call.dyn` slots and passes the map here (indexed by the
-    /// unit-local function index), so `ref.func N` lowers to `iconst(ref_slots[N])` — the real shared
-    /// table slot — instead of `N`, which would resolve against the *parent's* table. This is what
-    /// lets a unit `cont.new`/`thread.spawn`/`call.dyn` over its OWN function; it changes only
-    /// *which constant* `ref.func` emits, never the masked-dispatch lowering (invariant I2).
-    ref_slots: Option<&'a [u32]>,
+    /// Where this compile's functions sit in the table: what `ref.func` and `thread.spawn` name,
+    /// and how a direct call reaches its callee ([`FuncSlots`]).
+    slots: FuncSlots<'a>,
     /// The functions this code calls, declared before it is built (#2482): direct callees, host
     /// functions, and the D45 fast-path `call.cap` targets (none for a nested child, whose
     /// `call.cap`s go to the coroutine thunk).
@@ -8968,11 +8982,11 @@ struct Lower<'a> {
     /// of a §14 child. On for code that can run beside other vCPUs (a threaded module, every §14
     /// child); a single-vCPU compile emits nothing.
     domain_poll: bool,
-    /// Every function's `FuncId`, so `call`/`return_call` can reference callees.
+    /// Every function's `FuncId`, which a §22 unit's direct calls link to ([`FuncSlots::Unit`]).
     ids: &'a [FuncId],
     /// The functions of this compilation unit, indexed like [`Self::ids`], so a **direct** `call`
-    /// can read its callee's result types to decide the sret ABI (see [`uses_sret`]). `call.dyn`
-    /// uses its own carried type instead.
+    /// can read its callee's signature, and its result types to decide the sret ABI (see
+    /// [`uses_sret`]). `call.dyn` uses its own carried type instead.
     funcs: &'a [Func],
     /// Distinct module signatures, for `call.dyn` type ids.
     distinct: &'a [FuncType],
@@ -9056,7 +9070,7 @@ fn build_clif(
     fuel: bool,
     domain_poll: bool,
     fn_table_mask: u64,
-    ref_slots: Option<&[u32]>,
+    slots: FuncSlots,
     func_idx: u32,
     srclocs: Option<&SrcLocMap>,
     var_labels: Option<&VarLabelMap>,
@@ -9176,7 +9190,7 @@ fn build_clif(
         mapped,
         guard_offset,
         fn_table_mask,
-        ref_slots,
+        slots,
         callees,
         nesting,
         signals,
@@ -10047,8 +10061,7 @@ fn lower_block(
         // `call`/`call.dyn` append 0..N results — handle before the single-value
         // match (which produces exactly one value).
         if let Inst::Call { func, args } = inst {
-            let callee_id = *lower.ids.get(*func as usize).ok_or(JitError::Malformed)?;
-            let callee = lower.callees.import(b.func, callee_id)?;
+            let callee = direct_callee(b, lower, *func)?;
             let results = &lower
                 .funcs
                 .get(*func as usize)
@@ -10059,7 +10072,10 @@ fn lower_block(
             for a in args {
                 cargs.push(get(&vals, *a)?);
             }
-            let call = b.ins().call(callee, &cargs);
+            let call = match callee {
+                Direct::Linked(callee) => b.ins().call(callee, &cargs),
+                Direct::Word(sig, code) => b.ins().call_indirect(sig, code, &cargs),
+            };
             // A trap raised inside the callee leaves the trap cell set and returns zeros; propagate
             // it here so it unwinds immediately (else the caller would run on with bogus results,
             // and a later successful `call.cap` could reset the cell, masking the trap). On the sret
@@ -10488,15 +10504,9 @@ fn lower_block(
             let fnt = b.use_var(lower.fn_table_var);
             let vmctx = b.use_var(lower.vmctx_var);
             // The spawn entry is dispatched through the shared `fn_table` (`os_thread_rt` masks it
-            // into the table like any `call.dyn`). A submitted unit's own functions live in
-            // auto-installed padding slots, not at their module-relative indices — so remap `func`
-            // through `ref_slots` exactly like `ref.func` (DESIGN.md §22 "unit-own funcref"). Without
-            // this a unit's `thread.spawn N` would launch the *parent's* function N. Top-level
-            // compiles have no remap: `func` is module-0 slot N verbatim.
-            let entry = match lower.ref_slots {
-                Some(slots) => *slots.get(*func as usize).unwrap_or(func),
-                None => *func,
-            };
+            // into the table like any `call.dyn`), so it names `func`'s slot, as `ref.func` does:
+            // without that a unit's `thread.spawn N` would launch the *parent's* function N.
+            let entry = lower.slots.slot(*func);
             let func_idx = b.ins().iconst(I32, entry as i64);
             let arg0 = get(&vals, *arg0)?;
             let arg1 = get(&vals, *arg1)?;
@@ -11418,17 +11428,7 @@ fn lower_block(
             }
             // A funcref is just the function index as plain i32 data (§3c) — the same
             // value the interpreter materializes; `call.dyn` masks it into the table.
-            Inst::RefFunc { func } => {
-                // A submitted unit's own-function address must be a real shared-table slot (the unit
-                // is auto-installed there — DESIGN.md §22 "unit-own funcref"), so it resolves to the
-                // unit's function through the ordinary masked dispatch instead of the parent's table.
-                // Top-level compiles have no remap: `ref.func N` is module-0 slot N verbatim.
-                let idx = match lower.ref_slots {
-                    Some(slots) => *slots.get(*func as usize).unwrap_or(func),
-                    None => *func,
-                };
-                b.ins().iconst(I32, idx as i64)
-            }
+            Inst::RefFunc { func } => b.ins().iconst(I32, lower.slots.slot(*func) as i64),
             // §12 standalone fence. Cranelift emits a full (seq-cst) barrier regardless of the
             // requested `order` — the same sound strengthening the atomics use.
             Inst::AtomicFence { .. } => {
@@ -11643,8 +11643,7 @@ fn lower_block(
         }
         Terminator::ReturnCall { func, args } => {
             // Tail call (§3b): replace this frame with the callee, threading the context.
-            let callee_id = *lower.ids.get(*func as usize).ok_or(JitError::Malformed)?;
-            let callee = lower.callees.import(b.func, callee_id)?;
+            let callee = direct_callee(b, lower, *func)?;
             let mut cargs = ctx_args(b, lower);
             // The tail callee shares this function's result type (verifier-enforced), so its sret-ness
             // matches ours: when we return via sret, forward our own return-area pointer.
@@ -11654,7 +11653,10 @@ fn lower_block(
             for a in args {
                 cargs.push(get(&vals, *a)?);
             }
-            b.ins().return_call(callee, &cargs);
+            match callee {
+                Direct::Linked(callee) => b.ins().return_call(callee, &cargs),
+                Direct::Word(sig, code) => b.ins().return_call_indirect(sig, code, &cargs),
+            };
         }
         Terminator::ReturnCallIndirect { ty, idx, args } => {
             // Indirect tail call: table dispatch (§3c) then a guaranteed tail call.
@@ -12198,8 +12200,49 @@ fn indirect_dispatch(b: &mut FunctionBuilder, lower: &Lower, idx: Value, ty: &Fu
     emit_trap(b, lower, TrapKind::IndirectCallType);
     b.switch_to_block(matched);
     b.seal_block(matched);
-    // code pointer at offset 8.
-    b.ins().load(I64, MemFlags::trusted(), record, 8)
+    code_word(b, lower, record)
+}
+
+/// How a direct `call` or `return_call` reaches its callee.
+enum Direct {
+    /// Linked to the callee's code: a §22 unit's call of one of its own functions.
+    Linked(FuncRef),
+    /// An indirect call of the callee's code word, with the callee's signature.
+    Word(SigRef, Value),
+}
+
+/// The callee of a direct call of `func`. A compile's own function is reached through its code word
+/// (#2594): its slot names its record for the table's life ([`FuncSlots::Own`]), so the slot's load
+/// may move and be shared, and the record's word holds its code. Leaves the builder past the word's
+/// check.
+fn direct_callee(b: &mut FunctionBuilder, lower: &Lower, func: u32) -> Result<Direct, JitError> {
+    if let FuncSlots::Unit(_) = lower.slots {
+        let id = *lower.ids.get(func as usize).ok_or(JitError::Malformed)?;
+        return Ok(Direct::Linked(lower.callees.import(b.func, id)?));
+    }
+    let callee = lower.funcs.get(func as usize).ok_or(JitError::Malformed)?;
+    let sig = b.import_signature(sig_from(&callee.params, &callee.results));
+    let slot = i32::try_from(u64::from(func) * 8).map_err(|_| JitError::Malformed)?;
+    let table = b.use_var(lower.fn_table_var);
+    let fixed = MemFlags::trusted().with_readonly().with_can_move();
+    let record = b.ins().load(I64, fixed, table, slot);
+    Ok(Direct::Word(sig, code_word(b, lower, record)))
+}
+
+/// The code word of the record at `record` (offset 8): the address of its function's code, which
+/// every call reads (#2594). Every word is filled before a run starts, so a zero one would be the
+/// host's bug and traps. Leaves the builder past the check.
+fn code_word(b: &mut FunctionBuilder, lower: &Lower, record: Value) -> Value {
+    let code = b.ins().load(I64, MemFlags::trusted(), record, 8);
+    let ready = b.create_block();
+    let empty = b.create_block();
+    b.ins().brif(code, ready, &[], empty, &[]);
+    b.switch_to_block(empty);
+    b.seal_block(empty);
+    emit_trap(b, lower, TrapKind::Unreachable);
+    b.switch_to_block(ready);
+    b.seal_block(ready);
+    code
 }
 
 /// What a call's trap check follows (#2488), which decides the word it reads.
