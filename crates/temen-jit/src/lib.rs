@@ -7396,14 +7396,7 @@ mod callees_tests {
         std::sync::Mutex::new(Vec::new());
 
     /// The fast path of `call.cap 3 8 (i64) -> (i64)`: its argument plus one.
-    unsafe extern "C" fn plus_one(
-        _: *mut c_void,
-        _: *mut u8,
-        _: u64,
-        _: i32,
-        _: *mut i64,
-        a: i64,
-    ) -> i64 {
+    unsafe extern "C" fn plus_one(_: &VmCtx, _: i32, a: i64) -> i64 {
         a + 1
     }
 
