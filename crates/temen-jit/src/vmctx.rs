@@ -15,14 +15,22 @@
 //! emitted at all (a compile armed with no kill-path, fuel budget or signal source emits no check,
 //! so its code is byte-identical to before). The host functions the code calls (its thunks) it
 //! names by symbol, which its link binds to their addresses in the process (`HostFn`, temen#2452).
-//! The §12 thread `Domain` lives here too: the `thread.*`, futex and blocking-resume sites load it,
-//! and so does the §14 `Nursery` the `Instantiator` sites spawn through (temen#2168), so every
-//! spawn of a child runs one compile of its code, and so does the `setjmp` table (temen#2389). The
-//! fiber runtime is found through a thread-local each entry sets. So the code names no per-instance
-//! object, and each instance stands up runtimes of its own (`CompiledModule::instance`): the code
-//! is **instance-independent** — the property a fork twin sharing its parent's code, and a compile
-//! cache, rely on (#1825). Only a §22 unit's program, defined into a module after its compile, is
-//! more than the compile; such a module is never shared.
+//! The §12 thread `Domain` lives here too, which the `thread.*`, futex and blocking-resume thunks
+//! act in, and so does the §14 `Nursery` the `Instantiator` thunks spawn through (temen#2168), so
+//! every spawn of a child runs one compile of its code, and so does the `setjmp` table (temen#2389).
+//! The fiber runtime is found through a thread-local each entry sets. So the code names no
+//! per-instance object, and each instance stands up runtimes of its own (`CompiledModule::instance`):
+//! the code is **instance-independent** — the property a fork twin sharing its parent's code, and a
+//! compile cache, rely on (#1825). Only a §22 unit's program, defined into a module after its
+//! compile, is more than the compile; such a module is never shared.
+//!
+//! **A host function takes from the code only what the code alone can supply (#2534).** It is
+//! handed the context, which the machine-code validator checks is this one, and reads here every
+//! runtime object it acts on and the run's [`Window`] (the window base and reservation it confines
+//! guest offsets to, and the function table), which the runtime records when it makes the context.
+//! A backend bug that passed the wrong register could otherwise move the window a host function
+//! trusts. Compiled code never reads the runtime objects itself, and the validator rejects a load
+//! of one.
 //!
 //! **The trust argument is the entry.** Code that runs with the wrong vmctx dispatches its `call.cap`s
 //! into the wrong powerbox — authority confusion, not a crash. So every entry into compiled code takes
@@ -277,9 +285,6 @@ pub(crate) const EPOCH: i32 = core::mem::offset_of!(VmCtx, epoch) as i32;
 pub(crate) const FUEL: i32 = core::mem::offset_of!(VmCtx, fuel) as i32;
 pub(crate) const SIG_ARMED: i32 = core::mem::offset_of!(VmCtx, sig_armed) as i32;
 pub(crate) const SIG_CTX: i32 = core::mem::offset_of!(VmCtx, sig_ctx) as i32;
-pub(crate) const SCHED: i32 = core::mem::offset_of!(VmCtx, sched) as i32;
-pub(crate) const NURSERY: i32 = core::mem::offset_of!(VmCtx, nursery) as i32;
-pub(crate) const SETJMP: i32 = core::mem::offset_of!(VmCtx, setjmp) as i32;
 pub(crate) const PAGES: i32 = core::mem::offset_of!(VmCtx, pages) as i32;
 
 // The stop word must be the first field: the check after each call dereferences the vmctx pointer

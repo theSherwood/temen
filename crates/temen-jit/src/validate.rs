@@ -112,7 +112,8 @@ pub(crate) enum ArgTag {
     /// What a call [`Ret::JmpBuf`] returned: the host `jmp_buf` an inline `_setjmp` saves into.
     JmpBuf,
     /// The context's fuel cell (`Cell::Fuel`, read from `vmctx`), which the refill and `remaining`
-    /// functions read and write.
+    /// functions read and write. Only the x86-64 validator's contracts for them name it.
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
     FuelCell,
     /// This function's frame pointer, the address of its saved `rbp` just below the return address,
     /// which the `-g` trap capture walks the frame chain from.
@@ -2163,7 +2164,9 @@ pub(crate) mod x86 {
     /// or an opaque pointer it only hands to host functions. `None` for any other offset.
     fn vmctx_field(disp: i64) -> Option<(bool, Fact)> {
         use crate::vmctx as v;
-        let opaque = [v::CAP_CTX, v::SIG_CTX, v::SCHED, v::NURSERY, v::SETJMP];
+        // #2534 — the scheduler, the nursery and the setjmp table are no longer among them: the host
+        // functions read those from the context they are handed, so code has no reason to load one.
+        let opaque = [v::CAP_CTX, v::SIG_CTX];
         Some(match disp {
             0 => (true, Fact::Unknown),
             d if d == i64::from(v::FUEL) => (false, Fact::Cell(Cell::Fuel)),
