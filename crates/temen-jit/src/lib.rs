@@ -6407,7 +6407,7 @@ impl HostFn {
     /// signal thunks) still take window values from the code; their ABI moves to the context in a
     /// later slice.
     fn arg_contract(self) -> &'static [validate::ArgTag] {
-        use validate::ArgTag::{Any, StackSlot, Vmctx, WindowBase};
+        use validate::ArgTag::{Any, FramePointer, JmpBuf, StackSlot, Vmctx, WindowBase};
         // An 8-byte status/exit word the host writes back through a resume's or join's `status_ptr`.
         const STATUS: validate::ArgTag = StackSlot {
             len: 8,
@@ -6442,6 +6442,11 @@ impl HostFn {
             | HostFn::ChildGrant
             | HostFn::SetjmpSlot
             | HostFn::Longjmp => &[Vmctx],
+            // libc `_setjmp` saves the frame's registers into its argument, so it must be the host
+            // `jmp_buf` `SetjmpSlot` returned (`Self::ret`), never a value the code computed.
+            HostFn::Setjmp => &[JmpBuf],
+            // The trap capture walks the frame chain from its argument: this frame's pointer.
+            HostFn::TrapCapture => &[FramePointer],
             // ctx, out — the host writes a 24-byte `[fref, signum, sp]` record into the out slot.
             HostFn::SigTake => &[
                 Any,
@@ -6460,6 +6465,15 @@ impl HostFn {
                 },
             ],
             _ => &[],
+        }
+    }
+
+    /// #2534 — what this host function returns, as far as the validator models it: `SetjmpSlot`'s
+    /// host `jmp_buf`, which only `Setjmp` takes; every other result is a guest value.
+    fn ret(self) -> validate::Ret {
+        match self {
+            HostFn::SetjmpSlot => validate::Ret::JmpBuf,
+            _ => validate::Ret::Unknown,
         }
     }
 
@@ -7107,6 +7121,7 @@ fn callee_contracts(module: &JITModule) -> Vec<Option<validate::Contract>> {
             if let (Some(c), Some(name)) = (c.as_mut(), decl.name.as_deref()) {
                 c.args = host_args(name);
                 c.safepoint = host_safepoint(name);
+                c.ret = host_ret(name);
             }
             out[i] = c;
         }
@@ -7138,6 +7153,15 @@ fn host_safepoint(name: &str) -> bool {
         .iter()
         .find(|h| h.symbol() == name)
         .is_some_and(|h| h.is_safepoint())
+}
+
+/// What a call to the host function a symbol names returns, for the validator (`HostFn::ret`).
+/// A guest function's result, and an unknown symbol's, is unknown.
+fn host_ret(name: &str) -> validate::Ret {
+    HostFn::ALL
+        .iter()
+        .find(|h| h.symbol() == name)
+        .map_or(validate::Ret::Unknown, |h| h.ret())
 }
 
 #[cfg(test)]
