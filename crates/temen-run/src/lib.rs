@@ -2824,6 +2824,7 @@ pub fn production_grant_hooks(ctx: CapCtx) -> temen_jit::GrantChildHooks {
             budget_mem_give
         },
         child_ended,
+        child_end_signal,
         lane_give: if locked { lane_give_locked } else { lane_give },
         premap_admit: if locked {
             premap_admit_locked
@@ -3922,17 +3923,30 @@ pub unsafe extern "C" fn budget_mem_give(
 }
 
 /// #1936 — [`temen_jit::ChildEnded`]: a detached child's domain ended, at its root's end. What it
-/// holds goes back ([`Host::release_memory`]) and its end post is signalled, its waiters woken in its
-/// run, before the child leaves the run's live count, so none of them reads the run as deadlocked.
+/// holds goes back ([`Host::release_memory`]), and its end post is answered, with the run it wakes
+/// waiters in, for [`child_end_signal`] once the end is published (#2800).
 ///
 /// # Safety
 /// `child` is a live [`temen_jit::GrantChild::ctx`].
-pub unsafe extern "C" fn child_ended(child: *mut c_void) {
+pub unsafe extern "C" fn child_ended(child: *mut c_void) -> *mut c_void {
     let child = &*(child as *const Mutex<Host>);
     let mut g = child.lock().unwrap_or_else(|e| e.into_inner());
-    let end = g.release_memory();
-    if let Some((backing, off)) = end.as_ref().and_then(|w| w.os_key()) {
-        temen_jit::notify_region_in(g.park_hub(), backing, off);
+    match g.release_memory() {
+        Some(end) => Box::into_raw(Box::new((end, g.park_hub()))) as *mut c_void,
+        None => core::ptr::null_mut(),
+    }
+}
+
+/// #2800 — [`temen_jit::ChildEndSignal`]: signal the end post [`child_ended`] answered, and wake its
+/// waiters in its run.
+///
+/// # Safety
+/// `post` is what [`child_ended`] answered, not null, and not yet signalled; the run whose park hub
+/// it names is live (it outlives every task).
+pub unsafe extern "C" fn child_end_signal(post: *mut c_void) {
+    let (end, hub) = *Box::from_raw(post as *mut (temen_interp::EndPost, usize));
+    if let Some((backing, off)) = end.signal().os_key() {
+        temen_jit::notify_region_in(hub, backing, off);
     }
 }
 

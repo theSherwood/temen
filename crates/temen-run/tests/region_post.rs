@@ -405,6 +405,88 @@ fn a_child_out_of_fuel_signals_its_end_post() {
     agree_everywhere("a child out of fuel", &m, &ok(1));
 }
 
+/// Where a parent keeps its child's handle and its `Instantiator` for a block past the wait.
+const KEPT: u64 = 18432;
+
+/// Blocks `first` and `first + 1`: [`wait_for`]'s loop, but spinning on the bits, never waiting:
+/// a waiter that takes the bits as they land.
+fn spin_for(p: &str, want: u64, first: u32, done: u32) -> String {
+    let take = first + 1;
+    format!(
+        "block {first} ({p}acc: i64) {{
+  {p}want = i64.const {want}
+  {p}got = i64.and {p}acc {p}want
+  {p}all = i64.eq {p}got {p}want
+  br_if {p}all {done}({p}acc) {take}({p}acc)
+}}
+block {take} ({p}acc1: i64) {{
+  {p}ba = i64.const {MAP}
+  {p}z = i64.const 0
+  {p}bits = i64.atomic.rmw.xchg {p}ba {p}z
+  {p}acc2 = i64.or {p}acc1 {p}bits
+  br {first}({p}acc2)
+}}
+"
+    )
+}
+
+/// [`ends`], then a poll of the child (Instantiator op 9) once its end post's bits are taken, by a
+/// wait ([`wait_for`]) or a spin ([`spin_for`]): what the poll answers.
+fn polled_at_its_end(child: &str, then: &str, spin: bool) -> Module {
+    let mut body = mint_and_map();
+    body.push_str(&post("p", 0, 1, "vp"));
+    body.push_str(&spawn("s", 0, "c", (END_NAME, 3), "vp", "vc"));
+    body.push_str(&format!(
+        "  ka = i64.const {KEPT}\n  i32.store ka vc\n  kb = i64.const {}\n  i32.store kb vinst\n",
+        KEPT + 4
+    ));
+    body.push_str(then);
+    body.push_str("  vacc = i64.const 0\n  br 1(vacc)\n");
+    let (waits, done) = match spin {
+        true => (spin_for("w", 1, 1, 3), 3),
+        false => (wait_for("w", 1, 1, 4), 4),
+    };
+    let blocks = format!(
+        "{waits}block {done} (vgot: i64) {{
+  ya = i64.const {KEPT}
+  yc = i32.load ya
+  yb = i64.const {}
+  yi = i32.load yb
+  ys = call.cap 6 9 (i32) -> (i32) yi (yc)
+  yr = i64.extend_i32_s ys
+  return yr
+}}
+",
+        KEPT + 4
+    );
+    module(&parent(&body, &blocks, &[("c", child)]))
+}
+
+/// A child has ended by the time its end post is signalled (#2800): a poll then answers its end (1
+/// returned, 2 trapped or killed), never 0, whether the parent slept until the post woke it or took
+/// the bits as they landed. A waiter that takes the post's bits and polls never reads the child as
+/// running, so it never waits again for an end that has come.
+#[test]
+fn a_child_has_ended_once_its_end_post_is_signalled() {
+    let kill = "  vk = call.cap 6 12 (i32) -> (i32) vinst (vc)\n";
+    for spin in [false, true] {
+        let returns = polled_at_its_end(CHILD_RETURNS, "", spin);
+        agree_everywhere(
+            &format!("a child that returns (spin {spin})"),
+            &returns,
+            &ok(1),
+        );
+        let traps = polled_at_its_end(CHILD_TRAPS, "", spin);
+        agree_everywhere(&format!("a child that traps (spin {spin})"), &traps, &ok(2));
+        let killed = polled_at_its_end(CHILD_SPINS, kill, spin);
+        agree_everywhere(
+            &format!("a child its parent kills (spin {spin})"),
+            &killed,
+            &ok(2),
+        );
+    }
+}
+
 /// The child never holds its end post: its name binds nothing in the child's directory.
 #[test]
 fn a_child_cannot_see_its_end_post() {
