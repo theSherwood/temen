@@ -231,7 +231,8 @@ impl Reloc {
 
 /// The validator's view of a function's relocations: each one's patched bytes, and the contract of
 /// what it names — `callee(id)` for a function the module declares, a libcall's from its signature
-/// under `cc`, and `None` for anything else (data, a linker symbol, an offset in a function).
+/// under `cc` (one that takes guest pointers has none, [`libcall_contract`]), and `None` for anything
+/// else (data, a linker symbol, an offset in a function).
 pub(crate) fn relocs(
     relocs: &[cranelift_module::ModuleReloc],
     callee: &dyn Fn(u32) -> Option<Contract>,
@@ -249,11 +250,26 @@ pub(crate) fn relocs(
                     namespace: 0,
                     index,
                 } => callee(*index),
-                T::LibCall(lc) => contract(&lc.signature(cc, cranelift_codegen::ir::types::I64)),
+                T::LibCall(lc) => libcall_contract(*lc, cc),
                 _ => None,
             },
         })
         .collect()
+}
+
+/// A libcall's contract. The C runtime's memory functions (`memcpy`, `memmove`, `memset`,
+/// `memcmp`) take raw pointers no tag can prove are the window's, so they have none, and a call to
+/// one is a finding: compiled code reaches guest memory in bulk only through the host helpers,
+/// which confine the spans themselves (#2534). The rest take values only.
+fn libcall_contract(
+    lc: cranelift_codegen::ir::LibCall,
+    cc: cranelift_codegen::isa::CallConv,
+) -> Option<Contract> {
+    use cranelift_codegen::ir::LibCall as L;
+    match lc {
+        L::Memcpy | L::Memmove | L::Memset | L::Memcmp => None,
+        _ => contract(&lc.signature(cc, cranelift_codegen::ir::types::I64)),
+    }
 }
 
 /// What temen knows of a guest function's module, which its machine code is checked against: the

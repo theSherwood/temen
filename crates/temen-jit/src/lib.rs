@@ -4833,6 +4833,7 @@ impl CompiledModule {
             } else {
                 0
             },
+            page_miss: self.page.miss,
             fn_table: self.fn_table.base() as *const u8,
         }
     }
@@ -6295,6 +6296,10 @@ enum HostFn {
     ChildOffer,
     ChildGrant,
     SetjmpSlot,
+    /// #2534 — `mem.copy`/`mem.move` and `mem.fill` (D62): the host confines, pages, probes and
+    /// writes the spans in the window the context names (`mem::mem_copy`, `mem::mem_fill`).
+    MemCopy,
+    MemFill,
     /// libc `_setjmp`, called inline in the guest frame (LLVM.md §"JIT `longjmp`").
     Setjmp,
     /// `rt_longjmp`: looks the host `jmp_buf` up and `_longjmp`s to it (#2534).
@@ -6314,7 +6319,7 @@ enum HostFn {
 
 impl HostFn {
     /// Every host function, for [`new_jit_module`] to bind.
-    const ALL: [HostFn; 29] = [
+    const ALL: [HostFn; 31] = [
         HostFn::CapThunk,
         HostFn::SigTake,
         HostFn::SigReturn,
@@ -6335,6 +6340,8 @@ impl HostFn {
         HostFn::ChildOffer,
         HostFn::ChildGrant,
         HostFn::SetjmpSlot,
+        HostFn::MemCopy,
+        HostFn::MemFill,
         HostFn::Setjmp,
         HostFn::Longjmp,
         HostFn::VcpuTlsGet,
@@ -6384,6 +6391,8 @@ impl HostFn {
             HostFn::ChildOffer => "temen.child_offer",
             HostFn::ChildGrant => "temen.child_grant",
             HostFn::SetjmpSlot => "temen.setjmp_slot",
+            HostFn::MemCopy => "temen.mem_copy",
+            HostFn::MemFill => "temen.mem_fill",
             HostFn::Setjmp => "temen.setjmp",
             HostFn::Longjmp => "temen.longjmp",
             HostFn::VcpuTlsGet => "temen.vcpu_tls_get",
@@ -6441,7 +6450,9 @@ impl HostFn {
             | HostFn::ChildOffer
             | HostFn::ChildGrant
             | HostFn::SetjmpSlot
-            | HostFn::Longjmp => &[Vmctx],
+            | HostFn::Longjmp
+            | HostFn::MemCopy
+            | HostFn::MemFill => &[Vmctx],
             // libc `_setjmp` saves the frame's registers into its argument, so it must be the host
             // `jmp_buf` `SetjmpSlot` returned (`Self::ret`), never a value the code computed.
             HostFn::Setjmp => &[JmpBuf],
@@ -6528,6 +6539,8 @@ impl HostFn {
             ChildOffer | ChildGrant => (&[I64, I32, I32, I64], &[I32]),
             // (vmctx, buf) -> jmp_buf
             SetjmpSlot => (&[I64, I64], &[I64]),
+            // (vmctx, dst, src, len) / (vmctx, dst, byte, len)
+            MemCopy | MemFill => (&[I64, I64, I64, I64], &[]),
             // (jmp_buf) -> 0, or the value a `longjmp` to it passes
             Setjmp => (&[I64], &[I32]),
             // (vmctx, buf, value); returns only when `buf` names no `setjmp`, having raised
@@ -6589,6 +6602,8 @@ impl HostFn {
             HostFn::ChildGrant => instantiator_rt::child_grant as *const (),
             #[cfg(setjmp_rt)]
             HostFn::SetjmpSlot => setjmp_rt::rt_setjmp_slot as *const (),
+            HostFn::MemCopy => mem::mem_copy as *const (),
+            HostFn::MemFill => mem::mem_fill as *const (),
             #[cfg(setjmp_rt)]
             HostFn::Setjmp => setjmp_rt::setjmp_addr(),
             #[cfg(setjmp_rt)]
@@ -7425,6 +7440,8 @@ block 0 (vh: i32, vi: i32, vx: i64) {
   vtls = vcpu.tls.get
   vcpu.tls.set vtls
   vsb = durable.shadow_base
+  mem.copy vbuf vlo vx
+  mem.fill vbuf vc vx
   vkid = call.cap 6 17 (i64) -> (i32) vi (vx)
   vst, vval = call.cap 6 1 (i32) -> (i64, i64) vi (vkid)
   vp = call.cap 6 9 (i32) -> (i32) vi (vkid)
@@ -7807,12 +7824,10 @@ block 2 (v7: i32) {
         }
     }
 
-    /// #2788 — a bulk op of a **dynamic** length is machine-code-validator-clean. [`confine_span`]
-    /// range-checks each span with one `trapnz` and clamps its base; the I21 probe ([`probe_span`])
-    /// then touches the span's first and last byte, each confined like any guest access
-    /// ([`mask_addr`]). An unconfined `phys + (len − 1)` adds a guest length the validator cannot
-    /// bound (the range check is a relational `trapnz` it does not track), and is a load in the bulk
-    /// path not confined under a misspeculated `trapnz`.
+    /// #2788, #2534 — a bulk op of a **dynamic** length is machine-code-validator-clean: the code
+    /// hands the host helper (`mem::mem_copy`, `mem::mem_fill`) the context and the guest offsets,
+    /// and the helper confines the spans. No pointer-taking libcall (`memcpy`, …) is called, whose
+    /// arguments the validator could not check.
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn validator_is_clean_on_a_dynamic_length_bulk_op() {
@@ -8113,7 +8128,7 @@ fn compile_child_windowed(
     // #2164 — a demand-paged child checks its instance's access table before each access.
     let page = match (addrs.pages.is_null(), page_miss) {
         (true, _) => PageEnv::NONE,
-        (false, Some(_)) => PageEnv::paged(mapped),
+        (false, Some(miss)) => PageEnv::paged(mapped, miss),
         (false, None) => {
             return Err(JitError::Unsupported(
                 "a demand-paged child needs a page-miss thunk",
@@ -8890,6 +8905,8 @@ struct PageEnv {
     paged: bool,
     shift: u8,
     pages: u64,
+    /// The miss thunk, which the host's bulk-op helpers call too (#2534).
+    miss: Option<PageMissThunk>,
 }
 
 impl PageEnv {
@@ -8897,15 +8914,17 @@ impl PageEnv {
         paged: false,
         shift: 0,
         pages: 0,
+        miss: None,
     };
 
-    /// The shape for a child whose declared window is `mapped` bytes.
-    fn paged(mapped: u64) -> PageEnv {
+    /// The shape for a child whose declared window is `mapped` bytes, whose misses `miss` serves.
+    fn paged(mapped: u64, miss: PageMissThunk) -> PageEnv {
         let page = mem::page_size() as u64;
         PageEnv {
             paged: true,
             shift: page.trailing_zeros() as u8,
             pages: mapped.div_ceil(page),
+            miss: Some(miss),
         }
     }
 
@@ -11326,11 +11345,13 @@ fn lower_block(
                 lower_store(b, *op, phys, get(&vals, *value)?);
                 continue; // store produces no value
             }
-            // Bulk-memory ops (D62). Each span is confined once (single range check + base clamp),
-            // then the copy/fill is the platform libcall — `memory.copy`-class lowering, not a
-            // per-byte confined loop. `MemCopy`/`MemMove` differ only in the libcall (overlap safety).
-            // #2177: a short copy of one of this block's constant lengths is loads and stores instead
-            // ([`copy_inline`]); a zero-length one is inert, as the libcall path makes it.
+            // Bulk-memory ops (D62): the host helper confines both spans to the context's window,
+            // checks a demand-paged child's pages, probes each span's first and last byte (I21) and
+            // copies or fills — the interpreters' order, through the one span-OOB reference, with
+            // no window pointer from the code (#2534). `MemCopy`/`MemMove` are one helper: both are
+            // overlap-safe, as the interpreters make them. #2177: a short copy of one of this
+            // block's constant lengths is loads and stores instead ([`copy_inline`]); a zero-length
+            // one is inert, as the helper makes it.
             Inst::MemCopy { dst, src, len } | Inst::MemMove { dst, src, len } => {
                 let short = checked.consts.get(&get(&vals, *len)?).copied();
                 if let Some(n) =
@@ -11341,32 +11362,24 @@ fn lower_block(
                     }
                     continue;
                 }
-                let n = get(&vals, *len)?;
-                let (dv, sv) = (get(&vals, *dst)?, get(&vals, *src)?);
-                let dphys = confine_span(b, lower, dv, n);
-                let sphys = confine_span(b, lower, sv, n);
-                // #2164: the source's pages, then the destination's, as the interpreters check them.
-                emit_span_page_check(b, lower, sphys, n, 0);
-                emit_span_page_check(b, lower, dphys, n, PAGE_MISS_WRITE);
-                // I21: fault an overrun before the libcall (no partial write; catches `dst==src`).
-                probe_span(b, lower, dv, n);
-                probe_span(b, lower, sv, n);
-                if matches!(inst, Inst::MemCopy { .. }) {
-                    b.call_memcpy(lower.callees.frontend, dphys, sphys, n);
-                } else {
-                    b.call_memmove(lower.callees.frontend, dphys, sphys, n);
-                }
+                let vmctx = b.use_var(lower.vmctx_var);
+                let (dv, sv, n) = (get(&vals, *dst)?, get(&vals, *src)?, get(&vals, *len)?);
+                call_host(lower.callees, b, HostFn::MemCopy, &[vmctx, dv, sv, n])?;
+                emit_trap_propagate(b, lower, Callee::Host);
                 continue;
             }
             Inst::MemFill { dst, val, len } => {
-                let n = get(&vals, *len)?;
-                let dv = get(&vals, *dst)?;
-                let dphys = confine_span(b, lower, dv, n);
-                emit_span_page_check(b, lower, dphys, n, PAGE_MISS_WRITE); // #2164
-                probe_span(b, lower, dv, n);
-                // `call_memset` uextends the fill byte to i32, so hand it the low byte (i8).
-                let v8 = b.ins().ireduce(I8, get(&vals, *val)?);
-                b.call_memset(lower.callees.frontend, dphys, v8, n);
+                let vmctx = b.use_var(lower.vmctx_var);
+                let (dv, n) = (get(&vals, *dst)?, get(&vals, *len)?);
+                // The helper keeps the low byte; hand it the value as one i64 argument.
+                let v = get(&vals, *val)?;
+                let v = if b.func.dfg.value_type(v) == I64 {
+                    v
+                } else {
+                    b.ins().uextend(I64, v)
+                };
+                call_host(lower.callees, b, HostFn::MemFill, &[vmctx, dv, v, n])?;
+                emit_trap_propagate(b, lower, Callee::Host);
                 continue;
             }
             // §12 atomics. Confine like a normal access, then a natural-alignment guard (a misaligned
@@ -12978,27 +12991,6 @@ fn emit_page_check(b: &mut FunctionBuilder, lower: &Lower, phys: Value, len: u32
     b.seal_block(done);
 }
 
-/// #2164 — a demand-paged child's page check of a bulk op's span `[phys, phys + n)`: the miss thunk
-/// walks every page of a non-empty one before the op touches any, as the interpreters check a span
-/// whole before they copy (a span may cover many pages, so no inline test). An unpaged compile emits
-/// nothing.
-fn emit_span_page_check(b: &mut FunctionBuilder, lower: &Lower, phys: Value, n: Value, flags: u64) {
-    let Some((_, thunk, _)) = lower.page else {
-        return;
-    };
-    let base = b.use_var(lower.mem_var);
-    let off = b.ins().isub(phys, base);
-    let walk = b.create_block();
-    let done = b.create_block();
-    b.ins().brif(n, walk, &[], done, &[]);
-    b.switch_to_block(walk);
-    b.seal_block(walk);
-    emit_page_miss(b, lower, thunk, base, off, n, flags);
-    b.ins().jump(done, &[]);
-    b.switch_to_block(done);
-    b.seal_block(done);
-}
-
 /// #2164 — whether a demand-paged instance's access table `table` admits a `len`-byte access at
 /// window offset `off` that needs `need` ([`temen_ir::PAGE_READ`] or [`temen_ir::PAGE_WRITE`]): every
 /// page of it among the declared window's `pages` has the bit. Past the declared window the hardware
@@ -13040,66 +13032,6 @@ fn emit_page_miss(
     emit_trap_propagate(b, lower, Callee::Host);
 }
 
-/// **Bulk-span backed-extent probe (ISSUES.md I21).** Fault a bulk span that overruns the
-/// currently-*backed* region **before** the libcall runs. [`confine_span`] only bounds the span
-/// against `reserved`, delegating the `[mapped, reserved)` guard hole to the libcall's own accesses
-/// — but that leaks in two ways the interpreter (`Mem::check_prot_span`, which validates every page
-/// up front) does not: (1) libc `memcpy`/`memmove` **short-circuit `dst == src`**, so a self-copy
-/// overrunning `mapped` never faults; (2) the libcall writes a prefix before hitting the guard, so a
-/// faulting run diverges from the interpreter's fault-before-any-write. Both are interp↔JIT
-/// divergences (§3 parity), not escapes (every byte stays in `[0, reserved)`).
-///
-/// The fix is a guarded 1-byte read of the span's **first** byte (window offset `ptr`) and **last**
-/// byte (`ptr + len − 1`), each an ordinary guest access confined by [`mask_addr`] — the same bytes
-/// the span's confined base addresses, since the range check already bounds both. Each faults
-/// [`TrapKind::MemoryFault`] on a `PROT_NONE` guard page exactly where the interpreter faults —
-/// **consulting the live page tables**, so it honors guest `grow` (unlike the compile-time
-/// `Lower::mapped`, which would over-fault a grown window). The last-byte read catches an overrun
-/// past the backed extent; the first-byte read catches a span starting inside the #1094 NULL guard
-/// `[0, POWERBOX_NULL_GUARD)` — which the last-byte read alone misses when the span *ends* in backed
-/// memory (e.g. a whole-window self-copy from 0: macOS libc `memmove` short-circuits `dst == src`,
-/// so nothing else would ever touch the guard, an interp↔JIT divergence the spec-mem differential
-/// caught on macOS while glibc happened to fault). For the contiguous unmapped-guard + backed-prefix
-/// model (the production window + the spec window), first-and-last-in-bounds ⟺ whole-span-in-bounds.
-/// Emitted per span (`dst` and `src`) before the copy, so no partial write survives. `len == 0`
-/// skips the probe entirely (a branch on `len != 0`), keeping a zero-length op inert even at a wild
-/// pointer (D62).
-///
-/// Residual (documented, not silently dropped): a bulk op whose span straddles a guest-created
-/// **interior** hole (`unmap`) or a read-only page mid-span is not caught by a last-byte read probe
-/// — the same boundary the interpreter's contiguous fast path assumes away. Left to a per-page probe
-/// loop if a real workload needs bulk ops over a deliberately-punched window.
-fn probe_span(b: &mut FunctionBuilder, lower: &Lower, ptr: Value, len: Value) {
-    let do_probe = b.create_block();
-    let after = b.create_block();
-    let nonzero = b.ins().icmp_imm(IntCC::NotEqual, len, 0);
-    b.ins().brif(nonzero, do_probe, &[], after, &[]);
-
-    b.switch_to_block(do_probe);
-    b.seal_block(do_probe);
-    // May-trap loads: each faults `MemoryFault` on a guard page — the first byte on the #1094 NULL
-    // guard, the last byte on an overrun past the backed region. The results are unused, but the
-    // loads are preserved because they can trap (side-effecting).
-    //
-    // Each byte is an ordinary 1-byte guest access, confined by [`mask_addr`]'s bounds test and
-    // branchless `select_spectre_guard` redirect like every other (D63). Architecturally a no-op —
-    // [`confine_span`]'s range check proved `ptr + len − 1 < reserved`, so both bytes are already in
-    // `[0, reserved)` — but a misspeculated `trapnz` then sends an out-of-bounds probe to the guard
-    // rather than past the window (an unconfined `phys + (len − 1)` adds a guest length), and it is a
-    // confinement the machine-code validator proves (#2788).
-    let one = b.ins().iconst(I64, 1);
-    let len_minus_one = b.ins().isub(len, one);
-    let last = b.ins().iadd(ptr, len_minus_one);
-    for off in [ptr, last] {
-        let at = mask_addr(b, lower, off, 0, false, 1);
-        b.ins().load(I8, mem_flags(), at, 0);
-    }
-    b.ins().jump(after, &[]);
-
-    b.switch_to_block(after);
-    b.seal_block(after);
-}
-
 /// #2177 — the most bytes a constant-length `mem.copy`/`mem.move` copies inline ([`copy_inline`]).
 const INLINE_COPY_MAX: i64 = 64;
 
@@ -13109,8 +13041,8 @@ const INLINE_COPY_MAX: i64 = 64;
 /// store of that width is ([`CheckedBases`], or no check where the bound proof elides one). Every
 /// source byte is loaded, and the destination's first and last bytes are probed, before the first
 /// store. So overlapping spans copy as `mem.move` does, and a span that faults faults before anything
-/// is written (I21, as [`probe_span`] keeps the libcall path): `n` is under a page, so each span
-/// touches at most two pages, and those reads reach both.
+/// is written (I21, as the host helper `mem::mem_copy` probes its spans): `n` is under a page, so
+/// each span touches at most two pages, and those reads reach both.
 #[allow(clippy::too_many_arguments)]
 fn copy_inline(
     b: &mut FunctionBuilder,
@@ -13154,47 +13086,6 @@ fn copy_inline(
         b.ins().store(mem_flags(), word, d, off);
     }
     Ok(())
-}
-
-/// Confine a **dynamic-length span** `[ptr, ptr+len)` to the reserved domain `[0, reserved)` and
-/// return its physical base `mem_base + (ptr & mask)` — the bulk-memory hinge (D62). Where
-/// [`mask_addr`] confines one fixed-width access, this confines a whole span with a *single* range
-/// check: it traps [`TrapKind::MemoryFault`] (native `trapnz`) when `len != 0 && (len > reserved ||
-/// ptr > reserved − len)`, i.e. any byte of the span would fall outside `[0, reserved)`. The two
-/// sub-checks avoid overflow: `len > reserved` catches an oversized (or negative-as-u64) length before
-/// the `reserved − len` subtraction can wrap. `len == 0` is a no-op span that never faults (matching
-/// the interpreter and C `memcpy(_,_,0)`), so a 0-length op on a wild pointer is inert.
-///
-/// This predicate is the overflow-avoiding lowering of the **one span-OOB reference**,
-/// `temen_mask::Window::span_checked` (the arithmetic the interpreter calls and the `mask` fuzz target
-/// asserts against a `u128` oracle). Any change to that reference must be mirrored in the CLIF here —
-/// the fuzz oracle pins the reference, and the `diff.rs` escape oracle pins this emission to it.
-///
-/// The returned base is then Spectre-clamped (`& mask`): architecturally a no-op (the check proved
-/// `ptr < reserved`), but on a *mispredicted* path it pins the copy's base inside `[0, reserved)`.
-/// This is the pre-D63 AND clamp, kept for the base the libcall is handed (INVARIANTS #2 records it);
-/// the guest-code loads of a span — [`probe_span`]'s first and last byte — confine through
-/// [`mask_addr`] like every other access. Like `mask_addr`, this matches Wasmtime's bounds-checked
-/// `memory.copy` posture ("as secure as wasm", DESIGN.md §1a): the length is checked, the base is
-/// confined, and the bulk copy itself is a libcall the CPU does not speculate byte-by-byte — so no
-/// per-byte clamp is needed. Callers pass the **same** `len` to the copy, so both spans (dst and src)
-/// are checked.
-fn confine_span(b: &mut FunctionBuilder, lower: &Lower, ptr: Value, len: Value) -> Value {
-    let reserved = lower.mask.wrapping_add(1);
-    let resv = b.ins().iconst(I64, reserved as i64);
-    let oob_len = b.ins().icmp(IntCC::UnsignedGreaterThan, len, resv);
-    let rem = b.ins().isub(resv, len); // reserved − len; meaningful only when !oob_len
-    let oob_ptr = b.ins().icmp(IntCC::UnsignedGreaterThan, ptr, rem);
-    let oob_span = b.ins().bor(oob_len, oob_ptr);
-    let zero = b.ins().iconst(I64, 0);
-    let nonzero = b.ins().icmp(IntCC::NotEqual, len, zero);
-    let oob = b.ins().band(nonzero, oob_span);
-    b.ins()
-        .trapnz(oob, cranelift_codegen::ir::TrapCode::HEAP_OUT_OF_BOUNDS);
-    let m = b.ins().iconst(I64, lower.mask as i64);
-    let clamped = b.ins().band(ptr, m);
-    let base = b.use_var(lower.mem_var);
-    b.ins().iadd(base, clamped)
 }
 
 // The confinement bound-proof (`UB_TOP`/`ub_at`/`ub_of`/`in_window`) now lives in one audited place,

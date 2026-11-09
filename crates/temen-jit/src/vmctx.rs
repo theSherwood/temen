@@ -153,6 +153,9 @@ pub struct Window {
     pub reserved: u64,
     /// #2164 — how many pages a demand-paged child's access table covers; `0` when unpaged.
     pub pages: u64,
+    /// #2164 — a demand-paged child's page-miss thunk, which asks its pager for a page its access
+    /// table refuses; `None` when unpaged.
+    pub page_miss: Option<crate::PageMissThunk>,
     /// The function table the entry is handed as `fn_table_base`.
     pub fn_table: *const u8,
 }
@@ -164,15 +167,23 @@ impl Window {
         mapped: 0,
         reserved: 0,
         pages: 0,
+        page_miss: None,
         fn_table: core::ptr::null(),
     };
 
-    /// The host address of the `len` bytes at window offset `off`, if they lie in the reservation:
-    /// what a host function reads or writes in place of a guest access. `None` for an empty window
-    /// or a span past the reservation, which the caller faults as a guest access would.
+    /// The host address of the `len ≥ 1` bytes at window offset `off`, if they lie in the
+    /// reservation: what a host function reads or writes in place of a guest access. `None` for an
+    /// empty span or window, or a span past the reservation, which the caller faults as a guest
+    /// access there would. The bound is temen-mask's `span_checked`, the one definition of the
+    /// span-OOB arithmetic the interpreters confine their bulk ops with.
     pub fn span(&self, off: u64, len: u64) -> Option<*mut u8> {
-        let end = off.checked_add(len)?;
-        (end <= self.reserved).then(|| self.base.wrapping_add(off as usize))
+        if len == 0 || self.reserved == 0 {
+            return None;
+        }
+        // `reserved` is `mask + 1`, a power of two.
+        temen_mask::Window::new(self.reserved.trailing_zeros() as u8)
+            .span_checked(off, len)
+            .map(|off| self.base.wrapping_add(off as usize))
     }
 }
 

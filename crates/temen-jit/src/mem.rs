@@ -491,6 +491,88 @@ pub(crate) unsafe fn run_guarded_range(
 /// The trap code a caught guard fault reports.
 pub(crate) const FAULT_TRAP: i64 = TrapKind::MemoryFault as i64;
 
+/// #2534 — `mem.copy`/`mem.move` (D62) for compiled code: copy `len` bytes from window offset `src`
+/// to window offset `dst` of `vm`'s window, overlap-safe, as the interpreters' `Mem::mem_copy` does
+/// and in its order. Both spans are confined to the reservation first (temen-mask's `span_checked`,
+/// through [`crate::Window::span`]); then a demand-paged child's pages, the source's and then the
+/// destination's (#2164); then each span's first and last byte is read (ISSUES.md I21), which faults
+/// an overrun of the backed extent through the SIGSEGV guard before any byte is written, as a guest
+/// load would; then the copy. A fault is raised on `vm`, and the caller's trap check unwinds.
+///
+/// The window is `vm`'s, so the code hands the host no pointer: a backend bug can pass a wrong
+/// offset, which this confines, but never a wrong window.
+///
+/// # Safety
+/// `vm` is the calling context, called from inside the armed guest call, so a probe that faults
+/// unwinds the call; this frame holds nothing to drop.
+pub(crate) unsafe extern "C" fn mem_copy(vm: &crate::VmCtx, dst: u64, src: u64, len: u64) {
+    if len == 0 {
+        return;
+    }
+    let w = vm.window();
+    let (Some(s), Some(d)) = (w.span(src, len), w.span(dst, len)) else {
+        return vm.raise(FAULT_TRAP);
+    };
+    if !pages_admit(vm, src, len, false) || !pages_admit(vm, dst, len, true) {
+        return;
+    }
+    probe(s, len);
+    probe(d, len);
+    core::ptr::copy(s, d, len as usize);
+}
+
+/// #2534 — `mem.fill` (D62) for compiled code: set the `len` bytes at window offset `dst` of `vm`'s
+/// window to the low byte of `val`, confined, paged and probed as [`mem_copy`] does its destination.
+///
+/// # Safety
+/// As [`mem_copy`].
+pub(crate) unsafe extern "C" fn mem_fill(vm: &crate::VmCtx, dst: u64, val: u64, len: u64) {
+    if len == 0 {
+        return;
+    }
+    let Some(d) = vm.window().span(dst, len) else {
+        return vm.raise(FAULT_TRAP);
+    };
+    if !pages_admit(vm, dst, len, true) {
+        return;
+    }
+    probe(d, len);
+    core::ptr::write_bytes(d, val as u8, len as usize);
+}
+
+/// I21 — read the first and last byte of the `len ≥ 1` bytes at `p`, so a span past the backed
+/// extent faults before a bulk op writes any of it, and a self-copy (which `memmove` may skip) too.
+unsafe fn probe(p: *mut u8, len: u64) {
+    core::ptr::read_volatile(p);
+    core::ptr::read_volatile(p.add(len as usize - 1));
+}
+
+/// #2164 — whether a demand-paged child may read (or, when `write`, write) the `len` bytes at window
+/// offset `off`, which lie in the reservation: what its access table admits, or what its pager
+/// supplies when asked through the miss thunk, as a guest access's miss is. `false` once the miss
+/// ended the domain (the refusal's `MemoryFault`, or the end the pager raised). An unpaged window
+/// admits everything; the hardware decides.
+unsafe fn pages_admit(vm: &crate::VmCtx, off: u64, len: u64, write: bool) -> bool {
+    let w = vm.window();
+    let Some(miss) = w.page_miss.filter(|_| w.pages != 0) else {
+        return true;
+    };
+    #[cfg(fiber_rt)]
+    {
+        let need = if write {
+            temen_ir::PAGE_WRITE
+        } else {
+            temen_ir::PAGE_READ
+        };
+        if crate::table_admits(vm.pages, w.pages, off, len, need) {
+            return true;
+        }
+    }
+    let flags = if write { crate::PAGE_MISS_WRITE } else { 0 };
+    miss(vm, w.base, off, len, flags);
+    vm.ended().is_none()
+}
+
 /// The host page size — the §14 demand-paging granularity (what one fault supplies), and a fork
 /// copy's (#1768).
 pub(crate) fn page_size() -> usize {
