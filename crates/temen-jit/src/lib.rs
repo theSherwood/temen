@@ -183,6 +183,22 @@ pub unsafe fn fiber_park_outside() {
 // §12 per-vCPU TLS register (`vcpu.tls.get`/`set`): one i64 per OS thread (a vCPU). Always compiled
 // (substrate-independent), so a plain non-fiber root has a TLS word too.
 mod vcpu_tls;
+#[cfg(fiber_rt)]
+pub use child_exec::{HandlerDone, HandlerEnd, Ran, ServeRefused, ServeSite};
+
+/// #1952, #2742 — whether the running code is in a guest fiber (`cont.*`): a park there yields
+/// `FIBER_PARKED` to the fiber's resumer, which runs on. Not a vCPU's own context, a §14 task's
+/// root or a serve handler's fiber, whose parks are their own.
+pub fn in_guest_fiber() -> bool {
+    #[cfg(fiber_rt)]
+    {
+        fiber_rt::current_fiber_slot().is_some_and(|s| !s.is_platform())
+    }
+    #[cfg(not(fiber_rt))]
+    {
+        false
+    }
+}
 pub use vcpu_tls::serve_handlers;
 
 // #1768 — the per-instance context compiled code reaches through its threaded context pointer.

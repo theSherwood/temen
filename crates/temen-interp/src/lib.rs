@@ -15896,9 +15896,11 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     // is registered yet) — take it and continue. If the handler parks mid-handoff
                     // (no reply) or the provider is ineligible, fall through to the enqueue+wake+park
                     // path on the same ticket `t` (4d.2: the handler completes later and replies
-                    // via `t`).
+                    // via `t`). #1952, #2742 — a guest fiber's call takes the queue: it parks the
+                    // fiber, whose resumer sees `FIBER_PARKED`, and a handoff would answer it first,
+                    // which no resumer of a fiber may tell from the queue.
                     if let SchedRef::Real(sr) = sched {
-                        if sr.handoff {
+                        if sr.handoff && *cur == ROOT_FIBER {
                             if let Some(provider) = sr.take_parked_serve_loop(callee_id as usize) {
                                 dispatch(sr, provider);
                                 let served = callee.lock_unpoisoned().svc_results.remove(&t);
@@ -26176,28 +26178,11 @@ pub struct Host {
     /// serve loop's next `svc.wait` that would park with nothing served answers `0` instead, so the
     /// server reaches its `join` (the tree-walker keeps the same token in its scheduler).
     client_gone: bool,
-    /// CALLS.md 5c.2 — the child's **published serve activation** while its serve loop is parked
-    /// at an empty-queue `svc.wait`: `(serve_ctx, mem_base, mem_reserved)` — everything a claiming
-    /// caller needs to invoke a handler inline over the child's live window (the §10.2 arm-4
-    /// direct handoff, JIT twin). Published/cleared only by the child's own serve loop, under the
-    /// cell's lock; `None` whenever the child is running, serving, or gone.
-    serve_activation: Option<(usize, usize, u64)>,
-    /// CALLS.md 5c.2 — the activation **claim** flag: set (under the lock, atomically with the
-    /// activation check) by the one caller serving inline. While set: no second claimer, the
-    /// child's serve loop neither pops nor exits (its window must stay alive under the claimer),
-    /// and interrupt exits defer until release.
-    handoff_claimed: bool,
-    /// CALLS.md 5c.2 — dispatches served **by claimers** since the child last folded its count:
-    /// the §10.2 settlement rule ("a handoff-served dispatch counts in the callee's serve
-    /// accounting") — the child's parked `svc.wait` completes with the same served-count
-    /// observation the enqueue path would have delivered.
-    handoff_served: i64,
-    /// CALLS.md 5c.2 — a trap raised by a handoff-served handler (`0` ⇒ none). The inline invoke
-    /// runs child code on the **claimer's** thread, but a handler trap is the *child's* outcome
-    /// (under the enqueue path the child's own serve loop would have died with it): the claimer
-    /// records it here and answers `CAP_REVOKED` (the dying-callee errno); the child's serve loop
-    /// folds it on wake and exits with it as its own trap — same observables on both transports.
-    handoff_trap: i64,
+    /// #2742 — the serve ops of this domain parked at an empty queue (the Cranelift JIT's
+    /// `temen_jit::ServeSite`s, opaque here): a caller that finds one may start its own call's
+    /// handler on its own thread, taking the serve op's gate (the §10.2 arm-4 direct handoff).
+    /// Published and withdrawn by the serve op only, under the cell's lock.
+    parked_sites: Vec<Arc<dyn std::any::Any + Send + Sync>>,
     /// §3.6 slice 3 — live-callee offer entries ([`Binding::LiveImpl`] indexes here).
     live_impls: Vec<LiveImplEntry>,
     /// §13.4 slice 4d — restored `LiveImpl` handles awaiting **re-link** to their re-launched §14
@@ -27054,10 +27039,7 @@ impl Host {
             svc_bell: None,
             self_cell: None,
             client_gone: false,
-            serve_activation: None,
-            handoff_claimed: false,
-            handoff_served: 0,
-            handoff_trap: 0,
+            parked_sites: Vec::new(),
             live_impls: Vec::new(),
             pending_live_impls: Vec::new(),
             pending_inherited: Vec::new(),
@@ -31570,6 +31552,11 @@ impl Host {
             .map(|d| (d.export, d.op, d.args, d.ticket))
     }
 
+    /// The dispatches queued and not yet popped.
+    pub fn svc_queued(&self) -> usize {
+        self.svc_queue.len()
+    }
+
     /// I36 slice 3 — settle ticket `ticket`'s completion cell with `reply`: the embedder serve
     /// loop's counterpart of the eval-loop settle (the enqueuer claims it via
     /// [`Host::svc_result`]).
@@ -31664,53 +31651,21 @@ impl Host {
         host
     }
 
-    /// CALLS.md 5c.2 — publish / clear this child's parked serve activation; see
-    /// [`Host::serve_activation`]. Child serve loop only, under the cell's lock.
-    pub fn set_serve_activation(&mut self, a: Option<(usize, usize, u64)>) {
-        self.serve_activation = a;
+    /// #2742 — publish a serve op of this domain parked at an empty queue; see
+    /// [`Host::parked_sites`]. The serve op itself, under the cell's lock.
+    pub fn publish_site(&mut self, site: Arc<dyn std::any::Any + Send + Sync>) {
+        self.parked_sites.push(site);
     }
 
-    /// CALLS.md 5c.2 — try to claim the published activation (atomic with the check under the
-    /// cell's lock): `Some((serve_ctx, mem_base, mem_size))` and the claim is held; `None` when
-    /// nothing is published or another claimer holds it.
-    pub fn try_claim_handoff(&mut self) -> Option<(usize, usize, u64)> {
-        if self.handoff_claimed {
-            return None;
-        }
-        let a = self.serve_activation?;
-        self.handoff_claimed = true;
-        Some(a)
+    /// #2742 — withdraw the serve op at `site` (its address), once its park has ended.
+    pub fn withdraw_site(&mut self, site: *const ()) {
+        self.parked_sites
+            .retain(|s| Arc::as_ptr(s) as *const () != site);
     }
 
-    /// CALLS.md 5c.2 — release the claim after the inline serve, recording `served` dispatches
-    /// into the callee's serve accounting (the §10.2 settlement rule). The caller then notifies
-    /// the cell's Condvar so the child folds the count and completes its `svc.wait`.
-    pub fn release_handoff(&mut self, served: i64) {
-        self.handoff_claimed = false;
-        self.handoff_served += served;
-    }
-
-    /// Whether a claimer currently holds this child's activation (the child's serve loop must
-    /// neither pop, exit, nor honor interrupts while it does — the claimer runs over the child's
-    /// live window).
-    pub fn handoff_claimed(&self) -> bool {
-        self.handoff_claimed
-    }
-
-    /// CALLS.md 5c.2 — fold and reset the handoff-served count (the child's serve loop, on wake).
-    pub fn take_handoff_served(&mut self) -> i64 {
-        std::mem::take(&mut self.handoff_served)
-    }
-
-    /// CALLS.md 5c.2 — record a handoff-served handler's trap as the **child's** outcome; see
-    /// [`Host::handoff_trap`].
-    pub fn set_handoff_trap(&mut self, t: i64) {
-        self.handoff_trap = t;
-    }
-
-    /// Fold and reset the handoff trap (the child's serve loop, on wake; nonzero ⇒ exit with it).
-    pub fn take_handoff_trap(&mut self) -> i64 {
-        std::mem::take(&mut self.handoff_trap)
+    /// #2742 — the serve op of this domain parked latest at an empty queue.
+    pub fn parked_site(&self) -> Option<Arc<dyn std::any::Any + Send + Sync>> {
+        self.parked_sites.last().cloned()
     }
 
     /// §3.6 — the shape of THIS domain's impl-export `export` (its op signatures, in op

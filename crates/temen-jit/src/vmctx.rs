@@ -91,6 +91,10 @@ pub struct VmCtx {
     /// The domain's end word, owned by its root context ([`Self::new`]); `None` for a vCPU's
     /// context ([`Self::vcpu`]), which points at its root's. Never read by compiled code.
     owned_end: Option<Box<AtomicI64>>,
+    /// #2742 — the vCPU's serve site, made at its first serve op ([`crate::ServeSite::of`]), so it
+    /// goes with the vCPU. Never read by compiled code.
+    #[cfg(fiber_rt)]
+    pub(crate) serve_site: std::sync::OnceLock<std::sync::Arc<crate::child_exec::ServeSite>>,
 }
 
 /// The per-instance addresses a [`VmCtx`] is filled from — everything but the trap cell, which each
@@ -146,6 +150,8 @@ impl VmCtx {
             setjmp: a.setjmp,
             pages: a.pages,
             owned_end: Some(owned_end),
+            #[cfg(fiber_rt)]
+            serve_site: std::sync::OnceLock::new(),
         }
     }
 
@@ -167,6 +173,8 @@ impl VmCtx {
             setjmp: self.setjmp,
             pages: self.pages,
             owned_end: None,
+            #[cfg(fiber_rt)]
+            serve_site: std::sync::OnceLock::new(),
         }
     }
 
@@ -192,6 +200,12 @@ impl VmCtx {
         let _ = self
             .trap
             .compare_exchange(0, end, Ordering::Relaxed, Ordering::Relaxed);
+    }
+
+    /// #2742 — the domain this context is of, as a key: the address of its end word, which every
+    /// context of the domain shares.
+    pub(crate) fn domain_key(&self) -> usize {
+        self.end as usize
     }
 
     /// The code that ended this context's domain, or `None` while it runs.

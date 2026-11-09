@@ -1097,6 +1097,37 @@ pub(crate) unsafe fn make_task_fiber(
     })
 }
 
+/// #2742 — the `suspend` value a serve handler's fiber yields once its dispatch is done: it waits
+/// there, reusable, for its next ([`make_handler_fiber`]).
+pub(crate) const JOB_DONE: u64 = u64::MAX - 7;
+
+/// #2742 — the fiber serve handlers run on, one dispatch after another (`child_exec::Shell`): each
+/// resume runs `run(job, stack_low)`, the job its resumer left at `job`, then yields [`JOB_DONE`]
+/// and waits for the next. The yielder is pushed on the resuming thread's runtime for each job, as
+/// [`make_task_fiber`] does, so an event park inside the handler finds it. Nothing the body owns
+/// lives across its `suspend`, so dropping the waiting fiber leaks nothing.
+///
+/// # Safety
+/// As [`make_task_fiber`]; `job` stays valid for every resume.
+pub(crate) unsafe fn make_handler_fiber(
+    stack: usize,
+    job: *const (),
+    run: unsafe fn(*const (), u64),
+) -> Option<Fiber> {
+    let job = job as usize;
+    Fiber::new(stack, move |y: &Yielder, _arg: u64| -> u64 {
+        loop {
+            // SAFETY: as `make_task_fiber`'s body; the resumer left a job at `job`.
+            unsafe {
+                (*current()).yielders.push(y as *const Yielder);
+                run(job as *const (), y.stack_low());
+                (*current()).yielders.pop();
+            }
+            let _ = y.suspend(JOB_DONE);
+        }
+    })
+}
+
 /// `cont.new` thunk: allocate a suspended fiber that, on first resume, calls guest `funcref(arg0, arg)`.
 /// Returns the fiber handle (the domain-shared table's slot index — the same numbering as the interp
 /// registry), or traps (`-1`) on a fiber-bomb (the **per-domain** bound, or its `Budget.mem`).
@@ -1590,6 +1621,13 @@ pub(crate) fn in_task() -> bool {
     let rt = current();
     // SAFETY: `current()` is this thread's live runtime; the borrow is momentary.
     !rt.is_null() && unsafe { (*rt).runs_task() }
+}
+
+/// #2742 — the fiber table of the computation running on this thread, if it has a fiber runtime.
+pub(crate) fn current_table() -> Option<Arc<SharedFiberTable>> {
+    let rt = current();
+    // SAFETY: `current()` is this thread's live runtime; the borrow is momentary.
+    (!rt.is_null()).then(|| unsafe { (*rt).table() })
 }
 
 /// #2793 — the low bound of the fiber stack `sp` is on, when that is the innermost running fiber's

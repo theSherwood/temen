@@ -1376,6 +1376,34 @@ impl Domain {
         cell_unpark(flag, &self.hub().parked);
     }
 
+    /// #2742 — a serve handler started in an open window: a live task of the run until it ends or its
+    /// window shuts, for the deadlock predicate. It is no vCPU, so no vCPU ceiling counts it.
+    pub(crate) fn handler_started(&self) {
+        lock(&self.threads).live += 1;
+    }
+
+    /// #2742 — a handler of an open window ended: out of the live count. The executor then wakes
+    /// the parks that decide the deadlock verdict if the run is quiescent, as at a killed task's
+    /// end; no parked task is re-offered, since a handler's end satisfies no task's park, and its
+    /// settle and its gate rang the bells that do.
+    pub(crate) fn handler_finished(&self) {
+        lock(&self.threads).live -= 1;
+    }
+
+    /// #2742 — a serving vCPU's window opened (`open`) or shut, with `handlers` started and `parked`
+    /// of them counted blocked: they count in the deadlock predicate only while it is open. A shut
+    /// window wakes no waiter: its vCPU is running, so the predicate cannot hold.
+    pub(crate) fn count_window(&self, open: bool, handlers: usize, parked: usize) {
+        let mut t = lock(&self.threads);
+        if open {
+            t.live += handlers;
+            self.parked.fetch_add(parked, Ordering::AcqRel);
+        } else {
+            t.live -= handlers;
+            self.parked.fetch_sub(parked, Ordering::AcqRel);
+        }
+    }
+
     /// The §14 child finished — drop it from the live count (see [`Self::child_started`]), and if
     /// that leaves the run quiescent wake its parked vCPUs, whose indefinite parks it has made
     /// deadlocks, exactly as when a spawned vCPU exits ([`run_child`]): nothing re-checks on a
@@ -1511,6 +1539,11 @@ impl Domain {
     /// nested nursery, which has no futex either, so nothing can park).
     pub(crate) fn set_child_exec(&self, exec: std::sync::Arc<crate::child_exec::ChildExec>) {
         *lock(&self.child_exec) = Some(exec);
+    }
+
+    /// #2742 — the run's child-domain executor, if its nursery registered one. Asked of the hub.
+    pub(crate) fn child_exec(&self) -> Option<std::sync::Arc<crate::child_exec::ChildExec>> {
+        lock(&self.child_exec).clone()
     }
 
     /// D66 — re-offer the parked child tasks `which` names, each to re-check its own predicate.
@@ -1865,6 +1898,13 @@ std::thread_local! {
 /// Publish `dom` as this thread's current domain (see [`CURRENT_DOMAIN`]); returns the previous one.
 pub(crate) fn set_current_domain(dom: *const Domain) -> *const Domain {
     CURRENT_DOMAIN.with(|c| c.replace(dom))
+}
+
+/// #2742 — this thread's current domain as [`CURRENT_DOMAIN`] holds it: null where the vmctx's
+/// `sched` is the domain. Not inlined, for the reason [`current_domain`] is not.
+#[inline(never)]
+pub(crate) fn current_domain_ptr() -> *const Domain {
+    CURRENT_DOMAIN.with(|c| c.get())
 }
 
 /// The domain a thread thunk acts in: this thread's current one, else the vmctx's `sched`. Not
