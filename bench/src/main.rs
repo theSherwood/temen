@@ -1192,6 +1192,31 @@ fn temen_call_host(m: &temen_ir::Module, entry: u32, lead: &[i64], n: i64) -> i6
     }
 }
 
+/// [`temen_call_host`] through the real capability path (#2319): `temen_run::cap_thunk` over a
+/// fresh [`dispatch_host`], whose host procedure's handle the kernel takes first (`lead`).
+fn temen_call_dispatch(m: &temen_ir::Module, entry: u32, lead: &[i64], n: i64) -> i64 {
+    let (mut host, handle) = dispatch_host();
+    assert_eq!(lead, [handle as i64], "a fresh host's first grant");
+    let ctx = &mut host as *mut temen_interp::Host as *mut c_void;
+    match compile_and_run_with_host(m, entry, &[handle as i64, n], temen_run::cap_thunk, ctx) {
+        Ok(JitOutcome::Returned(s)) => s[0],
+        other => panic!("temen jit (dispatch) produced {other:?}"),
+    }
+}
+
+/// A host granted one host procedure, `x -> x+1` (`bench_thunk`'s op 0), and its handle.
+fn dispatch_host() -> (temen_interp::Host, i32) {
+    use temen_interp::{put_results, CapState, HostProcGrant, ProcHandler};
+    let mut host = temen_interp::Host::new();
+    let handle = host.grant_host_proc(HostProcGrant::new(
+        ProcHandler::Sync(Box::new(|_op, args, out, _mem, _minter| {
+            put_results(out, &[args.first().copied().unwrap_or(0).wrapping_add(1)])
+        })),
+        CapState::Stateless,
+    ));
+    (host, handle)
+}
+
 /// What a kernel measures. `Compute` kernels run an import-less wasm module and the no-cap
 /// Temen JIT (per-iteration *compute*). `HostCall` kernels instead make one host crossing per
 /// iteration — Temen `call.cap` through a trampoline thunk vs a Wasmtime **imported host
@@ -1200,6 +1225,9 @@ fn temen_call_host(m: &temen_ir::Module, entry: u32, lead: &[i64], n: i64) -> i6
 enum Mode {
     Compute,
     HostCall,
+    /// #2319 — a `HostCall` kernel whose crossing goes where an embedder's do: `temen_run::cap_thunk`
+    /// into a `Host` that dispatches a granted host procedure ([`temen_call_dispatch`]).
+    Dispatch,
 }
 
 /// A kernel resolved for this run: IR text — hand-written, or generated from C through the
@@ -1262,10 +1290,13 @@ fn resolve_kernels(from_wasm: bool) -> Vec<Resolved> {
     }
     // Interface (host-call) kernels — the §1a "around-compute" axis the harness was missing.
     v.push(hostcall_kernel());
+    v.push(hostproc_kernel());
     v.push(hostbuf_kernel());
 
     if from_wasm {
-        for k in &mut v {
+        // #2319 — a `Dispatch` kernel stays hand-written: it calls the host's granted procedure by
+        // handle, which a transpiled import would not reach.
+        for k in v.iter_mut().filter(|k| k.mode != Mode::Dispatch) {
             // The `irreducible` kernel already *is* wasm (clang output); transpile those bytes.
             // Everything else assembles its hand-written WAT first.
             let transpiled = match &k.wasm32_bytes {
@@ -1364,6 +1395,50 @@ block 3 (v15: i64) {
         .into(),
         wat64: None,
         mode: Mode::HostCall,
+        native: None,
+        wasm32_bytes: None,
+        n_span: None,
+    }
+}
+
+/// Interface benchmark — **a host call through the real dispatch** (#2319). The crossing is
+/// `hostcall`'s (`x -> x+1` against the same Wasmtime import), but it goes where an embedder's go:
+/// `temen_run::cap_thunk` into a `Host` that dispatches the granted host procedure. `hostcall`'s
+/// [`bench_thunk`] dispatches nothing, so only this kernel sees what a call costs a real program:
+/// the window view, the dispatch and the park decision.
+fn hostproc_kernel() -> Resolved {
+    Resolved {
+        name: "hostproc".into(),
+        ir: "\
+memory 16
+func (i32, i64) -> (i64) {
+block 0 (v0: i32, v1: i64) {
+  v2 = i64.const 0
+  v3 = i64.const 0
+  br 1(v0, v1, v2, v3)
+}
+block 1 (v4: i32, v5: i64, v6: i64, v7: i64) {
+  v8 = i64.ge_s v7 v5
+  br_if v8 3(v6) 2(v4, v5, v6, v7)
+}
+block 2 (v9: i32, v10: i64, v11: i64, v12: i64) {
+  v13 = call.cap 13 0 (i64) -> (i64) v9(v12)
+  v14 = i64.add v11 v13
+  v15 = i64.const 1
+  v16 = i64.add v12 v15
+  br 1(v9, v10, v14, v16)
+}
+block 3 (v17: i64) {
+  return v17
+}
+}
+"
+        .into(),
+        entry: 0,
+        lead_args: vec![dispatch_host().1 as i64],
+        wat32: hostcall_kernel().wat32,
+        wat64: None,
+        mode: Mode::Dispatch,
         native: None,
         wasm32_bytes: None,
         n_span: None,
@@ -1956,16 +2031,17 @@ fn measure(engine: &Engine, k: &Resolved, reps: u32, optimize: bool) -> Raw {
     // cache-miss kernel does, since both ends must exceed its working set.
     let least = k.n_span.unwrap_or(match k.mode {
         Mode::Compute => (N_BIG, N_SMALL),
-        Mode::HostCall => (N_HOST_BIG, N_HOST_SMALL),
+        Mode::HostCall | Mode::Dispatch => (N_HOST_BIG, N_HOST_SMALL),
     });
     let n_small = least.1;
     let temen = |m: &temen_ir::Module, entry: u32, n: i64| match k.mode {
         Mode::Compute => temen_call(m, entry, &k.lead_args, n),
         Mode::HostCall => temen_call_host(m, entry, &k.lead_args, n),
+        Mode::Dispatch => temen_call_dispatch(m, entry, &k.lead_args, n),
     };
     let inst = |wasm: &[u8]| match k.mode {
         Mode::Compute => wasm_entry(engine, wasm),
-        Mode::HostCall => wasm_entry_host(engine, wasm),
+        Mode::HostCall | Mode::Dispatch => wasm_entry_host(engine, wasm),
     };
 
     // Cross-check every engine, and every layout, agrees before timing (never benchmark a
