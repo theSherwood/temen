@@ -6698,8 +6698,8 @@ struct Callees {
     host: [FuncId; HostFn::ALL.len()],
     /// Each fast-path target's id, by [`fast_cap_key_of`]; `None` where the resolver claims none.
     fast: HashMap<[u32; 4], Option<FuncId>>,
-    /// The target's pointer width and default calling convention, for the Cranelift
-    /// `call_memcpy`/`call_memmove`/`call_memset` helpers that lower the bulk-memory ops (D62).
+    /// The target's pointer width and default calling convention, for the signatures lowering
+    /// builds on the spot (the fuel-remaining call's).
     frontend: cranelift_codegen::isa::TargetFrontendConfig,
 }
 
@@ -6911,7 +6911,9 @@ fn new_jit_module(imports: Imports) -> Result<JITModule, JitError> {
 /// [`new_jit_module`] binds them as it binds each [`HostFn`], so the JIT never looks a name up in the
 /// process's dynamic symbol table, which a statically linked host doesn't have: there, a
 /// `memory.copy` could not link (#2514). The others (`Probestack`, which is off, and the TLS and x86
-/// shuffle helpers) name nothing a C runtime has.
+/// shuffle helpers) name nothing a C runtime has. No lowering calls `memcpy`/`memmove`/`memset`/
+/// `memcmp` since #2534 (a bulk op is a host helper), and the machine-code validator refuses a call
+/// to one; they stay bound so that a Cranelift change that emits one fails validation, not the link.
 fn libcalls() -> [(&'static str, *const u8); 14] {
     use core::ffi::{c_int, c_void};
     extern "C" {
