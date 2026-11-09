@@ -62,8 +62,10 @@ vCPU and **separate per spawned vCPU/OS thread**. Widen that host cell from one 
   resumed fiber's low bound before `call_tramp`, restore the previous value after (handles nested
   resumes automatically);
 - the **root** computation (on the OS thread stack, not an arena slot) takes its thread's limit, the
-  stack's low bound plus a quarter of its size (#1983). `stack_limit = 0` still means inert
-  (`SP − RED_ZONE < 0` is never true), which is what an entry off its thread's stack gets.
+  stack's low bound plus a quarter of its size (#1983). An entry that host code makes on a
+  **fiber's** stack (a serve handler in a pool task, a direct handoff from a fiber) takes that
+  fiber's low bound, as the fiber's own entry does (#2793). `stack_limit = 0` still means inert
+  (`SP − RED_ZONE < 0` is never true), which is what an entry on neither stack gets.
 
 This keeps the check per-thread-correct with no ABI param and no TLS access-model codegen.
 

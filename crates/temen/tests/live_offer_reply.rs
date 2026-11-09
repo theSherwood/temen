@@ -9,7 +9,7 @@
 //! The caller spawns the serving child detached (op 17), mints a live offer over its export (op 14),
 //! makes the call, joins the child, and returns `join · 1_000_000 + call`: the child's entry serves
 //! one dispatch (`svc.wait`) and returns how many it served. Each case runs on the tree-walker, the
-//! bytecode engine and the Cranelift JIT, which must agree (INVARIANTS #9). On the JIT a caller
+//! bytecode engine's pump and executor 2, and the Cranelift JIT, which must agree (INVARIANTS #9). On the JIT a caller
 //! without a fiber holds its powerbox outright, and one with a fiber shares it in a cell.
 
 #[path = "../../temen-interp/tests/support/rec.rs"]
@@ -149,6 +149,16 @@ fn bytecode_engine(
     run_with_host_fast(m, 0, &args.map(Value::I32), &mut fuel, host)
 }
 
+/// Executor 2, the bytecode engine's parallel driver: a thread per task.
+fn parallel(m: &temen_ir::Module, args: &[i32; 4], host: &mut Host) -> Result<Vec<Value>, Trap> {
+    let mut fuel = 5_000_000u64;
+    let args = args.map(Value::I32);
+    let run = bytecode::compile_and_run_capture_over_parallel_with_host;
+    let (out, _) =
+        run(m, 0, &args, &mut fuel, &[], None, host).expect("executor 2 runs the caller");
+    out
+}
+
 fn jit(m: &temen_ir::Module, args: &[i32; 4], host: &mut Host) -> Result<Vec<Value>, Trap> {
     let image = MemLayout::image(vec![0u8; 128 << 10]);
     let (out, _) = temen_run::jit_cap_run(m, 0, &args.map(i64::from), &image, 0, 0, host, None)
@@ -180,9 +190,17 @@ fn run_on(entry: Entry, caller: &str, server: &str, handoff: bool) -> Result<Vec
         .expect("the run hung")
 }
 
-/// Run `caller` with the serving child `server` on the tree-walker, natively on the bytecode engine,
-/// and on the Cranelift JIT, and answer their one result.
+/// Run `caller` with the serving child `server` on the tree-walker, natively on the bytecode engine's
+/// two executors, and on the Cranelift JIT, and answer their one result.
 fn run(caller: &str, server: &str, handoff: bool) -> Result<Vec<Value>, Trap> {
+    let oracle = interpreted(caller, server, handoff);
+    let jitted = run_on(jit, caller, server, handoff);
+    assert_eq!(jitted, oracle, "the JIT answers as the tree-walker does");
+    oracle
+}
+
+/// [`run`] on the tree-walker and the bytecode engine's two executors alone.
+fn interpreted(caller: &str, server: &str, handoff: bool) -> Result<Vec<Value>, Trap> {
     assert!(
         bytecode::admits(&module(caller)),
         "the bytecode engine runs the caller"
@@ -194,8 +212,8 @@ fn run(caller: &str, server: &str, handoff: bool) -> Result<Vec<Value>, Trap> {
         fast, oracle,
         "the bytecode engine answers as the tree-walker does"
     );
-    let jitted = run_on(jit, caller, server, handoff);
-    assert_eq!(jitted, oracle, "the JIT answers as the tree-walker does");
+    let par = run_on(parallel, caller, server, handoff);
+    assert_eq!(par, oracle, "executor 2 answers as the tree-walker does");
     oracle
 }
 
@@ -314,6 +332,34 @@ block 0 (va: i64, vb: i64) {
     );
 }
 
+/// #2742 — the same from a fiber, which the call parked alone: the callee's death answers it
+/// `(CAP_REVOKED, 0)` when it next resumes.
+#[test]
+fn a_parked_fiber_whose_callee_dies_answers_its_errno() {
+    let handler = r#"func (i64, i64) -> (i64, i64) {
+block 0 (va: i64, vb: i64) {
+  unreachable
+  }
+}
+"#;
+    let r = run(
+        &caller(IN_A_FIBER, ADDMUL_FIBER),
+        &server(ADDMUL_TYPES, handler),
+        false,
+    );
+    let Ok(v) = r else {
+        panic!("the caller survives a dead callee: {r:?}")
+    };
+    let [Value::I64(x)] = v[..] else {
+        panic!("{v:?}")
+    };
+    assert_eq!(
+        x.rem_euclid(1_000_000),
+        (CAP_REVOKED * 1000).rem_euclid(1_000_000),
+        "(CAP_REVOKED, 0) in the call's two results: {x}"
+    );
+}
+
 /// A failed call whose first result is not an integer cannot carry its errno, so it traps.
 #[test]
 fn a_failed_call_without_an_integer_first_result_traps() {
@@ -411,4 +457,261 @@ block 0 (vh: i64) {
   vcall = call.cap 268435456 0 (i64) -> (i64) v7 (vin64)"#;
     let r = run(&caller(call, ""), server, false);
     assert_eq!(r, Err(Trap::ThreadFault), "the deadlock verdict");
+}
+
+/// #2742 — a handler that calls its own domain waits while its serve loop serves that call. The
+/// parent grants the child the offer over the child (op 19) and calls `again(h, 1)` with the child's
+/// index of it. That handler calls `again(h, 0)` through `h`, which queues on the child's own queue,
+/// and answers its reply plus one. The child's one `svc.wait` serves both: the handler parked on
+/// its own domain's call parks alone, as a fiber of the serve loop, and takes the reply at once.
+/// The Cranelift JIT runs a handler on its serve loop's stack, so there its park parks the whole
+/// loop and the call deadlocks: this case leaves it out.
+#[test]
+fn a_handler_calling_its_own_domain_is_served_meanwhile() {
+    let r = interpreted(&caller(AGAIN_CALL, ""), &server(AGAIN_TYPES, AGAIN), false);
+    // Two dispatches served, and the call answers 7 + 1.
+    assert_eq!(r, Ok(vec![Value::I64(2_000_008)]));
+}
+
+const AGAIN_TYPES: &str = "type 0 func (i64, i64) -> (i64)
+type 1 interface { again: 0 }
+export 0 interface \"again\" 1 { again: 1 }";
+
+/// `again(h, n)`: 7 at `n = 0`, else one more than its call of `again(h, n - 1)` through `h`.
+const AGAIN: &str = r#"func (i64, i64) -> (i64) {
+block 0 (vh: i64, vn: i64) {
+  vzero = i64.const 0
+  vlast = i64.eq vn vzero
+  br_if vlast 1() 2(vh, vn)
+}
+block 1 () {
+  vseven = i64.const 7
+  return vseven
+}
+block 2 (wh: i64, wn: i64) {
+  vone = i64.const 1
+  wn1 = i64.sub wn vone
+  vself = i32.wrap_i64 wh
+  vr = call.cap 268435456 0 (i64, i64) -> (i64) vself (wh, wn1)
+  vr1 = i64.add vr vone
+  return vr1
+  }
+}
+"#;
+
+/// The parent's call of `again(h, 1)`, `h` the child's index of the offer over itself.
+const AGAIN_CALL: &str = r#"
+  v764 = i64.extend_i32_u v7
+  vin = call.cap 6 19 (i32, i64) -> (i32) v0 (v5, v764)
+  vin64 = i64.extend_i32_s vin
+  vone = i64.const 1
+  vcall = call.cap 268435456 0 (i64, i64) -> (i64) v7 (vin64, vone)"#;
+
+/// The caller's entry resumes fiber func 1 once with a plain `cont.resume`, then with
+/// `cont.resume.block` until it returns. `vcall` is the first resume's status · 100_000 plus the
+/// fiber's value.
+const POLLED_FIBER: &str = r#"
+  vf = ref.func 1
+  vfsp = i64.const 24576
+  vfk = cont.new vf vfsp
+  voff = i64.extend_i32_u v7
+  vs1, vv1 = cont.resume vfk voff
+  vone1 = i32.const 1
+  vdone1 = i32.eq vs1 vone1
+  br_if vdone1 2(v0, v5, vs1, vv1) 1(v0, v5, vfk, voff, vs1)
+}
+block 1 (x0: i32, x5: i32, xk: i64, xoff: i64, xs1: i32) {
+  xs, xv = cont.resume.block xk xoff
+  xone = i32.const 1
+  xdone = i32.eq xs xone
+  br_if xdone 2(x0, x5, xs1, xv) 1(x0, x5, xk, xoff, xs1)
+}
+block 2 (v0: i32, v5: i32, ws1: i32, wv: i64) {
+  ws164 = i64.extend_i32_u ws1
+  vhk = i64.const 100000
+  vsh1 = i64.mul ws164 vhk
+  vcall = i64.add vsh1 wv"#;
+
+/// Fiber func 1 of [`a_fiber_s_thread_local_word_survives_its_park`]: [`ADDMUL_FIBER`]'s call, after
+/// it sets the thread-local word to 42.
+const TLS_FIBER: &str = r#"
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, voff: i64) {
+  vtl = i64.const 42
+  vcpu.tls.set vtl
+  v7 = i32.wrap_i64 voff
+  va = i64.const 40
+  vb = i64.const 2
+  vsum, vprod = call.cap 268435456 0 (i64, i64) -> (i64, i64) v7 (va, vb)
+  vthousand = i64.const 1000
+  vsh = i64.mul vsum vthousand
+  vr = i64.add vsh vprod
+  return vr
+  }
+}
+"#;
+
+/// The caller's entry resumes fiber func 1 once with a plain `cont.resume`, reads the thread-local
+/// word, then resumes it with `cont.resume.block` until it returns. `vcall` is the word · 100_000
+/// plus the fiber's value.
+const TLS_READER: &str = r#"
+  vf = ref.func 1
+  vfsp = i64.const 24576
+  vfk = cont.new vf vfsp
+  voff = i64.extend_i32_u v7
+  vs1, vv1 = cont.resume vfk voff
+  vtl = vcpu.tls.get
+  br 1(v0, v5, vfk, voff, vtl)
+}
+block 1 (x0: i32, x5: i32, xk: i64, xoff: i64, xtl: i64) {
+  xs, xv = cont.resume.block xk xoff
+  xone = i32.const 1
+  xdone = i32.eq xs xone
+  br_if xdone 2(x0, x5, xtl, xv) 1(x0, x5, xk, xoff, xtl)
+}
+block 2 (v0: i32, v5: i32, wtl: i64, wv: i64) {
+  vhk = i64.const 100000
+  vsh1 = i64.mul wtl vhk
+  vcall = i64.add vsh1 wv"#;
+
+/// A fiber parked on its call hands the thread-local word back with execution: the word is the
+/// vCPU's, so its resumer reads what the fiber set (#2742, `park_running_fiber`).
+#[test]
+fn a_fiber_s_thread_local_word_survives_its_park() {
+    let r = run(
+        &caller(TLS_READER, TLS_FIBER),
+        &server(ADDMUL_TYPES, ADDMUL),
+        false,
+    );
+    assert_eq!(r, served(42 * 100_000 + 42_080));
+}
+
+/// #2742 — a fiber's call parks the fiber, not its task: the plain resume that ran it into the call
+/// answers `FIBER_PARKED` (3), and the blocking resumes after it take the call's value once the
+/// reply comes.
+#[test]
+fn a_polled_fiber_making_a_call_parks_alone() {
+    let r = run(
+        &caller(POLLED_FIBER, ADDMUL_FIBER),
+        &server(ADDMUL_TYPES, ADDMUL),
+        false,
+    );
+    assert_eq!(r, served(3 * 100_000 + 42_080));
+}
+
+/// #2742 — a handler parked on a call into another domain: its serve loop waits in `svc.wait` with
+/// nothing queued, and the reply, when it comes, wakes the loop to resume the handler. The parent
+/// spawns two children from [`AGAIN`]'s module, grants the first an offer over the second (op 19),
+/// and calls `again(h, 1)` on the first, whose handler calls `again(h, 0)` on the second. Each child
+/// serves one dispatch. The parent answers `joinA · 1_000_000 + joinB · 1_000 + call`.
+#[test]
+fn a_handler_waiting_on_another_domain_wakes_its_serve_loop() {
+    let caller = format!(
+        r#"memory 17
+
+func (i32, i32, i32, i32) -> (i64) {{
+block 0 (v0: i32, v1: i32, v2: i32, v3: i32) {{
+  vrm = i64.const 17416
+  i32.store vrm v1
+  vrb = i64.const 17420
+  i32.store vrb v2
+  vrp = i64.const 17408
+  va = call.cap 6 17 (i64) -> (i32) v0 (vrp)
+  vb = call.cap 6 17 (i64) -> (i32) v0 (vrp)
+  vz = i64.const 0
+  vtob = call.cap 6 14 (i32, i64) -> (i32) v0 (vb, vz)
+  vtob64 = i64.extend_i32_u vtob
+  vin = call.cap 6 19 (i32, i64) -> (i32) v0 (va, vtob64)
+  vin64 = i64.extend_i32_s vin
+  vtoa = call.cap 6 14 (i32, i64) -> (i32) v0 (va, vz)
+  vone = i64.const 1
+  vcall = call.cap 268435456 0 (i64, i64) -> (i64) vtoa (vin64, vone)
+  vja_st, vja = call.cap 6 1 (i32) -> (i64, i64) v0 (va)
+  vjb_st, vjb = call.cap 6 1 (i32) -> (i64, i64) v0 (vb)
+  vmil = i64.const 1000000
+  vk = i64.const 1000
+  vma = i64.mul vja vmil
+  vmb = i64.mul vjb vk
+  vs1 = i64.add vma vmb
+  vs = i64.add vs1 vcall
+  return vs
+  }}
+}}
+{rec}"#,
+        rec = rec::segment(17408, &temen_ir::SpawnRec::default())
+    );
+    let r = run(&caller, &server(AGAIN_TYPES, AGAIN), false);
+    assert_eq!(r, Ok(vec![Value::I64(1_001_008)]));
+}
+
+const REC_TYPES: &str = "type 0 func (i64, i64) -> (i64)
+type 1 interface { rec: 0 }
+export 0 interface \"rec\" 1 { rec: 1 }";
+
+/// `rec(h, n)` answers `deep(n)`, which recurses `n` deep.
+const REC: &str = r#"func (i64, i64) -> (i64) {
+block 0 (vh: i64, vn: i64) {
+  vr = call 2 (vn)
+  return vr
+  }
+}
+func (i64) -> (i64) {
+block 0 (vn: i64) {
+  vz = i64.const 0
+  vlast = i64.eq vn vz
+  br_if vlast 1() 2(vn)
+}
+block 1 () {
+  vzero = i64.const 0
+  return vzero
+}
+block 2 (wn: i64) {
+  vone = i64.const 1
+  wn1 = i64.sub wn vone
+  vr = call 2 (wn1)
+  vr1 = i64.add vr vone
+  return vr1
+  }
+}
+"#;
+
+/// The caller's call of `rec(0, 100_000)`, deeper than any engine's stack lets a handler go.
+const REC_CALL: &str = r#"
+  vz = i64.const 0
+  vdepth = i64.const 100000
+  vcall = call.cap 268435456 0 (i64, i64) -> (i64) v7 (vz, vdepth)"#;
+
+/// Fiber func 1 for [`IN_A_FIBER`]: the same call, from inside a fiber.
+const REC_FIBER: &str = r#"
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, voff: i64) {
+  v7 = i32.wrap_i64 voff
+  vz = i64.const 0
+  vdepth = i64.const 100000
+  vr = call.cap 268435456 0 (i64, i64) -> (i64) v7 (vz, vdepth)
+  return vr
+  }
+}
+"#;
+
+/// #2793 — a handler that recurses past its stack traps `StackOverflow` on every engine, so the
+/// callee dies and the call answers `CAP_REVOKED`. The serving child is a pool task on the JIT, so
+/// its handler runs on the task's fiber stack, which has no guard page: the prologue check is its
+/// only defense, and it used to be inert there. The process died with SIGSEGV.
+#[test]
+fn a_handler_recursing_past_its_stack_traps() {
+    let r = run(&caller(REC_CALL, ""), &server(REC_TYPES, REC), false);
+    assert_eq!(r, Ok(vec![Value::I64(CAP_REVOKED)]));
+}
+
+/// #2793 — the same, the call made from a caller's fiber with direct handoff on: a handoff runs the
+/// handler on the caller fiber's own stack, where the check must hold too.
+#[test]
+fn a_handler_recursing_past_its_stack_traps_under_handoff_from_a_fiber() {
+    let r = run(
+        &caller(IN_A_FIBER, REC_FIBER),
+        &server(REC_TYPES, REC),
+        true,
+    );
+    assert_eq!(r, Ok(vec![Value::I64(CAP_REVOKED)]));
 }

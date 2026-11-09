@@ -407,13 +407,13 @@ enum Op {
         results: Box<[ValType]>,
     },
     /// §3.6 serve-loop core (ISSUES.md I36 slice 1): `svc.poll` (`call.cap CAP_SELF 9`) — drain
-    /// the domain's inbound queue, running each servable dispatch as a handler activation over
-    /// the one world. Rewind-driven like the tree-walk serve arm: an admitted handler's return
-    /// linkage re-enters THIS op (pc un-advanced) with its result in `dst` (the linkage's result
-    /// slot), which the re-execution settles into the ticket's completion cell before admitting
-    /// the next dispatch; the final execution overwrites `dst` with the served count. Compiled
-    /// only when the module-level qualification veto admits it (no park-capable seams — see
-    /// [`compile_module`]), so a handler always runs to completion or traps.
+    /// the domain's inbound queue, running each servable dispatch as a **handler fiber** of the
+    /// serving task (#2742, the tree-walk serve arm's shape): the driver starts it ([`serve`]),
+    /// with the cursor AT this op, so the handler's return (which answers its dispatch) or park
+    /// re-executes it. A parked handler resumes once woken, before the queue's next dispatch. The
+    /// execution that finds nothing to run delivers the served count to `dst`. Compiled only when
+    /// the module-level qualification veto admits it ([`compile_module`]), so the domain holds no
+    /// fibers of its own.
     SvcPoll {
         dst: u32,
         /// `svc.wait` (op 10): identical drain, but a no-progress empty-queue execution parks
@@ -4730,6 +4730,7 @@ fn any_event_parked<'a>(mut fibers: impl Iterator<Item = &'a FiberState>) -> boo
             FiberState::WaitParked { .. }
                 | FiberState::CapParked { .. }
                 | FiberState::HostParked { .. }
+                | FiberState::TicketParked { .. }
         )
     })
 }
@@ -5224,7 +5225,8 @@ fn journal_state(
                 FiberState::Parked { vm, .. }
                 | FiberState::WaitParked { vm, .. }
                 | FiberState::CapParked { vm, .. }
-                | FiberState::HostParked { vm, .. } => vm.clone_slots(),
+                | FiberState::HostParked { vm, .. }
+                | FiberState::TicketParked { vm, .. } => vm.clone_slots(),
                 _ => 0,
             })
             .sum::<u64>()
@@ -5309,10 +5311,12 @@ fn debug_advance_fiber(
     {
         Ok(Outcome::Suspended) => FiberStep::Stepped,
         // The root activation finished — the run's result — or a fiber returned to its resumer.
-        Ok(Outcome::Done(vals)) => match return_from_fiber(vt, &mut cell, mem, false, vals) {
-            Some(vals) => FiberStep::Finished(vals),
-            None => FiberStep::Stepped,
-        },
+        Ok(Outcome::Done(vals)) => {
+            match return_from_fiber(vt, &mut cell, mem, &mut HostCell::Excl(host), false, vals) {
+                Some(vals) => FiberStep::Finished(vals),
+                None => FiberStep::Stepped,
+            }
+        }
         Ok(Outcome::ContNew { funcref, arg0, dst }) => {
             match new_fiber(
                 &mut cell,
@@ -5419,6 +5423,16 @@ fn debug_advance_fiber(
         // #1366: a host-answered call parks the same way, and the backend surfaces
         // `StopReason::CapPark` until its embedder answers it.
         Ok(Outcome::CapPending { id, dst }) => FiberStep::CapParked { id, dst, at },
+        // #2742 — a serve op runs its handlers as fibers here too, so a step enters each handler's
+        // body. A `svc.wait` that would park stays the seam this engine declines.
+        Ok(Outcome::Serve { dst, wait, unit }) => {
+            let host = &mut HostCell::Excl(host);
+            match serve(vt, &mut cell, &unit, mem, host, false, dst, wait) {
+                Ok(None) => FiberStep::Stepped,
+                Ok(Some(_)) => FiberStep::Other(Outcome::SvcWait),
+                Err(t) => FiberStep::Trapped(t),
+            }
+        }
         // Threads / wait / notify / instantiate / (scheduled-engine) separate-module coroutine / tier-up
         // — a scheduler seam the caller applies (`service_advance` dispatches its subset, declines the rest).
         Ok(other) => FiberStep::Other(other),
@@ -6563,6 +6577,7 @@ fn service_advance(
             Outcome::CapPending { .. }
             | Outcome::LiveCall { .. }
             | Outcome::SvcWait
+            | Outcome::Serve { .. }
             | Outcome::ChildOffer { grant: false, .. }
             | Outcome::CloneCaller { .. } => return Serviced::Declined,
 
@@ -9354,6 +9369,14 @@ enum Outcome {
     /// domain until a caller's enqueue re-admits it. The cursor is persisted AT the op, so the
     /// wake re-executes the whole serve drain (the tree-walker's rewound park).
     SvcWait,
+    /// #2742 — a serve op (`svc.poll`, or `svc.wait` when `wait`) with a dispatch queued or a
+    /// handler of its own parked: the driver runs the next one as a handler fiber ([`serve`]). The
+    /// cursor is persisted AT the op; its result lands at `dst` once nothing is left to run.
+    Serve {
+        dst: u32,
+        wait: bool,
+        unit: std::sync::Arc<Compiled>,
+    },
     /// PROCESS.md S3 — `poll`/`detach`/`kill` on child `child` ([`Op::ChildCtl`]); driver-side, as
     /// it owns the task set. The answer (`poll`'s status, else 0) lands at `dst`.
     ChildCtl {
@@ -9631,6 +9654,23 @@ enum FiberState {
     /// rewound, so the fiber re-executes it when resumed. A `cont.resume` claims it once the op can
     /// proceed ([`HostWait::ready`]) and reports `FIBER_PARKED` without switching until then.
     HostParked { vm: Vm, on: HostWait },
+    /// #2742 — **event-parked on a live call's reply**: the fiber's call through a live offer queued
+    /// on the callee and parked the FIBER, not its task, as the oracle parks it (a fiber waiter in
+    /// its `ticket_waiters`). Not resumable until [`settle_wakes`] claims the reply into `woken`:
+    /// the call's result slots, laid out by the results its op declares, or the trap a reply that
+    /// cannot be completed raises ([`super::complete_call`]). A `cont.resume` meanwhile reports
+    /// `FIBER_PARKED` without switching.
+    TicketParked {
+        vm: Vm,
+        /// The call's first result register in `vm`.
+        dst: u32,
+        sig: super::OpSig,
+        ticket: u64,
+        callee: DomainCell,
+        /// The callee's [`Host::domain_id`]: a ticket names a call only with the domain that minted it.
+        callee_id: u64,
+        woken: Option<Result<Vec<i64>, Trap>>,
+    },
     /// Currently on the resume chain (active or an ancestor) — not independently resumable.
     /// `blocking_ip` (I48): `Some(ip)` if this fiber's current resume used `cont.resume.block`, so a
     /// park inside it idles the resumer (rewinding the resumer's cursor to `ip`) instead of returning
@@ -9643,6 +9683,9 @@ enum FiberState {
     },
     /// Returned; resuming again is a `FiberFault`.
     Done,
+    /// #2742 — a serve handler's slot once it has answered ([`release_handler`]), for the next
+    /// handler to take. No guest handle names one: a module that serves has no fibers of its own.
+    Free,
 }
 
 /// The §12 fiber registry's three parallel tables — the slots, each fiber's durable shadow-SP
@@ -9681,7 +9724,7 @@ impl FiberTables {
                 func: 0,
                 arg0: 0,
                 charge: match f {
-                    FiberState::Done => LiveFiber::none(),
+                    FiberState::Done | FiberState::Free => LiveFiber::none(),
                     _ => host.fiber_recharge(),
                 },
             })
@@ -9997,6 +10040,27 @@ fn claim_fiber(
             vm.set(cap_dst, Reg::from_i64(r));
             Ok(Claim::Continue(vm))
         }
+        // #2742 — a fiber parked on a live call: once its reply is claimed (`woken`), the resume
+        // lays the call's results into its result registers and continues it. A reply that could
+        // not be completed traps here, in the resumer's step, as the call itself would have.
+        Some(slot @ FiberState::TicketParked { .. }) => {
+            let FiberState::TicketParked { woken, .. } = slot else {
+                unreachable!()
+            };
+            let Some(reply) = woken.take() else {
+                return Ok(blocked());
+            };
+            let FiberState::TicketParked {
+                mut vm, dst, sig, ..
+            } = std::mem::replace(slot, running())
+            else {
+                unreachable!()
+            };
+            for (i, v) in super::result_regs(&reply?, sig.results()).enumerate() {
+                vm.set(dst + i as u32, v);
+            }
+            Ok(Claim::Continue(vm))
+        }
         Some(FiberState::Done) => Ok(Claim::Spent), // a finished slot keeps its place (#1684)
         _ => Err(Trap::FiberFault),                 // forged / Running
     })
@@ -10099,6 +10163,7 @@ fn return_from_fiber(
     vt: &mut VTask,
     fibers: &mut FiberCell,
     mem: &mut Option<Mem>,
+    host: &mut HostCell,
     durable: bool,
     vals: Vec<Value>,
 ) -> Option<Vec<Value>> {
@@ -10107,6 +10172,20 @@ fn return_from_fiber(
     };
     let id = vt.active_id;
     fibers.shadow_switch(mem, durable, vt, id, rid);
+    // #2742 — a handler's return answers its dispatch, and its serve loop, back at its serve op,
+    // counts it. The serve op's one result is not the resumer's `(status, value)` pair.
+    if let Some(ticket) = vt.active.dispatch() {
+        answer_dispatch(host, fibers, mem, ticket, &vals);
+        release_handler(fibers, id);
+        let mut handler = std::mem::replace(&mut vt.active, resumer);
+        vt.active.tls = handler.tls;
+        vt.active.profile = handler.profile.take();
+        vt.active_id = rid;
+        let serving = vt.active.rare();
+        serving.serve_count += 1;
+        serving.spare = Some(handler);
+        return None;
+    }
     let base = mem
         .as_ref()
         .map_or(0, |m| m.shadow_arena().frame_base(id + 1));
@@ -10141,6 +10220,191 @@ fn return_from_fiber(
     vt.active.set(rdst, Reg::from_i32(status));
     vt.active.set(rdst + 1, Reg::from_value(retval));
     None
+}
+
+/// #2742 — the serve op of `vt`'s running context (`svc.poll`, or `svc.wait` when `wait`), its
+/// result at `dst`: the tree-walk oracle's serve arm over this engine's fiber registry. Each
+/// dispatch runs as a **handler fiber** of the serving task, its serve loop the resumer, so a
+/// handler that parks parks alone and the loop goes on serving ([`park_running_fiber`]). A woken
+/// parked handler resumes first, its dispatch being older than any still queued; then the next
+/// queued dispatch starts. With neither, the op delivers how many it served, or a `svc.wait` that
+/// served none parks its task on its domain (`Some(SvcWait)`). The cursor stays at the op until it
+/// delivers, so each handler's return or park re-executes it. `unit` is the program the op runs in.
+#[allow(clippy::too_many_arguments)]
+fn serve(
+    vt: &mut VTask,
+    fibers: &mut FiberCell,
+    unit: &Compiled,
+    mem: &mut Option<Mem>,
+    host: &mut HostCell,
+    durable: bool,
+    dst: u32,
+    wait: bool,
+) -> Result<Option<VcpuStop>, Trap> {
+    let parked = std::mem::take(&mut vt.active.rare().handlers);
+    let mut woken = None;
+    let mut still = Vec::with_capacity(parked.len());
+    for k in parked {
+        if woken.is_none() {
+            match claim_fiber(fibers, host, k, 0, None, false)? {
+                Claim::Continue(vm) => {
+                    woken = Some((k, vm));
+                    continue;
+                }
+                Claim::Poll => {}
+                _ => return Err(Trap::FiberFault),
+            }
+        }
+        still.push(k);
+    }
+    vt.active.rare().handlers = still;
+    if let Some((k, mut vm)) = woken {
+        vt.active.lend_tier(&mut vm);
+        enter_fiber(vt, fibers, mem, durable, k, vm, dst);
+        return Ok(None);
+    }
+    // An un-servable dispatch settles inline with a probeable errno: the dispatch's fault, never the
+    // domain's, which keeps serving.
+    while let Some(d) = host.with(|p| p.svc_queue.pop_front()) {
+        // The queue only holds servable dispatches (checked at enqueue), so a missing handler here
+        // is host-state corruption: fail closed. Handlers are the domain's home-module functions
+        // (`home` — the primary, or a separate-module child's own unit); serving from any other
+        // unit would resolve indices against the wrong program table.
+        let fidx = host
+            .with(|p| p.svc_handler_func(d.export, d.op))
+            .ok_or(Trap::CapFault)? as usize;
+        let home = vt.active.home;
+        if vt.active.module != home {
+            return Err(Trap::CapFault);
+        }
+        let (params, _) = unit.sigs.get(fidx).ok_or(Trap::CapFault)?;
+        let refuse = |host: &mut HostCell, errno| {
+            host.with(|p| {
+                let v = p.settle_page(d.ticket, errno, None);
+                p.svc_results.insert(d.ticket, super::Reply::Failed(v))
+            })
+        };
+        if d.args.len() != params.len() {
+            refuse(host, super::EINVAL);
+            continue;
+        }
+        // A full registry is backpressure to the dispatch, as on the oracle, not a trap.
+        let Some(k) = handler_slot(fibers, mem) else {
+            refuse(host, super::EAGAIN);
+            continue;
+        };
+        let args = (d.args.iter().zip(params.iter())).map(|(a, ty)| slot_to_val(*ty, *a));
+        let mut vm = match vt.active.rare().spare.take() {
+            Some(mut vm) => {
+                vm.restart(unit, fidx, args)?;
+                vm
+            }
+            None => Vm::new(unit, fidx, &args.collect::<Vec<_>>(), payer(host))?,
+        };
+        vm.module = home;
+        vm.home = home;
+        vm.durable_region_base = mem
+            .as_ref()
+            .map_or(super::ShadowArena::EMPTY, |m| m.shadow_arena())
+            .region_base(k + 1);
+        vm.rare().dispatch = Some(d.ticket);
+        vt.active.lend_tier(&mut vm);
+        enter_fiber(vt, fibers, mem, durable, k, vm, dst);
+        return Ok(None);
+    }
+    Ok(vt
+        .active
+        .serve_idle(host, dst, wait)
+        .then_some(VcpuStop::SvcWait))
+}
+
+/// #2742 — a fiber slot for a new handler, `Running` from the start, as [`serve`] builds the
+/// handler's first frame itself: a finished handler's, or a new one. `None` when the registry is
+/// full. A handler is mechanism, charged to nothing (#2112), as on the oracle.
+fn handler_slot(fibers: &mut FiberCell, mem: &Option<Mem>) -> Option<usize> {
+    let arena = mem
+        .as_ref()
+        .map_or(super::ShadowArena::EMPTY, |m| m.shadow_arena());
+    let running = || FiberState::Running {
+        blocking_ip: None,
+        pending: None,
+    };
+    fibers.with(|f, sp, meta| {
+        if let Some(k) = f.iter().position(|s| matches!(s, FiberState::Free)) {
+            f[k] = running();
+            sp[k] = arena.frame_base(k + 1);
+            meta[k].charge = LiveFiber::none();
+            return Some(k);
+        }
+        if f.len() + 1 >= super::MAX_FIBERS {
+            return None;
+        }
+        let k = f.len();
+        f.push(running());
+        sp.push(arena.frame_base(k + 1));
+        meta.push(FiberMeta {
+            func: 0,
+            arg0: 0,
+            charge: LiveFiber::none(),
+        });
+        Some(k)
+    })
+}
+
+/// #2742 — handler fiber `k` returned: its slot is free for the next handler, and the registry
+/// drops the free slots at its end, so an idle serve loop leaves no fiber for a freeze to carry.
+fn release_handler(fibers: &mut FiberCell, k: usize) {
+    fibers.with(|f, sp, meta| {
+        f[k] = FiberState::Free;
+        while f.last().is_some_and(|s| matches!(s, FiberState::Free)) {
+            f.pop();
+            sp.pop();
+            meta.pop();
+        }
+    });
+}
+
+/// #2742 — answer dispatch `ticket` with a handler's results, every one (INVARIANTS #8). #1862,
+/// #2164: a page request's bytes move now, from the serving domain's window, before its child can
+/// claim the reply; its status is the handler's one result. A fiber of this domain parked on the
+/// call (a handler that called its own domain) takes the reply at once, as the oracle's parked
+/// caller beats the cell: one powerbox, so no handle crosses. Any other caller claims it from the
+/// cell ([`settle_wakes`]).
+fn answer_dispatch(
+    host: &mut HostCell,
+    fibers: &mut FiberCell,
+    mem: &Option<Mem>,
+    ticket: u64,
+    vals: &[Value],
+) {
+    let mut results: Vec<i64> = vals.iter().map(|v| super::val_to_slot(*v)).collect();
+    let own = host.with(|p| {
+        if let Some(first) = results.first_mut() {
+            *first = p.settle_page(ticket, *first, mem.as_ref().map(|m| m as _));
+        }
+        p.domain_id()
+    });
+    let mut results = Some(results);
+    fibers.with(|f, _, _| {
+        for fib in f.iter_mut() {
+            if let FiberState::TicketParked {
+                ticket: t,
+                callee_id,
+                woken: woken @ None,
+                ..
+            } = fib
+            {
+                if *t == ticket && *callee_id == own {
+                    *woken = results.take().map(Ok);
+                    return;
+                }
+            }
+        }
+    });
+    host.with(|p| match results {
+        Some(results) => _ = p.svc_results.insert(ticket, super::Reply::Results(results)),
+        None => _ = p.svc_payers.remove(&ticket),
+    });
 }
 
 /// #1952 — what a [`FiberState::HostParked`] fiber waits on.
@@ -10239,24 +10503,31 @@ fn drain_fiber_completions(domains: &mut [Domain]) -> bool {
 /// (`BlockedOnFiber`), as the parallel driver counts them. A fiber no task resumes is left out, one
 /// of a domain that has finished, say (#2480): its answer wakes no one, so nothing waits for it.
 fn outstanding_calls(tasks: &[TaskSlot], domains: &[Domain]) -> Vec<(usize, u64)> {
-    tasks
-        .iter()
-        .filter_map(|t| call_awaited(t, domains).map(|id| (t.domain, id)))
+    (tasks.iter())
+        .flat_map(|t| calls_awaited(t, domains).map(|id| (t.domain, id)))
         .collect()
 }
 
-/// The punted call task `t` waits on, if it does ([`outstanding_calls`]).
-fn call_awaited(t: &TaskSlot, domains: &[Domain]) -> Option<u64> {
-    match t.state {
+/// The punted calls task `t` waits on ([`outstanding_calls`]): its own, that of the fiber it idles
+/// on, or, a `svc.wait`, those of its parked handlers (#2742).
+fn calls_awaited<'a>(t: &'a TaskSlot, domains: &'a [Domain]) -> impl Iterator<Item = u64> + 'a {
+    let own = match t.state {
         TaskState::BlockedHostCap { id, .. } => Some(id),
-        TaskState::BlockedOnFiber { fiber } => match domains[t.domain].fibers.fibers.get(fiber) {
+        _ => None,
+    };
+    let fibers: &[usize] = match &t.state {
+        TaskState::BlockedOnFiber { fiber } => std::slice::from_ref(fiber),
+        TaskState::BlockedSvc => t.vm.vt.active.handlers(),
+        _ => &[],
+    };
+    let registry = &domains[t.domain].fibers.fibers;
+    own.into_iter()
+        .chain(fibers.iter().filter_map(move |&k| match registry.get(k) {
             Some(FiberState::CapParked {
                 id, woken: None, ..
             }) => Some(*id),
             _ => None,
-        },
-        _ => None,
-    }
+        }))
 }
 
 /// What only the world can end (#1122): the verdict on a run in which no task can run, no wait's
@@ -10548,10 +10819,16 @@ fn freeze_drive(
     // The tree-walker's classification, before anything is consumed: an unwoken **cap** park would
     // spill the freeze placeholder as the call's result, which its thaw cannot re-derive, so it
     // fails the whole freeze closed.
-    if fibers
-        .iter()
-        .any(|f| matches!(f, FiberState::CapParked { woken: None, .. }))
-    {
+    if fibers.iter().any(|f| {
+        matches!(
+            f,
+            FiberState::CapParked { woken: None, .. }
+                | FiberState::TicketParked {
+                    woken: None | Some(Err(_)),
+                    ..
+                }
+        )
+    }) {
         return Err(Trap::FiberFault);
     }
     let mut frozen = Vec::new();
@@ -10594,6 +10871,18 @@ fn freeze_drive(
                 vm.set(dst, Reg::from_i64(r));
                 (vm, false)
             }
+            FiberState::TicketParked {
+                mut vm,
+                dst,
+                sig,
+                woken: Some(Ok(slots)),
+                ..
+            } => {
+                for (i, v) in super::result_regs(&slots, sig.results()).enumerate() {
+                    vm.set(dst + i as u32, v);
+                }
+                (vm, false)
+            }
             // A pipe or stdin park's op is rewound (#1952): the unwind re-runs it, and it abandons
             // itself under the landing freeze (`abandon_for_freeze`), for the thaw to re-issue.
             FiberState::HostParked { vm, .. } => (vm, false),
@@ -10609,7 +10898,9 @@ fn freeze_drive(
                         generation: 0,
                         consumed: false,
                     }),
-                    FiberState::Done => frozen.push(super::FrozenFiber::free(slot, 0)),
+                    FiberState::Done | FiberState::Free => {
+                        frozen.push(super::FrozenFiber::free(slot, 0))
+                    }
                     _ => {}
                 }
                 fibers[slot] = other;
@@ -10792,7 +11083,8 @@ fn gc_scan_beneath(
                 if let FiberState::Parked { vm, .. }
                 | FiberState::WaitParked { vm, .. }
                 | FiberState::CapParked { vm, .. }
-                | FiberState::HostParked { vm, .. } = fib
+                | FiberState::HostParked { vm, .. }
+                | FiberState::TicketParked { vm, .. } = fib
                 {
                     scan_vm_roots(vm, source, &mut consider);
                 }
@@ -10969,7 +11261,7 @@ fn drive_nested(
         match vt.active.resume(source, table, fuel, mem, host, budget)? {
             Outcome::Done(vals) => {
                 // The entry finished — the bounce's or the invoke's results — or a fiber returned.
-                if let Some(vals) = return_from_fiber(&mut vt, fibers, mem, false, vals) {
+                if let Some(vals) = return_from_fiber(&mut vt, fibers, mem, host, false, vals) {
                     return Ok(Nested::Done(vals));
                 }
             }
@@ -11056,6 +11348,13 @@ fn drive_nested(
             // synchronous invoke, the seam the §22 contract forbids.
             Outcome::FiberSuspend { value, dst } => {
                 suspend_fiber(&mut vt, fibers, mem, false, value, dst, Trap::CapFault)?
+            }
+            // #2742 — a serve op, as a task's step serves it. A nested drive cannot park its task, so a
+            // `svc.wait` that would faults, as it always has here.
+            Outcome::Serve { dst, wait, unit } => {
+                if serve(&mut vt, fibers, &unit, mem, host, false, dst, wait)?.is_some() {
+                    return Err(Trap::CapFault);
+                }
             }
             // #1233: a §22 `Jit.install`/`uninstall` reached from a bounced **tier-up region** — the
             // interpreted-inline-call territory (`run_meta` is `Some`) where the pump's own install arm
@@ -11331,7 +11630,7 @@ enum VcpuStop {
 
 impl Outcome {
     /// The stop an op makes for its executor ([`step_vcpu`]), or, for what a drive serves itself (its
-    /// end, a spent quantum, a fiber op, `gc.roots`), the outcome back. A nested drive hands back the
+    /// end, a spent quantum, a fiber op, `gc.roots`, a serve op), the outcome back. A nested drive hands back the
     /// same stops ([`BounceRunCtx::park`]), so both reach the one rule set ([`SchedCore::on_stop`]).
     fn into_stop(self) -> Result<VcpuStop, Outcome> {
         Ok(match self {
@@ -11456,7 +11755,8 @@ impl Outcome {
             | Outcome::ContNew { .. }
             | Outcome::ContResume { .. }
             | Outcome::FiberSuspend { .. }
-            | Outcome::GcRoots { .. }) => return Err(o),
+            | Outcome::GcRoots { .. }
+            | Outcome::Serve { .. }) => return Err(o),
         })
     }
 }
@@ -11570,7 +11870,9 @@ fn step_vcpu(
             }
             Outcome::Done(vals) => {
                 // The vCPU's root activation finished, or a fiber returned to its resumer.
-                if let Some(vals) = return_from_fiber(vt, fibers, ctx.mem, ctx.durable, vals) {
+                if let Some(vals) =
+                    return_from_fiber(vt, fibers, ctx.mem, &mut ctx.host, ctx.durable, vals)
+                {
                     return Ok(VcpuStop::Done(vals));
                 }
             }
@@ -11625,6 +11927,12 @@ fn step_vcpu(
                 dst,
                 Trap::FiberFault,
             )?,
+            Outcome::Serve { dst, wait, unit } => {
+                let (mem, host) = (&mut *ctx.mem, &mut ctx.host);
+                if let Some(stop) = serve(vt, fibers, &unit, mem, host, ctx.durable, dst, wait)? {
+                    return Ok(stop);
+                }
+            }
             // §GC `gc.roots`: scan the whole vCPU continuation — the active window, its call stack
             // (covered by `scan_vm_roots`), every resume-chain ancestor, every parked fiber, and every
             // suspended coroutine — for words that (masked) land in `[lo, hi)`. A **sound superset**
@@ -12113,11 +12421,25 @@ fn park_running_fiber(
         Some(FiberState::Running { blocking_ip, .. }) => *blocking_ip,
         _ => None,
     };
+    let handler = vt.active.dispatch().is_some();
     let (rid, resumer, rdst) = vt.chain.pop().expect("a running fiber has a resumer");
     shadow_switch(mem, fiber_sp, &mut vt.root_shadow_sp, durable, k, rid);
-    fibers[k] = park(std::mem::replace(&mut vt.active, resumer));
+    // `vcpu.tls` is the vCPU's word, not the fiber's: it goes back with execution, and so does a
+    // handler's hotness profile, its serve loop's ([`Vm::lend_tier`]).
+    let mut parked = std::mem::replace(&mut vt.active, resumer);
+    vt.active.tls = parked.tls;
+    if handler {
+        vt.active.profile = parked.profile.take();
+    }
+    fibers[k] = park(parked);
     vt.active_id = rid;
     let woken = woken(fibers);
+    // #2742 — a handler's park leaves it to its serve loop, its resumer, which goes on serving and
+    // resumes it once woken ([`serve`]).
+    if handler {
+        vt.active.rare().handlers.push(k);
+        return None;
+    }
     if let (Some(ip), true) = (blocking_ip, can_idle) {
         vt.active.pc = ip;
         return (!woken).then_some(k);
@@ -12183,6 +12505,42 @@ fn host_park_fiber(tasks: &mut [TaskSlot], ti: usize, domains: &mut [Domain], st
     }
 }
 
+/// #2742 — task `ti`'s running fiber (never fiber 0) parks on its live call's reply
+/// ([`FiberState::TicketParked`]), in its task's domain: `call` is the call's ticket and its
+/// callee's cell and id. Nothing rechecks the reply: the call was only now queued, and a reply that
+/// comes before the next settle waits in the callee's results for [`settle_wakes`] to claim.
+fn ticket_park_fiber(
+    tasks: &mut [TaskSlot],
+    ti: usize,
+    domains: &mut [Domain],
+    (ticket, callee, callee_id): (u64, DomainCell, u64),
+    dst: u32,
+    sig: super::OpSig,
+) {
+    let durable = domains[0].host.lock_unpoisoned().is_durable();
+    let e = &mut domains[tasks[ti].domain];
+    if let Some(k) = park_running_fiber(
+        &mut tasks[ti].vm.vt,
+        &mut e.fibers.fibers,
+        &mut e.fibers.sp,
+        &mut e.mem,
+        durable,
+        true,
+        |vm| FiberState::TicketParked {
+            vm,
+            dst,
+            sig,
+            ticket,
+            callee,
+            callee_id,
+            woken: None,
+        },
+        |_| false,
+    ) {
+        tasks[ti].state = TaskState::BlockedOnFiber { fiber: k };
+    }
+}
+
 impl TaskState {
     /// #1904 — the [`super::ParkSite`] this state parks at, so a freeze applies the one rule for it
     /// ([`super::ParkSite::freeze_rule`], DURABILITY §4 "One rule per park site"). Exhaustive, so a
@@ -12233,18 +12591,29 @@ fn freeze_step(
         *freeze_on_quiesce = false;
         let parked_declined = tasks.iter().enumerate().find_map(|(ti, t)| {
             let site = t.state.park_site()?;
-            (freeze_rule_here(site) == FreezeRule::Decline).then_some((site, ti))
+            (freeze_rule_here(site) == FreezeRule::Decline).then_some((site, ti, None))
+        });
+        // #2742 — a fiber parked on a live call waits on a reply as a task does, so it declines
+        // alike, named by the task idling on it (or the root's) and, as the oracle names a fiber
+        // park, by its slot.
+        let parked_declined = parked_declined.or_else(|| {
+            let k = (root.fibers.fibers.iter())
+                .position(|f| matches!(f, FiberState::TicketParked { .. }))?;
+            let on =
+                |t: &TaskSlot| matches!(t.state, TaskState::BlockedOnFiber { fiber } if fiber == k);
+            let ti = tasks.iter().position(on).unwrap_or(0);
+            Some((super::ParkSite::Reply, ti, Some(k)))
         });
         let declined = match (forked_twins.first(), parked_declined) {
-            (Some(&twin), _) => Some((DeclineCause::ForkTwin, twin)),
-            (None, Some((site, ti))) => Some((DeclineCause::Parked(site), ti)),
+            (Some(&twin), _) => Some((DeclineCause::ForkTwin, twin, None)),
+            (None, Some((site, ti, slot))) => Some((DeclineCause::Parked(site), ti, slot)),
             (None, None) => None,
         };
-        if let Some((cause, task)) = declined {
+        if let Some((cause, task, slot)) = declined {
             host.freeze_declined = Some(FreezeDeclined {
                 cause,
                 task: task as u64,
-                slot: None,
+                slot,
             });
             return true;
         }
@@ -12630,6 +12999,10 @@ struct Held {
     /// The activations made for calls through the queue since an executor last took them, each with
     /// the task whose call it answers: on executor 2 that task's thread carries it.
     made: Vec<(usize, usize)>,
+    /// The task that made each call into the domain through its queue, by ticket, until an
+    /// activation takes the call ([`serve_resting`]). The call parked the task, or only the fiber
+    /// that made it (#2742), whose task's thread still carries it.
+    callers: std::collections::BTreeMap<u64, usize>,
 }
 
 impl Held {
@@ -12724,15 +13097,8 @@ fn serve_resting(
         let payer = host.lock_unpoisoned().svc_payers.remove(&d.ticket);
         let fuel = payer.map_or_else(|| domains[0].fuel.for_thread(), Fuel::drawn);
         let to = super::AnswerTo::Ticket(d.ticket);
-        // The task parked on the call, whose thread carries it on executor 2.
-        let carrier = tasks.iter().position(|t| match &t.state {
-            TaskState::BlockedTicket { ticket, callee, .. }
-            | TaskState::BlockedPage {
-                ticket,
-                pager: callee,
-            } => *ticket == d.ticket && std::sync::Arc::ptr_eq(callee, host),
-            _ => false,
-        });
+        // The task that made the call, whose thread carries it on executor 2.
+        let carrier = held.callers.remove(&d.ticket);
         let (export, op) = (d.export, d.op);
         let made = activation(
             tasks, domains, held, source, export, op, &d.args, fuel, to, carrier,
@@ -12971,6 +13337,34 @@ fn settle_wakes(
     for (i, trap) in refused {
         complete(tasks, domains, i, Err(trap));
     }
+    // #2742 — a fiber parked on a live call wakes the same way: its reply, laid out for its own
+    // domain's powerbox, waits in the fiber for the resume that delivers it.
+    for e in domains.iter_mut() {
+        for f in e.fibers.fibers.iter_mut() {
+            let FiberState::TicketParked {
+                ticket,
+                callee,
+                sig,
+                woken: woken @ None,
+                ..
+            } = f
+            else {
+                continue;
+            };
+            let reply = {
+                let mut c = callee.lock_unpoisoned();
+                let reply = c.svc_results.remove(ticket);
+                if reply.is_some() {
+                    c.svc_payers.remove(ticket);
+                }
+                reply
+            };
+            if let Some(reply) = reply {
+                let to = &mut super::CallerHost::Cell(&e.host);
+                *woken = Some(super::complete_call(reply, sig.results(), callee, to));
+            }
+        }
+    }
     // #1215 — the default-action TERMINATE, cooperative form (invariant 14). A domain the
     // personality has terminated (a `SIG_DFL` SIGKILL/SIGTERM/SIGINT delivered through the gate,
     // `term_sig` set) must DIE. A task mid-step dies at its next op, through its domain's
@@ -13183,22 +13577,31 @@ fn settle_wakes(
     // the next step re-executes it and claims the now-woken fiber. Centralized here so every
     // wake source feeds it uniformly (no per-site wiring). Runs before the pick so a fiber
     // woken during the previous step is seen this iteration.
+    // #2742 — and a `svc.wait` wakes once one of its parked handlers can resume.
     for t in tasks.iter_mut() {
-        if let TaskState::BlockedOnFiber { fiber } = t.state {
-            let woken = match domains[t.domain].fibers.fibers.get(fiber) {
-                Some(
-                    FiberState::WaitParked { woken: Some(_), .. }
-                    | FiberState::CapParked { woken: Some(_), .. },
-                ) => true,
-                Some(FiberState::HostParked { on, .. }) => {
-                    on.ready(&domains[t.domain].host.lock_unpoisoned())
-                }
-                _ => false,
-            };
-            if woken {
-                t.state = TaskState::Runnable;
-            }
+        let e = &domains[t.domain];
+        let woken = match t.state {
+            TaskState::BlockedOnFiber { fiber } => fiber_woken(e, fiber),
+            TaskState::BlockedSvc => t.vm.vt.active.handlers().iter().any(|&k| fiber_woken(e, k)),
+            _ => false,
+        };
+        if woken {
+            t.state = TaskState::Runnable;
         }
+    }
+}
+
+/// Whether event-parked fiber `k` of domain `e` can be claimed now: its event fired, or the host op
+/// it waits on can proceed.
+fn fiber_woken(e: &Domain, k: usize) -> bool {
+    match e.fibers.fibers.get(k) {
+        Some(
+            FiberState::WaitParked { woken: Some(_), .. }
+            | FiberState::CapParked { woken: Some(_), .. }
+            | FiberState::TicketParked { woken: Some(_), .. },
+        ) => true,
+        Some(FiberState::HostParked { on, .. }) => on.ready(&e.host.lock_unpoisoned()),
+        _ => false,
     }
 }
 
@@ -13529,7 +13932,7 @@ impl CoopSched {
                         e.fibers
                             .fibers
                             .iter()
-                            .any(|f| !matches!(f, FiberState::Done))
+                            .any(|f| !matches!(f, FiberState::Done | FiberState::Free))
                     }) {
                         return Err(Trap::FiberFault);
                     }
@@ -13692,10 +14095,12 @@ impl CoopSched {
                     } else if !awaits_call
                         && matches!(
                             t.state,
-                            TaskState::BlockedHostCap { .. } | TaskState::BlockedOnFiber { .. }
+                            TaskState::BlockedHostCap { .. }
+                                | TaskState::BlockedOnFiber { .. }
+                                | TaskState::BlockedSvc
                         )
                     {
-                        awaits_call = call_awaited(t, domains).is_some();
+                        awaits_call = calls_awaited(t, domains).next().is_some();
                     }
                 }
                 runnable >= 2 || awaits_call
@@ -14129,18 +14534,28 @@ impl SchedCore {
                     }
                     // Wake any svc.wait-parked task of the callee's domain — the tree-walker's
                     // `svc_wake` — then park the caller on its ticket.
-                    Ok((Some(ticket), _)) => {
+                    Ok((Some(ticket), callee_id)) => {
                         if let Some(env) = callee_env {
                             wake_serve_loops(tasks, env);
                         }
-                        tasks[ti].state = TaskState::BlockedTicket {
-                            ticket,
-                            callee,
-                            dst,
-                            sig,
-                        };
-                        // #2695 step 2 — a resting held domain runs the call as an activation.
+                        // #2742 — a fiber's call parks the fiber, not its task, as the oracle parks
+                        // it: the resumer goes on, or idles under a blocking resume, until the reply.
+                        if tasks[ti].vm.vt.active_id != ROOT_FIBER {
+                            let call = (ticket, callee, callee_id);
+                            ticket_park_fiber(tasks, ti, domains, call, dst, sig);
+                        } else {
+                            tasks[ti].state = TaskState::BlockedTicket {
+                                ticket,
+                                callee,
+                                dst,
+                                sig,
+                            };
+                        }
+                        // #2695 step 2 — a call into the held domain names the task that made it,
+                        // whose thread carries the activation that answers it on executor 2; a
+                        // resting domain starts that activation now.
                         if let (Some(h), Some(0)) = (held.as_mut(), callee_env) {
+                            h.callers.insert(ticket, ti);
                             serve_resting(tasks, domains, h, source);
                         }
                     }
@@ -14177,6 +14592,9 @@ impl SchedCore {
                 wake_serve_loops(tasks, pager_env);
                 if let Some(ticket) = ticket {
                     tasks[ti].state = TaskState::BlockedPage { ticket, pager };
+                    if let (Some(h), 0) = (held.as_mut(), pager_env) {
+                        h.callers.insert(ticket, ti);
+                    }
                 }
             }
             Ok(VcpuStop::CapPending { id, dst }) => {
@@ -14296,7 +14714,7 @@ impl SchedCore {
                 let result: i64 = 'fork: {
                     // The running handler's dispatch ticket names the parked caller; outside a
                     // handler there is none → `-EINVAL`, exactly as the oracle.
-                    let Some((ticket, _)) = tasks[ti].vm.vt.active.serve_ticket() else {
+                    let Some(ticket) = tasks[ti].vm.vt.active.dispatch() else {
                         break 'fork super::EINVAL;
                     };
                     // The server (this task) is the callee the caller parked on. In the fork
@@ -14411,7 +14829,7 @@ impl SchedCore {
                 // it finished) or park the caller until it does. `-ECHILD` for a pid this run did not
                 // mint (the handler's own reply carries it); `-EINVAL` outside a handler. Never a hang.
                 let result: i64 = 'reap: {
-                    let Some((ticket, _)) = tasks[ti].vm.vt.active.serve_ticket() else {
+                    let Some(ticket) = tasks[ti].vm.vt.active.dispatch() else {
                         break 'reap super::EINVAL;
                     };
                     let server_env = tasks[ti].domain;
@@ -14486,7 +14904,7 @@ impl SchedCore {
                 // (the shell / `bash -c` replacing itself) and a **fork-twin** exec (bash forking
                 // then exec'ing an external command) are serviced; they differ only in where the
                 // rebuilt activation's window/host/table live.
-                let clean = tasks[ti].vm.vt.active.serve_ticket().is_none()
+                let clean = tasks[ti].vm.vt.active.dispatch().is_none()
                     && tasks[ti].answers.is_none()
                     && tasks[ti].vm.vt.active_id == ROOT_FIBER
                     && !domains[0].host.lock_unpoisoned().is_durable();
@@ -14576,14 +14994,15 @@ impl SchedCore {
                 }
             }
             Ok(VcpuStop::SpawnSelf { cmd, plan, dst }) => {
-                // A personality `posix_spawn` ([`spawn_task`]). The tree-walker's gate: a request
-                // from a fiber keeps its placeholder, and a serve handler is not a clean root.
-                if tasks[ti].vm.vt.active_id != ROOT_FIBER {
-                    tasks[ti].deliver(dst, Reg::from_i64(temen_ir::errno::ENOSYS));
+                // A personality `posix_spawn` ([`spawn_task`]). The tree-walker's gate: a serve
+                // handler, a fiber of the serving task (#2742), is not a clean root, and a request
+                // from any other fiber keeps its placeholder.
+                if tasks[ti].vm.vt.active.dispatch().is_some() || tasks[ti].answers.is_some() {
+                    tasks[ti].deliver(dst, Reg::from_i64(super::EINVAL));
                     return None;
                 }
-                if tasks[ti].vm.vt.active.serve_ticket().is_some() || tasks[ti].answers.is_some() {
-                    tasks[ti].deliver(dst, Reg::from_i64(super::EINVAL));
+                if tasks[ti].vm.vt.active_id != ROOT_FIBER {
+                    tasks[ti].deliver(dst, Reg::from_i64(temen_ir::errno::ENOSYS));
                     return None;
                 }
                 let r = spawn_task(
@@ -18140,6 +18559,22 @@ impl ThreadRun {
             | TaskState::BlockedPipeWrite { .. }
             | TaskState::BlockedStdin => ParkFor::Poll,
             TaskState::BlockedHostCap { id, .. } => ParkFor::Answer(id),
+            // #2742 — a `svc.wait` whose parked handler waits on the host polls for it; one woken
+            // by a reply or a call is woken at the settle that brings it.
+            TaskState::BlockedSvc => {
+                let fibers = &core.domains[t.domain].fibers.fibers;
+                let polls = t.vm.vt.active.handlers().iter().any(|&k| {
+                    matches!(
+                        fibers.get(k),
+                        Some(FiberState::HostParked { .. } | FiberState::CapParked { .. })
+                    )
+                });
+                if polls {
+                    ParkFor::Poll
+                } else {
+                    ParkFor::Wake
+                }
+            }
             TaskState::BlockedOnFiber { fiber } => {
                 match core.domains[t.domain].fibers.fibers.get(fiber) {
                     Some(FiberState::WaitParked {
@@ -19014,6 +19449,20 @@ fn teardown_domains(
             for (i, dst, sig) in unanswered {
                 fail_call(tasks, domains, i, dst, sig.results(), super::CAP_REVOKED);
             }
+            // #2742 — and so does a fiber parked on a call into it, at its resume.
+            for f in domains.iter_mut().flat_map(|e| e.fibers.fibers.iter_mut()) {
+                if let FiberState::TicketParked {
+                    callee,
+                    sig,
+                    woken: woken @ None,
+                    ..
+                } = f
+                {
+                    if std::sync::Arc::ptr_eq(callee, &dying) {
+                        *woken = Some(super::failed_slots(super::CAP_REVOKED, sig.results()));
+                    }
+                }
+            }
             for i in stranded {
                 complete(tasks, domains, i, Err(Trap::MemoryFault));
             }
@@ -19167,31 +19616,17 @@ struct VmRare {
     /// `COPY_PROCENV` memcpy of `top_level` — carry the checkpoint identity with the bytes; bounded
     /// by pruning checkpoints whose `setjmp` activation has returned (`SetJmp` op).
     setjmp_points: std::collections::BTreeMap<u64, ByteSetJmp>,
-    /// §3.6 serve-loop core (I36 slice 1): the in-flight handler ([`Serving`]) — `Some` between
-    /// admitting a handler activation (whose return linkage rewinds into the `SvcPoll` op) and the
-    /// re-execution that settles its results — and the count of dispatches completed by the
-    /// current `svc.poll` activation.
-    serve_ticket: Option<Serving>,
+    /// §3.6 serve-loop core, #2742: on a handler fiber, the ticket of the dispatch it answers, which
+    /// its return replies to ([`return_from_fiber`]). A serve op inside it refuses (#2160).
+    dispatch: Option<u64>,
+    /// On a serve loop: its handlers that parked, by fiber slot, oldest first. Its serve op resumes
+    /// each once woken ([`serve`]), and a `svc.wait` that parks wakes for them too.
+    handlers: Vec<usize>,
+    /// On a serve loop: the `Vm` of the handler that last answered, which the next handler restarts
+    /// ([`Vm::restart`]) rather than building its own.
+    spare: Option<Vm>,
+    /// The count of dispatches completed by the current `svc.poll` / `svc.wait` activation.
     serve_count: i64,
-}
-
-/// §3.6 — a serve loop's in-flight handler: its dispatch's ticket, the depth of the serve frame that
-/// admitted it (`stack.len()` there), and its function. INVARIANTS #8: its return lays its results
-/// just past its own frame ([`Serving::results_at`]), where they alias neither the frame they are
-/// copied from nor the serve frame, and the serve op settles every one of them.
-#[derive(Clone, Copy, Debug)]
-struct Serving {
-    ticket: u64,
-    depth: usize,
-    func: usize,
-}
-
-impl Serving {
-    /// Where the handler's return lays its results, for a serve frame of program `serve`'s at `base`
-    /// in `c`.
-    fn results_at(&self, c: &Compiled, base: usize, serve: usize) -> usize {
-        base + c.prog(serve).nslots as usize + c.prog(self.func).nslots as usize
-    }
 }
 
 const _: () = assert!(std::mem::size_of::<Vm>() <= 256);
@@ -19355,6 +19790,17 @@ impl Vm {
         self.jit_entry = Some(leaf.parks);
     }
 
+    /// #2742 — lend this serve loop's tier-up to handler fiber `to`, which runs as the loop's own
+    /// frames once did: its calls tier up as the loop's would, and the hotness profile goes with
+    /// execution, so the task keeps one ([`Self::tier_up`]). The park or the return that hands
+    /// execution back hands the profile back too.
+    fn lend_tier(&mut self, to: &mut Vm) {
+        to.jit_eligible = self.jit_eligible.clone();
+        to.jit_module = self.jit_module;
+        to.jit_page_checked = self.jit_page_checked;
+        to.profile = self.profile.take();
+    }
+
     /// Undo [`Self::tier_up`]: every call interprets.
     fn tier_down(&mut self) {
         self.jit_eligible = None;
@@ -19443,10 +19889,32 @@ impl Vm {
         self.rare.get_or_insert_default()
     }
 
-    /// The serve loop's in-flight ticket and the depth of the frame that admitted it.
-    fn serve_ticket(&self) -> Option<(u64, usize)> {
-        let s = self.rare.as_ref()?.serve_ticket?;
-        Some((s.ticket, s.depth))
+    /// #2742 — the ticket of the dispatch this handler fiber answers; `None` off a handler.
+    fn dispatch(&self) -> Option<u64> {
+        self.rare.as_ref()?.dispatch
+    }
+
+    /// #2742 — this serve loop's parked handlers, by fiber slot ([`VmRare::handlers`]).
+    fn handlers(&self) -> &[usize] {
+        self.rare.as_ref().map_or(&[], |r| &r.handlers)
+    }
+
+    /// The serve op at `dst`, whose cursor is persisted, found nothing to run. A `svc.wait`
+    /// (`wait`) that served none parks its task on its domain (`true`): a wake re-executes the op.
+    /// Otherwise the op delivers the count it served and the activation closes. #1217 — a client of
+    /// this domain ended: `svc.wait` answers `0` instead of parking on a queue no client can fill.
+    /// Consulted only where it would park, so queued work is served first and the token outlives it.
+    fn serve_idle(&mut self, host: &mut HostCell, dst: u32, wait: bool) -> bool {
+        let served = self.rare.as_ref().map_or(0, |r| r.serve_count);
+        if wait && served == 0 && !host.with(Host::take_client_gone) {
+            return true;
+        }
+        if let Some(r) = self.rare.as_mut() {
+            r.serve_count = 0;
+        }
+        self.set(dst, Reg::from_i64(served));
+        self.pc += 1;
+        false
     }
 
     /// #2336 — hold again, past any ceiling, what the `Vm` this copies held ([`RegsRoom`]): a copy
@@ -19499,6 +19967,37 @@ impl Vm {
             sig_handler_stack: Vec::new(), // #1146 — no delivery in flight at entry
             rare: None,
         })
+    }
+
+    /// #2742 — make this answered handler's `Vm` the entry activation of `entry` with `args`, as
+    /// [`Vm::new`] opens one, keeping what it holds: its register file and the room charged for it,
+    /// and its rare part, emptied.
+    fn restart(
+        &mut self,
+        c: &Compiled,
+        entry: usize,
+        args: impl Iterator<Item = Value>,
+    ) -> Result<(), Trap> {
+        if entry >= c.progs.len() {
+            return Err(Trap::Malformed);
+        }
+        let n = c.prog(entry).nslots as usize;
+        if self.regs.len() < n {
+            self.room.grow(&mut self.regs, n)?;
+        }
+        self.regs[..n].fill(Reg::default());
+        for (i, a) in args.enumerate() {
+            *self.regs.get_mut(i).ok_or(Trap::Malformed)? = Reg::from_value(a);
+        }
+        self.stack.clear();
+        self.scratch.clear();
+        self.sig_handler_stack.clear();
+        (self.module, self.cur, self.base, self.pc) = (0, entry, 0, 0);
+        (self.work, self.entered) = (0, 0);
+        if let Some(r) = self.rare.as_mut() {
+            **r = VmRare::default();
+        }
+        Ok(())
     }
 
     /// Write a value to a frame-relative slot of the *current* (persisted) activation window. Used
@@ -19640,7 +20139,9 @@ impl Vm {
         // active module is held as an owned `Arc<Compiled>` (`c`) — independent of `local`, so a refresh
         // can't invalidate it — re-resolved only when an activation crosses modules (so the per-op hot
         // path, `c.*` via `Arc` deref, is unchanged). `resolve!` returns the `Arc` for a module index.
-        let mut local: Vec<std::sync::Arc<Compiled>> = source.snapshot();
+        // #2742 — a resume resolves only the module it enters; the cache is filled on the first
+        // activation that crosses modules, so an entry costs no clone of every unit.
+        let mut local: Vec<std::sync::Arc<Compiled>> = Vec::new();
         macro_rules! resolve {
             ($m:expr) => {{
                 let m = $m as usize;
@@ -19653,7 +20154,7 @@ impl Vm {
                 }
             }};
         }
-        let mut c: std::sync::Arc<Compiled> = resolve!(module);
+        let mut c: std::sync::Arc<Compiled> = source.get(module).ok_or(Trap::Malformed)?;
         // The current function's ops, which every op reads (`ops[pc]`). Set again wherever the
         // current function changes (`enter!`), so the per-op read is one index and checks nothing.
         let mut ops: &[Op] = &c.prog(cur).ops;
@@ -20837,42 +21338,13 @@ impl Vm {
                     }
                 }
                 Op::SvcPoll { dst, wait } => {
-                    // §3.6 serve-loop core (I36 slice 1), the tree-walk serve arm's rewind state
-                    // machine in register-window form. A handler that just returned re-entered
-                    // this op via its rewound linkage with its result in `dst` — settle it into
-                    // the ticket's completion cell. No cross-domain caller can be parked on the
-                    // ticket in this engine yet (caller-side parking is a later I36 slice), so
-                    // the reply always rides the cell — the tree-walker's unclaimed-result path.
-                    // #2160, the oracle's rule: a `svc.*` from *under* the running handler (deeper
-                    // than the serve frame) is a probeable refusal that serves nothing — the serve
-                    // loop is the domain's outermost dispatcher.
-                    if self
-                        .serve_ticket()
-                        .is_some_and(|(_, depth)| self.stack.len() > depth)
-                    {
+                    // §3.6 serve-loop core. #2160, the oracle's rule: a serve op inside a running
+                    // handler is a probeable refusal that serves nothing — the serve loop is the
+                    // domain's outermost dispatcher.
+                    if self.dispatch().is_some() {
                         self.regs[base + *dst as usize] = Reg::from_i64(super::EINVAL);
                         pc += 1;
                         continue;
-                    }
-                    if let Some(s) = self.rare.as_mut().and_then(|r| r.serve_ticket.take()) {
-                        // INVARIANTS #8: the reply is every result the handler returned.
-                        let at = s.results_at(&c, base, cur);
-                        let (_, tys) = c.sigs.get(s.func).ok_or(Trap::Malformed)?;
-                        let mut results: Vec<i64> = (tys.iter().enumerate())
-                            .map(|(i, ty)| super::val_to_slot(self.regs[at + i].to_value(*ty)))
-                            .collect();
-                        // #1862, #2164: a page request's bytes move now, from this serving vCPU's
-                        // window, before its child can claim the reply. Its status is the
-                        // handler's one result.
-                        host.with(|p| {
-                            if let Some(first) = results.first_mut() {
-                                *first =
-                                    p.settle_page(s.ticket, *first, mem.as_ref().map(|m| m as _));
-                            }
-                            p.svc_results
-                                .insert(s.ticket, super::Reply::Results(results))
-                        });
-                        self.rare().serve_count += 1;
                     }
                     // DURABILITY.md §13.4 slice 4b, the oracle's rule: under `UNWINDING` a serve op
                     // makes **no progress** — it delivers an inert sentinel so its trailing poll
@@ -20884,77 +21356,25 @@ impl Vm {
                         pc += 1;
                         continue;
                     }
-                    // Admit queued dispatches: un-servable ones settle inline with a probeable
-                    // errno (the dispatch's fault, never the domain's — it keeps serving); the
-                    // first servable one switches into a handler activation whose return linkage
-                    // re-executes this op (pc deliberately NOT advanced).
-                    let mut admitted = false;
-                    loop {
-                        let d = host.with(|p| p.svc_queue.pop_front());
-                        let Some(d) = d else { break };
-                        // The queue only holds servable dispatches (checked at enqueue), so a
-                        // missing handler here is host-state corruption: fail closed. Handlers
-                        // are the domain's home-module functions (`self.home` — the primary, or
-                        // a separate-module child's own unit); serving from any other unit
-                        // would resolve indices against the wrong program table.
-                        let fidx = host
-                            .with(|p| p.svc_handler_func(d.export, d.op))
-                            .ok_or(Trap::CapFault)? as usize;
-                        if module != self.home {
-                            return Err(Trap::CapFault);
-                        }
-                        let (params, _) = c.sigs.get(fidx).ok_or(Trap::CapFault)?;
-                        if d.args.len() != params.len() {
-                            host.with(|p| {
-                                let v = p.settle_page(d.ticket, super::EINVAL, None);
-                                p.svc_results.insert(d.ticket, super::Reply::Failed(v))
-                            });
-                            continue;
-                        }
-                        let nb = base + c.prog(cur).nslots as usize;
-                        let serving = Serving {
-                            ticket: d.ticket,
-                            depth: self.stack.len(),
-                            func: fidx,
-                        };
-                        let at = serving.results_at(&c, base, cur);
-                        let (_, tys) = c.sigs.get(fidx).ok_or(Trap::CapFault)?;
-                        self.open_frame(at + tys.len())?;
-                        for (i, (s, ty)) in d.args.iter().zip(params.iter()).enumerate() {
-                            self.regs[nb + i] = Reg::from_value(slot_to_val(*ty, *s));
-                        }
-                        self.rare().serve_ticket = Some(serving);
-                        self.stack.push((module, cur, base, pc, at, self.entered));
-                        self.entered = self.work;
-                        cur = fidx;
-                        enter!();
-                        base = nb;
-                        pc = 0;
-                        admitted = true;
-                        break;
+                    // #2742 — each dispatch runs as a fiber of this task, as on the oracle, so a
+                    // handler that parks parks alone: the driver starts it over the registry
+                    // ([`serve`]). The cursor stays AT this op, which each handler's return or
+                    // park re-executes, until the op finds nothing to run and delivers.
+                    self.module = module;
+                    self.cur = cur;
+                    self.base = base;
+                    self.pc = pc;
+                    if !self.handlers().is_empty() || host.with(|p| !p.svc_queue.is_empty()) {
+                        return Ok(Outcome::Serve {
+                            dst: *dst,
+                            wait: *wait,
+                            unit: std::sync::Arc::clone(&c),
+                        });
                     }
-                    if !admitted {
-                        // #1217 — a client of this domain ended: `svc.wait` answers `0` (the timed
-                        // form's no-progress answer) instead of parking on a queue no client can
-                        // fill. Consulted only where it would park, so queued work is served first
-                        // and the token outlives it.
-                        if *wait
-                            && self.rare().serve_count == 0
-                            && !host.with(Host::take_client_gone)
-                        {
-                            // svc.wait with no progress: persist the cursor AT this op (a wake
-                            // re-executes the whole drain) and park the task on its domain.
-                            self.module = module;
-                            self.cur = cur;
-                            self.base = base;
-                            self.pc = pc;
-                            return Ok(Outcome::SvcWait);
-                        }
-                        // Queue drained: deliver the completed count and close the activation.
-                        let served = std::mem::take(&mut self.rare().serve_count);
-                        self.regs[base + *dst as usize] = Reg::from_i64(served);
-                        pc += 1;
+                    if self.serve_idle(host, *dst, *wait) {
+                        return Ok(Outcome::SvcWait);
                     }
+                    pc = self.pc;
                 }
                 Op::CapSelfExt { op, handle, dst } => {
                     // §3.5 self-namespace extensions — through the shared &mut dispatch entry

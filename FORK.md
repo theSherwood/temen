@@ -841,17 +841,18 @@ the bytecode structures, not a reuse of the oracle's scheduler methods:
   `TaskState::BlockedTicket { ticket, callee, dst }` (`bytecode.rs` `drive`); its continuation is the
   task's `VTask.active: Vm`, positioned past the `call.cap`, with `dst` the reply slot. The settle
   scan wakes it by `svc_results[ticket]` → `active.set(dst, reply)` → `Runnable`.
-- **Serve linkage.** The serve driver already carries `serve_ticket` (the `ServeRun.ticket` analog)
-  while a handler runs. That is the handler→caller linkage, already present.
+- **Serve linkage.** A handler runs as a fiber of the serving task (#2742), and its `Vm` carries the
+  ticket of the dispatch it answers (`dispatch`, the `ServeRun.ticket` analog). That is the
+  handler→caller linkage, already present.
 
 The slices, **all landed for the cooperative driver** (each pinned against the oracle):
 
 1. **`Op::CloneCaller`/`Op::Reap` + driver surface. DONE.** `call.cap CAP_SELF 11/12` compile to
    native ops that surface to the cooperative `drive` via `Outcome`/`VcpuStop::CloneCaller`/`Reap`
    carrying the reply/pid args + dst — the `LiveCall`/`SvcWait` shape. The driver reads the running
-   handler's `serve_ticket` (on the task's `Vm`) to name the parked caller.
+   handler's `dispatch` (on the handler fiber's `Vm`, the task's active one) to name the parked caller.
 2. **The twin (cooperative driver). DONE.** In `drive`, find the `BlockedTicket` caller for
-   `serve_ticket` (matched by `(ticket, server host Arc)`); build a twin **env**
+   the handler's `dispatch` (matched by `(ticket, server host Arc)`); build a twin **env**
    (`fork_private(caller_env.mem)` + `fork_powerbox(caller_env.host)`, a new `extra_envs` entry) and a
    twin **task** whose `VTask` is the caller's `Vm.clone()` with `active.set(caller_dst, reply_twin)`;
    deliver `reply_orig`/twin-pid to the original. No `replied` flag is needed — the woken caller is
