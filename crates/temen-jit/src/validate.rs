@@ -1258,10 +1258,16 @@ pub(crate) mod x86 {
                 ArgTag::Any => true,
                 ArgTag::WindowBase => fact == Fact::MemBase,
                 ArgTag::Vmctx => fact == Fact::Vmctx,
-                // A buffer pointer must be a known frame slot, never a guest value: the host writes
-                // through it, so a forged pointer would escape. The extent is enforced by the frame
-                // policy on the slots the write clears below.
-                ArgTag::StackSlot { .. } => matches!(fact, Fact::Stack(Some(_))),
+                // A buffer pointer must be a known frame slot, never a guest value: the host reads
+                // and writes through it, so a forged pointer would escape. All `len` bytes lie in
+                // this function's allocated frame, `[rsp, 0)`, as a direct access through the frame
+                // must: never over the return address or a caller's frame, never below `rsp`.
+                ArgTag::StackSlot { len, .. } => match (fact, state.regs[reg::RSP as usize]) {
+                    (Fact::Stack(Some(off)), Fact::Stack(Some(cur))) => {
+                        off >= cur && off.checked_add(i64::from(len)).is_some_and(|top| top <= 0)
+                    }
+                    _ => false,
+                },
                 ArgTag::JmpBuf => fact == Fact::JmpBuf,
                 ArgTag::FuelCell => fact == Fact::Cell(Cell::Fuel),
                 // The saved-`rbp` slot below the return address: what `mov rbp, rsp` after the
@@ -5426,6 +5432,53 @@ pub(crate) mod x86 {
             inner.splice(4..7, [0x48, 0x8d, 0x7d, 0xf8]);
             let f = check(&inner, &[reloc(10)], Entry::Guest(&G), Frame::UNKNOWN);
             assert!(has(&f, "not FramePointer"), "{f:?}");
+        }
+
+        /// #2534 — a host call's frame buffer lies in the caller's allocated frame, `[rsp, 0)`: a
+        /// status pointer aimed at the return address, or one that runs into it, is a finding, not a
+        /// buffer the host may write.
+        #[test]
+        fn a_frame_buffer_stays_in_the_frame() {
+            const STATUS: Contract = Contract {
+                clobbers: SYSV_CLOBBERS,
+                pops: Some(0),
+                args: &[
+                    ArgTag::Any,
+                    ArgTag::Any,
+                    ArgTag::StackSlot {
+                        len: 8,
+                        write: true,
+                    },
+                ],
+                safepoint: false,
+                ret: Ret::Unknown,
+            };
+            let c = CHECK_LEN as u32;
+            // sub rsp, 0x20; lea rdx, [rsp + disp8]; movabs rax, <sym>; call rax; add rsp, 0x20; ret
+            let at = |disp: u8| {
+                checked(&[
+                    0x48, 0x83, 0xec, 0x20, 0x48, 0x8d, 0x54, 0x24, disp, 0x48, 0xb8, 0, 0, 0, 0,
+                    0, 0, 0, 0, 0xff, 0xd0, 0x48, 0x83, 0xc4, 0x20, 0xc3,
+                ])
+            };
+            let reloc = Reloc {
+                at: c + 11,
+                kind: R::Abs8,
+                addend: 0,
+                callee: Some(STATUS),
+            };
+            let f = check(&at(0x18), &[reloc], Entry::Guest(&G), Frame::UNKNOWN);
+            assert!(
+                f.is_empty(),
+                "a status word in the frame was flagged: {f:?}"
+            );
+            for (disp, why) in [
+                (0x20, "the return address"),
+                (0x1c, "a word over the return address"),
+            ] {
+                let f = check(&at(disp), &[reloc], Entry::Guest(&G), Frame::UNKNOWN);
+                assert!(has(&f, "call argument 2"), "{why}: {f:?}");
+            }
         }
 
         /// #2534 — a host call that writes a caller-frame buffer clears only that buffer's slots, so

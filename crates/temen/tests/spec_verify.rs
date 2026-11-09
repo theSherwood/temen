@@ -798,3 +798,39 @@ fn spec_agreement_on_v7_grouped_surface() {
     });
     let _ = V::I32;
 }
+
+/// #2534 — a host-dispatched call passes at most `CAP_MAX_ARITY` arguments and results each way:
+/// the JIT hands them to its thunk in a buffer of that many words in the context. Both verifiers
+/// accept a call at the bound and reject one past it, by parameters or by results.
+#[test]
+fn a_host_call_fits_the_argument_buffer() {
+    use ValType as V;
+    let n = CAP_MAX_ARITY;
+    let call = |params: usize, results: usize| {
+        let mut m = module(vec![func(
+            vec![V::I32, V::I64],
+            vec![V::I64],
+            vec![Inst::CapCall(Box::new(CapCall {
+                type_id: 3,
+                op: 7,
+                sig: 0,
+                handle: 0,
+                args: vec![1; params].into_boxed_slice(),
+            }))],
+            Terminator::Return(vec![2]),
+        )]);
+        m.types = vec![TypeEntry::Func(FuncType {
+            params: vec![V::I64; params],
+            results: vec![V::I64; results],
+        })];
+        m
+    };
+    accept(&call(n, 1), "params at the bound");
+    accept(&call(1, n), "results at the bound");
+    reject(&call(n + 1, 1), "params past the bound", |e| {
+        matches!(e, VerifyError::HostCallArity { .. })
+    });
+    reject(&call(1, n + 1), "results past the bound", |e| {
+        matches!(e, VerifyError::HostCallArity { .. })
+    });
+}
