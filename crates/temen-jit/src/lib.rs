@@ -11365,7 +11365,10 @@ fn lower_block(
                 let vmctx = b.use_var(lower.vmctx_var);
                 let (dv, sv, n) = (get(&vals, *dst)?, get(&vals, *src)?, get(&vals, *len)?);
                 call_host(lower.callees, b, HostFn::MemCopy, &[vmctx, dv, sv, n])?;
-                emit_trap_propagate(b, lower, Callee::Host);
+                // The helper raises a fault on this context, which sets its stop word: one load,
+                // as after a guest call, not the domain's end (it runs no guest code and parks
+                // only in a pager, whose end it raises here too).
+                emit_trap_propagate(b, lower, Callee::Guest);
                 continue;
             }
             Inst::MemFill { dst, val, len } => {
@@ -11379,7 +11382,10 @@ fn lower_block(
                     b.ins().uextend(I64, v)
                 };
                 call_host(lower.callees, b, HostFn::MemFill, &[vmctx, dv, v, n])?;
-                emit_trap_propagate(b, lower, Callee::Host);
+                // The helper raises a fault on this context, which sets its stop word: one load,
+                // as after a guest call, not the domain's end (it runs no guest code and parks
+                // only in a pager, whose end it raises here too).
+                emit_trap_propagate(b, lower, Callee::Guest);
                 continue;
             }
             // §12 atomics. Confine like a normal access, then a natural-alignment guard (a misaligned
