@@ -7,7 +7,7 @@
 use temen_interp::{cap_id, run_with_host, Host, Value};
 use temen_jit::{
     compile_and_run_with_host, compile_and_run_with_host_fast, InstanceAddrs, JitOutcome, TrapKind,
-    VmCtx,
+    VmCtx, Window,
 };
 use temen_run::{cap_thunk, fast_cap_resolver};
 
@@ -121,7 +121,7 @@ fn a_successful_call_leaves_the_domains_end() {
     let clk = host.grant_clock();
     let ctx = &mut host as *mut Host as *mut core::ffi::c_void;
     let end = TrapKind::Unreachable.code();
-    let vm = VmCtx::new(InstanceAddrs::NONE);
+    let vm = VmCtx::new(InstanceAddrs::NONE, Window::NONE);
     vm.raise(end);
 
     let mut now = 0i64;

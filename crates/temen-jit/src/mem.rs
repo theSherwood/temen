@@ -1445,7 +1445,7 @@ mod tests {
         win: &GuestWindow,
         f: extern "C" fn(*const i64, *mut i64, *mut u8, *const c_void, *mut i64),
     ) -> bool {
-        let vm = crate::VmCtx::new(crate::InstanceAddrs::NONE);
+        let vm = crate::VmCtx::new(crate::InstanceAddrs::NONE, crate::Window::NONE);
         // SAFETY: `f` honours the Entry ABI; `mem_base` is this window's base.
         unsafe {
             run_guarded(

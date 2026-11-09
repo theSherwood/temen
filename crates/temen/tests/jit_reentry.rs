@@ -197,7 +197,7 @@ fn invoke_outside_a_run_is_rejected() {
         .expect("define outside run")[0]
         .tramp;
     let mut results = [0i64; 1];
-    let vm = temen_jit::VmCtx::new(temen_jit::InstanceAddrs::NONE);
+    let vm = temen_jit::VmCtx::new(temen_jit::InstanceAddrs::NONE, temen_jit::Window::NONE);
     let err = unsafe {
         CompiledModule::invoke_extra(
             ctx.cm.get(),

@@ -3300,7 +3300,7 @@ unsafe fn live_reply(
                     // outcome (on the enqueue path the child would have died serving this dispatch):
                     // it lands in this context's own cell, never the caller's trap cell.
                     let child_vm =
-                        temen_jit::VmCtx::new(temen_jit::instance_of(sctx as *const c_void));
+                        temen_jit::handler_vmctx(sctx as *const c_void, cbase as *mut u8);
                     CROSSING_DEPTH.with(|d| d.set(d.get() + 1));
                     temen_jit::invoke_handler(
                         sctx as *const c_void,

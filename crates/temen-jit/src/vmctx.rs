@@ -91,6 +91,10 @@ pub struct VmCtx {
     /// The domain's end word, owned by its root context ([`Self::new`]); `None` for a vCPU's
     /// context ([`Self::vcpu`]), which points at its root's. Never read by compiled code.
     owned_end: Option<Box<AtomicI64>>,
+    /// #2534 — the window and function table this run's code runs over, for the host functions,
+    /// which read them here rather than take them from the code. Never read by compiled code, so
+    /// it sits past every field the code loads, which keep their short offsets.
+    window: Window,
 }
 
 /// The per-instance addresses a [`VmCtx`] is filled from — everything but the trap cell, which each
@@ -127,9 +131,47 @@ impl InstanceAddrs {
     };
 }
 
+/// #2534 — the window and function table a run's code runs over, recorded in its [`VmCtx`] so that
+/// a host function derives them from the context compiled code hands it (which the validator
+/// checks) instead of taking them as arguments the code computes. The base and the table are the
+/// run's, the ones its entry is handed; the sizes are the geometry its compile baked in.
+#[derive(Clone, Copy, Debug)]
+pub struct Window {
+    /// The window's base: what the entry is handed as `mem_base`. Null when there is no window.
+    pub base: *mut u8,
+    /// The declared window's bytes, `mapped`: what a `call.cap` is handed as its size.
+    pub mapped: u64,
+    /// The reservation, `mask + 1`, which bounds every confined offset. `0` when there is no window.
+    pub reserved: u64,
+    /// #2164 — how many pages a demand-paged child's access table covers; `0` when unpaged.
+    pub pages: u64,
+    /// The function table the entry is handed as `fn_table_base`.
+    pub fn_table: *const u8,
+}
+
+impl Window {
+    /// No window and no function table.
+    pub const NONE: Window = Window {
+        base: core::ptr::null_mut(),
+        mapped: 0,
+        reserved: 0,
+        pages: 0,
+        fn_table: core::ptr::null(),
+    };
+
+    /// The host address of the `len` bytes at window offset `off`, if they lie in the reservation:
+    /// what a host function reads or writes in place of a guest access. `None` for an empty window
+    /// or a span past the reservation, which the caller faults as a guest access would.
+    pub fn span(&self, off: u64, len: u64) -> Option<*mut u8> {
+        let end = off.checked_add(len)?;
+        (end <= self.reserved).then(|| self.base.wrapping_add(off as usize))
+    }
+}
+
 impl VmCtx {
-    /// A fresh root context for the instance at `a`: a domain of its own, not yet ended.
-    pub fn new(a: InstanceAddrs) -> VmCtx {
+    /// A fresh root context for the instance at `a`, running over window `w`: a domain of its own,
+    /// not yet ended.
+    pub fn new(a: InstanceAddrs, w: Window) -> VmCtx {
         // Boxed, so the word stays put when the context moves.
         let owned_end = Box::new(AtomicI64::new(0));
         VmCtx {
@@ -145,6 +187,7 @@ impl VmCtx {
             nursery: a.nursery,
             setjmp: a.setjmp,
             pages: a.pages,
+            window: w,
             owned_end: Some(owned_end),
         }
     }
@@ -166,8 +209,14 @@ impl VmCtx {
             nursery: self.nursery,
             setjmp: self.setjmp,
             pages: self.pages,
+            window: self.window,
             owned_end: None,
         }
+    }
+
+    /// #2534 — the window and function table this context's code runs over.
+    pub fn window(&self) -> &Window {
+        &self.window
     }
 
     /// The domain's end word.
@@ -239,12 +288,12 @@ const _: () = assert!(core::mem::offset_of!(VmCtx, trap) == 0);
 
 #[cfg(test)]
 mod tests {
-    use super::{InstanceAddrs, VmCtx};
+    use super::{InstanceAddrs, VmCtx, Window};
 
     /// #2499 — a domain ends once: the first end raised stands, and a later one changes nothing.
     #[test]
     fn the_first_end_wins() {
-        let vm = VmCtx::new(InstanceAddrs::NONE);
+        let vm = VmCtx::new(InstanceAddrs::NONE, Window::NONE);
         assert_eq!(vm.ended(), None);
         vm.raise(7);
         vm.raise(9);
@@ -256,7 +305,7 @@ mod tests {
     #[test]
     fn a_vcpu_context_shares_the_end_and_stops_on_its_copy() {
         let stop = |vm: &VmCtx| vm.trap.load(core::sync::atomic::Ordering::Relaxed);
-        let root = VmCtx::new(InstanceAddrs::NONE);
+        let root = VmCtx::new(InstanceAddrs::NONE, Window::NONE);
         let a = root.vcpu(core::ptr::null_mut());
         let b = root.vcpu(core::ptr::null_mut());
         a.raise(7);
@@ -297,6 +346,43 @@ mod tests {
         )
         .expect("compiles and runs");
         (outcome, mem[16392..16400] != [0; 8])
+    }
+
+    /// #2534 — `memory.wait` and `atomic.notify` hand their thunks the guest address, which the
+    /// thunk confines against the context's window: a wait past the reservation is the
+    /// `MemoryFault` a load there is, and a notify there wakes nobody (no wait can park there). A
+    /// notify inside the window still reaches the thunk's futex.
+    #[test]
+    fn a_wait_past_the_window_faults_and_a_notify_there_wakes_none() {
+        if !temen_fiber::supported() {
+            return;
+        }
+        let run = |body: &str| {
+            let src = format!(
+                "memory 16\nfunc (i64) -> (i64) {{\nblock 0 (v0: i64) {{\n{body}  }}\n}}\n"
+            );
+            run_marked(&src).0
+        };
+        let wait = run(
+            "  v1 = i64.const 2199023255552\n  v2 = i32.const 0\n  v3 = i64.const -1\n  \
+             v4 = i32.atomic.wait v1 v2 v3\n  v5 = i64.extend_i32_u v4\n  return v5\n",
+        );
+        assert_eq!(
+            wait,
+            crate::JitOutcome::Trapped(crate::TrapKind::MemoryFault),
+            "a wait past the window"
+        );
+        for addr in ["2199023255552", "16384"] {
+            let notify = run(&format!(
+                "  v1 = i64.const {addr}\n  v2 = i32.const -1\n  v3 = atomic.notify v1 v2\n  \
+                 v4 = i64.extend_i32_u v3\n  return v4\n"
+            ));
+            assert_eq!(
+                notify,
+                crate::JitOutcome::Returned(vec![0]),
+                "a notify at {addr} woke someone"
+            );
+        }
     }
 
     /// #2488 — a vCPU parked when a sibling ends the domain wakes as if woken, with nothing raised on

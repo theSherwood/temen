@@ -370,7 +370,10 @@ fn jit_locked_thunk_releases_lock_before_completion_wait() {
                 s.spawn(move || {
                     let arg = [i];
                     let mut result = 0i64;
-                    let vm = temen_jit::VmCtx::new(temen_jit::InstanceAddrs::NONE);
+                    let vm = temen_jit::VmCtx::new(
+                        temen_jit::InstanceAddrs::NONE,
+                        temen_jit::Window::NONE,
+                    );
                     unsafe {
                         temen_run::cap_thunk_locked(
                             addr as *mut core::ffi::c_void,
