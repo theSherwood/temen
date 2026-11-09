@@ -37774,8 +37774,8 @@ impl Mem {
     /// calling, so this always sees `len >= 1` (matching the JIT's `len != 0`-guarded check).
     fn confine_span(&self, addr: u64, len: u64) -> Result<u64, Trap> {
         self.last_fault.store(NO_FAULT, Ordering::Relaxed);
-        // The span-OOB arithmetic is temen-mask's `span_checked` — the one fuzzed reference the JIT's
-        // `confine_span` must emit (INVARIANTS #2's "one masking regime").
+        // The span-OOB arithmetic is temen-mask's `span_checked` — the one fuzzed reference, which
+        // the JIT's bulk-op helpers call too (INVARIANTS #2's "one masking regime").
         self.window
             .span_checked(addr, len)
             .ok_or_else(|| self.report_out_of_window(addr, 0))
