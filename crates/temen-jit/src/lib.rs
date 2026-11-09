@@ -862,9 +862,10 @@ impl TrapKind {
 /// calling context's (`vm.cap_ctx`), and so is the window ([`VmCtx::window`]: its base, the backed
 /// prefix `mapped`, and the reservation the guest may `map`-grow into via the Memory cap, §3e/§4):
 /// the machine-code validator checks that the code hands it that context. The call's
-/// `counts as u32` arguments are in `buf`, and its `counts >> 32` results go back in the same words;
-/// [`cap_slots`] reads both. `buf` is [`CAP_BUF_WORDS`] words of the caller's own frame, which the
-/// validator checks too; the verifier holds every call to that many of each.
+/// `counts as u32` arguments are at word 0 of `buf`, and its `counts >> 32` result slots at word
+/// [`CAP_RESULTS_AT`], which the code zeroes before the call; [`cap_slots`] borrows both. `buf` is
+/// [`CAP_BUF_WORDS`] words of the caller's own frame, which the validator checks too; the verifier
+/// holds every call to [`temen_ir::CAP_MAX_ARITY`] arguments and as many results.
 ///
 /// # Safety
 /// `vm` is the calling instance's live context, and `buf` a live buffer of [`CAP_BUF_WORDS`] words,
@@ -878,46 +879,29 @@ pub type CapThunk = unsafe extern "C" fn(
     counts: u64,
 );
 
-/// #2534 — the words of a [`CapThunk`]'s `buf`: room for every argument, or every result, of a
-/// call the verifier admits ([`temen_ir::CAP_MAX_ARITY`]).
-pub const CAP_BUF_WORDS: usize = temen_ir::CAP_MAX_ARITY;
+/// #2534 — where a [`CapThunk`]'s `buf` holds the call's result slots: past room for every argument
+/// of a call the verifier admits ([`temen_ir::CAP_MAX_ARITY`]).
+pub const CAP_RESULTS_AT: usize = temen_ir::CAP_MAX_ARITY;
 
-/// #2534 — a `call.cap`'s arguments and its result slots, from the `buf` and `counts` a
-/// [`CapThunk`] is handed. The arguments are copied out, since the results take their words; the
-/// result slots are zeroed, so a slot the op leaves unwritten reads zero (#2361). Each count is held
-/// to [`CAP_BUF_WORDS`], so a thunk never touches a word past the buffer.
+/// #2534 — the words of a [`CapThunk`]'s `buf`: the arguments, then the result slots.
+pub const CAP_BUF_WORDS: usize = 2 * temen_ir::CAP_MAX_ARITY;
+
+/// #2534 — a `call.cap`'s arguments and its result slots, in the `buf` and `counts` a [`CapThunk`]
+/// is handed: the `counts as u32` arguments at word 0, and the `counts >> 32` result slots at word
+/// [`CAP_RESULTS_AT`]. The two never overlap. The code zeroed the result slots, so one the op leaves
+/// unwritten reads zero (#2361). Each count is held to [`temen_ir::CAP_MAX_ARITY`], so a thunk never
+/// touches a word past the buffer.
 ///
 /// # Safety
 /// `buf` is live for `'a` and holds [`CAP_BUF_WORDS`] words, as the JIT hands every thunk.
-pub unsafe fn cap_slots<'a>(buf: *mut i64, counts: u64) -> (CapArgs, &'a mut [i64]) {
-    let n_args = (counts as u32 as usize).min(CAP_BUF_WORDS);
-    let n_results = ((counts >> 32) as usize).min(CAP_BUF_WORDS);
-    let mut args = CapArgs {
-        words: [0; CAP_BUF_WORDS],
-        len: n_args,
-    };
-    if buf.is_null() {
-        args.len = 0;
-        return (args, &mut []);
-    }
-    core::ptr::copy_nonoverlapping(buf, args.words.as_mut_ptr(), n_args);
-    let results = core::slice::from_raw_parts_mut(buf, n_results);
-    results.fill(0);
-    (args, results)
-}
-
-/// A `call.cap`'s arguments, as [`cap_slots`] copies them out of its buffer.
-#[derive(Clone, Copy, Debug)]
-pub struct CapArgs {
-    words: [i64; CAP_BUF_WORDS],
-    len: usize,
-}
-
-impl core::ops::Deref for CapArgs {
-    type Target = [i64];
-    fn deref(&self) -> &[i64] {
-        &self.words[..self.len]
-    }
+#[inline]
+pub unsafe fn cap_slots<'a>(buf: *mut i64, counts: u64) -> (&'a [i64], &'a mut [i64]) {
+    let n_args = (counts as u32 as usize).min(temen_ir::CAP_MAX_ARITY);
+    let n_results = ((counts >> 32) as usize).min(temen_ir::CAP_MAX_ARITY);
+    (
+        core::slice::from_raw_parts(buf, n_args),
+        core::slice::from_raw_parts_mut(buf.add(CAP_RESULTS_AT), n_results),
+    )
 }
 
 /// The **devirtualized `call.cap` fast path** (§9 / D45). A `call.cap` to a statically-known
@@ -7210,6 +7194,41 @@ fn host_ret(name: &str) -> validate::Ret {
 }
 
 #[cfg(test)]
+mod cap_buffer_tests {
+    use super::*;
+
+    /// `call.cap 0 0` answers its two results; `call.cap 0 1` writes nothing.
+    unsafe extern "C" fn raw_thunk(_: &VmCtx, _: u32, op: u32, _: i32, buf: *mut i64, _: u64) {
+        if op == 0 {
+            *buf.add(CAP_RESULTS_AT) = 11;
+            *buf.add(CAP_RESULTS_AT + 1) = 0xdead;
+        }
+    }
+
+    /// Audit #4 (#2534) — every `call.cap` of a function shares one frame buffer, so a result slot
+    /// holds what an earlier call left there until the code zeroes it. A result the thunk leaves
+    /// unwritten reads zero.
+    #[test]
+    fn a_result_the_thunk_leaves_unwritten_reads_zero() {
+        let m = temen_text::parse_module(
+            "func () -> (i64, i64) {
+block 0 () {
+  v0 = i32.const 0
+  v1 = i64.const 5
+  v2, v3 = call.cap 0 0 (i64) -> (i64, i64) v0 (v1)
+  v4, v5 = call.cap 0 1 (i64) -> (i64, i64) v0 (v1)
+  return v4, v5
+}
+}",
+        )
+        .expect("parse");
+        temen_verify::verify_module(&m).expect("verify");
+        let out = compile_and_run_with_host(&m, 0, &[], raw_thunk, core::ptr::null_mut());
+        assert_eq!(out.expect("run"), JitOutcome::Returned(vec![0, 0]));
+    }
+}
+
+#[cfg(test)]
 mod arg_contract_tests {
     use super::*;
     use validate::ArgTag::{Any, StackSlot, Vmctx};
@@ -12361,12 +12380,12 @@ fn lower_cap_call_fast(
     Ok(())
 }
 
-/// Lower a `call.cap` (§3c/§9): store the args into the function's call buffer, call the host thunk
-/// ([`HostFn::CapThunk`]) with the cap immediates, the context and the buffer, and — unless it set
-/// the trap cell — read the results back from the same buffer, where the thunk wrote them over the
-/// args ([`cap_slots`]). A trap from the thunk (CapFault / Exit) propagates like any other (return
-/// early; the cell is already set). The thunk finds the powerbox and the window through the context,
-/// so the code hands it neither (#2534).
+/// Lower a `call.cap` (§3c/§9): store the args into the function's call buffer and zero its result
+/// slots ([`cap_slots`]), call the host thunk ([`HostFn::CapThunk`]) with the cap immediates, the
+/// context and the buffer, and — unless it set the trap cell — read the results back. A trap from
+/// the thunk (CapFault / Exit) propagates like any other (return early; the cell is already set).
+/// The thunk finds the powerbox and the window through the context, so the code hands it neither
+/// (#2534).
 #[allow(clippy::too_many_arguments)]
 fn lower_cap_call(
     b: &mut FunctionBuilder,
@@ -12382,7 +12401,7 @@ fn lower_cap_call(
 ) -> Result<(), JitError> {
     let (n_args, n_res) = (args.len(), sig.results.len());
     // The verifier holds every call to the buffer; an unverified one is refused, never lowered past it.
-    if n_args > CAP_BUF_WORDS || n_res > CAP_BUF_WORDS {
+    if n_args > temen_ir::CAP_MAX_ARITY || n_res > temen_ir::CAP_MAX_ARITY {
         return Err(JitError::Malformed);
     }
     let buf = lower.cap_buf.get().unwrap_or_else(|| {
@@ -12398,6 +12417,15 @@ fn lower_cap_call(
         let v = get(vals, *a)?;
         let slot = encode_slot(b, v); // each arg widened to its i64 slot
         b.ins().stack_store(slot, buf, (i * 8) as i32);
+    }
+    // Audit #4: zero the result slots, so a thunk that writes fewer results than the call declares
+    // hands back zero (#2361), never what an earlier call left in the buffer or stale frame bytes.
+    if n_res > 0 {
+        let zero = b.ins().iconst(I64, 0);
+        for i in 0..n_res {
+            b.ins()
+                .stack_store(zero, buf, ((CAP_RESULTS_AT + i) * 8) as i32);
+        }
     }
     let vmctx = b.use_var(lower.vmctx_var);
     let tid = b.ins().iconst(I32, type_id as i64);
@@ -12416,7 +12444,9 @@ fn lower_cap_call(
     // code).
     emit_trap_propagate(b, lower, Callee::Host);
     for (i, rty) in sig.results.iter().enumerate() {
-        let slot = b.ins().stack_load(I64, buf, (i * 8) as i32);
+        let slot = b
+            .ins()
+            .stack_load(I64, buf, ((CAP_RESULTS_AT + i) * 8) as i32);
         vals.push(decode_slot(b, slot, *rty));
     }
     Ok(())

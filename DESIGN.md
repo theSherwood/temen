@@ -355,10 +355,12 @@ found (#2603):
   unidentified call, and `rsp` fell to unknown — cascading a whole function to a false rejection.)
   Every host call that *does* write a caller-frame pointer must still tag it (the fiber and thread
   status words, the signal record, the `call.cap` buffer), or the validator would miss that write.
-  The `call.cap` buffer is one per function, `CAP_BUF_WORDS` (16) words of its frame that carry the
-  call's arguments in and its results out: the verifier holds every host-dispatched call to
-  `CAP_MAX_ARITY` (16) of each, on every tier. It lives in the frame, not the context, because a
-  fiber runs on its creator's context and may run on another vCPU at the same time as it.
+  The `call.cap` buffer is one per function, `CAP_BUF_WORDS` (32) words of its frame: the call's
+  arguments in the first 16, its result slots in the next 16, which the code zeroes before the call,
+  so the two never overlap and the host reads the arguments in place. The verifier holds every
+  host-dispatched call to `CAP_MAX_ARITY` (16) of each, on every tier. The buffer lives in the
+  frame, not the context, because a fiber runs on its creator's context and may run on another vCPU
+  at the same time as it.
 - A type check proves something only on its equal edge, and only of the record whose type id it
   loaded: every register still holding that record's address. A record never changes, so the proof
   outlives a call in a register the callee keeps. `test r, r` is exactly `cmp r, 0`.

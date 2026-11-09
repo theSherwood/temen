@@ -388,7 +388,7 @@ fn jit_locked_thunk_releases_lock_before_completion_wait() {
                         );
                     }
                     assert_eq!(vm.ended(), None, "worker {i}: clean dispatch");
-                    buf[0]
+                    buf[temen_jit::CAP_RESULTS_AT]
                 })
             })
             .collect();

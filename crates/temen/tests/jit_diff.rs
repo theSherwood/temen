@@ -1622,7 +1622,7 @@ mod cap {
             Some(&mut wm)
         };
 
-        match host.cap_call(type_id, op, handle, &arg_slots, 1, gm) {
+        match host.cap_call(type_id, op, handle, arg_slots, 1, gm) {
             Ok(res) => {
                 for (o, r) in out.iter_mut().zip(res) {
                     *o = r;

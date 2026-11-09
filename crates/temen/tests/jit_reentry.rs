@@ -67,7 +67,7 @@ unsafe extern "C" fn reentry_thunk(
         vm.raise(tc.end_first.get());
     }
     // The thunk's `vm` is the running instance's `VmCtx`: the unit runs as that instance.
-    CompiledModule::invoke_extra(cm, tc.code.get(), &args, results, mem_base, vm)
+    CompiledModule::invoke_extra(cm, tc.code.get(), args, results, mem_base, vm)
         .expect("invoke_extra during a live run");
 }
 
