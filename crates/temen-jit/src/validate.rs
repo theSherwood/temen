@@ -99,8 +99,6 @@ pub(crate) enum Ret {
 pub(crate) enum ArgTag {
     /// Unconstrained — a guest value, a count, a handle: nothing the host confines with.
     Any,
-    /// The window base `mem_base` (rdi at entry): the base the host confines guest pointers against.
-    WindowBase,
     /// The `vmctx` pointer: the host's own context, never a guest value.
     Vmctx,
     /// A pointer to a buffer in the caller's own frame, at most `len` bytes, that the host reads
@@ -1256,7 +1254,6 @@ pub(crate) mod x86 {
             let fact = state.regs[r as usize];
             let ok = match tag {
                 ArgTag::Any => true,
-                ArgTag::WindowBase => fact == Fact::MemBase,
                 ArgTag::Vmctx => fact == Fact::Vmctx,
                 // A buffer pointer must be a known frame slot, never a guest value: the host reads
                 // and writes through it, so a forged pointer would escape. All `len` bytes lie in
@@ -2182,13 +2179,11 @@ pub(crate) mod x86 {
     }
 
     /// A vmctx field compiled code may access at offset `disp`: whether it may write it (only the
-    /// stop word, offset 0), and what an 8-byte load of it yields — a host cell compiled code reads,
-    /// or an opaque pointer it only hands to host functions. `None` for any other offset.
+    /// stop word, offset 0), and what an 8-byte load of it yields — a host cell compiled code reads.
+    /// `None` for any other offset: the runtime objects a host function acts on (the powerbox, the
+    /// scheduler, …) it reads from the context itself (#2534), so code never loads one.
     fn vmctx_field(disp: i64) -> Option<(bool, Fact)> {
         use crate::vmctx as v;
-        // #2534 — the scheduler, the nursery and the setjmp table are no longer among them: the host
-        // functions read those from the context they are handed, so code has no reason to load one.
-        let opaque = [v::CAP_CTX, v::SIG_CTX];
         Some(match disp {
             0 => (true, Fact::Unknown),
             d if d == i64::from(v::FUEL) => (false, Fact::Cell(Cell::Fuel)),
@@ -2197,7 +2192,6 @@ pub(crate) mod x86 {
             d if d == i64::from(v::END) => (false, Fact::Cell(Cell::End)),
             // #2164 — the demand-paged access table (read by `emit_page_check`).
             d if d == i64::from(v::PAGES) => (false, Fact::PageTable),
-            d if opaque.iter().any(|&o| i64::from(o) == d) => (false, Fact::Unknown),
             _ => return None,
         })
     }
@@ -5315,16 +5309,16 @@ pub(crate) mod x86 {
             assert!(has(&findings(&unknown), "unidentified callee"));
         }
 
-        /// #2534 — a host call's argument registers are checked against its contract: the window base
-        /// must be the real `mem_base`, never another value a backend bug left in the register.
+        /// #2534 — a host call's argument registers are checked against its contract: the context
+        /// must be the real `vmctx`, never another value a backend bug left in the register, since
+        /// the host finds through it the window and every runtime object it acts on.
         #[test]
         fn a_host_call_argument_must_match_its_contract() {
-            // A callee that wants the window base in its second argument register (rsi), as the
-            // `call.cap` thunk does.
+            // A callee that wants the context in its second argument register (rsi).
             const CAP: Contract = Contract {
                 clobbers: SYSV_CLOBBERS,
                 pops: Some(0),
-                args: &[ArgTag::Any, ArgTag::WindowBase],
+                args: &[ArgTag::Any, ArgTag::Vmctx],
                 safepoint: false,
                 ret: Ret::Unknown,
             };
@@ -5335,16 +5329,16 @@ pub(crate) mod x86 {
                 callee: Some(CAP),
             };
             let c = CHECK_LEN as u32;
-            // mov rsi, rdi (rsi := the window base); movabs rax, <sym>; call rax; ret
+            // mov rsi, rdx (rsi := the context); movabs rax, <sym>; call rax; ret
             let ok = checked(&[
-                0x48, 0x89, 0xfe, 0x48, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xd0, 0xc3,
+                0x48, 0x89, 0xd6, 0x48, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xd0, 0xc3,
             ]);
             let f = check(&ok, &[reloc(c + 5)], Entry::Guest(&G), Frame::UNKNOWN);
             assert!(
                 f.is_empty(),
-                "a correct window-base argument was flagged: {f:?}"
+                "a correct context argument was flagged: {f:?}"
             );
-            // Without the move, rsi is still fn_table_base — a different window.
+            // Without the move, rsi is still fn_table_base — not the context.
             let bad = checked(&[0x48, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xd0, 0xc3]);
             let f = check(&bad, &[reloc(c + 2)], Entry::Guest(&G), Frame::UNKNOWN);
             assert!(has(&f, "call argument 1"), "{f:?}");

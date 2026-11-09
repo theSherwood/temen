@@ -583,7 +583,7 @@ unsafe fn pages_admit(vm: &crate::VmCtx, off: u64, len: u64, write: bool) -> boo
         }
     }
     let flags = if write { crate::PAGE_MISS_WRITE } else { 0 };
-    miss(vm, w.base, off, len, flags);
+    miss(vm, off, len, flags);
     match vm.ended() {
         None => true,
         Some(end) => {

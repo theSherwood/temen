@@ -851,39 +851,79 @@ impl TrapKind {
     }
 }
 
-/// The host callback the JIT invokes for `call.cap` (§9's trampoline). The caller wires
-/// it to its capability host; the JIT bakes the function + ctx addresses in as constants
-/// and calls it. Scalars cross as `i64` slots (`i32` in the low bits), buffers as the
-/// `(ptr, len)` window borrow. A call that traps or exits ends the domain: it raises a
-/// [`TrapKind`] code, or `EXIT_CODE | (exit_code << 32)` for an `Exit`, on `vm`
-/// ([`VmCtx::raise`]). A call that succeeds leaves the trap cell alone — it holds the domain's
-/// end, which a sibling vCPU may have raised during the call (#2499).
+/// The host callback the JIT invokes for `call.cap` (§9's trampoline). The caller wires it to its
+/// capability host. Scalars cross as `i64` slots (`i32` in the low bits), buffers as the `(ptr, len)`
+/// window borrow. A call that traps or exits ends the domain: it raises a [`TrapKind`] code, or
+/// `EXIT_CODE | (exit_code << 32)` for an `Exit`, on `vm` ([`VmCtx::raise`]). A call that succeeds
+/// leaves the trap cell alone — it holds the domain's end, which a sibling vCPU may have raised during
+/// the call (#2499).
+///
+/// #2534 — the thunk takes from the code only what the code alone can supply. The powerbox is the
+/// calling context's (`vm.cap_ctx`), and so is the window ([`VmCtx::window`]: its base, the backed
+/// prefix `mapped`, and the reservation the guest may `map`-grow into via the Memory cap, §3e/§4):
+/// the machine-code validator checks that the code hands it that context. The call's
+/// `counts as u32` arguments are in `buf`, and its `counts >> 32` results go back in the same words;
+/// [`cap_slots`] reads both. `buf` is [`CAP_BUF_WORDS`] words of the caller's own frame, which the
+/// validator checks too; the verifier holds every call to that many of each.
 ///
 /// # Safety
-/// `ctx` is the caller's host pointer; `args`/`results` point at `n_args`/`n_results`
-/// `i64` slots; `[mem_base, mem_base+mem_size)` is the guest window's backed prefix
-/// (`mem_base` null if none) and `mem_reserved` is the full reserved mask domain
-/// (`>= mem_size`) the guest may `map`-grow into via the Memory cap (§3e/§4); `vm` is the
-/// calling instance's live context. All must outlive the call.
+/// `vm` is the calling instance's live context, and `buf` a live buffer of [`CAP_BUF_WORDS`] words,
+/// for the call.
 pub type CapThunk = unsafe extern "C" fn(
-    ctx: *mut core::ffi::c_void,
-    mem_base: *mut u8,
-    mem_size: u64,
-    mem_reserved: u64,
+    vm: &VmCtx,
     type_id: u32,
     op: u32,
     handle: i32,
-    args: *const i64,
-    n_args: u64,
-    results: *mut i64,
-    n_results: u64,
-    vm: &VmCtx,
+    buf: *mut i64,
+    counts: u64,
 );
 
+/// #2534 — the words of a [`CapThunk`]'s `buf`: room for every argument, or every result, of a
+/// call the verifier admits ([`temen_ir::CAP_MAX_ARITY`]).
+pub const CAP_BUF_WORDS: usize = temen_ir::CAP_MAX_ARITY;
+
+/// #2534 — a `call.cap`'s arguments and its result slots, from the `buf` and `counts` a
+/// [`CapThunk`] is handed. The arguments are copied out, since the results take their words; the
+/// result slots are zeroed, so a slot the op leaves unwritten reads zero (#2361). Each count is held
+/// to [`CAP_BUF_WORDS`], so a thunk never touches a word past the buffer.
+///
+/// # Safety
+/// `buf` is live for `'a` and holds [`CAP_BUF_WORDS`] words, as the JIT hands every thunk.
+pub unsafe fn cap_slots<'a>(buf: *mut i64, counts: u64) -> (CapArgs, &'a mut [i64]) {
+    let n_args = (counts as u32 as usize).min(CAP_BUF_WORDS);
+    let n_results = ((counts >> 32) as usize).min(CAP_BUF_WORDS);
+    let mut args = CapArgs {
+        words: [0; CAP_BUF_WORDS],
+        len: n_args,
+    };
+    if buf.is_null() {
+        args.len = 0;
+        return (args, &mut []);
+    }
+    core::ptr::copy_nonoverlapping(buf, args.words.as_mut_ptr(), n_args);
+    let results = core::slice::from_raw_parts_mut(buf, n_results);
+    results.fill(0);
+    (args, results)
+}
+
+/// A `call.cap`'s arguments, as [`cap_slots`] copies them out of its buffer.
+#[derive(Clone, Copy, Debug)]
+pub struct CapArgs {
+    words: [i64; CAP_BUF_WORDS],
+    len: usize,
+}
+
+impl core::ops::Deref for CapArgs {
+    type Target = [i64];
+    fn deref(&self) -> &[i64] {
+        &self.words[..self.len]
+    }
+}
+
 /// The **devirtualized `call.cap` fast path** (§9 / D45). A `call.cap` to a statically-known
-/// `(type_id, op)` normally goes through the generic [`CapThunk`]: it marshals args through a stack
-/// buffer, passes a 12-wide ABI (incl. `n_args`/`n_res`/`type_id`/`op`), and the host dispatches on
-/// `(type_id, op)` at runtime. A `FastCapResolver` lets an embedder hand the JIT a **specialized**
+/// `(type_id, op)` normally goes through the generic [`CapThunk`]: it marshals args through a frame
+/// buffer, passes the immediates and the counts, and the host dispatches on `(type_id, op)` at
+/// runtime. A `FastCapResolver` lets an embedder hand the JIT a **specialized**
 /// host function for a given `(type_id, op)`, which the JIT calls **register-to-register** — args and
 /// the result in registers, no stack marshalling, no runtime dispatch. Resolution happens once at
 /// **compile time** (the JIT calls the resolver during codegen and bakes the returned address); a
@@ -891,9 +931,10 @@ pub type CapThunk = unsafe extern "C" fn(
 ///
 /// The specialized function's ABI is, for a `call.cap` with `n_args` args and **one** result
 /// (multi-result ops fall back to the generic thunk):
-/// `unsafe extern "C" fn(ctx, mem_base, mem_size, handle: i32, vm: &VmCtx, a0: i64, …, aN: i64) -> i64`
-/// — `ctx`/`mem_base`/`mem_size`/`vm` are exactly as in [`CapThunk`]; the `handle` is the
-/// resolved capability handle (the fn still does the authority check); each `ai` is the i'th argument
+/// `unsafe extern "C" fn(vm: &VmCtx, handle: i32, a0: i64, …, aN: i64) -> i64`
+/// — `vm` is exactly as in [`CapThunk`], and the fn finds the powerbox and the window through it
+/// (#2534); the `handle` is the resolved capability handle (the fn still does the authority check);
+/// each `ai` is the i'th argument
 /// widened to its i64 slot (an i32/f32 in the low bits, an f64 bit-pattern); the i64 return is decoded
 /// to the result type. A 0-result op returns an ignored 0. The fn raises a trap on `vm` exactly like
 /// the generic thunk.
@@ -901,7 +942,8 @@ pub type CapThunk = unsafe extern "C" fn(
 /// **The resolver MUST gate on `(n_args, n_res)`**: the JIT builds the call signature from the IR
 /// `call.cap`'s arity, so a returned fn whose Rust signature has a *different* arity is a C-ABI
 /// mismatch. A frontend may emit a `call.cap` to any `(type_id, op)` with any sig (the verifier checks
-/// only `args.len() == sig.params.len()`, not that it matches the host op), so the resolver must return
+/// only `args.len() == sig.params.len()` and the arity bound, not that it matches the host op), so
+/// the resolver must return
 /// a fn **only** when `(n_args, n_res)` equals that fn's own arity — otherwise `null` (the generic
 /// slot-based path handles the odd arity safely). Types never mismatch (every arg is passed as an i64
 /// register, the result decoded from i64), so only arity matters.
@@ -1044,15 +1086,15 @@ pub type PagerAdmit = unsafe extern "C" fn(ctx: *mut core::ffi::c_void, export: 
 
 /// §2.2 / #2164 — a demand-paged child's **miss thunk**: its code calls it when an access's page
 /// check fails ([`emit_page_check`]), with the access's `len` bytes at window offset `off` of the
-/// window at `mem_base`, and [`PAGE_MISS_WRITE`] / [`PAGE_MISS_FATAL`] in `flags`. It returns once
-/// every page of the access admits it, having asked the child's pager for each one that may be
-/// paged in, or with a trap raised on `vm`, which the code propagates.
+/// context's window ([`VmCtx::window`], #2534), and [`PAGE_MISS_WRITE`] / [`PAGE_MISS_FATAL`] in
+/// `flags`. It returns once every page of the access admits it, having asked the child's pager for
+/// each one that may be paged in, or with a trap raised on `vm`, which the code propagates. The
+/// span is the code's to name, so the thunk faults one past the window's reservation
+/// ([`Window::span`]) itself.
 ///
 /// # Safety
-/// `vm` is the faulting instance's live context; `[mem_base, mem_base + off + len)` lies in its
-/// window's reservation.
-pub type PageMissThunk =
-    unsafe extern "C" fn(vm: &VmCtx, mem_base: *mut u8, off: u64, len: u64, flags: u64);
+/// `vm` is the faulting instance's live context.
+pub type PageMissThunk = unsafe extern "C" fn(vm: &VmCtx, off: u64, len: u64, flags: u64);
 
 /// [`PageMissThunk`] flag: the access stores.
 pub const PAGE_MISS_WRITE: u64 = 1;
@@ -1318,18 +1360,12 @@ pub type ChildManifestBinder = unsafe extern "C" fn(
 /// The default thunk for [`compile_and_run`] (no host): an empty powerbox, so every
 /// `call.cap` is inert — a `CapFault` — exactly like the interpreter's `run`.
 unsafe extern "C" fn empty_cap_thunk(
-    _ctx: *mut core::ffi::c_void,
-    _mem_base: *mut u8,
-    _mem_size: u64,
-    _mem_reserved: u64,
+    vm: &VmCtx,
     _type_id: u32,
     _op: u32,
     _handle: i32,
-    _args: *const i64,
-    _n_args: u64,
-    _results: *mut i64,
-    _n_results: u64,
-    vm: &VmCtx,
+    _buf: *mut i64,
+    _counts: u64,
 ) {
     vm.raise(TrapKind::CapFault as i64);
 }
@@ -2741,20 +2777,14 @@ mod domain_teardown_tests {
         /// A one-op powerbox: `call.cap 1 0` is `exit(code)` — raise `EXIT_CODE | code << 32`,
         /// exactly as temen-run's host thunk does for `Trap::Exit`.
         unsafe extern "C" fn exit_thunk(
-            _ctx: *mut core::ffi::c_void,
-            _mem_base: *mut u8,
-            _mem_size: u64,
-            _mem_reserved: u64,
+            vm: &crate::VmCtx,
             _type_id: u32,
             _op: u32,
             _handle: i32,
-            args: *const i64,
-            _n_args: u64,
-            _results: *mut i64,
-            _n_results: u64,
-            vm: &crate::VmCtx,
+            buf: *mut i64,
+            _counts: u64,
         ) {
-            let code = *args as i32;
+            let code = *buf as i32;
             vm.raise(EXIT_CODE as i64 | ((code as i64) << 32));
         }
 
@@ -2859,21 +2889,15 @@ mod domain_teardown_tests {
     /// waits at most half of [`PROMPT`], so a run that never ends its domain still ends, with
     /// whatever outcome it then reports.
     unsafe extern "C" fn in_flight_thunk(
-        _ctx: *mut core::ffi::c_void,
-        _mem_base: *mut u8,
-        _mem_size: u64,
-        _mem_reserved: u64,
+        vm: &crate::VmCtx,
         _type_id: u32,
         op: u32,
         _handle: i32,
-        args: *const i64,
-        _n_args: u64,
-        _results: *mut i64,
-        _n_results: u64,
-        vm: &crate::VmCtx,
+        buf: *mut i64,
+        _counts: u64,
     ) {
         if op == 0 {
-            vm.raise(EXIT_CODE as i64 | ((*args as i32 as i64) << 32));
+            vm.raise(EXIT_CODE as i64 | ((*buf as i32 as i64) << 32));
             return;
         }
         let start = Instant::now();
@@ -3983,7 +4007,6 @@ impl CompiledModule {
                     &mut ctx.func,
                     &m.funcs[fi],
                     mask,
-                    win_mapped as u64,
                     guard_offset_of(win_reserved as u64),
                     epoch_addr != 0,
                     fuel_addr != 0,
@@ -5723,7 +5746,6 @@ impl CompiledModule {
                     &mut ctx.func,
                     &funcs[fi],
                     self.mask,
-                    self.win_mapped as u64,
                     guard_offset_of(self.win_reserved as u64),
                     self.epoch,
                     self.fuel, // charges the running instance's fuel cell, as the parent's functions do
@@ -6412,21 +6434,29 @@ impl HostFn {
     /// window it confines guest offsets to, and the register-position frame buffers it reads or
     /// writes (a fiber's or thread's status word, a signal record, `gc.roots`' operands), tagged so
     /// the validator clobbers only their bytes across the call. Everything else is a guest value the
-    /// host checks itself. The embedder thunks (`call.cap`, its D45 fast path, the page-miss and
-    /// signal thunks) still take window values from the code; their ABI moves to the context in a
-    /// later slice.
+    /// host checks itself; no host function takes a window value or a runtime object from the code.
     fn arg_contract(self) -> &'static [validate::ArgTag] {
-        use validate::ArgTag::{Any, FramePointer, JmpBuf, StackSlot, Vmctx, WindowBase};
+        use validate::ArgTag::{Any, FramePointer, JmpBuf, StackSlot, Vmctx};
         // An 8-byte status/exit word the host writes back through a resume's or join's `status_ptr`.
         const STATUS: validate::ArgTag = StackSlot {
             len: 8,
             write: true,
         };
         match self {
-            // ctx, mem_base, mem_size, mem_reserved, tid, op, handle, args_ptr, …
-            HostFn::CapThunk => &[Any, WindowBase],
-            // vmctx, mem_base, off, len, flags
-            HostFn::PageMiss => &[Vmctx, WindowBase],
+            // vmctx, type_id, op, handle, buf — the call's arguments in, its results out, the
+            // function's call buffer (`lower_cap_call`) — counts
+            HostFn::CapThunk => &[
+                Vmctx,
+                Any,
+                Any,
+                Any,
+                StackSlot {
+                    len: (CAP_BUF_WORDS * 8) as u32,
+                    write: true,
+                },
+            ],
+            // vmctx, off, len, flags
+            HostFn::PageMiss => &[Vmctx],
             // vmctx, funcref, arg0
             HostFn::FiberNew => &[Vmctx],
             // k, arg, status_ptr, vmctx
@@ -6458,14 +6488,16 @@ impl HostFn {
             HostFn::Setjmp => &[JmpBuf],
             // The trap capture walks the frame chain from its argument: this frame's pointer.
             HostFn::TrapCapture => &[FramePointer],
-            // ctx, out — the host writes a 24-byte `[fref, signum, sp]` record into the out slot.
+            // vmctx, out — the host writes a 24-byte `[fref, signum, sp]` record into the out slot.
             HostFn::SigTake => &[
-                Any,
+                Vmctx,
                 StackSlot {
                     len: 24,
                     write: true,
                 },
             ],
+            // vmctx
+            HostFn::SigReturn => &[Vmctx],
             // vmctx, args_ptr — the five operands the host only reads (the roots it collects go to
             // the guest-memory `buf` named inside them, never back into this frame).
             HostFn::GcRoots => &[
@@ -6501,15 +6533,11 @@ impl HostFn {
     fn signature(self, cc: cranelift_codegen::isa::CallConv) -> Signature {
         use HostFn::*;
         let (params, returns): (&[Type], &[Type]) = match self {
-            // (ctx, mem_base, mem_size, mem_reserved, type_id, op, handle, args, n_args, results,
-            // n_results, vmctx)
-            CapThunk => (
-                &[I64, I64, I64, I64, I32, I32, I32, I64, I64, I64, I64, I64],
-                &[],
-            ),
-            // (ctx, out) -> 1 when a signal is deliverable, 0 when not
+            // (vmctx, type_id, op, handle, buf, counts)
+            CapThunk => (&[I64, I32, I32, I32, I64, I64], &[]),
+            // (vmctx, out) -> 1 when a signal is deliverable, 0 when not
             SigTake => (&[I64, I64], &[I32]),
-            // (ctx)
+            // (vmctx)
             SigReturn => (&[I64], &[]),
             // (vmctx, funcref, arg0) -> handle (16-bit slot, 48-bit generation)
             FiberNew => (&[I64, I32, I64], &[I64]),
@@ -6553,7 +6581,8 @@ impl HostFn {
             // (the fuel cell)
             FuelRefill => (&[I64], &[]),
             // (vmctx, mem_base, off, len, flags)
-            PageMiss => (&[I64, I64, I64, I64, I64], &[]),
+            // (vmctx, off, len, flags)
+            PageMiss => (&[I64, I64, I64, I64], &[]),
         };
         c_signature(cc, params, returns)
     }
@@ -6797,15 +6826,14 @@ fn fast_cap_symbol([type_id, op, n_args, n_res]: [u32; 4]) -> String {
     format!("temen.fast_cap.{type_id}.{op}.{n_args}.{n_res}")
 }
 
-/// The C signature of the fast-path target for `key` ([`fast_cap_key_of`]): `(ctx, mem_base,
-/// mem_size, handle, vmctx, args…) -> [result]`, each arg and the result in its `i64` register
-/// slot.
+/// The C signature of the fast-path target for `key` ([`fast_cap_key_of`]): `(vmctx, handle,
+/// args…) -> [result]`, each arg and the result in its `i64` register slot.
 fn fast_cap_signature(
     cc: cranelift_codegen::isa::CallConv,
     [_, _, n_args, n_res]: [u32; 4],
 ) -> Signature {
-    let mut params = vec![I64, I64, I64, I32, I64];
-    params.resize(5 + n_args as usize, I64);
+    let mut params = vec![I64, I32];
+    params.resize(2 + n_args as usize, I64);
     c_signature(cc, &params, &[I64][..n_res as usize])
 }
 
@@ -7149,10 +7177,10 @@ fn callee_contracts(module: &JITModule) -> Vec<Option<validate::Contract>> {
 /// (`temen.fast_cap.{type}.{op}.{n_args}.{n_res}`), so it is matched by prefix; every other host
 /// function is matched against [`HostFn::symbol`], the single source of truth for these names.
 fn host_args(name: &str) -> &'static [validate::ArgTag] {
-    use validate::ArgTag::{Any, Vmctx, WindowBase};
+    use validate::ArgTag::Vmctx;
     if name.starts_with("temen.fast_cap.") {
-        // ctx, mem_base, mem_size, handle, vmctx, args…
-        return &[Any, WindowBase, Any, Any, Vmctx];
+        // vmctx, handle, args… — guest values, the target confines any buffer they name (#2534)
+        return &[Vmctx];
     }
     HostFn::ALL
         .iter()
@@ -7204,11 +7232,11 @@ mod arg_contract_tests {
             HostFn::FiberResumeBlock.arg_contract(),
             &[Vmctx, Any, Any, W8]
         );
-        // the 24-byte signal record in rsi (idx 1).
+        // vmctx in rdi, the 24-byte signal record in rsi (idx 1).
         assert_eq!(
             HostFn::SigTake.arg_contract(),
             &[
-                Any,
+                Vmctx,
                 StackSlot {
                     len: 24,
                     write: true
@@ -7239,9 +7267,10 @@ mod arg_contract_tests {
         assert_eq!(host_args("temen.gc_roots"), HostFn::GcRoots.arg_contract());
     }
 
-    /// #2534 — the host functions temen's own runtime implements take the context first, tagged,
-    /// and derive from it the window, the function table and every runtime object they act on, so
-    /// none takes one of those from the code. No host function tags an argument past the sixth: the
+    /// #2534 — every host function that acts on the window or a runtime object takes the context
+    /// first, tagged, and derives from it the window, the function table and every runtime object
+    /// it acts on, so none takes one of those from the code: temen's own runtime functions, the bulk
+    /// helpers, and the embedder's `call.cap`, D45 fast-path, page-miss and signal thunks. No host function tags an argument past the sixth: the
     /// ABI passes those on the stack, where the validator checks nothing.
     #[test]
     fn runtime_host_calls_take_the_context_first() {
@@ -7263,9 +7292,16 @@ mod arg_contract_tests {
             ChildGrant,
             SetjmpSlot,
             Longjmp,
+            MemCopy,
+            MemFill,
+            CapThunk,
+            PageMiss,
+            SigTake,
+            SigReturn,
         ] {
             assert_eq!(h.arg_contract().first(), Some(&Vmctx), "{h:?}");
         }
+        assert_eq!(host_args(&fast_cap_symbol([3, 8, 1, 1])), &[Vmctx]);
         for h in HostFn::ALL {
             assert!(h.arg_contract().len() <= 6, "{h:?} tags a stack argument");
         }
@@ -7485,31 +7521,9 @@ block 2 (v7: i32) {
 }
 ";
 
-    #[allow(clippy::too_many_arguments)]
-    unsafe extern "C" fn cap_thunk(
-        _: *mut c_void,
-        _: *mut u8,
-        _: u64,
-        _: u64,
-        _: u32,
-        _: u32,
-        _: i32,
-        _: *const i64,
-        _: u64,
-        _: *mut i64,
-        _: u64,
-        _: &VmCtx,
-    ) {
-    }
+    unsafe extern "C" fn cap_thunk(_: &VmCtx, _: u32, _: u32, _: i32, _: *mut i64, _: u64) {}
 
-    unsafe extern "C" fn fast_target(
-        _: *mut c_void,
-        _: *mut u8,
-        _: u64,
-        _: i32,
-        _: &VmCtx,
-        _: i64,
-    ) -> i64 {
+    unsafe extern "C" fn fast_target(_: &VmCtx, _: i32, _: i64) -> i64 {
         0
     }
 
@@ -7522,13 +7536,13 @@ block 2 (v7: i32) {
         }
     }
 
-    unsafe extern "C" fn sig_take(_: *mut c_void, _: *mut i64) -> i32 {
+    unsafe extern "C" fn sig_take(_: &VmCtx, _: *mut i64) -> i32 {
         0
     }
 
-    unsafe extern "C" fn sig_return(_: *mut c_void) {}
+    unsafe extern "C" fn sig_return(_: &VmCtx) {}
 
-    unsafe extern "C" fn page_miss(_: &VmCtx, _: *mut u8, _: u64, _: u64, _: u64) {}
+    unsafe extern "C" fn page_miss(_: &VmCtx, _: u64, _: u64, _: u64) {}
 
     /// What the test programs' compiles bind beside temen-jit's own functions.
     fn imports() -> Imports {
@@ -8211,7 +8225,6 @@ fn compile_child_windowed(
                 &mut ctx.func,
                 &funcs[fi],
                 mask,
-                mapped,                    // the committed prefix
                 guard_offset_of(reserved), // its own window's trailing guard
                 epoch_addr != 0, // §5 kill-path: the child polls the parent's interrupt cell
                 fuel_addr != 0, // counted fuel: the child charges its own budget cell (else un-metered)
@@ -8870,15 +8883,16 @@ fn ensure_supported(f: &Func, type_section: &[temen_ir::TypeEntry]) -> Result<()
 }
 
 /// #932 — the JIT-side ABI of the async-signal delivery **decision** thunk a host supplies to
-/// [`compile_and_run_with_host_signals`]: given the delivery ctx and a 3-slot `out` buffer, gate on
-/// the nesting bound + consume one deliverable signal, writing `(handler_funcref, signum, handler_sp)`
-/// into `out[0..3]` and returning `1` (delivered) or `0` (nothing / bound reached). Mirrors the
-/// interpreter's per-op redirect — the host wires it to `temen_interp::SignalSource::take_deliverable`.
-pub type SigTakeThunk = unsafe extern "C" fn(ctx: *mut core::ffi::c_void, out: *mut i64) -> i32;
+/// [`compile_and_run_with_host_signals`]: given the calling context, whose `sig_ctx` is the
+/// delivery ctx (#2534), and a 3-slot `out` buffer in the caller's frame, gate on the nesting bound +
+/// consume one deliverable signal, writing `(handler_funcref, signum, handler_sp)` into `out[0..3]`
+/// and returning `1` (delivered) or `0` (nothing / bound reached). Mirrors the interpreter's per-op
+/// redirect — the host wires it to `temen_interp::SignalSource::take_deliverable`.
+pub type SigTakeThunk = unsafe extern "C" fn(vm: &VmCtx, out: *mut i64) -> i32;
 /// #932 — the JIT-side ABI of the async-signal **handler-return** thunk: fire after the guest handler
 /// the redirect dispatched returns, so the host restores the block-during-handler mask
-/// (`SignalSource::handler_returned`) and pops the nesting count.
-pub type SigReturnThunk = unsafe extern "C" fn(ctx: *mut core::ffi::c_void);
+/// (`SignalSource::handler_returned`) and pops the nesting count. Its delivery ctx is `vm.sig_ctx`.
+pub type SigReturnThunk = unsafe extern "C" fn(vm: &VmCtx);
 
 /// #932 — the host's async-signal delivery **arm** for a JIT run: the `Host::sig_armed` flag the
 /// lowering polls at its safepoints (function entries + taken back-edges), plus the two call-out
@@ -9024,10 +9038,6 @@ struct Lower<'a> {
     result_tys: Vec<Type>,
     /// The §4 confinement mask (`reserved - 1`); `0` when the module has no memory.
     mask: u64,
-    /// The backed `mapped` extent in bytes — the guest window length handed to the `call.cap`
-    /// thunk (`[mem_base, mem_base+mapped)`), so buffer borrows and Memory-cap ops bound against
-    /// the *backed* region, not the larger reserved mask domain. `0` when the module has no memory.
-    mapped: u64,
     /// Offset from `mem_base` of the **window's trailing guard page** — `round_up(win_reserved,
     /// page)`. Always `PROT_NONE`, so the D63 branchless lowering redirects an out-of-bounds access
     /// here to fault it. `0` when the module has no memory (the branchless path isn't taken).
@@ -9118,6 +9128,10 @@ struct Lower<'a> {
     page: Option<(PageEnv, FuncRef, Variable)>,
     /// #2488 — the function's shared exits ([`Exits`]).
     exits: Exits,
+    /// #2534 — the function's `call.cap` buffer, [`CAP_BUF_WORDS`] words of its frame that every
+    /// `call.cap` in it passes its arguments and results through ([`lower_cap_call`]), made at the
+    /// first. One per function, so a function of many calls does not grow a frame per call.
+    cap_buf: std::cell::Cell<Option<cranelift_codegen::ir::StackSlot>>,
 }
 
 /// The address of the §5 W3 explicit-trap capture helper (`temen_capture_explicit_trap` in
@@ -9161,7 +9175,6 @@ fn build_clif(
     clif: &mut Function,
     f: &Func,
     mask: u64,
-    mapped: u64,
     guard_offset: u64,
     epoch: bool,
     fuel: bool,
@@ -9284,7 +9297,6 @@ fn build_clif(
         funcs,
         result_tys: f.results.iter().map(|t| clif_ty(*t)).collect(),
         mask,
-        mapped,
         guard_offset,
         fn_table_mask,
         ref_slots,
@@ -9303,6 +9315,7 @@ fn build_clif(
         trap_capture,
         page,
         exits: Exits::default(),
+        cap_buf: std::cell::Cell::new(None),
     };
 
     // Jump into IR block 0 passing the function parameters (entry params after the three context
@@ -11978,12 +11991,13 @@ fn emit_signal_check(b: &mut FunctionBuilder, lower: &Lower) -> Result<(), JitEr
     let maybe = b.create_block();
     b.ins().brif(armed, maybe, &[], cont, &[]);
 
-    // Armed: ask the host decision thunk `fn(ctx, *mut [i64;3]) -> i32` for a deliverable signal.
+    // Armed: ask the host decision thunk `fn(vmctx, *mut [i64;3]) -> i32` for a deliverable signal;
+    // it finds the delivery ctx through `vmctx` (#2534).
     b.switch_to_block(maybe);
     let out_ss = b.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 24, 3)); // [fref,signum,sp]
     let out = b.ins().stack_addr(I64, out_ss, 0);
-    let ctx = vmctx_load(b, lower, vmctx::SIG_CTX);
-    let got = call_host(lower.callees, b, HostFn::SigTake, &[ctx, out])?;
+    let vmctx = b.use_var(lower.vmctx_var);
+    let got = call_host(lower.callees, b, HostFn::SigTake, &[vmctx, out])?;
     let got = b.inst_results(got)[0];
     let deliver = b.create_block();
     b.ins().brif(got, deliver, &[], cont, &[]);
@@ -12012,8 +12026,8 @@ fn emit_signal_check(b: &mut FunctionBuilder, lower: &Lower) -> Result<(), JitEr
     // exactly as after a `call.dyn`. Leaves the builder in a fresh continuation block.
     emit_trap_propagate(b, lower, Callee::Guest);
     // Handler returned normally: notify the host (restore the block-during-handler mask, pop nesting).
-    let ctx2 = vmctx_load(b, lower, vmctx::SIG_CTX);
-    call_host(lower.callees, b, HostFn::SigReturn, &[ctx2])?;
+    let vmctx = b.use_var(lower.vmctx_var);
+    call_host(lower.callees, b, HostFn::SigReturn, &[vmctx])?;
     b.ins().jump(poll, &[]); // re-poll: deliver a nested/queued signal before resuming
     b.switch_to_block(cont);
     // `poll`/`maybe`/`deliver`/`cont` are sealed by the caller's `seal_all_blocks`.
@@ -12325,18 +12339,10 @@ fn lower_cap_call_fast(
     vals: &mut Vec<Value>,
 ) -> Result<(), JitError> {
     let n_res = sig.results.len();
-    let ctx = vmctx_load(b, lower, vmctx::CAP_CTX);
-    let mem_base = b.use_var(lower.mem_var);
-    // #826: this frozen `lower.mapped` is deliberate — the ABI slot is the window's
-    // default-committed **prefix** (the interpreter's equally-frozen `window.mapped`; growth lives
-    // as explicit page-map entries, never by moving this value). A fast-path fn that needs to
-    // admit grown-tail buffers must consult live page state like the generic thunk's
-    // `MprotectWindow` does, not this bound alone.
-    let mem_size = b.ins().iconst(I64, lower.mapped as i64);
     let h = get(vals, handle)?;
+    // The target finds the powerbox and the window through the context (#2534).
     let vmctx = b.use_var(lower.vmctx_var);
-
-    let mut call_args = vec![ctx, mem_base, mem_size, h, vmctx];
+    let mut call_args = vec![vmctx, h];
     for a in args {
         let v = get(vals, *a)?;
         call_args.push(encode_slot(b, v)); // each arg widened to its i64 register slot
@@ -12353,10 +12359,12 @@ fn lower_cap_call_fast(
     Ok(())
 }
 
-/// Lower a `call.cap` (§3c/§9): marshal the arg slots into a stack buffer, call the host
-/// thunk ([`HostFn::CapThunk`]) with the cap immediates + the guest window, and
-/// — unless it set the trap cell — read the result slots back. A trap from the thunk
-/// (CapFault / Exit) propagates like any other (return early; the cell is already set).
+/// Lower a `call.cap` (§3c/§9): store the args into the function's call buffer, call the host thunk
+/// ([`HostFn::CapThunk`]) with the cap immediates, the context and the buffer, and — unless it set
+/// the trap cell — read the results back from the same buffer, where the thunk wrote them over the
+/// args ([`cap_slots`]). A trap from the thunk (CapFault / Exit) propagates like any other (return
+/// early; the cell is already set). The thunk finds the powerbox and the window through the context,
+/// so the code hands it neither (#2534).
 #[allow(clippy::too_many_arguments)]
 fn lower_cap_call(
     b: &mut FunctionBuilder,
@@ -12370,94 +12378,44 @@ fn lower_cap_call(
     args: &[u32],
     vals: &mut Vec<Value>,
 ) -> Result<(), JitError> {
-    let n_args = args.len();
-    let n_res = sig.results.len();
-
-    // Marshal the args into a stack buffer of i64 slots (null pointer when there are 0).
-    let args_ptr = if n_args == 0 {
-        b.ins().iconst(I64, 0)
-    } else {
+    let (n_args, n_res) = (args.len(), sig.results.len());
+    // The verifier holds every call to the buffer; an unverified one is refused, never lowered past it.
+    if n_args > CAP_BUF_WORDS || n_res > CAP_BUF_WORDS {
+        return Err(JitError::Malformed);
+    }
+    let buf = lower.cap_buf.get().unwrap_or_else(|| {
         let ss = b.create_sized_stack_slot(StackSlotData::new(
             StackSlotKind::ExplicitSlot,
-            (n_args * 8) as u32,
+            (CAP_BUF_WORDS * 8) as u32,
             3,
         ));
-        let addr = b.ins().stack_addr(I64, ss, 0);
-        for (i, a) in args.iter().enumerate() {
-            let v = get(vals, *a)?;
-            let slot = encode_slot(b, v);
-            b.ins()
-                .store(MemFlags::trusted(), slot, addr, (i * 8) as i32);
-        }
-        addr
-    };
-    let res_ss = if n_res == 0 {
-        None
-    } else {
-        Some(b.create_sized_stack_slot(StackSlotData::new(
-            StackSlotKind::ExplicitSlot,
-            (n_res * 8) as u32,
-            3,
-        )))
-    };
-    let res_ptr = match res_ss {
-        Some(ss) => b.ins().stack_addr(I64, ss, 0),
-        None => b.ins().iconst(I64, 0),
-    };
-    // Audit #4: pre-zero the result slots, so a host op that writes fewer than `n_res` results can't
-    // leave uninitialized stack for the read-back to decode. The verifier pins the sig arity, so a
-    // correct host fills all of them — this guards a buggy host, not a guest (bounded to this slot).
-    if let Some(ss) = res_ss {
-        let z = b.ins().iconst(I64, 0);
-        for i in 0..n_res {
-            b.ins().stack_store(z, ss, (i * 8) as i32);
-        }
+        lower.cap_buf.set(Some(ss));
+        ss
+    });
+    for (i, a) in args.iter().enumerate() {
+        let v = get(vals, *a)?;
+        let slot = encode_slot(b, v); // each arg widened to its i64 slot
+        b.ins().stack_store(slot, buf, (i * 8) as i32);
     }
-
-    // Assemble the thunk arguments (see `CapThunk`): the ctx is the instance's powerbox.
-    let ctx = vmctx_load(b, lower, vmctx::CAP_CTX);
-    let mem_base = b.use_var(lower.mem_var);
-    // #826: this frozen `lower.mapped` is deliberate — it is the window's default-committed
-    // **prefix** (the interpreter's equally-frozen `window.mapped`): the thunk builds its
-    // `MprotectWindow` view as `(mapped default, reserved, live shared page map)`, so grown-tail
-    // borrows are admitted by the page map, not by this value. Do not "fix" it to `reserved` —
-    // that would default-commit the whole tail and admit borrows of never-mapped pages.
-    let mem_size = b.ins().iconst(I64, lower.mapped as i64);
-    // The reserved mask domain (`mask + 1`) the guest may `map`-grow into; 0 when no memory.
-    let reserved = if lower.mapped == 0 { 0 } else { lower.mask + 1 };
-    let mem_reserved = b.ins().iconst(I64, reserved as i64);
+    let vmctx = b.use_var(lower.vmctx_var);
     let tid = b.ins().iconst(I32, type_id as i64);
     let opc = b.ins().iconst(I32, op as i64);
-    let na = b.ins().iconst(I64, n_args as i64);
-    let nr = b.ins().iconst(I64, n_res as i64);
-    let vmctx = b.use_var(lower.vmctx_var);
-
-    let call_args = [
-        ctx,
-        mem_base,
-        mem_size,
-        mem_reserved,
-        tid,
-        opc,
-        h,
-        args_ptr,
-        na,
-        res_ptr,
-        nr,
-        vmctx,
-    ];
-    call_host(lower.callees, b, HostFn::CapThunk, &call_args)?;
-
-    // If the thunk set the trap cell, propagate (return early; the cell already holds
-    // the kind / exit code).
+    let addr = b.ins().stack_addr(I64, buf, 0);
+    let counts = b
+        .ins()
+        .iconst(I64, (n_args as u64 | (n_res as u64) << 32) as i64);
+    call_host(
+        lower.callees,
+        b,
+        HostFn::CapThunk,
+        &[vmctx, tid, opc, h, addr, counts],
+    )?;
+    // If the thunk set the trap cell, propagate (return early; the cell already holds the kind / exit
+    // code).
     emit_trap_propagate(b, lower, Callee::Host);
-
-    // Read the result slots back.
-    if let Some(ss) = res_ss {
-        for (i, rty) in sig.results.iter().enumerate() {
-            let slot = b.ins().stack_load(I64, ss, (i * 8) as i32);
-            vals.push(decode_slot(b, slot, *rty));
-        }
+    for (i, rty) in sig.results.iter().enumerate() {
+        let slot = b.ins().stack_load(I64, buf, (i * 8) as i32);
+        vals.push(decode_slot(b, slot, *rty));
     }
     Ok(())
 }
@@ -12990,7 +12948,7 @@ fn emit_page_check(b: &mut FunctionBuilder, lower: &Lower, phys: Value, len: u32
     b.switch_to_block(miss);
     b.seal_block(miss);
     let len = b.ins().iconst(I64, i64::from(len));
-    emit_page_miss(b, lower, thunk, base, off, len, flags);
+    emit_page_miss(b, lower, thunk, off, len, flags);
     b.ins().jump(done, &[]);
 
     b.switch_to_block(done);
@@ -13021,20 +12979,19 @@ pub(crate) unsafe fn table_admits(
         .all(|p| (*table.add(p as usize)).load(Ordering::Acquire) & need != 0)
 }
 
-/// Call the miss thunk `thunk` on `len` bytes at window offset `off` of the window at `base`, and
+/// Call the miss thunk `thunk` on `len` bytes at window offset `off` of the context's window, and
 /// unwind if it set a trap.
 fn emit_page_miss(
     b: &mut FunctionBuilder,
     lower: &Lower,
     thunk: FuncRef,
-    base: Value,
     off: Value,
     len: Value,
     flags: u64,
 ) {
     let vm = b.use_var(lower.vmctx_var);
     let flags = b.ins().iconst(I64, flags as i64);
-    b.ins().call(thunk, &[vm, base, off, len, flags]);
+    b.ins().call(thunk, &[vm, off, len, flags]);
     emit_trap_propagate(b, lower, Callee::Host);
 }
 

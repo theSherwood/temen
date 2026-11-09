@@ -368,30 +368,27 @@ fn jit_locked_thunk_releases_lock_before_completion_wait() {
         let handles: Vec<_> = (0..2i64)
             .map(|i| {
                 s.spawn(move || {
-                    let arg = [i];
-                    let mut result = 0i64;
+                    let mut buf = [0i64; temen_jit::CAP_BUF_WORDS];
+                    buf[0] = i;
                     let vm = temen_jit::VmCtx::new(
-                        temen_jit::InstanceAddrs::NONE,
+                        temen_jit::InstanceAddrs {
+                            cap_ctx: addr as *mut core::ffi::c_void,
+                            ..temen_jit::InstanceAddrs::NONE
+                        },
                         temen_jit::Window::NONE,
                     );
                     unsafe {
                         temen_run::cap_thunk_locked(
-                            addr as *mut core::ffi::c_void,
-                            std::ptr::null_mut(),
-                            0,
-                            0,
+                            &vm,
                             10, // cap_id::BLOCKING
                             0,
                             h,
-                            arg.as_ptr(),
-                            1,
-                            &mut result,
-                            1,
-                            &vm,
+                            buf.as_mut_ptr(),
+                            1 | 1 << 32, // one argument, one result
                         );
                     }
                     assert_eq!(vm.ended(), None, "worker {i}: clean dispatch");
-                    result
+                    buf[0]
                 })
             })
             .collect();

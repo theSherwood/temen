@@ -291,11 +291,9 @@ unsafe impl Sync for VmCtx {}
 /// Field offsets compiled code loads at (`#[repr(C)]` makes them fixed; `offset_of!` keeps them in
 /// step with the struct).
 pub(crate) const END: i32 = core::mem::offset_of!(VmCtx, end) as i32;
-pub(crate) const CAP_CTX: i32 = core::mem::offset_of!(VmCtx, cap_ctx) as i32;
 pub(crate) const EPOCH: i32 = core::mem::offset_of!(VmCtx, epoch) as i32;
 pub(crate) const FUEL: i32 = core::mem::offset_of!(VmCtx, fuel) as i32;
 pub(crate) const SIG_ARMED: i32 = core::mem::offset_of!(VmCtx, sig_armed) as i32;
-pub(crate) const SIG_CTX: i32 = core::mem::offset_of!(VmCtx, sig_ctx) as i32;
 pub(crate) const PAGES: i32 = core::mem::offset_of!(VmCtx, pages) as i32;
 
 // The stop word must be the first field: the check after each call dereferences the vmctx pointer

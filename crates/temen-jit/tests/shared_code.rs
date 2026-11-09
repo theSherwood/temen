@@ -19,23 +19,19 @@ use core::ffi::c_void;
 use temen_jit::{CompiledModule, FuelCell, InstanceAddrs, JitError, JitOutcome, INERT_CAP_THUNK};
 use temen_text::parse_module;
 
-/// A `call.cap` whose answer is the powerbox's own: the thunk returns the `i64` its ctx points at.
+/// A `call.cap` whose answer is the powerbox's own: the thunk returns the `i64` its context's
+/// powerbox points at.
 unsafe extern "C" fn ctx_value_thunk(
-    ctx: *mut c_void,
-    _mem_base: *mut u8,
-    _mem_size: u64,
-    _mem_reserved: u64,
+    vm: &temen_jit::VmCtx,
     _type_id: u32,
     _op: u32,
     _handle: i32,
-    _args: *const i64,
-    _n_args: u64,
-    results: *mut i64,
-    _n_results: u64,
-    _vm: &temen_jit::VmCtx,
+    buf: *mut i64,
+    counts: u64,
 ) {
     unsafe {
-        *results = *(ctx as *const i64);
+        let (_, results) = temen_jit::cap_slots(buf, counts);
+        results[0] = *(vm.cap_ctx as *const i64);
     }
 }
 

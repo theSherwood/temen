@@ -44,19 +44,14 @@ struct TestCtx {
 /// The stand-in handler: on first call, `define_extra` the unit **mid-run**; then
 /// `invoke_extra` it over the live window, marshalling the guest's call.cap args/results.
 unsafe extern "C" fn reentry_thunk(
-    ctx: *mut c_void,
-    mem_base: *mut u8,
-    _mem_size: u64,
-    _mem_reserved: u64,
+    vm: &temen_jit::VmCtx,
     _type_id: u32,
     _op: u32,
     _handle: i32,
-    args: *const i64,
-    n_args: u64,
-    results: *mut i64,
-    n_results: u64,
-    vm: &temen_jit::VmCtx,
+    buf: *mut i64,
+    counts: u64,
 ) {
+    let (ctx, mem_base) = (vm.cap_ctx, vm.window().base);
     let tc = &*(ctx as *const TestCtx);
     let cm = tc.cm.get();
     if tc.code.get().is_null() {
@@ -67,13 +62,12 @@ unsafe extern "C" fn reentry_thunk(
             .expect("define_extra mid-run");
         tc.code.set(ptrs[0].tramp);
     }
-    let args = std::slice::from_raw_parts(args, n_args as usize);
-    let results = std::slice::from_raw_parts_mut(results, n_results as usize);
+    let (args, results) = temen_jit::cap_slots(buf, counts);
     if tc.end_first.get() != 0 {
         vm.raise(tc.end_first.get());
     }
     // The thunk's `vm` is the running instance's `VmCtx`: the unit runs as that instance.
-    CompiledModule::invoke_extra(cm, tc.code.get(), args, results, mem_base, vm)
+    CompiledModule::invoke_extra(cm, tc.code.get(), &args, results, mem_base, vm)
         .expect("invoke_extra during a live run");
 }
 

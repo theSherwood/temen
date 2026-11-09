@@ -121,26 +121,19 @@ fn a_successful_call_leaves_the_domains_end() {
     let clk = host.grant_clock();
     let ctx = &mut host as *mut Host as *mut core::ffi::c_void;
     let end = TrapKind::Unreachable.code();
-    let vm = VmCtx::new(InstanceAddrs::NONE, Window::NONE);
+    let vm = VmCtx::new(
+        InstanceAddrs {
+            cap_ctx: ctx,
+            ..InstanceAddrs::NONE
+        },
+        Window::NONE,
+    );
     vm.raise(end);
 
-    let mut now = 0i64;
-    // SAFETY: `ctx` is a live `*mut Host`; no args, one result slot, no window.
+    let mut buf = [0i64; temen_jit::CAP_BUF_WORDS];
+    // SAFETY: `vm`'s powerbox is a live `*mut Host`; no args, one result slot, no window.
     unsafe {
-        cap_thunk(
-            ctx,
-            core::ptr::null_mut(),
-            0,
-            0,
-            cap_id::CLOCK,
-            0,
-            clk,
-            core::ptr::null(),
-            0,
-            &mut now,
-            1,
-            &vm,
-        );
+        cap_thunk(&vm, cap_id::CLOCK, 0, clk, buf.as_mut_ptr(), 1 << 32);
     }
     assert_eq!(vm.ended(), Some(end), "the generic thunk kept the end");
 
@@ -148,9 +141,8 @@ fn a_successful_call_leaves_the_domains_end() {
     let fast = unsafe { fast_cap_resolver(cap_id::CLOCK, 0, 0, 1) };
     assert!(!fast.is_null(), "the clock read is fast-path claimed");
     // SAFETY: the `FastCapResolver` ABI of a 0-arg, 1-result op.
-    let fast: unsafe extern "C" fn(*mut core::ffi::c_void, *mut u8, u64, i32, &VmCtx) -> i64 =
-        unsafe { core::mem::transmute(fast) };
+    let fast: unsafe extern "C" fn(&VmCtx, i32) -> i64 = unsafe { core::mem::transmute(fast) };
     // SAFETY: as for the generic call.
-    unsafe { fast(ctx, core::ptr::null_mut(), 0, clk, &vm) };
+    unsafe { fast(&vm, clk) };
     assert_eq!(vm.ended(), Some(end), "the fast path kept the end");
 }

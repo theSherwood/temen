@@ -1459,22 +1459,18 @@ impl Nursery {
 
     /// Resolve `handle` as this domain's `Instantiator` via the run's `call.cap` thunk: `false` (and
     /// a `CapFault` raised on `vm`) for a forged/closed/wrong handle.
-    unsafe fn resolve(&self, mem_base: u64, handle: i32, vm: &crate::VmCtx) -> bool {
+    unsafe fn resolve(&self, handle: i32, vm: &crate::VmCtx) -> bool {
         // op 0 on an `Instantiator` binding is the host's authority probe, answering nothing for a
-        // live handle (see `cap_dispatch_slots`); a bad handle raises a `CapFault`.
+        // live handle (see `cap_dispatch_slots`); a bad handle raises a `CapFault`. The powerbox and
+        // the window are `vm`'s (#2534); the call has no arguments or results.
+        let mut buf = [0i64; crate::CAP_BUF_WORDS];
         (self.cap_thunk)(
-            self.cap_ctx,
-            mem_base as *mut u8,
-            0,
-            0,
+            vm,
             temen_ir_iface_instantiator(),
             0,
             handle,
-            core::ptr::null(),
+            buf.as_mut_ptr(),
             0,
-            core::ptr::null_mut(),
-            0,
-            vm,
         );
         vm.ended().is_none()
     }
@@ -1788,7 +1784,7 @@ unsafe fn spawn_detached(
         rt.cap_thunk
     };
     // The Instantiator is the authority (a forged handle is a CapFault).
-    if !rt.resolve(mem_base, handle, vm) {
+    if !rt.resolve(handle, vm) {
         return 0;
     }
     // §2.2 — a record's pager must be a `{ page: (i64) -> (i64) }` export of the spawner's own
@@ -2062,9 +2058,9 @@ pub(crate) unsafe extern "C" fn child_offer(
     export: i64,
 ) -> i32 {
     const EINVAL: i32 = -22;
-    let (rt, mem_base) = (vm.nursery as *const Nursery, vm.window().base as u64);
+    let rt = vm.nursery as *const Nursery;
     let rt = &*rt;
-    if !rt.resolve(mem_base, inst, vm) {
+    if !rt.resolve(inst, vm) {
         return 0; // a forged `Instantiator` — its CapFault is raised (#1729)
     }
     let mint_addr = rt.grant_mint.load(Ordering::Acquire);
@@ -2098,9 +2094,9 @@ pub(crate) unsafe extern "C" fn child_grant(
     child: i32,
     handle: i64,
 ) -> i32 {
-    let (rt, mem_base) = (vm.nursery as *const Nursery, vm.window().base as u64);
+    let rt = vm.nursery as *const Nursery;
     let rt = &*rt;
-    if !rt.resolve(mem_base, inst, vm) {
+    if !rt.resolve(inst, vm) {
         return 0; // a forged `Instantiator` — its CapFault is raised (#1729)
     }
     let grant_addr = rt.grant_into.load(Ordering::Acquire);
@@ -2137,7 +2133,7 @@ pub(crate) unsafe extern "C" fn join(
     *status_out = 0;
     let (rt, mem_base) = (vm.nursery as *const Nursery, vm.window().base as u64);
     let rt = &*rt;
-    if !rt.resolve(mem_base, inst, vm) {
+    if !rt.resolve(inst, vm) {
         return 0; // a forged `Instantiator` — its CapFault is raised (#1729)
     }
     join_named(rt, mem_base, handle, status_out, vm)
@@ -2343,9 +2339,9 @@ pub(crate) unsafe fn join_named(
 /// # Safety
 /// As [`join`].
 pub(crate) unsafe extern "C" fn poll(vm: &crate::VmCtx, inst: i32, handle: i32) -> i32 {
-    let (rt, mem_base) = (vm.nursery as *const Nursery, vm.window().base as u64);
+    let rt = vm.nursery as *const Nursery;
     let rt = &*rt;
-    if !rt.resolve(mem_base, inst, vm) {
+    if !rt.resolve(inst, vm) {
         return 0; // a forged `Instantiator` — its CapFault is raised (#1729)
     }
     let outcome = match rt.with_child(handle, |c| {
@@ -2372,9 +2368,9 @@ pub(crate) unsafe extern "C" fn poll(vm: &crate::VmCtx, inst: i32, handle: i32) 
 /// # Safety
 /// As [`join`].
 pub(crate) unsafe extern "C" fn detach(vm: &crate::VmCtx, inst: i32, handle: i32) -> i32 {
-    let (rt, mem_base) = (vm.nursery as *const Nursery, vm.window().base as u64);
+    let rt = vm.nursery as *const Nursery;
     let rt = &*rt;
-    if !rt.resolve(mem_base, inst, vm) {
+    if !rt.resolve(inst, vm) {
         return 0; // a forged `Instantiator` — its CapFault is raised (#1729)
     }
     match rt.retire(handle) {
@@ -2395,9 +2391,9 @@ pub(crate) unsafe extern "C" fn detach(vm: &crate::VmCtx, inst: i32, handle: i32
 /// # Safety
 /// As [`join`].
 pub(crate) unsafe extern "C" fn kill(vm: &crate::VmCtx, inst: i32, handle: i32) -> i32 {
-    let (rt, mem_base) = (vm.nursery as *const Nursery, vm.window().base as u64);
+    let rt = vm.nursery as *const Nursery;
     let rt = &*rt;
-    if !rt.resolve(mem_base, inst, vm) {
+    if !rt.resolve(inst, vm) {
         return 0; // a forged `Instantiator` — its CapFault is raised (#1729)
     }
     match rt.with_child(handle, |c| (c.task, c.kid.clone())) {
