@@ -6,6 +6,7 @@
 //! All single-vCPU: the whole point is that the domain never stops.
 
 use std::time::Duration;
+use temen_interp::put_results;
 
 #[path = "support/drivers.rs"]
 mod drivers;
@@ -278,7 +279,7 @@ fn a_punted_host_call_parks_the_fiber_not_the_vcpu() {
     temen_verify::verify_module(&m).expect("verify");
     let mut host = Host::new();
     let h = host.grant_host_proc(HostProcGrant::new(
-        ProcHandler::Offloadable(Box::new(|_op, args| {
+        ProcHandler::Offloadable(Box::new(|_op, args, _out| {
             let a = *args.first().unwrap_or(&0);
             OffloadOutcome::Offload(Box::new(move || a + 100))
         })),
@@ -512,7 +513,7 @@ fn root_return_abandons_a_cap_parked_fiber() {
     temen_verify::verify_module(&m).expect("verify");
     let mut host = Host::new();
     let h = host.grant_host_proc(HostProcGrant::new(
-        ProcHandler::Offloadable(Box::new(|_op, args| {
+        ProcHandler::Offloadable(Box::new(|_op, args, _out| {
             let a = *args.first().unwrap_or(&0);
             OffloadOutcome::Offload(Box::new(move || {
                 std::thread::sleep(Duration::from_millis(100));
@@ -548,7 +549,7 @@ fn a_durable_caller_never_fiber_parks_on_a_punt() {
     let mut host = Host::new();
     host.set_durable(true);
     let h = host.grant_host_proc(HostProcGrant::new(
-        ProcHandler::Offloadable(Box::new(|_op, args| {
+        ProcHandler::Offloadable(Box::new(|_op, args, _out| {
             let a = *args.first().unwrap_or(&0);
             OffloadOutcome::Offload(Box::new(move || a + 100))
         })),
@@ -583,13 +584,13 @@ fn a_later_answer_is_not_held_behind_an_earlier_call() {
     let gate_rel = std::sync::Arc::clone(&gate);
     let mut host = Host::new();
     let h = host.grant_host_proc(HostProcGrant::new(
-        ProcHandler::Offloadable(Box::new(move |op, args| {
+        ProcHandler::Offloadable(Box::new(move |op, args, out| {
             if op == 1 {
                 // The release (inline `Done` — never punts): open the latch.
                 let (m, cv) = &*gate_rel;
                 *m.lock().unwrap() = true;
                 cv.notify_all();
-                return OffloadOutcome::Done(Ok(vec![0]));
+                return OffloadOutcome::Done(put_results(out, &[0]));
             }
             let a = *args.first().unwrap_or(&0);
             if a == 0 {

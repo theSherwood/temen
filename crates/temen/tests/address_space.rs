@@ -155,7 +155,7 @@ fn sub_rejects_ranges_outside_the_holder() {
 
     // A helper to call `sub(off, size_log2)` on `handle` and get the raw result.
     let sub = |h: &mut Host, handle: i32, off: i64, size_log2: i64| -> i64 {
-        h.cap_dispatch_slots(cap_id::ADDRESS_SPACE, 4, handle, &[off, size_log2], None)
+        h.cap_call(cap_id::ADDRESS_SPACE, 4, handle, &[off, size_log2], 1, None)
             .expect("dispatch")[0]
     };
 

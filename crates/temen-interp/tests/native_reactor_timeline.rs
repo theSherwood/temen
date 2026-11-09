@@ -16,6 +16,7 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use temen_interp::moment::{Moment, MomentReactor, ReactorTimeline, Refusal, SteppableReactor};
+use temen_interp::put_results;
 use temen_interp::{bytecode, Host, HostProcGrant, ProcHandler, Value};
 use temen_text::parse_module;
 
@@ -88,8 +89,8 @@ impl NativeReactor {
         // read two ways.
         let (qc, qr) = (Arc::clone(&queue), Arc::clone(&queue));
         let kbd = host.grant_host_proc(HostProcGrant::new(
-            ProcHandler::Sync(Box::new(move |_op, _args, _mem, _minter| {
-                Ok(vec![q.lock().unwrap().pop_front().unwrap_or(-1)])
+            ProcHandler::Sync(Box::new(move |_op, _args, out, _mem, _minter| {
+                put_results(out, &[q.lock().unwrap().pop_front().unwrap_or(-1)])
             })),
             temen_interp::CapState::Captured {
                 capture: Box::new(move || {

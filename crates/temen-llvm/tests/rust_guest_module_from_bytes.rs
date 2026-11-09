@@ -118,19 +118,19 @@ pub extern "C" fn run() -> i64 {{
 /// one shared `Arc` so a call from inside the confined child is observable here.
 fn grant_fs(host: &mut Host, counter: &Arc<Mutex<i64>>) -> i32 {
     let c1 = Arc::clone(counter);
-    let handler: HostProc = Box::new(move |_op, _args, _mem, _| {
+    let handler: HostProc = Box::new(move |_op, _args, out, _mem, _| {
         let mut c = c1.lock().unwrap();
         *c += 1;
-        Ok(vec![*c])
+        temen_interp::put_results(out, &[*c])
     });
     let c2 = Arc::clone(counter);
     let fork = Arc::new(move |_pid: u64| {
         let c = Arc::clone(&c2);
         Some(ForkedProc::shared(
-            ProcHandler::Sync(Box::new(move |_op, _args, _mem, _| {
+            ProcHandler::Sync(Box::new(move |_op, _args, out, _mem, _| {
                 let mut c = c.lock().unwrap();
                 *c += 1;
-                Ok(vec![*c])
+                temen_interp::put_results(out, &[*c])
             })),
             temen_interp::CapState::Stateless,
         ))

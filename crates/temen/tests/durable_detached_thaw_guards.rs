@@ -151,7 +151,14 @@ fn a_freeze_keeps_a_captured_childs_window_charged() {
             continue;
         };
         let room = host
-            .cap_dispatch_slots(temen_interp::cap_id::BUDGET, 1, args[2] as i32, &[1], None)
+            .cap_call(
+                temen_interp::cap_id::BUDGET,
+                1,
+                args[2] as i32,
+                &[1],
+                1,
+                None,
+            )
             .expect("read")[0];
         assert_eq!(room, (1 << 20) - (1 << 17), "frozen on {engine:?}");
     }

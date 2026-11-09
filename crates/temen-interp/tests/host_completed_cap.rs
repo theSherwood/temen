@@ -33,6 +33,7 @@ use temen_interp::bytecode::{
     self, CoopEvent, EmittedCall, EmittedTarget, LeafOffer, ProgramEmit, ThreadPlatform,
     ThreadTier, TierUpConfig,
 };
+use temen_interp::put_results;
 use temen_interp::{
     run_with_host, BoundImport, CapRequests, Completer, Host, HostProcGrant, OffloadOutcome,
     ProcHandler, Trap, Value,
@@ -108,10 +109,10 @@ fn host_completed(recorded: &Recorded) -> (Host, i32) {
     let mut host = Host::new();
     let rec = Arc::clone(recorded);
     let h = host.grant_host_proc(HostProcGrant::new(
-        ProcHandler::Offloadable(Box::new(move |op, args| {
+        ProcHandler::Offloadable(Box::new(move |op, args, out| {
             let a = *args.first().unwrap_or(&0);
             if op == 0 {
-                return OffloadOutcome::Done(Ok(vec![a + 100]));
+                return OffloadOutcome::Done(put_results(out, &[a + 100]));
             }
             let rec = Arc::clone(&rec);
             OffloadOutcome::Host(Box::new(move |c| rec.lock().unwrap().push((c, a))))
@@ -126,10 +127,10 @@ fn host_completed(recorded: &Recorded) -> (Host, i32) {
 fn pool_completed() -> (Host, i32) {
     let mut host = Host::new();
     let h = host.grant_host_proc(HostProcGrant::new(
-        ProcHandler::Offloadable(Box::new(move |op, args| {
+        ProcHandler::Offloadable(Box::new(move |op, args, out| {
             let a = *args.first().unwrap_or(&0);
             if op == 0 {
-                return OffloadOutcome::Done(Ok(vec![a + 100]));
+                return OffloadOutcome::Done(put_results(out, &[a + 100]));
             }
             OffloadOutcome::Offload(Box::new(move || a + 100))
         })),
@@ -601,10 +602,10 @@ fn host_completing_inside_submit_does_not_park() {
         let mut host = Host::new();
         let comps = host.completions();
         let h = host.grant_host_proc(HostProcGrant::new(
-            ProcHandler::Offloadable(Box::new(move |op, args| {
+            ProcHandler::Offloadable(Box::new(move |op, args, out| {
                 let a = *args.first().unwrap_or(&0);
                 if op == 0 {
-                    return OffloadOutcome::Done(Ok(vec![a + 100]));
+                    return OffloadOutcome::Done(put_results(out, &[a + 100]));
                 }
                 OffloadOutcome::Host(Box::new(move |c: Completer| c.complete(a + 100)))
             })),
@@ -630,8 +631,8 @@ fn sync_ops_never_pay_for_the_host_posture() {
         let mut host = Host::new();
         let comps = host.completions();
         let h = host.grant_host_proc(HostProcGrant::new(
-            ProcHandler::Offloadable(Box::new(|_op, args| {
-                OffloadOutcome::Done(Ok(vec![*args.first().unwrap_or(&0) + 100]))
+            ProcHandler::Offloadable(Box::new(|_op, args, out| {
+                OffloadOutcome::Done(put_results(out, &[*args.first().unwrap_or(&0) + 100]))
             })),
             temen_interp::CapState::Stateless,
         ));
@@ -757,10 +758,10 @@ fn a_task_waiting_on_a_host_answered_call_sleeps_until_its_answer() {
     let meanwhile = Arc::clone(&reads_meanwhile);
     let mut host = Host::new();
     let h = host.grant_host_proc(HostProcGrant::new(
-        ProcHandler::Offloadable(Box::new(move |op, args| {
+        ProcHandler::Offloadable(Box::new(move |op, args, out| {
             let a = *args.first().unwrap_or(&0);
             if op == 0 {
-                return OffloadOutcome::Done(Ok(vec![a + 100]));
+                return OffloadOutcome::Done(put_results(out, &[a + 100]));
             }
             let meanwhile = Arc::clone(&meanwhile);
             OffloadOutcome::Host(Box::new(move |c| {
@@ -1274,7 +1275,9 @@ fn a_root_calling_a_host_capability_inline_is_offered_when_none_can_park() {
     for exec in PUMPED {
         let mut host = Host::new();
         let h = host.grant_host_proc(HostProcGrant::new(
-            ProcHandler::Sync(Box::new(|_op, args, _mem, _| Ok(vec![args[0] + 100]))),
+            ProcHandler::Sync(Box::new(|_op, args, out, _mem, _| {
+                put_results(out, &[args[0] + 100])
+            })),
             temen_interp::CapState::Stateless,
         ));
         let m = root_host_call(h);
@@ -1401,7 +1404,7 @@ fn the_host_procs_park_by_their_shape() {
     use temen_interp::{CapState, OpParks};
     let sync = || {
         HostProcGrant::new(
-            ProcHandler::Sync(Box::new(|_op, _args, _mem, _| Ok(vec![0]))),
+            ProcHandler::Sync(Box::new(|_op, _args, out, _mem, _| put_results(out, &[0]))),
             CapState::Stateless,
         )
     };
@@ -1419,7 +1422,9 @@ fn the_host_procs_park_by_their_shape() {
         "a declared one parks on the host"
     );
     host.grant_host_proc(HostProcGrant::new(
-        ProcHandler::Offloadable(Box::new(|_op, _args| OffloadOutcome::Done(Ok(vec![0])))),
+        ProcHandler::Offloadable(Box::new(|_op, _args, out| {
+            OffloadOutcome::Done(put_results(out, &[0]))
+        })),
         CapState::Stateless,
     ));
     assert_eq!(

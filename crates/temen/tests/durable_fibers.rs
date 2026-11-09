@@ -13,6 +13,7 @@
 //! second fiber into the first's freed region.)
 
 use std::sync::{Arc, Mutex};
+use temen_interp::put_results;
 use temen_interp::{
     run_capture_reserved_with_host, Host, HostProcGrant, ProcHandler, Value, DEFAULT_SHADOW_STRIDE,
 };
@@ -69,9 +70,9 @@ fn durable_fiber_switch_routes_shadow_sp_per_context() {
     let mut host = Host::new();
     host.set_durable(true);
     let hf = host.grant_host_proc(HostProcGrant::new(
-        ProcHandler::Sync(Box::new(move |_op, args, _mem, _| {
+        ProcHandler::Sync(Box::new(move |_op, args, out, _mem, _| {
             sink.lock().unwrap().push(args[0] as u64);
-            Ok(vec![0])
+            put_results(out, &[0])
         })),
         temen_interp::CapState::Stateless,
     ));

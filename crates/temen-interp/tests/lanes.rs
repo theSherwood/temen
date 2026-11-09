@@ -242,11 +242,11 @@ fn split_bounds_a_childs_lane_by_the_holders_cap_and_never_draws_the_cap_down() 
     host.set_lane_cap(2);
     let b = host.grant_budget(-1, 1 << 20, -1);
     let split = |host: &mut Host, lane: i64| -> i64 {
-        host.cap_dispatch_slots(cap_id::BUDGET, 0, b, &[-1, 4096, 0, -1, lane], None)
+        host.cap_call(cap_id::BUDGET, 0, b, &[-1, 4096, 0, -1, lane], 1, None)
             .expect("split dispatches")[0]
     };
     let read_lane = |host: &mut Host, h: i32| -> i64 {
-        host.cap_dispatch_slots(cap_id::BUDGET, 1, h, &[4], None)
+        host.cap_call(cap_id::BUDGET, 1, h, &[4], 1, None)
             .expect("read dispatches")[0]
     };
     let inherit = split(&mut host, -1) as i32;
@@ -283,10 +283,8 @@ fn budget_mem_give_is_the_exact_undo_of_a_take() {
     // sees the run's own node's `mem` too (#2337).
     host.set_grant(-1, -1, -1, -1);
     let b = host.grant_budget(-1, 8192, -1);
-    let read_mem = |host: &mut Host| -> i64 {
-        host.cap_dispatch_slots(cap_id::BUDGET, 1, b, &[1], None)
-            .unwrap()[0]
-    };
+    let read_mem =
+        |host: &mut Host| -> i64 { host.cap_call(cap_id::BUDGET, 1, b, &[1], 1, None).unwrap()[0] };
     assert!(host.budget_mem_take(b, 4096));
     assert_eq!(read_mem(&mut host), 4096);
     host.budget_mem_give(b, 4096);
@@ -294,8 +292,7 @@ fn budget_mem_give_is_the_exact_undo_of_a_take() {
     let u = host.grant_budget(-1, -1, -1);
     host.budget_mem_give(u, 4096);
     assert_eq!(
-        host.cap_dispatch_slots(cap_id::BUDGET, 1, u, &[1], None)
-            .unwrap()[0],
+        host.cap_call(cap_id::BUDGET, 1, u, &[1], 1, None).unwrap()[0],
         -1,
         "an unbounded field stays unbounded"
     );

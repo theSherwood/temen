@@ -27,7 +27,7 @@ fn an_exec_whose_output_does_not_fit_is_refused() {
         win[..argv.len()].copy_from_slice(argv);
         let mut wm = WindowMem::new(&mut win, 64);
         let args = [0, argv.len() as i64, 0, 0];
-        h.cap_dispatch_slots(cap_id::HOST_PROC, EXEC_RUN, exec, &args, Some(&mut wm))
+        h.cap_call(cap_id::HOST_PROC, EXEC_RUN, exec, &args, 1, Some(&mut wm))
             .expect("dispatch")[0]
     };
     assert_eq!(run(&mut h, b"yes"), ENOMEM, "`yes` writes forever");
@@ -35,7 +35,7 @@ fn an_exec_whose_output_does_not_fit_is_refused() {
     let job = run(&mut h, b"echo\0hi");
     assert!(job >= 0, "a run whose output fits goes through: {job}");
     assert!(h.channel_used() > 0, "its output is held");
-    let close = h.cap_dispatch_slots(cap_id::HOST_PROC, EXEC_CLOSE, exec, &[job], None);
+    let close = h.cap_call(cap_id::HOST_PROC, EXEC_CLOSE, exec, &[job], 1, None);
     assert_eq!(close.expect("dispatch")[0], 0);
     assert_eq!(h.channel_used(), 0, "closed, the job holds nothing");
 }
@@ -57,7 +57,7 @@ fn a_listing_is_charged_until_it_is_closed() {
     win[0] = b'd';
     let mut call = |h: &mut Host, op, args: &[i64]| {
         let mut wm = WindowMem::new(&mut win, 64);
-        h.cap_dispatch_slots(cap_id::HOST_PROC, op, fs, args, Some(&mut wm))
+        h.cap_call(cap_id::HOST_PROC, op, fs, args, 1, Some(&mut wm))
             .expect("dispatch")[0]
     };
     let dh = call(&mut h, FS_OPENDIR, &[0, 1]);

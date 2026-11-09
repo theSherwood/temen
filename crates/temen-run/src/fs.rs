@@ -946,9 +946,10 @@ pub fn host_fs_mmap(root: PathBuf) -> HostCap {
         let h = Box::new(
             move |op: u32,
                   args: &[i64],
+                  out: &mut [i64],
                   mem: Option<&mut dyn GuestMem>,
                   minter: Option<&mut dyn RegionMinter>| {
-                Ok(vec![st.handle(op, args, mem, minter)])
+                temen_interp::put_results(out, &[st.handle(op, args, mem, minter)])
             },
         ) as HostProc;
         // Open host files and directories, guest-visible cursors: `Uncaptured` (#1699).
@@ -962,9 +963,10 @@ fn host_fs_impl(root: PathBuf, crashy: bool) -> HostCap {
         let h = Box::new(
             move |op: u32,
                   args: &[i64],
+                  out: &mut [i64],
                   mem: Option<&mut dyn GuestMem>,
                   _minter: Option<&mut dyn temen_interp::RegionMinter>| {
-                Ok(vec![st.handle(op, args, mem, None)])
+                temen_interp::put_results(out, &[st.handle(op, args, mem, None)])
             },
         ) as HostProc;
         // Open host files and directories, guest-visible cursors: `Uncaptured` (#1699).
@@ -982,7 +984,7 @@ mod tests {
     fn call(host: &mut Host, h: i32, win: &mut [u8], op: u32, args: &[i64]) -> i64 {
         let n = win.len();
         let mut wm = WindowMem::new(win, n as u64);
-        host.cap_dispatch_slots(cap_id::HOST_PROC, op, h, args, Some(&mut wm))
+        host.cap_call(cap_id::HOST_PROC, op, h, args, 1, Some(&mut wm))
             .unwrap()[0]
     }
 
@@ -1054,15 +1056,23 @@ mod tests {
             let fs_h = (cap.grant)(&mut host, 0);
             let mut wm = WindowMem::new(&mut win, 4096);
             let fd = host
-                .cap_dispatch_slots(cap_id::HOST_PROC, FS_OPEN, fs_h, &open_args, Some(&mut wm))
+                .cap_call(
+                    cap_id::HOST_PROC,
+                    FS_OPEN,
+                    fs_h,
+                    &open_args,
+                    1,
+                    Some(&mut wm),
+                )
                 .unwrap()[0];
             assert!(fd >= 0, "open failed: {fd}");
             let region = host
-                .cap_dispatch_slots(
+                .cap_call(
                     cap_id::HOST_PROC,
                     FS_MAP_REGION,
                     fs_h,
                     &[fd, 0, 8192],
+                    1,
                     Some(&mut wm),
                 )
                 .unwrap()[0];
@@ -1072,7 +1082,14 @@ mod tests {
             );
             // The returned handle is a live SharedRegion; op 2 `len()` reports the mapped size.
             let len = host
-                .cap_dispatch_slots(cap_id::SHARED_REGION, 2, region as i32, &[], Some(&mut wm))
+                .cap_call(
+                    cap_id::SHARED_REGION,
+                    2,
+                    region as i32,
+                    &[],
+                    1,
+                    Some(&mut wm),
+                )
                 .unwrap()[0];
             assert_eq!(len, 8192, "the minted region maps the whole file");
         }
@@ -1084,14 +1101,22 @@ mod tests {
             let fs_h = (cap.grant)(&mut host, 0);
             let mut wm = WindowMem::new(&mut win, 4096);
             let fd = host
-                .cap_dispatch_slots(cap_id::HOST_PROC, FS_OPEN, fs_h, &open_args, Some(&mut wm))
+                .cap_call(
+                    cap_id::HOST_PROC,
+                    FS_OPEN,
+                    fs_h,
+                    &open_args,
+                    1,
+                    Some(&mut wm),
+                )
                 .unwrap()[0];
             let region = host
-                .cap_dispatch_slots(
+                .cap_call(
                     cap_id::HOST_PROC,
                     FS_MAP_REGION,
                     fs_h,
                     &[fd, 0, 8192],
+                    1,
                     Some(&mut wm),
                 )
                 .unwrap()[0];
@@ -1253,21 +1278,23 @@ mod tests {
         win[..10].copy_from_slice(b"PG_VERSION");
         let mut wm = WindowMem::new(&mut win, 4096);
         let fd = host
-            .cap_dispatch_slots(
+            .cap_call(
                 cap_id::HOST_PROC,
                 FS_OPEN,
                 h,
                 &[0, 10, O_READ, 0],
+                1,
                 Some(&mut wm),
             )
             .unwrap()[0];
         assert!(fd >= 0, "open a file from the mounted image");
         let n = host
-            .cap_dispatch_slots(
+            .cap_call(
                 cap_id::HOST_PROC,
                 FS_READ,
                 h,
                 &[fd, 512, 8, 0],
+                1,
                 Some(&mut wm),
             )
             .unwrap()[0];

@@ -10,6 +10,7 @@
 //! The `.expect(...)` on `compile_and_run_with_host`'s `Option` is the gate: if the bytecode engine
 //! does not *support* a synchronous `call.cap` (returns `None` → would fall back), the test fails.
 
+use temen_interp::put_results;
 use temen_interp::{
     bytecode, run_with_host, Host, HostProcGrant, ProcHandler, StreamRole, Trap, Value,
 };
@@ -19,9 +20,11 @@ use temen_text::parse_module;
 fn host_with_det_fn() -> (Host, i32) {
     let mut h = Host::new();
     let handle = h.grant_host_proc(HostProcGrant::new(
-        ProcHandler::Sync(Box::new(|op: u32, args: &[i64], _mem, _| {
-            Ok(vec![op as i64 * 100 + args.iter().sum::<i64>()])
-        })),
+        ProcHandler::Sync(Box::new(
+            |op: u32, args: &[i64], out: &mut [i64], _mem, _| {
+                put_results(out, &[op as i64 * 100 + args.iter().sum::<i64>()])
+            },
+        )),
         temen_interp::CapState::Stateless,
     ));
     (h, handle)
@@ -144,7 +147,7 @@ fn host_with_powerbox() -> Host {
     let _ = h.grant_stream(StreamRole::Out); // handle 0, type_id 0
     let _ = h.grant_exit(); // handle 1, type_id 1
     let _ = h.grant_host_proc(HostProcGrant::new(
-        ProcHandler::Sync(Box::new(|_o, _a, _m, _| Ok(vec![0]))),
+        ProcHandler::Sync(Box::new(|_o, _a, out, _m, _| put_results(out, &[0]))),
         temen_interp::CapState::Stateless,
     )); // handle 2, type_id 13
     h

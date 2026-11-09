@@ -193,11 +193,12 @@ fn the_clone_caller_op_number_is_pinned() {
 fn a_non_serving_tier_refuses_clone_caller_probeably() {
     let mut host = Host::new();
     let r = host
-        .cap_dispatch_slots(
+        .cap_call(
             temen_ir::CAP_SELF_TYPE_ID,
             temen_interp::CAP_SELF_CLONE_CALLER,
             0,
             &[0],
+            1,
             None,
         )
         .expect("refusal, not a trap");

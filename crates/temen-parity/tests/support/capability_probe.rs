@@ -21,6 +21,7 @@
 // call site; the compiler will not.
 #![allow(dead_code)]
 
+use temen_interp::put_results;
 use temen_interp::{
     CapState, Host, HostProc, HostProcGrant, ProcHandler, RegionBacking, SharedBacking, StreamRole,
 };
@@ -99,7 +100,7 @@ pub const ZERO: &str = "zero";
 
 /// The `HostProc` row's procedure: it answers `0` to any call.
 pub fn zero() -> HostProc {
-    Box::new(|_, _, _, _| Ok(vec![0]))
+    Box::new(|_, _, out, _, _| put_results(out, &[0]))
 }
 
 /// A region backing something outside the VM writes, as a host file's is

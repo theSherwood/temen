@@ -19,6 +19,7 @@ use temen_durable::{
     arm_freeze_after_backedges, arm_freeze_on_quiesce, begin_thaw, init_durable_window,
     transform_module_assume_confined, write_state, STATE_UNWINDING,
 };
+use temen_interp::put_results;
 use temen_interp::{run_capture_reserved_with_host, Host, HostProcGrant, ProcHandler, Trap, Value};
 use temen_ir::Memory;
 
@@ -725,9 +726,9 @@ fn a_vcpu_stopped_before_the_freeze_is_brought_through_it() {
     let stop = {
         let stopper = stopper.clone();
         h.grant_host_proc(HostProcGrant::new(
-            ProcHandler::Sync(Box::new(move |_op, _args, _mem, _minter| {
+            ProcHandler::Sync(Box::new(move |_op, _args, out, _mem, _minter| {
                 stopper.stop();
-                Ok(vec![0])
+                put_results(out, &[0])
             })),
             temen_interp::CapState::Stateless,
         ))

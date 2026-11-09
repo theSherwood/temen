@@ -92,16 +92,20 @@ fn domain_exec_inner(programs: Vec<DomainProgram>, child_fs: Option<HostCap>) ->
         let h = Box::new(
             move |op: u32,
                   args: &[i64],
+                  out: &mut [i64],
                   mem: Option<&mut dyn GuestMem>,
                   _minter: Option<&mut dyn temen_interp::RegionMinter>| {
-                Ok(vec![domain_dispatch(
-                    &programs,
-                    (*child_fs).as_ref(),
-                    &mut jobs,
-                    op,
-                    args,
-                    mem,
-                )])
+                temen_interp::put_results(
+                    out,
+                    &[domain_dispatch(
+                        &programs,
+                        (*child_fs).as_ref(),
+                        &mut jobs,
+                        op,
+                        args,
+                        mem,
+                    )],
+                )
             },
         ) as HostProc;
         // A job table the guest drains output from: `Uncaptured` (#1699).
@@ -178,9 +182,10 @@ fn host_exec_handler(
         Box::new(
             move |op: u32,
                   args: &[i64],
+                  out: &mut [i64],
                   mem: Option<&mut dyn GuestMem>,
                   _minter: Option<&mut dyn temen_interp::RegionMinter>| {
-                Ok(vec![host_dispatch(&allow, &mut jobs, op, args, mem)])
+                temen_interp::put_results(out, &[host_dispatch(&allow, &mut jobs, op, args, mem)])
             },
         ) as HostProc
     }

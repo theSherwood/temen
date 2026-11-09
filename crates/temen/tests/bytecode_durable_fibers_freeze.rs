@@ -22,6 +22,7 @@ use temen_durable::{
     begin_thaw, init_durable_window, read_state, transform_module, write_state, STATE_NORMAL,
     STATE_UNWINDING,
 };
+use temen_interp::put_results;
 use temen_interp::{
     bytecode, run_capture_reserved_with_host, FrozenFiber, Host, HostProcGrant, ProcHandler, Trap,
     Value,
@@ -290,7 +291,7 @@ fn a_consumed_park_redelivers_after_thaw_on_the_bytecode_engine() {
     let host = |freeze: bool, frozen: Vec<FrozenFiber>| -> (Host, i32) {
         let mut h = durable_host(frozen);
         let hf = h.grant_host_proc(HostProcGrant::new(
-            ProcHandler::Sync(Box::new(move |_op, _args, mem, _| {
+            ProcHandler::Sync(Box::new(move |_op, _args, out, mem, _| {
                 if freeze {
                     if let Some(m) = mem {
                         let word = m
@@ -301,7 +302,7 @@ fn a_consumed_park_redelivers_after_thaw_on_the_bytecode_engine() {
                             .expect("the freeze word is in the window");
                     }
                 }
-                Ok(vec![0])
+                put_results(out, &[0])
             })),
             temen_interp::CapState::Stateless,
         ));
@@ -434,7 +435,7 @@ fn freeze_at_host_call(inst: &temen_ir::Module, want: Result<Vec<Value>, Trap>) 
     let run = |bytecode_engine: bool, win: &[u8], freeze: bool, frozen: Vec<FrozenFiber>| {
         let mut h = durable_host(frozen);
         let hf = h.grant_host_proc(HostProcGrant::new(
-            ProcHandler::Sync(Box::new(move |_op, _args, mem, _| {
+            ProcHandler::Sync(Box::new(move |_op, _args, out, mem, _| {
                 if freeze {
                     if let Some(m) = mem {
                         let word = m
@@ -445,7 +446,7 @@ fn freeze_at_host_call(inst: &temen_ir::Module, want: Result<Vec<Value>, Trap>) 
                             .expect("the freeze word is in the window");
                     }
                 }
-                Ok(vec![0])
+                put_results(out, &[0])
             })),
             temen_interp::CapState::Stateless,
         ));

@@ -13,6 +13,7 @@
 
 use std::sync::Mutex;
 use std::time::Duration;
+use temen_interp::put_results;
 
 use temen_interp::{
     bytecode, run_with_host, Host, HostProcGrant, OffloadHostProc, OffloadOutcome, ProcHandler,
@@ -70,7 +71,7 @@ fn parse(src: &str) -> temen_ir::Module {
 
 /// An offloadable handler that always punts: op 0 returns `mix(arg)` off the vCPU thread.
 fn punting_handler() -> OffloadHostProc {
-    Box::new(|_op, args| {
+    Box::new(|_op, args, _out| {
         let a = *args.first().unwrap_or(&0);
         OffloadOutcome::Offload(Box::new(move || mix(a)))
     })
@@ -79,10 +80,10 @@ fn punting_handler() -> OffloadHostProc {
 /// An offloadable handler exercising the per-call decision: even args complete inline (`Done`),
 /// odd args punt.
 fn deciding_handler() -> OffloadHostProc {
-    Box::new(|_op, args| {
+    Box::new(|_op, args, out| {
         let a = *args.first().unwrap_or(&0);
         if a % 2 == 0 {
-            OffloadOutcome::Done(Ok(vec![mix(a)]))
+            OffloadOutcome::Done(put_results(out, &[mix(a)]))
         } else {
             OffloadOutcome::Offload(Box::new(move || mix(a)))
         }
@@ -199,8 +200,8 @@ fn sync_ops_never_touch_parking_machinery() {
     // read zero — no completion id, no table touch (the §12 pin).
     let mut host = Host::new();
     let h = host.grant_host_proc(HostProcGrant::new(
-        ProcHandler::Sync(Box::new(|_op, args, _mem, _minter| {
-            Ok(vec![mix(*args.first().unwrap_or(&0))])
+        ProcHandler::Sync(Box::new(|_op, args, out, _mem, _minter| {
+            put_results(out, &[mix(*args.first().unwrap_or(&0))])
         })),
         temen_interp::CapState::Stateless,
     ));

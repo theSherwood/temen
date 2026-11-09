@@ -423,9 +423,9 @@ mod tests {
         let sink = events.clone();
         let mut h = temen_interp::Host::new();
         let handle = h.grant_host_proc(temen_interp::HostProcGrant::new(
-            temen_interp::ProcHandler::Sync(Box::new(move |op, args, _mem, _| {
+            temen_interp::ProcHandler::Sync(Box::new(move |op, args, _out, _mem, _| {
                 sink.lock().unwrap().push((op, args.to_vec()));
-                Ok(vec![])
+                Ok(())
             })),
             temen_interp::CapState::Stateless,
         ));

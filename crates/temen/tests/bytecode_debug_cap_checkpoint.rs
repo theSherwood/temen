@@ -24,6 +24,7 @@
 
 use std::sync::{Arc, Mutex};
 use temen_interp::moment::Refusal;
+use temen_interp::put_results;
 use temen_interp::{bytecode::ScheduledDebugRun, HostProcGrant, ProcHandler};
 use temen_interp::{run_with_host, GuestMem, Host, RegionMinter, Value};
 use temen_text::parse_module;
@@ -80,11 +81,12 @@ fn grant_counter(host: &mut Host, named: bool) {
         ProcHandler::Sync(Box::new(
             move |_op: u32,
                   _args: &[i64],
+                  out: &mut [i64],
                   _mem: Option<&mut dyn GuestMem>,
                   _minter: Option<&mut dyn RegionMinter>| {
                 let mut c = call.lock().unwrap();
                 *c += 1;
-                Ok(vec![*c])
+                put_results(out, &[*c])
             },
         )),
         temen_interp::CapState::Captured {
