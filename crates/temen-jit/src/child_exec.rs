@@ -451,9 +451,13 @@ pub(crate) struct Window {
     /// Its vCPU is inside a serve op. The pool's count of the window ([`WindowCount`]), which exists
     /// only while it holds handlers of it, takes it from here.
     open: std::sync::atomic::AtomicBool,
-    /// Its gate is held: by the serve op whenever it is not parked, or by the thread running one of
-    /// its handlers (a pool worker, or a caller's under the direct handoff).
-    gate: std::sync::atomic::AtomicBool,
+    /// Who holds its gate ([`fiber_rt::context_id`]), `0` while it is free: the serve op whenever it
+    /// is not parked, or the thread of control running one of its handlers. A handler gives it back
+    /// for each live call it makes and each event park ([`handler_steps_aside`]).
+    gate: AtomicU64,
+    /// How many wait to take the gate, parked on its key ([`Window::wait_take`]): a release wakes
+    /// them only when there are some.
+    gate_waiters: AtomicUsize,
 }
 
 /// #2742 — how many idle handler fibers a window keeps.
@@ -542,17 +546,133 @@ impl Window {
         (1 << (usize::BITS - 2)) | Arc::as_ptr(self) as usize
     }
 
-    /// Take the gate if it is free.
-    fn take_gate(&self) -> bool {
+    /// Take the gate for `me` if it is free.
+    fn take(&self, me: u64) -> bool {
         self.gate
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .compare_exchange(0, me, Ordering::SeqCst, Ordering::Acquire)
             .is_ok()
     }
 
-    /// Give the gate back.
-    fn give_gate(&self) {
-        self.gate.store(false, Ordering::Release);
+    /// Whether `me` holds the gate.
+    fn held_by(&self, me: u64) -> bool {
+        self.gate.load(Ordering::Acquire) == me
     }
+
+    /// Hand the gate from `from`, which holds it, to `to`: a starter to the handler it runs, and back
+    /// once the handler has ended there. `false` when `from` does not hold it.
+    fn hand(&self, from: u64, to: u64) -> bool {
+        self.gate
+            .compare_exchange(from, to, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    /// `me` gives the gate back, and whoever waits to take it is woken. `false`, and nothing done,
+    /// when `me` does not hold it: a release a handler's park already made is not made twice.
+    fn release(&self, me: u64) -> bool {
+        if self
+            .gate
+            .compare_exchange(me, 0, Ordering::SeqCst, Ordering::Relaxed)
+            .is_err()
+        {
+            return false;
+        }
+        // Read after the release, as a waiter counts itself before it last looks at the gate: one
+        // of the two sees the other.
+        if self.gate_waiters.load(Ordering::SeqCst) != 0 {
+            // SAFETY: the window's handler context names its live domain, whose hub its parks use.
+            unsafe { os_thread_rt::wake_host_parks_in(self.vm.sched as usize, self.gate_key()) };
+        }
+        true
+    }
+
+    /// The key gate waiters park on, in the run's hub: the window's address, tagged clear of every
+    /// bell's key.
+    fn gate_key(&self) -> u64 {
+        (1 << 62) | self as *const Window as u64
+    }
+
+    /// `me` takes the gate, waiting while the window is shut or another holds it, parked as a park
+    /// of the run counts (as `vm`'s, the waiter's context). `false` when the window's domain has ended
+    /// (`vm`'s trap cell then names its end) or no live vCPU could ever give the gate back (the
+    /// deadlock verdict, raised as `ThreadFault`). A gate handed to `me` meanwhile counts as taken.
+    ///
+    /// # Safety
+    /// `vm` is the live context of the waiter's call.
+    unsafe fn wait_take(&self, me: u64, vm: &VmCtx) -> bool {
+        loop {
+            if self.held_by(me) || (self.open.load(Ordering::Acquire) && self.take(me)) {
+                return true;
+            }
+            if vm.ended().is_some() {
+                vm.raise(TrapKind::ThreadFault as i64);
+                return false;
+            }
+            let free = || {
+                (self.open.load(Ordering::Acquire) && self.gate.load(Ordering::SeqCst) == 0)
+                    || self.held_by(me)
+            };
+            self.gate_waiters.fetch_add(1, Ordering::SeqCst);
+            // Looked at again once counted, before parking: a release before the count is seen
+            // here, and one after it sees the count and wakes this wait, parked or still on its way
+            // to the park (a task's park checks only once woken, and a wake meanwhile is latched).
+            let parked = if free() {
+                os_thread_rt::HostPark::Woken
+            } else {
+                os_thread_rt::park_host_call(
+                    vm,
+                    None,
+                    self.gate_key(),
+                    os_thread_rt::Parks::Fiber,
+                    || !free() && vm.ended().is_none(),
+                )
+            };
+            self.gate_waiters.fetch_sub(1, Ordering::SeqCst);
+            match parked {
+                os_thread_rt::HostPark::Woken | os_thread_rt::HostPark::Frozen => {}
+                os_thread_rt::HostPark::Deadlock => {
+                    vm.raise(TrapKind::ThreadFault as i64);
+                    return false;
+                }
+                os_thread_rt::HostPark::Ended => {
+                    vm.raise(TrapKind::ThreadFault as i64);
+                    return false;
+                }
+            }
+        }
+    }
+}
+
+/// #2742 — a handler's gate, given back for a wait ([`handler_steps_aside`]).
+pub struct GateAside {
+    window: *const Window,
+    me: u64,
+}
+
+/// #2742 — code running as a serve handler parks on an event, or makes a live call: if it holds its
+/// window's gate, the gate goes back for the wait, so the window's serve op and other handlers run
+/// meanwhile, as on the oracle, where a handler's park frees its serving vCPU. A handler on a fiber
+/// of its own and one on a caller's stack alike. `None` when `vm` is no handler's context, or the
+/// gate is not held here (it was given back already, for the live call this park is part of).
+pub fn handler_steps_aside(vm: &VmCtx) -> Option<GateAside> {
+    let window = vm.handler_window.load(Ordering::Acquire);
+    // A guest fiber's park parks the fiber alone, and the handler's own code runs on, as the fiber's
+    // resumer, with the gate.
+    if window.is_null() || crate::in_guest_fiber() {
+        return None;
+    }
+    let me = fiber_rt::context_id();
+    // SAFETY: a handler context's window outlives every handler running as it.
+    unsafe { (*window).release(me) }.then_some(GateAside { window, me })
+}
+
+/// #2742 — ...and takes it back after, before the handler's code runs on: waiting while the window
+/// is shut or another holds the gate. `false` when the handler's domain has ended meanwhile, its trap
+/// cell then set to unwind it.
+///
+/// # Safety
+/// `vm` is the context `aside` was given back from.
+pub unsafe fn handler_steps_back(aside: GateAside, vm: &VmCtx) -> bool {
+    (*aside.window).wait_take(aside.me, vm)
 }
 
 /// #2742 — a window's handlers, as the run's deadlock predicate counts them: in the domain's `live`
@@ -629,6 +749,12 @@ pub type HandlerDone = Box<dyn FnOnce(HandlerEnd) + Send>;
 type ServeEntry = extern "C" fn(*const i64, *mut i64, *mut u8, *const core::ffi::c_void, *mut i64);
 
 impl HandlerTask {
+    /// Its thread of control as its window's gate records it ([`fiber_rt::context_id`]): its shell's
+    /// platform slot, which each residency makes the runtime's first active slot.
+    fn id(&self) -> u64 {
+        Arc::as_ptr(&self.shell.slot) as u64
+    }
+
     /// How it ended, once its fiber has.
     fn end(&mut self) -> HandlerEnd {
         match self.window.vm.ended() {
@@ -746,6 +872,22 @@ impl ServeSite {
                 None,
             ))
         });
+        let window = Arc::new(Window {
+            tls: std::sync::atomic::AtomicI64::new(0),
+            ring: ring(),
+            served: AtomicU64::new(0),
+            vm: Arc::new(vm.vcpu((*(cc as *const CompiledModule)).instance.fuel)),
+            shells: Mutex::new(Vec::new()),
+            pooled: AtomicUsize::new(0),
+            open: std::sync::atomic::AtomicBool::new(false),
+            gate: AtomicU64::new(0),
+            gate_waiters: AtomicUsize::new(0),
+        });
+        // Its handler context names it, for the gate a handler's park gives back.
+        window
+            .vm
+            .handler_window
+            .store(Arc::as_ptr(&window) as *mut Window, Ordering::Release);
         let site = Arc::new(ServeSite {
             cc: cc as *const CompiledModule,
             mem_base,
@@ -753,16 +895,7 @@ impl ServeSite {
             table,
             domain: os_thread_rt::current_domain_ptr(),
             exec,
-            window: Arc::new(Window {
-                tls: std::sync::atomic::AtomicI64::new(0),
-                ring: ring(),
-                served: AtomicU64::new(0),
-                vm: Arc::new(vm.vcpu((*(cc as *const CompiledModule)).instance.fuel)),
-                shells: Mutex::new(Vec::new()),
-                pooled: AtomicUsize::new(0),
-                open: std::sync::atomic::AtomicBool::new(false),
-                gate: std::sync::atomic::AtomicBool::new(false),
-            }),
+            window,
         });
         Some(Arc::clone(vm.serve_site.get_or_init(|| site)))
     }
@@ -773,7 +906,7 @@ impl ServeSite {
         self.window
             .tls
             .store(vcpu_tls::get(), std::sync::atomic::Ordering::Relaxed);
-        let taken = self.try_enter();
+        let taken = self.window.take(fiber_rt::context_id());
         debug_assert!(taken, "a shut window's gate is free");
         self.set_open(true);
     }
@@ -794,20 +927,29 @@ impl ServeSite {
     pub fn end(&self, held: bool) {
         self.set_open(false);
         if held {
-            self.window.give_gate();
+            self.window.release(fiber_rt::context_id());
         }
         vcpu_tls::seed(self.window.tls.load(std::sync::atomic::Ordering::Relaxed));
     }
 
     /// Take the gate if it is free: no handler of this window runs, and the serve op is parked.
     pub fn try_enter(&self) -> bool {
-        self.window.take_gate()
+        self.window.take(fiber_rt::context_id())
+    }
+
+    /// The serve op takes the gate back, waiting while a handler holds it: `false` when its domain
+    /// has ended meanwhile, or no live vCPU could give the gate back (`vm`'s trap cell then says why).
+    ///
+    /// # Safety
+    /// `vm` is the serve op's live context.
+    pub unsafe fn wait_enter(&self, vm: &VmCtx) -> bool {
+        self.window.wait_take(fiber_rt::context_id(), vm)
     }
 
     /// The serve op parks: give the gate back, so a woken handler of the window runs meanwhile on
     /// the pool, which is woken for it if one waits.
     pub fn step_aside(&self) {
-        self.window.give_gate();
+        self.window.release(fiber_rt::context_id());
         if self.window.pooled.load(Ordering::Acquire) != 0 {
             self.exec.offer_gate(self.window.key());
         }
@@ -1289,24 +1431,34 @@ impl ChildExec {
         mut h: HandlerTask,
         make_done: &mut dyn FnMut() -> HandlerDone,
     ) -> Ran {
+        // The starter's gate goes to the handler for its run, and comes back if it ends here.
+        let me = fiber_rt::context_id();
+        let handed = h.window.hand(me, h.id());
+        debug_assert!(handed, "a handler starts under its starter's gate");
         h.holds_lanes = true;
         let outcome = self.run_handler(&mut h, HERE, false);
         match outcome {
             Outcome::Done | Outcome::Finished => {
                 let reusable = h.reusable;
+                let held = h.window.hand(h.id(), me);
                 Ran {
-                    held: true,
+                    held,
                     ended: true,
                     end: h.conclude(reusable),
                 }
             }
+            // It keeps the gate for a quantum's end or a whole-vCPU park, and gives it back for any
+            // other (its park gave it back already, unless it parked again within the same wait).
             Outcome::Parked { .. } | Outcome::Yielded => {
                 h.done = Some(make_done());
+                let (window, hid) = (Arc::clone(&h.window), h.id());
                 let mut task = Box::new(Task::Handler(h));
-                let kept = task.keep_lanes(&outcome);
+                if !task.keep_lanes(&outcome) {
+                    window.release(hid);
+                }
                 self.promote(task);
                 Ran {
-                    held: !kept,
+                    held: false,
                     ended: false,
                     end: None,
                 }
@@ -1380,31 +1532,41 @@ impl ChildExec {
     /// `done`; a park files it with the pool. One that keeps the gate (a quantum's end, a whole-vCPU
     /// park) takes it from the caller, and gives it back when it lets go of it on a worker.
     fn reside_here(self: &Arc<Self>, id: u64, mut task: Box<Task>) -> Ran {
-        if let Task::Handler(h) = &mut *task {
-            h.holds_lanes = true;
-        }
-        let outcome = self.run_once(&mut task, HERE, false);
-        let kept = task.keep_lanes(&outcome);
-        let ended = match self.file(id, task, outcome, false) {
-            Some(task) => {
-                self.finish(task);
-                true
-            }
-            None => false,
+        let me = fiber_rt::context_id();
+        let Task::Handler(h) = &mut *task else {
+            unreachable!("only a handler is resumed here");
         };
+        let (window, hid) = (Arc::clone(&h.window), h.id());
+        let handed = window.hand(me, hid);
+        debug_assert!(
+            handed,
+            "a woken handler is resumed under its resumer's gate"
+        );
+        h.holds_lanes = true;
+        let outcome = self.run_once(&mut task, HERE, false);
+        let keep = task.keep_lanes(&outcome);
+        let ended = matches!(outcome, Outcome::Finished | Outcome::Done);
+        // One that ended gives the gate back to its resumer before its end is told; one that parked
+        // gives it back, as on a worker, unless it keeps it.
+        let held = ended && window.hand(hid, me);
+        if !ended && !keep {
+            window.release(hid);
+        }
+        if let Some(task) = self.file(id, task, outcome, false) {
+            self.finish(task);
+        }
         Ran {
-            held: !kept,
+            held,
             ended,
             end: None,
         }
     }
 
-    /// #2742 — a handler's worker gives its window's gate back, and rings for a serve op waiting
-    /// to take it.
-    fn release_gate(&self, window: Option<&Arc<Window>>) {
+    /// #2742 — handler `hid`'s worker gives its window's gate back, if the handler still holds it
+    /// (its park gave it back already), and whoever waits for it is woken.
+    fn release_gate(&self, window: Option<&Arc<Window>>, hid: u64) {
         if let Some(w) = window {
-            w.give_gate();
-            (w.ring)();
+            w.release(hid);
         }
     }
 
@@ -1676,7 +1838,8 @@ impl ChildExec {
         let mut chains = g.runnable.iter().map(|id| {
             g.tasks.get(id).and_then(|e| e.task.as_ref()).and_then(|t| {
                 if let (Some(w), false) = (t.window(), t.holds_lanes() || unwinding(t)) {
-                    if !g.windows[&w.key()].open || !w.take_gate() {
+                    let hid = Arc::as_ptr(t.slot()) as u64;
+                    if !g.windows[&w.key()].open || !(w.held_by(hid) || w.take(hid)) {
                         return None;
                     }
                 }
@@ -1749,14 +1912,17 @@ impl ChildExec {
             // queued behind it. `lane_leave` touches only the domain's lane lock, so it is safe to
             // call before taking this executor's. It wakes no worker of this pool: this worker's
             // own next `pick` re-offers the queue. A task its quantum preempted keeps its lanes.
-            // #2742 — a handler gives its gate back with a ring of the serving domain's bell, for a
-            // serve op waiting to take it: one that parks, before its park is counted (else a
-            // waiter could read every live task parked while the ring that wakes the serve op is
-            // still to come, a false deadlock verdict); one that ended, after its end has run, so
-            // whoever takes the gate next sees the dispatch settled and counted.
+            // #2742 — a handler that parked gives its gate back before its park is counted (its park
+            // gave it back already, unless it parked again within the same wait), else a waiter for
+            // the gate could read every live task parked while the wake that frees it is still to
+            // come, a false deadlock verdict. One that ended gives it back as it finishes, once its
+            // dispatch is settled and counted, and before it leaves the live count
+            // ([`Self::finish_handler`]). One its quantum preempted, or parked on a whole-vCPU
+            // wait, keeps it.
             let held = task.holds_lanes();
             let keep = task.keep_lanes(&outcome);
             let gate = task.window().filter(|_| held && !keep).map(Arc::clone);
+            let hid = Arc::as_ptr(task.slot()) as u64;
             let ends = matches!(outcome, Outcome::Finished | Outcome::Done);
             if !keep && task.window().is_none() {
                 if let Some(d) = self.domain() {
@@ -1764,16 +1930,13 @@ impl ChildExec {
                 }
             }
             if !ends {
-                self.release_gate(gate.as_ref());
+                self.release_gate(gate.as_ref(), hid);
             }
             // No wake here (#1991): this worker takes the next runnable task itself, a task it
             // requeued included, and every other task was queued with a wake of its own. A lane it
             // gave back admits at most one more task, which this worker's own `pick` takes.
             if let Some(task) = self.file(id, task, outcome, true) {
                 self.finish(task);
-            }
-            if ends {
-                self.release_gate(gate.as_ref());
             }
         }
     }
@@ -2110,14 +2273,17 @@ impl ChildExec {
     fn finish_handler(self: &Arc<Self>, h: HandlerTask) {
         let key = h.window.key();
         let window = Arc::clone(&h.window);
+        let hid = h.id();
         window.pooled.fetch_sub(1, Ordering::AcqRel);
         let reusable = h.reusable;
         let _given = h.conclude(reusable);
         debug_assert!(_given.is_none(), "a pooled handler was given its done");
         // Whoever waits on its dispatch is woken before it leaves the live count, as a joiner is
         // settled before its joinee leaves it (#1820): else a waiter that re-checks the deadlock
-        // predicate in between sees every live vCPU parked, its answer already there.
+        // predicate in between sees every live vCPU parked, its answer already there. So is whoever
+        // waits for its gate, which goes back once its dispatch is settled and counted.
         (window.ring)();
+        window.release(hid);
         let mut g = lock(&self.state);
         let w = g
             .windows

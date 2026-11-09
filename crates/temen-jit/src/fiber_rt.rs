@@ -1646,6 +1646,27 @@ pub(crate) fn running_stack_low(sp: u64) -> Option<u64> {
     (sp > low && sp - low <= temen_ir::FIBER_STACK).then_some(low)
 }
 
+thread_local! {
+    /// #2742 — this OS thread as a gate's holder ([`context_id`]), by the address of this byte.
+    static THREAD_CONTEXT: u8 = const { 0 };
+}
+
+/// #2742 — the thread of control running here, as a serve window's gate records its holder: the
+/// platform slot of the task or handler fiber this code runs in, else this OS thread. A guest fiber
+/// runs as its vCPU, so it is its vCPU's. Stable while that thread of control lives, across a
+/// task's migration between workers.
+#[inline(never)] // re-reads the thread pointer after a switch, as `current` does (#1466)
+pub(crate) fn context_id() -> u64 {
+    let rt = current();
+    if !rt.is_null() {
+        // SAFETY: `current()` is this thread's live runtime; the borrow is momentary.
+        if let Some(slot) = unsafe { (*rt).active_slots.first() }.filter(|s| s.is_platform()) {
+            return Arc::as_ptr(slot) as u64;
+        }
+    }
+    THREAD_CONTEXT.with(|t| t as *const u8 as u64)
+}
+
 pub(crate) fn current_fiber_slot() -> Option<Arc<FiberSlot>> {
     let rt = current();
     if rt.is_null() {

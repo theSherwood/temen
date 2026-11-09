@@ -436,6 +436,35 @@ pub unsafe fn park_host_call(
     parks: Parks,
     still_parked: impl Fn() -> bool,
 ) -> HostPark {
+    // #2742 — a serve handler's event park gives its window's gate back for the wait, and takes it
+    // back after; a whole-vCPU park keeps it, as on the oracle, where it blocks the serving vCPU.
+    let aside = match parks {
+        Parks::Fiber => crate::child_exec::handler_steps_aside(vm),
+        Parks::Vcpu => None,
+    };
+    let parked = park_host_call_here(vm, freeze, key, parks, still_parked);
+    if let Some(aside) = aside {
+        if matches!(parked, HostPark::Woken | HostPark::Frozen)
+            && !crate::child_exec::handler_steps_back(aside, vm)
+        {
+            return HostPark::Ended;
+        }
+    }
+    parked
+}
+
+/// [`park_host_call`]'s park itself.
+///
+/// # Safety
+/// As [`park_host_call`].
+#[cfg(not(loom))]
+unsafe fn park_host_call_here(
+    vm: &crate::VmCtx,
+    freeze: Option<FreezeWatch>,
+    key: u64,
+    parks: Parks,
+    still_parked: impl Fn() -> bool,
+) -> HostPark {
     let frozen = || freeze.filter(|f| f.landed());
     // #1952 — a fiber's park takes the fiber alone: it yields `FIBER_PARKED` to its resumer, which
     // runs on, and re-checks each time a `cont.resume` polls it. It parks before the first re-check,
@@ -525,6 +554,27 @@ pub unsafe fn park_host_call(
 /// The caller holds no lock the run's other vCPUs need.
 #[cfg(not(loom))]
 pub unsafe fn wait_outside<R>(
+    vm: &crate::VmCtx,
+    rouse: Box<dyn Fn() + Send + Sync>,
+    wait: impl FnOnce(&dyn Fn() -> bool) -> Option<R>,
+) -> Option<R> {
+    // #2742 — a serve handler's wait gives its window's gate back meanwhile ([`park_host_call`]).
+    let aside = crate::child_exec::handler_steps_aside(vm);
+    let answer = wait_outside_here(vm, rouse, wait);
+    if let Some(aside) = aside {
+        if !crate::child_exec::handler_steps_back(aside, vm) {
+            return None;
+        }
+    }
+    answer
+}
+
+/// [`wait_outside`]'s wait itself.
+///
+/// # Safety
+/// As [`wait_outside`].
+#[cfg(not(loom))]
+unsafe fn wait_outside_here<R>(
     vm: &crate::VmCtx,
     rouse: Box<dyn Fn() + Send + Sync>,
     wait: impl FnOnce(&dyn Fn() -> bool) -> Option<R>,
@@ -3040,6 +3090,30 @@ unsafe fn read_phys(phys: u64, width: u32) -> u64 {
 /// # Safety
 /// `sched` is the run's live `Domain`; `phys` points at `width` readable guest bytes.
 pub(crate) unsafe extern "C" fn thread_wait(
+    sched: *const Domain,
+    phys: u64,
+    expected: u64,
+    width: u32,
+    timeout: i64,
+    vm: &crate::VmCtx,
+) -> i32 {
+    // #2742 — a serve handler's futex wait gives its window's gate back meanwhile, as an event park
+    // does ([`park_host_call`]); one whose domain ended meanwhile unwinds.
+    let aside = crate::child_exec::handler_steps_aside(vm);
+    let status = thread_wait_here(sched, phys, expected, width, timeout, vm);
+    if let Some(aside) = aside {
+        if !crate::child_exec::handler_steps_back(aside, vm) {
+            return 0;
+        }
+    }
+    status
+}
+
+/// [`thread_wait`]'s wait itself.
+///
+/// # Safety
+/// As [`thread_wait`].
+unsafe fn thread_wait_here(
     sched: *const Domain,
     phys: u64,
     expected: u64,

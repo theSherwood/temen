@@ -3095,17 +3095,15 @@ unsafe fn serve_locked(
         }
         if let Some(s) = &site {
             if !held {
-                // Take the gate back; while a handler holds it, wait on the bell, which its release
-                // rings.
-                let seen = bell_now(bell.as_ref());
+                // Take the gate back, waiting while a handler holds it: one that ended its domain,
+                // or a deadlock, ends the loop (the trap cell says which).
                 if !s.try_enter() {
                     drop(guard);
-                    let parked = park_on_bell(vm, bell.as_ref(), seen, Parks::Fiber, None);
+                    let entered = s.wait_enter(vm);
                     guard = lock();
-                    if let Some(end) = bell_park_end(parked, vm) {
-                        break end;
+                    if !entered {
+                        break None;
                     }
-                    continue;
                 }
                 held = true;
             }
@@ -3388,6 +3386,34 @@ unsafe fn live_impl_call(
 /// handles (a `cap` of `params`, the op's) are granted into the callee before its handler sees them.
 #[allow(clippy::too_many_arguments)]
 unsafe fn live_reply(
+    caller: &mut CallerHost,
+    callee: &Mutex<Host>,
+    export: u32,
+    fast: bool,
+    op: u32,
+    args: &[i64],
+    params: &[temen_ir::ValType],
+    vm: &temen_jit::VmCtx,
+) -> Option<Reply> {
+    // #2742 — a serve handler's call gives its window's gate back for the call, as on the oracle,
+    // where a handler's call parks it, and takes it back once the call is answered: the window's
+    // serve op serves meanwhile, a call the handler's own call makes into its domain included.
+    let aside = temen_jit::handler_steps_aside(vm);
+    let reply = live_call(caller, callee, export, fast, op, args, params, vm);
+    if let Some(aside) = aside {
+        if !temen_jit::handler_steps_back(aside, vm) {
+            return None;
+        }
+    }
+    reply
+}
+
+/// [`live_reply`]'s call itself.
+///
+/// # Safety
+/// As [`live_reply`].
+#[allow(clippy::too_many_arguments)]
+unsafe fn live_call(
     caller: &mut CallerHost,
     callee: &Mutex<Host>,
     export: u32,

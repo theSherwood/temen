@@ -95,6 +95,11 @@ pub struct VmCtx {
     /// goes with the vCPU. Never read by compiled code.
     #[cfg(fiber_rt)]
     pub(crate) serve_site: std::sync::OnceLock<std::sync::Arc<crate::child_exec::ServeSite>>,
+    /// #2742 — the window this is the handler context of ([`crate::child_exec::Window::vm`]), null
+    /// for every other context: what a park or a live call of code running as a handler finds its
+    /// window's gate by. Never read by compiled code.
+    #[cfg(fiber_rt)]
+    pub(crate) handler_window: std::sync::atomic::AtomicPtr<crate::child_exec::Window>,
 }
 
 /// The per-instance addresses a [`VmCtx`] is filled from — everything but the trap cell, which each
@@ -152,6 +157,8 @@ impl VmCtx {
             owned_end: Some(owned_end),
             #[cfg(fiber_rt)]
             serve_site: std::sync::OnceLock::new(),
+            #[cfg(fiber_rt)]
+            handler_window: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
         }
     }
 
@@ -175,6 +182,8 @@ impl VmCtx {
             owned_end: None,
             #[cfg(fiber_rt)]
             serve_site: std::sync::OnceLock::new(),
+            #[cfg(fiber_rt)]
+            handler_window: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
         }
     }
 

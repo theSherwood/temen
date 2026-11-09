@@ -184,7 +184,10 @@ pub unsafe fn fiber_park_outside() {
 // (substrate-independent), so a plain non-fiber root has a TLS word too.
 mod vcpu_tls;
 #[cfg(fiber_rt)]
-pub use child_exec::{HandlerDone, HandlerEnd, Ran, ServeRefused, ServeSite};
+pub use child_exec::{
+    handler_steps_aside, handler_steps_back, GateAside, HandlerDone, HandlerEnd, Ran, ServeRefused,
+    ServeSite,
+};
 
 /// #1952, #2742 — whether the running code is in a guest fiber (`cont.*`): a park there yields
 /// `FIBER_PARKED` to the fiber's resumer, which runs on. Not a vCPU's own context, a §14 task's
