@@ -4,9 +4,10 @@
 //! [`every_cranelift_form_is_rejected_or_modeled_soundly`] walks every form in it, synthesizes the
 //! bytes that encoder emits for it, and decodes them with the validator's decoder and with iced-x86.
 //! The decoder must reject the form, or agree with iced wherever the validator relies on it: the
-//! length, the memory operand and whether it is written, the GP registers written, any implicit
-//! memory access, and where control goes next. A Cranelift upgrade that adds an encoding therefore
-//! fails here, not in a user's compile.
+//! length, the memory operand, whether it is written and how wide the access is (exactly, both
+//! ways, so a read is never taken for a store, #2813), the GP registers written, any implicit
+//! memory access, the implicit change to rsp, and where control goes next. A Cranelift upgrade that
+//! adds an encoding therefore fails here, not in a user's compile.
 
 use super::*;
 use cranelift_assembler_x64_meta::dsl::{
@@ -367,6 +368,8 @@ fn check_form(bytes: &[u8], insn: &Instruction) -> Result<bool, String> {
         return Err(format!("GP writes: iced {iced_w:#06x}, ours {ours_w:#06x}"));
     }
     let mut f = InstructionInfoFactory::new();
+    // Whether iced says the explicit memory operand is only read, `None` with no explicit access.
+    let mut only_read = None;
     for m in f.info(insn).used_memory() {
         // Synthesized memory operands never use rsp, so an rsp-based access is an implicit one:
         // the push, pop, call or return the decoder must know moves rsp.
@@ -385,23 +388,42 @@ fn check_form(bytes: &[u8], insn: &Instruction) -> Result<bool, String> {
             m.access(),
             OpAccess::Read | OpAccess::CondRead | OpAccess::NoMemAccess
         );
-        if d.reads_only && !reads {
-            return Err("writes the memory it claims only to read".into());
-        }
+        only_read = Some(only_read.unwrap_or(true) && reads);
     }
-    // A reported width must not be *smaller* than the real access (that would let an access run
-    // past a region's end unnoticed); a larger one is a sound over-approximation — a stricter bound.
-    // `0` means "unknown, assume the widest", also sound.
-    if d.operands.mem.is_some() && d.width != 0 && usize::from(d.width) < insn.memory_size().size()
-    {
+    // The policy's notion of a write, `writes_memory`, must be iced's both ways. A form that writes
+    // memory it claims only to read escapes every write check; one that only reads memory it claims
+    // to write makes a constant load from rodata look like a store to it (#2813).
+    match (only_read, writes_memory(&d)) {
+        (Some(false), false) => return Err("writes the memory it claims only to read".into()),
+        (Some(true), true) => return Err("only reads the memory it claims to write".into()),
+        _ => {}
+    }
+    // So must the width of every access iced reports. A smaller one would let an access run past a
+    // region's end unnoticed. A larger one, or `0` (unknown, so the widest), flags a constant read
+    // at the end of the function's rodata as reaching past it (#2813).
+    if only_read.is_some() && usize::from(d.width) != insn.memory_size().size() {
         return Err(format!(
-            "access width under-reported: ours {}, iced {}",
+            "access width: ours {}, iced {}",
             d.width,
             insn.memory_size().size()
         ));
     }
     if d.keeps_flags && insn.rflags_modified() != 0 {
         return Err("modifies the flags it claims to keep".into());
+    }
+    // The implicit stack-pointer change the transfer models is iced's: a push or pop that moved rsp
+    // by another amount would misplace every later frame access, the return address among them.
+    // Synthesized operands never name rsp, so any change is implicit. A call or return runs a
+    // contract instead, which the call tests check.
+    if d.kind == Kind::Normal {
+        let ours = match run(bytes).regs[reg::RSP as usize] {
+            Fact::Stack(Some(o)) => Some(o),
+            _ => None,
+        };
+        let iced = i64::from(insn.stack_pointer_increment());
+        if ours != Some(iced) {
+            return Err(format!("rsp moves by {ours:?}, iced {iced}"));
+        }
     }
     if !flow_agrees(&d, insn) {
         return Err(format!(
@@ -451,7 +473,8 @@ fn every_cranelift_form_is_rejected_or_modeled_soundly() {
     // A coverage report (shown under `--nocapture`): which forms the decoder rejects outright, and
     // how many variants were checked in all. Every emitted form either is rejected here or decodes
     // soundly; the rejections are the forms Cranelift never emits in guest code (`hlt`, the far
-    // branches, `bt` with a memory bit-offset) plus the EVEX compressed-`disp8` operand.
+    // branches, `bt` with a memory bit-offset, the 16-bit push/pop) plus the EVEX compressed-`disp8`
+    // operand.
     let rejected: Vec<String> = outcomes
         .iter()
         .filter(|(_, v)| v.iter().any(|m| !m))

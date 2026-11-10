@@ -2975,7 +2975,11 @@ pub(crate) mod x86 {
                 }
             }
         }?;
-        Some(match addressing {
+        // A 16-bit push or pop moves rsp by 2, not the 8 the transfer models, which would misplace
+        // every later frame access. Cranelift's encoder has the forms, but it emits none for guest
+        // code.
+        let stack16 = p.op66 && matches!(d.eff, Eff::Push { .. } | Eff::Pop { .. });
+        Some(match addressing.or(stack16.then_some("16-bit push/pop")) {
             Some(why) => Decoded {
                 kind: Kind::Forbidden(why),
                 ..d
@@ -3502,16 +3506,19 @@ pub(crate) mod x86 {
             }
             0xD3 => finish_modrm(c, start, p, 0, Normal, E::ShiftCl).map(|d| d.width(w)), // shift r/m, cl
             0xFE => finish_modrm(c, start, p, 0, Normal, E::WrRm).map(|d| d.width(1)), // inc/dec r/m8
+            // The ALU group with an immediate: imm8, or immZ for `81`. `/7` is `cmp`, which only
+            // reads its r/m at every width (#2813).
+            0x80..=0x83 => {
+                let digit = (c.peek()? >> 3) & 0x07;
+                let (intent, imm, width) = match op {
+                    0x81 => (E::AluImmGroup(digit), imm_z(p), w),
+                    0x83 => (E::AluImmGroup(digit), 1, w),
+                    _ => (E::ByteAluImm, 1, 1),
+                };
+                let d = finish_modrm(c, start, p, imm, Normal, intent)?.width(width);
+                Some(if digit == 7 { d.reads() } else { d })
+            }
             // ModRM + imm8.
-            0x80 | 0x82 => {
-                let digit = (c.peek()? >> 3) & 0x07;
-                let d = finish_modrm(c, start, p, 1, Normal, E::ByteAluImm)?.width(1);
-                Some(if digit == 7 { d.reads() } else { d }) // `/7` is cmp
-            }
-            0x83 => {
-                let digit = (c.peek()? >> 3) & 0x07;
-                finish_modrm(c, start, p, 1, Normal, E::AluImmGroup(digit)).map(|d| d.width(w))
-            }
             0x6B => finish_modrm(c, start, p, 1, Normal, E::WrReg).map(|d| d.width(w)), // imul r, r/m, imm8
             0xC0 => finish_modrm(c, start, p, 1, Normal, E::WrRm).map(|d| d.width(w)), // shift r/m8, imm8
             0xC1 => {
@@ -3521,11 +3528,6 @@ pub(crate) mod x86 {
             }
             0xC6 => keep(finish_modrm(c, start, p, 1, Normal, E::WrRm)).map(|d| d.width(1)), // mov r/m8, imm8
             // ModRM + immZ.
-            0x81 => {
-                let digit = (c.peek()? >> 3) & 0x07;
-                finish_modrm(c, start, p, imm_z(p), Normal, E::AluImmGroup(digit))
-                    .map(|d| d.width(w))
-            }
             0x69 => finish_modrm(c, start, p, imm_z(p), Normal, E::WrReg).map(|d| d.width(w)), // imul r, r/m, immZ
             0xC7 => {
                 keep(finish_modrm(c, start, p, imm_z(p), Normal, E::MovImmToRm)).map(|d| d.width(w))
@@ -3835,11 +3837,15 @@ pub(crate) mod x86 {
     }
 
     /// Whether an SSE or AVX instruction of the 0F map only reads its memory operand: a load, a
-    /// compare, or an arithmetic source. The stores (`11`, `29`, `7F`, `D6`, and `66 0F 7E`) and the
-    /// rest are not.
+    /// compare, a shuffle or an arithmetic source. The stores (`11`, `13`, `17`, `29`, `7F`, `D6`,
+    /// and `66 0F 7E`) and the rest are not.
     fn vec_reads(op2: u8, p: &Pfx) -> bool {
         match op2 {
-            0x10 | 0x28 | 0x2A | 0x2C..=0x2F | 0x51 | 0x54..=0x5F | 0x6E | 0x6F | 0xE6 => true,
+            0x10 | 0x28 | 0x2A | 0x2C..=0x2F | 0x51..=0x5F | 0x6E | 0x6F | 0xE6 => true,
+            // The half-vector loads `movlps`/`movhps`/`movlpd`/`movhpd`/`movddup`/`movs{l,h}dup`
+            // (their stores are `13`/`17`), the `unpck`s, and the `pshuf`/`cmp`/`pinsrw`/`shuf`
+            // forms with an imm8 (#2813).
+            0x12 | 0x14..=0x16 | 0x70 | 0xC2 | 0xC4 | 0xC6 => true,
             // Packed-integer arithmetic (SSE2/AVX): the memory operand is a source the op reads
             // (`padd*`/`psub*`/`pand`/`por`/`pxor`/`pcmp*`/`pmul*`/`pavg*`/`pmin*`/`pmax*`/`psll*`/
             // `psrl*`/`psad*`/`punpck*`/`pack*`, and `lddqu`). The stores in these rows are excluded
@@ -3875,8 +3881,9 @@ pub(crate) mod x86 {
                 0x98..=0x9F | 0xA8..=0xAF | 0xB8..=0xBF if op & 1 == 1 => {
                     (true, if p.rex_w { 8 } else { 4 })
                 }
-                // BMI (andn/bzhi/mulx/shlx/shrx/sarx) and legacy adcx/adox read a GP memory source.
-                0xF2 | 0xF5 | 0xF6 | 0xF7 => (true, gpw),
+                // BMI (andn, blsr/blsmsk/blsi, bzhi, mulx, shlx/shrx/sarx) and legacy adcx/adox read
+                // a GP memory source.
+                0xF2 | 0xF3 | 0xF5 | 0xF6 | 0xF7 => (true, gpw),
                 _ => (true, packed),
             },
             Map::Of3a => match op {
@@ -3950,6 +3957,13 @@ pub(crate) mod x86 {
             (0x10 | 0x11 | 0x51 | 0x58 | 0x59 | 0x5C..=0x5F, 0xF2) => 8,
             (0x10 | 0x11 | 0x51 | 0x58 | 0x59 | 0x5C..=0x5F, _) => packed,
             (0x28 | 0x29 | 0x54..=0x57, _) => packed,
+            (0x52 | 0x53 | 0xC2, 0xF3) => 4,   // rsqrtss/rcpss/cmpss
+            (0xC2, 0xF2) => 8,                 // cmpsd
+            (0x12, 0xF2) if p.vex_l => packed, // vmovddup ymm: the whole vector
+            (0x12 | 0x16, 0xF3) => packed,     // movsldup/movshdup
+            (0x12 | 0x16, _) => 8,             // a lane: movddup xmm, movlps/movhps/movlpd/movhpd
+            (0x14 | 0x15 | 0x52 | 0x53 | 0x70 | 0xC2 | 0xC6, _) => packed,
+            (0xC4, _) => 2,                       // pinsrw xmm, m16
             (0x2E | 0x2F, _) if p.op66 => 8,      // ucomisd/comisd
             (0x2E | 0x2F, _) => 4,                // ucomiss/comiss
             (0x6F | 0x7F, 0xF3) => packed,        // movdqu
@@ -4048,7 +4062,7 @@ pub(crate) mod x86 {
         c.next()?; // 0x62
         let b0 = c.next()?; // R X B R' 0 0 m m (R/X/B inverted)
         let b1 = c.next()?; // W v v v v 1 p p
-        c.next()?; // p2
+        let p2 = c.next()?; // z L'L b V' a a a
         let op = c.next()?;
         let p = Pfx {
             rex_r: (b0 & 0x80) == 0,
@@ -4079,13 +4093,37 @@ pub(crate) mod x86 {
                 ..UNDECODABLE
             });
         }
-        // EVEX's L'L can make the operand 512 bits wide, which `vec_width` doesn't model.
+        // L'L is the vector length, the widest the operand can be: a lane, a broadcast element or a
+        // down-convert accesses less, so `16 << L'L` bounds every access (`0`, unknown, for the
+        // reserved L'L). The VEX tables' widths and directions don't carry over ([`evex_reads`]).
         let d = vex_body(c, start, &p, map, op)?;
         Some(Decoded {
-            width: 0,
-            reads_only: false,
+            width: match (p2 >> 5) & 0x03 {
+                ll @ 0..=2 => 16 << ll,
+                _ => 0,
+            },
+            reads_only: evex_reads(map, op, &p),
             ..d
         })
+    }
+
+    /// Whether an EVEX instruction only reads its memory operand: exactly the AVX-512 forms
+    /// Cranelift emits, each a load or an arithmetic source, by map, mandatory prefix and opcode.
+    /// Any other EVEX form is taken to write it, since EVEX puts stores in slots where VEX has loads
+    /// (`F3.0F38 30–35` are the `vpmov*` down-converts, `66.0F38 30–35` the `pmovzx` loads), so the
+    /// VEX tables don't carry over. Cross-checked against iced by the completeness oracle (#2813).
+    fn evex_reads(map: Map, op: u8, p: &Pfx) -> bool {
+        match map {
+            // vaddpd; the shifts by an imm8 (`72`/`73`, which take a memory source in EVEX) and by
+            // xmm/m128.
+            Map::Of if p.op66 => {
+                matches!(op, 0x58 | 0x72 | 0x73 | 0xD2 | 0xD3 | 0xE2 | 0xF2 | 0xF3)
+            }
+            Map::Of => p.rep == 0xF2 && op == 0x7A, // vcvtudq2ps
+            // vpabsd/q, vpmulld/q, vpopcntb/w, vpermi2b.
+            Map::Of38 => p.op66 && matches!(op, 0x1E | 0x1F | 0x40 | 0x54 | 0x75),
+            Map::Of3a => false,
+        }
     }
 
     /// The implied prefix (`pp`) and the vector length (`L`) the VEX byte `b` (`… L pp`) carries,
@@ -4675,6 +4713,48 @@ pub(crate) mod x86 {
                 d.operands.mem.is_some() && !d.reads_only,
                 "movdqa store stays a write: {d:?}"
             );
+        }
+
+        /// #2813: Cranelift's unsigned-to-float conversion reads two rodata constants with
+        /// `vunpcklps` and `vsubpd`. Both only read, each exactly 16 bytes, so neither is a store to
+        /// the function's rodata, and the second, which ends the function, doesn't reach past it.
+        /// EVEX has its own table: `vpmovqd [rax], xmm1` stores in the slot where `pmovzxdq` loads.
+        #[test]
+        fn vector_constant_reads_are_not_stores() {
+            // [0] vunpcklps xmm0, xmm0, [rip + 0x18] reads [32]; [8] vsubpd xmm0, xmm0, [rip + 0x20]
+            // reads [48]; [16] ret; then the two 16-byte constants, the second ending the function.
+            let mut code = vec![0xc5, 0xf8, 0x14, 0x05, 0x18, 0, 0, 0];
+            code.extend([0xc5, 0xf9, 0x5c, 0x05, 0x20, 0, 0, 0, 0xc3]);
+            code.resize(64, 0);
+            let f = findings(&code);
+            assert!(f.is_empty(), "a constant read was flagged: {f:?}");
+            let evex_store = decode(&[0x62, 0xf2, 0x7e, 0x08, 0x35, 0x08], 0); // vpmovqd [rax], xmm1
+            assert!(
+                evex_store.operands.mem.is_some() && !evex_store.reads_only,
+                "{evex_store:?}"
+            );
+            assert!(decode(&[0x66, 0x0f, 0x38, 0x35, 0x08], 0).reads_only); // pmovzxdq xmm1, [rax]
+        }
+
+        /// A 16-bit push or pop moves rsp by 2, not the 8 the transfer models, so it is rejected
+        /// rather than tracked 6 bytes off: a store the validator placed inside the frame could land
+        /// on the return address.
+        #[test]
+        fn a_16bit_push_or_pop_is_rejected() {
+            for insn in [
+                &[0x66, 0x50][..],         // push ax
+                &[0x66, 0x41, 0xff, 0x30], // push word [r8]
+                &[0x66, 0x68, 0x01, 0x00], // push 1 (imm16)
+                &[0x66, 0x58],             // pop ax
+                &[0x66, 0x41, 0x8f, 0x00], // pop word [r8]
+            ] {
+                let d = decode(insn, 0);
+                assert!(
+                    matches!(d.kind, Kind::Forbidden("16-bit push/pop")),
+                    "{insn:02x?}: {d:?}"
+                );
+            }
+            assert!(matches!(decode(&[0x50], 0).kind, Kind::Normal)); // push rax
         }
 
         #[test]
