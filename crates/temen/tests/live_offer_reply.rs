@@ -177,6 +177,9 @@ fn run_on(entry: Entry, caller: &str, server: &str, handoff: bool) -> Result<Vec
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let mut host = Host::new();
+        // The caller's own module, as an embedder's instantiation records it: what a live
+        // self-serve grant over one of its exports offers its child (#744).
+        host.set_self_module(&std::sync::Arc::new(a.clone()));
         host.set_handoff(handoff);
         let args = [
             host.grant_instantiator(),
@@ -223,8 +226,9 @@ fn agree(caller: &str, server: &str, engines: &[(&str, Entry)]) -> Result<Vec<Va
             assert_eq!(
                 run_on(entry, caller, server, handoff),
                 oracle,
-                "{name} with the handoff {} answers as the tree-walker does",
+                "{name} with the handoff {} answers as {} does",
                 if handoff { "on" } else { "off" },
+                engines[0].0,
             );
         }
     }
@@ -889,14 +893,15 @@ block 2 (wme: i64, wth: i64, wn: i64) {
 }
 "#;
 
-/// #2742 — a serve loop that returns while one of its handlers is still parked leaves the handler
-/// as it is, on every engine: never resumed, its call never answered (unlike a trap or a kill, which
-/// revoke it). The handler sets a flag in its domain's memory and parks on a futex nothing wakes;
-/// the child's main polls until it sees the flag, and returns. The parent, waiting on the call with
-/// nothing else live, gets the deadlock verdict. The bytecode engine's serve veto declines a serving
-/// module that waits on a futex (#2789), so the tree-walker and the JIT run it.
+/// #2742 — a serve loop that returns while one of its handlers is still parked revokes the
+/// handler's call, as a trap or a kill does (owner, 2026-11-09): a serving vCPU's end leaves nothing
+/// to resume its handlers, so their calls answer `CAP_REVOKED` (D37). The handler sets a flag in its
+/// domain's memory and parks on a futex nothing wakes; the child's main polls until it sees the
+/// flag, and returns 77. The bytecode engine's serve veto declines a serving module that waits on a
+/// futex (#2789), so the tree-walker and the JIT run it; the next test pins the same on every
+/// engine.
 #[test]
-fn a_serve_loop_that_returns_leaves_its_parked_handler_unanswered() {
+fn a_serve_loop_that_returns_revokes_its_parked_handler_s_call() {
     let call = r#"
   va = i64.const 1
   vb = i64.const 2
@@ -906,8 +911,252 @@ fn a_serve_loop_that_returns_leaves_its_parked_handler_unanswered() {
         POLL_UNTIL_PARKED,
         &[ENGINES[0], ENGINES[3]],
     );
-    assert_eq!(r, Err(Trap::ThreadFault));
+    assert_eq!(r, Ok(vec![Value::I64(77 * 1_000_000 + CAP_REVOKED)]));
 }
+
+/// #2742 — the same where the bytecode engine runs it: the handler parks on a call back into its
+/// parent, which never serves it (the parent's own call waits on the handler), so only the serve
+/// loop's end can answer the parent. The parent grants its child a live self-serve offer over its
+/// export `back` (#744), mints an offer over the child and calls `hang(1, 2)`; the handler sets the
+/// flag and calls `back.back(1, 2)`; the child's main polls until it sees the flag and returns 77.
+/// The parent answers `join · 1_000_000 + call`. The parent's offer and the child's grant hold each
+/// other's hosts, which the tree-walker's end of run cannot unwrap (#2830), so the bytecode engine's
+/// two executors and the JIT run it, against the oracle's answer.
+#[test]
+fn a_handler_parked_on_its_parent_when_its_serve_loop_returns_is_revoked() {
+    let child = temen_ir::SpawnRec {
+        grants_ptr: 17536,
+        grants_n: 1,
+        ..temen_ir::SpawnRec::default()
+    };
+    let caller = format!(
+        r#"memory 17
+data 17600 "back"
+type 0 func (i64, i64) -> (i64)
+type 1 interface {{ back: 0 }}
+export 0 interface "back" 1 {{ back: 1 }}
+
+func (i32, i32, i32, i32) -> (i64) {{
+block 0 (v0: i32, v1: i32, v2: i32, v3: i32) {{
+  vrm = i64.const 17416
+  i32.store vrm v1
+  vrb = i64.const 17420
+  i32.store vrb v2
+  vgh = i32.const {tag}
+{grant}  vrp = i64.const 17408
+  v5 = call.cap 6 17 (i64) -> (i32) v0 (vrp)
+  v6 = i64.const 0
+  v7 = call.cap 6 14 (i32, i64) -> (i32) v0 (v5, v6)
+  va = i64.const 1
+  vb = i64.const 2
+  vcall = call.cap 268435456 0 (i64, i64) -> (i64) v7 (va, vb)
+  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) v0 (v5)
+  vk = i64.const 1000000
+  vm = i64.mul vj vk
+  vs = i64.add vm vcall
+  return vs
+  }}
+}}
+
+func (i64, i64) -> (i64) {{
+block 0 (va: i64, vb: i64) {{
+  vs = i64.add va vb
+  return vs
+  }}
+}}
+{rec}"#,
+        tag = temen_interp::GRANT_SERVE_LIVE_TAG as i32,
+        grant = rec::grant("ge", 17536, 17600, 4, "vgh"),
+        rec = rec::segment(17408, &child),
+    );
+    let server = r#"memory 17
+data 16384 "back"
+type 0 func (i64, i64) -> (i64)
+type 1 interface { hang: 0 }
+export 0 interface "hang" 1 { hang: 1 }
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  br 1()
+}
+block 1 () {
+  vz = i32.const 0
+  vn = call.cap 4294967295 9 () -> (i64) vz ()
+  vfa = i64.const 17416
+  vflag = i64.load vfa
+  vzero = i64.const 0
+  vset = i64.ne vflag vzero
+  br_if vset 2() 1()
+}
+block 2 () {
+  vr = i64.const 77
+  return vr
+  }
+}
+
+func (i64, i64) -> (i64) {
+block 0 (va: i64, vb: i64) {
+  vfa = i64.const 17416
+  vone = i64.const 1
+  i64.store vfa vone
+  vnp = i64.const 16384
+  vl4 = i64.const 4
+  vback = self.resolve vnp vl4
+  vr = call.cap 268435456 0 (i64, i64) -> (i64) vback (va, vb)
+  return vr
+  }
+}
+"#;
+    assert!(
+        bytecode::admits(&module(&caller)),
+        "the bytecode engine runs the caller"
+    );
+    assert!(bytecode::admits(&module(server)), "and the serving child");
+    let r = agree(&caller, server, &ENGINES[1..]);
+    assert_eq!(r, Ok(vec![Value::I64(77 * 1_000_000 + CAP_REVOKED)]));
+}
+
+/// #2742 — a serving vCPU's end revokes the calls of the handlers it parked at once, while its
+/// domain runs on: the parent's next call needs that answer first. The parent calls `hang(1, 2)`
+/// and then `add(3, 4)`, answering `join · 1_000_000 + first · 1_000 + second`. The handler sets the
+/// flag and parks on a futex nothing wakes. The child's two cases: [`SERVED_BY_A_THREAD`], whose
+/// thread serves `hang` and ends before the main serves `add`, and [`A_THREAD_OUTLIVES_THE_ROOT`],
+/// whose main serves `hang` and returns, leaving a thread to serve `add`. Only the serving vCPU's
+/// own end can answer `hang` in time: the domain's end waits on the `add` that waits on it. TW and
+/// JIT, as above.
+#[test]
+fn a_serving_vcpu_s_end_revokes_its_parked_handler_s_call_at_once() {
+    let call = r#"
+  va = i64.const 1
+  vb = i64.const 2
+  vfirst = call.cap 268435456 0 (i64, i64) -> (i64) v7 (va, vb)
+  vc = i64.const 3
+  vd = i64.const 4
+  vsecond = call.cap 268435456 1 (i64, i64) -> (i64) v7 (vc, vd)
+  vthou = i64.const 1000
+  vf = i64.mul vfirst vthou
+  vcall = i64.add vf vsecond"#;
+    for server in [SERVED_BY_A_THREAD, A_THREAD_OUTLIVES_THE_ROOT] {
+        let r = agree(
+            &caller(call, ""),
+            &format!("{HANG_ADD}{server}"),
+            &[ENGINES[0], ENGINES[3]],
+        );
+        assert_eq!(
+            r,
+            Ok(vec![Value::I64(77 * 1_000_000 + CAP_REVOKED * 1_000 + 7)])
+        );
+    }
+}
+
+/// The interface of [`a_serving_vcpu_s_end_revokes_its_parked_handler_s_call_at_once`]'s child, its
+/// handlers, and its poll loop, func 1 of each case: it serves until `hang` has set the flag.
+const HANG_ADD: &str = r#"memory 17
+type 0 func (i64, i64) -> (i64)
+type 1 interface { hang: 0, add: 0 }
+export 0 interface "hang" 1 { hang: 2, add: 3 }
+"#;
+
+/// The child's main spawns a thread that polls until `hang` has parked and returns; the main joins
+/// it, then serves `add` and returns 77.
+const SERVED_BY_A_THREAD: &str = r#"func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vz = i64.const 0
+  vt = thread.spawn 1 vz vz
+  vt_st, vtr = thread.join vt
+  vw = i32.const 0
+  vn = svc.wait vw
+  vr = i64.const 77
+  return vr
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (va: i64, vb: i64) {
+  br 1()
+}
+block 1 () {
+  vz = i32.const 0
+  vn = call.cap 4294967295 9 () -> (i64) vz ()
+  vfa = i64.const 17416
+  vflag = i64.load vfa
+  vzero = i64.const 0
+  vset = i64.ne vflag vzero
+  br_if vset 2() 1()
+}
+block 2 () {
+  vr = i64.const 5
+  return vr
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (va: i64, vb: i64) {
+  vfa = i64.const 17416
+  vone = i64.const 1
+  i64.store vfa vone
+  vw = i64.const 17408
+  vexp = i32.const 0
+  vto = i64.const -1
+  vst = i32.atomic.wait vw vexp vto
+  vst64 = i64.extend_i32_u vst
+  return vst64
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (va: i64, vb: i64) {
+  vs = i64.add va vb
+  return vs
+  }
+}
+"#;
+
+/// The child's main polls until `hang` has parked, spawns a thread that serves `add`, and returns
+/// 77 without joining it.
+const A_THREAD_OUTLIVES_THE_ROOT: &str = r#"func (i64) -> (i64) {
+block 0 (v0: i64) {
+  br 1()
+}
+block 1 () {
+  vz = i32.const 0
+  vn = call.cap 4294967295 9 () -> (i64) vz ()
+  vfa = i64.const 17416
+  vflag = i64.load vfa
+  vzero = i64.const 0
+  vset = i64.ne vflag vzero
+  br_if vset 2() 1()
+}
+block 2 () {
+  vz0 = i64.const 0
+  vt = thread.spawn 1 vz0 vz0
+  vr = i64.const 77
+  return vr
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (va: i64, vb: i64) {
+  vw = i32.const 0
+  vn = svc.wait vw
+  return vn
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (va: i64, vb: i64) {
+  vfa = i64.const 17416
+  vone = i64.const 1
+  i64.store vfa vone
+  vw = i64.const 17408
+  vexp = i32.const 0
+  vto = i64.const -1
+  vst = i32.atomic.wait vw vexp vto
+  vst64 = i64.extend_i32_u vst
+  return vst64
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (va: i64, vb: i64) {
+  vs = i64.add va vb
+  return vs
+  }
+}
+"#;
 
 /// #2742 — the same, its main ending in a trap: the handler's call answers `CAP_REVOKED`.
 #[test]
@@ -925,8 +1174,8 @@ fn a_serve_loop_that_traps_revokes_its_parked_handler_s_call() {
     assert_eq!(r, Ok(vec![Value::I64(CAP_REVOKED)]));
 }
 
-/// The child of [`a_serve_loop_that_returns_leaves_its_parked_handler_unanswered`]: `hang` sets the
-/// flag at 17416 and waits on the futex word at 17408 for ever.
+/// The child of [`a_serve_loop_that_returns_revokes_its_parked_handler_s_call`]: `hang` sets the flag
+/// at 17416 and waits on the futex word at 17408 for ever.
 const POLL_UNTIL_PARKED: &str = r#"memory 17
 type 0 func (i64, i64) -> (i64)
 type 1 interface { hang: 0 }

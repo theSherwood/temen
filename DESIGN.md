@@ -2551,7 +2551,14 @@ direct handoff (arm 4) the caller's call takes no ticket, and its handler runs o
 stack when it can never park (`temen_ir::seams::handler_never_parks`: nothing its call closure
 reaches can park) and the stack has room for it: it runs to completion or traps, and never gives
 its gate back. Every other handoff runs its handler on a fiber of its own, so a chain of crossings
-needs no depth bound. A domain retires until its handlers have ended, wherever they run. A run with
+needs no depth bound. A domain retires until its handlers have ended, wherever they run.
+**A serving vCPU's end revokes the handlers it parked** (owner, 2026-11-09), however it ended: a
+return, a trap or a kill. Nothing can resume them, so each one's call answers `CAP_REVOKED` then
+(D37), on every engine, while the rest of the domain, threads that outlive the root included,
+runs on. The tree-walker and the bytecode engine answer from the vCPU's own end. The JIT answers
+from the vCPU's window (`ServeSite::revoke`, at a §14 root's end and as a thread's context goes
+back to the pool), and unwinds the handlers' fibers once the domain has no vCPU left, on its end
+or, for a domain whose root returned, `DOMAIN_DONE`. A run with
 no pool (no §14 child, so no live offer reaches it), and a domain a freeze can land in (a handler
 fiber cannot ride the snapshot yet, #2804), keep each handler on the serve op's own stack. Bytecode: declines
 to the tree-walker. Observable results and provider state are identical across

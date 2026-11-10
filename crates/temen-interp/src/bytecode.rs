@@ -5056,14 +5056,7 @@ fn journal_state(
         + cont
             .fibers
             .iter()
-            .map(|f| match f {
-                FiberState::Parked { vm, .. }
-                | FiberState::WaitParked { vm, .. }
-                | FiberState::CapParked { vm, .. }
-                | FiberState::HostParked { vm, .. }
-                | FiberState::TicketParked { vm, .. } => vm.clone_slots(),
-                _ => 0,
-            })
+            .map(|f| f.parked_vm().map_or(0, Vm::clone_slots))
             .sum::<u64>()
         + cont
             .child_domains
@@ -9533,6 +9526,20 @@ struct FiberTables {
     meta: Vec<FiberMeta>,
 }
 
+impl FiberState {
+    /// A parked fiber's continuation: what it resumes, and what a scan of its frames reads.
+    fn parked_vm(&self) -> Option<&Vm> {
+        match self {
+            FiberState::Parked { vm, .. }
+            | FiberState::WaitParked { vm, .. }
+            | FiberState::CapParked { vm, .. }
+            | FiberState::HostParked { vm, .. }
+            | FiberState::TicketParked { vm, .. } => Some(vm),
+            _ => None,
+        }
+    }
+}
+
 impl FiberTables {
     /// These tables, owned by the caller, as the registry a fiber transition runs over.
     fn cell(&mut self) -> FiberCell<'_> {
@@ -10011,7 +10018,7 @@ fn return_from_fiber(
     // #2742 — a handler's return answers its dispatch, and its serve loop, back at its serve op,
     // counts it. The serve op's one result is not the resumer's `(status, value)` pair.
     if let Some(ticket) = vt.active.dispatch() {
-        answer_dispatch(host, fibers, mem, ticket, &vals);
+        answer_dispatch(host, fibers, mem, ticket, Ok(&vals));
         release_handler(fibers, id);
         let mut handler = std::mem::replace(&mut vt.active, resumer);
         vt.active.tls = handler.tls;
@@ -10211,34 +10218,45 @@ fn answer_dispatch(
     fibers: &mut FiberCell,
     mem: &Option<Mem>,
     ticket: u64,
-    vals: &[Value],
+    answer: Result<&[Value], i64>,
 ) {
-    let mut results: Vec<i64> = vals.iter().map(|v| super::val_to_slot(*v)).collect();
-    let own = host.with(|p| {
-        if let Some(first) = results.first_mut() {
-            *first = p.settle_page(ticket, *first, mem.as_ref().map(|m| m as _));
-        }
-        p.domain_id()
+    let (reply, own) = host.with(|p| {
+        let reply = match answer {
+            Ok(vals) => {
+                let mut results: Vec<i64> = vals.iter().map(|v| super::val_to_slot(*v)).collect();
+                if let Some(first) = results.first_mut() {
+                    *first = p.settle_page(ticket, *first, mem.as_ref().map(|m| m as _));
+                }
+                super::Reply::Results(results)
+            }
+            // A page request's sink goes, as for any errno reply (#2164).
+            Err(errno) => super::Reply::Failed(p.settle_page(ticket, errno, None)),
+        };
+        (reply, p.domain_id())
     });
-    let mut results = Some(results);
+    let mut reply = Some(reply);
     fibers.with(|f, _, _| {
         for fib in f.iter_mut() {
             if let FiberState::TicketParked {
                 ticket: t,
                 callee_id,
+                sig,
                 woken: woken @ None,
                 ..
             } = fib
             {
                 if *t == ticket && *callee_id == own {
-                    *woken = results.take().map(Ok);
+                    *woken = reply.take().map(|r| match r {
+                        super::Reply::Results(results) => Ok(results),
+                        super::Reply::Failed(errno) => super::failed_slots(errno, sig.results()),
+                    });
                     return;
                 }
             }
         }
     });
-    host.with(|p| match results {
-        Some(results) => _ = p.svc_results.insert(ticket, super::Reply::Results(results)),
+    host.with(|p| match reply {
+        Some(reply) => _ = p.svc_results.insert(ticket, reply),
         None => _ = p.svc_payers.remove(&ticket),
     });
 }
@@ -10915,15 +10933,8 @@ fn gc_scan_beneath(
         // completion) holds live frames exactly like a suspended one — scan all three, or a
         // root held across a fiber's blocking point would be missed (unsound for GC.md §3.2).
         let mut scan = |fibers: &[FiberState]| {
-            for fib in fibers {
-                if let FiberState::Parked { vm, .. }
-                | FiberState::WaitParked { vm, .. }
-                | FiberState::CapParked { vm, .. }
-                | FiberState::HostParked { vm, .. }
-                | FiberState::TicketParked { vm, .. } = fib
-                {
-                    scan_vm_roots(vm, source, &mut consider);
-                }
+            for vm in fibers.iter().filter_map(FiberState::parked_vm) {
+                scan_vm_roots(vm, source, &mut consider);
             }
         };
         for r in &view.fibers {
@@ -18632,6 +18643,8 @@ fn complete(tasks: &mut [TaskSlot], envs: &mut [Domain], ti: usize, res: Result<
         if let Some(a) = tasks[done].answers.take() {
             answer(*a, &res, &envs[tasks[done].domain]);
         }
+        let domain = tasks[done].domain;
+        revoke_handlers(&mut tasks[done], &mut envs[domain]);
         let joiners: Vec<(usize, i32, u32)> = (0..tasks.len())
             .filter_map(|j| match tasks[j].state {
                 TaskState::BlockedJoin { child, handle, dst } if child == done => {
@@ -18653,6 +18666,32 @@ fn complete(tasks: &mut [TaskSlot], envs: &mut [Domain], ti: usize, res: Result<
                 }
                 Err(trap) => work.push((j, Err(trap))),
             }
+        }
+    }
+}
+
+/// #2742 — task `t` of domain `d` has ended, however it ended (owner, 2026-11-09): the handlers its
+/// serve loop parked can never run again, so each one's dispatch answers `CAP_REVOKED`, as the
+/// oracle answers a dead vCPU's parked handlers, and its fiber slot goes. Not under a freeze, whose
+/// cut carries them.
+fn revoke_handlers(t: &mut TaskSlot, d: &mut Domain) {
+    let Domain {
+        host, fibers, mem, ..
+    } = d;
+    if is_unwinding(mem) {
+        return;
+    }
+    let parked = match t.vm.vt.active.rare.as_mut() {
+        Some(r) => std::mem::take(&mut r.handlers),
+        None => return,
+    };
+    let mut host = HostCell::Shared(host);
+    let mut fibers = fibers.cell();
+    for k in parked {
+        let ticket = fibers.with(|f, _, _| f.get(k)?.parked_vm()?.dispatch());
+        release_handler(&mut fibers, k);
+        if let Some(ticket) = ticket {
+            answer_dispatch(&mut host, &mut fibers, mem, ticket, Err(super::CAP_REVOKED));
         }
     }
 }

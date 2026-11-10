@@ -1256,11 +1256,16 @@ impl Domain {
     }
 
     /// #2488 — a vCPU ended: its cell hands back what it did not burn, and its context waits for
-    /// the next spawn.
+    /// the next spawn. #2742 — without the serve site the vCPU had, whose handlers it parked can
+    /// never run again, so their calls answer `CAP_REVOKED` now ([`crate::ServeSite::revoke`]); the
+    /// next vCPU on the context starts a window of its own.
     fn put_vcpu_ctx(&self, mut ctx: Box<VcpuCtx>) {
         if let Some(cell) = ctx.cell.as_deref_mut() {
             // SAFETY: a live cell; a fiber still charging it is `settle`'s documented race.
             unsafe { crate::FuelCell::settle(cell) };
+        }
+        if let Some(site) = ctx.vm.serve_site.take() {
+            site.revoke();
         }
         lock(&self.vcpu_ctxs).push(ctx);
     }

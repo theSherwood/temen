@@ -172,6 +172,17 @@ impl ChildTask {
         self
     }
 
+    /// What the task's parent learns of its end: its root's first result, and the trap that ended its
+    /// domain (`0` for none). `DOMAIN_DONE` is no trap: it is the end a returned domain's last handlers
+    /// unwind on ([`ChildExec::file`]), or the run's teardown.
+    fn outcome(&self) -> (i64, i64) {
+        let trap = match self.vm.ended() {
+            Some(code) if code != crate::DOMAIN_DONE_CODE as i64 => code,
+            _ => 0,
+        };
+        (self.results.first().copied().unwrap_or(0), trap)
+    }
+
     /// #1936 — the task's domain has ended, and no freeze captured it: tell its powerbox, once, while
     /// it is live. Answers its end post's signal, for the caller to give once the end is published
     /// and before the task leaves the run's live count (#2800).
@@ -1013,6 +1024,16 @@ impl ServeSite {
         self.window.release(fiber_rt::context_id());
         if self.window.pooled.load(Ordering::Acquire) != 0 {
             self.exec.offer_gate(self.window.key());
+        }
+    }
+
+    /// #2742 — the site's vCPU has ended, however it ended (owner, 2026-11-09): its window never opens
+    /// again, so each handler of it the pool holds answers its call `CAP_REVOKED` now, as the
+    /// oracle answers a dead vCPU's parked handlers. Their fibers unwind once their domain has no
+    /// vCPU left ([`ChildExec::drain`]).
+    pub(crate) fn revoke(&self) {
+        if self.window.pooled.load(Ordering::Acquire) != 0 {
+            self.exec.revoke_window(&self.window);
         }
     }
 
@@ -2094,13 +2115,22 @@ impl ChildExec {
             }
             _ => false,
         };
-        // A domain that ended by a trap or a kill (its end recorded) revokes its handlers' calls:
-        // they run once more, to unwind ([`Self::drain`]). One whose root returned leaves them as
-        // they are, as the oracle does: shut out of every window, never resumed, their calls
-        // unanswered, the domain retiring until the run's teardown ends them. The handlers count
-        // as live from before the root leaves the count, so no waiter sees the domain all parked
-        // while they still have to unwind.
-        if handlers && !task.threads_live() && task.vm().ended().is_some() {
+        // #2742 — the root has ended, however it ended (owner, 2026-11-09): the handlers it parked
+        // can never run again, so their calls answer `CAP_REVOKED` now ([`ServeSite::revoke`]).
+        if let (Task::Child(t), Outcome::Finished) = (&*task, &outcome) {
+            if let Some(site) = t.vm.serve_site.get() {
+                site.revoke();
+            }
+        }
+        // Once none of its vCPUs is left, the domain's handlers run once more, to unwind on its end
+        // ([`Self::drain`]): a trap's or a kill's, or, for a root that returned, `DOMAIN_DONE`,
+        // which nothing of the domain is left to see but them. They count as live from before the
+        // root leaves the count, so no waiter sees the domain all parked while they still have to
+        // unwind.
+        if handlers && !task.threads_live() {
+            if task.vm().ended().is_none() {
+                task.vm().raise(crate::DOMAIN_DONE_CODE as i64);
+            }
             self.drain(task.vm().domain_key());
         }
         let outcome = match outcome {
@@ -2405,8 +2435,9 @@ impl ChildExec {
         let hid = h.id();
         h.window.pooled.fetch_sub(1, Ordering::AcqRel);
         let reusable = h.reusable;
-        let (_given, window) = h.conclude(reusable);
-        debug_assert!(_given.is_none(), "a pooled handler was given its done");
+        // A pooled handler was given its `done`, unless its serving vCPU's end answered its call
+        // already ([`ServeSite::revoke`]): that one unwound, and its end goes nowhere.
+        let (_revoked, window) = h.conclude(reusable);
         // Whoever waits on its dispatch is woken before it leaves the live count, as a joiner is
         // settled before its joinee leaves it (#1820): else a waiter that re-checks the deadlock
         // predicate in between sees every live vCPU parked, its answer already there. So is whoever
@@ -2444,11 +2475,36 @@ impl ChildExec {
         }
     }
 
-    /// #2742 — domain `domain` has ended by a trap or a kill, every vCPU of it, with handlers of its
-    /// serve loops still parked or queued: their windows are shut for good, so none can run on. Mark
-    /// them draining: each runs once more, whatever its window and gate, to unwind on the recorded
-    /// end, and its `done` answers its caller `CAP_REVOKED`, as the oracle revokes such a callee's
-    /// calls. They count as live meanwhile. The domain's task retires until the last has ended.
+    /// #2742 — `window`'s vCPU has ended ([`ServeSite::revoke`]): each handler of it the pool holds
+    /// answers its call `CAP_REVOKED`, and keeps its fiber parked, shut out of the window, until its
+    /// domain drains it. Its `done` is run outside the pool's lock, as a handler's end runs it, and
+    /// the window's bell rings for the callers.
+    fn revoke_window(&self, window: &Arc<Window>) {
+        let dones: Vec<HandlerDone> = {
+            let mut g = lock(&self.state);
+            g.tasks
+                .values_mut()
+                .filter_map(|e| match e.task.as_deref_mut() {
+                    Some(Task::Handler(h)) if Arc::ptr_eq(&h.window, window) => h.done.take(),
+                    _ => None,
+                })
+                .collect()
+        };
+        if dones.is_empty() {
+            return;
+        }
+        for done in dones {
+            done(HandlerEnd::Trapped(crate::DOMAIN_DONE_CODE as i64));
+        }
+        (window.ring)();
+    }
+
+    /// #2742 — domain `domain` has ended, every vCPU of it, with handlers of its serve loops still
+    /// parked or queued: their windows are shut for good, so none can run on. Mark them draining:
+    /// each runs once more, whatever its window and gate, to unwind on the domain's end, and its
+    /// `done`, unless its vCPU's end ran it ([`Self::revoke_window`]), answers its caller
+    /// `CAP_REVOKED`, as the oracle revokes such a callee's calls. They count as live meanwhile. The
+    /// domain's task retires until the last has ended.
     fn drain(self: &Arc<Self>, domain: usize) {
         let mut g = lock(&self.state);
         let mut began = false;
@@ -2530,8 +2586,7 @@ impl ChildExec {
             t(captured);
         }
         // A retiring task published at `settle`, unless its root unwound, whose capture this is.
-        let trap = task.vm.ended().unwrap_or(0);
-        let result = task.results.first().copied().unwrap_or(0);
+        let (result, trap) = task.outcome();
         done.publish(result, trap, self.domain());
         // #2800 — its end post once the end is published, while the task still counts as live.
         if let Some(signal) = end {
@@ -2557,8 +2612,7 @@ impl ChildExec {
     /// they have ended is what its parent's join is owed.
     fn settle(&self, task: &mut ChildTask) {
         task.retiring = true;
-        let trap = task.vm.ended().unwrap_or(0);
-        let result = task.results.first().copied().unwrap_or(0);
+        let (result, trap) = task.outcome();
         // A trap ends the child's domain: its parked vCPUs observe the shared cell and unwind.
         if trap != 0 {
             if let Some(d) = &task.dom {

@@ -10584,7 +10584,12 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 if !froze {
                     if let Some(t) = &died {
                         teardown_domain(&mut s, key, t, &dying_host);
-                        wake_dead_tickets(&mut s, key, own_tickets);
+                    }
+                    // #2742 — the handlers this vCPU parked can never run again, however it ended
+                    // (owner, 2026-11-09): each one's call answers `CAP_REVOKED` now, as its own
+                    // reply would, whether its caller has parked yet or not (D37).
+                    for t in own_tickets {
+                        reply_locked(&mut s, t, Reply::Failed(CAP_REVOKED), &dying_host);
                     }
                     if (id == ROOT_TASK && !rests) || (died.is_some() && key == s.root_domain) {
                         teardown_run(&mut s);
