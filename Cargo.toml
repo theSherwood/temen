@@ -27,6 +27,7 @@ members = [
     "crates/temen-posix",
     "crates/temen-capi",
     "crates/temen-parity",
+    "crates/temen-gpu",
 ]
 # `fuzz/` is a cargo-fuzz crate (nightly + libfuzzer-sys); `bench/` pulls in Wasmtime for
 # the comparison harness; `crates/temen-llvm` is the AOT LLVM→IR on-ramp (D54 — an opt-in,
