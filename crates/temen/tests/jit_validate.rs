@@ -17,8 +17,9 @@ use temen_text::parse_module;
 
 /// A spread of modules exercising the instruction families Cranelift emits: integer ALU, the
 /// memory-access confinement lowering (cmp/cmov/branch), loops (rel8/rel32 jmp/jcc + block starts),
-/// `br_table` (indirect jmp + a jump-table island), `select`/extends (cmov/setcc/movsx/movzx), and
-/// floats (SSE + a constant pool).
+/// `br_table` (indirect jmp + a jump-table island), `select`/extends (cmov/setcc/movsx/movzx),
+/// floats (SSE + a constant pool), and direct and tail calls through their callee's code word
+/// (#2594).
 const MODULES: &[&str] = &[
     "func (i64, i64) -> (i64) {\nblock 0 (v0: i64, v1: i64) {\n  v2 = i64.add v0 v1\n  \
      v3 = i64.mul v2 v0\n  v4 = i64.sub v3 v1\n  return v4\n  }\n}\n",
@@ -38,6 +39,11 @@ const MODULES: &[&str] = &[
      v7 = i64.extend_i32_u v0\n  v8 = i64.add v6 v7\n  return v8\n  }\n}\n",
     "func (f64, f64) -> (f64) {\nblock 0 (v0: f64, v1: f64) {\n  v2 = f64.add v0 v1\n  \
      v3 = f64.mul v2 v0\n  v4 = f64.const 2.5\n  v5 = f64.div v3 v4\n  return v5\n  }\n}\n",
+    "func (i64) -> (i64) {\nblock 0 (v0: i64) {\n  v1 = call 1 (v0)\n  v2 = call 2 (v1, v0)\n  \
+     return_call 1(v2)\n  }\n}\nfunc (i64) -> (i64) {\nblock 0 (v0: i64) {\n  \
+     v1 = i64.const 1\n  v2 = i64.add v0 v1\n  return v2\n  }\n}\n\
+     func (i64, i64) -> (i64) {\nblock 0 (v0: i64, v1: i64) {\n  v2 = i64.mul v0 v1\n  \
+     return v2\n  }\n}\n",
 ];
 
 #[test]

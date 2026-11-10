@@ -223,7 +223,7 @@ fn compile_refill_trampoline() -> Result<(crate::OwnedJit, usize), crate::JitErr
     use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
     use cranelift_module::{Linkage, Module};
     let backend = |e: cranelift_module::ModuleError| crate::JitError::Backend(e.to_string());
-    let mut module = crate::new_jit_module(crate::Imports::NONE)?;
+    let mut module = crate::new_jit_module(crate::Imports::NONE, &crate::FastClaims::new())?;
     let mut sig = Signature::new(CallConv::PreserveAll);
     sig.params.push(AbiParam::new(I64)); // the cell
     let id = module
@@ -238,7 +238,7 @@ fn compile_refill_trampoline() -> Result<(crate::OwnedJit, usize), crate::JitErr
     b.switch_to_block(entry);
     b.seal_block(entry);
     let cell = b.block_params(entry)[0];
-    let callees = crate::Callees::new(&mut module, &[], &[], &[], None)?;
+    let callees = crate::Callees::new(&mut module, &[], &[], &[], &crate::FastClaims::new())?;
     crate::call_host(&callees, &mut b, crate::HostFn::FuelRefill, &[cell])?;
     b.ins().return_(&[]);
     b.finalize();
