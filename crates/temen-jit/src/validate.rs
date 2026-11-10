@@ -1679,7 +1679,6 @@ pub(crate) mod x86 {
                     // `zext32(src)` is `< 2^32`, and `≤ src` when `src` is bounded below `2^32`: the
                     // move keeps the source's bound, clamped to `2^32` (#2784). An unbounded source
                     // still yields `Bounded(2^32)` — exactly what a 32-bit write guarantees.
-                    const W32: u64 = 1 << 32;
                     let b =
                         max_value(fact(&state, src)).map_or(W32, |m| m.saturating_add(1).min(W32));
                     set(&mut state, dst, Fact::Bounded(b));
@@ -1728,6 +1727,18 @@ pub(crate) mod x86 {
                     };
                     set(&mut state, dst, f);
                 }
+                Eff::Shl { dst, by } => {
+                    // So does a left shift that cannot carry out: `v < n ⇒ v·2^by ≤ (n−1)·2^by`.
+                    let f = match fact(&state, dst) {
+                        Fact::Bounded(n) if n > 0 => (n - 1)
+                            .checked_mul(1 << by)
+                            .and_then(|m| m.checked_add(1))
+                            .map_or(Fact::Unknown, Fact::Bounded),
+                        _ => Fact::Unknown,
+                    };
+                    set(&mut state, dst, f);
+                }
+                Eff::Wr32 { dst } => set(&mut state, dst, Fact::Bounded(W32)),
                 Eff::Cmov { dst, cc, w } => {
                     let src = d.operands.rm_reg;
                     let f = cmov_fact(
@@ -2341,6 +2352,8 @@ pub(crate) mod x86 {
             | Eff::Lea { dst, .. }
             | Eff::Alu { dst, .. }
             | Eff::Shr { dst, .. }
+            | Eff::Shl { dst, .. }
+            | Eff::Wr32 { dst }
             | Eff::Cmov { dst, .. } => bit(dst),
             Eff::Push { .. } => bit(reg::RSP),
             Eff::Pop { dst } => bit(reg::RSP) | dst.map_or(0, bit),
@@ -2718,8 +2731,17 @@ pub(crate) mod x86 {
         Alu { dst: u8, alu: Alu, src: Opnd },
         /// A 64-bit `shr dst, by` (logical right shift by an immediate `by < 64`): a `Bounded` value
         /// stays bounded, `v < n ⇒ v >> by < ((n − 1) >> by) + 1`. The paged access check shifts a
-        /// window offset to a page index this way (#2164). Other shifts clobber `dst` (`WrRm`).
+        /// window offset to a page index this way (#2164).
         Shr { dst: u8, by: u8 },
+        /// A 64-bit `shl dst, by` (by a known count `by < 64`): a `Bounded` value stays bounded while
+        /// the shift cannot overflow, `v < n ⇒ v << by < ((n − 1) << by) + 1`. A scaled index is
+        /// formed this way (#2815). Other 64-bit shifts clobber `dst` (`WrRm`).
+        Shl { dst: u8, by: u8 },
+        /// A 32-bit ALU or shift write of the register `dst`, which zero-extends: `dst < 2^32`, even
+        /// when the op wraps, which is what lets a lowering elide D63 for an index computed in 32
+        /// bits (#2815). Only for forms that are never 8-bit: a byte or 16-bit write keeps the
+        /// register's upper bits, so it stays a clobber (`WrRm`/`WrReg`).
+        Wr32 { dst: u8 },
         /// A 32- or 64-bit `cmp lhs, rhs` (it computes `lhs − rhs`), or a `test r, r`, which sets the
         /// flags `cmp r, 0` does. Writes only the flags.
         Cmp { w: u8, lhs: Opnd, rhs: Opnd },
@@ -2987,10 +3009,11 @@ pub(crate) mod x86 {
         CmpRegRm,
         /// `cmp r/m, reg` (`39`).
         CmpRmReg,
-        /// `add`/`and`/`sub r/m, reg` (`01`/`21`/`29`).
-        AluRmReg(Alu),
-        /// `add`/`and`/`sub reg, r/m` (`03`/`23`/`2B`).
-        AluRegRm(Alu),
+        /// A non-byte ALU `op r/m, reg` (`01`/`09`/`11`/`19`/`21`/`29`/`31`), the op when the
+        /// transfer models it (add/and/sub).
+        AluRmReg(Option<Alu>),
+        /// A non-byte ALU `op reg, r/m` (`03`/`0B`/`13`/`1B`/`23`/`2B`/`33`), as [`Self::AluRmReg`].
+        AluRegRm(Option<Alu>),
         /// `test r/m, reg` (`85`).
         Test,
         /// `movsxd reg, r/m32` (`63`).
@@ -3002,9 +3025,12 @@ pub(crate) mod x86 {
         Setcc(bool),
         /// `0x81/0x83 /digit` — the ModRM.reg field (`digit`) picks add/or/.../cmp with `imm`.
         AluImmGroup(u8),
-        /// `0xC0/0xC1 /digit, imm8` — the shift group; `digit == 5` is `shr`, modeled on a 64-bit
-        /// register; every other digit or a narrower/memory operand clobbers the r/m (`WrRm`).
+        /// `0xC1 /digit, imm8` — the shift group by an immediate ([`shift_eff`]).
         ShiftImm(u8),
+        /// `0xD1 /digit` — the shift group by one ([`shift_eff`]).
+        ShiftOne(u8),
+        /// `0xD3 /digit` — the shift group by `cl`, an unknown count ([`shift_eff`]).
+        ShiftCl,
         /// `0x80/0x82 /digit` — the byte forms, 8-bit whatever the prefixes say (REX.W doesn't widen
         /// a byte operation), so never a tracked value.
         ByteAluImm,
@@ -3029,8 +3055,11 @@ pub(crate) mod x86 {
     /// (8/4/2 bytes), and the immediate are known. The guiding rule for soundness: a fact (`MemBase`,
     /// `Confined`, …) is a property of a full 64-bit register value, so only a **64-bit** operation
     /// may carry one; a narrower write truncates, zero-extends or merges, and therefore *clobbers* the
-    /// destination. Two exceptions, each exact: a 32-bit `mov r, imm` zero-extends to a known value,
-    /// and a 32-bit `cmp`/`cmov` pair confines what its zero-extending `cmov` selects (#2603).
+    /// destination. The exceptions, each exact, are 32-bit writes, which zero-extend: a `mov r, imm`
+    /// gives a known value, a reg-reg `mov` keeps a bounded source's bound (#2784), a `cmp`/`cmov`
+    /// pair confines what the `cmov` selects (#2603), and an ALU or shift write is below `2^32`
+    /// (#2815). `osz` is the prefixes' operand size, which a byte opcode ignores, so the last applies
+    /// only to intents that are never byte forms.
     fn resolve_eff(intent: EffIntent, ops: &Operands, osz: u8, immv: i64) -> Eff {
         use EffIntent as I;
         let (reg, rm, mem) = (ops.reg, ops.rm_reg, ops.mem.is_some());
@@ -3078,17 +3107,19 @@ pub(crate) mod x86 {
                 (Some(_), false) => Eff::WrRm,
                 _ => Eff::NoGp,
             },
-            I::AluRmReg(alu) => match (rm, reg, mem) {
-                (Some(dst), Some(src), false) if osz == 8 => Eff::Alu {
+            I::AluRmReg(alu) => match (rm, reg, mem, alu) {
+                (Some(dst), Some(src), false, Some(alu)) if osz == 8 => Eff::Alu {
                     dst,
                     alu,
                     src: Opnd::Reg(src),
                 },
-                (_, _, true) => Eff::NoGp, // RMW on memory (access checked); no GP write
-                _ => Eff::WrRm,            // narrower: truncates or zero-extends, so clobber
+                (_, _, true, _) => Eff::NoGp, // RMW on memory (access checked); no GP write
+                (Some(dst), _, false, _) if osz == 4 => Eff::Wr32 { dst },
+                _ => Eff::WrRm, // 64-bit or/adc/sbb/xor, or 16-bit (keeps the upper bits): clobber
             },
-            I::AluRegRm(alu) => match (reg, rm_opnd) {
-                (Some(dst), Some(src)) if osz == 8 => Eff::Alu { dst, alu, src },
+            I::AluRegRm(alu) => match (reg, rm_opnd, alu) {
+                (Some(dst), Some(src), Some(alu)) if osz == 8 => Eff::Alu { dst, alu, src },
+                (Some(dst), _, _) if osz == 4 => Eff::Wr32 { dst },
                 _ => Eff::WrReg,
             },
             // `test r, r` sets every flag a condition reads as `cmp r, 0` does: ZF and SF from `r`, CF
@@ -3154,19 +3185,13 @@ pub(crate) mod x86 {
                         alu,
                         src: Opnd::Imm(immv as u64),
                     },
-                    (false, ..) => Eff::WrRm, // narrower, or or/adc/sbb/xor: clobber r/m
+                    (false, 4, _, Some(dst)) => Eff::Wr32 { dst },
+                    (false, ..) => Eff::WrRm, // 64-bit or/adc/sbb/xor, or 16-bit: clobber r/m
                 }
             }
-            I::ShiftImm(digit) => match (digit, mem, osz, rm) {
-                // `shr` (/5) on a 64-bit register: a `Bounded` value stays bounded (#2164).
-                (5, false, 8, Some(dst)) => Eff::Shr {
-                    dst,
-                    by: (immv as u8) & 0x3f,
-                },
-                (_, true, ..) => Eff::NoGp, // RMW on memory (its access is checked); no GP write
-                (_, false, _, Some(_)) => Eff::WrRm, // other shift, or narrower: clobber the r/m
-                _ => Eff::NoGp,
-            },
+            I::ShiftImm(digit) => shift_eff(Some((digit, (immv as u8) & 0x3f)), ops, osz),
+            I::ShiftOne(digit) => shift_eff(Some((digit, 1)), ops, osz),
+            I::ShiftCl => shift_eff(None, ops, osz),
             I::ByteAluImm if mem => Eff::NoGp,
             I::ByteAluImm => Eff::WrRm,
             I::Group3(digit) => match digit {
@@ -3191,6 +3216,25 @@ pub(crate) mod x86 {
             I::PopRm => Eff::Pop {
                 dst: rm.filter(|_| !mem),
             },
+        }
+    }
+
+    /// `2^32`: every value a 32-bit write leaves in a register is below it.
+    const W32: u64 = 1 << 32;
+
+    /// The effect of a non-byte shift of the r/m (`C1`/`D1`/`D3`), with `known` its ModRM digit and
+    /// count when the count is not in `cl`. A 64-bit `shr` or `shl` of a register by a known count
+    /// keeps a bound (#2164, #2815), a 32-bit shift of a register zero-extends ([`Eff::Wr32`]), a
+    /// memory operand is a read-modify-write whose access is checked, and anything else clobbers the
+    /// register.
+    fn shift_eff(known: Option<(u8, u8)>, ops: &Operands, osz: u8) -> Eff {
+        match (known, ops.mem.is_some(), osz, ops.rm_reg) {
+            (_, true, ..) => Eff::NoGp,
+            (Some((5, by)), false, 8, Some(dst)) => Eff::Shr { dst, by },
+            (Some((4, by)), false, 8, Some(dst)) => Eff::Shl { dst, by },
+            (_, false, 4, Some(dst)) => Eff::Wr32 { dst },
+            (_, false, _, Some(_)) => Eff::WrRm,
+            _ => Eff::NoGp,
         }
     }
 
@@ -3389,9 +3433,10 @@ pub(crate) mod x86 {
                 (true, ..) if byte => E::NoGp, // an 8-bit compare: flags only, not modeled
                 (true, 0 | 1, _) => E::CmpRmReg,
                 (true, ..) => E::CmpRegRm,
-                (false, 1, Some(alu)) => E::AluRmReg(alu),
-                (false, 3, Some(alu)) => E::AluRegRm(alu),
-                (false, 0 | 1, _) => E::WrRm,
+                (false, 1, alu) => E::AluRmReg(alu),
+                (false, 3, alu) => E::AluRegRm(alu),
+                // The byte columns: an 8-bit write keeps the register's upper bits.
+                (false, 0, _) => E::WrRm,
                 (false, ..) => E::WrReg,
             };
             let w = if byte { 1 } else { p.osz() };
@@ -3425,7 +3470,13 @@ pub(crate) mod x86 {
             0x63 => keep(finish_modrm(c, start, p, 0, Normal, E::Movsxd)).map(|d| d.width(4)), // movsxd r64, rm32
             0x8D => keep(finish_modrm(c, start, p, 0, Normal, E::Lea)),
             0x8F => keep(finish_modrm(c, start, p, 0, Normal, E::PopRm)).map(|d| d.width(8)), // pop r/m
-            0xD0..=0xD3 => finish_modrm(c, start, p, 0, Normal, E::WrRm).map(|d| d.width(w)), // shift r/m, 1|cl
+            0xD0 | 0xD2 => finish_modrm(c, start, p, 0, Normal, E::WrRm).map(|d| d.width(1)), // shift r/m8, 1|cl
+            0xD1 => {
+                // shift r/m, 1
+                let digit = (c.peek()? >> 3) & 0x07;
+                finish_modrm(c, start, p, 0, Normal, E::ShiftOne(digit)).map(|d| d.width(w))
+            }
+            0xD3 => finish_modrm(c, start, p, 0, Normal, E::ShiftCl).map(|d| d.width(w)), // shift r/m, cl
             0xFE => finish_modrm(c, start, p, 0, Normal, E::WrRm).map(|d| d.width(1)), // inc/dec r/m8
             // ModRM + imm8.
             0x80 | 0x82 => {
@@ -3440,8 +3491,7 @@ pub(crate) mod x86 {
             0x6B => finish_modrm(c, start, p, 1, Normal, E::WrReg).map(|d| d.width(w)), // imul r, r/m, imm8
             0xC0 => finish_modrm(c, start, p, 1, Normal, E::WrRm).map(|d| d.width(w)), // shift r/m8, imm8
             0xC1 => {
-                // shift r/m, imm8 — the ModRM.reg field (`digit`) picks the shift; only `shr` (/5)
-                // on a 64-bit register is modeled (#2164), the rest clobber the r/m.
+                // shift r/m, imm8 — the ModRM.reg field (`digit`) picks the shift ([`shift_eff`]).
                 let digit = (c.peek()? >> 3) & 0x07;
                 finish_modrm(c, start, p, 1, Normal, E::ShiftImm(digit)).map(|d| d.width(w))
             }
@@ -3519,8 +3569,14 @@ pub(crate) mod x86 {
                     ..one(c, start, Normal, Eff::Alu { dst: 0, alu, src })
                 })
             }
+            // The 32-bit forms zero-extend, as every 32-bit ALU write does (#2815).
             0x05 | 0x0D | 0x15 | 0x1D | 0x25 | 0x2D | 0x35 => {
-                finish_imm(c, start, imm_z(p), Normal, Eff::Wr(bit(0)))
+                let eff = if p.osz() == 4 {
+                    Eff::Wr32 { dst: 0 }
+                } else {
+                    Eff::Wr(bit(0))
+                };
+                finish_imm(c, start, imm_z(p), Normal, eff)
             }
             // `cmp eax/rax, imm32`: the accumulator form of a compare the `cmov` rule reads.
             0x3D if !p.op66 => {
@@ -5000,6 +5056,125 @@ pub(crate) mod x86 {
             // guarantee — so a register written by one never reads back as an unbounded pointer.
             let s = run(&[0x44, 0x89, 0xc0, 0xc3]); // mov eax, r8d; ret  (r8 = Unknown at entry)
             assert_eq!(s.regs[0], Fact::Bounded(1 << 32));
+        }
+
+        /// #2815: a 32-bit ALU or shift write zero-extends, so it is below `2^32` even when it wraps.
+        /// tinfl's length lookup indexes two tables with `(sym & 0x1ff) − 0x101` computed in 32 bits,
+        /// and the lowering elides D63 because every such index stays inside the reservation. These
+        /// are its instructions, with `rdi` as the window base and `r8` for tinfl's callee-saved `r14`.
+        #[test]
+        fn transfer_a_32bit_alu_or_shift_write_is_below_2_32() {
+            const MASK: [u8; 7] = [0x41, 0x81, 0xe0, 0xff, 0x01, 0, 0]; // and r8d, 0x1ff
+            const SUB: [u8; 7] = [0x41, 0x81, 0xe8, 0x01, 0x01, 0, 0]; // sub r8d, 0x101
+
+            // movzx ecx, byte [rdi + r8 + 0x8120]
+            const LOAD: [u8; 9] = [0x4a, 0x0f, 0xb6, 0x8c, 0x07, 0x20, 0x81, 0, 0];
+            // movzx eax, word [rdi + r8*2 + 0x50a6]
+            const LOAD2: [u8; 9] = [0x4a, 0x0f, 0xb7, 0x84, 0x47, 0xa6, 0x50, 0, 0];
+            let code = [&MASK[..], &SUB, &LOAD, &LOAD2, &[0xc3]].concat();
+            assert!(
+                findings(&code).is_empty(),
+                "a wrapping 32-bit index was flagged: {:?}",
+                findings(&code)
+            );
+            // `sub eax, 0x10` then `lea rdx, [rax + 0x80d5]`: the 32-bit result plus a displacement.
+            let lea = [
+                0x83, 0xe8, 0x10, // sub eax, 0x10
+                0x48, 0x8d, 0x90, 0xd5, 0x80, 0, 0, // lea rdx, [rax + 0x80d5]
+                0x0f, 0xbe, 0x14, 0x17, // movsx edx, byte [rdi + rdx]
+                0xc3,
+            ];
+            assert!(findings(&lea).is_empty(), "{:?}", findings(&lea));
+            // Every 32-bit register form of the two groups, whatever its op, encoding or count.
+            let fact_after = |w: &[u8], r: usize| run(&[w, &[0xc3]].concat()).regs[r];
+            for w in [
+                &[0x41, 0x01, 0xc8][..],   // add r8d, ecx
+                &[0x44, 0x33, 0xc1],       // xor r8d, ecx
+                &[0x41, 0x83, 0xf0, 0x01], // xor r8d, 1
+                &[0x41, 0xc1, 0xe0, 0x03], // shl r8d, 3
+                &[0x41, 0xd1, 0xf8],       // sar r8d, 1
+                &[0x41, 0xd3, 0xc0],       // rol r8d, cl
+            ] {
+                assert_eq!(fact_after(w, 8), Fact::Bounded(1 << 32), "{w:02x?}");
+            }
+            let sub_eax = [0x2d, 1, 0, 0, 0]; // sub eax, 1 (the accumulator form)
+            assert_eq!(fact_after(&sub_eax, 0), Fact::Bounded(1 << 32));
+
+            // A 64-bit op the transfer doesn't model clobbers the bound.
+            let xor64 = [&MASK[..], &[0x49, 0x31, 0xc8]].concat(); // …; xor r8, rcx
+            assert_eq!(fact_after(&xor64, 8), Fact::Unknown);
+            // A 16-bit or an 8-bit write keeps the register's upper bits, so it bounds nothing, even
+            // though the prefixes' operand size of the byte form is 32 bits.
+            let narrow = |w: &[u8]| [w, &LOAD, &[0xc3]].concat();
+            let sub16 = [0x66, 0x41, 0x81, 0xe8, 0x01, 0x01]; // sub r8w, 0x101
+            assert!(has(&findings(&narrow(&sub16)), "unconfined index"));
+            let add8 = [0x41, 0x00, 0xc8]; // add r8b, cl
+            assert!(has(&findings(&narrow(&add8)), "unconfined index"));
+            assert_eq!(fact_after(&[0x66, 0x2d, 1, 0], 0), Fact::Unknown); // sub ax, 1
+        }
+
+        /// #2815: a 64-bit `shl` of a bounded value stays bounded while it cannot carry out. tinfl
+        /// scales a 32-bit index by two this way before adding a table's offset.
+        #[test]
+        fn transfer_shl_keeps_a_bound() {
+            const WIDEN: [u8; 3] = [0x44, 0x89, 0xf2]; // mov edx, r14d    → rdx < 2^32
+            const OFFSET: [u8; 7] = [0x48, 0x81, 0xc2, 0x60, 0x50, 0, 0]; // add rdx, 0x5060
+            const LOAD: [u8; 4] = [0x0f, 0xb7, 0x14, 0x17]; // movzx edx, word [rdi + rdx]
+            let access = |shift: &[u8]| [&WIDEN[..], shift, &OFFSET, &LOAD, &[0xc3]].concat();
+            let by_one = access(&[0x48, 0xd1, 0xe2]); // shl rdx, 1
+            assert!(findings(&by_one).is_empty(), "{:?}", findings(&by_one));
+            let by_three = [&WIDEN[..], &[0x48, 0xc1, 0xe2, 0x03, 0xc3]].concat(); // shl rdx, 3
+            assert_eq!(
+                run(&by_three).regs[reg::RDX as usize],
+                Fact::Bounded(((1u64 << 32) - 1) * 8 + 1)
+            );
+            // A shift that could carry out, or by `cl`, bounds nothing.
+            let by_forty = [0x48, 0xc1, 0xe2, 0x28]; // shl rdx, 40
+            let by_cl = [0x48, 0xd3, 0xe2]; // shl rdx, cl
+            for shift in [&by_forty[..], &by_cl] {
+                let state = run(&[&WIDEN[..], shift, &[0xc3]].concat());
+                assert_eq!(state.regs[reg::RDX as usize], Fact::Unknown, "{shift:02x?}");
+                assert!(has(&findings(&access(shift)), "unconfined index"));
+            }
+        }
+
+        /// #2814: a demand-paged page check scales its index by 8 with a 64-bit `shl`, then reads the
+        /// access table at `(index·8 + 0x4007) >> 12`, which the `shl`'s bound keeps below `0x44`.
+        /// These are `paging_bench`'s instructions, with `rsi`/`r8` for its callee-saved `rbx`/`r12`:
+        /// clean against a 256-page window's 0x101-byte table, flagged against a 64-page window's
+        /// 0x41 bytes.
+        #[test]
+        fn page_check_index_through_shl_stays_in_the_table() {
+            let mut bytes = vec![0x48, 0x8b, 0xb2]; // mov rsi, [rdx + PAGES]   (the access table)
+            bytes.extend_from_slice(&crate::vmctx::PAGES.to_le_bytes());
+            bytes.extend_from_slice(&[
+                0x49, 0x81, 0xe0, 0xff, 0x7f, 0, 0, // and r8, 0x7fff
+                0x4c, 0x89, 0xc0, // mov rax, r8
+                0x48, 0xc1, 0xe0, 0x03, // shl rax, 3
+                0x48, 0x81, 0xc0, 0x07, 0x40, 0, 0, // add rax, 0x4007
+                0x48, 0xc1, 0xe8, 0x0c, // shr rax, 12
+                0x48, 0x0f, 0xb6, 0x04, 0x06, // movzx rax, byte [rsi + rax]
+                0xc3,
+            ]);
+            let with_pages = |pages: u64| {
+                let window = Some(WindowLayout {
+                    mask: (1u64 << 37) - 1,
+                    guard_offset: 1u64 << 37,
+                    pages,
+                });
+                check(
+                    &bytes,
+                    &[],
+                    Entry::Guest(&Guest { window, ..G }),
+                    Frame::UNKNOWN,
+                )
+            };
+            assert!(with_pages(0x100).is_empty(), "{:?}", with_pages(0x100));
+            assert!(
+                has(&with_pages(0x40), "access-table read reaches +0x44"),
+                "{:?}",
+                with_pages(0x40)
+            );
         }
 
         /// #2784 (G3): a function that spills **more than 32** confined window indices to distinct
