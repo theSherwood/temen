@@ -2245,7 +2245,21 @@ fn remap_targets(t: &mut Terminator, map: &[u32]) {
     }
 }
 
-/// The passes a linker runs on a **whole program** before it ships it (temen-leng's link, #2147):
+/// How hard [`optimize_linked`] works on a program: `temen-link`'s `--opt:` (#2816).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LinkOpt {
+    /// What every program gets unless it asks for more, the self-hosted toolchain among them: callees
+    /// of at most [`LINKED_MAX_CALLEE`] instructions inlined, then each function canonicalized. More
+    /// costs a program like hexer compile time and size for almost nothing (#2147).
+    #[default]
+    Default,
+    /// `--opt:speed`, for a program whose hot loops call small procs (#2816): callees of up to
+    /// [`LINKED_SPEED_MAX_CALLEE`] instructions inlined, smallest first, then the same cleanup.
+    Speed,
+}
+
+/// The passes a linker runs on a **whole program** before it ships it (temen-leng's link, #2147), as
+/// hard as `opt` asks. [`LinkOpt::Default`]:
 /// 1. inline direct calls to callees of at most [`LINKED_MAX_CALLEE`] instructions
 ///    ([`interproc::inline_calls_with`]);
 /// 2. canonicalize every function ([`optimize_func_with`] with every optional pass off): fold
@@ -2253,6 +2267,14 @@ fn remap_targets(t: &mut Terminator, map: &[u32]) {
 ///    block parameters, propagate copies and drop dead values;
 /// 3. raise every function into dominance form ([`Module::raise`], #2454), which also numbers its
 ///    blocks in reverse postorder and drops the ones the entry cannot reach.
+///
+/// [`LinkOpt::Speed`] repeats step 1 with the limit doubled each time, up to
+/// [`LINKED_SPEED_MAX_CALLEE`]. Each round's budget is half the program it starts from, as step 1's
+/// is. The rounds put the smallest callees first: one round at the largest limit spends its budget on
+/// whatever big callees come first in the program, and on nisaba's regex kernel it then never reaches
+/// the hot loop's helpers, running 61% more instructions than the default link. Step 2 stays as it is:
+/// after the rounds, every optional pass saves 0.1% of the kernel's instructions and takes hexer's link
+/// from 18 s to 4–5 minutes.
 ///
 /// Reverse postorder matters to fuel: INVARIANTS #9 charges it per taken back edge, and every engine
 /// reads a back edge off the block indices, as a branch to an equal-or-earlier block. In reverse
@@ -2262,24 +2284,19 @@ fn remap_targets(t: &mut Terminator, map: &[u32]) {
 ///
 /// Step 2 folds no float or vector op ([`OptConfig::floats`]), so a host linker and an in-guest one
 /// (whose temen-opt is built without `libm-floats`) still produce the same module, which the
-/// self-hosted lane's fixed point requires. It runs none of the optional passes (SCCP, CSE, memory
-/// forwarding, jump threading): on nimony's `hexer` they take four times as long and save 0.1% more
-/// instructions. The budget, half the program, only bounds a pathological cycle; the size limit keeps
-/// real growth small.
-pub fn optimize_linked(m: &Module) -> Module {
+/// self-hosted lane's fixed point requires. By default it runs none of the optional passes (SCCP, CSE,
+/// memory forwarding, jump threading): on nimony's `hexer` they take four times as long and save 0.1%
+/// more instructions.
+pub fn optimize_linked(m: &Module, opt: LinkOpt) -> Module {
     let local = block_local(m);
-    let m: &Module = &local;
-    let size: usize = m
-        .funcs
-        .iter()
-        .flat_map(|f| &f.blocks)
-        .map(|b| b.insts.len())
-        .sum();
-    let limits = interproc::InlineLimits {
-        max_callee: LINKED_MAX_CALLEE,
-        budget: size / 2,
-    };
-    let mut out = interproc::inline_calls_with(m, limits);
+    let mut out = inline_round(&local, LINKED_MAX_CALLEE);
+    if opt == LinkOpt::Speed {
+        let mut max_callee = LINKED_MAX_CALLEE;
+        while max_callee < LINKED_SPEED_MAX_CALLEE {
+            max_callee = (2 * max_callee).min(LINKED_SPEED_MAX_CALLEE);
+            out = inline_round(&out, max_callee);
+        }
+    }
     let cfg = OptConfig {
         floats: false,
         ..OptConfig::none()
@@ -2300,10 +2317,33 @@ pub fn optimize_linked(m: &Module) -> Module {
     out
 }
 
-/// The largest callee [`optimize_linked`] inlines. On nimony's `hexer` (#2147), with the cleanup
-/// that follows, a limit of 12 runs 1.2% fewer instructions than 6 and 24 no fewer than 12, but at 12
-/// the program is 18% larger and Cranelift compiles it 19% slower.
+/// The largest callee a default link inlines ([`LinkOpt::Default`]). On nimony's `hexer` (#2147), with
+/// the cleanup that follows, a limit of 12 runs 1.2% fewer instructions than 6 and 24 no fewer than
+/// 12, but at 12 the program is 18% larger and Cranelift compiles it 19% slower.
 pub const LINKED_MAX_CALLEE: usize = 6;
+
+/// The largest callee a speed link inlines ([`LinkOpt::Speed`], #2816): four doublings of
+/// [`LINKED_MAX_CALLEE`]. On nisaba's regex kernel the default link runs 1,354 M instructions a
+/// search, the rounds to 48 run 1,045 M, and the rounds to 96 run 898 M. Rounds on to 200 or 400 save
+/// 0.2% more and make the program 1.8× or 3.4× as large.
+pub const LINKED_SPEED_MAX_CALLEE: usize = 96;
+
+/// One round of [`optimize_linked`]'s inlining: direct callees of at most `max_callee` instructions,
+/// until half the program's size has been spliced. At the default's limit the budget only bounds a
+/// pathological cycle; at a speed link's it also bounds how much the program grows.
+fn inline_round(m: &Module, max_callee: usize) -> Module {
+    let size: usize = m
+        .funcs
+        .iter()
+        .flat_map(|f| &f.blocks)
+        .map(|b| b.insts.len())
+        .sum();
+    let limits = interproc::InlineLimits {
+        max_callee,
+        budget: size / 2,
+    };
+    interproc::inline_calls_with(m, limits)
+}
 
 /// `d` without the positional entries of the functions marked in `stale`, whose code changed, so their
 /// `(block, inst)` locations and variable locations no longer point at what they described. What is

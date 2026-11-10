@@ -296,6 +296,17 @@ tracked enhancement, not a blocker.
     - **Why not more.** SCCP, CSE, memory forwarding and jump threading take four times as long
       and save 0.1% more instructions. With the cleanup, an inline limit of 12 saves 1.2% more
       instructions but makes `hexer` 18% larger and slower to compile, and 24 saves no more than 12.
+    - **A speed link** (`LinkOpt::Speed`, `temen-link --opt:speed`, #2816) is for a program whose
+      hot loops call small procs; the program asks for it. It repeats the inlining round with the limit
+      doubled each time, up to `LINKED_SPEED_MAX_CALLEE` (96), each round's budget half the program
+      it starts from, so the smallest callees go first. One round at 96 spends its budget on the big
+      callees early in the program, and on nisaba's regex kernel never reached the hot loop's helpers:
+      61% more instructions than the default link. The cleanup is the default's: after the rounds,
+      every optional pass saves 0.1% of the kernel's instructions, and takes `hexer`'s link from 18 s
+      to 4–5 minutes. On the kernel (a 1 MB search, `-d:danger`) it runs 34% fewer instructions and
+      36% less time on Cranelift, from a program 63% larger. On `hexer d` it runs 7% fewer
+      instructions, too few to show in 100 timed runs, from a program 2.8× as large that takes twice
+      as long to compile; the self-hosted toolchain keeps the default.
     Fuel is charged per taken back edge (INVARIANTS #9), which every engine reads off the block
     indices: a branch to an equal-or-earlier block. In reverse postorder that is exactly a loop's back
     edge, while leng's own order puts an `if`'s join before its arms; on `hexer` that was 63% of its
