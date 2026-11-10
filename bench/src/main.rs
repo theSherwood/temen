@@ -1074,11 +1074,11 @@ fn interp_call(m: &temen_ir::Module, entry: u32, lead: &[i64], n: i64) -> i64 {
 /// kernel passes in-window constants so `[ptr, ptr+len) ⊆ window`.
 unsafe extern "C" fn bench_thunk(
     vm: &temen_jit::VmCtx,
+    buf: *mut i64,
+    counts: u64,
     type_id: u32,
     op: u32,
     _handle: i32,
-    buf: *mut i64,
-    counts: u64,
 ) {
     let (a, results) = temen_jit::cap_slots(buf, counts);
     let n_args = a.len();

@@ -133,7 +133,7 @@ fn a_successful_call_leaves_the_domains_end() {
     let mut buf = [0i64; temen_jit::CAP_BUF_WORDS];
     // SAFETY: `vm`'s powerbox is a live `*mut Host`; no args, one result slot, no window.
     unsafe {
-        cap_thunk(&vm, cap_id::CLOCK, 0, clk, buf.as_mut_ptr(), 1 << 32);
+        cap_thunk(&vm, buf.as_mut_ptr(), 1 << 32, cap_id::CLOCK, 0, clk);
     }
     assert_eq!(vm.ended(), Some(end), "the generic thunk kept the end");
 

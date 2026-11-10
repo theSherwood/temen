@@ -32,11 +32,11 @@ block 0 (v0: i64) {
 /// A `call.cap` that answers 41.
 unsafe extern "C" fn forty_one(
     _vm: &temen_jit::VmCtx,
+    buf: *mut i64,
+    counts: u64,
     _type_id: u32,
     _op: u32,
     _handle: i32,
-    buf: *mut i64,
-    counts: u64,
 ) {
     unsafe {
         temen_jit::cap_slots(buf, counts).1[0] = 41;

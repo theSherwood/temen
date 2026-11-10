@@ -1466,11 +1466,11 @@ impl Nursery {
         let mut buf = [0i64; crate::CAP_BUF_WORDS];
         (self.cap_thunk)(
             vm,
+            buf.as_mut_ptr(),
+            0,
             temen_ir_iface_instantiator(),
             0,
             handle,
-            buf.as_mut_ptr(),
-            0,
         );
         vm.ended().is_none()
     }

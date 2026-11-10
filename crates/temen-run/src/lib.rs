@@ -190,11 +190,11 @@ impl Drop for WindowRegionPurge {
 /// during the call (#2499).
 pub unsafe extern "C" fn cap_thunk(
     vm: &temen_jit::VmCtx,
+    buf: *mut i64,
+    counts: u64,
     type_id: u32,
     op: u32,
     handle: i32,
-    buf: *mut i64,
-    counts: u64,
 ) {
     let (call_args, call_results) = temen_jit::cap_slots(buf, counts);
     let (args, n_args) = (call_args.as_ptr(), call_args.len() as u64);
@@ -715,11 +715,11 @@ fn import_dispatch(host: &Host, packed: u32) -> Option<(u32, u32, i32)> {
 /// take from any of the run's vCPU threads.
 pub unsafe extern "C" fn cap_thunk_locked(
     vm: &temen_jit::VmCtx,
+    buf: *mut i64,
+    counts: u64,
     type_id: u32,
     op: u32,
     handle: i32,
-    buf: *mut i64,
-    counts: u64,
 ) {
     let (call_args, call_results) = temen_jit::cap_slots(buf, counts);
     let (args, n_args) = (call_args.as_ptr(), call_args.len() as u64);

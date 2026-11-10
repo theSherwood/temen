@@ -45,11 +45,11 @@ struct TestCtx {
 /// `invoke_extra` it over the live window, marshalling the guest's call.cap args/results.
 unsafe extern "C" fn reentry_thunk(
     vm: &temen_jit::VmCtx,
+    buf: *mut i64,
+    counts: u64,
     _type_id: u32,
     _op: u32,
     _handle: i32,
-    buf: *mut i64,
-    counts: u64,
 ) {
     let (ctx, mem_base) = (vm.cap_ctx, vm.window().base);
     let tc = &*(ctx as *const TestCtx);

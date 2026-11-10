@@ -1241,11 +1241,12 @@ pub(crate) mod x86 {
         }
     }
 
-    /// Check a call's arguments against its callee's contract (#2534): a host function confines guest
-    /// pointers against the window values the code hands it, so a wrong register — a backend bug —
-    /// would move the window the host trusts. Positional over the integer argument registers (SysV
-    /// order); arguments past the sixth ride the stack and are a PR 3b follow-up. The window's mask
-    /// and reserved domain come from the module's geometry (`None`/0 for a memoryless module).
+    /// Check a call's arguments against its callee's contract (#2534): a host function takes from the
+    /// code only the context, the frame buffers and the pointers its contract tags, and derives the
+    /// rest from the context, so a wrong register — a backend bug — would hand it a forged context
+    /// or buffer. Positional over the integer argument registers, in SysV order whatever the callee's
+    /// convention (Win64 is #2820). No contract tags an argument past the fourth, so each tagged one
+    /// is a register on Win64 too.
     fn check_args(c: &Contract, state: &State, at: usize, findings: &mut Vec<Finding>) {
         for (i, &tag) in c.args.iter().enumerate() {
             let Some(&r) = reg::ARG_REGS.get(i) else {

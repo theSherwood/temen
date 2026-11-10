@@ -380,11 +380,11 @@ fn jit_locked_thunk_releases_lock_before_completion_wait() {
                     unsafe {
                         temen_run::cap_thunk_locked(
                             &vm,
-                            10, // cap_id::BLOCKING
-                            0,
-                            h,
                             buf.as_mut_ptr(),
                             1 | 1 << 32, // one argument, one result
+                            10,          // cap_id::BLOCKING
+                            0,
+                            h,
                         );
                     }
                     assert_eq!(vm.ended(), None, "worker {i}: clean dispatch");

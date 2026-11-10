@@ -339,7 +339,9 @@ found (#2603):
   (`Fact::JmpBuf`); the fuel refill's argument must be the fuel cell, and the trap capture's this
   frame's pointer. Every other argument is a guest value the host checks itself (a window offset it
   confines through `Window::span`, a handle it resolves). No host function tags an argument past the
-  sixth: the ABI passes those on the stack, where the validator checks nothing. A wrong register
+  fourth, so every tagged argument is a register on SysV and on Win64, which passes only four in
+  registers: a stack argument carries no fact to check. (The validator itself models only SysV's
+  registers so far, #2820.) A wrong register
   would otherwise move the window the host trusts or hand it a forged pointer. The caller's spill
   slots survive the call: a host callee writes the caller's stack only through a *write*-buffer
   pointer its contract names, so exactly that buffer's slots are dropped; a *read* buffer it only
@@ -355,9 +357,10 @@ found (#2603):
   unidentified call, and `rsp` fell to unknown — cascading a whole function to a false rejection.)
   Every host call that *does* write a caller-frame pointer must still tag it (the fiber and thread
   status words, the signal record, the `call.cap` buffer), or the validator would miss that write.
-  The `call.cap` buffer is one per function, `CAP_BUF_WORDS` (32) words of its frame: the call's
-  arguments in the first 16, its result slots in the next 16, which the code zeroes before the call,
-  so the two never overlap and the host reads the arguments in place. The verifier holds every
+  The `call.cap` buffer is one per function, `CAP_BUF_WORDS` (32) words of its frame, handed to the
+  thunk as its second argument: the call's arguments in the first 16 words, its result slots in the
+  next 16, which the code zeroes before the call, so the two never overlap and the host reads the
+  arguments in place. The verifier holds every
   host-dispatched call to `CAP_MAX_ARITY` (16) of each, on every tier. The buffer lives in the
   frame, not the context, because a fiber runs on its creator's context and may run on another vCPU
   at the same time as it.

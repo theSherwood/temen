@@ -872,11 +872,11 @@ impl TrapKind {
 /// for the call.
 pub type CapThunk = unsafe extern "C" fn(
     vm: &VmCtx,
+    buf: *mut i64,
+    counts: u64,
     type_id: u32,
     op: u32,
     handle: i32,
-    buf: *mut i64,
-    counts: u64,
 );
 
 /// #2534 — where a [`CapThunk`]'s `buf` holds the call's result slots: past room for every argument
@@ -1345,11 +1345,11 @@ pub type ChildManifestBinder = unsafe extern "C" fn(
 /// `call.cap` is inert — a `CapFault` — exactly like the interpreter's `run`.
 unsafe extern "C" fn empty_cap_thunk(
     vm: &VmCtx,
+    _buf: *mut i64,
+    _counts: u64,
     _type_id: u32,
     _op: u32,
     _handle: i32,
-    _buf: *mut i64,
-    _counts: u64,
 ) {
     vm.raise(TrapKind::CapFault as i64);
 }
@@ -2762,11 +2762,11 @@ mod domain_teardown_tests {
         /// exactly as temen-run's host thunk does for `Trap::Exit`.
         unsafe extern "C" fn exit_thunk(
             vm: &crate::VmCtx,
+            buf: *mut i64,
+            _counts: u64,
             _type_id: u32,
             _op: u32,
             _handle: i32,
-            buf: *mut i64,
-            _counts: u64,
         ) {
             let code = *buf as i32;
             vm.raise(EXIT_CODE as i64 | ((code as i64) << 32));
@@ -2874,11 +2874,11 @@ mod domain_teardown_tests {
     /// whatever outcome it then reports.
     unsafe extern "C" fn in_flight_thunk(
         vm: &crate::VmCtx,
+        buf: *mut i64,
+        _counts: u64,
         _type_id: u32,
         op: u32,
         _handle: i32,
-        buf: *mut i64,
-        _counts: u64,
     ) {
         if op == 0 {
             vm.raise(EXIT_CODE as i64 | ((*buf as i32 as i64) << 32));
@@ -6427,13 +6427,10 @@ impl HostFn {
             write: true,
         };
         match self {
-            // vmctx, type_id, op, handle, buf — the call's arguments in, its results out, the
-            // function's call buffer (`lower_cap_call`) — counts
+            // vmctx, buf — the function's call buffer (`lower_cap_call`): the call's arguments in,
+            // its results out — then counts, type_id, op, handle
             HostFn::CapThunk => &[
                 Vmctx,
-                Any,
-                Any,
-                Any,
                 StackSlot {
                     len: (CAP_BUF_WORDS * 8) as u32,
                     write: true,
@@ -6517,8 +6514,8 @@ impl HostFn {
     fn signature(self, cc: cranelift_codegen::isa::CallConv) -> Signature {
         use HostFn::*;
         let (params, returns): (&[Type], &[Type]) = match self {
-            // (vmctx, type_id, op, handle, buf, counts)
-            CapThunk => (&[I64, I32, I32, I32, I64, I64], &[]),
+            // (vmctx, buf, counts, type_id, op, handle)
+            CapThunk => (&[I64, I64, I64, I32, I32, I32], &[]),
             // (vmctx, out) -> 1 when a signal is deliverable, 0 when not
             SigTake => (&[I64, I64], &[I32]),
             // (vmctx)
@@ -7198,7 +7195,7 @@ mod cap_buffer_tests {
     use super::*;
 
     /// `call.cap 0 0` answers its two results; `call.cap 0 1` writes nothing.
-    unsafe extern "C" fn raw_thunk(_: &VmCtx, _: u32, op: u32, _: i32, buf: *mut i64, _: u64) {
+    unsafe extern "C" fn raw_thunk(_: &VmCtx, buf: *mut i64, _: u64, _: u32, op: u32, _: i32) {
         if op == 0 {
             *buf.add(CAP_RESULTS_AT) = 11;
             *buf.add(CAP_RESULTS_AT + 1) = 0xdead;
@@ -7275,6 +7272,17 @@ mod arg_contract_tests {
                 }
             ]
         );
+        // vmctx in rdi, the call's 256-byte argument and result buffer in rsi (idx 1).
+        assert_eq!(
+            HostFn::CapThunk.arg_contract(),
+            &[
+                Vmctx,
+                StackSlot {
+                    len: 256,
+                    write: true
+                }
+            ]
+        );
         // The validator reads the contract by reloc symbol, so the wiring must agree.
         assert_eq!(
             host_args("temen.thread_join"),
@@ -7291,8 +7299,9 @@ mod arg_contract_tests {
     /// #2534 — every host function that acts on the window or a runtime object takes the context
     /// first, tagged, and derives from it the window, the function table and every runtime object
     /// it acts on, so none takes one of those from the code: temen's own runtime functions, the bulk
-    /// helpers, and the embedder's `call.cap`, D45 fast-path, page-miss and signal thunks. No host function tags an argument past the sixth: the
-    /// ABI passes those on the stack, where the validator checks nothing.
+    /// helpers, and the embedder's `call.cap`, D45 fast-path, page-miss and signal thunks. No host
+    /// function tags an argument past the fourth, so every tagged argument is a register on SysV and
+    /// on Win64, which passes only four in registers: a stack argument carries no fact to check.
     #[test]
     fn runtime_host_calls_take_the_context_first() {
         use HostFn::*;
@@ -7324,7 +7333,10 @@ mod arg_contract_tests {
         }
         assert_eq!(host_args(&fast_cap_symbol([3, 8, 1, 1])), &[Vmctx]);
         for h in HostFn::ALL {
-            assert!(h.arg_contract().len() <= 6, "{h:?} tags a stack argument");
+            assert!(
+                h.arg_contract().len() <= 4,
+                "{h:?} tags a Win64 stack argument"
+            );
         }
     }
 }
@@ -7535,7 +7547,7 @@ block 2 (v7: i32) {
 }
 ";
 
-    unsafe extern "C" fn cap_thunk(_: &VmCtx, _: u32, _: u32, _: i32, _: *mut i64, _: u64) {}
+    unsafe extern "C" fn cap_thunk(_: &VmCtx, _: *mut i64, _: u64, _: u32, _: u32, _: i32) {}
 
     unsafe extern "C" fn fast_target(_: &VmCtx, _: i32, _: i64) -> i64 {
         0
@@ -12431,7 +12443,7 @@ fn lower_cap_call(
         lower.callees,
         b,
         HostFn::CapThunk,
-        &[vmctx, tid, opc, h, addr, counts],
+        &[vmctx, addr, counts, tid, opc, h],
     )?;
     // If the thunk set the trap cell, propagate (return early; the cell already holds the kind / exit
     // code).

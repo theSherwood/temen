@@ -23,11 +23,11 @@ use temen_text::parse_module;
 /// powerbox points at.
 unsafe extern "C" fn ctx_value_thunk(
     vm: &temen_jit::VmCtx,
+    buf: *mut i64,
+    counts: u64,
     _type_id: u32,
     _op: u32,
     _handle: i32,
-    buf: *mut i64,
-    counts: u64,
 ) {
     unsafe {
         let (_, results) = temen_jit::cap_slots(buf, counts);

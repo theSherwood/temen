@@ -1602,11 +1602,11 @@ mod cap {
     /// is a `*mut Host`, and `buf` its call buffer.
     unsafe extern "C" fn cap_thunk(
         vm: &temen_jit::VmCtx,
+        buf: *mut i64,
+        counts: u64,
         type_id: u32,
         op: u32,
         handle: i32,
-        buf: *mut i64,
-        counts: u64,
     ) {
         let host = &mut *(vm.cap_ctx as *mut Host);
         let (arg_slots, out) = temen_jit::cap_slots(buf, counts);
@@ -2094,11 +2094,11 @@ mod fast_cap {
     /// Generic thunk: op 1 doubles its arg, any other op increments — the fallback semantics.
     unsafe extern "C" fn generic_thunk(
         _vm: &temen_jit::VmCtx,
+        buf: *mut i64,
+        counts: u64,
         _type_id: u32,
         op: u32,
         _handle: i32,
-        buf: *mut i64,
-        counts: u64,
     ) {
         let (a, results) = temen_jit::cap_slots(buf, counts);
         let r = match op {
