@@ -33,7 +33,8 @@ path = "src/bin/bench.rs"
 # The Cranelift JIT is pulled in only for the differential tests (§18), so it stays
 # out of the umbrella crate's normal build and the auditable dependency-free core.
 [dev-dependencies]
-temen-jit.workspace = true
+# `validator-mutants`: the validator's mutation test over irgen modules (`validator_mutants.rs`, #2799).
+temen-jit = { workspace = true, features = ["validator-mutants"] }
 # The op × backend parity matrix — its `supports()` predicate is the single source of the Cranelift
 # supported-op set, which the generated differential corpus (`parity_corpus.rs`) is checked against.
 temen-parity.workspace = true

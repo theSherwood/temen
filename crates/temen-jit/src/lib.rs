@@ -1496,6 +1496,25 @@ pub fn jit_validate_disagreements() -> u64 {
     validate::disagreement_count()
 }
 
+/// #2799 — the machine-code validator's accept-direction mutation test: compile `m` with the
+/// validator's capture armed, rewrite each function it accepts where a rewrite must make it reject
+/// (`validate::x86::mutants`), and report what it made of each mutant. Test infrastructure, behind
+/// the `validator-mutants` feature, which the `temen` tests and the `validator_mutants` fuzz target
+/// turn on.
+#[cfg(all(feature = "validator-mutants", target_arch = "x86_64"))]
+#[doc(hidden)]
+pub fn validator_mutants(m: &IrModule) -> Result<ValidatorMutants, JitError> {
+    validate::arm_capture();
+    let compiled = compile(m, 0);
+    let caps = validate::take_capture();
+    compiled?;
+    Ok(validate::x86::mutants::run(&caps))
+}
+
+#[cfg(all(feature = "validator-mutants", target_arch = "x86_64"))]
+#[doc(hidden)]
+pub use validate::x86::mutants::Report as ValidatorMutants;
+
 /// Compile `func` of `m` to a reusable [`CompiledModule`] with the default no-host policy (an empty
 /// powerbox — any `call.cap` is an inert CapFault, exactly like [`compile_and_run`]), so the caller can
 /// **compile once and [`CompiledModule::run`] many times** (DESIGN.md §22's long-lived split). The
@@ -7315,8 +7334,8 @@ fn define_funcs(
                     .map_err(|e| JitError::Backend(e.to_string()))?;
                 #[cfg(test)]
                 record_emitted(module, code.code_buffer(), &relocs);
-                #[cfg(all(test, target_arch = "x86_64"))]
-                validate::capture_code(validate::CapturedFn {
+                #[cfg(all(any(test, feature = "validator-mutants"), target_arch = "x86_64"))]
+                validate::capture_code(|| validate::CapturedFn {
                     code: code.code_buffer().to_vec(),
                     relocs: validate::relocs(&relocs, callee, isa.default_call_conv()),
                     window: guest.window,
@@ -7409,7 +7428,7 @@ fn compile_verified(
 /// #2603 — the contract of a function of each type id in `distinct` (its [`sig_from`]), which the
 /// machine-code validator gives a `call.dyn` whose type check matched. Empty when it doesn't run.
 fn type_contracts(distinct: &[FuncType]) -> Vec<Option<validate::Contract>> {
-    if !(validate::enabled() || cfg!(test)) {
+    if !validate::gathers_facts() {
         return Vec::new();
     }
     distinct
@@ -7422,7 +7441,7 @@ fn type_contracts(distinct: &[FuncType]) -> Vec<Option<validate::Contract>> {
 /// validator checks the calls that name it against. Empty when the validator doesn't run.
 fn callee_contracts(module: &JITModule) -> Vec<Option<validate::Contract>> {
     let mut out = Vec::new();
-    if validate::enabled() || cfg!(test) {
+    if validate::gathers_facts() {
         for (id, decl) in module.declarations().get_functions() {
             let i = id.as_u32() as usize;
             if out.len() <= i {

@@ -309,6 +309,19 @@ its target's state, and that every instruction obeys the policy under the state 
 inductive proposal over-approximates every execution, so a policy that holds under it holds for every
 run. A wrong or unconverged proposal fails the check and rejects; it never admits code.
 
+**What tests the claim.** Two directions. *Completeness* (accepts correct code) is the real-program
+shadow corpus and the interp↔JIT differential over irgen modules, clean on ~10K functions — and once
+the validator fails closed (#2536) a false rejection becomes a compile error irgen's own harness
+panics on. *Soundness* (accepted ⟹ cannot escape) is the accept-direction **mutation fuzzer** (#2799):
+over real Cranelift output, captured per function, it rewrites each accepted function's machine code
+exactly where the acceptance rested on a rule — a guest register in an addressing mode, a shift
+folded into the SIB scale, a narrowed or sign-extending spill reload (CVE-2021-32629/-26489), a
+deleted or inverted D63 `cmov`, a widened displacement, a dropped stack check, a forged host-call
+argument, a jump into the middle of an instruction or a jump-table entry, a skipped callee-saved
+restore — and the validator must reject every mutant. A survivor is a soundness hole. Beneath it, a
+table of **pins**: fixed byte sequences, one per published escape and per review-found hole (#2603),
+each rejected for its named reason, so a refactor cannot quietly reopen one.
+
 Across functions the argument is the same induction, over the steps of an execution. Each function is
 checked assuming its callees keep their contracts: the clobber set, callee-saved restoration and
 stack effect. An accepted function keeps its own contract, so the assumption holds of every guest
@@ -408,8 +421,11 @@ found (#2603):
   not model fails that test, not a user's compile.
 - A form whose address isn't `[base + index·scale + disp]` (fs/gs, `0x67`, `xlat`, `bt* [mem], reg`)
   is rejected, not modeled; so is an EVEX compressed-`disp8` operand, whose scale is a per-form
-  property the bytes don't carry (Cranelift's pool/stack operands use `disp0`/`disp32`), and a 16-bit
-  push or pop, which moves rsp by 2 where the transfer models 8.
+  property the bytes don't carry (Cranelift's pool/stack operands use `disp0`/`disp32`), a 16-bit
+  push or pop and `pushf`/`popf`, which move rsp where the transfer models no change, and the
+  `fxsave`/`xsave` family (`0F AE` memory forms), which access a span the decoder does not size
+  (Cranelift emits only the register-form fences there). Each is a form Cranelift's lowering never
+  emits, so rejecting it costs real code nothing.
 - The native frame is confined by the overflow check (I5), not the window mask. The check is
   recognized by the facts it compares — a stack pointer `RED_ZONE` below the current `rsp` against
   `stack_limit` — so both the `mov r,rsp; add r,-RED_ZONE` and `lea r,[rsp−RED_ZONE]` forms qualify;

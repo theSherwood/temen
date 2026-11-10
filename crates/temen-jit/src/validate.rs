@@ -30,6 +30,12 @@ pub(crate) fn enabled() -> bool {
     })
 }
 
+/// Whether a compile gathers what the validator checks code against, each callee's contract: when
+/// the validator runs, and when a test or the mutation test (#2799) captures the code to check it.
+pub(crate) fn gathers_facts() -> bool {
+    enabled() || cfg!(any(test, feature = "validator-mutants"))
+}
+
 /// How many shadow-mode disagreements have been seen this process (so a fuzz run can assert the
 /// count stayed at the baseline the corpus is known clean against, and a human sees a total).
 static DISAGREEMENTS: AtomicU64 = AtomicU64::new(0);
@@ -317,15 +323,16 @@ pub(crate) fn shadow_check(bytes: &[u8], relocs: &[Reloc], entry: Entry, frame: 
     let _ = (bytes, relocs, entry, frame);
 }
 
-// --- test-only capture of real compiled code, cross-checked against iced-x86 ---
+// --- test-only capture of real compiled code ---
 //
-// The whole subsystem exists only for the x86-64 decoder cross-check (`x86::tests`), and its one
-// caller in `lib.rs` is gated to match, so it is `all(test, target_arch = "x86_64")` — on another
-// target (the aarch64 clippy lane) it would be dead code under `-D warnings`.
+// The subsystem exists for the x86-64 decoder cross-check (`x86::tests`) and the mutation test
+// (`x86::mutants`, #2799), and its one caller in `lib.rs` is gated to match, so it is
+// `all(any(test, feature = "validator-mutants"), target_arch = "x86_64")` — on another target (the
+// aarch64 clippy lane) it would be dead code under `-D warnings`.
 
 /// One captured function: its machine code, relocations, its module's [`Guest`] facts (the type
 /// contracts owned), and its own contract (what a caller expects its `ret` to pop).
-#[cfg(all(test, target_arch = "x86_64"))]
+#[cfg(all(any(test, feature = "validator-mutants"), target_arch = "x86_64"))]
 pub(crate) struct CapturedFn {
     pub code: Vec<u8>,
     pub relocs: Vec<Reloc>,
@@ -337,7 +344,7 @@ pub(crate) struct CapturedFn {
     pub contract: Option<Contract>,
 }
 
-#[cfg(all(test, target_arch = "x86_64"))]
+#[cfg(all(any(test, feature = "validator-mutants"), target_arch = "x86_64"))]
 impl CapturedFn {
     /// The module facts it was compiled against.
     pub fn guest(&self) -> Guest<'_> {
@@ -350,7 +357,7 @@ impl CapturedFn {
     }
 }
 
-#[cfg(all(test, target_arch = "x86_64"))]
+#[cfg(all(any(test, feature = "validator-mutants"), target_arch = "x86_64"))]
 thread_local! {
     /// When armed, each function the compile defines appends its capture here, so a test can decode
     /// real Cranelift output and compare our decoder to iced-x86 / run the policy.
@@ -358,24 +365,25 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
-/// Record one defined function, if a test armed the capture.
-#[cfg(all(test, target_arch = "x86_64"))]
-pub(crate) fn capture_code(f: CapturedFn) {
+/// Record one defined function, if a test armed the capture. `f` builds the record only then, so
+/// a compile nothing captures copies nothing.
+#[cfg(all(any(test, feature = "validator-mutants"), target_arch = "x86_64"))]
+pub(crate) fn capture_code(f: impl FnOnce() -> CapturedFn) {
     CAPTURE.with(|c| {
         if let Some(v) = c.borrow_mut().as_mut() {
-            v.push(f);
+            v.push(f());
         }
     });
 }
 
 /// Arm capture, clearing anything held.
-#[cfg(all(test, target_arch = "x86_64"))]
+#[cfg(all(any(test, feature = "validator-mutants"), target_arch = "x86_64"))]
 pub(crate) fn arm_capture() {
     CAPTURE.with(|c| *c.borrow_mut() = Some(Vec::new()));
 }
 
 /// Take the captured functions.
-#[cfg(all(test, target_arch = "x86_64"))]
+#[cfg(all(any(test, feature = "validator-mutants"), target_arch = "x86_64"))]
 pub(crate) fn take_capture() -> Vec<CapturedFn> {
     CAPTURE.with(|c| c.borrow_mut().take().unwrap_or_default())
 }
@@ -478,6 +486,11 @@ pub(crate) mod x86 {
         /// register must hold this again, so the caller's value is preserved (claim item 4). It flows
         /// through a spill slot: the prologue saves it, the epilogue reloads it.
         Saved(u8),
+        /// A register whose low byte is below `.0` (2 to 255), its other bits unknown: what a `setcc`
+        /// leaves in a register not known to be below 256. A `movzx` of the byte is then bounded,
+        /// which Cranelift relies on when it drops the fn-table mask of a boolean index, in whatever
+        /// block reads the byte.
+        LowByte(u16),
         /// The caller's result-area pointer (`sret`, in r8 at entry) of a function that returns more
         /// than `MAX_REG_RESULTS` results: the function writes its `.0` eight-byte result slots
         /// through it, so `[0, .0·8)` is writable host memory the caller granted.
@@ -514,6 +527,12 @@ pub(crate) mod x86 {
                     guard: g,
                 },
                 (Fact::Stack(_), Fact::Stack(_)) => Fact::Stack(None),
+                // A low-byte bound joins whatever bounds the other side's low byte: a `setcc` on one
+                // path and a constant on another still leave a byte below the larger bound.
+                (Fact::LowByte(a), b) | (b, Fact::LowByte(a)) => match a.max(low_byte(b)) {
+                    256 => Fact::Unknown,
+                    k => Fact::LowByte(k),
+                },
                 (Fact::Record(_), Fact::Record(_)) => Fact::Record(None),
                 (Fact::WinPtr(a), Fact::WinPtr(b)) => Fact::WinPtr(a.max(b)),
                 // `Saved` and `ReturnArea` carry a register number / a result count, both
@@ -1118,6 +1137,15 @@ pub(crate) mod x86 {
         Ok(Some(
             start.saturating_add(added).saturating_add(m.disp as u64),
         ))
+    }
+
+    /// The bound below which the low byte of a register holding `f` lies: the byte is at most the
+    /// whole value, and below 256. `256` when nothing bounds it.
+    fn low_byte(f: Fact) -> u16 {
+        match f {
+            Fact::LowByte(k) => k,
+            _ => max_value(f).map_or(256, |m| m.saturating_add(1).min(256) as u16),
+        }
     }
 
     /// The largest value a register holding `f` can have, when `f` bounds it.
@@ -1747,9 +1775,6 @@ pub(crate) mod x86 {
         // The last record type id the block loaded: the loaded value, and the record it reads (the
         // value of the register that holds the record's address).
         let mut type_id: Option<(Sym, Sym)> = None;
-        // A bound on each register's low byte, where a `setcc` wrote it (`256`: none known), so a
-        // `movzx` of it is bounded (Cranelift drops the fn-table mask of a boolean index).
-        let mut low_byte = [256u16; 16];
         // The symbolic value each 8-byte frame slot holds, by entry-relative offset, while nothing
         // writes it: two reloads of one spill are one value to the `cmov` rule.
         let mut slot_vals: Vec<(i64, Sym)> = Vec::new();
@@ -1831,9 +1856,35 @@ pub(crate) mod x86 {
                         .and_then(|t| ctx.constant(t, usize::from(w))),
                 }
             };
-            // An ALU op's source, as a constant, read before the op writes its destination.
-            let alu_k = match d.eff {
-                Eff::Alu { src, .. } => konst(&state, src, 8).map(|k| k as i64),
+            // An ALU op's source and destination, as constants, read before the op writes it.
+            let (alu_k, dst_k) = match d.eff {
+                Eff::Alu { dst, src, .. } => (
+                    konst(&state, src, 8).map(|k| k as i64),
+                    konst(&state, Opnd::Reg(dst), 8).map(|k| k as i64),
+                ),
+                _ => (None, None),
+            };
+            // What a full `lea` computes as one register plus a constant, when its other operand is
+            // a constant (`lea r, [b + k]`, `lea r, [b + i]` with `i` holding one): the symbolic
+            // value it keeps.
+            let lea_tie = match (d.eff, d.operands.mem) {
+                (Eff::Lea { full: true, .. }, Some(m)) if !m.rip => {
+                    let k = |r: u8| konst(&state, Opnd::Reg(r), 8).map(|v| v as i64);
+                    match (m.base, m.index) {
+                        (Some(b), None) => Some((b, m.disp)),
+                        (Some(b), Some(i)) => {
+                            match k(i).and_then(|x| x.checked_mul(i64::from(m.scale))) {
+                                Some(x) => x.checked_add(m.disp).map(|o| (b, o)),
+                                None if m.scale == 1 => {
+                                    k(b).and_then(|x| x.checked_add(m.disp)).map(|o| (i, o))
+                                }
+                                None => None,
+                            }
+                        }
+                        (None, Some(i)) if m.scale == 1 => Some((i, m.disp)),
+                        _ => None,
+                    }
+                }
                 _ => None,
             };
             let mut set = |state: &mut State, r: u8, f: Fact| {
@@ -1904,9 +1955,21 @@ pub(crate) mod x86 {
                         addr_fact(&m, &state, ctx)
                     };
                     let f = match (alu, alu_k, src) {
-                        // `r & m` ≤ `m` for a non-negative mask.
-                        (Alu::And, Some(m), _) if (0..i64::MAX).contains(&m) => {
-                            Fact::Bounded(m as u64 + 1)
+                        // `r & s` is at most `r` and at most `s`, as unsigned values: a mask bounds
+                        // the result, and so does a bound on `r` whatever the mask (an alignment
+                        // `and r, -8` keeps it).
+                        (Alu::And, ..) => {
+                            let s = match (alu_k, src) {
+                                (Some(k), _) => Some(k as u64),
+                                (None, Opnd::Reg(r)) => max_value(fact(&state, r)),
+                                _ => None,
+                            };
+                            [max_value(fact(&state, dst)), s]
+                                .into_iter()
+                                .flatten()
+                                .min()
+                                .and_then(|m| m.checked_add(1))
+                                .map_or(Fact::Unknown, Fact::Bounded)
                         }
                         (Alu::Add, Some(k), _) => sum(None, k),
                         (Alu::Sub, Some(k), _) => {
@@ -1917,14 +1980,18 @@ pub(crate) mod x86 {
                     };
                     set(&mut state, dst, f);
                 }
-                Eff::Shr { dst, by } => {
-                    // A logical right shift keeps a value bounded: `v < n ⇒ v >> by < ((n−1)>>by)+1`.
-                    let f = match fact(&state, dst) {
-                        Fact::Bounded(n) if n > 0 => {
-                            Fact::Bounded(((n - 1) >> by).saturating_add(1))
-                        }
-                        _ => Fact::Unknown,
+                Eff::Shr { dst, by, w } => {
+                    // A logical right shift of `v ≤ m` leaves at most `m >> by`. A 32-bit one shifts
+                    // the low half, which is below `2^32` whatever `v` is, by the count's low five
+                    // bits, and zero-extends.
+                    let m = max_value(fact(&state, dst)).unwrap_or(u64::MAX);
+                    let (m, by) = match w {
+                        4 => (m.min(W32 - 1), by & 31),
+                        _ => (m, by),
                     };
+                    let f = (m >> by)
+                        .checked_add(1)
+                        .map_or(Fact::Unknown, Fact::Bounded);
                     set(&mut state, dst, f);
                 }
                 Eff::Shl { dst, by } => {
@@ -1981,10 +2048,19 @@ pub(crate) mod x86 {
                     set(&mut state, dst, Fact::Unknown);
                 }
                 Eff::Zext { dst, bound, low } => {
-                    let byte = low
+                    let ub = low
                         .filter(|_| d.operands.mem.is_none())
-                        .map_or(bound, |r| u32::from(low_byte[r as usize & 15]).min(bound));
-                    set(&mut state, dst, Fact::Bounded(u64::from(byte)));
+                        .map_or(bound, |r| u32::from(low_byte(fact(&state, r))).min(bound));
+                    set(&mut state, dst, Fact::Bounded(u64::from(ub)));
+                }
+                Eff::SetByte { dst } => {
+                    // `setcc` writes 0 or 1 to the low byte and keeps the rest: a register below 256
+                    // is then below 2, and any other has a low byte below 2.
+                    let f = match max_value(fact(&state, dst)) {
+                        Some(m) if m < 256 => Fact::Bounded(2),
+                        _ => Fact::LowByte(2),
+                    };
+                    set(&mut state, dst, f);
                 }
                 Eff::LoadSx32 { dst } => {
                     let f = d
@@ -2040,12 +2116,7 @@ pub(crate) mod x86 {
                         }
                     }
                 }
-                Eff::StoreReg { .. }
-                | Eff::SetByte { .. }
-                | Eff::WrReg
-                | Eff::WrRm
-                | Eff::Wr(_)
-                | Eff::NoGp => {}
+                Eff::StoreReg { .. } | Eff::WrReg | Eff::WrRm | Eff::Wr(_) | Eff::NoGp => {}
             }
             if matches!(d.kind, Kind::DirectCall | Kind::IndirectCall) {
                 // A call runs its callee's contract: the registers it clobbers become unknown (below),
@@ -2201,19 +2272,13 @@ pub(crate) mod x86 {
                     Some((dst, Some(s)))
                 }),
                 Eff::MovReg { dst, src } => Some((dst, Some(sym_of(src)))),
-                Eff::Lea { dst, full: true } => match d.operands.mem {
-                    Some(Mem {
-                        base: Some(b),
-                        index: None,
-                        disp,
-                        rip: false,
-                        ..
-                    }) => Some((dst, offset(b, Some(disp)))),
-                    _ => None,
-                },
-                Eff::Alu { dst, alu, .. } => match (alu, alu_k) {
-                    (Alu::Add, Some(k)) => Some((dst, offset(dst, Some(k)))),
-                    (Alu::Sub, Some(k)) => Some((dst, offset(dst, k.checked_neg()))),
+                Eff::Lea { dst, full: true } => lea_tie.map(|(r, o)| (dst, offset(r, Some(o)))),
+                Eff::Alu { dst, alu, src } => match (alu, alu_k, src, dst_k) {
+                    (Alu::Add, Some(k), ..) => Some((dst, offset(dst, Some(k)))),
+                    (Alu::Sub, Some(k), ..) => Some((dst, offset(dst, k.checked_neg()))),
+                    // A destination holding a constant `c`: `dst + s` is `s + c`. D63 compares
+                    // `v = x − k` and selects `x + c'`, computed as `mov r, c'; add r, x` (#2799).
+                    (Alu::Add, None, Opnd::Reg(s), Some(c)) => Some((dst, offset(s, Some(c)))),
                     _ => None,
                 },
                 _ => None,
@@ -2234,14 +2299,6 @@ pub(crate) mod x86 {
             }
             if let Some((dst, entry)) = loaded_type_id {
                 type_id = Some((sym[dst as usize & 15], entry));
-            }
-            for (r, b) in low_byte.iter_mut().enumerate() {
-                if written & bit(r as u8) != 0 {
-                    *b = 256;
-                }
-            }
-            if let Eff::SetByte { dst } = d.eff {
-                low_byte[dst as usize & 15] = 2;
             }
             if !matches!(d.eff, Eff::Cmp { .. }) && !d.keeps_flags {
                 flags = None;
@@ -2642,6 +2699,20 @@ pub(crate) mod x86 {
             Some(Fact::Const(c)) => Some(c),
             _ => None,
         };
+        // Bounded operands and a non-negative displacement sum to a bounded value: `b ≤ x` and `i ≤
+        // y` ⇒ `b + i·s + disp ≤ x + y·s + disp`. The paged access check forms its last-page index
+        // this way (`lea r, [off + (len − 1)]` before `off >> page_shift`, #2164), and a lowering
+        // adds two bounded indices so (`add rax, rax`). An absent operand adds 0.
+        let max = |f: Option<Fact>| f.map_or(Some(0), max_value);
+        let sum = (m.disp >= 0)
+            .then(|| {
+                let scaled = max(index)?.checked_mul(u64::from(m.scale))?;
+                max(base)?
+                    .checked_add(scaled)?
+                    .checked_add(m.disp as u64)?
+                    .checked_add(1)
+            })
+            .flatten();
         match (base, index, konst(base), konst(index)) {
             (.., Some(b), Some(i)) => Fact::Const(
                 b.wrapping_add(i.wrapping_mul(i64::from(m.scale)))
@@ -2653,19 +2724,15 @@ pub(crate) mod x86 {
             {
                 Fact::TableTarget { at, n }
             }
-            // A `Bounded` base plus a non-negative displacement (no index) stays bounded: `v < n`
-            // ⇒ `v + disp < n + disp`. The paged access check forms its last-page index this way
-            // (`lea r, [off + (len − 1)]` before `off >> page_shift`, #2164).
-            (Some(Fact::Bounded(n)), None, None, _) if m.disp >= 0 => {
-                Fact::Bounded(n.saturating_add(m.disp as u64))
-            }
             _ => match (
+                sum,
                 window_offset(m, state, ctx.guest.window),
                 frame_addr(state, m),
             ) {
-                (Ok(Some(off)), _) => Fact::WinPtr(off),
-                (_, Some(Some(off))) => Fact::Stack(Some(off)),
-                (_, Some(None)) if m.index.is_none() => Fact::Stack(None),
+                (Some(n), ..) => Fact::Bounded(n),
+                (_, Ok(Some(off)), _) => Fact::WinPtr(off),
+                (.., Some(Some(off))) => Fact::Stack(Some(off)),
+                (.., Some(None)) if m.index.is_none() => Fact::Stack(None),
                 _ => Fact::Unknown,
             },
         }
@@ -2992,10 +3059,11 @@ pub(crate) mod x86 {
         /// A 64-bit `add`/`sub`/`and dst, src`, `src` an immediate, a register, or a memory operand
         /// (the function's constant pool holds a mask too wide for an `imm32`).
         Alu { dst: u8, alu: Alu, src: Opnd },
-        /// A 64-bit `shr dst, by` (logical right shift by an immediate `by < 64`): a `Bounded` value
-        /// stays bounded, `v < n ⇒ v >> by < ((n − 1) >> by) + 1`. The paged access check shifts a
-        /// window offset to a page index this way (#2164).
-        Shr { dst: u8, by: u8 },
+        /// A `w`-byte (4 or 8) `shr dst, by` (logical right shift by an immediate `by < 64`): the
+        /// result is at most `v >> by`, and below `2^(8w − by)`. The paged access check shifts a
+        /// window offset to a page index this way (#2164), and a lowering takes a sign bit as a
+        /// fn-table index with a 32-bit one.
+        Shr { dst: u8, by: u8, w: u8 },
         /// A 64-bit `shl dst, by` (by a known count `by < 64`): a `Bounded` value stays bounded while
         /// the shift cannot overflow, `v < n ⇒ v << by < ((n − 1) << by) + 1`. A scaled index is
         /// formed this way (#2815). Other 64-bit shifts clobber `dst` (`WrRm`).
@@ -3505,14 +3573,14 @@ pub(crate) mod x86 {
     const W32: u64 = 1 << 32;
 
     /// The effect of a non-byte shift of the r/m (`C1`/`D1`/`D3`), with `known` its ModRM digit and
-    /// count when the count is not in `cl`. A 64-bit `shr` or `shl` of a register by a known count
-    /// keeps a bound (#2164, #2815), a 32-bit shift of a register zero-extends ([`Eff::Wr32`]), a
-    /// memory operand is a read-modify-write whose access is checked, and anything else clobbers the
-    /// register.
+    /// count when the count is not in `cl`. A `shr` of a register by a known count keeps a bound
+    /// (#2164), as does a 64-bit `shl` (#2815), another 32-bit shift of a register zero-extends
+    /// ([`Eff::Wr32`]), a memory operand is a read-modify-write whose access is checked, and anything
+    /// else clobbers the register.
     fn shift_eff(known: Option<(u8, u8)>, ops: &Operands, osz: u8) -> Eff {
         match (known, ops.mem.is_some(), osz, ops.rm_reg) {
             (_, true, ..) => Eff::NoGp,
-            (Some((5, by)), false, 8, Some(dst)) => Eff::Shr { dst, by },
+            (Some((5, by)), false, 4 | 8, Some(dst)) => Eff::Shr { dst, by, w: osz },
             (Some((4, by)), false, 8, Some(dst)) => Eff::Shl { dst, by },
             (_, false, 4, Some(dst)) => Eff::Wr32 { dst },
             (_, false, _, Some(_)) => Eff::WrRm,
@@ -3826,24 +3894,16 @@ pub(crate) mod x86 {
             0x98 => Some(one(c, start, Normal, Eff::Wr(bit(0)))), // cwde/cdqe → rax
             0x99 => Some(one(c, start, Normal, Eff::Wr(bit(2)))), // cwd/cdq/cqo → rdx
             // nops, flag ops, invalid-in-64 legacy: no tracked GP write.
-            0x06
-            | 0x07
-            | 0x0E
-            | 0x16
-            | 0x17
-            | 0x1E
-            | 0x1F
-            | 0x27
-            | 0x2F
-            | 0x37
-            | 0x3F
-            | 0x90
-            | 0x9B..=0x9F
-            | 0xF5
-            | 0xF8
-            | 0xF9
-            | 0xFC
-            | 0xFD => Some(one(c, start, Normal, Eff::NoGp)),
+            0x06 | 0x07 | 0x0E | 0x16 | 0x17 | 0x1E | 0x1F | 0x27 | 0x2F | 0x37 | 0x3F | 0x90
+            | 0x9B | 0x9E | 0x9F | 0xF5 | 0xF8 | 0xF9 | 0xFC | 0xFD => {
+                Some(one(c, start, Normal, Eff::NoGp))
+            }
+            // `pushf`/`popf` move rsp by 8, but this decoder would track no change — the same rsp
+            // desync the 16-bit push/pop forms carry (#2813), where a later frame store the validator
+            // places inside the frame could land on the return address. Cranelift never emits them,
+            // so reject rather than model (#2799).
+            0x9C => Some(one(c, start, Forbidden("pushf"), Eff::NoGp)),
+            0x9D => Some(one(c, start, Forbidden("popf"), Eff::NoGp)),
             // Accumulator ALU + immediate (writes rax); cmp/test/push imm write no GP register.
             0x04 | 0x0C | 0x14 | 0x1C | 0x24 | 0x2C | 0x34 => {
                 finish_imm(c, start, 1, Normal, Eff::Wr(bit(0)))
@@ -4066,6 +4126,18 @@ pub(crate) mod x86 {
             } // cpuid
             0x31 => return Some(one(c, start, Normal, Eff::Wr(bit(0) | bit(2)))), // rdtsc → rax, rdx
             0x77 => return Some(one(c, start, Normal, Eff::NoGp)),                // emms
+            // `0F AE`: Cranelift emits only the register-form fences (`lfence`/`mfence`/`sfence`,
+            // ModRM `E8`/`F0`/`F8`), which touch no GP register or memory. The memory forms
+            // (`fxsave`/`fxrstor` 512 bytes, `xsave`, `ldmxcsr`/`stmxcsr`) access a span this decoder
+            // does not size, so a default-deny rejects them rather than model a wrong width (#2799).
+            0xAE => {
+                let kind = if c.peek()? >> 6 == 3 {
+                    Normal // a register-form fence
+                } else {
+                    Forbidden("fxsave/xsave family (unmodeled width)")
+                };
+                return finish_modrm(c, start, p, 0, kind, E::NoGp);
+            }
             // bswap r32/r64 (`0F C8+r`): byte-reverses a GP register in place (no memory, no flags).
             0xC8..=0xCF => {
                 let r = (op2 & 0x07) | (u8::from(p.rex_b) << 3);
@@ -4284,8 +4356,21 @@ pub(crate) mod x86 {
         Decoded {
             width,
             reads_only: reads,
-            eff: if gp != 0 { Eff::Wr(gp) } else { d.eff },
+            eff: vec_gp_eff(gp, p, d.eff),
             ..d
+        }
+    }
+
+    /// The effect of a VEX/EVEX form that writes the GP registers `gp` (`eff` when it writes none):
+    /// one written without `W` is a 32-bit write, which zero-extends ([`Eff::Wr32`]) — a BMI shift
+    /// or `andn` of an index, a lane extract (#2799). Any other GP write clobbers.
+    fn vec_gp_eff(gp: u16, p: &Pfx, eff: Eff) -> Eff {
+        match gp {
+            0 => eff,
+            _ if !p.rex_w && gp.count_ones() == 1 => Eff::Wr32 {
+                dst: gp.trailing_zeros() as u8,
+            },
+            _ => Eff::Wr(gp),
         }
     }
 
@@ -4425,13 +4510,9 @@ pub(crate) mod x86 {
             Map::Of => {
                 let d = d.vector(op, p);
                 let gp = vec_gp_writes(Map::Of, op, p, &d.operands);
-                if gp != 0 {
-                    Decoded {
-                        eff: Eff::Wr(gp),
-                        ..d
-                    }
-                } else {
-                    d
+                Decoded {
+                    eff: vec_gp_eff(gp, p, d.eff),
+                    ..d
                 }
             }
             Map::Of38 | Map::Of3a => apply_vec_class(d, map, op, p),
@@ -4528,9 +4609,13 @@ pub(crate) mod x86 {
             .collect()
     }
 
+    #[cfg(feature = "validator-mutants")]
+    pub(crate) mod mutants;
+
     #[cfg(test)]
     mod tests {
         mod oracle;
+        mod pins;
 
         use super::*;
         use crate::{compile, validate};
