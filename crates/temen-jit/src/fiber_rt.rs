@@ -1097,6 +1097,37 @@ pub(crate) unsafe fn make_task_fiber(
     })
 }
 
+/// #2742 — the `suspend` value a serve handler's fiber yields once its dispatch is done: it waits
+/// there, reusable, for its next ([`make_handler_fiber`]).
+pub(crate) const JOB_DONE: u64 = u64::MAX - 7;
+
+/// #2742 — the fiber serve handlers run on, one dispatch after another (`child_exec::Shell`): each
+/// resume runs `run(job, stack_low)`, the job its resumer left at `job`, then yields [`JOB_DONE`]
+/// and waits for the next. The yielder is pushed on the resuming thread's runtime for each job, as
+/// [`make_task_fiber`] does, so an event park inside the handler finds it. Nothing the body owns
+/// lives across its `suspend`, so dropping the waiting fiber leaks nothing.
+///
+/// # Safety
+/// As [`make_task_fiber`]; `job` stays valid for every resume.
+pub(crate) unsafe fn make_handler_fiber(
+    stack: usize,
+    job: *const (),
+    run: unsafe fn(*const (), u64),
+) -> Option<Fiber> {
+    let job = job as usize;
+    Fiber::new(stack, move |y: &Yielder, _arg: u64| -> u64 {
+        loop {
+            // SAFETY: as `make_task_fiber`'s body; the resumer left a job at `job`.
+            unsafe {
+                (*current()).yielders.push(y as *const Yielder);
+                run(job as *const (), y.stack_low());
+                (*current()).yielders.pop();
+            }
+            let _ = y.suspend(JOB_DONE);
+        }
+    })
+}
+
 /// `cont.new` thunk: allocate a suspended fiber that, on first resume, calls guest `funcref(arg0, arg)`.
 /// Returns the fiber handle (the domain-shared table's slot index — the same numbering as the interp
 /// registry), or traps (`-1`) on a fiber-bomb (the **per-domain** bound, or its `Budget.mem`).
@@ -1594,6 +1625,13 @@ pub(crate) fn in_task() -> bool {
     !rt.is_null() && unsafe { (*rt).runs_task() }
 }
 
+/// #2742 — the fiber table of the computation running on this thread, if it has a fiber runtime.
+pub(crate) fn current_table() -> Option<Arc<SharedFiberTable>> {
+    let rt = current();
+    // SAFETY: `current()` is this thread's live runtime; the borrow is momentary.
+    (!rt.is_null()).then(|| unsafe { (*rt).table() })
+}
+
 /// #2793 — the low bound of the fiber stack `sp` is on, when that is the innermost running fiber's
 /// (a pool task's, or a guest fiber's): the limit its own entry passes its prologue checks. `None`
 /// off every running fiber, as on an OS thread's own stack.
@@ -1608,6 +1646,27 @@ pub(crate) fn running_stack_low(sp: u64) -> Option<u64> {
     // The running fiber's stack holds `sp` when `sp` is above its low bound and within one stack of
     // it: no fiber stack is larger than `temen_fiber`'s slot.
     (sp > low && sp - low <= temen_ir::FIBER_STACK).then_some(low)
+}
+
+thread_local! {
+    /// #2742 — this OS thread as a gate's holder ([`context_id`]), by the address of this byte.
+    static THREAD_CONTEXT: u8 = const { 0 };
+}
+
+/// #2742 — the thread of control running here, as a serve window's gate records its holder: the
+/// platform slot of the task or handler fiber this code runs in, else this OS thread. A guest fiber
+/// runs as its vCPU, so it is its vCPU's. Stable while that thread of control lives, across a
+/// task's migration between workers.
+#[inline(never)] // re-reads the thread pointer after a switch, as `current` does (#1466)
+pub(crate) fn context_id() -> u64 {
+    let rt = current();
+    if !rt.is_null() {
+        // SAFETY: `current()` is this thread's live runtime; the borrow is momentary.
+        if let Some(slot) = unsafe { (*rt).active_slots.first() }.filter(|s| s.is_platform()) {
+            return Arc::as_ptr(slot) as u64;
+        }
+    }
+    THREAD_CONTEXT.with(|t| t as *const u8 as u64)
 }
 
 pub(crate) fn current_fiber_slot() -> Option<Arc<FiberSlot>> {

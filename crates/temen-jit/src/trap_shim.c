@@ -143,6 +143,9 @@ void temen_install_trap_handler(void) {
      * itself fault (#1487), and that nested fault must reach the handler, which aborts the walk
      * (`temen_walk_abort`): a blocked synchronous signal would kill the process instead. Nothing else
      * in the handler faults (it touches only thread-locals), so re-entry is not a recursion hazard.
+     * #2805 — and load-bearing for the guarded entry, which saves no signal mask: the jump out of the
+     * handler leaves the mask as the handler ran with, so the handler must not block the signal it
+     * takes (`tests/fault_mask.rs`).
      * (No demand fault is handled here: the Cranelift JIT pages a child by a software check before
      * the access, never by a fault, #2164.) */
     sa.sa_flags = SA_SIGINFO | SA_ONSTACK | SA_NODEFER;
@@ -172,7 +175,14 @@ int temen_run_guarded(void (*fn)(const long *, long *, unsigned char *, const vo
 
     g_lo = lo;
     g_hi = hi;
-    if (sigsetjmp(g_buf, 1)) {
+    /* #2805 — armed without saving the signal mask: saving it is an `rt_sigprocmask` syscall on
+     * every guarded entry (about 120 ns, and a point where a woken peer takes a contended core),
+     * and the jump never needs it restored. The handler runs with the mask the fault found
+     * (`SA_NODEFER`, an empty `sa_mask`), and it jumps only out of a fault in the armed window range
+     * or out of an emitted trap: guest code, which cannot change the mask, or a host thunk touching
+     * guest memory, and no host code here changes the thread's mask (a guest's `sigprocmask` is
+     * emulated state). So the mask at the jump is the mask at this entry. */
+    if (sigsetjmp(g_buf, 0)) {
         /* A guarded fault unwound back here — restore the parent's recovery state and report it. */
         memcpy(&g_buf, &saved_buf, sizeof g_buf);
         g_armed = saved_armed;

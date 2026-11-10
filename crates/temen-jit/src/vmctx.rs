@@ -99,6 +99,23 @@ pub struct VmCtx {
     /// The domain's end word, owned by its root context ([`Self::new`]); `None` for a vCPU's
     /// context ([`Self::vcpu`]), which points at its root's. Never read by compiled code.
     owned_end: Option<Box<AtomicI64>>,
+    /// #2742 — the vCPU's serve site, made at its first serve op ([`crate::ServeSite::of`]), so it
+    /// goes with the vCPU. Never read by compiled code.
+    #[cfg(fiber_rt)]
+    pub(crate) serve_site: std::sync::OnceLock<std::sync::Arc<crate::child_exec::ServeSite>>,
+    /// #2742 — the window this is the handler context of ([`crate::child_exec::Window::vm`]), null
+    /// for every other context: what a park or a live call of code running as a handler finds its
+    /// window's gate by. Never read by compiled code.
+    #[cfg(fiber_rt)]
+    pub(crate) handler_window: std::sync::atomic::AtomicPtr<crate::child_exec::Window>,
+    /// #2742 — the domain's serve handlers not yet ended that its end must wait for: those the pool
+    /// holds, and those running on a caller's stack. Shared by every context of the domain, as its
+    /// end word is; owned by its root context ([`Self::owned_handlers`]). Never read by compiled
+    /// code.
+    #[cfg(fiber_rt)]
+    handlers: *const std::sync::atomic::AtomicUsize,
+    #[cfg(fiber_rt)]
+    owned_handlers: Option<Box<std::sync::atomic::AtomicUsize>>,
     /// #2534 — the window and function table this run's code runs over, for the host functions,
     /// which read them here rather than take them from the code. Never read by compiled code, so
     /// it sits past every field the code loads, which keep their short offsets.
@@ -197,6 +214,8 @@ impl VmCtx {
     pub fn new(a: InstanceAddrs, w: Window) -> VmCtx {
         // Boxed, so the word stays put when the context moves.
         let owned_end = Box::new(AtomicI64::new(0));
+        #[cfg(fiber_rt)]
+        let owned_handlers = Box::new(std::sync::atomic::AtomicUsize::new(0));
         VmCtx {
             trap: AtomicI64::new(0),
             end: &*owned_end,
@@ -212,6 +231,14 @@ impl VmCtx {
             pages: a.pages,
             window: w,
             owned_end: Some(owned_end),
+            #[cfg(fiber_rt)]
+            serve_site: std::sync::OnceLock::new(),
+            #[cfg(fiber_rt)]
+            handler_window: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
+            #[cfg(fiber_rt)]
+            handlers: &*owned_handlers,
+            #[cfg(fiber_rt)]
+            owned_handlers: Some(owned_handlers),
             thunk_state: std::sync::OnceLock::new(),
         }
     }
@@ -235,8 +262,25 @@ impl VmCtx {
             pages: self.pages,
             window: self.window,
             owned_end: None,
+            #[cfg(fiber_rt)]
+            serve_site: std::sync::OnceLock::new(),
+            #[cfg(fiber_rt)]
+            handler_window: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
+            #[cfg(fiber_rt)]
+            handlers: self.handlers,
+            #[cfg(fiber_rt)]
+            owned_handlers: None,
             thunk_state: std::sync::OnceLock::new(),
         }
+    }
+
+    /// #2742 — the domain's count of serve handlers its end waits for
+    /// ([`crate::child_exec::HANDLERS_ENDING`]).
+    #[cfg(fiber_rt)]
+    pub(crate) fn handlers(&self) -> &std::sync::atomic::AtomicUsize {
+        // SAFETY: as the end word's: the root context's boxed count, which outlives every context of
+        // its domain.
+        unsafe { &*self.handlers }
     }
 
     /// #2534 — the window and function table this context's code runs over.
@@ -266,6 +310,12 @@ impl VmCtx {
         let _ = self
             .trap
             .compare_exchange(0, end, Ordering::Relaxed, Ordering::Relaxed);
+    }
+
+    /// #2742 — the domain this context is of, as a key: the address of its end word, which every
+    /// context of the domain shares.
+    pub(crate) fn domain_key(&self) -> usize {
+        self.end as usize
     }
 
     /// #2319 — the `call.cap` thunk's state on this context, made by `init` on the first call that

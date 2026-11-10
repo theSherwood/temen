@@ -2521,8 +2521,8 @@ call, replacing "sync vs async" entirely:
 1. **Quiesce bit closed** → contended path: enqueue + park (bounded; `-EAGAIN` at the rim).
 2. **`threaded` provider** → mint a concurrent handler fiber, animate inline.
 3. **`single` library provider, try-enter won** → inline animation on the caller's thread.
-4. **`single` process provider parked at `svc.wait`** → **direct handoff**: the caller claims
-   the serve activation and animates the handler on its own thread (the Doors / L4
+4. **`single` process provider parked at `svc.wait`** → **direct handoff**: the caller takes
+   the serve op's gate and starts the handler on its own thread (the Doors / L4
    direct-process-switch shape). Handoff-served dispatches count in the callee's serve
    accounting; handoff-on ≡ handoff-off on observable results (differentially pinned).
 5. **Otherwise** (mid-handler, between serve points) → enqueue + park.
@@ -2539,10 +2539,29 @@ re-issues on thaw (O10 at-least-once).
 
 Interp: inline animation (the caller's thread switches worlds and runs the handler fiber — the
 §14 coroutine-drive shape); promotion is free by construction since interp fibers are reified
-data. JIT: direct call through a thunk at native speed; a parked handler thread-blocks the OS
-thread (JIT vCPUs are real threads), under a **per-thread crossing-depth bound** — at the bound
-the call declines to the parked transport (slower-but-correct, never a wrong answer). Bytecode:
-declines to the tree-walker. Observable results and provider state are identical across
+data. JIT (#2742): a serve op's handlers run against the serving vCPU's **window**, one at a
+time under its gate, and only while the serve op is inside a serve op. The gate records its
+holder: the serve op whenever it is not parked, or the thread of control running a handler. A
+handler gives the gate back around each live call it makes and each event park (a futex wait, a
+host-call park, an outside wait) and takes it back after, as on the oracle, where a handler's park
+frees its serving vCPU; a whole-vCPU park and a quantum's end keep it. A handler the serve op
+starts runs on a fiber of its own; one that parks joins the run's pool, which resumes it when its
+wait ends, on a worker, or on the serve op's thread when the serve op finds it woken. Under the
+direct handoff (arm 4) the caller's call takes no ticket, and its handler runs on the caller's own
+stack when it can never park (`temen_ir::seams::handler_never_parks`: nothing its call closure
+reaches can park) and the stack has room for it: it runs to completion or traps, and never gives
+its gate back. Every other handoff runs its handler on a fiber of its own, so a chain of crossings
+needs no depth bound. A domain retires until its handlers have ended, wherever they run.
+**A serving vCPU's end revokes the handlers it parked** (owner, 2026-11-09), however it ended: a
+return, a trap or a kill. Nothing can resume them, so each one's call answers `CAP_REVOKED` then
+(D37), on every engine, while the rest of the domain, threads that outlive the root included,
+runs on. The tree-walker and the bytecode engine answer from the vCPU's own end. The JIT answers
+from the vCPU's window (`ServeSite::revoke`, at a §14 root's end and as a thread's context goes
+back to the pool), and unwinds the handlers' fibers once the domain has no vCPU left, on its end
+or, for a domain whose root returned, `DOMAIN_DONE`. A run with
+no pool (no §14 child, so no live offer reaches it), and a domain a freeze can land in (a handler
+fiber cannot ride the snapshot yet, #2804), keep each handler on the serve op's own stack. Bytecode: declines
+to the tree-walker. Observable results and provider state are identical across
 backends (§18 oracle); scheduling interleavings are quarantined in the deterministic explorer.
 The two transports — animated (library) and serve-loop (process/live callee) — are **kept on
 purpose** (`OFFER_TRANSPORT.md`): collapsing library instances onto the serve loop would
@@ -2552,9 +2571,16 @@ pessimize the common synchronous cross-domain call against the §1a yardstick.
 engine: a handler that parks parks alone, and the loop goes on serving, so a call that needs the
 handler's own domain to serve something meanwhile completes. The bytecode engine pays about
 140 ns a dispatch for it over the nested call it replaced (`serving_bench`'s serial live-call
-round trip, +15%). Weighed and set aside (#2771): run a handler inline and promote it to a fiber
+round trip, +15%). On the JIT a handler that ends without parking, the common call, runs on a
+fiber its window keeps for the next dispatch and never meets the pool; one that parks is
+promoted into the pool then. Weighed and set aside (#2771): run a handler inline and promote it to a fiber
 only when it parks. That wins most of the cost back, but it is a second way to run a handler, and
-the JIT cannot do the same, since its frames cannot leave the stack they run on. The lock-held
+the JIT cannot do the same, since its frames cannot leave the stack they run on. The JIT's one
+inline case is a direct handoff of a handler that can never park (owner, 2026-11-10): it needs no
+promotion, its caller waits on it anyway, and a fiber per handoff cost 45–95% of the round trip.
+A handler that can park and runs on the caller's stack (weighed and set aside the same day) would
+park as its caller, where its wake reaches no serve loop: the oracle resumes a woken handler
+before its serve loop's `svc.wait` returns, and that order would be lost. The lock-held
 nested sub-interpreter, its acyclicity/deadlock argument, and provider-pays fuel all left the
 TCB; the caller's powerbox lock is held only at the two `cap`-slot translation edges.
 
