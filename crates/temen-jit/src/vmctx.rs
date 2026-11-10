@@ -15,14 +15,22 @@
 //! emitted at all (a compile armed with no kill-path, fuel budget or signal source emits no check,
 //! so its code is byte-identical to before). The host functions the code calls (its thunks) it
 //! names by symbol, which its link binds to their addresses in the process (`HostFn`, temen#2452).
-//! The §12 thread `Domain` lives here too: the `thread.*`, futex and blocking-resume sites load it,
-//! and so does the §14 `Nursery` the `Instantiator` sites spawn through (temen#2168), so every
-//! spawn of a child runs one compile of its code, and so does the `setjmp` table (temen#2389). The
-//! fiber runtime is found through a thread-local each entry sets. So the code names no per-instance
-//! object, and each instance stands up runtimes of its own (`CompiledModule::instance`): the code
-//! is **instance-independent** — the property a fork twin sharing its parent's code, and a compile
-//! cache, rely on (#1825). Only a §22 unit's program, defined into a module after its compile, is
-//! more than the compile; such a module is never shared.
+//! The §12 thread `Domain` lives here too, which the `thread.*`, futex and blocking-resume thunks
+//! act in, and so does the §14 `Nursery` the `Instantiator` thunks spawn through (temen#2168), so
+//! every spawn of a child runs one compile of its code, and so does the `setjmp` table (temen#2389).
+//! The fiber runtime is found through a thread-local each entry sets. So the code names no
+//! per-instance object, and each instance stands up runtimes of its own (`CompiledModule::instance`):
+//! the code is **instance-independent** — the property a fork twin sharing its parent's code, and a
+//! compile cache, rely on (#1825). Only a §22 unit's program, defined into a module after its
+//! compile, is more than the compile; such a module is never shared.
+//!
+//! **A host function takes from the code only what the code alone can supply (#2534).** It is
+//! handed the context, which the machine-code validator checks is this one, and reads here every
+//! runtime object it acts on and the run's [`Window`] (the window base and reservation it confines
+//! guest offsets to, and the function table), which the runtime records when it makes the context.
+//! A backend bug that passed the wrong register could otherwise move the window a host function
+//! trusts. Compiled code never reads the runtime objects itself, and the validator rejects a load
+//! of one.
 //!
 //! **The trust argument is the entry.** Code that runs with the wrong vmctx dispatches its `call.cap`s
 //! into the wrong powerbox — authority confusion, not a crash. So every entry into compiled code takes
@@ -96,6 +104,10 @@ pub struct VmCtx {
     /// The domain's end word, owned by its root context ([`Self::new`]); `None` for a vCPU's
     /// context ([`Self::vcpu`]), which points at its root's. Never read by compiled code.
     owned_end: Option<Box<AtomicI64>>,
+    /// #2534 — the window and function table this run's code runs over, for the host functions,
+    /// which read them here rather than take them from the code. Never read by compiled code, so
+    /// it sits past every field the code loads, which keep their short offsets.
+    window: Window,
     /// #2319 — the `call.cap` thunk's own state on this context, opaque to the JIT
     /// ([`Self::thunk_state`]): made by the thunk's first call, dropped with the context. Never read
     /// by compiled code.
@@ -140,9 +152,58 @@ impl InstanceAddrs {
     };
 }
 
+/// #2534 — the window and function table a run's code runs over, recorded in its [`VmCtx`] so that
+/// a host function derives them from the context compiled code hands it (which the validator
+/// checks) instead of taking them as arguments the code computes. The base and the table are the
+/// run's, the ones its entry is handed; the sizes are the geometry its compile baked in.
+#[derive(Clone, Copy, Debug)]
+pub struct Window {
+    /// The window's base: what the entry is handed as `mem_base`. Null when there is no window.
+    pub base: *mut u8,
+    /// The declared window's bytes, `mapped`: what a `call.cap` is handed as its size.
+    pub mapped: u64,
+    /// The reservation, `mask + 1`, which bounds every confined offset. `0` when there is no window.
+    pub reserved: u64,
+    /// #2164 — how many pages a demand-paged child's access table covers; `0` when unpaged.
+    pub pages: u64,
+    /// #2164 — a demand-paged child's page-miss thunk, which asks its pager for a page its access
+    /// table refuses; `None` when unpaged.
+    pub page_miss: Option<crate::PageMissThunk>,
+    /// The function table the entry is handed as `fn_table_base`.
+    pub fn_table: *const u8,
+}
+
+impl Window {
+    /// No window and no function table.
+    pub const NONE: Window = Window {
+        base: core::ptr::null_mut(),
+        mapped: 0,
+        reserved: 0,
+        pages: 0,
+        page_miss: None,
+        fn_table: core::ptr::null(),
+    };
+
+    /// The host address of the `len ≥ 1` bytes at window offset `off`, if they lie in the
+    /// reservation: what a host function reads or writes in place of a guest access. `None` for an
+    /// empty span or window, or a span past the reservation, which the caller faults as a guest
+    /// access there would. The bound is temen-mask's `span_checked`, the one definition of the
+    /// span-OOB arithmetic the interpreters confine their bulk ops with.
+    pub fn span(&self, off: u64, len: u64) -> Option<*mut u8> {
+        if len == 0 || self.reserved == 0 {
+            return None;
+        }
+        // `reserved` is `mask + 1`, a power of two.
+        temen_mask::Window::new(self.reserved.trailing_zeros() as u8)
+            .span_checked(off, len)
+            .map(|off| self.base.wrapping_add(off as usize))
+    }
+}
+
 impl VmCtx {
-    /// A fresh root context for the instance at `a`: a domain of its own, not yet ended.
-    pub fn new(a: InstanceAddrs) -> VmCtx {
+    /// A fresh root context for the instance at `a`, running over window `w`: a domain of its own,
+    /// not yet ended.
+    pub fn new(a: InstanceAddrs, w: Window) -> VmCtx {
         // Boxed, so the word stays put when the context moves.
         let owned_end = Box::new(AtomicI64::new(0));
         VmCtx {
@@ -159,6 +220,7 @@ impl VmCtx {
             setjmp: a.setjmp,
             pages: a.pages,
             lazy: a.lazy,
+            window: w,
             owned_end: Some(owned_end),
             thunk_state: std::sync::OnceLock::new(),
         }
@@ -182,9 +244,15 @@ impl VmCtx {
             setjmp: self.setjmp,
             pages: self.pages,
             lazy: self.lazy,
+            window: self.window,
             owned_end: None,
             thunk_state: std::sync::OnceLock::new(),
         }
+    }
+
+    /// #2534 — the window and function table this context's code runs over.
+    pub fn window(&self) -> &Window {
+        &self.window
     }
 
     /// The domain's end word.
@@ -253,14 +321,9 @@ unsafe impl Sync for VmCtx {}
 /// Field offsets compiled code loads at (`#[repr(C)]` makes them fixed; `offset_of!` keeps them in
 /// step with the struct).
 pub(crate) const END: i32 = core::mem::offset_of!(VmCtx, end) as i32;
-pub(crate) const CAP_CTX: i32 = core::mem::offset_of!(VmCtx, cap_ctx) as i32;
 pub(crate) const EPOCH: i32 = core::mem::offset_of!(VmCtx, epoch) as i32;
 pub(crate) const FUEL: i32 = core::mem::offset_of!(VmCtx, fuel) as i32;
 pub(crate) const SIG_ARMED: i32 = core::mem::offset_of!(VmCtx, sig_armed) as i32;
-pub(crate) const SIG_CTX: i32 = core::mem::offset_of!(VmCtx, sig_ctx) as i32;
-pub(crate) const SCHED: i32 = core::mem::offset_of!(VmCtx, sched) as i32;
-pub(crate) const NURSERY: i32 = core::mem::offset_of!(VmCtx, nursery) as i32;
-pub(crate) const SETJMP: i32 = core::mem::offset_of!(VmCtx, setjmp) as i32;
 pub(crate) const PAGES: i32 = core::mem::offset_of!(VmCtx, pages) as i32;
 
 // The stop word must be the first field: the check after each call dereferences the vmctx pointer
@@ -269,12 +332,12 @@ const _: () = assert!(core::mem::offset_of!(VmCtx, trap) == 0);
 
 #[cfg(test)]
 mod tests {
-    use super::{InstanceAddrs, VmCtx};
+    use super::{InstanceAddrs, VmCtx, Window};
 
     /// #2499 — a domain ends once: the first end raised stands, and a later one changes nothing.
     #[test]
     fn the_first_end_wins() {
-        let vm = VmCtx::new(InstanceAddrs::NONE);
+        let vm = VmCtx::new(InstanceAddrs::NONE, Window::NONE);
         assert_eq!(vm.ended(), None);
         vm.raise(7);
         vm.raise(9);
@@ -286,7 +349,7 @@ mod tests {
     #[test]
     fn a_vcpu_context_shares_the_end_and_stops_on_its_copy() {
         let stop = |vm: &VmCtx| vm.trap.load(core::sync::atomic::Ordering::Relaxed);
-        let root = VmCtx::new(InstanceAddrs::NONE);
+        let root = VmCtx::new(InstanceAddrs::NONE, Window::NONE);
         let a = root.vcpu(core::ptr::null_mut());
         let b = root.vcpu(core::ptr::null_mut());
         a.raise(7);
@@ -327,6 +390,43 @@ mod tests {
         )
         .expect("compiles and runs");
         (outcome, mem[16392..16400] != [0; 8])
+    }
+
+    /// #2534 — `memory.wait` and `atomic.notify` hand their thunks the guest address, which the
+    /// thunk confines against the context's window: a wait past the reservation is the
+    /// `MemoryFault` a load there is, and a notify there wakes nobody (no wait can park there). A
+    /// notify inside the window still reaches the thunk's futex.
+    #[test]
+    fn a_wait_past_the_window_faults_and_a_notify_there_wakes_none() {
+        if !temen_fiber::supported() {
+            return;
+        }
+        let run = |body: &str| {
+            let src = format!(
+                "memory 16\nfunc (i64) -> (i64) {{\nblock 0 (v0: i64) {{\n{body}  }}\n}}\n"
+            );
+            run_marked(&src).0
+        };
+        let wait = run(
+            "  v1 = i64.const 2199023255552\n  v2 = i32.const 0\n  v3 = i64.const -1\n  \
+             v4 = i32.atomic.wait v1 v2 v3\n  v5 = i64.extend_i32_u v4\n  return v5\n",
+        );
+        assert_eq!(
+            wait,
+            crate::JitOutcome::Trapped(crate::TrapKind::MemoryFault),
+            "a wait past the window"
+        );
+        for addr in ["2199023255552", "16384"] {
+            let notify = run(&format!(
+                "  v1 = i64.const {addr}\n  v2 = i32.const -1\n  v3 = atomic.notify v1 v2\n  \
+                 v4 = i64.extend_i32_u v3\n  return v4\n"
+            ));
+            assert_eq!(
+                notify,
+                crate::JitOutcome::Returned(vec![0]),
+                "a notify at {addr} woke someone"
+            );
+        }
     }
 
     /// #2488 — a vCPU parked when a sibling ends the domain wakes as if woken, with nothing raised on

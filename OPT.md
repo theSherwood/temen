@@ -401,6 +401,21 @@ tracked enhancement, not a blocker.
     differential, 46 peval differentials, `opt_sccp` fuzz) exercises it. **Next:** loop-invariant load
     hoisting and an opt-in scratch-region contract for dead-store elimination (DSE needs a
     private-region guarantee to stay sound under shared-memory threads).
+  - **No scalar replacement of frame slots** (#2817, closed). LLVM's SROA and mem2reg turn a local
+    whose address does not escape into SSA values. temen-opt cannot, because temen IR gives a frame
+    slot no privacy to rest on:
+    - The window is flat, pointer arithmetic is unrestricted, and the data stack is one region. A
+      frame pointer is an ordinary value its caller made: a callee handed `sp + 8` can write `[sp]`,
+      and a pointer parameter can equal `sp`.
+    - Every nim `var` parameter and every sret passes a data-stack pointer, so in a real program
+      something can always reach a frame.
+    - LLVM's argument rests on provenance: arithmetic out of an alloca is undefined. temen IR has no
+      provenance, which is also why the alias model above lets a different base alias.
+
+    So a frame slot's value stays in memory across any call or any store off another base. The
+    frontend knows more: temen-leng knows that a nim local is an object of its own. On nisaba's regex
+    kernel, though, a frontend that kept object locals, temporaries and sret results in SSA would save
+    about 1% (#2817), so it is not done either.
 - [ ] **Phase 5 — close out.** In-sandbox demo (guest runs `temen-opt` on a module and JITs the
   result, peval-demo shape); peval + Wasmtime-relative numbers with the optimizer on;
   fold the settled design into `DESIGN.md` §20 and retire this doc to a tracker stub.

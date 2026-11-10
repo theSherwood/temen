@@ -5,7 +5,6 @@
 
 #![cfg(unix)]
 
-use core::ffi::c_void;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use temen_jit::{CodeDir, CompiledModule, JitOutcome};
@@ -41,21 +40,15 @@ block 0 (v0: i64) {
 
 /// A `call.cap` that answers 41.
 unsafe extern "C" fn forty_one(
-    _ctx: *mut c_void,
-    _mem_base: *mut u8,
-    _mem_size: u64,
-    _mem_reserved: u64,
+    _vm: &temen_jit::VmCtx,
+    buf: *mut i64,
+    counts: u64,
     _type_id: u32,
     _op: u32,
     _handle: i32,
-    _args: *const i64,
-    _n_args: u64,
-    results: *mut i64,
-    _n_results: u64,
-    _vm: &temen_jit::VmCtx,
 ) {
     unsafe {
-        *results = 41;
+        temen_jit::cap_slots(buf, counts).1[0] = 41;
     }
 }
 

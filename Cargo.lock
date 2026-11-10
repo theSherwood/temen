@@ -880,6 +880,7 @@ dependencies = [
  "temen-fiber",
  "temen-interp",
  "temen-ir",
+ "temen-mask",
  "temen-text",
  "temen-verify",
  "windows-sys 0.59.0",

@@ -1598,29 +1598,20 @@ mod cap {
     /// mock Host the interpreter uses, so the two backends share capability semantics.
     ///
     /// # Safety
-    /// Honours the `CapThunk` contract: `ctx` is a `*mut Host`, the slot/window pointers are
-    /// valid for their lengths, and `vm` is the calling instance's live context.
+    /// Honours the `CapThunk` contract: `vm` is the calling instance's live context, whose powerbox
+    /// is a `*mut Host`, and `buf` its call buffer.
     unsafe extern "C" fn cap_thunk(
-        ctx: *mut c_void,
-        mem_base: *mut u8,
-        mem_size: u64,
-        mem_reserved: u64,
+        vm: &temen_jit::VmCtx,
+        buf: *mut i64,
+        counts: u64,
         type_id: u32,
         op: u32,
         handle: i32,
-        args: *const i64,
-        n_args: u64,
-        results: *mut i64,
-        n_results: u64,
-        vm: &temen_jit::VmCtx,
     ) {
-        let host = &mut *(ctx as *mut Host);
-        // Null args pointer when there are 0 args; `from_raw_parts` needs non-null even for len 0.
-        let arg_slots = if n_args == 0 {
-            &[][..]
-        } else {
-            std::slice::from_raw_parts(args, n_args as usize)
-        };
+        let host = &mut *(vm.cap_ctx as *mut Host);
+        let (arg_slots, out) = temen_jit::cap_slots(buf, counts);
+        let w = vm.window();
+        let (mem_base, mem_size, mem_reserved) = (w.base, w.mapped, w.reserved);
         // The production JIT-side guest window: `map`/`unmap`/`protect` backed by real `mprotect`
         // (incl. growth into the reserved tail), mirrored by a software page map so the Memory cap is
         // bit-identical to the interpreter's paged `Mem` — exactly what this differential checks.
@@ -1633,11 +1624,8 @@ mod cap {
 
         match host.cap_call(type_id, op, handle, arg_slots, 1, gm) {
             Ok(res) => {
-                if n_results != 0 {
-                    let out = std::slice::from_raw_parts_mut(results, n_results as usize);
-                    for (o, r) in out.iter_mut().zip(res) {
-                        *o = r;
-                    }
+                for (o, r) in out.iter_mut().zip(res) {
+                    *o = r;
                 }
             }
             // The host's trap on the one wire code, as `temen_run::cap_thunk` reports it (#1735).
@@ -2105,42 +2093,25 @@ mod fast_cap {
 
     /// Generic thunk: op 1 doubles its arg, any other op increments — the fallback semantics.
     unsafe extern "C" fn generic_thunk(
-        _ctx: *mut c_void,
-        _mem_base: *mut u8,
-        _mem_size: u64,
-        _mem_reserved: u64,
+        _vm: &temen_jit::VmCtx,
+        buf: *mut i64,
+        counts: u64,
         _type_id: u32,
         op: u32,
         _handle: i32,
-        args: *const i64,
-        n_args: u64,
-        results: *mut i64,
-        n_results: u64,
-        _vm: &temen_jit::VmCtx,
     ) {
-        let a = if n_args == 0 {
-            &[][..]
-        } else {
-            std::slice::from_raw_parts(args, n_args as usize)
-        };
+        let (a, results) = temen_jit::cap_slots(buf, counts);
         let r = match op {
             1 => a[0].wrapping_mul(2),
             _ => a[0].wrapping_add(1),
         };
-        if n_results != 0 {
-            *results = r;
+        if let Some(out) = results.first_mut() {
+            *out = r;
         }
     }
 
     /// The specialized (register-ABI) fast fn for `(42, 0)`: `a0 + 1` — must match the generic op-0.
-    unsafe extern "C" fn fast_add1(
-        _ctx: *mut c_void,
-        _mem_base: *mut u8,
-        _mem_size: u64,
-        _handle: i32,
-        _vm: &temen_jit::VmCtx,
-        a0: i64,
-    ) -> i64 {
+    unsafe extern "C" fn fast_add1(_vm: &temen_jit::VmCtx, _handle: i32, a0: i64) -> i64 {
         a0.wrapping_add(1)
     }
 

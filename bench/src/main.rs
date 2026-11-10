@@ -1263,23 +1263,19 @@ fn interp_call(m: &temen_ir::Module, entry: u32, lead: &[i64], n: i64) -> i64 {
 /// timing isolates the boundary-crossing cost rather than the work.
 ///
 /// # Safety
-/// Honours the [`temen_jit::CapThunk`] contract: `args`/`results` are valid for their declared
-/// lengths, and for op 1 the kernel passes in-window constants so `[ptr, ptr+len) ⊆ window`.
+/// Honours the [`temen_jit::CapThunk`] contract: `buf` holds the call's slots, and for op 1 the
+/// kernel passes in-window constants so `[ptr, ptr+len) ⊆ window`.
 unsafe extern "C" fn bench_thunk(
-    _ctx: *mut c_void,
-    mem_base: *mut u8,
-    _mem_size: u64,
-    _mem_reserved: u64,
+    vm: &temen_jit::VmCtx,
+    buf: *mut i64,
+    counts: u64,
     type_id: u32,
     op: u32,
     _handle: i32,
-    args: *const i64,
-    n_args: u64,
-    results: *mut i64,
-    n_results: u64,
-    _vm: &temen_jit::VmCtx,
 ) {
-    let a = std::slice::from_raw_parts(args, n_args as usize);
+    let (a, results) = temen_jit::cap_slots(buf, counts);
+    let n_args = a.len();
+    let mem_base = vm.window().base;
     // A transpiled kernel dispatches as `call.import` (IMPORTS.md phase 3): the thunk sees the
     // `CAP_IMPORT_TYPE_ID` sentinel with the manifest slot as `op`. Each `HostCall` kernel imports
     // exactly one op and the two bench ops have distinct arities, so pick by arity there; the
@@ -1303,35 +1299,20 @@ unsafe extern "C" fn bench_thunk(
         // op 0: scalar round-trip.
         _ => a[0].wrapping_add(1),
     };
-    if n_results > 0 {
-        *results = r;
+    if let Some(out) = results.first_mut() {
+        *out = r;
     }
 }
 
 /// The §9/D45 **devirtualized** counterparts of [`bench_thunk`]'s ops: register-to-register host fns
 /// the JIT calls directly when `--fast-cap` is set. `op 0` (`x -> x+1`) and `op 1` (sum a `(ptr,len)`
 /// borrow buffer) — identical results to the generic thunk, but no stack marshalling / runtime
-/// dispatch. The ABI matches [`temen_jit::FastCapResolver`]: `(ctx, mem_base, mem_size, handle, vm,
-/// args…)`.
-unsafe extern "C" fn fast_op0(
-    _ctx: *mut c_void,
-    _mem_base: *mut u8,
-    _mem_size: u64,
-    _handle: i32,
-    _vm: &temen_jit::VmCtx,
-    a0: i64,
-) -> i64 {
+/// dispatch. The ABI matches [`temen_jit::FastCapResolver`]: `(vm, handle, args…)`.
+unsafe extern "C" fn fast_op0(_vm: &temen_jit::VmCtx, _handle: i32, a0: i64) -> i64 {
     a0.wrapping_add(1)
 }
-unsafe extern "C" fn fast_op1(
-    _ctx: *mut c_void,
-    mem_base: *mut u8,
-    _mem_size: u64,
-    _handle: i32,
-    _vm: &temen_jit::VmCtx,
-    ptr: i64,
-    len: i64,
-) -> i64 {
+unsafe extern "C" fn fast_op1(vm: &temen_jit::VmCtx, _handle: i32, ptr: i64, len: i64) -> i64 {
+    let mem_base = vm.window().base;
     let buf = std::slice::from_raw_parts(mem_base.add(ptr as usize), len as usize);
     buf.iter().map(|&b| b as i64).sum()
 }

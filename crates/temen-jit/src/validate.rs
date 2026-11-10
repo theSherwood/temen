@@ -77,6 +77,19 @@ pub(crate) struct Contract {
     /// `RED_ZONE` margin as the pre-check register spills (`STACK_GUARD.md`). The fuel refill and the
     /// `-g` `trap_capture` backtrace call are the two; every other call must be dominated.
     pub safepoint: bool,
+    /// What the callee leaves in `rax` (#2534).
+    pub ret: Ret,
+}
+
+/// What a call returns, as far as the validator models it (#2534).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Ret {
+    /// Nothing known: a guest value, a count, a handle.
+    Unknown,
+    /// The host `jmp_buf` `rt_setjmp_slot` returns: host storage the code hands only to an inline
+    /// `_setjmp` ([`ArgTag::JmpBuf`]), which saves the frame's registers into it. A `_setjmp` handed
+    /// anything else would write them wherever the code said.
+    JmpBuf,
 }
 
 /// What one call argument must be, for the validator to accept the call (#2534). The host confines
@@ -86,8 +99,6 @@ pub(crate) struct Contract {
 pub(crate) enum ArgTag {
     /// Unconstrained — a guest value, a count, a handle: nothing the host confines with.
     Any,
-    /// The window base `mem_base` (rdi at entry): the base the host confines guest pointers against.
-    WindowBase,
     /// The `vmctx` pointer: the host's own context, never a guest value.
     Vmctx,
     /// A pointer to a buffer in the caller's own frame, at most `len` bytes, that the host reads
@@ -96,6 +107,15 @@ pub(crate) enum ArgTag {
     /// through a forged pointer), and a `write` buffer's slots are dropped across the call since the
     /// host may change them, while every other slot (the context-pointer spills) survives.
     StackSlot { len: u32, write: bool },
+    /// What a call [`Ret::JmpBuf`] returned: the host `jmp_buf` an inline `_setjmp` saves into.
+    JmpBuf,
+    /// The context's fuel cell (`Cell::Fuel`, read from `vmctx`), which the refill and `remaining`
+    /// functions read and write. Only the x86-64 validator's contracts for them name it.
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+    FuelCell,
+    /// This function's frame pointer, the address of its saved `rbp` just below the return address,
+    /// which the `-g` trap capture walks the frame chain from.
+    FramePointer,
 }
 
 /// What the validator knows of a function's own frame at entry (#2603 PR 3): the bytes of incoming
@@ -141,6 +161,7 @@ pub(crate) fn contract(sig: &cranelift_codegen::ir::Signature) -> Option<Contrac
         args: &[],
         // Identified-by-name in `lib.rs` (`callee_contracts`); the signature alone never marks one.
         safepoint: false,
+        ret: Ret::Unknown,
     })
 }
 
@@ -208,7 +229,8 @@ impl Reloc {
 
 /// The validator's view of a function's relocations: each one's patched bytes, and the contract of
 /// what it names — `callee(id)` for a function the module declares, a libcall's from its signature
-/// under `cc`, and `None` for anything else (data, a linker symbol, an offset in a function).
+/// under `cc` (one that takes guest pointers has none, [`libcall_contract`]), and `None` for anything
+/// else (data, a linker symbol, an offset in a function).
 pub(crate) fn relocs(
     relocs: &[cranelift_module::ModuleReloc],
     callee: &dyn Fn(u32) -> Option<Contract>,
@@ -226,11 +248,26 @@ pub(crate) fn relocs(
                     namespace: 0,
                     index,
                 } => callee(*index),
-                T::LibCall(lc) => contract(&lc.signature(cc, cranelift_codegen::ir::types::I64)),
+                T::LibCall(lc) => libcall_contract(*lc, cc),
                 _ => None,
             },
         })
         .collect()
+}
+
+/// A libcall's contract. The C runtime's memory functions (`memcpy`, `memmove`, `memset`,
+/// `memcmp`) take raw pointers no tag can prove are the window's, so they have none, and a call to
+/// one is a finding: compiled code reaches guest memory in bulk only through the host helpers,
+/// which confine the spans themselves (#2534). The rest take values only.
+fn libcall_contract(
+    lc: cranelift_codegen::ir::LibCall,
+    cc: cranelift_codegen::isa::CallConv,
+) -> Option<Contract> {
+    use cranelift_codegen::ir::LibCall as L;
+    match lc {
+        L::Memcpy | L::Memmove | L::Memset | L::Memcmp => None,
+        _ => contract(&lc.signature(cc, cranelift_codegen::ir::types::I64)),
+    }
 }
 
 /// What temen knows of a guest function's module, which its machine code is checked against: the
@@ -345,7 +382,7 @@ pub(crate) mod x86 {
     //! classification), the machine-CFG recovery and abstract dataflow (#2535), and the
     //! memory-access confinement policy (#2535/#2603) they feed.
 
-    use super::{ArgTag, Contract, Entry, Frame, Guest, Reloc, WindowLayout, SYSV_CLOBBERS};
+    use super::{ArgTag, Contract, Entry, Frame, Guest, Reloc, Ret, WindowLayout, SYSV_CLOBBERS};
 
     /// A machine-code policy disagreement: `why`, at byte offset `at` in the function.
     #[derive(Clone, Debug, PartialEq, Eq)]
@@ -356,6 +393,7 @@ pub(crate) mod x86 {
 
     /// x86-64 GP register numbers the entry ABI and the policy refer to by name (Tail CC, §3b).
     mod reg {
+        pub const RAX: u8 = 0; // a call's result
         pub const RCX: u8 = 1; // stack_limit (arg 3)
         pub const RDX: u8 = 2; // vmctx / trap_out (arg 2)
         pub const RSP: u8 = 4; // stack pointer
@@ -440,6 +478,9 @@ pub(crate) mod x86 {
         /// than `MAX_REG_RESULTS` results: the function writes its `.0` eight-byte result slots
         /// through it, so `[0, .0·8)` is writable host memory the caller granted.
         ReturnArea(u32),
+        /// #2534 — the host `jmp_buf` a [`Ret::JmpBuf`] call returned. Code may only hand it to
+        /// `_setjmp` ([`ArgTag::JmpBuf`]); it addresses nothing the code itself may access.
+        JmpBuf,
         /// No information.
         Unknown,
     }
@@ -1218,11 +1259,12 @@ pub(crate) mod x86 {
         }
     }
 
-    /// Check a call's arguments against its callee's contract (#2534): a host function confines guest
-    /// pointers against the window values the code hands it, so a wrong register — a backend bug —
-    /// would move the window the host trusts. Positional over the integer argument registers (SysV
-    /// order); arguments past the sixth ride the stack and are a PR 3b follow-up. The window's mask
-    /// and reserved domain come from the module's geometry (`None`/0 for a memoryless module).
+    /// Check a call's arguments against its callee's contract (#2534): a host function takes from the
+    /// code only the context, the frame buffers and the pointers its contract tags, and derives the
+    /// rest from the context, so a wrong register — a backend bug — would hand it a forged context
+    /// or buffer. Positional over the integer argument registers, in SysV order whatever the callee's
+    /// convention (Win64 is #2820). No contract tags an argument past the fourth, so each tagged one
+    /// is a register on Win64 too.
     fn check_args(c: &Contract, state: &State, at: usize, findings: &mut Vec<Finding>) {
         for (i, &tag) in c.args.iter().enumerate() {
             let Some(&r) = reg::ARG_REGS.get(i) else {
@@ -1231,12 +1273,22 @@ pub(crate) mod x86 {
             let fact = state.regs[r as usize];
             let ok = match tag {
                 ArgTag::Any => true,
-                ArgTag::WindowBase => fact == Fact::MemBase,
                 ArgTag::Vmctx => fact == Fact::Vmctx,
-                // A buffer pointer must be a known frame slot, never a guest value: the host writes
-                // through it, so a forged pointer would escape. The extent is enforced by the frame
-                // policy on the slots the write clears below.
-                ArgTag::StackSlot { .. } => matches!(fact, Fact::Stack(Some(_))),
+                // A buffer pointer must be a known frame slot, never a guest value: the host reads
+                // and writes through it, so a forged pointer would escape. All `len` bytes lie in
+                // this function's allocated frame, `[rsp, 0)`, as a direct access through the frame
+                // must: never over the return address or a caller's frame, never below `rsp`.
+                ArgTag::StackSlot { len, .. } => match (fact, state.regs[reg::RSP as usize]) {
+                    (Fact::Stack(Some(off)), Fact::Stack(Some(cur))) => {
+                        off >= cur && off.checked_add(i64::from(len)).is_some_and(|top| top <= 0)
+                    }
+                    _ => false,
+                },
+                ArgTag::JmpBuf => fact == Fact::JmpBuf,
+                ArgTag::FuelCell => fact == Fact::Cell(Cell::Fuel),
+                // The saved-`rbp` slot below the return address: what `mov rbp, rsp` after the
+                // prologue's `push rbp` leaves in `rbp`, and so what `get_frame_pointer` reads.
+                ArgTag::FramePointer => fact == Fact::Stack(Some(-8)),
             };
             if !ok {
                 findings.push(Finding {
@@ -1564,6 +1616,8 @@ pub(crate) mod x86 {
             // The registers the semantic below sets precisely; every other register the instruction
             // writes becomes `Unknown`.
             let mut defined = 0u16;
+            // What a call leaves in `rax`, by its contract.
+            let mut ret = Ret::Unknown;
             // The frame slot an 8-byte load reads or store writes, by entry-relative offset.
             let slot8 = match (d.eff, d.operands.mem) {
                 (Eff::LoadReg { .. } | Eff::StoreReg { w: 8, .. }, Some(m)) => {
@@ -1827,7 +1881,9 @@ pub(crate) mod x86 {
                     pops: None,
                     args: &[],
                     safepoint: false,
+                    ret: Ret::Unknown,
                 });
+                ret = c.ret;
                 if let Some(f) = findings.as_deref_mut() {
                     check_args(&c, &state, pos, f);
                 }
@@ -1859,8 +1915,9 @@ pub(crate) mod x86 {
                             // A write buffer at an unknown offset: clear conservatively.
                             _ => unexpected = true,
                         },
-                        // A read buffer: the host doesn't write our stack through it.
-                        Some(ArgTag::StackSlot { write: false, .. }) => {}
+                        // A read buffer: the host doesn't write our stack through it, nor does the
+                        // trap capture through the frame pointer it walks from.
+                        Some(ArgTag::StackSlot { write: false, .. } | ArgTag::FramePointer) => {}
                         // Another tagged argument (a window value, vmctx, a guest value): a frame
                         // pointer where the contract expects none is unexpected.
                         Some(_) => unexpected |= matches!(f, Fact::Stack(_)),
@@ -1890,6 +1947,9 @@ pub(crate) mod x86 {
                 if written & !defined & bit(r) != 0 {
                     state.regs[r as usize] = Fact::Unknown;
                 }
+            }
+            if ret == Ret::JmpBuf {
+                state.regs[reg::RAX as usize] = Fact::JmpBuf;
             }
             // The symbolic values: a 64-bit copy keeps the source's, a constant offset moves it, and
             // any other write makes a fresh one.
@@ -2072,18 +2132,21 @@ pub(crate) mod x86 {
     /// `remaining` (a C function).
     // Each takes the fuel cell pointer alone (never a frame pointer), so the contract lists that one
     // argument — a scratch frame pointer left in another register is then not mistaken for a buffer.
+    // The host writes the cell it is handed, so it must be the context's (#2534).
     const FUEL_REFILL: Contract = Contract {
         clobbers: 0,
         pops: Some(0),
-        args: &[ArgTag::Any],
+        args: &[ArgTag::FuelCell],
         // The fuel refill rides the prologue fuel safepoint, before the stack check (I5).
         safepoint: true,
+        ret: Ret::Unknown,
     };
     const FUEL_REMAINING: Contract = Contract {
         clobbers: SYSV_CLOBBERS,
         pops: Some(0),
-        args: &[ArgTag::Any],
+        args: &[ArgTag::FuelCell],
         safepoint: false,
+        ret: Ret::Unknown,
     };
 
     /// What a 64-bit load from `m` yields: the fact a tracked spill slot holds, a fn-table record (of
@@ -2139,11 +2202,11 @@ pub(crate) mod x86 {
     }
 
     /// A vmctx field compiled code may access at offset `disp`: whether it may write it (only the
-    /// stop word, offset 0), and what an 8-byte load of it yields — a host cell compiled code reads,
-    /// or an opaque pointer it only hands to host functions. `None` for any other offset.
+    /// stop word, offset 0), and what an 8-byte load of it yields — a host cell compiled code reads.
+    /// `None` for any other offset: the runtime objects a host function acts on (the powerbox, the
+    /// scheduler, …) it reads from the context itself (#2534), so code never loads one.
     fn vmctx_field(disp: i64) -> Option<(bool, Fact)> {
         use crate::vmctx as v;
-        let opaque = [v::CAP_CTX, v::SIG_CTX, v::SCHED, v::NURSERY, v::SETJMP];
         Some(match disp {
             0 => (true, Fact::Unknown),
             d if d == i64::from(v::FUEL) => (false, Fact::Cell(Cell::Fuel)),
@@ -2152,7 +2215,6 @@ pub(crate) mod x86 {
             d if d == i64::from(v::END) => (false, Fact::Cell(Cell::End)),
             // #2164 — the demand-paged access table (read by `emit_page_check`).
             d if d == i64::from(v::PAGES) => (false, Fact::PageTable),
-            d if opaque.iter().any(|&o| i64::from(o) == d) => (false, Fact::Unknown),
             _ => return None,
         })
     }
@@ -2208,6 +2270,7 @@ pub(crate) mod x86 {
         pops: Some(0),
         args: &[],
         safepoint: false,
+        ret: Ret::Unknown,
     };
 
     /// Where an explicit memory operand points in the stack frame: `Some(Some(off))` for a plain
@@ -4761,6 +4824,7 @@ pub(crate) mod x86 {
             pops: Some(0),
             args: &[],
             safepoint: false,
+            ret: Ret::Unknown,
         };
 
         /// A Tail-CC callee with 16 bytes of stack arguments.
@@ -4769,6 +4833,7 @@ pub(crate) mod x86 {
             pops: Some(16),
             args: &[],
             safepoint: false,
+            ret: Ret::Unknown,
         };
 
         /// The relocation a call or tail call to [`TAIL0`] carries on the `rel32` at `at`.
@@ -5180,6 +5245,7 @@ pub(crate) mod x86 {
                     pops: Some(0),
                     args: &[],
                     safepoint: false,
+                    ret: Ret::Unknown,
                 })
             );
             let preserve = |r: &[types::Type]| {
@@ -5257,6 +5323,7 @@ pub(crate) mod x86 {
                 pops: Some(0),
                 args: &[],
                 safepoint: false,
+                ret: Ret::Unknown,
             });
             assert_eq!(sysv.regs[reg::RDI as usize], Fact::Unknown);
             assert_eq!(sysv.regs[reg::RSP as usize], Fact::Stack(Some(0)));
@@ -5265,6 +5332,7 @@ pub(crate) mod x86 {
                 pops: Some(16),
                 args: &[],
                 safepoint: false,
+                ret: Ret::Unknown,
             });
             assert_eq!(tail.regs[reg::RSP as usize], Fact::Stack(Some(16)));
             let preserve = with(Contract {
@@ -5272,23 +5340,25 @@ pub(crate) mod x86 {
                 pops: Some(0),
                 args: &[],
                 safepoint: false,
+                ret: Ret::Unknown,
             });
             assert_eq!(preserve.regs[reg::RDI as usize], Fact::MemBase);
             let unknown = [0x48, 0x89, 0xf0, 0xff, 0xd0, 0xc3]; // mov rax, rsi; call rax; ret
             assert!(has(&findings(&unknown), "unidentified callee"));
         }
 
-        /// #2534 — a host call's argument registers are checked against its contract: the window base
-        /// must be the real `mem_base`, never another value a backend bug left in the register.
+        /// #2534 — a host call's argument registers are checked against its contract: the context
+        /// must be the real `vmctx`, never another value a backend bug left in the register, since
+        /// the host finds through it the window and every runtime object it acts on.
         #[test]
         fn a_host_call_argument_must_match_its_contract() {
-            // A callee that wants the window base in its second argument register (rsi), as the
-            // `call.cap` thunk does.
+            // A callee that wants the context in its second argument register (rsi).
             const CAP: Contract = Contract {
                 clobbers: SYSV_CLOBBERS,
                 pops: Some(0),
-                args: &[ArgTag::Any, ArgTag::WindowBase],
+                args: &[ArgTag::Any, ArgTag::Vmctx],
                 safepoint: false,
+                ret: Ret::Unknown,
             };
             let reloc = |at: u32| Reloc {
                 at,
@@ -5297,19 +5367,150 @@ pub(crate) mod x86 {
                 callee: Some(CAP),
             };
             let c = CHECK_LEN as u32;
-            // mov rsi, rdi (rsi := the window base); movabs rax, <sym>; call rax; ret
+            // mov rsi, rdx (rsi := the context); movabs rax, <sym>; call rax; ret
             let ok = checked(&[
-                0x48, 0x89, 0xfe, 0x48, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xd0, 0xc3,
+                0x48, 0x89, 0xd6, 0x48, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xd0, 0xc3,
             ]);
             let f = check(&ok, &[reloc(c + 5)], Entry::Guest(&G), Frame::UNKNOWN);
             assert!(
                 f.is_empty(),
-                "a correct window-base argument was flagged: {f:?}"
+                "a correct context argument was flagged: {f:?}"
             );
-            // Without the move, rsi is still fn_table_base — a different window.
+            // Without the move, rsi is still fn_table_base — not the context.
             let bad = checked(&[0x48, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xd0, 0xc3]);
             let f = check(&bad, &[reloc(c + 2)], Entry::Guest(&G), Frame::UNKNOWN);
             assert!(has(&f, "call argument 1"), "{f:?}");
+        }
+
+        /// #2534 — `_setjmp` saves the frame's registers into its argument, so it must be the host
+        /// `jmp_buf` `rt_setjmp_slot` returned (`Ret::JmpBuf`), carried through any register move;
+        /// any other value, a window pointer included, is a finding.
+        #[test]
+        fn setjmp_takes_only_the_slot_the_host_returned() {
+            const SLOT: Contract = Contract {
+                clobbers: SYSV_CLOBBERS,
+                pops: Some(0),
+                args: &[ArgTag::Vmctx],
+                safepoint: false,
+                ret: Ret::JmpBuf,
+            };
+            const SETJMP: Contract = Contract {
+                clobbers: SYSV_CLOBBERS,
+                pops: Some(0),
+                args: &[ArgTag::JmpBuf],
+                safepoint: false,
+                ret: Ret::Unknown,
+            };
+            let c = CHECK_LEN as u32;
+            let relocs = |at: [u32; 2]| {
+                [SLOT, SETJMP].map(|callee| Reloc {
+                    at: at[usize::from(callee == SETJMP)],
+                    kind: R::Abs8,
+                    addend: 0,
+                    callee: Some(callee),
+                })
+            };
+            // mov rdi, rdx (vmctx); movabs rax, <slot>; call rax; mov rdi, rax; movabs rax, <setjmp>;
+            // call rax; ret
+            let ok = checked(&[
+                0x48, 0x89, 0xd7, 0x48, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xd0, 0x48, 0x89, 0xc7,
+                0x48, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xd0, 0xc3,
+            ]);
+            let f = check(
+                &ok,
+                &relocs([c + 5, c + 20]),
+                Entry::Guest(&G),
+                Frame::UNKNOWN,
+            );
+            assert!(f.is_empty(), "the host slot was flagged: {f:?}");
+            // mov rdi, rbx instead: a value the call kept (the caller's rbx), not the slot it returned.
+            let mut forged = ok.clone();
+            forged[CHECK_LEN + 15..CHECK_LEN + 18].copy_from_slice(&[0x48, 0x89, 0xdf]);
+            let f = check(
+                &forged,
+                &relocs([c + 5, c + 20]),
+                Entry::Guest(&G),
+                Frame::UNKNOWN,
+            );
+            assert!(has(&f, "call argument 0 is Saved(3), not JmpBuf"), "{f:?}");
+        }
+
+        /// #2534 — the `-g` trap capture walks the frame chain from its argument, so it must be this
+        /// frame's pointer: `rbp` after `push rbp; mov rbp, rsp`, the saved-`rbp` slot.
+        #[test]
+        fn the_trap_capture_takes_this_frames_pointer() {
+            const CAPTURE: Contract = Contract {
+                clobbers: SYSV_CLOBBERS,
+                pops: Some(0),
+                args: &[ArgTag::FramePointer],
+                safepoint: true,
+                ret: Ret::Unknown,
+            };
+            let reloc = |at: u32| Reloc {
+                at,
+                kind: R::Abs8,
+                addend: 0,
+                callee: Some(CAPTURE),
+            };
+            // push rbp; mov rbp, rsp; mov rdi, rbp; movabs rax, <capture>; call rax; pop rbp; ret
+            let ok = [
+                0x55, 0x48, 0x89, 0xe5, 0x48, 0x89, 0xef, 0x48, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0xff,
+                0xd0, 0x5d, 0xc3,
+            ];
+            let f = check(&ok, &[reloc(9)], Entry::Guest(&G), Frame::UNKNOWN);
+            assert!(f.is_empty(), "this frame's pointer was flagged: {f:?}");
+            // lea rdi, [rbp - 8] instead: a pointer into the frame, but not its frame pointer.
+            let mut inner = ok.to_vec();
+            inner.splice(4..7, [0x48, 0x8d, 0x7d, 0xf8]);
+            let f = check(&inner, &[reloc(10)], Entry::Guest(&G), Frame::UNKNOWN);
+            assert!(has(&f, "not FramePointer"), "{f:?}");
+        }
+
+        /// #2534 — a host call's frame buffer lies in the caller's allocated frame, `[rsp, 0)`: a
+        /// status pointer aimed at the return address, or one that runs into it, is a finding, not a
+        /// buffer the host may write.
+        #[test]
+        fn a_frame_buffer_stays_in_the_frame() {
+            const STATUS: Contract = Contract {
+                clobbers: SYSV_CLOBBERS,
+                pops: Some(0),
+                args: &[
+                    ArgTag::Any,
+                    ArgTag::Any,
+                    ArgTag::StackSlot {
+                        len: 8,
+                        write: true,
+                    },
+                ],
+                safepoint: false,
+                ret: Ret::Unknown,
+            };
+            let c = CHECK_LEN as u32;
+            // sub rsp, 0x20; lea rdx, [rsp + disp8]; movabs rax, <sym>; call rax; add rsp, 0x20; ret
+            let at = |disp: u8| {
+                checked(&[
+                    0x48, 0x83, 0xec, 0x20, 0x48, 0x8d, 0x54, 0x24, disp, 0x48, 0xb8, 0, 0, 0, 0,
+                    0, 0, 0, 0, 0xff, 0xd0, 0x48, 0x83, 0xc4, 0x20, 0xc3,
+                ])
+            };
+            let reloc = Reloc {
+                at: c + 11,
+                kind: R::Abs8,
+                addend: 0,
+                callee: Some(STATUS),
+            };
+            let f = check(&at(0x18), &[reloc], Entry::Guest(&G), Frame::UNKNOWN);
+            assert!(
+                f.is_empty(),
+                "a status word in the frame was flagged: {f:?}"
+            );
+            for (disp, why) in [
+                (0x20, "the return address"),
+                (0x1c, "a word over the return address"),
+            ] {
+                let f = check(&at(disp), &[reloc], Entry::Guest(&G), Frame::UNKNOWN);
+                assert!(has(&f, "call argument 2"), "{why}: {f:?}");
+            }
         }
 
         /// #2534 — a host call that writes a caller-frame buffer clears only that buffer's slots, so
@@ -5353,6 +5554,7 @@ pub(crate) mod x86 {
                     },
                 ],
                 safepoint: false,
+                ret: Ret::Unknown,
             });
             assert_eq!(
                 status.regs[0],
@@ -5367,6 +5569,7 @@ pub(crate) mod x86 {
                 pops: Some(0),
                 args: &[],
                 safepoint: false,
+                ret: Ret::Unknown,
             });
             assert_eq!(
                 plain.regs[0],
@@ -5427,6 +5630,7 @@ pub(crate) mod x86 {
                     write: false,
                 }],
                 safepoint: false,
+                ret: Ret::Unknown,
             });
             assert_eq!(
                 read.regs[0],
@@ -5442,6 +5646,7 @@ pub(crate) mod x86 {
                     write: true,
                 }],
                 safepoint: false,
+                ret: Ret::Unknown,
             });
             assert_eq!(
                 write.regs[0],
@@ -5465,6 +5670,7 @@ pub(crate) mod x86 {
                             write: false,
                         }],
                         safepoint: false,
+                        ret: Ret::Unknown,
                     }),
                 }],
                 Entry::Guest(&G),
@@ -5888,6 +6094,7 @@ pub(crate) mod x86 {
             let refill = [
                 0x48, 0x8b, 0x42, 0x18, // mov rax, [rdx + 0x18]   (vmctx.fuel cell)
                 0x48, 0x8b, 0x48, 0x08, // mov rcx, [rax + 8]      (the refill fn pointer)
+                0x48, 0x89, 0xc7, // mov rdi, rax            (the cell, its argument)
                 0xff,
                 0xd1, // call rcx                (PreserveAll; identified as the fuel refill)
                 0xc3, // ret
@@ -6228,12 +6435,20 @@ pub(crate) mod x86 {
                 0x48, 0x83, 0xe9, 0x01, // [07] sub rcx, 1
                 0x48, 0x89, 0x08, // [0b] mov [rax], rcx
                 0x48, 0x8b, 0x48, 0x08, // [0e] mov rcx, [rax + 8]       (refill)
-                0xff, 0xd1, // [12] call rcx
-                0x48, 0x8b, 0x0f, // [14] mov rcx, [rdi]
-                0xc3, // [17] ret
+                0x48, 0x89, 0xc7, // [12] mov rdi, rax            (the cell, its argument)
+                0xff, 0xd1, // [15] call rcx
+                0x48, 0x8b, 0x0f, // [17] mov rcx, [rdi]           (the cell's `left`, kept)
+                0xc3, // [1a] ret
             ];
             let f = findings(&checked(&fuel));
             assert!(f.is_empty(), "the fuel charge was flagged: {f:?}");
+            // #2534 — the refill writes the cell it is handed, so it must be the context's.
+            let mut not_the_cell = fuel;
+            not_the_cell[0x12..0x15].copy_from_slice(&[0x48, 0x89, 0xd7]); // mov rdi, rdx (vmctx)
+            assert!(has(
+                &findings(&checked(&not_the_cell)),
+                "call argument 0 is Vmctx, not FuelCell"
+            ));
             let mut remaining = fuel;
             remaining[0x11] = 0x10; // mov rcx, [rax + 16]: `remaining` clobbers rdi
             assert!(has(

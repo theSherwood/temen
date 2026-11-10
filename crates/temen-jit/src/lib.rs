@@ -189,7 +189,7 @@ pub use vcpu_tls::serve_handlers;
 
 // #1768 — the per-instance context compiled code reaches through its threaded context pointer.
 mod vmctx;
-pub use vmctx::{InstanceAddrs, VmCtx};
+pub use vmctx::{InstanceAddrs, VmCtx, Window};
 mod fuel;
 pub use fuel::{BudgetNode, FuelCell};
 // #2757 slice 3 — the embedder's kill door, and the wakers a store into a run fires.
@@ -881,39 +881,63 @@ impl TrapKind {
     }
 }
 
-/// The host callback the JIT invokes for `call.cap` (§9's trampoline). The caller wires
-/// it to its capability host; the JIT bakes the function + ctx addresses in as constants
-/// and calls it. Scalars cross as `i64` slots (`i32` in the low bits), buffers as the
-/// `(ptr, len)` window borrow. A call that traps or exits ends the domain: it raises a
-/// [`TrapKind`] code, or `EXIT_CODE | (exit_code << 32)` for an `Exit`, on `vm`
-/// ([`VmCtx::raise`]). A call that succeeds leaves the trap cell alone — it holds the domain's
-/// end, which a sibling vCPU may have raised during the call (#2499).
+/// The host callback the JIT invokes for `call.cap` (§9's trampoline). The caller wires it to its
+/// capability host. Scalars cross as `i64` slots (`i32` in the low bits), buffers as the `(ptr, len)`
+/// window borrow. A call that traps or exits ends the domain: it raises a [`TrapKind`] code, or
+/// `EXIT_CODE | (exit_code << 32)` for an `Exit`, on `vm` ([`VmCtx::raise`]). A call that succeeds
+/// leaves the trap cell alone — it holds the domain's end, which a sibling vCPU may have raised during
+/// the call (#2499).
+///
+/// #2534 — the thunk takes from the code only what the code alone can supply. The powerbox is the
+/// calling context's (`vm.cap_ctx`), and so is the window ([`VmCtx::window`]: its base, the backed
+/// prefix `mapped`, and the reservation the guest may `map`-grow into via the Memory cap, §3e/§4):
+/// the machine-code validator checks that the code hands it that context. The call's
+/// `counts as u32` arguments are at word 0 of `buf`, and its `counts >> 32` result slots at word
+/// [`CAP_RESULTS_AT`], which the code zeroes before the call; [`cap_slots`] borrows both. `buf` is
+/// [`CAP_BUF_WORDS`] words of the caller's own frame, which the validator checks too; the verifier
+/// holds every call to [`temen_ir::CAP_MAX_ARITY`] arguments and as many results.
 ///
 /// # Safety
-/// `ctx` is the caller's host pointer; `args`/`results` point at `n_args`/`n_results`
-/// `i64` slots; `[mem_base, mem_base+mem_size)` is the guest window's backed prefix
-/// (`mem_base` null if none) and `mem_reserved` is the full reserved mask domain
-/// (`>= mem_size`) the guest may `map`-grow into via the Memory cap (§3e/§4); `vm` is the
-/// calling instance's live context. All must outlive the call.
+/// `vm` is the calling instance's live context, and `buf` a live buffer of [`CAP_BUF_WORDS`] words,
+/// for the call.
 pub type CapThunk = unsafe extern "C" fn(
-    ctx: *mut core::ffi::c_void,
-    mem_base: *mut u8,
-    mem_size: u64,
-    mem_reserved: u64,
+    vm: &VmCtx,
+    buf: *mut i64,
+    counts: u64,
     type_id: u32,
     op: u32,
     handle: i32,
-    args: *const i64,
-    n_args: u64,
-    results: *mut i64,
-    n_results: u64,
-    vm: &VmCtx,
 );
 
+/// #2534 — where a [`CapThunk`]'s `buf` holds the call's result slots: past room for every argument
+/// of a call the verifier admits ([`temen_ir::CAP_MAX_ARITY`]).
+pub const CAP_RESULTS_AT: usize = temen_ir::CAP_MAX_ARITY;
+
+/// #2534 — the words of a [`CapThunk`]'s `buf`: the arguments, then the result slots.
+pub const CAP_BUF_WORDS: usize = 2 * temen_ir::CAP_MAX_ARITY;
+
+/// #2534 — a `call.cap`'s arguments and its result slots, in the `buf` and `counts` a [`CapThunk`]
+/// is handed: the `counts as u32` arguments at word 0, and the `counts >> 32` result slots at word
+/// [`CAP_RESULTS_AT`]. The two never overlap. The code zeroed the result slots, so one the op leaves
+/// unwritten reads zero (#2361). Each count is held to [`temen_ir::CAP_MAX_ARITY`], so a thunk never
+/// touches a word past the buffer.
+///
+/// # Safety
+/// `buf` is live for `'a` and holds [`CAP_BUF_WORDS`] words, as the JIT hands every thunk.
+#[inline]
+pub unsafe fn cap_slots<'a>(buf: *mut i64, counts: u64) -> (&'a [i64], &'a mut [i64]) {
+    let n_args = (counts as u32 as usize).min(temen_ir::CAP_MAX_ARITY);
+    let n_results = ((counts >> 32) as usize).min(temen_ir::CAP_MAX_ARITY);
+    (
+        core::slice::from_raw_parts(buf, n_args),
+        core::slice::from_raw_parts_mut(buf.add(CAP_RESULTS_AT), n_results),
+    )
+}
+
 /// The **devirtualized `call.cap` fast path** (§9 / D45). A `call.cap` to a statically-known
-/// `(type_id, op)` normally goes through the generic [`CapThunk`]: it marshals args through a stack
-/// buffer, passes a 12-wide ABI (incl. `n_args`/`n_res`/`type_id`/`op`), and the host dispatches on
-/// `(type_id, op)` at runtime. A `FastCapResolver` lets an embedder hand the JIT a **specialized**
+/// `(type_id, op)` normally goes through the generic [`CapThunk`]: it marshals args through a frame
+/// buffer, passes the immediates and the counts, and the host dispatches on `(type_id, op)` at
+/// runtime. A `FastCapResolver` lets an embedder hand the JIT a **specialized**
 /// host function for a given `(type_id, op)`, which the JIT calls **register-to-register** — args and
 /// the result in registers, no stack marshalling, no runtime dispatch. Resolution happens once at
 /// **compile time** (the JIT calls the resolver during codegen and bakes the returned address); a
@@ -921,9 +945,10 @@ pub type CapThunk = unsafe extern "C" fn(
 ///
 /// The specialized function's ABI is, for a `call.cap` with `n_args` args and **one** result
 /// (multi-result ops fall back to the generic thunk):
-/// `unsafe extern "C" fn(ctx, mem_base, mem_size, handle: i32, vm: &VmCtx, a0: i64, …, aN: i64) -> i64`
-/// — `ctx`/`mem_base`/`mem_size`/`vm` are exactly as in [`CapThunk`]; the `handle` is the
-/// resolved capability handle (the fn still does the authority check); each `ai` is the i'th argument
+/// `unsafe extern "C" fn(vm: &VmCtx, handle: i32, a0: i64, …, aN: i64) -> i64`
+/// — `vm` is exactly as in [`CapThunk`], and the fn finds the powerbox and the window through it
+/// (#2534); the `handle` is the resolved capability handle (the fn still does the authority check);
+/// each `ai` is the i'th argument
 /// widened to its i64 slot (an i32/f32 in the low bits, an f64 bit-pattern); the i64 return is decoded
 /// to the result type. A 0-result op returns an ignored 0. The fn raises a trap on `vm` exactly like
 /// the generic thunk.
@@ -931,7 +956,8 @@ pub type CapThunk = unsafe extern "C" fn(
 /// **The resolver MUST gate on `(n_args, n_res)`**: the JIT builds the call signature from the IR
 /// `call.cap`'s arity, so a returned fn whose Rust signature has a *different* arity is a C-ABI
 /// mismatch. A frontend may emit a `call.cap` to any `(type_id, op)` with any sig (the verifier checks
-/// only `args.len() == sig.params.len()`, not that it matches the host op), so the resolver must return
+/// only `args.len() == sig.params.len()` and the arity bound, not that it matches the host op), so
+/// the resolver must return
 /// a fn **only** when `(n_args, n_res)` equals that fn's own arity — otherwise `null` (the generic
 /// slot-based path handles the odd arity safely). Types never mismatch (every arg is passed as an i64
 /// register, the result decoded from i64), so only arity matters.
@@ -1074,15 +1100,15 @@ pub type PagerAdmit = unsafe extern "C" fn(ctx: *mut core::ffi::c_void, export: 
 
 /// §2.2 / #2164 — a demand-paged child's **miss thunk**: its code calls it when an access's page
 /// check fails ([`emit_page_check`]), with the access's `len` bytes at window offset `off` of the
-/// window at `mem_base`, and [`PAGE_MISS_WRITE`] / [`PAGE_MISS_FATAL`] in `flags`. It returns once
-/// every page of the access admits it, having asked the child's pager for each one that may be
-/// paged in, or with a trap raised on `vm`, which the code propagates.
+/// context's window ([`VmCtx::window`], #2534), and [`PAGE_MISS_WRITE`] / [`PAGE_MISS_FATAL`] in
+/// `flags`. It returns once every page of the access admits it, having asked the child's pager for
+/// each one that may be paged in, or with a trap raised on `vm`, which the code propagates. The
+/// span is the code's to name, so the thunk faults one past the window's reservation
+/// ([`Window::span`]) itself.
 ///
 /// # Safety
-/// `vm` is the faulting instance's live context; `[mem_base, mem_base + off + len)` lies in its
-/// window's reservation.
-pub type PageMissThunk =
-    unsafe extern "C" fn(vm: &VmCtx, mem_base: *mut u8, off: u64, len: u64, flags: u64);
+/// `vm` is the faulting instance's live context.
+pub type PageMissThunk = unsafe extern "C" fn(vm: &VmCtx, off: u64, len: u64, flags: u64);
 
 /// [`PageMissThunk`] flag: the access stores.
 pub const PAGE_MISS_WRITE: u64 = 1;
@@ -1348,18 +1374,12 @@ pub type ChildManifestBinder = unsafe extern "C" fn(
 /// The default thunk for [`compile_and_run`] (no host): an empty powerbox, so every
 /// `call.cap` is inert — a `CapFault` — exactly like the interpreter's `run`.
 unsafe extern "C" fn empty_cap_thunk(
-    _ctx: *mut core::ffi::c_void,
-    _mem_base: *mut u8,
-    _mem_size: u64,
-    _mem_reserved: u64,
+    vm: &VmCtx,
+    _buf: *mut i64,
+    _counts: u64,
     _type_id: u32,
     _op: u32,
     _handle: i32,
-    _args: *const i64,
-    _n_args: u64,
-    _results: *mut i64,
-    _n_results: u64,
-    vm: &VmCtx,
 ) {
     vm.raise(TrapKind::CapFault as i64);
 }
@@ -2808,20 +2828,14 @@ mod domain_teardown_tests {
         /// A one-op powerbox: `call.cap 1 0` is `exit(code)` — raise `EXIT_CODE | code << 32`,
         /// exactly as temen-run's host thunk does for `Trap::Exit`.
         unsafe extern "C" fn exit_thunk(
-            _ctx: *mut core::ffi::c_void,
-            _mem_base: *mut u8,
-            _mem_size: u64,
-            _mem_reserved: u64,
+            vm: &crate::VmCtx,
+            buf: *mut i64,
+            _counts: u64,
             _type_id: u32,
             _op: u32,
             _handle: i32,
-            args: *const i64,
-            _n_args: u64,
-            _results: *mut i64,
-            _n_results: u64,
-            vm: &crate::VmCtx,
         ) {
-            let code = *args as i32;
+            let code = *buf as i32;
             vm.raise(EXIT_CODE as i64 | ((code as i64) << 32));
         }
 
@@ -2926,21 +2940,15 @@ mod domain_teardown_tests {
     /// waits at most half of [`PROMPT`], so a run that never ends its domain still ends, with
     /// whatever outcome it then reports.
     unsafe extern "C" fn in_flight_thunk(
-        _ctx: *mut core::ffi::c_void,
-        _mem_base: *mut u8,
-        _mem_size: u64,
-        _mem_reserved: u64,
+        vm: &crate::VmCtx,
+        buf: *mut i64,
+        _counts: u64,
         _type_id: u32,
         op: u32,
         _handle: i32,
-        args: *const i64,
-        _n_args: u64,
-        _results: *mut i64,
-        _n_results: u64,
-        vm: &crate::VmCtx,
     ) {
         if op == 0 {
-            vm.raise(EXIT_CODE as i64 | ((*args as i32 as i64) << 32));
+            vm.raise(EXIT_CODE as i64 | ((*buf as i32 as i64) << 32));
             return;
         }
         let start = Instant::now();
@@ -4079,7 +4087,6 @@ impl CompiledModule {
             signals, // #932 async signal delivery (off unless a `SignalArm` was supplied)
             page: PageEnv::NONE, // #2164 — only a §14 child is demand-paged
             mask,
-            mapped: win_mapped as u64,
             guard_offset: guard_offset_of(win_reserved as u64),
             epoch: epoch_addr != 0,
             fuel: fuel_addr != 0,
@@ -4382,7 +4389,6 @@ impl CompiledModule {
                     nesting,
                     signals,
                     mask,
-                    mapped: win_mapped as u64,
                     guard_offset: guard_offset_of(win_reserved as u64),
                     epoch: epoch_addr != 0,
                     fuel: fuel_addr != 0,
@@ -4988,6 +4994,28 @@ impl CompiledModule {
         std::mem::take(&mut self.tail_out)
     }
 
+    /// #2534 — the window this compile's code runs over when its base is `base`, with its function
+    /// table: what a run's [`VmCtx`] records, so its host functions never take them from the code.
+    /// The sizes are the ones the compile baked in, as its accesses see them.
+    pub(crate) fn window_at(&self, base: *mut u8) -> Window {
+        Window {
+            base,
+            mapped: self.win_mapped as u64,
+            reserved: if self.win_mapped == 0 {
+                0
+            } else {
+                self.mask + 1
+            },
+            pages: if self.page.is_paged() {
+                self.page.pages
+            } else {
+                0
+            },
+            page_miss: self.page.miss,
+            fn_table: self.fn_table.base() as *const u8,
+        }
+    }
+
     /// #2025 — run `hook` over each fresh root window once it is seeded and protected, before the
     /// guest runs ([`WindowReady`], with `ctx` the root's powerbox): the embedder's page map records
     /// the read-only data pages (#2268), and a durable thaw's §13 pages are aliased back onto their
@@ -5257,7 +5285,7 @@ impl CompiledModule {
         // exit code for an Exit. Each spawned vCPU runs on a context of its own that shares that end
         // (#2488, `set_env`), so every end is a compare-and-swap from 0 — emitted code's and the
         // runtime's alike ([`VmCtx::raise`]) — and the first end wins (#2499).
-        let vm = VmCtx::new((*this).instance);
+        let vm = VmCtx::new((*this).instance, (*this).window_at(mem_base));
 
         // §12: the root vCPU (`main`) runs on this thread under the §5 detect-and-kill guard; any spawned
         // vCPUs run on their own OS threads via the instance's `Domain`. Seed its per-run `Env` now
@@ -5877,7 +5905,6 @@ impl CompiledModule {
             signals: false, // #932 — define_extra units are not signal-delivery armed (slice 1b)
             page: self.page, // #2164 — a paged child's units check its access table, as its own code does
             mask: self.mask,
-            mapped: self.win_mapped as u64,
             guard_offset: guard_offset_of(self.win_reserved as u64),
             epoch: self.epoch,
             fuel: self.fuel, // charges the running instance's fuel cell, as the parent's functions do
@@ -6318,16 +6345,17 @@ pub unsafe fn invoke_handler(
     }
 }
 
-/// #1768 — the instance a serving domain's module runs as (its powerbox, and the kill-path and fuel
-/// cells its compile was handed): what a caller running one of its handlers **on another thread**
-/// (the CALLS.md 5c.2 handoff) mints the handler's [`VmCtx`] from, so the handler's `call.cap`s reach
-/// the server's powerbox, never the caller's.
+/// #1768 — the context a caller running one of a serving domain's handlers **on another thread**
+/// (the CALLS.md 5c.2 handoff) runs it on: the server's instance (its powerbox, and the kill-path
+/// and fuel cells its compile was handed), so the handler's `call.cap`s reach the server's powerbox,
+/// never the caller's, over the server's window at `mem_base` (#2534).
 ///
 /// # Safety
-/// `cc` is a live registered serve context (see [`invoke_handler`]).
+/// `cc` is a live registered serve context (see [`invoke_handler`]), and `mem_base` its window.
 #[cfg(fiber_rt)]
-pub unsafe fn instance_of(cc: *const core::ffi::c_void) -> InstanceAddrs {
-    (*(cc as *const CompiledModule)).instance
+pub unsafe fn handler_vmctx(cc: *const core::ffi::c_void, mem_base: *mut u8) -> VmCtx {
+    let m = &*(cc as *const CompiledModule);
+    VmCtx::new(m.instance, m.window_at(mem_base))
 }
 
 /// CALLS.md 5c.1a — resolve handler `func`'s serve trampoline on a raw serve-context
@@ -6455,10 +6483,13 @@ enum HostFn {
     ChildOffer,
     ChildGrant,
     SetjmpSlot,
-    SetjmpLookup,
+    /// #2534 — `mem.copy`/`mem.move` and `mem.fill` (D62): the host confines, pages, probes and
+    /// writes the spans in the window the context names (`mem::mem_copy`, `mem::mem_fill`).
+    MemCopy,
+    MemFill,
     /// libc `_setjmp`, called inline in the guest frame (LLVM.md §"JIT `longjmp`").
     Setjmp,
-    /// libc `_longjmp`, called inline in the guest frame.
+    /// `rt_longjmp`: looks the host `jmp_buf` up and `_longjmp`s to it (#2534).
     Longjmp,
     VcpuTlsGet,
     VcpuTlsSet,
@@ -6478,7 +6509,7 @@ enum HostFn {
 
 impl HostFn {
     /// Every host function, for [`new_jit_module`] to bind.
-    const ALL: [HostFn; 31] = [
+    const ALL: [HostFn; 32] = [
         HostFn::CapThunk,
         HostFn::SigTake,
         HostFn::SigReturn,
@@ -6499,7 +6530,8 @@ impl HostFn {
         HostFn::ChildOffer,
         HostFn::ChildGrant,
         HostFn::SetjmpSlot,
-        HostFn::SetjmpLookup,
+        HostFn::MemCopy,
+        HostFn::MemFill,
         HostFn::Setjmp,
         HostFn::Longjmp,
         HostFn::VcpuTlsGet,
@@ -6550,7 +6582,8 @@ impl HostFn {
             HostFn::ChildOffer => "temen.child_offer",
             HostFn::ChildGrant => "temen.child_grant",
             HostFn::SetjmpSlot => "temen.setjmp_slot",
-            HostFn::SetjmpLookup => "temen.setjmp_lookup",
+            HostFn::MemCopy => "temen.mem_copy",
+            HostFn::MemFill => "temen.mem_fill",
             HostFn::Setjmp => "temen.setjmp",
             HostFn::Longjmp => "temen.longjmp",
             HostFn::VcpuTlsGet => "temen.vcpu_tls_get",
@@ -6565,53 +6598,94 @@ impl HostFn {
     }
 
     /// #2534 — what each argument register must be, for the machine-code validator to accept a call
-    /// to this host function. A host function confines guest pointers against the window values the
-    /// emitted code hands it, so a wrong register (a backend bug) would move the window the host
-    /// trusts; these tags pin the ones it would subvert. Positional, SysV integer-register order;
-    /// `Any`/trailing-unlisted arguments are unconstrained. The register-position frame buffers (a
-    /// fiber's or thread's status word, a signal record, GcRoots' marshalling struct) are tagged
-    /// here so the validator clobbers only their bytes across the call; the `call.cap` buffers ride
-    /// the stack (arguments past the sixth) and are checked in a PR 3c follow-up, when stack-passed
-    /// arguments get facts, along with `WindowSize`/`WindowReserved` tags for the window constants.
+    /// to this host function. Positional, SysV integer-register order; `Any`/trailing-unlisted
+    /// arguments are unconstrained. A host function takes from the code only what the code alone can
+    /// supply: the context, tagged `Vmctx`, through which it finds every runtime object and the
+    /// window it confines guest offsets to, and the register-position frame buffers it reads or
+    /// writes (a fiber's or thread's status word, a signal record, `gc.roots`' operands), tagged so
+    /// the validator clobbers only their bytes across the call. Everything else is a guest value the
+    /// host checks itself; no host function takes a window value or a runtime object from the code.
     fn arg_contract(self) -> &'static [validate::ArgTag] {
-        use validate::ArgTag::{Any, StackSlot, Vmctx, WindowBase};
+        use validate::ArgTag::{Any, FramePointer, JmpBuf, StackSlot, Vmctx};
         // An 8-byte status/exit word the host writes back through a resume's or join's `status_ptr`.
         const STATUS: validate::ArgTag = StackSlot {
             len: 8,
             write: true,
         };
         match self {
-            // ctx, mem_base, mem_size, mem_reserved, tid, op, handle, args_ptr, … (mem_size and
-            // mem_reserved are window constants — their `WindowSize`/`WindowReserved` tags wait on
-            // the validator tracking those constants across the spill they often ride, PR 3c).
-            HostFn::CapThunk => &[Any, WindowBase],
-            // vmctx, mem_base, off, len, flags
-            HostFn::PageMiss => &[Vmctx, WindowBase],
+            // vmctx, buf — the function's call buffer (`lower_cap_call`): the call's arguments in,
+            // its results out — then counts, type_id, op, handle
+            HostFn::CapThunk => &[
+                Vmctx,
+                StackSlot {
+                    len: (CAP_BUF_WORDS * 8) as u32,
+                    write: true,
+                },
+            ],
+            // vmctx, off, len, flags
+            HostFn::PageMiss => &[Vmctx],
+            // vmctx, funcref, arg0
+            HostFn::FiberNew => &[Vmctx],
             // vmctx, the lazy entry's own address
             HostFn::Resolve => &[Vmctx],
             // k, arg, status_ptr, vmctx
             HostFn::FiberResume => &[Any, Any, STATUS, Vmctx],
-            // sched, k, arg, status_ptr, vmctx
-            HostFn::FiberResumeBlock => &[Any, Any, Any, STATUS, Vmctx],
-            // sched, handle, status_ptr, vmctx — status_ptr-in-rdx, the same shape as FiberResume.
-            HostFn::ThreadJoin => &[Any, Any, STATUS, Vmctx],
-            // nursery, mem_base, instantiator, child, status_ptr, vmctx
-            HostFn::InstJoin => &[Any, WindowBase, Any, Any, STATUS, Vmctx],
-            // ctx, out — the host writes a 24-byte `[fref, signum, sp]` record into the out slot.
+            // vmctx, k, arg, status_ptr
+            HostFn::FiberResumeBlock => &[Vmctx, Any, Any, STATUS],
+            // value, vmctx
+            HostFn::FiberSuspend => &[Any, Vmctx],
+            // vmctx, handle, status_ptr
+            HostFn::ThreadJoin => &[Vmctx, Any, STATUS],
+            // vmctx, instantiator, child, status_ptr
+            HostFn::InstJoin => &[Vmctx, Any, Any, STATUS],
+            // vmctx, then guest values
+            HostFn::ThreadSpawn
+            | HostFn::ThreadWait
+            | HostFn::ThreadNotify
+            | HostFn::InstPoll
+            | HostFn::InstDetach
+            | HostFn::InstKill
+            | HostFn::InstSpawn
+            | HostFn::ChildOffer
+            | HostFn::ChildGrant
+            | HostFn::SetjmpSlot
+            | HostFn::Longjmp
+            | HostFn::MemCopy
+            | HostFn::MemFill => &[Vmctx],
+            // libc `_setjmp` saves the frame's registers into its argument, so it must be the host
+            // `jmp_buf` `SetjmpSlot` returned (`Self::ret`), never a value the code computed.
+            HostFn::Setjmp => &[JmpBuf],
+            // The trap capture walks the frame chain from its argument: this frame's pointer.
+            HostFn::TrapCapture => &[FramePointer],
+            // vmctx, out — the host writes a 24-byte `[fref, signum, sp]` record into the out slot.
             HostFn::SigTake => &[
-                Any,
+                Vmctx,
                 StackSlot {
                     len: 24,
                     write: true,
                 },
             ],
-            // args_ptr — one 80-byte marshalling struct the host only reads (the roots it collects
-            // go to a guest-memory `buf` field named inside it, never back into this frame).
-            HostFn::GcRoots => &[StackSlot {
-                len: 80,
-                write: false,
-            }],
+            // vmctx
+            HostFn::SigReturn => &[Vmctx],
+            // vmctx, args_ptr — the five operands the host only reads (the roots it collects go to
+            // the guest-memory `buf` named inside them, never back into this frame).
+            HostFn::GcRoots => &[
+                Vmctx,
+                StackSlot {
+                    len: 40,
+                    write: false,
+                },
+            ],
             _ => &[],
+        }
+    }
+
+    /// #2534 — what this host function returns, as far as the validator models it: `SetjmpSlot`'s
+    /// host `jmp_buf`, which only `Setjmp` takes; every other result is a guest value.
+    fn ret(self) -> validate::Ret {
+        match self {
+            HostFn::SetjmpSlot => validate::Ret::JmpBuf,
+            _ => validate::Ret::Unknown,
         }
     }
 
@@ -6628,51 +6702,46 @@ impl HostFn {
     fn signature(self, cc: cranelift_codegen::isa::CallConv) -> Signature {
         use HostFn::*;
         let (params, returns): (&[Type], &[Type]) = match self {
-            // (ctx, mem_base, mem_size, mem_reserved, type_id, op, handle, args, n_args, results,
-            // n_results, vmctx)
-            CapThunk => (
-                &[I64, I64, I64, I64, I32, I32, I32, I64, I64, I64, I64, I64],
-                &[],
-            ),
-            // (ctx, out) -> 1 when a signal is deliverable, 0 when not
+            // (vmctx, buf, counts, type_id, op, handle)
+            CapThunk => (&[I64, I64, I64, I32, I32, I32], &[]),
+            // (vmctx, out) -> 1 when a signal is deliverable, 0 when not
             SigTake => (&[I64, I64], &[I32]),
-            // (ctx)
+            // (vmctx)
             SigReturn => (&[I64], &[]),
-            // (mem_base, fn_table, vmctx, funcref, sp, fuel) -> handle (16-bit slot, 48-bit
-            // generation)
-            FiberNew => (&[I64, I64, I64, I32, I64, I64], &[I64]),
+            // (vmctx, funcref, arg0) -> handle (16-bit slot, 48-bit generation)
+            FiberNew => (&[I64, I32, I64], &[I64]),
             // (handle, arg, status_out, vmctx) -> value
             FiberResume => (&[I64, I64, I64, I64], &[I64]),
-            // (domain, handle, arg, status_out, vmctx) -> value
-            FiberResumeBlock => (&[I64, I64, I64, I64, I64], &[I64]),
+            // (vmctx, handle, arg, status_out) -> value
+            FiberResumeBlock => (&[I64, I64, I64, I64], &[I64]),
             // (value, vmctx) -> value
             FiberSuspend => (&[I64, I64], &[I64]),
-            // (args) -> the candidates found
-            GcRoots => (&[I64], &[I64]),
-            // (domain, mem_base, fn_table, vmctx, func, arg0, arg1) -> handle
-            ThreadSpawn => (&[I64, I64, I64, I64, I32, I64, I64], &[I32]),
-            // (domain, handle, status_out, vmctx) -> value
-            ThreadJoin => (&[I64, I32, I64, I64], &[I64]),
-            // (domain, addr, expected, width, timeout, vmctx) -> how the wait ended
-            ThreadWait => (&[I64, I64, I64, I32, I64, I64], &[I32]),
-            // (domain, addr, count) -> the waiters woken
+            // (vmctx, args) -> the candidates found
+            GcRoots => (&[I64, I64], &[I64]),
+            // (vmctx, func, arg0, arg1) -> handle
+            ThreadSpawn => (&[I64, I32, I64, I64], &[I32]),
+            // (vmctx, handle, status_out) -> value
+            ThreadJoin => (&[I64, I32, I64], &[I64]),
+            // (vmctx, addr, expected, width, timeout) -> how the wait ended
+            ThreadWait => (&[I64, I64, I64, I32, I64], &[I32]),
+            // (vmctx, addr, count) -> the waiters woken
             ThreadNotify => (&[I64, I64, I32], &[I32]),
-            // (nursery, mem_base, instantiator, child, status_out, vmctx) -> value
-            InstJoin => (&[I64, I64, I32, I32, I64, I64], &[I64]),
-            // (nursery, mem_base, instantiator, child, vmctx) -> status
-            InstPoll | InstDetach | InstKill => (&[I64, I64, I32, I32, I64], &[I32]),
-            // (nursery, mem_base, mem_size, instantiator, record, vmctx) -> child
-            InstSpawn => (&[I64, I64, I64, I32, I64, I64], &[I32]),
-            // (nursery, mem_base, instantiator, child, arg, vmctx) -> handle or -errno
-            ChildOffer | ChildGrant => (&[I64, I64, I32, I32, I64, I64], &[I32]),
-            // (table, buf) -> jmp_buf
+            // (vmctx, instantiator, child, status_out) -> value
+            InstJoin => (&[I64, I32, I32, I64], &[I64]),
+            // (vmctx, instantiator, child) -> status
+            InstPoll | InstDetach | InstKill => (&[I64, I32, I32], &[I32]),
+            // (vmctx, instantiator, record) -> child
+            InstSpawn => (&[I64, I32, I64], &[I32]),
+            // (vmctx, instantiator, child, arg) -> handle or -errno
+            ChildOffer | ChildGrant => (&[I64, I32, I32, I64], &[I32]),
+            // (vmctx, buf) -> jmp_buf
             SetjmpSlot => (&[I64, I64], &[I64]),
-            // (table, buf, vmctx) -> jmp_buf
-            SetjmpLookup => (&[I64, I64, I64], &[I64]),
+            // (vmctx, dst, src, len) / (vmctx, dst, byte, len)
+            MemCopy | MemFill => (&[I64, I64, I64, I64], &[]),
             // (jmp_buf) -> 0, or the value a `longjmp` to it passes
             Setjmp => (&[I64], &[I32]),
-            // (jmp_buf, value)
-            Longjmp => (&[I64, I32], &[]),
+            // (vmctx, buf, value); returns only when `buf` names no `setjmp`, having raised
+            Longjmp => (&[I64, I64, I32], &[]),
             VcpuTlsGet | DurableShadowBase | StackLimit => (&[], &[I64]),
             // (value)
             VcpuTlsSet => (&[I64], &[]),
@@ -6681,7 +6750,8 @@ impl HostFn {
             // (the fuel cell)
             FuelRefill => (&[I64], &[]),
             // (vmctx, mem_base, off, len, flags)
-            PageMiss => (&[I64, I64, I64, I64, I64], &[]),
+            // (vmctx, off, len, flags)
+            PageMiss => (&[I64, I64, I64, I64], &[]),
             // (vmctx, the lazy entry's own address) -> the function it runs
             Resolve => (&[I64, I64], &[I32]),
         };
@@ -6732,12 +6802,12 @@ impl HostFn {
             HostFn::ChildGrant => instantiator_rt::child_grant as *const (),
             #[cfg(setjmp_rt)]
             HostFn::SetjmpSlot => setjmp_rt::rt_setjmp_slot as *const (),
-            #[cfg(setjmp_rt)]
-            HostFn::SetjmpLookup => setjmp_rt::rt_setjmp_lookup as *const (),
+            HostFn::MemCopy => mem::mem_copy as *const (),
+            HostFn::MemFill => mem::mem_fill as *const (),
             #[cfg(setjmp_rt)]
             HostFn::Setjmp => setjmp_rt::setjmp_addr(),
             #[cfg(setjmp_rt)]
-            HostFn::Longjmp => setjmp_rt::longjmp_addr(),
+            HostFn::Longjmp => setjmp_rt::rt_longjmp as *const (),
             HostFn::VcpuTlsGet => vcpu_tls::get as *const (),
             HostFn::VcpuTlsSet => vcpu_tls::set as *const (),
             HostFn::DurableShadowBase => durable_shadow::get as *const (),
@@ -6800,8 +6870,8 @@ struct Callees {
     host: [FuncId; HostFn::ALL.len()],
     /// Each fast-path target's id, by [`fast_cap_key_of`]; `None` where the resolver claims none.
     fast: HashMap<[u32; 4], Option<FuncId>>,
-    /// The target's pointer width and default calling convention, for the Cranelift
-    /// `call_memcpy`/`call_memmove`/`call_memset` helpers that lower the bulk-memory ops (D62).
+    /// The target's pointer width and default calling convention, for the signatures lowering
+    /// builds on the spot (the fuel-remaining call's).
     frontend: cranelift_codegen::isa::TargetFrontendConfig,
 }
 
@@ -6968,15 +7038,14 @@ fn fast_cap_symbol([type_id, op, n_args, n_res]: [u32; 4]) -> String {
     format!("temen.fast_cap.{type_id}.{op}.{n_args}.{n_res}")
 }
 
-/// The C signature of the fast-path target for `key` ([`fast_cap_key_of`]): `(ctx, mem_base,
-/// mem_size, handle, vmctx, args…) -> [result]`, each arg and the result in its `i64` register
-/// slot.
+/// The C signature of the fast-path target for `key` ([`fast_cap_key_of`]): `(vmctx, handle,
+/// args…) -> [result]`, each arg and the result in its `i64` register slot.
 fn fast_cap_signature(
     cc: cranelift_codegen::isa::CallConv,
     [_, _, n_args, n_res]: [u32; 4],
 ) -> Signature {
-    let mut params = vec![I64, I64, I64, I32, I64];
-    params.resize(5 + n_args as usize, I64);
+    let mut params = vec![I64, I32];
+    params.resize(2 + n_args as usize, I64);
     c_signature(cc, &params, &[I64][..n_res as usize])
 }
 
@@ -7057,7 +7126,9 @@ fn new_jit_module(imports: Imports, claims: &FastClaims) -> Result<JITModule, Ji
 /// [`new_jit_module`] binds them as it binds each [`HostFn`], so the JIT never looks a name up in the
 /// process's dynamic symbol table, which a statically linked host doesn't have: there, a
 /// `memory.copy` could not link (#2514). The others (`Probestack`, which is off, and the TLS and x86
-/// shuffle helpers) name nothing a C runtime has.
+/// shuffle helpers) name nothing a C runtime has. No lowering calls `memcpy`/`memmove`/`memset`/
+/// `memcmp` since #2534 (a bulk op is a host helper), and the machine-code validator refuses a call
+/// to one; they stay bound so that a Cranelift change that emits one fails validation, not the link.
 fn libcalls() -> [(&'static str, *const u8); 14] {
     use core::ffi::{c_int, c_void};
     extern "C" {
@@ -7332,6 +7403,7 @@ fn callee_contracts(module: &JITModule) -> Vec<Option<validate::Contract>> {
             if let (Some(c), Some(name)) = (c.as_mut(), decl.name.as_deref()) {
                 c.args = host_args(name);
                 c.safepoint = host_safepoint(name);
+                c.ret = host_ret(name);
             }
             out[i] = c;
         }
@@ -7344,10 +7416,10 @@ fn callee_contracts(module: &JITModule) -> Vec<Option<validate::Contract>> {
 /// (`temen.fast_cap.{type}.{op}.{n_args}.{n_res}`), so it is matched by prefix; every other host
 /// function is matched against [`HostFn::symbol`], the single source of truth for these names.
 fn host_args(name: &str) -> &'static [validate::ArgTag] {
-    use validate::ArgTag::{Any, Vmctx, WindowBase};
+    use validate::ArgTag::Vmctx;
     if name.starts_with("temen.fast_cap.") {
-        // ctx, mem_base, mem_size, handle, vmctx, args…
-        return &[Any, WindowBase, Any, Any, Vmctx];
+        // vmctx, handle, args… — guest values, the target confines any buffer they name (#2534)
+        return &[Vmctx];
     }
     HostFn::ALL
         .iter()
@@ -7365,16 +7437,60 @@ fn host_safepoint(name: &str) -> bool {
         .is_some_and(|h| h.is_safepoint())
 }
 
+/// What a call to the host function a symbol names returns, for the validator (`HostFn::ret`).
+/// A guest function's result, and an unknown symbol's, is unknown.
+fn host_ret(name: &str) -> validate::Ret {
+    HostFn::ALL
+        .iter()
+        .find(|h| h.symbol() == name)
+        .map_or(validate::Ret::Unknown, |h| h.ret())
+}
+
+#[cfg(test)]
+mod cap_buffer_tests {
+    use super::*;
+
+    /// `call.cap 0 0` answers its two results; `call.cap 0 1` writes nothing.
+    unsafe extern "C" fn raw_thunk(_: &VmCtx, buf: *mut i64, _: u64, _: u32, op: u32, _: i32) {
+        if op == 0 {
+            *buf.add(CAP_RESULTS_AT) = 11;
+            *buf.add(CAP_RESULTS_AT + 1) = 0xdead;
+        }
+    }
+
+    /// Audit #4 (#2534) — every `call.cap` of a function shares one frame buffer, so a result slot
+    /// holds what an earlier call left there until the code zeroes it. A result the thunk leaves
+    /// unwritten reads zero.
+    #[test]
+    fn a_result_the_thunk_leaves_unwritten_reads_zero() {
+        let m = temen_text::parse_module(
+            "func () -> (i64, i64) {
+block 0 () {
+  v0 = i32.const 0
+  v1 = i64.const 5
+  v2, v3 = call.cap 0 0 (i64) -> (i64, i64) v0 (v1)
+  v4, v5 = call.cap 0 1 (i64) -> (i64, i64) v0 (v1)
+  return v4, v5
+}
+}",
+        )
+        .expect("parse");
+        temen_verify::verify_module(&m).expect("verify");
+        let out = compile_and_run_with_host(&m, 0, &[], raw_thunk, core::ptr::null_mut());
+        assert_eq!(out.expect("run"), JitOutcome::Returned(vec![0, 0]));
+    }
+}
+
 #[cfg(test)]
 mod arg_contract_tests {
     use super::*;
-    use validate::ArgTag::{Any, StackSlot, Vmctx, WindowBase};
+    use validate::ArgTag::{Any, StackSlot, Vmctx};
 
     /// #2534 — each host call that hands the host a pointer into the *caller's* frame must tag that
     /// pointer at the exact SysV argument index the ABI puts it: the validator clobbers the slot at
     /// that index's frame pointer (a wrong index would leave the real buffer's stale value trusted)
-    /// and checks the window/vmctx registers the host confines with. These pin the four PR 3c calls
-    /// against the call sites in `define_funcs`, and confirm `host_args` resolves the reloc symbol
+    /// and checks the context register the host derives everything else from. These pin the calls
+    /// with frame buffers against their call sites, and confirm `host_args` resolves the reloc symbol
     /// the validator sees to the same contract.
     #[test]
     fn frame_buffer_host_calls_are_tagged_at_their_abi_positions() {
@@ -7382,31 +7498,46 @@ mod arg_contract_tests {
             len: 8,
             write: true,
         };
-        // status_ptr in rdx (idx 2), vmctx in rcx — the FiberResume shape.
-        assert_eq!(HostFn::ThreadJoin.arg_contract(), &[Any, Any, W8, Vmctx]);
-        // mem_base in rsi (idx 1), status_ptr in r8 (idx 4), vmctx in r9.
+        // vmctx in rdi, status_ptr in rdx (idx 2).
+        assert_eq!(HostFn::ThreadJoin.arg_contract(), &[Vmctx, Any, W8]);
+        // vmctx in rdi, status_ptr in rcx (idx 3).
+        assert_eq!(HostFn::InstJoin.arg_contract(), &[Vmctx, Any, Any, W8]);
         assert_eq!(
-            HostFn::InstJoin.arg_contract(),
-            &[Any, WindowBase, Any, Any, W8, Vmctx]
+            HostFn::FiberResumeBlock.arg_contract(),
+            &[Vmctx, Any, Any, W8]
         );
-        // the 24-byte signal record in rsi (idx 1).
+        // vmctx in rdi, the 24-byte signal record in rsi (idx 1).
         assert_eq!(
             HostFn::SigTake.arg_contract(),
             &[
-                Any,
+                Vmctx,
                 StackSlot {
                     len: 24,
                     write: true
                 }
             ]
         );
-        // the 80-byte marshalling struct in rdi (idx 0), read-only.
+        // vmctx in rdi, the 40-byte operand struct in rsi (idx 1), read-only.
         assert_eq!(
             HostFn::GcRoots.arg_contract(),
-            &[StackSlot {
-                len: 80,
-                write: false
-            }]
+            &[
+                Vmctx,
+                StackSlot {
+                    len: 40,
+                    write: false
+                }
+            ]
+        );
+        // vmctx in rdi, the call's 256-byte argument and result buffer in rsi (idx 1).
+        assert_eq!(
+            HostFn::CapThunk.arg_contract(),
+            &[
+                Vmctx,
+                StackSlot {
+                    len: 256,
+                    write: true
+                }
+            ]
         );
         // The validator reads the contract by reloc symbol, so the wiring must agree.
         assert_eq!(
@@ -7419,6 +7550,50 @@ mod arg_contract_tests {
         );
         assert_eq!(host_args("temen.sig_take"), HostFn::SigTake.arg_contract());
         assert_eq!(host_args("temen.gc_roots"), HostFn::GcRoots.arg_contract());
+    }
+
+    /// #2534 — every host function that acts on the window or a runtime object takes the context
+    /// first, tagged, and derives from it the window, the function table and every runtime object
+    /// it acts on, so none takes one of those from the code: temen's own runtime functions, the bulk
+    /// helpers, and the embedder's `call.cap`, D45 fast-path, page-miss and signal thunks. No host
+    /// function tags an argument past the fourth, so every tagged argument is a register on SysV and
+    /// on Win64, which passes only four in registers: a stack argument carries no fact to check.
+    #[test]
+    fn runtime_host_calls_take_the_context_first() {
+        use HostFn::*;
+        for h in [
+            FiberNew,
+            FiberResumeBlock,
+            GcRoots,
+            ThreadSpawn,
+            ThreadJoin,
+            ThreadWait,
+            ThreadNotify,
+            InstJoin,
+            InstPoll,
+            InstDetach,
+            InstKill,
+            InstSpawn,
+            ChildOffer,
+            ChildGrant,
+            SetjmpSlot,
+            Longjmp,
+            MemCopy,
+            MemFill,
+            CapThunk,
+            PageMiss,
+            SigTake,
+            SigReturn,
+        ] {
+            assert_eq!(h.arg_contract().first(), Some(&Vmctx), "{h:?}");
+        }
+        assert_eq!(host_args(&fast_cap_symbol([3, 8, 1, 1])), &[Vmctx]);
+        for h in HostFn::ALL {
+            assert!(
+                h.arg_contract().len() <= 4,
+                "{h:?} tags a Win64 stack argument"
+            );
+        }
     }
 }
 
@@ -7489,14 +7664,7 @@ mod callees_tests {
         std::sync::Mutex::new(Vec::new());
 
     /// The fast path of `call.cap 3 8 (i64) -> (i64)`: its argument plus one.
-    unsafe extern "C" fn plus_one(
-        _: *mut c_void,
-        _: *mut u8,
-        _: u64,
-        _: i32,
-        _: *mut i64,
-        a: i64,
-    ) -> i64 {
+    unsafe extern "C" fn plus_one(_: &VmCtx, _: i32, a: i64) -> i64 {
         a + 1
     }
 
@@ -7590,6 +7758,8 @@ block 0 (vh: i32, vi: i32, vx: i64) {
   vtls = vcpu.tls.get
   vcpu.tls.set vtls
   vsb = durable.shadow_base
+  mem.copy vbuf vlo vx
+  mem.fill vbuf vc vx
   vkid = call.cap 6 17 (i64) -> (i32) vi (vx)
   vst, vval = call.cap 6 1 (i32) -> (i64, i64) vi (vkid)
   vp = call.cap 6 9 (i32) -> (i32) vi (vkid)
@@ -7633,31 +7803,9 @@ block 2 (v7: i32) {
 }
 ";
 
-    #[allow(clippy::too_many_arguments)]
-    unsafe extern "C" fn cap_thunk(
-        _: *mut c_void,
-        _: *mut u8,
-        _: u64,
-        _: u64,
-        _: u32,
-        _: u32,
-        _: i32,
-        _: *const i64,
-        _: u64,
-        _: *mut i64,
-        _: u64,
-        _: &VmCtx,
-    ) {
-    }
+    unsafe extern "C" fn cap_thunk(_: &VmCtx, _: *mut i64, _: u64, _: u32, _: u32, _: i32) {}
 
-    unsafe extern "C" fn fast_target(
-        _: *mut c_void,
-        _: *mut u8,
-        _: u64,
-        _: i32,
-        _: &VmCtx,
-        _: i64,
-    ) -> i64 {
+    unsafe extern "C" fn fast_target(_: &VmCtx, _: i32, _: i64) -> i64 {
         0
     }
 
@@ -7670,13 +7818,13 @@ block 2 (v7: i32) {
         }
     }
 
-    unsafe extern "C" fn sig_take(_: *mut c_void, _: *mut i64) -> i32 {
+    unsafe extern "C" fn sig_take(_: &VmCtx, _: *mut i64) -> i32 {
         0
     }
 
-    unsafe extern "C" fn sig_return(_: *mut c_void) {}
+    unsafe extern "C" fn sig_return(_: &VmCtx) {}
 
-    unsafe extern "C" fn page_miss(_: &VmCtx, _: *mut u8, _: u64, _: u64, _: u64) {}
+    unsafe extern "C" fn page_miss(_: &VmCtx, _: u64, _: u64, _: u64) {}
 
     /// What the test programs' compiles bind beside temen-jit's own functions.
     fn imports() -> Imports {
@@ -7972,12 +8120,10 @@ block 2 (v7: i32) {
         }
     }
 
-    /// #2788 — a bulk op of a **dynamic** length is machine-code-validator-clean. [`confine_span`]
-    /// range-checks each span with one `trapnz` and clamps its base; the I21 probe ([`probe_span`])
-    /// then touches the span's first and last byte, each confined like any guest access
-    /// ([`mask_addr`]). An unconfined `phys + (len − 1)` adds a guest length the validator cannot
-    /// bound (the range check is a relational `trapnz` it does not track), and is a load in the bulk
-    /// path not confined under a misspeculated `trapnz`.
+    /// #2788, #2534 — a bulk op of a **dynamic** length is machine-code-validator-clean: the code
+    /// hands the host helper (`mem::mem_copy`, `mem::mem_fill`) the context and the guest offsets,
+    /// and the helper confines the spans. No pointer-taking libcall (`memcpy`, …) is called, whose
+    /// arguments the validator could not check.
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn validator_is_clean_on_a_dynamic_length_bulk_op() {
@@ -8274,7 +8420,7 @@ fn compile_child_windowed(
     // #2164 — a demand-paged child checks its instance's access table before each access.
     let page = match (addrs.pages.is_null(), page_miss) {
         (true, _) => PageEnv::NONE,
-        (false, Some(_)) => PageEnv::paged(mapped),
+        (false, Some(miss)) => PageEnv::paged(mapped, miss),
         (false, None) => {
             return Err(JitError::Unsupported(
                 "a demand-paged child needs a page-miss thunk",
@@ -8352,7 +8498,6 @@ fn compile_child_windowed(
         signals: false, // #932 — a §14 child is not signal-delivery armed (slice 1b)
         page,    // #2164 — its access table's check, when it is demand-paged
         mask,
-        mapped,                                  // the committed prefix
         guard_offset: guard_offset_of(reserved), // its own window's trailing guard
         epoch: epoch_addr != 0, // §5 kill-path: the child polls the parent's interrupt cell
         fuel: fuel_addr != 0, // counted fuel: the child charges its own budget cell (else un-metered)
@@ -9032,15 +9177,16 @@ fn ensure_supported(f: &Func, type_section: &[temen_ir::TypeEntry]) -> Result<()
 }
 
 /// #932 — the JIT-side ABI of the async-signal delivery **decision** thunk a host supplies to
-/// [`compile_and_run_with_host_signals`]: given the delivery ctx and a 3-slot `out` buffer, gate on
-/// the nesting bound + consume one deliverable signal, writing `(handler_funcref, signum, handler_sp)`
-/// into `out[0..3]` and returning `1` (delivered) or `0` (nothing / bound reached). Mirrors the
-/// interpreter's per-op redirect — the host wires it to `temen_interp::SignalSource::take_deliverable`.
-pub type SigTakeThunk = unsafe extern "C" fn(ctx: *mut core::ffi::c_void, out: *mut i64) -> i32;
+/// [`compile_and_run_with_host_signals`]: given the calling context, whose `sig_ctx` is the
+/// delivery ctx (#2534), and a 3-slot `out` buffer in the caller's frame, gate on the nesting bound +
+/// consume one deliverable signal, writing `(handler_funcref, signum, handler_sp)` into `out[0..3]`
+/// and returning `1` (delivered) or `0` (nothing / bound reached). Mirrors the interpreter's per-op
+/// redirect — the host wires it to `temen_interp::SignalSource::take_deliverable`.
+pub type SigTakeThunk = unsafe extern "C" fn(vm: &VmCtx, out: *mut i64) -> i32;
 /// #932 — the JIT-side ABI of the async-signal **handler-return** thunk: fire after the guest handler
 /// the redirect dispatched returns, so the host restores the block-during-handler mask
-/// (`SignalSource::handler_returned`) and pops the nesting count.
-pub type SigReturnThunk = unsafe extern "C" fn(ctx: *mut core::ffi::c_void);
+/// (`SignalSource::handler_returned`) and pops the nesting count. Its delivery ctx is `vm.sig_ctx`.
+pub type SigReturnThunk = unsafe extern "C" fn(vm: &VmCtx);
 
 /// #932 — the host's async-signal delivery **arm** for a JIT run: the `Host::sig_armed` flag the
 /// lowering polls at its safepoints (function entries + taken back-edges), plus the two call-out
@@ -9067,6 +9213,8 @@ struct PageEnv {
     paged: bool,
     shift: u8,
     pages: u64,
+    /// The miss thunk, which the host's bulk-op helpers call too (#2534).
+    miss: Option<PageMissThunk>,
 }
 
 impl PageEnv {
@@ -9074,15 +9222,17 @@ impl PageEnv {
         paged: false,
         shift: 0,
         pages: 0,
+        miss: None,
     };
 
-    /// The shape for a child whose declared window is `mapped` bytes.
-    fn paged(mapped: u64) -> PageEnv {
+    /// The shape for a child whose declared window is `mapped` bytes, whose misses `miss` serves.
+    fn paged(mapped: u64, miss: PageMissThunk) -> PageEnv {
         let page = mem::page_size() as u64;
         PageEnv {
             paged: true,
             shift: page.trailing_zeros() as u8,
             pages: mapped.div_ceil(page),
+            miss: Some(miss),
         }
     }
 
@@ -9208,10 +9358,6 @@ struct Lower<'a> {
     result_tys: Vec<Type>,
     /// The §4 confinement mask (`reserved - 1`); `0` when the module has no memory.
     mask: u64,
-    /// The backed `mapped` extent in bytes — the guest window length handed to the `call.cap`
-    /// thunk (`[mem_base, mem_base+mapped)`), so buffer borrows and Memory-cap ops bound against
-    /// the *backed* region, not the larger reserved mask domain. `0` when the module has no memory.
-    mapped: u64,
     /// Offset from `mem_base` of the **window's trailing guard page** — `round_up(win_reserved,
     /// page)`. Always `PROT_NONE`, so the D63 branchless lowering redirects an out-of-bounds access
     /// here to fault it. `0` when the module has no memory (the branchless path isn't taken).
@@ -9296,6 +9442,10 @@ struct Lower<'a> {
     page: Option<(PageEnv, FuncRef, Variable)>,
     /// #2488 — the function's shared exits ([`Exits`]).
     exits: Exits,
+    /// #2534 — the function's `call.cap` buffer, [`CAP_BUF_WORDS`] words of its frame that every
+    /// `call.cap` in it passes its arguments and results through ([`lower_cap_call`]), made at the
+    /// first. One per function, so a function of many calls does not grow a frame per call.
+    cap_buf: std::cell::Cell<Option<cranelift_codegen::ir::StackSlot>>,
 }
 
 /// The address of the §5 W3 explicit-trap capture helper (`temen_capture_explicit_trap` in
@@ -9339,8 +9489,6 @@ struct LowerPlan<'a> {
     page: PageEnv,
     /// The §4 confinement mask (`reserved - 1`); `0` when the module has no memory.
     mask: u64,
-    /// The backed `mapped` extent in bytes.
-    mapped: u64,
     /// Offset from `mem_base` of the window's trailing guard page.
     guard_offset: u64,
     /// Poll the §5 interrupt cell.
@@ -9384,7 +9532,6 @@ fn open_function<'a>(
         signals,
         page,
         mask,
-        mapped,
         guard_offset,
         epoch,
         fuel,
@@ -9461,7 +9608,6 @@ fn open_function<'a>(
         funcs,
         result_tys: results.iter().map(|t| clif_ty(*t)).collect(),
         mask,
-        mapped,
         guard_offset,
         fn_table_mask,
         slots,
@@ -9480,6 +9626,7 @@ fn open_function<'a>(
         trap_capture,
         page,
         exits: Exits::default(),
+        cap_buf: std::cell::Cell::new(None),
     };
     // The params follow the three context pointers and the stack limit, then the sret pointer.
     let pbase = 4 + usize::from(sret);
@@ -10621,26 +10768,14 @@ fn lower_block(
         // `mem_base`/`fn_table_base`/`vmctx` like `call.cap`. A thunk that sets the trap cell
         // (forged handle, bad funcref, fiber-bomb, root suspend) propagates here.
         if let Inst::ContNew { func, arg0 } = inst {
-            // fiber_new(mem_base, fn_table_base, vmctx, funcref:i32, arg0:i64, fuel_addr:i64) -> i32
-            // handle. The running vCPU's fiber runtime is read from a thread-local, so threads +
-            // fibers compose. `fuel_addr` (`0` ⇒ un-armed) lets the fiber's first entry refund the
-            // prologue charge its starting `cont.resume` already paid (#1642).
-            let mem_base = b.use_var(lower.mem_var);
-            let fnt = b.use_var(lower.fn_table_var);
+            // fiber_new(vmctx, funcref:i32, arg0:i64) -> i32 handle. The running vCPU's fiber
+            // runtime is read from a thread-local, so threads + fibers compose. The fiber's window,
+            // function table and fuel cell (whose first entry refunds the prologue charge its
+            // starting `cont.resume` already paid, #1642) are its creator's, read from `vmctx`.
             let vmctx = b.use_var(lower.vmctx_var);
             let funcref = get(&vals, *func)?;
             let arg0 = get(&vals, *arg0)?;
-            let fuel = if lower.fuel {
-                vmctx_load(b, lower, vmctx::FUEL)
-            } else {
-                b.ins().iconst(I64, 0)
-            };
-            let call = call_host(
-                lower.callees,
-                b,
-                HostFn::FiberNew,
-                &[mem_base, fnt, vmctx, funcref, arg0, fuel],
-            )?;
+            let call = call_host(lower.callees, b, HostFn::FiberNew, &[vmctx, funcref, arg0])?;
             emit_trap_propagate(b, lower, Callee::Host);
             vals.push(b.inst_results(call)[0]);
             continue;
@@ -10666,13 +10801,12 @@ fn lower_block(
             let av = get(&vals, *arg)?;
             let vmctx = b.use_var(lower.vmctx_var);
             let call = if blocking {
-                // fiber_resume_block(sched, handle, arg, status_out, vmctx) -> value:i64.
-                let sched = vmctx_load(b, lower, vmctx::SCHED);
+                // fiber_resume_block(vmctx, handle, arg, status_out) -> value:i64.
                 call_host(
                     lower.callees,
                     b,
                     HostFn::FiberResumeBlock,
-                    &[sched, kh, av, status_ptr, vmctx],
+                    &[vmctx, kh, av, status_ptr],
                 )?
             } else {
                 // fiber_resume(handle, arg, status_out, vmctx) -> value:i64.
@@ -10714,9 +10848,9 @@ fn lower_block(
             // stackslot *before* the call, and reload it after, so both returns (direct and via
             // longjmp) read the saved copy, not a spill slot the longjmp path may clobber.
             let laundered = launder_across_setjmp(b, lower, blk, inst_idx, &vals);
-            // slot = rt_setjmp_slot(rt_addr, buf) -> *mut jmp_buf
-            let rt_addr = vmctx_load(b, lower, vmctx::SETJMP);
-            let c1 = call_host(lower.callees, b, HostFn::SetjmpSlot, &[rt_addr, bufv])?;
+            // slot = rt_setjmp_slot(vmctx, buf) -> *mut jmp_buf, in the instance's table (#2534)
+            let vmctx = b.use_var(lower.vmctx_var);
+            let c1 = call_host(lower.callees, b, HostFn::SetjmpSlot, &[vmctx, bufv])?;
             let slot = b.inst_results(c1)[0];
             // r = _setjmp(slot) -> i32 — emitted inline in this JIT frame.
             let c2 = call_host(lower.callees, b, HostFn::Setjmp, &[slot])?;
@@ -10727,28 +10861,17 @@ fn lower_block(
             vals.push(r);
             continue;
         }
-        // `longjmp` (LLVM.md §"JIT `longjmp`"): look up the host `jmp_buf` slot for this `buf` (set by a
-        // prior `setjmp`); a miss writes the trap cell and `emit_trap_propagate` bails *before* the
-        // (skipped) `_longjmp`. Otherwise `_longjmp(slot, val)` restores the saved frame and never
-        // returns — the IR's trailing `unreachable` terminator caps the block (the call isn't marked
-        // noreturn, but the dead fall-through is terminated by it). No result.
+        // `longjmp` (LLVM.md §"JIT `longjmp`"): `rt_longjmp(vmctx, buf, val)` looks up the host
+        // `jmp_buf` slot for this `buf` (set by a prior `setjmp`) and `_longjmp`s to it, restoring the
+        // saved frame and never returning; the IR's trailing `unreachable` terminator caps the block.
+        // A miss (forged/stale token) raises instead and returns, and `emit_trap_propagate` bails. The
+        // code never holds the host slot, so it cannot hand `_longjmp` a forged one (#2534). No result.
         if let Inst::LongJmp { buf, val } = inst {
             let bufv = get(&vals, *buf)?;
             let valv = get(&vals, *val)?; // i32 long-jump value (0 → 1 is applied by libc `_longjmp`)
             let vmctx = b.use_var(lower.vmctx_var);
-            // slot = rt_setjmp_lookup(rt_addr, buf, vmctx) -> *mut jmp_buf (null + trap on miss)
-            let rt_addr = vmctx_load(b, lower, vmctx::SETJMP);
-            let c1 = call_host(
-                lower.callees,
-                b,
-                HostFn::SetjmpLookup,
-                &[rt_addr, bufv, vmctx],
-            )?;
-            let slot = b.inst_results(c1)[0];
-            // Bail on a miss (forged/stale token) before `_longjmp`.
+            call_host(lower.callees, b, HostFn::Longjmp, &[vmctx, bufv, valv])?;
             emit_trap_propagate(b, lower, Callee::Host);
-            // _longjmp(slot, val) — inline, noreturn.
-            call_host(lower.callees, b, HostFn::Longjmp, &[slot, valv])?;
             continue;
         }
         // §12 per-vCPU TLS register: thunks over a per-OS-thread word (no window/trap context —
@@ -10780,72 +10903,47 @@ fn lower_block(
             cap,
         } = inst
         {
-            // gc_roots(heap_lo, heap_hi, payload_mask, buf, cap, mem_base, mask, mapped, vmctx)
-            // -> i64 count. The thunk walks the live fiber stacks (runtime via the thread-local),
-            // masks each word with `payload_mask` (§GC tagged pointers; distinct from the
-            // window-confinement `mask`), filters the masked value to `[heap_lo, heap_hi)`, and
-            // writes the first `cap` deduped words to guest `buf` — confining/bounds-checking it
-            // with the same `mask`/bound as `mask_addr`, so a forged buffer faults
-            // (below). #826: the bound is the **reserved** mask domain (not the compile-time
-            // `mapped`), so a roots buffer in a legitimately `map`-grown tail page is admitted
-            // where the interpreter's live page map admits it; committed-ness and write-protection
-            // are the hardware's to enforce — a write into an uncommitted or `Ro` page faults through
-            // the SIGSEGV shim to `MemoryFault`, exactly like a guest store.
+            // gc_roots(vmctx, args) -> i64 count, `args` the five operands. The thunk walks the live
+            // fiber stacks (runtime via the thread-local), masks each word with `payload_mask` (§GC
+            // tagged pointers; distinct from the window-confinement mask), filters the masked value
+            // to `[heap_lo, heap_hi)`, and writes the first `cap` deduped words to guest `buf` —
+            // confining/bounds-checking it against `vmctx`'s window (#2534) with the same mask/bound
+            // as `mask_addr`, so a forged buffer faults. #826: the bound is the **reserved** mask
+            // domain (not the compile-time `mapped`), so a roots buffer in a legitimately
+            // `map`-grown tail page is admitted where the interpreter's live page map admits it;
+            // committed-ness and write-protection are the hardware's to enforce — a write into an
+            // uncommitted or `Ro` page faults through the SIGSEGV shim to `MemoryFault`, exactly like
+            // a guest store. A demand-paged child's thunk checks its access table first (#2164).
             let lo = get(&vals, *heap_lo)?;
             let hi = get(&vals, *heap_hi)?;
             let payload_mask = get(&vals, *mask)?;
             let dst = get(&vals, *buf)?;
             let cap_v = get(&vals, *cap)?;
-            let mem_base = b.use_var(lower.mem_var);
-            let maskv = b.ins().iconst(I64, lower.mask as i64);
-            let win_reserved = if lower.mapped == 0 { 0 } else { lower.mask + 1 };
-            let mappedv = b.ins().iconst(I64, win_reserved as i64);
             let vmctx = b.use_var(lower.vmctx_var);
-            // #2164 — a demand-paged child's thunk checks the access table before it writes: the
-            // declared window's page count bounds it.
-            let pages = b
-                .ins()
-                .iconst(I64, lower.page.map_or(0, |(p, ..)| p.pages as i64));
-            // Marshal the ten args into one 8-byte-aligned stack slot (matching `GcRootsArgs`'s
-            // `#[repr(C)]` field order) and pass a single pointer. The thunk is the register-flush
-            // trampoline, which spills the callee-saved registers before the scan; a one-pointer ABI
-            // lets it do so with no per-argument reshuffle (see `fiber_rt::temen_gc_roots_flush`).
+            // Marshal the five operands into one 8-byte-aligned stack slot (matching `GcRootsArgs`'s
+            // `#[repr(C)]` field order) and pass its address beside `vmctx`. The thunk is the
+            // register-flush trampoline, which spills the callee-saved registers before the scan; two
+            // register arguments on every ABI let it do so with no per-argument reshuffle (see
+            // `fiber_rt::temen_gc_roots_flush`).
             let slot = b.create_sized_stack_slot(StackSlotData::new(
                 StackSlotKind::ExplicitSlot,
-                80, // 10 × 8 bytes
+                40, // 5 × 8 bytes
                 3,  // 8-byte aligned
             ));
-            for (i, v) in [
-                lo,
-                hi,
-                payload_mask,
-                dst,
-                cap_v,
-                mem_base,
-                maskv,
-                mappedv,
-                vmctx,
-                pages,
-            ]
-            .into_iter()
-            .enumerate()
-            {
+            for (i, v) in [lo, hi, payload_mask, dst, cap_v].into_iter().enumerate() {
                 b.ins().stack_store(v, slot, (i * 8) as i32);
             }
             let args_ptr = b.ins().stack_addr(I64, slot, 0);
-            let call = call_host(lower.callees, b, HostFn::GcRoots, &[args_ptr])?;
+            let call = call_host(lower.callees, b, HostFn::GcRoots, &[vmctx, args_ptr])?;
             emit_trap_propagate(b, lower, Callee::Host);
             vals.push(b.inst_results(call)[0]);
             continue;
         }
         // §12 threads: lower `thread.spawn`/`thread.join` to calls to the host scheduler thunks
-        // ([`HostFn`]), threading `mem_base`/`fn_table_base`/`vmctx` like `call.cap`. A thunk
+        // ([`HostFn`]), threading `vmctx`, through which the thunk finds the domain (#2534). A thunk
         // that sets the trap cell (forged handle, thread-bomb) propagates here.
         if let Inst::ThreadSpawn { func, arg0, arg1 } = inst {
-            // thread_spawn(sched, mem_base, fn_table_base, vmctx, func_idx:i32, arg0:i64, arg1:i64) -> i32
-            let sched = vmctx_load(b, lower, vmctx::SCHED);
-            let mem_base = b.use_var(lower.mem_var);
-            let fnt = b.use_var(lower.fn_table_var);
+            // thread_spawn(vmctx, func_idx:i32, arg0:i64, arg1:i64) -> i32
             let vmctx = b.use_var(lower.vmctx_var);
             // The spawn entry is dispatched through the shared `fn_table` (`os_thread_rt` masks it
             // into the table like any `call.dyn`), so it names `func`'s slot, as `ref.func` does:
@@ -10858,16 +10956,15 @@ fn lower_block(
                 lower.callees,
                 b,
                 HostFn::ThreadSpawn,
-                &[sched, mem_base, fnt, vmctx, func_idx, arg0, arg1],
+                &[vmctx, func_idx, arg0, arg1],
             )?;
             emit_trap_propagate(b, lower, Callee::Host);
             vals.push(b.inst_results(call)[0]);
             continue;
         }
         if let Inst::ThreadJoin { handle } = inst {
-            // thread_join(sched, handle:i32, status_out:i64, vmctx:i64) -> value:i64, the status
-            // through `status_out` as `Instantiator.join`'s is (#2667).
-            let sched = vmctx_load(b, lower, vmctx::SCHED);
+            // thread_join(vmctx, handle:i32, status_out:i64) -> value:i64, the status through
+            // `status_out` as `Instantiator.join`'s is (#2667).
             let h = get(&vals, *handle)?;
             let ss =
                 b.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 8, 3));
@@ -10877,7 +10974,7 @@ fn lower_block(
                 lower.callees,
                 b,
                 HostFn::ThreadJoin,
-                &[sched, h, status_ptr, vmctx],
+                &[vmctx, h, status_ptr],
             )?;
             emit_trap_propagate(b, lower, Callee::Host);
             let value = b.inst_results(call)[0];
@@ -10892,16 +10989,18 @@ fn lower_block(
             timeout,
         } = inst
         {
-            // thread_wait(sched, phys:i64, expected:i64, width:i32, timeout:i64, vmctx:i64) ->
-            // status:i32. `vmctx` carries the §12.8 thaw fail-closed (a re-issued wait that would
-            // park on the single worker traps `ThreadFault`); on a fresh run it is never written.
+            // thread_wait(vmctx, addr:i64, expected:i64, width:i32, timeout:i64) -> status:i32. The
+            // thunk confines `addr` against `vmctx`'s window itself (#2534); the code confines it too,
+            // for the alignment and page checks, whose traps come first. `vmctx` also carries the
+            // §12.8 thaw fail-closed (a re-issued wait that would park on the single worker traps
+            // `ThreadFault`).
             let w = atomic_width(*ty);
-            let phys = mask_addr(b, lower, get(&vals, *addr)?, 0, false, w);
+            let addr = get(&vals, *addr)?;
+            let phys = mask_addr(b, lower, addr, 0, false, w);
             guard_atomic_align(b, lower, phys, w); // misaligned wait traps (like the other atomics)
                                                    // #2164 — a wait reads its word, and a word on an unsupplied page faults it: fatal on
                                                    // every engine, never paged.
             emit_page_check(b, lower, phys, w, PAGE_MISS_FATAL);
-            let sched = vmctx_load(b, lower, vmctx::SCHED);
             let exp_raw = get(&vals, *expected)?;
             let exp = if w < 8 {
                 b.ins().uextend(I64, exp_raw) // compare is bit-equality on the low `w` bytes
@@ -10915,19 +11014,20 @@ fn lower_block(
                 lower.callees,
                 b,
                 HostFn::ThreadWait,
-                &[sched, phys, exp, width, to, vmctx],
+                &[vmctx, addr, exp, width, to],
             )?;
             emit_trap_propagate(b, lower, Callee::Host);
             vals.push(b.inst_results(call)[0]);
             continue;
         }
         if let Inst::MemoryNotify { addr, count } = inst {
-            // thread_notify(sched, phys:i64, count:i32) -> woken:i32. Accesses no memory (the address
-            // is only confined, no alignment requirement — matching the interpreter).
-            let phys = mask_addr(b, lower, get(&vals, *addr)?, 0, false, 4);
-            let sched = vmctx_load(b, lower, vmctx::SCHED);
+            // thread_notify(vmctx, addr:i64, count:i32) -> woken:i32. Accesses no memory (the thunk
+            // confines the address against `vmctx`'s window, #2534; no alignment requirement —
+            // matching the interpreter).
+            let addr = get(&vals, *addr)?;
+            let vmctx = b.use_var(lower.vmctx_var);
             let cnt = get(&vals, *count)?;
-            let call = call_host(lower.callees, b, HostFn::ThreadNotify, &[sched, phys, cnt])?;
+            let call = call_host(lower.callees, b, HostFn::ThreadNotify, &[vmctx, addr, cnt])?;
             vals.push(b.inst_results(call)[0]);
             continue;
         }
@@ -11635,11 +11735,13 @@ fn lower_block(
                 lower_store(b, *op, phys, get(&vals, *value)?);
                 continue; // store produces no value
             }
-            // Bulk-memory ops (D62). Each span is confined once (single range check + base clamp),
-            // then the copy/fill is the platform libcall — `memory.copy`-class lowering, not a
-            // per-byte confined loop. `MemCopy`/`MemMove` differ only in the libcall (overlap safety).
-            // #2177: a short copy of one of this block's constant lengths is loads and stores instead
-            // ([`copy_inline`]); a zero-length one is inert, as the libcall path makes it.
+            // Bulk-memory ops (D62): the host helper confines both spans to the context's window,
+            // checks a demand-paged child's pages, probes each span's first and last byte (I21) and
+            // copies or fills — the interpreters' order, through the one span-OOB reference, with
+            // no window pointer from the code (#2534). `MemCopy`/`MemMove` are one helper: both are
+            // overlap-safe, as the interpreters make them. #2177: a short copy of one of this
+            // block's constant lengths is loads and stores instead ([`copy_inline`]); a zero-length
+            // one is inert, as the helper makes it.
             Inst::MemCopy { dst, src, len } | Inst::MemMove { dst, src, len } => {
                 let short = checked.consts.get(&get(&vals, *len)?).copied();
                 if let Some(n) =
@@ -11650,32 +11752,30 @@ fn lower_block(
                     }
                     continue;
                 }
-                let n = get(&vals, *len)?;
-                let (dv, sv) = (get(&vals, *dst)?, get(&vals, *src)?);
-                let dphys = confine_span(b, lower, dv, n);
-                let sphys = confine_span(b, lower, sv, n);
-                // #2164: the source's pages, then the destination's, as the interpreters check them.
-                emit_span_page_check(b, lower, sphys, n, 0);
-                emit_span_page_check(b, lower, dphys, n, PAGE_MISS_WRITE);
-                // I21: fault an overrun before the libcall (no partial write; catches `dst==src`).
-                probe_span(b, lower, dv, n);
-                probe_span(b, lower, sv, n);
-                if matches!(inst, Inst::MemCopy { .. }) {
-                    b.call_memcpy(lower.callees.frontend, dphys, sphys, n);
-                } else {
-                    b.call_memmove(lower.callees.frontend, dphys, sphys, n);
-                }
+                let vmctx = b.use_var(lower.vmctx_var);
+                let (dv, sv, n) = (get(&vals, *dst)?, get(&vals, *src)?, get(&vals, *len)?);
+                call_host(lower.callees, b, HostFn::MemCopy, &[vmctx, dv, sv, n])?;
+                // The helper raises a fault on this context, which sets its stop word: one load,
+                // as after a guest call, not the domain's end (it runs no guest code and parks
+                // only in a pager, whose end it raises here too).
+                emit_trap_propagate(b, lower, Callee::Guest);
                 continue;
             }
             Inst::MemFill { dst, val, len } => {
-                let n = get(&vals, *len)?;
-                let dv = get(&vals, *dst)?;
-                let dphys = confine_span(b, lower, dv, n);
-                emit_span_page_check(b, lower, dphys, n, PAGE_MISS_WRITE); // #2164
-                probe_span(b, lower, dv, n);
-                // `call_memset` uextends the fill byte to i32, so hand it the low byte (i8).
-                let v8 = b.ins().ireduce(I8, get(&vals, *val)?);
-                b.call_memset(lower.callees.frontend, dphys, v8, n);
+                let vmctx = b.use_var(lower.vmctx_var);
+                let (dv, n) = (get(&vals, *dst)?, get(&vals, *len)?);
+                // The helper keeps the low byte; hand it the value as one i64 argument.
+                let v = get(&vals, *val)?;
+                let v = if b.func.dfg.value_type(v) == I64 {
+                    v
+                } else {
+                    b.ins().uextend(I64, v)
+                };
+                call_host(lower.callees, b, HostFn::MemFill, &[vmctx, dv, v, n])?;
+                // The helper raises a fault on this context, which sets its stop word: one load,
+                // as after a guest call, not the domain's end (it runs no guest code and parks
+                // only in a pager, whose end it raises here too).
+                emit_trap_propagate(b, lower, Callee::Guest);
                 continue;
             }
             // §12 atomics. Confine like a normal access, then a natural-alignment guard (a misaligned
@@ -12260,12 +12360,13 @@ fn emit_signal_check(b: &mut FunctionBuilder, lower: &Lower) -> Result<(), JitEr
     let maybe = b.create_block();
     b.ins().brif(armed, maybe, &[], cont, &[]);
 
-    // Armed: ask the host decision thunk `fn(ctx, *mut [i64;3]) -> i32` for a deliverable signal.
+    // Armed: ask the host decision thunk `fn(vmctx, *mut [i64;3]) -> i32` for a deliverable signal;
+    // it finds the delivery ctx through `vmctx` (#2534).
     b.switch_to_block(maybe);
     let out_ss = b.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 24, 3)); // [fref,signum,sp]
     let out = b.ins().stack_addr(I64, out_ss, 0);
-    let ctx = vmctx_load(b, lower, vmctx::SIG_CTX);
-    let got = call_host(lower.callees, b, HostFn::SigTake, &[ctx, out])?;
+    let vmctx = b.use_var(lower.vmctx_var);
+    let got = call_host(lower.callees, b, HostFn::SigTake, &[vmctx, out])?;
     let got = b.inst_results(got)[0];
     let deliver = b.create_block();
     b.ins().brif(got, deliver, &[], cont, &[]);
@@ -12294,8 +12395,8 @@ fn emit_signal_check(b: &mut FunctionBuilder, lower: &Lower) -> Result<(), JitEr
     // exactly as after a `call.dyn`. Leaves the builder in a fresh continuation block.
     emit_trap_propagate(b, lower, Callee::Guest);
     // Handler returned normally: notify the host (restore the block-during-handler mask, pop nesting).
-    let ctx2 = vmctx_load(b, lower, vmctx::SIG_CTX);
-    call_host(lower.callees, b, HostFn::SigReturn, &[ctx2])?;
+    let vmctx = b.use_var(lower.vmctx_var);
+    call_host(lower.callees, b, HostFn::SigReturn, &[vmctx])?;
     b.ins().jump(poll, &[]); // re-poll: deliver a nested/queued signal before resuming
     b.switch_to_block(cont);
     // `poll`/`maybe`/`deliver`/`cont` are sealed by the caller's `seal_all_blocks`.
@@ -12637,18 +12738,10 @@ fn lower_cap_call_fast(
     vals: &mut Vec<Value>,
 ) -> Result<(), JitError> {
     let n_res = sig.results.len();
-    let ctx = vmctx_load(b, lower, vmctx::CAP_CTX);
-    let mem_base = b.use_var(lower.mem_var);
-    // #826: this frozen `lower.mapped` is deliberate — the ABI slot is the window's
-    // default-committed **prefix** (the interpreter's equally-frozen `window.mapped`; growth lives
-    // as explicit page-map entries, never by moving this value). A fast-path fn that needs to
-    // admit grown-tail buffers must consult live page state like the generic thunk's
-    // `MprotectWindow` does, not this bound alone.
-    let mem_size = b.ins().iconst(I64, lower.mapped as i64);
     let h = get(vals, handle)?;
+    // The target finds the powerbox and the window through the context (#2534).
     let vmctx = b.use_var(lower.vmctx_var);
-
-    let mut call_args = vec![ctx, mem_base, mem_size, h, vmctx];
+    let mut call_args = vec![vmctx, h];
     for a in args {
         let v = get(vals, *a)?;
         call_args.push(encode_slot(b, v)); // each arg widened to its i64 register slot
@@ -12665,10 +12758,12 @@ fn lower_cap_call_fast(
     Ok(())
 }
 
-/// Lower a `call.cap` (§3c/§9): marshal the arg slots into a stack buffer, call the host
-/// thunk ([`HostFn::CapThunk`]) with the cap immediates + the guest window, and
-/// — unless it set the trap cell — read the result slots back. A trap from the thunk
-/// (CapFault / Exit) propagates like any other (return early; the cell is already set).
+/// Lower a `call.cap` (§3c/§9): store the args into the function's call buffer and zero its result
+/// slots ([`cap_slots`]), call the host thunk ([`HostFn::CapThunk`]) with the cap immediates, the
+/// context and the buffer, and — unless it set the trap cell — read the results back. A trap from
+/// the thunk (CapFault / Exit) propagates like any other (return early; the cell is already set).
+/// The thunk finds the powerbox and the window through the context, so the code hands it neither
+/// (#2534).
 #[allow(clippy::too_many_arguments)]
 fn lower_cap_call(
     b: &mut FunctionBuilder,
@@ -12682,94 +12777,55 @@ fn lower_cap_call(
     args: &[u32],
     vals: &mut Vec<Value>,
 ) -> Result<(), JitError> {
-    let n_args = args.len();
-    let n_res = sig.results.len();
-
-    // Marshal the args into a stack buffer of i64 slots (null pointer when there are 0).
-    let args_ptr = if n_args == 0 {
-        b.ins().iconst(I64, 0)
-    } else {
+    let (n_args, n_res) = (args.len(), sig.results.len());
+    // The verifier holds every call to the buffer; an unverified one is refused, never lowered past it.
+    if n_args > temen_ir::CAP_MAX_ARITY || n_res > temen_ir::CAP_MAX_ARITY {
+        return Err(JitError::Malformed);
+    }
+    let buf = lower.cap_buf.get().unwrap_or_else(|| {
         let ss = b.create_sized_stack_slot(StackSlotData::new(
             StackSlotKind::ExplicitSlot,
-            (n_args * 8) as u32,
+            (CAP_BUF_WORDS * 8) as u32,
             3,
         ));
-        let addr = b.ins().stack_addr(I64, ss, 0);
-        for (i, a) in args.iter().enumerate() {
-            let v = get(vals, *a)?;
-            let slot = encode_slot(b, v);
-            b.ins()
-                .store(MemFlags::trusted(), slot, addr, (i * 8) as i32);
-        }
-        addr
-    };
-    let res_ss = if n_res == 0 {
-        None
-    } else {
-        Some(b.create_sized_stack_slot(StackSlotData::new(
-            StackSlotKind::ExplicitSlot,
-            (n_res * 8) as u32,
-            3,
-        )))
-    };
-    let res_ptr = match res_ss {
-        Some(ss) => b.ins().stack_addr(I64, ss, 0),
-        None => b.ins().iconst(I64, 0),
-    };
-    // Audit #4: pre-zero the result slots, so a host op that writes fewer than `n_res` results can't
-    // leave uninitialized stack for the read-back to decode. The verifier pins the sig arity, so a
-    // correct host fills all of them — this guards a buggy host, not a guest (bounded to this slot).
-    if let Some(ss) = res_ss {
-        let z = b.ins().iconst(I64, 0);
+        lower.cap_buf.set(Some(ss));
+        ss
+    });
+    for (i, a) in args.iter().enumerate() {
+        let v = get(vals, *a)?;
+        let slot = encode_slot(b, v); // each arg widened to its i64 slot
+        b.ins().stack_store(slot, buf, (i * 8) as i32);
+    }
+    // Audit #4: zero the result slots, so a thunk that writes fewer results than the call declares
+    // hands back zero (#2361), never what an earlier call left in the buffer or stale frame bytes.
+    if n_res > 0 {
+        let zero = b.ins().iconst(I64, 0);
         for i in 0..n_res {
-            b.ins().stack_store(z, ss, (i * 8) as i32);
+            b.ins()
+                .stack_store(zero, buf, ((CAP_RESULTS_AT + i) * 8) as i32);
         }
     }
-
-    // Assemble the thunk arguments (see `CapThunk`): the ctx is the instance's powerbox.
-    let ctx = vmctx_load(b, lower, vmctx::CAP_CTX);
-    let mem_base = b.use_var(lower.mem_var);
-    // #826: this frozen `lower.mapped` is deliberate — it is the window's default-committed
-    // **prefix** (the interpreter's equally-frozen `window.mapped`): the thunk builds its
-    // `MprotectWindow` view as `(mapped default, reserved, live shared page map)`, so grown-tail
-    // borrows are admitted by the page map, not by this value. Do not "fix" it to `reserved` —
-    // that would default-commit the whole tail and admit borrows of never-mapped pages.
-    let mem_size = b.ins().iconst(I64, lower.mapped as i64);
-    // The reserved mask domain (`mask + 1`) the guest may `map`-grow into; 0 when no memory.
-    let reserved = if lower.mapped == 0 { 0 } else { lower.mask + 1 };
-    let mem_reserved = b.ins().iconst(I64, reserved as i64);
+    let vmctx = b.use_var(lower.vmctx_var);
     let tid = b.ins().iconst(I32, type_id as i64);
     let opc = b.ins().iconst(I32, op as i64);
-    let na = b.ins().iconst(I64, n_args as i64);
-    let nr = b.ins().iconst(I64, n_res as i64);
-    let vmctx = b.use_var(lower.vmctx_var);
-
-    let call_args = [
-        ctx,
-        mem_base,
-        mem_size,
-        mem_reserved,
-        tid,
-        opc,
-        h,
-        args_ptr,
-        na,
-        res_ptr,
-        nr,
-        vmctx,
-    ];
-    call_host(lower.callees, b, HostFn::CapThunk, &call_args)?;
-
-    // If the thunk set the trap cell, propagate (return early; the cell already holds
-    // the kind / exit code).
+    let addr = b.ins().stack_addr(I64, buf, 0);
+    let counts = b
+        .ins()
+        .iconst(I64, (n_args as u64 | (n_res as u64) << 32) as i64);
+    call_host(
+        lower.callees,
+        b,
+        HostFn::CapThunk,
+        &[vmctx, addr, counts, tid, opc, h],
+    )?;
+    // If the thunk set the trap cell, propagate (return early; the cell already holds the kind / exit
+    // code).
     emit_trap_propagate(b, lower, Callee::Host);
-
-    // Read the result slots back.
-    if let Some(ss) = res_ss {
-        for (i, rty) in sig.results.iter().enumerate() {
-            let slot = b.ins().stack_load(I64, ss, (i * 8) as i32);
-            vals.push(decode_slot(b, slot, *rty));
-        }
+    for (i, rty) in sig.results.iter().enumerate() {
+        let slot = b
+            .ins()
+            .stack_load(I64, buf, ((CAP_RESULTS_AT + i) * 8) as i32);
+        vals.push(decode_slot(b, slot, *rty));
     }
     Ok(())
 }
@@ -12777,9 +12833,9 @@ fn lower_cap_call(
 /// Lower a §14 `Instantiator` `call.cap` (iface 6) to the nesting runtime ([`instantiator_rt`]) — only
 /// reached when this (parent) compile has a live `Nursery` (`lower.nesting`). Each served op
 /// (`temen_ir::served_contract`: 17 `instantiate_rec`, 1 `join`, 9/10/12 supervision, 14
-/// `child_offer`, 19 `grant`) calls its thunk, threading `mem_base` (the live parent window) +
-/// `vmctx`; a thunk that sets the trap cell (forged handle, refused spawn, child trap) propagates
-/// here like any `call.cap`.
+/// `child_offer`, 19 `grant`) calls its thunk, threading `vmctx`, through which the thunk finds the
+/// instance's nursery and the live parent window (#2534); a thunk that sets the trap cell (forged
+/// handle, refused spawn, child trap) propagates here like any `call.cap`.
 #[allow(clippy::too_many_arguments)] // mirrors the CapCall fields + the shared lowering context
 fn lower_instantiator(
     b: &mut FunctionBuilder,
@@ -12796,15 +12852,13 @@ fn lower_instantiator(
     // contract names is present. The contract is width-tolerant: the per-arg coercions below
     // (`slot_i64`/`slot_i32`/`result_as`) reconcile the declared widths with each thunk's fixed ABI.
     // temen#2168: the instance's own nursery, from its vmctx, so one compile serves every instance.
-    let nursery = vmctx_load(b, lower, vmctx::NURSERY);
-    let mem_base = b.use_var(lower.mem_var);
     let vmctx = b.use_var(lower.vmctx_var);
     match op {
         1 => {
-            // join(nursery, mem_base, instantiator:i32, child_handle:i32, status_out:i64,
-            // vmctx:i64) -> value:i64, the status through `status_out` as `cont.resume`'s is
-            // (#2066). The nursery owns the child table for this run; the thunk still resolves the
-            // call.cap's `Instantiator` first, as the oracle does for every op (#1729).
+            // join(vmctx, instantiator:i32, child_handle:i32, status_out:i64) -> value:i64, the
+            // status through `status_out` as `cont.resume`'s is (#2066). The nursery owns the child
+            // table for this run; the thunk still resolves the call.cap's `Instantiator` first, as
+            // the oracle does for every op (#1729).
             let h = slot_i32(b, get(vals, handle)?);
             let child = slot_i32(b, get(vals, *args.first().ok_or(JitError::Malformed)?)?);
             let ss =
@@ -12814,7 +12868,7 @@ fn lower_instantiator(
                 lower.callees,
                 b,
                 HostFn::InstJoin,
-                &[nursery, mem_base, h, child, status_ptr, vmctx],
+                &[vmctx, h, child, status_ptr],
             )?;
             emit_trap_propagate(b, lower, Callee::Host);
             let value = b.inst_results(call)[0];
@@ -12823,8 +12877,8 @@ fn lower_instantiator(
             vals.push(result_as(b, value, sig.results[1]));
         }
         9 | 10 | 12 => {
-            // S3 lifecycle: poll / detach / kill (nursery, mem_base, instantiator:i32, child:i32,
-            // vmctx:i64) -> status:i32 — resolved and dispatched as `join` is.
+            // S3 lifecycle: poll / detach / kill (vmctx, instantiator:i32, child:i32) -> status:i32
+            // — resolved and dispatched as `join` is.
             let h = slot_i32(b, get(vals, handle)?);
             let child = slot_i32(b, get(vals, *args.first().ok_or(JitError::Malformed)?)?);
             let thunk = match op {
@@ -12832,21 +12886,16 @@ fn lower_instantiator(
                 10 => HostFn::InstDetach,
                 _ => HostFn::InstKill,
             };
-            let call = call_host(
-                lower.callees,
-                b,
-                thunk,
-                &[nursery, mem_base, h, child, vmctx],
-            )?;
+            let call = call_host(lower.callees, b, thunk, &[vmctx, h, child])?;
             emit_trap_propagate(b, lower, Callee::Host);
             let r = result_as(b, b.inst_results(call)[0], sig.results[0]);
             vals.push(r);
         }
         17 => {
-            // §3c instantiate_rec(nursery, mem_base, mem_size:i64, handle:i32, record_ptr:i64,
-            //   vmctx:i64) -> handle:i32 — the config-record spawn: the thunk parses the
-            //   record from the window (`mem_size` bounds the read) and spawns it. Pager records CapFault (sound: modules with impl exports fold to the
-            //   oracle).
+            // §3c instantiate_rec(vmctx, handle:i32, record_ptr:i64) -> handle:i32 — the
+            //   config-record spawn: the thunk parses the record from the window (its reservation,
+            //   read from `vmctx`, bounds the read) and spawns it. Pager records CapFault (sound:
+            //   modules with impl exports fold to the oracle).
             //
             // #826: the bound is the **reserved** mask domain, not the compile-time `mapped` — a
             // record in a legitimately `map`-grown tail page must be read where the interpreter's
@@ -12855,26 +12904,19 @@ fn lower_instantiator(
             // faults through the SIGSEGV shim to `MemoryFault` (the thunk runs inside the armed
             // guest call, and the faulting address is in the guarded window range).
             let h = slot_i32(b, get(vals, handle)?);
-            let win_reserved = if lower.mapped == 0 { 0 } else { lower.mask + 1 };
-            let mem_size = b.ins().iconst(I64, win_reserved as i64);
             let record_ptr = slot_i64(b, get(vals, *args.first().ok_or(JitError::Malformed)?)?);
-            let call = call_host(
-                lower.callees,
-                b,
-                HostFn::InstSpawn,
-                &[nursery, mem_base, mem_size, h, record_ptr, vmctx],
-            )?;
+            let call = call_host(lower.callees, b, HostFn::InstSpawn, &[vmctx, h, record_ptr])?;
             emit_trap_propagate(b, lower, Callee::Host);
             let r = result_as(b, b.inst_results(call)[0], sig.results[0]);
             vals.push(r);
         }
         14 | 19 => {
-            // CALLS.md 5c.0 child_offer(nursery, mem_base, instantiator:i32, child:i32, export:i64,
-            // vmctx) -> handle:i32. Mint a live-callee offer over a granted child's
-            // nursery-retained shared powerbox; every miss is the probeable -EINVAL (the interp op-14
-            // arm, errno-for-errno). A forged `Instantiator` is the `CapFault` every op gives (#1729);
-            // `mem_base` is only for that resolve — the mint reads no guest memory. #2220's `grant`
-            // has the same shape over the same powerbox, its last arg the handle to grant.
+            // CALLS.md 5c.0 child_offer(vmctx, instantiator:i32, child:i32, export:i64) ->
+            // handle:i32. Mint a live-callee offer over a granted child's nursery-retained shared
+            // powerbox; every miss is the probeable -EINVAL (the interp op-14 arm, errno-for-errno). A
+            // forged `Instantiator` is the `CapFault` every op gives (#1729); the window is only for
+            // that resolve — the mint reads no guest memory. #2220's `grant` has the same shape over
+            // the same powerbox, its last arg the handle to grant.
             let h = slot_i32(b, get(vals, handle)?);
             let child = slot_i32(b, get(vals, *args.first().ok_or(JitError::Malformed)?)?);
             let arg = slot_i64(b, get(vals, *args.get(1).ok_or(JitError::Malformed)?)?);
@@ -12882,12 +12924,7 @@ fn lower_instantiator(
                 14 => HostFn::ChildOffer,
                 _ => HostFn::ChildGrant,
             };
-            let call = call_host(
-                lower.callees,
-                b,
-                thunk,
-                &[nursery, mem_base, h, child, arg, vmctx],
-            )?;
+            let call = call_host(lower.callees, b, thunk, &[vmctx, h, child, arg])?;
             emit_trap_propagate(b, lower, Callee::Host);
             let r = result_as(b, b.inst_results(call)[0], sig.results[0]);
             vals.push(r);
@@ -13321,30 +13358,9 @@ fn emit_page_check(b: &mut FunctionBuilder, lower: &Lower, phys: Value, len: u32
     b.switch_to_block(miss);
     b.seal_block(miss);
     let len = b.ins().iconst(I64, i64::from(len));
-    emit_page_miss(b, lower, thunk, base, off, len, flags);
+    emit_page_miss(b, lower, thunk, off, len, flags);
     b.ins().jump(done, &[]);
 
-    b.switch_to_block(done);
-    b.seal_block(done);
-}
-
-/// #2164 — a demand-paged child's page check of a bulk op's span `[phys, phys + n)`: the miss thunk
-/// walks every page of a non-empty one before the op touches any, as the interpreters check a span
-/// whole before they copy (a span may cover many pages, so no inline test). An unpaged compile emits
-/// nothing.
-fn emit_span_page_check(b: &mut FunctionBuilder, lower: &Lower, phys: Value, n: Value, flags: u64) {
-    let Some((_, thunk, _)) = lower.page else {
-        return;
-    };
-    let base = b.use_var(lower.mem_var);
-    let off = b.ins().isub(phys, base);
-    let walk = b.create_block();
-    let done = b.create_block();
-    b.ins().brif(n, walk, &[], done, &[]);
-    b.switch_to_block(walk);
-    b.seal_block(walk);
-    emit_page_miss(b, lower, thunk, base, off, n, flags);
-    b.ins().jump(done, &[]);
     b.switch_to_block(done);
     b.seal_block(done);
 }
@@ -13373,81 +13389,20 @@ pub(crate) unsafe fn table_admits(
         .all(|p| (*table.add(p as usize)).load(Ordering::Acquire) & need != 0)
 }
 
-/// Call the miss thunk `thunk` on `len` bytes at window offset `off` of the window at `base`, and
+/// Call the miss thunk `thunk` on `len` bytes at window offset `off` of the context's window, and
 /// unwind if it set a trap.
 fn emit_page_miss(
     b: &mut FunctionBuilder,
     lower: &Lower,
     thunk: FuncRef,
-    base: Value,
     off: Value,
     len: Value,
     flags: u64,
 ) {
     let vm = b.use_var(lower.vmctx_var);
     let flags = b.ins().iconst(I64, flags as i64);
-    b.ins().call(thunk, &[vm, base, off, len, flags]);
+    b.ins().call(thunk, &[vm, off, len, flags]);
     emit_trap_propagate(b, lower, Callee::Host);
-}
-
-/// **Bulk-span backed-extent probe (ISSUES.md I21).** Fault a bulk span that overruns the
-/// currently-*backed* region **before** the libcall runs. [`confine_span`] only bounds the span
-/// against `reserved`, delegating the `[mapped, reserved)` guard hole to the libcall's own accesses
-/// — but that leaks in two ways the interpreter (`Mem::check_prot_span`, which validates every page
-/// up front) does not: (1) libc `memcpy`/`memmove` **short-circuit `dst == src`**, so a self-copy
-/// overrunning `mapped` never faults; (2) the libcall writes a prefix before hitting the guard, so a
-/// faulting run diverges from the interpreter's fault-before-any-write. Both are interp↔JIT
-/// divergences (§3 parity), not escapes (every byte stays in `[0, reserved)`).
-///
-/// The fix is a guarded 1-byte read of the span's **first** byte (window offset `ptr`) and **last**
-/// byte (`ptr + len − 1`), each an ordinary guest access confined by [`mask_addr`] — the same bytes
-/// the span's confined base addresses, since the range check already bounds both. Each faults
-/// [`TrapKind::MemoryFault`] on a `PROT_NONE` guard page exactly where the interpreter faults —
-/// **consulting the live page tables**, so it honors guest `grow` (unlike the compile-time
-/// `Lower::mapped`, which would over-fault a grown window). The last-byte read catches an overrun
-/// past the backed extent; the first-byte read catches a span starting inside the #1094 NULL guard
-/// `[0, POWERBOX_NULL_GUARD)` — which the last-byte read alone misses when the span *ends* in backed
-/// memory (e.g. a whole-window self-copy from 0: macOS libc `memmove` short-circuits `dst == src`,
-/// so nothing else would ever touch the guard, an interp↔JIT divergence the spec-mem differential
-/// caught on macOS while glibc happened to fault). For the contiguous unmapped-guard + backed-prefix
-/// model (the production window + the spec window), first-and-last-in-bounds ⟺ whole-span-in-bounds.
-/// Emitted per span (`dst` and `src`) before the copy, so no partial write survives. `len == 0`
-/// skips the probe entirely (a branch on `len != 0`), keeping a zero-length op inert even at a wild
-/// pointer (D62).
-///
-/// Residual (documented, not silently dropped): a bulk op whose span straddles a guest-created
-/// **interior** hole (`unmap`) or a read-only page mid-span is not caught by a last-byte read probe
-/// — the same boundary the interpreter's contiguous fast path assumes away. Left to a per-page probe
-/// loop if a real workload needs bulk ops over a deliberately-punched window.
-fn probe_span(b: &mut FunctionBuilder, lower: &Lower, ptr: Value, len: Value) {
-    let do_probe = b.create_block();
-    let after = b.create_block();
-    let nonzero = b.ins().icmp_imm(IntCC::NotEqual, len, 0);
-    b.ins().brif(nonzero, do_probe, &[], after, &[]);
-
-    b.switch_to_block(do_probe);
-    b.seal_block(do_probe);
-    // May-trap loads: each faults `MemoryFault` on a guard page — the first byte on the #1094 NULL
-    // guard, the last byte on an overrun past the backed region. The results are unused, but the
-    // loads are preserved because they can trap (side-effecting).
-    //
-    // Each byte is an ordinary 1-byte guest access, confined by [`mask_addr`]'s bounds test and
-    // branchless `select_spectre_guard` redirect like every other (D63). Architecturally a no-op —
-    // [`confine_span`]'s range check proved `ptr + len − 1 < reserved`, so both bytes are already in
-    // `[0, reserved)` — but a misspeculated `trapnz` then sends an out-of-bounds probe to the guard
-    // rather than past the window (an unconfined `phys + (len − 1)` adds a guest length), and it is a
-    // confinement the machine-code validator proves (#2788).
-    let one = b.ins().iconst(I64, 1);
-    let len_minus_one = b.ins().isub(len, one);
-    let last = b.ins().iadd(ptr, len_minus_one);
-    for off in [ptr, last] {
-        let at = mask_addr(b, lower, off, 0, false, 1);
-        b.ins().load(I8, mem_flags(), at, 0);
-    }
-    b.ins().jump(after, &[]);
-
-    b.switch_to_block(after);
-    b.seal_block(after);
 }
 
 /// #2177 — the most bytes a constant-length `mem.copy`/`mem.move` copies inline ([`copy_inline`]).
@@ -13459,8 +13414,8 @@ const INLINE_COPY_MAX: i64 = 64;
 /// store of that width is ([`CheckedBases`], or no check where the bound proof elides one). Every
 /// source byte is loaded, and the destination's first and last bytes are probed, before the first
 /// store. So overlapping spans copy as `mem.move` does, and a span that faults faults before anything
-/// is written (I21, as [`probe_span`] keeps the libcall path): `n` is under a page, so each span
-/// touches at most two pages, and those reads reach both.
+/// is written (I21, as the host helper `mem::mem_copy` probes its spans): `n` is under a page, so
+/// each span touches at most two pages, and those reads reach both.
 #[allow(clippy::too_many_arguments)]
 fn copy_inline(
     b: &mut FunctionBuilder,
@@ -13504,47 +13459,6 @@ fn copy_inline(
         b.ins().store(mem_flags(), word, d, off);
     }
     Ok(())
-}
-
-/// Confine a **dynamic-length span** `[ptr, ptr+len)` to the reserved domain `[0, reserved)` and
-/// return its physical base `mem_base + (ptr & mask)` — the bulk-memory hinge (D62). Where
-/// [`mask_addr`] confines one fixed-width access, this confines a whole span with a *single* range
-/// check: it traps [`TrapKind::MemoryFault`] (native `trapnz`) when `len != 0 && (len > reserved ||
-/// ptr > reserved − len)`, i.e. any byte of the span would fall outside `[0, reserved)`. The two
-/// sub-checks avoid overflow: `len > reserved` catches an oversized (or negative-as-u64) length before
-/// the `reserved − len` subtraction can wrap. `len == 0` is a no-op span that never faults (matching
-/// the interpreter and C `memcpy(_,_,0)`), so a 0-length op on a wild pointer is inert.
-///
-/// This predicate is the overflow-avoiding lowering of the **one span-OOB reference**,
-/// `temen_mask::Window::span_checked` (the arithmetic the interpreter calls and the `mask` fuzz target
-/// asserts against a `u128` oracle). Any change to that reference must be mirrored in the CLIF here —
-/// the fuzz oracle pins the reference, and the `diff.rs` escape oracle pins this emission to it.
-///
-/// The returned base is then Spectre-clamped (`& mask`): architecturally a no-op (the check proved
-/// `ptr < reserved`), but on a *mispredicted* path it pins the copy's base inside `[0, reserved)`.
-/// This is the pre-D63 AND clamp, kept for the base the libcall is handed (INVARIANTS #2 records it);
-/// the guest-code loads of a span — [`probe_span`]'s first and last byte — confine through
-/// [`mask_addr`] like every other access. Like `mask_addr`, this matches Wasmtime's bounds-checked
-/// `memory.copy` posture ("as secure as wasm", DESIGN.md §1a): the length is checked, the base is
-/// confined, and the bulk copy itself is a libcall the CPU does not speculate byte-by-byte — so no
-/// per-byte clamp is needed. Callers pass the **same** `len` to the copy, so both spans (dst and src)
-/// are checked.
-fn confine_span(b: &mut FunctionBuilder, lower: &Lower, ptr: Value, len: Value) -> Value {
-    let reserved = lower.mask.wrapping_add(1);
-    let resv = b.ins().iconst(I64, reserved as i64);
-    let oob_len = b.ins().icmp(IntCC::UnsignedGreaterThan, len, resv);
-    let rem = b.ins().isub(resv, len); // reserved − len; meaningful only when !oob_len
-    let oob_ptr = b.ins().icmp(IntCC::UnsignedGreaterThan, ptr, rem);
-    let oob_span = b.ins().bor(oob_len, oob_ptr);
-    let zero = b.ins().iconst(I64, 0);
-    let nonzero = b.ins().icmp(IntCC::NotEqual, len, zero);
-    let oob = b.ins().band(nonzero, oob_span);
-    b.ins()
-        .trapnz(oob, cranelift_codegen::ir::TrapCode::HEAP_OUT_OF_BOUNDS);
-    let m = b.ins().iconst(I64, lower.mask as i64);
-    let clamped = b.ins().band(ptr, m);
-    let base = b.use_var(lower.mem_var);
-    b.ins().iadd(base, clamped)
 }
 
 // The confinement bound-proof (`UB_TOP`/`ub_at`/`ub_of`/`in_window`) now lives in one audited place,

@@ -178,10 +178,11 @@ impl Window {
     /// `checked_add` makes the `ptr + len` bound overflow-free, so a wild `ptr`/`len` faults rather
     /// than wrapping. `len == 0` is an in-bounds no-op (returns `ptr`).
     ///
-    /// **This is the one definition of the span-OOB arithmetic** the Cranelift JIT's `confine_span`
-    /// emits (as the overflow-avoiding `len != 0 && (len > reserved || ptr > reserved − len)`) and
-    /// the interpreter calls. The `mask` fuzz target asserts it against a `u128` oracle, so the
-    /// security-critical overflow-avoidance is **fuzzed, not transcribed** into the harness.
+    /// **This is the one definition of the span-OOB arithmetic**: the interpreter calls it, and so do
+    /// the Cranelift JIT's bulk-op helpers (`temen-jit`'s `mem_copy`/`mem_fill`, through its
+    /// `Window::span`, #2534), so no lowering transcribes it. The `mask` fuzz target asserts it
+    /// against a `u128` oracle, so the security-critical overflow-avoidance is **fuzzed, not
+    /// transcribed** into the harness.
     #[inline]
     pub fn span_checked(self, ptr: u64, len: u64) -> Option<u64> {
         if len == 0 {
@@ -406,7 +407,7 @@ mod tests {
 
     /// `span_checked` is the D62 bulk-span confinement: admit `[ptr, ptr+len)` iff it lies in
     /// `[0, reserved)` (with `len == 0` an in-bounds no-op), returning `ptr`; total + panic-free.
-    /// This is the one reference the JIT's `confine_span` mirrors.
+    /// This is the one reference the interpreter and the JIT's bulk-op helpers confine with.
     #[test]
     fn span_checked_confines_or_faults() {
         let mut rng = Rng(0x5EED_1DEA_D00D_F00D);
