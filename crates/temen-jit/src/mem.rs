@@ -491,10 +491,122 @@ pub(crate) unsafe fn run_guarded_range(
 /// The trap code a caught guard fault reports.
 pub(crate) const FAULT_TRAP: i64 = TrapKind::MemoryFault as i64;
 
+/// #2534 — `mem.copy`/`mem.move` (D62) for compiled code: copy `len` bytes from window offset `src`
+/// to window offset `dst` of `vm`'s window, overlap-safe, as the interpreters' `Mem::mem_copy` does
+/// and in its order. Both spans are confined to the reservation first (temen-mask's `span_checked`,
+/// through [`crate::Window::span`]); then a demand-paged child's pages, the source's and then the
+/// destination's (#2164); then each span's first and last byte is read (ISSUES.md I21), which faults
+/// an overrun of the backed extent through the SIGSEGV guard before any byte is written, as a guest
+/// load would; then the copy. A fault is raised on `vm`, which sets this context's stop word, and
+/// the caller's check of it unwinds; so does an end a pager raised.
+///
+/// The window is `vm`'s, so the code hands the host no pointer: a backend bug can pass a wrong
+/// offset, which this confines, but never a wrong window.
+///
+/// # Safety
+/// `vm` is the calling context, called from inside the armed guest call, so a probe that faults
+/// unwinds the call; this frame holds nothing to drop.
+pub(crate) unsafe extern "C" fn mem_copy(vm: &crate::VmCtx, dst: u64, src: u64, len: u64) {
+    if len == 0 {
+        return;
+    }
+    let w = vm.window();
+    let (Some(s), Some(d)) = (w.span(src, len), w.span(dst, len)) else {
+        return fault(vm);
+    };
+    if w.pages != 0 && !(pages_admit(vm, src, len, false) && pages_admit(vm, dst, len, true)) {
+        return;
+    }
+    probe(s, len);
+    probe(d, len);
+    core::ptr::copy(s, d, len as usize);
+}
+
+/// #2534 — `mem.fill` (D62) for compiled code: set the `len` bytes at window offset `dst` of `vm`'s
+/// window to the low byte of `val`, confined, paged and probed as [`mem_copy`] does its destination.
+///
+/// # Safety
+/// As [`mem_copy`].
+pub(crate) unsafe extern "C" fn mem_fill(vm: &crate::VmCtx, dst: u64, val: u64, len: u64) {
+    if len == 0 {
+        return;
+    }
+    let w = vm.window();
+    let Some(d) = w.span(dst, len) else {
+        return fault(vm);
+    };
+    if w.pages != 0 && !pages_admit(vm, dst, len, true) {
+        return;
+    }
+    probe(d, len);
+    core::ptr::write_bytes(d, val as u8, len as usize);
+}
+
+/// A bulk op's span past the reservation: the `MemoryFault` a guest access there is. Out of line, so
+/// the helpers' common path stays a leaf that tail-calls the C runtime.
+#[cold]
+#[inline(never)]
+fn fault(vm: &crate::VmCtx) {
+    vm.raise(FAULT_TRAP);
+}
+
+/// I21 — read the first and last byte of the `len ≥ 1` bytes at `p`, so a span past the backed
+/// extent faults before a bulk op writes any of it, and a self-copy (which `memmove` may skip) too.
+unsafe fn probe(p: *mut u8, len: u64) {
+    core::ptr::read_volatile(p);
+    core::ptr::read_volatile(p.add(len as usize - 1));
+}
+
+/// #2164 — whether a demand-paged child may read (or, when `write`, write) the `len` bytes at window
+/// offset `off`, which lie in the reservation: what its access table admits, or what its pager
+/// supplies when asked through the miss thunk, as a guest access's miss is. `false` once the domain
+/// has ended (the refusal's `MemoryFault`, the end the pager raised, or another vCPU's end), with
+/// this context stopped too, so the caller's check of its stop word unwinds rather than run on past
+/// a skipped write. An unpaged window admits everything; the hardware decides. Out of line: only a
+/// paged child reaches it.
+#[cold]
+#[inline(never)]
+unsafe fn pages_admit(vm: &crate::VmCtx, off: u64, len: u64, write: bool) -> bool {
+    let w = vm.window();
+    let Some(miss) = w.page_miss.filter(|_| w.pages != 0) else {
+        return true;
+    };
+    #[cfg(fiber_rt)]
+    {
+        let need = if write {
+            temen_ir::PAGE_WRITE
+        } else {
+            temen_ir::PAGE_READ
+        };
+        if crate::table_admits(vm.pages, w.pages, off, len, need) {
+            return true;
+        }
+    }
+    let flags = if write { crate::PAGE_MISS_WRITE } else { 0 };
+    miss(vm, off, len, flags);
+    match vm.ended() {
+        None => true,
+        Some(end) => {
+            // The first end stands; this only copies it into this context's stop word.
+            vm.raise(end);
+            false
+        }
+    }
+}
+
 /// The host page size — the §14 demand-paging granularity (what one fault supplies), and a fork
 /// copy's (#1768).
 pub(crate) fn page_size() -> usize {
-    pal::page_size()
+    // Asked once: it never changes, and the paged bulk-op helpers ask per op (#2534).
+    static PAGE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+    match PAGE.load(core::sync::atomic::Ordering::Relaxed) {
+        0 => {
+            let page = pal::page_size();
+            PAGE.store(page, core::sync::atomic::Ordering::Relaxed);
+            page
+        }
+        page => page,
+    }
 }
 
 /// The inaccessible guard a window reserves past `round_up(reserved, page)`: one page. An access
@@ -1445,7 +1557,7 @@ mod tests {
         win: &GuestWindow,
         f: extern "C" fn(*const i64, *mut i64, *mut u8, *const c_void, *mut i64),
     ) -> bool {
-        let vm = crate::VmCtx::new(crate::InstanceAddrs::NONE);
+        let vm = crate::VmCtx::new(crate::InstanceAddrs::NONE, crate::Window::NONE);
         // SAFETY: `f` honours the Entry ABI; `mem_base` is this window's base.
         unsafe {
             run_guarded(

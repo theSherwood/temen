@@ -771,6 +771,7 @@ dependencies = [
  "temen-encode",
  "temen-fiber",
  "temen-ir",
+ "temen-mask",
  "temen-verify",
  "windows-sys 0.59.0",
 ]

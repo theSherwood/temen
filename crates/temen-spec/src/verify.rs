@@ -273,6 +273,20 @@ fn check_inst(
 ) -> R {
     use ValType as V;
     let w = |v: ValIdx, t: V| want(types, v, t);
+    // DESIGN.md §3c (#2534): a host-dispatched call passes at most `CAP_MAX_ARITY` arguments and
+    // results, each way.
+    if let Some((sig, _)) = inst.host_call() {
+        if let Some(ft) = func_sig(tsec, sig) {
+            let max = temen_ir::CAP_MAX_ARITY;
+            if ft.params.len() > max || ft.results.len() > max {
+                return Err(format!(
+                    "host call type {sig} has {} params and {} results, over {max}",
+                    ft.params.len(),
+                    ft.results.len()
+                ));
+            }
+        }
+    }
     // The type(s) this instruction appends; computed before mutating `types`.
     let push: Vec<V> = match inst {
         Inst::ConstI32(_) => vec![V::I32],
