@@ -618,11 +618,20 @@ sizes so compiling and setting up cancel out.
 | a capability call (`Clock.now`, a host procedure) | 0 | 0 | 0 |
 | a guest call | 0 | 0 | 0 |
 | a fiber switch | 0 | 0 | 0 |
-| a fiber's life (start, run to its return) | 4 | 2 | 4 |
+| a fiber's life (start, run to its return) | 0 | 0 | 0 |
 
-The last row is pinned at what it is, so it can only come down. On Apple targets the JIT's is 5:
-std's mutex there is a pthread mutex, boxed the first time it is locked, and the JIT gives each
-fiber a slot with mutexes of its own.
+A fiber's life used to allocate on every engine: 4 times on the JIT (5 on Apple, whose std mutex is
+boxed when first locked), twice on the bytecode engine, 4 times on the tree-walker. Now what a
+finished fiber held serves the next one:
+
+- **JIT.** temen-fiber lays a fiber's `Control` and its entry closure in the top of the fiber's own
+  stack, which the arena serves. The slot holds its `Fiber` inline, and a recycled slot is reset in
+  place, its locks included, so Apple's mutexes are boxed once per slot, not per fiber.
+- **Bytecode engine.** A task keeps the `Vm` of its last ended context, a fiber's or a serve
+  handler's, and the next one it starts restarts it with its register file (`VTask::spare`). An
+  entry's results stay in its window (`Outcome::Done`, `Vm::results`) instead of a `Vec`.
+- **Tree-walker.** The next fiber's start takes the returned fiber's frame stack, and its entry
+  frame's values come from the buffers calls already reuse.
 
 To find what a real program allocates and where, run it under valgrind:
 

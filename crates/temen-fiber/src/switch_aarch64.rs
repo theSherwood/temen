@@ -86,11 +86,13 @@ unsafe extern "C" fn trampoline() {
 }
 
 /// Lay out the fresh stack so the first [`jump`] into the returned context begins executing `entry`.
+/// The image starts `below` bytes under the top, which the caller keeps for itself (a fiber's
+/// `Control` and its entry closure, #2486).
 ///
 /// # Safety
-/// `stack` must be a live, writable control stack.
-pub unsafe fn make(stack: &crate::stack::Stack, entry: Entry) -> *mut u8 {
-    let top = stack.top() as usize;
+/// `stack` must be a live, writable control stack, `below` well under its size.
+pub unsafe fn make(stack: &crate::stack::Stack, below: usize, entry: Entry) -> *mut u8 {
+    let top = stack.top() as usize - below;
     let ctx = (top & !0xf) - 0xa0; // 16-aligned; `jump` restores from here then `add sp, #0xa0`
     unsafe {
         // SAFETY: every offset stays within the caller-provided stack region.

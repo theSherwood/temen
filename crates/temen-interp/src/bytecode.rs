@@ -3517,7 +3517,7 @@ pub fn compile_and_run_with_host_traced(
             1,
         ) {
             Ok(Outcome::Suspended) => continue, // one op done; keep stepping
-            Ok(Outcome::Done(vals)) => break Some((Ok(vals), Vec::new(), None)),
+            Ok(Outcome::Done) => break Some((Ok(vm.results(&source)), Vec::new(), None)),
             Ok(_) => break None, // a seam — out of single-vCPU debug scope (fall back to tree-walker)
             Err(t) => {
                 let bt = vm_trap_bt(&vm, &source, &t);
@@ -4359,7 +4359,7 @@ pub fn ir_trace(m: &Module, func: FuncIdx, args: &[Value], fuel: &mut u64) -> Op
             1,
         ) {
             Ok(Outcome::Suspended) => continue, // one op done; keep stepping
-            Ok(Outcome::Done(vals)) => return Some((trace, Ok(vals))),
+            Ok(Outcome::Done) => return Some((trace, Ok(vm.results(&source)))),
             Ok(_) => return None, // a seam — out of single-vCPU debug scope
             Err(t) => return Some((trace, Err(t))),
         }
@@ -4421,7 +4421,7 @@ pub fn ir_window_trace(
             1,
         ) {
             Ok(Outcome::Suspended) => continue,
-            Ok(Outcome::Done(vals)) => return Some((trace, Ok(vals))),
+            Ok(Outcome::Done) => return Some((trace, Ok(vm.results(&source)))),
             Ok(_) => return None, // a seam — out of single-vCPU debug scope
             Err(t) => return Some((trace, Err(t))),
         }
@@ -4497,7 +4497,7 @@ pub fn ir_value_trace(
             1,
         ) {
             Ok(Outcome::Suspended) => continue,
-            Ok(Outcome::Done(vals)) => return Some((trace, Ok(vals))),
+            Ok(Outcome::Done) => return Some((trace, Ok(vm.results(&source)))),
             Ok(_) => return None, // a seam — out of single-vCPU debug scope
             Err(t) => return Some((trace, Err(t))),
         }
@@ -5186,8 +5186,8 @@ fn debug_advance_fiber(
     {
         Ok(Outcome::Suspended) => FiberStep::Stepped,
         // The root activation finished — the run's result — or a fiber returned to its resumer.
-        Ok(Outcome::Done(vals)) => {
-            match return_from_fiber(vt, &mut cell, mem, &mut HostCell::Excl(host), false, vals) {
+        Ok(Outcome::Done) => {
+            match return_from_fiber(vt, &mut cell, mem, &mut HostCell::Excl(host), false, source) {
                 Some(vals) => FiberStep::Finished(vals),
                 None => FiberStep::Stepped,
             }
@@ -5217,7 +5217,7 @@ fn debug_advance_fiber(
                     Ok(Claim::Continue(vm)) => vm,
                     Ok(Claim::Start { funcref, arg0 }) => {
                         let payer = Some(host.own_node());
-                        match start_fiber(source, table, mem, k, funcref, arg0, arg, payer) {
+                        match start_fiber(source, table, mem, k, funcref, arg0, arg, payer, vt) {
                             Ok(vm) => vm,
                             Err(t) => return FiberStep::Trapped(t),
                         }
@@ -6438,7 +6438,7 @@ fn service_advance(
             // never `Other` (which is documented as "a non-fiber seam the caller must apply").
             // Declined rather than `unreachable!()` — an impossible-looking arm is a bad place to
             // introduce a panic, and the fallback is correct either way.
-            Outcome::Done(_) | Outcome::Suspended => return Serviced::Declined,
+            Outcome::Done | Outcome::Suspended => return Serviced::Declined,
 
             // Coroutines and fibers: this engine schedules tasks, not continuations.
             Outcome::ContNew { .. } | Outcome::ContResume { .. } | Outcome::FiberSuspend { .. } => {
@@ -8321,6 +8321,7 @@ impl ScheduledDebugRun {
                             .collect(),
                         root_shadow_sp: ts.root_shadow_sp,
                         active_invoke: None, // never captured mid-invoke (`checkpointable`)
+                        spare: None,
                     },
                     suspended: None,
                 }),
@@ -9165,7 +9166,9 @@ struct LiveCall {
 /// registry); the `Thread*`/`Memory*` cases are §12 multi-vCPU events handled by the [`drive`]
 /// scheduler. A trap is the `Err` arm of `resume`'s `Result` and is terminal, like the tree-walker.
 enum Outcome {
-    Done(Vec<Value>),
+    /// The entry returned. #2486 — its results stay in its window ([`Vm::results`]), so a return
+    /// that a fiber's resumer takes, as a slot, allocates nothing.
+    Done,
     Suspended,
     /// §2.2 / #2164 — a demand-paged child's recoverable fault at this window address: its pager
     /// must supply the page. The cursor sits AT the faulting op, which re-executes once the page is
@@ -9971,10 +9974,19 @@ fn start_fiber(
     arg0: i64,
     arg: i64,
     payer: Option<NodeRef>,
+    vt: &mut VTask,
 ) -> Result<Vm, Trap> {
     let (module, func, unit) =
         resolve_fiber_entry(source, table, funcref).ok_or(Trap::FiberFault)?;
-    let mut vm = Vm::new(&unit, func, &[Value::I64(arg0), Value::I64(arg)], payer)?;
+    let args = [Value::I64(arg0), Value::I64(arg)];
+    // #2486 — the task's last ended context, so a fiber's start allocates nothing once warmed.
+    let mut vm = match vt.take_spare(&payer) {
+        Some(mut vm) => {
+            vm.restart(&unit, func, args.into_iter())?;
+            vm
+        }
+        None => Vm::new(&unit, func, &args, payer)?,
+    };
     vm.module = module;
     vm.durable_region_base = mem
         .as_ref()
@@ -10041,12 +10053,13 @@ fn suspend_fiber(
     Ok(())
 }
 
-/// The running code returned `vals`. At the task's root that is its result, handed back. In a fiber,
-/// the fiber is done, its charge going back (#2112), and its resumer receives
-/// `(FIBER_RETURNED, retval)` — unless a `durable` run's freeze unwound it (#1835). An instrumented
-/// fiber always unwinds at a poll before a genuine return, so a return under `UNWINDING` that spilled
-/// frames (its shadow-SP past its frame base) is the freeze's: the fiber is residue, back in the
-/// `Pending` state a thaw seeds it in, and the resumer gets `FIBER_FROZEN`, which its thaw re-issues.
+/// The running code returned ([`Vm::results`]). At the task's root that is its result, handed back.
+/// In a fiber, the fiber is done, its charge going back (#2112), its `Vm` kept for the task's next
+/// context ([`VTask::keep_spare`]), and its resumer receives `(FIBER_RETURNED, retval)` — unless a
+/// `durable` run's freeze unwound it (#1835). An instrumented fiber always unwinds at a poll before
+/// a genuine return, so a return under `UNWINDING` that spilled frames (its shadow-SP past its
+/// frame base) is the freeze's: the fiber is residue, back in the `Pending` state a thaw seeds it
+/// in, and the resumer gets `FIBER_FROZEN`, which its thaw re-issues.
 /// Nothing was consumed: with no mid-run trigger, every park in a freeze run was made under
 /// `UNWINDING`.
 fn return_from_fiber(
@@ -10055,25 +10068,24 @@ fn return_from_fiber(
     mem: &mut Option<Mem>,
     host: &mut HostCell,
     durable: bool,
-    vals: Vec<Value>,
+    source: &ModuleSource,
 ) -> Option<Vec<Value>> {
     let Some((rid, resumer, rdst)) = vt.chain.pop() else {
-        return Some(vals);
+        return Some(vt.active.results(source));
     };
     let id = vt.active_id;
     fibers.shadow_switch(mem, durable, vt, id, rid);
     // #2742 — a handler's return answers its dispatch, and its serve loop, back at its serve op,
     // counts it. The serve op's one result is not the resumer's `(status, value)` pair.
     if let Some(ticket) = vt.active.dispatch() {
-        answer_dispatch(host, fibers, mem, ticket, Ok(&vals));
+        answer_dispatch(host, fibers, mem, ticket, Ok(&vt.active.results(source)));
         release_handler(fibers, id);
         let mut handler = std::mem::replace(&mut vt.active, resumer);
         vt.active.tls = handler.tls;
         vt.active.profile = handler.profile.take();
         vt.active_id = rid;
-        let serving = vt.active.rare();
-        serving.serve_count += 1;
-        serving.spare = Some(handler);
+        vt.active.rare().serve_count += 1;
+        vt.keep_spare(handler);
         return None;
     }
     let base = mem
@@ -10096,10 +10108,12 @@ fn return_from_fiber(
         };
         frozen
     });
-    let retval = vals.first().copied().unwrap_or(Value::I64(0));
+    // A fiber's entry returns its one `i64`: its start checked its signature (`resolve_fiber_entry`).
+    let retval = vt.active.regs[vt.active.base].i64();
     // `vcpu.tls` is the vCPU's word, not the fiber's: it goes back with execution.
     let tls = vt.active.tls;
-    vt.active = resumer;
+    let returned = std::mem::replace(&mut vt.active, resumer);
+    vt.keep_spare(returned);
     vt.active.tls = tls;
     vt.active_id = rid;
     let status = if frozen {
@@ -10108,7 +10122,7 @@ fn return_from_fiber(
         super::FIBER_RETURNED
     };
     vt.active.set(rdst, Reg::from_i32(status));
-    vt.active.set(rdst + 1, Reg::from_value(retval));
+    vt.active.set(rdst + 1, Reg::from_i64(retval));
     None
 }
 
@@ -10184,12 +10198,13 @@ fn serve(
             continue;
         };
         let args = (d.args.iter().zip(params.iter())).map(|(a, ty)| slot_to_val(*ty, *a));
-        let mut vm = match vt.active.rare().spare.take() {
+        let payer = payer(host);
+        let mut vm = match vt.take_spare(&payer) {
             Some(mut vm) => {
                 vm.restart(unit, fidx, args)?;
                 vm
             }
-            None => Vm::new(unit, fidx, &args.collect::<Vec<_>>(), payer(host))?,
+            None => Vm::new(unit, fidx, &args.collect::<Vec<_>>(), payer)?,
         };
         vm.module = home;
         vm.home = home;
@@ -10543,6 +10558,9 @@ struct VTask {
     /// so no scheduler seam can occur mid-invoke; a checkpoint mid-invoke is refused on both engines
     /// (`checkpointable`), since the unit's transient state + `source.push`ed module are not captured.
     active_invoke: Option<Box<InvokeStep>>,
+    /// #2486 — the `Vm` of the context that last ended on this task, a fiber's or a serve
+    /// handler's, which the next one it starts restarts ([`VTask::take_spare`]).
+    spare: Option<Vm>,
 }
 
 /// While a debug engine steps *inside* a §22 `Jit.invoke`d unit, the active continuation
@@ -10587,7 +10605,28 @@ impl VTask {
             chain: Vec::new(),
             root_shadow_sp,
             active_invoke: None,
+            spare: None,
         }
+    }
+
+    /// #2486 — keep `vm`, a context that ended on this task, for the next one it starts: what it
+    /// holds, its register file and the room charged for it, serves that one. A `Vm` holding more
+    /// than a fiber's stack charge ([`temen_ir::FIBER_STACK`]) is dropped, so a spare holds no more
+    /// than one live fiber is charged.
+    fn keep_spare(&mut self, vm: Vm) {
+        if vm.held() <= temen_ir::FIBER_STACK as usize {
+            self.spare = Some(vm);
+        }
+    }
+
+    /// The kept `Vm` ([`VTask::keep_spare`]), if its room is charged to `payer`.
+    fn take_spare(&mut self, payer: &Option<NodeRef>) -> Option<Vm> {
+        self.spare
+            .take()
+            .filter(|vm| match (vm.room.charge.payer(), payer) {
+                (Some(a), Some(b)) => a.same(b),
+                (a, b) => a.is_none() && b.is_none(),
+            })
     }
 
     /// Free a finished task's frames: its register file, call stack and parked fibers. It never
@@ -10602,6 +10641,7 @@ impl VTask {
         vm.sig_handler_stack = Vec::new();
         self.chain = Vec::new();
         self.active_invoke = None;
+        self.spare = None;
     }
 
     /// The continuation a debug engine is currently stepping: a §22 invoked unit's `Vm`
@@ -11153,9 +11193,9 @@ fn drive_nested(
         }
         ran = true;
         match vt.active.resume(source, table, fuel, mem, host, budget)? {
-            Outcome::Done(vals) => {
+            Outcome::Done => {
                 // The entry finished — the bounce's or the invoke's results — or a fiber returned.
-                if let Some(vals) = return_from_fiber(&mut vt, fibers, mem, host, false, vals) {
+                if let Some(vals) = return_from_fiber(&mut vt, fibers, mem, host, false, source) {
                     return Ok(Nested::Done(vals));
                 }
             }
@@ -11222,9 +11262,17 @@ fn drive_nested(
                 let k = kh as usize;
                 let target = match claim_fiber(fibers, host, k, arg, None, false)? {
                     Claim::Continue(vm) => vm,
-                    Claim::Start { funcref, arg0 } => {
-                        start_fiber(source, table, mem, k, funcref, arg0, arg, payer(host))?
-                    }
+                    Claim::Start { funcref, arg0 } => start_fiber(
+                        source,
+                        table,
+                        mem,
+                        k,
+                        funcref,
+                        arg0,
+                        arg,
+                        payer(host),
+                        &mut vt,
+                    )?,
                     Claim::Block | Claim::Poll => {
                         vt.active.set(dst, Reg::from_i32(super::FIBER_PARKED));
                         vt.active.set(dst + 1, Reg::from_i64(0));
@@ -11644,7 +11692,7 @@ impl Outcome {
                 params,
                 results,
             },
-            o @ (Outcome::Done(_)
+            o @ (Outcome::Done
             | Outcome::Suspended
             | Outcome::ContNew { .. }
             | Outcome::ContResume { .. }
@@ -11762,10 +11810,10 @@ fn step_vcpu(
                     return Ok(VcpuStop::Preempted);
                 }
             }
-            Outcome::Done(vals) => {
+            Outcome::Done => {
                 // The vCPU's root activation finished, or a fiber returned to its resumer.
                 if let Some(vals) =
-                    return_from_fiber(vt, fibers, ctx.mem, &mut ctx.host, ctx.durable, vals)
+                    return_from_fiber(vt, fibers, ctx.mem, &mut ctx.host, ctx.durable, source)
                 {
                     return Ok(VcpuStop::Done(vals));
                 }
@@ -11788,7 +11836,9 @@ fn step_vcpu(
                         Claim::Continue(vm) => vm,
                         Claim::Start { funcref, arg0 } => {
                             let payer = payer(&mut ctx.host);
-                            start_fiber(source, ctx.table, ctx.mem, k, funcref, arg0, arg, payer)?
+                            start_fiber(
+                                source, ctx.table, ctx.mem, k, funcref, arg0, arg, payer, vt,
+                            )?
                         }
                         // The oracle's rule: a durable run whose freeze is unwinding takes the
                         // advisory downgrade (the poll status), so the resumer reaches its trailing
@@ -19546,9 +19596,6 @@ struct VmRare {
     /// On a serve loop: its handlers that parked, by fiber slot, oldest first. Its serve op resumes
     /// each once woken ([`serve`]), and a `svc.wait` that parks wakes for them too.
     handlers: Vec<usize>,
-    /// On a serve loop: the `Vm` of the handler that last answered, which the next handler restarts
-    /// ([`Vm::restart`]) rather than building its own.
-    spare: Option<Vm>,
     /// The count of dispatches completed by the current `svc.poll` / `svc.wait` activation.
     serve_count: i64,
 }
@@ -19893,9 +19940,9 @@ impl Vm {
         })
     }
 
-    /// #2742 — make this answered handler's `Vm` the entry activation of `entry` with `args`, as
-    /// [`Vm::new`] opens one, keeping what it holds: its register file and the room charged for it,
-    /// and its rare part, emptied.
+    /// #2742 — make this ended context's `Vm` (a handler's that answered, a fiber's that returned)
+    /// the entry activation of `entry` with `args`, as [`Vm::new`] opens one, keeping what it
+    /// holds: its register file and the room charged for it, and its rare part, emptied.
     fn restart(
         &mut self,
         c: &Compiled,
@@ -19906,22 +19953,70 @@ impl Vm {
             return Err(Trap::Malformed);
         }
         let n = c.prog(entry).nslots as usize;
-        if self.regs.len() < n {
-            self.room.grow(&mut self.regs, n)?;
+        // #2486 — every field, so that one `Vm` gains is opened here as [`Vm::new`] opens it.
+        let Vm {
+            regs,
+            room,
+            stack,
+            module,
+            cur,
+            base,
+            pc,
+            scratch,
+            durable_region_base,
+            jit_eligible,
+            jit_module,
+            jit_entry,
+            jit_page_checked,
+            profile,
+            work,
+            entered,
+            tls,
+            home,
+            sig_handler_stack,
+            rare,
+        } = self;
+        if regs.len() < n {
+            room.grow(regs, n)?;
         }
-        self.regs[..n].fill(Reg::default());
+        regs[..n].fill(Reg::default());
         for (i, a) in args.enumerate() {
-            *self.regs.get_mut(i).ok_or(Trap::Malformed)? = Reg::from_value(a);
+            *regs.get_mut(i).ok_or(Trap::Malformed)? = Reg::from_value(a);
         }
-        self.stack.clear();
-        self.scratch.clear();
-        self.sig_handler_stack.clear();
-        (self.module, self.cur, self.base, self.pc) = (0, entry, 0, 0);
-        (self.work, self.entered) = (0, 0);
-        if let Some(r) = self.rare.as_mut() {
+        stack.clear();
+        scratch.clear();
+        sig_handler_stack.clear();
+        (*module, *cur, *base, *pc) = (0, entry, 0, 0);
+        *durable_region_base = c.shadow.unwrap_or(super::ShadowArena::EMPTY).region_base(0);
+        (*jit_eligible, *jit_module, *jit_entry, *jit_page_checked) = (None, 0, None, false);
+        *profile = None;
+        (*work, *entered, *tls, *home) = (0, 0, 0, 0);
+        if let Some(r) = rare.as_mut() {
             **r = VmRare::default();
         }
         Ok(())
+    }
+
+    /// #2486 — what this `Vm`'s buffers hold of the host: its register file, its return stack and
+    /// its scratch.
+    fn held(&self) -> usize {
+        fn bytes<T>(v: &Vec<T>) -> usize {
+            v.capacity() * std::mem::size_of::<T>()
+        }
+        bytes(&self.regs) + bytes(&self.stack) + bytes(&self.scratch)
+    }
+
+    /// #2486 — what the entry delivered when this `Vm` finished ([`Outcome::Done`]): its results,
+    /// which its last `Ret` left in the first slots of its window, typed by the function that
+    /// returned.
+    fn results(&self, source: &ModuleSource) -> Vec<Value> {
+        let Some(c) = source.get(self.module) else {
+            return Vec::new();
+        };
+        let tys = &c.result_types[self.cur];
+        (tys.iter().zip(&self.regs[self.base..]))
+            .map(|(ty, r)| r.to_value(*ty))
+            .collect()
     }
 
     /// Write a value to a frame-relative slot of the *current* (persisted) activation window. Used
@@ -20776,13 +20871,17 @@ impl Vm {
                     }
                     match self.stack.pop() {
                         None => {
-                            let tys = &c.result_types[cur];
-                            return Ok(Outcome::Done(
-                                srcs.iter()
-                                    .zip(tys)
-                                    .map(|(s, ty)| self.regs[base + *s as usize].to_value(*ty))
-                                    .collect(),
-                            ));
+                            // The entry's results go to the first slots of its window, gathered
+                            // first as they may overlap them, with the cursor that types them.
+                            self.scratch.clear();
+                            for s in srcs.iter() {
+                                self.scratch.push(self.regs[base + *s as usize]);
+                            }
+                            // A value returned twice can make more results than slots.
+                            self.grow_regs(base + srcs.len())?;
+                            self.regs[base..base + srcs.len()].copy_from_slice(&self.scratch);
+                            (self.module, self.cur, self.base) = (module, cur, base);
+                            return Ok(Outcome::Done);
                         }
                         Some((cmod, cprog, cbase, cpc, ret_abs, centered)) => {
                             self.count_call(module, cur);

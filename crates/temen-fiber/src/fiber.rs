@@ -116,16 +116,16 @@ impl Yielder {
     /// This fiber's control-stack low bound (`usable_low`) — the running native stack's limit, for a
     /// caller's software stack-overflow guard. Constant for the fiber's life.
     pub fn stack_low(&self) -> u64 {
-        // SAFETY: `control` outlives the body (the `Fiber` owns the `Box<Control>`).
+        // SAFETY: `control` outlives the body (it sits in the top of the stack the `Fiber` owns).
         unsafe { (*self.control).usable_low }
     }
 
     /// Suspend the fiber, handing `val` back to the resumer; returns the value passed to the next
     /// [`Fiber::resume`].
     pub fn suspend(&self, val: u64) -> u64 {
-        // SAFETY: `control` outlives the body (the `Fiber` owns the `Box<Control>` and cannot be
-        // dropped while suspended inside its own body). The resumer is parked, so we have exclusive
-        // access.
+        // SAFETY: `control` outlives the body (it sits in the top of the stack the `Fiber` owns,
+        // and the `Fiber` cannot be dropped while suspended inside its own body). The resumer is
+        // parked, so we have exclusive access.
         let c = unsafe { &*self.control };
         c.value.set(val);
         // ASan: leaving the fiber stack for the resumer's stack (whose bounds were captured at our
@@ -162,12 +162,13 @@ impl Yielder {
     /// computation's** frames (the resume chain's non-fiber parent runs on the OS thread stack, so
     /// its live region is `[resumer_sp, entry_sp)`).
     pub fn resumer_sp(&self) -> *const u8 {
-        // SAFETY: `control` outlives the running body (the `Fiber` owns the `Box<Control>` and
-        // cannot be dropped while suspended inside its own body), and only this side is live.
+        // SAFETY: `control` outlives the running body (it sits in the top of the stack the `Fiber`
+        // owns, which cannot be dropped while suspended inside its own body), and only this side is
+        // live.
         unsafe { (*self.control).resumer.get() as *const u8 }
     }
 
-    /// A stable identity for this fiber's `Control` — the box address, equal to the owning
+    /// A stable identity for this fiber's `Control` — its address, equal to the owning
     /// [`Fiber::control_id`]. Lets a GC scanner correlate a running fiber (found via its `Fiber` in
     /// the shared table) with its live `Yielder` in the resume chain, to read a tight scan low bound
     /// (`resumer_sp`) instead of the whole usable stack. Pointer identity only — never dereferenced.
@@ -181,7 +182,11 @@ pub struct Fiber {
     _stack: Stack, // owns the control stack; freed on drop
     ctx: *mut u8,  // the fiber's saved context — where to `jump` to resume it
     done: bool,
-    control: Box<Control>,
+    /// The fiber's `Control`, in the top of its own stack ([`Fiber::new`]): live while `_stack` is.
+    control: *const Control,
+    /// Where the frames end below the top of the stack, the `Control` and the entry closure above:
+    /// the upper bound of every scan extent.
+    frames_top: *const u8,
 }
 
 // SAFETY: a `Fiber` bundles an owned stack + control cell reachable only through itself; it is only
@@ -189,10 +194,14 @@ pub struct Fiber {
 // between threads (e.g. a scheduler migrating a parked fiber between workers).
 unsafe impl Send for Fiber {}
 
-/// Monomorphized dropper: reconstruct and drop the `Box<F>` behind an erased pointer.
+/// The most of a fiber's stack its `Control` and entry closure may take ([`Fiber::new`]): a small
+/// part of the smallest stack a fiber runs on.
+const MAX_HEADER: usize = 4096;
+
+/// Monomorphized dropper: drop the `F` behind an erased pointer, in place.
 unsafe fn drop_closure_impl<F>(p: *mut ()) {
-    // SAFETY: `p` came from `Box::into_raw(Box::<F>::new(..))` for this same `F`.
-    drop(unsafe { Box::from_raw(p as *mut F) });
+    // SAFETY: `p` is the untaken `F` [`Fiber::new`] wrote for this same `F`.
+    unsafe { core::ptr::drop_in_place(p as *mut F) }
 }
 
 /// The monomorphized [`crate::imp::Entry`] for a fiber whose body is an `F`. The first [`jump`] in
@@ -218,8 +227,9 @@ where
     }
     c.resumer.set(t.fctx);
     c.taken.set(true);
-    // SAFETY: `closure` is a `Box<F>` for this exact `F` (set in `Fiber::new`).
-    let f: F = *unsafe { Box::from_raw(c.closure.get() as *mut F) };
+    // SAFETY: `closure` is the `F` `Fiber::new` wrote for this exact `F`; `taken` (set above) keeps
+    // `Drop` from dropping it again.
+    let f: F = unsafe { core::ptr::read(c.closure.get() as *const F) };
     let yielder = Yielder { control };
     let first = c.value.get();
 
@@ -257,35 +267,56 @@ impl Fiber {
     where
         F: FnOnce(&Yielder, u64) -> u64 + 'static,
     {
+        // The closure and `Control` take the top of the stack: a closure past this would not leave
+        // the frames their room.
+        const { assert!(size_of::<F>() + align_of::<F>() + size_of::<Control>() <= MAX_HEADER) };
         let stack = Stack::new(stack_size)?;
+        // #2486 — the fiber's `Control` and its entry closure live in the top of its own stack,
+        // above the frame its first resume enters: they last exactly as long as the stack, which
+        // the arena serves, so a fiber costs no heap allocation.
+        let top = stack.top() as usize;
+        let control = (top - size_of::<Control>()) & !(align_of::<Control>() - 1);
+        let closure = (control - size_of::<F>()) & !(align_of::<F>() - 1);
+        // ASan's stack is where the frames are, below the `Control` and closure.
         #[cfg(feature = "asan")]
-        let (asan_bottom, asan_size) = stack.usable();
-        let control = Box::new(Control {
-            value: Cell::new(0),
-            resumer: Cell::new(std::ptr::null_mut()),
-            done: Cell::new(false),
-            taken: Cell::new(false),
-            running: AtomicBool::new(false),
-            closure: Cell::new(Box::into_raw(Box::new(f)) as *mut ()),
-            drop_closure: drop_closure_impl::<F>,
-            usable_low: stack.usable_low() as u64,
-            #[cfg(feature = "asan")]
-            asan: AsanState {
-                resumer_fake: Cell::new(std::ptr::null_mut()),
-                fiber_fake: Cell::new(std::ptr::null_mut()),
-                from_bottom: Cell::new(std::ptr::null()),
-                from_size: Cell::new(0),
-                stack_bottom: asan_bottom as *const core::ffi::c_void,
-                stack_size: asan_size,
-            },
-        });
-        // SAFETY: fresh, live stack; `fiber_entry::<F>` matches the boxed closure's type.
-        let ctx = unsafe { make(&stack, fiber_entry::<F>) };
+        let (asan_bottom, asan_size) = {
+            let (bottom, _) = stack.usable();
+            (bottom, closure - bottom as usize)
+        };
+        // SAFETY: both lie in the fresh stack's top `top - closure` bytes, far under its size, each
+        // aligned for its type; nothing else touches them until the frame `make` lays below them
+        // runs, and `Drop` drops them in place.
+        unsafe {
+            (closure as *mut F).write(f);
+            (control as *mut Control).write(Control {
+                value: Cell::new(0),
+                resumer: Cell::new(std::ptr::null_mut()),
+                done: Cell::new(false),
+                taken: Cell::new(false),
+                running: AtomicBool::new(false),
+                closure: Cell::new(closure as *mut ()),
+                drop_closure: drop_closure_impl::<F>,
+                usable_low: stack.usable_low() as u64,
+                #[cfg(feature = "asan")]
+                asan: AsanState {
+                    resumer_fake: Cell::new(std::ptr::null_mut()),
+                    fiber_fake: Cell::new(std::ptr::null_mut()),
+                    from_bottom: Cell::new(std::ptr::null()),
+                    from_size: Cell::new(0),
+                    stack_bottom: asan_bottom as *const core::ffi::c_void,
+                    stack_size: asan_size,
+                },
+            });
+        }
+        // SAFETY: fresh, live stack with its top `top - closure` bytes kept; `fiber_entry::<F>`
+        // matches the closure's type.
+        let ctx = unsafe { make(&stack, top - closure, fiber_entry::<F>) };
         Some(Fiber {
             _stack: stack,
             ctx,
             done: false,
-            control,
+            control: control as *const Control,
+            frames_top: closure as *const u8,
         })
     }
 
@@ -303,7 +334,7 @@ impl Fiber {
     /// Must only be called on a fiber that is **not currently running** (parked): while a fiber
     /// runs, `ctx` is the stale pre-resume context and does not bound the live frames.
     pub fn parked_extent(&self) -> (*const u8, *const u8) {
-        (self.ctx as *const u8, self._stack.top() as *const u8)
+        (self.ctx as *const u8, self.frames_top)
     }
 
     /// Conservative bounds `[usable_low, top)` for a **running** fiber whose exact live SP the
@@ -311,19 +342,26 @@ impl Fiber {
     /// scan the *whole* usable stack — a sound superset of its live frames (the unused portion is
     /// untouched/zeroed reserved pages or stale non-root bytes, harmless to a conservative scan).
     pub fn full_extent(&self) -> (*const u8, *const u8) {
-        (self._stack.usable_low(), self._stack.top() as *const u8)
+        (self._stack.usable_low(), self.frames_top)
     }
 
-    /// The high end (`top`) of this fiber's usable stack — the upper bound of any scan extent.
+    /// The high end (`top`) of this fiber's frames, below its `Control` and entry closure in the
+    /// top of its stack — the upper bound of any scan extent.
     pub fn stack_top(&self) -> *const u8 {
-        self._stack.top() as *const u8
+        self.frames_top
     }
 
-    /// A stable identity for this fiber's `Control` — the `Box<Control>` address, equal to the
+    /// A stable identity for this fiber's `Control` — its address, equal to the
     /// [`Yielder::control_id`] handed to its body. Used by the GC scanner to correlate a running
     /// fiber with its `Yielder` in the resume chain (see `Yielder::control_id`). Identity only.
     pub fn control_id(&self) -> usize {
-        &*self.control as *const Control as usize
+        self.control as usize
+    }
+
+    /// This fiber's `Control`.
+    fn control(&self) -> &Control {
+        // SAFETY: it sits in the top of `_stack`, which lives as long as `self` ([`Fiber::new`]).
+        unsafe { &*self.control }
     }
 
     /// Resume the fiber, passing `val`; returns whether it yielded or completed.
@@ -337,20 +375,20 @@ impl Fiber {
         // (an aliased `*mut Fiber` resumed concurrently — the catastrophe the §23 protocol forbids),
         // this swap sees `true` and we abort loudly rather than race the `Cell`s into UB. `Acquire`
         // pairs with the `Release` clear below so a (buggy) second resumer observes the first's writes.
-        if self.control.running.swap(true, Ordering::Acquire) {
+        if self.control().running.swap(true, Ordering::Acquire) {
             eprintln!("temen-fiber: fiber resumed while already running (single-owner violation)");
             std::process::abort();
         }
-        self.control.value.set(val);
-        let cptr = &*self.control as *const Control as u64;
+        self.control().value.set(val);
+        let cptr = self.control as u64;
         // ASan: leaving this (the resumer's) stack for the fiber's stack.
         #[cfg(feature = "asan")]
         // SAFETY: bracketing the jump below per the sanitizer fiber-annotation contract.
         unsafe {
             asan::__sanitizer_start_switch_fiber(
-                self.control.asan.resumer_fake.as_ptr(),
-                self.control.asan.stack_bottom,
-                self.control.asan.stack_size,
+                self.control().asan.resumer_fake.as_ptr(),
+                self.control().asan.stack_bottom,
+                self.control().asan.stack_size,
             );
         }
         // SAFETY: `ctx` is the fiber's live suspended context (fresh from `make`, or refreshed below).
@@ -360,7 +398,7 @@ impl Fiber {
         // SAFETY: the arrival half of the bracketing above.
         unsafe {
             asan::__sanitizer_finish_switch_fiber(
-                self.control.asan.resumer_fake.get(),
+                self.control().asan.resumer_fake.get(),
                 core::ptr::null_mut(),
                 core::ptr::null_mut(),
             );
@@ -369,24 +407,28 @@ impl Fiber {
                            // Control is back on the resumer's stack: release the single-owner claim
                            // (the fiber's stack is no longer executing). `Release` publishes our writes
                            // to any subsequent claimant.
-        self.control.running.store(false, Ordering::Release);
-        if self.control.done.get() {
+        self.control().running.store(false, Ordering::Release);
+        if self.control().done.get() {
             self.done = true;
-            State::Complete(self.control.value.get())
+            State::Complete(self.control().value.get())
         } else {
-            State::Yielded(self.control.value.get())
+            State::Yielded(self.control().value.get())
         }
     }
 }
 
 impl Drop for Fiber {
     fn drop(&mut self) {
-        if !self.control.taken.get() {
-            // The body never ran, so it still owns the boxed closure — reclaim it. (A fiber dropped
-            // mid-suspend leaks the values live on its stack; scheduler fibers run to completion.)
-            // SAFETY: `closure` is the untaken `Box<F>` and `drop_closure` its matching dropper.
-            unsafe { (self.control.drop_closure)(self.control.closure.get()) }
+        let c = self.control();
+        if !c.taken.get() {
+            // The body never ran, so the closure is still in the top of the stack — drop it. (A
+            // fiber dropped mid-suspend leaks the values live on its stack; scheduler fibers run to
+            // completion.)
+            // SAFETY: `closure` is the untaken `F` and `drop_closure` its matching dropper.
+            unsafe { (c.drop_closure)(c.closure.get()) }
         }
+        // SAFETY: the `Control` [`Fiber::new`] wrote, dropped once, before `_stack` frees it.
+        unsafe { core::ptr::drop_in_place(self.control as *mut Control) }
     }
 }
 

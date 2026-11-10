@@ -78,7 +78,8 @@ unsafe extern "C" fn trampoline() {
 }
 
 /// Lay out the fresh stack `stack_top` (its highest address, exclusive) so the first [`jump`] into the
-/// returned context begins executing `entry`.
+/// returned context begins executing `entry`. The image starts `below` bytes under the top, which
+/// the caller keeps for itself (a fiber's `Control` and its entry closure, #2486).
 ///
 /// The image, low → high from the returned pointer, is the six callee-saved slots that [`jump`] will
 /// `pop` (with `entry` parked in the `r12` slot for the trampoline to `call`) followed by the
@@ -90,10 +91,10 @@ unsafe extern "C" fn trampoline() {
 /// ```
 ///
 /// # Safety
-/// `stack` must be a live, writable, suitably sized control stack.
-pub unsafe fn make(stack: &crate::stack::Stack, entry: Entry) -> *mut u8 {
+/// `stack` must be a live, writable, suitably sized control stack, `below` well under its size.
+pub unsafe fn make(stack: &crate::stack::Stack, below: usize, entry: Entry) -> *mut u8 {
     // 16-align the base, then push the seven 8-byte slots top-down.
-    let mut sp = (stack.top() as usize) & !15usize;
+    let mut sp = (stack.top() as usize - below) & !15usize;
     let mut push = |v: u64| {
         sp -= 8;
         // SAFETY: `sp` stays within the caller-provided stack region.
