@@ -1,16 +1,20 @@
 /* render.c — WebGPU **render → present → readback**, checked pixel for pixel (LLVM.md WebGPU demo 2;
- * temen-gpu, #2665). A guest renders one frame into the host's 64x64 offscreen surface, reads it back,
- * and compares every pixel with a model computed here on the CPU:
+ * temen-gpu, #2665). A guest renders one frame into the host's 64x64 surface, reads it back, and
+ * compares every pixel with a model computed here on the CPU:
  *   - two rects, as instanced quads from an index buffer and a per-instance vertex buffer, added
  *     to a black clear (red, green, and yellow where they overlap);
  *   - a full-surface blue quad, scissored to the top-right 16x16;
  *   - a 4x4 texture, written from the guest and sampled nearest, scaled 4x into the bottom-left.
  * Every edge lies on a pixel boundary and every colour is a whole step of 1/255, so any conformant
- * WebGPU gives exactly these bytes. The frame is presented, and the host compares what it saw
- * presented with the digest printed here.
+ * WebGPU gives exactly these bytes, natively and in a page alike. The frame is presented, and a host
+ * that sees it can compare it with the digest printed here.
  *
- * It also checks the surface's size, that a malformed stream is refused whole and says why, and that
- * a WGSL error is reported as a value. */
+ * It also checks the surface, that a malformed stream is refused whole and says why, and that a WGSL
+ * error comes back as a value. The surface may be RGBA or BGRA; the readback is put in RGBA order.
+ *
+ * One program for every host. Built with `-DGPU_REACTOR` it is a reactor: `main()` submits the frame,
+ * and `tick()` asks for the readback until it arrives, as a page must, since the browser resolves a
+ * readback, and reports WebGPU's errors, only between ticks. Without it, `main()` asks in a loop. */
 
 #include <stdio.h>
 
@@ -20,9 +24,11 @@
 
 #define S 64
 
+static gpu_stream s;
 static unsigned char stream[16 << 10];
 static unsigned char px[S * S * 4];
 static char why[256];
+static int ok = 1, stage, waited, bgra;
 
 enum {
   UBO = 1, RECTS, INDICES, TEX, TEX_VIEW, SAMPLER, READBACK,
@@ -106,18 +112,20 @@ static int contains(const char *s, const char *sub) {
   return 0;
 }
 
-int main(void) {
-  int ok = 1;
-  gpu_stream s;
+/* The surface, the refused stream, the resources, and the frame with its readback. */
+static void setup(void) {
   gpu_stream_init(&s, stream, sizeof stream);
 
   /* The surface the host bound. */
   gpu_surface_info info;
   long r = gpu_surface(&info);
-  int surface_ok = r == 0 && info.width == S && info.height == S && info.format == GPU_RGBA8UNORM;
+  bgra = info.format == GPU_BGRA8UNORM;
+  int surface_ok = r == 0 && info.width == S && info.height == S &&
+                   (info.format == GPU_RGBA8UNORM || bgra);
   printf("surface: %ldx%ld format %ld: %s\n", (long)info.width, (long)info.height,
          (long)info.format, surface_ok ? "OK" : "FAIL");
   ok &= surface_ok;
+  if (!surface_ok) return;
 
   /* A malformed stream runs nothing, and says why. */
   gpu_create_buffer(&s, UBO, 16, GPU_BUFFER_UNIFORM | GPU_BUFFER_COPY_DST);
@@ -127,15 +135,6 @@ int main(void) {
   int refused = r == GPU_EINVAL && contains(why, "only inside a render pass");
   printf("refused: %s (%s)\n", refused ? "OK" : "FAIL", why);
   ok &= refused;
-
-  /* A WGSL error is WebGPU's, and comes back as a value. */
-  gpu_create_shader_module(&s, BROKEN, "fn broken(");
-  gpu_destroy(&s, BROKEN);
-  r = gpu_submit(&s);
-  long n = gpu_error(why, sizeof why);
-  int reported = r == 0 && n > 0;
-  printf("wgsl error reported: %s\n", reported ? "OK" : "FAIL");
-  ok &= reported;
 
   /* The resources. The refused stream above made none, so UBO is free. */
   float size[4] = {S, S, 0, 0};
@@ -165,7 +164,7 @@ int main(void) {
   gpu_create_shader_module(&s, SOLID_MOD, solid_wgsl);
   gpu_attribute attrs[2] = {{GPU_FLOAT32X4, 0, 0}, {GPU_UNORM8X4, 1, 16}};
   gpu_vertex_buffer vb = {sizeof(rect), GPU_STEP_INSTANCE, 2, attrs};
-  gpu_target add = {GPU_RGBA8UNORM, GPU_WRITE_ALL, 1,
+  gpu_target add = {info.format, GPU_WRITE_ALL, 1,
                     {GPU_ONE, GPU_ONE, GPU_ADD}, {GPU_ONE, GPU_ZERO, GPU_ADD}};
   gpu_render_pipeline solid = {SOLID, SOLID_MOD, "vs", "fs", GPU_TRIANGLE_LIST, 0, GPU_CCW,
                                GPU_CULL_NONE, 1, 1, &vb, 1, &add};
@@ -176,18 +175,13 @@ int main(void) {
 
   /* The textured pipeline: one quad, replacing what is there. */
   gpu_create_shader_module(&s, TEXT_MOD, textured_wgsl);
-  gpu_target replace = {GPU_RGBA8UNORM, GPU_WRITE_ALL, 0, {0, 0, 0}, {0, 0, 0}};
+  gpu_target replace = {info.format, GPU_WRITE_ALL, 0, {0, 0, 0}, {0, 0, 0}};
   gpu_render_pipeline textured = {TEXTURED, TEXT_MOD, "vs", "fs", GPU_TRIANGLE_LIST, 0, GPU_CCW,
                                   GPU_CULL_NONE, 1, 0, 0, 1, &replace};
   gpu_create_render_pipeline(&s, &textured);
   gpu_bind_group_layout_of(&s, TEXT_LAYOUT, TEXTURED, 0);
   gpu_bind_entry te[] = {{0, GPU_BIND_VIEW, TEX_VIEW, 0, 0}, {1, GPU_BIND_SAMPLER, SAMPLER, 0, 0}};
   gpu_create_bind_group(&s, TEXT_GROUP, TEXT_LAYOUT, 2, te);
-  r = gpu_submit(&s);
-  if (r != 0 || gpu_error(why, sizeof why) > 0) {
-    printf("resources: FAIL (%ld: %s)\n", r, why);
-    return 1;
-  }
 
   /* The frame. */
   gpu_acquire(&s, FRAME, FRAME_VIEW);
@@ -209,11 +203,24 @@ int main(void) {
   gpu_readback(&s, READBACK, 0, S * S * 4);
   gpu_present(&s, FRAME, FRAME_VIEW);
   r = gpu_submit(&s);
-  n = r == 0 ? gpu_read_wait(READBACK, px, sizeof px) : r;
-  if (gpu_error(why, sizeof why) > 0) printf("webgpu error: %s\n", why);
+  if (r != 0) {
+    gpu_error(why, sizeof why);
+    printf("frame: FAIL (%ld: %s)\n", r, why);
+    ok = 0;
+    return;
+  }
+  stage = 1;
+}
 
-  int frame_ok = r == 0 && n == (long)sizeof px;
+/* Compares the frame read back with the model, in RGBA order. */
+static void check(long n) {
+  int frame_ok = n == (long)sizeof px;
   int bad = 0;
+  for (int i = 0; bgra && frame_ok && i < S * S; i++) {
+    unsigned char b = px[i * 4];
+    px[i * 4] = px[i * 4 + 2];
+    px[i * 4 + 2] = b;
+  }
   for (int y = 0; y < S && frame_ok; y++)
     for (int x = 0; x < S; x++) {
       unsigned char want[4];
@@ -229,7 +236,57 @@ int main(void) {
   printf("frame: %s, %d pixels differ, digest=%08x\n", frame_ok ? "OK" : "FAIL", bad,
          fnv(px, sizeof px));
   ok &= frame_ok;
-
-  printf("render: %s\n", ok ? "OK" : "FAIL");
-  return ok ? 0 : 1;
 }
+
+/* One step: 1 once the program is done. Stage 1 waits for the readback and checks the frame, then
+ * submits a broken WGSL module; stage 2 waits for its error. Nothing else may have reported one. */
+static int step(void) {
+  if (stage == 1) {
+    long n = gpu_read(READBACK, px, sizeof px);
+    if (n == GPU_EAGAIN) return 0;
+    if (gpu_error(why, sizeof why) > 0) {
+      printf("an error before the WGSL case: %s\n", why);
+      ok = 0;
+    }
+    check(n);
+    gpu_create_shader_module(&s, BROKEN, "fn broken(");
+    gpu_destroy(&s, BROKEN);
+    long r = gpu_submit(&s);
+    ok &= r == 0;
+    stage = 2;
+    waited = 0;
+  }
+  if (stage == 2) {
+    if (gpu_error(why, sizeof why) == 0 && ++waited < 600) return 0;
+    printf("wgsl error reported: %s\n", waited < 600 ? "OK" : "NOT REPORTED");
+    ok &= waited < 600;
+    stage = 3;
+  }
+  if (stage == 3) {
+    printf("render: %s\n", ok ? "OK" : "FAIL");
+    stage = 4;
+  }
+  return stage >= 3;
+}
+
+int main(void) {
+  setup();
+  if (stage == 0) {
+    printf("render: FAIL\n");
+    return 1;
+  }
+#ifdef GPU_REACTOR
+  return 0;
+#else
+  while (!step()) {
+  }
+  return ok ? 0 : 1;
+#endif
+}
+
+#ifdef GPU_REACTOR
+int tick(void) {
+  if (stage == 1 || stage == 2) step();
+  return 0;
+}
+#endif

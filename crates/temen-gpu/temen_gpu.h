@@ -95,35 +95,26 @@ static int gpu_cap(void) {
   return gpu__h;
 }
 
-static void gpu__byte(gpu_stream *s, unsigned char b) {
-  if (s->len >= s->cap) {
+/* Appends `n` bytes, or marks the stream overflowed. temen is little-endian, so a scalar's bytes are
+ * its wire form; one bulk copy keeps a large upload cheap on every engine. */
+static void gpu__put(gpu_stream *s, const void *p, unsigned long n) {
+  if (s->overflow || n > s->cap - s->len) {
     s->overflow = 1;
     return;
   }
-  s->p[s->len++] = b;
+  __builtin_memcpy(s->p + s->len, p, n);
+  s->len += n;
 }
-static void gpu__u32(gpu_stream *s, unsigned v) {
-  for (int i = 0; i < 4; i++) gpu__byte(s, (unsigned char)(v >> (8 * i)));
-}
-static void gpu__u64(gpu_stream *s, unsigned long long v) {
-  for (int i = 0; i < 8; i++) gpu__byte(s, (unsigned char)(v >> (8 * i)));
-}
-static void gpu__f32(gpu_stream *s, float v) {
-  union { float f; unsigned u; } c;
-  c.f = v;
-  gpu__u32(s, c.u);
-}
-static void gpu__f64(gpu_stream *s, double v) {
-  union { double f; unsigned long long u; } c;
-  c.f = v;
-  gpu__u64(s, c.u);
-}
+static void gpu__u32(gpu_stream *s, unsigned v) { gpu__put(s, &v, 4); }
+static void gpu__u64(gpu_stream *s, unsigned long long v) { gpu__put(s, &v, 8); }
+static void gpu__f32(gpu_stream *s, float v) { gpu__put(s, &v, 4); }
+static void gpu__f64(gpu_stream *s, double v) { gpu__put(s, &v, 8); }
 static void gpu__pad(gpu_stream *s) {
-  while (s->len % 8 && !s->overflow) gpu__byte(s, 0);
+  static const unsigned char zero[8];
+  gpu__put(s, zero, (8 - s->len % 8) % 8);
 }
 static void gpu__bytes(gpu_stream *s, const void *p, unsigned long n) {
-  const unsigned char *b = (const unsigned char *)p;
-  for (unsigned long i = 0; i < n && !s->overflow; i++) gpu__byte(s, b[i]);
+  gpu__put(s, p, n);
   gpu__pad(s);
 }
 static unsigned long gpu__strlen(const char *z) {

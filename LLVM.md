@@ -2975,56 +2975,51 @@ WebGPU does the validation for you (guest-authored WGSL is safe by construction)
   readback (`mapAsync` / queue completion) maps onto the existing **parked completions + M:N executor** —
   GPU work is the same submit/validate/return-data shape as I/O.
 
-**Demos that prove safe access (headless first — the safety story is complete with no display):**
-1. **GPU compute → readback → assert vs CPU** *(the ideal first demo)* — a WGSL compute shader
-   over a guest-uploaded buffer, read back and checked against a CPU reference. Proves the whole data
-   plane (upload → dispatch → readback) + the validated-buffer model, **with zero windowing**. —
-   **DONE.** The new **workspace-excluded `crates/temen-webgpu`** crate holds a `webgpu` [`HostCap`]
-   backed by **`wgpu`**: an op protocol (create_buffer / write_buffer / set_shader / dispatch /
-   read_buffer) the guest drives over the generic §7 `__vm_cap_resolve("webgpu")` + `__vm_host_call`
-   surface — **no translator change** (exactly the doc's prediction; the same shape as the `fs`/LMDB
-   host-fn caps). `demos/webgpu/{wgpu_demo.c,wgpu_shim.c}`: a guest uploads a `u32` buffer, sets a WGSL
-   kernel, dispatches, reads back, and re-checks the result against a CPU reference **in-guest** — two
-   kernels (an in-place `b[i]=b[i]*3+7` single-buffer map, and a two-buffer `c[i]=a[i]*a[i]+i` at
-   `@binding(0)`/`@binding(1)`). Test `demo_webgpu_compute` runs it through the on-ramp on **all three
-   engines** (tree-walk/bytecode/JIT), asserting the guest's self-check (`ALL MATCH cpu`); no native
-   oracle (the cap is TEMEN-only, like the async/JIT demos). Runs headless with **no physical GPU** via
-   **lavapipe** (`force_fallback_adapter` → llvmpipe software Vulkan); the wgpu build is isolated to
-   this opt-in crate (like `temen-llvm`), so the default `cargo test` is untouched. **CI note:** the
-   webgpu lane installs `mesa-vulkan-drivers`; without an adapter the test **skips cleanly**
-   (`adapter_available()`). Follow-ups: promote the cap into `temen-run` behind a feature; the
-   offscreen-render (demo 2) + Mandelbrot→PNG (demo 3) slices; richer bind-group/uniform support.
-2. **Offscreen render-to-texture → read pixels → hash** — "hello triangle" / a rotating cube to an
-   offscreen attachment, pixels compared to a reference image. Proves the render pipeline headlessly.
-3. **Compute image filter / Mandelbrot / a Shadertoy-style shader → PNG** (written via the File cap) —
-   visually compelling, deterministic, self-validating; a great screenshot artifact. — **DONE.**
-   `demos/webgpu/mandelbrot.c`: a WGSL compute shader renders a Mandelbrot into an RGBA buffer, the
-   guest reads it back and writes the raw pixels out through the granted **`fs` cap** (compute + fs caps
-   **together**), and the host test encodes the PNG. Self-validated **without a fragile hardcoded hash**:
-   the imaginary-axis mapping is *center-relative* (`y0 = (py − 119.5)·scale`), so mirrored rows are
-   exact IEEE negatives and Mandelbrot conjugate symmetry makes row `py` equal row `H−1−py`
-   **bit-for-bit** — a float-implementation-independent invariant — plus an in-set/escaped sanity pair.
-   Test `demo_webgpu_mandelbrot` runs it through the on-ramp on **all three engines**, asserts the
-   self-check, and encodes the guest-written RGBA to a PNG. (A latent finding: computing `y0` from
-   `(py+0.5)/H·range−offset` is *not* bit-symmetric under f32 rounding — the center-relative form is.)
-4. **On-screen presentation (a swapchain/canvas capability)** — presenting to a real display surface.
-   — **DONE (in the browser playground).** The native path is still deferred (a host window is the
-   OS-coupled part), but the browser is a swapchain we already have: `browser/web/webgpu.js` installs a
-   **`webgpu` capability servicer** on the wasm engine, backed by the page's `<canvas>` + `navigator.gpu`.
-   `demos/display/gpu_shader.c` is a reactor guest that ships one WGSL fragment shader (op 0 `set_shader`)
-   and asks the host to present a frame each `tick` (op 1 `present(frame,w,h)`); the Mandelbrot escape
-   loop runs on the **real GPU** and renders straight to the canvas — only the `(frame,w,h)` scalars
-   cross the boundary per frame, and the guest never holds a GPU pointer (validation, not raw access,
-   is the boundary — §2a). All per-op work is **synchronous** (device creation, the one async step, is
-   awaited before the reactor loop starts — required, since the main-thread reactor can't block). Wired
-   into the playground as **"GPU: Mandelbrot zoom (WebGPU shader)"** (`browser/web/play.js`), and proven
-   end-to-end by `browser/browser-webgpu-test.mjs`: a headless-Chromium Playwright test that drives the
-   full stack (wasm → `webgpu` cap → servicer → `navigator.gpu`) and verifies real GPU pixels via an
-   **offscreen** readback (headless Chromium can't read the canvas swapchain, but an offscreen texture
-   reads back fine). **CI note:** that browser test needs lavapipe (`mesa-vulkan-drivers`) + the WebGPU
-   Chromium flags (`--enable-unsafe-webgpu --enable-features=Vulkan --use-angle=vulkan`); wiring it into
-   a workflow lane is a maintainer follow-up. The native `Surface`/swapchain capability remains the
-   later slice.
+**The protocol (#2665).** One protocol serves every host: `crates/temen-gpu`, pure and dependency-free.
+A guest names GPU objects by ids it chooses and submits **command streams**, runs of C-layout records
+it builds in its own window, as a WebGPU client's wire protocol does (`temen_gpu.h` for C, the
+`Encoder` for Rust). Four ops reach the host: `submit`, `read` (a readback, `-EAGAIN` until it arrives;
+#2838 makes it park), `error`, and `surface`. Each stream is copied out of the window, decoded totally
+(fail closed: an unknown code, nonzero padding or a short record refuses it whole), and checked against
+the live ids by a `Session`: kinds, buffer ranges, pass structure and draw ranges. Only then does a
+backend run it, so a refused stream runs nothing, and the `error` op says why. What remains (formats,
+usages, layouts, WGSL) WebGPU validates, and reports through `error` too. The commands cover buffers,
+textures and views, samplers, WGSL modules, render and compute pipelines with their own (`"auto"`)
+layouts, bind groups, queue writes, render passes (vertex and index buffers, scissor, draws and
+indexed draws), compute passes, copies, readback, and a host-bound surface (`acquire`, `present`).
+Because a stream is plain data, a GPU broker in another process (§17) takes the same streams.
+
+- **Natively,** `crates/temen-webgpu` is the backend over **`wgpu`**: a hardware adapter if there is
+  one, else a software one (lavapipe). wgpu's errors go to the guest through a non-panicking handler,
+  and a panic inside wgpu loses the device, never the host (#2330 A). Its `Surface` is an offscreen
+  texture each present reads back into `Frames` for the embedder; a window's surface is #2837.
+- **In the browser,** the engine runs the same decoder and checks, and hands `web/webgpu.js` the WebGPU
+  calls a checked stream stands for, as JSON steps it makes by name against `navigator.gpu`. The JS
+  holds no knowledge of WebGPU's API of its own. Each capability handler is its own session there, so a
+  fork twin's ids never meet its parent's. The surface is the page's `<canvas>`.
+
+**Demos and tests** (`crates/temen-run/demos/webgpu/`, run by `crates/temen-webgpu/tests/` on **all
+three engines**; a host with no adapter fails them, saying what to install, rather than skipping):
+1. **Compute → readback → assert vs CPU** — `wgpu_demo.c`: an in-place `b[i]=b[i]*3+7` kernel and a
+   two-buffer `c[i]=a[i]*a[i]+i` kernel, each re-checked against a CPU reference **in-guest**.
+2. **Offscreen render → readback → every pixel** — `render.c`: instanced quads from index and vertex
+   buffers with additive blending, a scissored draw, and a texture the guest uploads and samples
+   nearest, read back and compared pixel for pixel with a CPU model. Every edge lies on a pixel boundary
+   and every colour is a whole step of 1/255, so any conformant WebGPU gives exactly these bytes. The
+   host checks that the frame it saw presented is the one the guest read back. The same program runs as
+   a reactor in headless Chromium (`browser/browser-webgpu-test.mjs`), and gives the same bytes there.
+3. **Compute Mandelbrot → PNG** — `mandelbrot.c`: a WGSL compute shader renders a Mandelbrot into an
+   RGBA buffer; the guest reads it back and writes the raw pixels through the granted **`fs` cap**
+   (compute + fs caps together), and the host test encodes the PNG. Self-validated without a hardcoded
+   hash: the imaginary-axis mapping is *center-relative* (`y0 = (py − 119.5)·scale`), so mirrored rows
+   are exact IEEE negatives and conjugate symmetry makes row `py` equal row `H−1−py` **bit-for-bit**.
+4. **Errors are values** — `errors.c`: each case that once reached wgpu's panicking default handler (a
+   buffer over the limit, a misaligned write, a bind group short of a binding, a dispatch over the
+   limit) comes back from `error`, and the device stays usable.
+5. **On-screen presentation** — in the playground, **"GPU: Mandelbrot zoom (WebGPU shader)"**
+   (`demos/display/gpu_shader.c`) builds one render pipeline and draws a frame to the page's canvas
+   each `tick`; only a short command stream crosses the boundary per frame. Headless Chromium presents a
+   WebGPU canvas only through ANGLE on Vulkan (lavapipe), so the browser test runs with those flags.
 
 Riders: any C/C++/Rust app on **wgpu-native** or **Dawn** (the WebGPU C API) — learn-wgpu / WebGPU
 samples — plus `wgpu`'s own CTS as a (meta) conformance check.

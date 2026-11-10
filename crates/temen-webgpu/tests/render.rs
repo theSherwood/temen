@@ -19,34 +19,38 @@ fn fnv(bytes: &[u8]) -> u32 {
 fn demo_webgpu_render() {
     common::require_adapter();
     let inst = common::guest("render");
-    for backend in common::ENGINES {
-        let frames = Frames::default();
-        let surface = Surface::Offscreen {
-            width: 64,
-            height: 64,
-            format: temen_gpu::TextureFormat::Rgba8Unorm,
-            frames: frames.clone(),
-        };
-        let stdout = common::run(
-            &inst,
-            backend,
-            &[("webgpu", temen_webgpu::webgpu_cap(surface))],
-        );
-        assert!(
-            stdout.contains("surface: 64x64 format 3: OK")
-                && stdout.contains("refused: OK")
-                && stdout.contains("wgsl error reported: OK")
-                && stdout.contains("frame: OK, 0 pixels differ")
-                && stdout.contains("render: OK"),
-            "render ({backend:?}) self-check failed; stdout:\n{stdout}"
-        );
-        let (presented, frame) = frames.last();
-        let frame = frame.expect("a presented frame");
-        assert_eq!((presented, frame.width, frame.height), (1, 64, 64));
-        let digest = format!("digest={:08x}", fnv(&frame.texels));
-        assert!(
-            stdout.contains(&digest),
-            "the presented frame ({digest}) is the one the guest read back; stdout:\n{stdout}"
-        );
+    use temen_gpu::TextureFormat::{Bgra8Unorm, Rgba8Unorm};
+    for (format, code) in [(Rgba8Unorm, 3), (Bgra8Unorm, 5)] {
+        for backend in common::ENGINES {
+            let frames = Frames::default();
+            let surface = Surface::Offscreen {
+                width: 64,
+                height: 64,
+                format,
+                frames: frames.clone(),
+            };
+            let caps = [("webgpu", temen_webgpu::webgpu_cap(surface))];
+            let stdout = common::run(&inst, backend, &caps);
+            assert!(
+                stdout.contains(&format!("surface: 64x64 format {code}: OK"))
+                    && stdout.contains("refused: OK")
+                    && stdout.contains("frame: OK, 0 pixels differ")
+                    && stdout.contains("wgsl error reported: OK")
+                    && stdout.contains("render: OK"),
+                "render ({format:?}, {backend:?}) self-check failed; stdout:\n{stdout}"
+            );
+            // The guest reads the frame back in RGBA order; so does this.
+            let (presented, frame) = frames.last();
+            let mut frame = frame.expect("a presented frame");
+            assert_eq!((presented, frame.width, frame.height), (1, 64, 64));
+            if format == Bgra8Unorm {
+                frame.texels.chunks_mut(4).for_each(|t| t.swap(0, 2));
+            }
+            let digest = format!("digest={:08x}", fnv(&frame.texels));
+            assert!(
+                stdout.contains(&digest),
+                "the presented frame ({digest}) is the one the guest read back; stdout:\n{stdout}"
+            );
+        }
     }
 }

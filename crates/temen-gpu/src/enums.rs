@@ -19,6 +19,10 @@ macro_rules! codes {
             pub fn name(self) -> &'static str {
                 match self { $(Self::$v => $s,)* }
             }
+            /// The enum a WebGPU name names, or `None` for any other.
+            pub fn from_name(s: &str) -> Option<Self> {
+                match s { $($s => Some(Self::$v),)* _ => None }
+            }
         }
     };
 }

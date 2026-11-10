@@ -31,11 +31,11 @@ use temen_interp::{
     DEFAULT_FUEL,
 };
 
-// The `webgpu` capability's host import (browser: `navigator.gpu` via `webgpu_op`). Wasm-only — native
-// builds (the Rust reactor tests) have no such import, so the cap is simply not granted there.
 mod nimony;
 pub use nimony::{module_suffix, nim_build, NimBuild};
 pub mod plan;
+// The `webgpu` capability over the page's `navigator.gpu` (#2665). Wasm-only: native builds (the Rust
+// reactor tests) have no page, so the cap is simply not granted there.
 #[cfg(target_arch = "wasm32")]
 mod webgpu;
 
@@ -2737,49 +2737,29 @@ impl OnrampCaps {
                     },
                 ))
             }
-            // `webgpu` — a GPU render surface, serviced (in the browser) against `navigator.gpu` via
-            // the `webgpu_op` host import (`src/webgpu.rs`). The guest ships a WGSL shader once (op 0)
-            // and asks the host to present a frame each tick (op 1); the parallel pixel work runs on
-            // the GPU and only tiny scalars + the shader source cross the boundary — the guest never
-            // holds a GPU pointer (§2a). Only granted in the wasm build (native has no GPU import); a
-            // guest resolves `-1` and skips elsewhere. Stateless — nothing to declare — but it lives
-            // here with the rest so a thaw's registrar can re-grant it: a browser artifact names it.
+            // `webgpu` — the GPU, through the protocol every host shares (`temen-gpu`, #2665): the guest
+            // submits command streams naming objects by its own ids, and this handler decodes and checks
+            // each one, then runs it against the page's `navigator.gpu` (`src/webgpu.rs`). The guest
+            // never holds a GPU object; validation, not raw access, is the boundary (§2a). Only granted
+            // in the wasm build (native has no page); a guest resolves `-1` and skips elsewhere. Each
+            // handler is a session of its own, so a fork twin's ids never meet its parent's.
             #[cfg(target_arch = "wasm32")]
-            "webgpu" => Some(Box::new(
-                move |op,
-                      args: &[i64],
-                      out: &mut [i64],
-                      mem: Option<&mut dyn temen_interp::GuestMem>,
-                      _| {
-                    match op {
-                        // set_shader(wgsl_ptr, wgsl_len) → 0 (compiled) / -1 (bad ptr or compile error)
-                        0 => {
-                            let ptr = args.first().copied().unwrap_or(0);
-                            let len = args.get(1).copied().unwrap_or(0);
-                            if !(0..=1 << 20).contains(&len) {
-                                return put_results(out, &[-1]);
-                            }
-                            let Some(wgsl) = mem.and_then(|m| m.read_bytes(ptr as u64, len as u64))
-                            else {
-                                return put_results(out, &[-1]);
-                            };
-                            // SAFETY: wasm-only import; `wgsl` outlives the synchronous call.
-                            let r =
-                                unsafe { webgpu::webgpu_op(0, 0, 0, 0, wgsl.as_ptr(), wgsl.len()) };
-                            put_results(out, &[r])
-                        }
-                        // present(frame, w, h) → 0
-                        1 => {
-                            let a = args.first().copied().unwrap_or(0);
-                            let b = args.get(1).copied().unwrap_or(0);
-                            let c = args.get(2).copied().unwrap_or(0);
-                            let r = unsafe { webgpu::webgpu_op(1, a, b, c, core::ptr::null(), 0) };
-                            put_results(out, &[r])
-                        }
-                        _ => put_results(out, &[-1]),
-                    }
-                },
-            )),
+            "webgpu" => {
+                let mut gpu = temen_gpu::Gpu::new(webgpu::Js::new());
+                Some(Box::new(
+                    move |op,
+                          args: &[i64],
+                          out: &mut [i64],
+                          mem: Option<&mut dyn temen_interp::GuestMem>,
+                          _| {
+                        let r = match mem {
+                            Some(m) => gpu.call(op, args, Some(&mut webgpu::Window(m))),
+                            None => gpu.call(op, args, None),
+                        };
+                        put_results(out, &[r])
+                    },
+                ))
+            }
             // `fs` — a read-only in-memory file (Doom slice 4: the WAD read path). The op protocol
             // mirrors the native `doom_diff` differential's in-memory WAD server (and the reused
             // `lua_files_stdio.c` FILE shim): 0 open(nameptr,namelen,flags)→fd|-2(ENOENT),
@@ -2940,8 +2920,13 @@ impl OnrampCaps {
     /// [`set_state`](Self::set_state). Given at every grant, fork and thaw re-grant, so a thawed
     /// capability is captured by the next freeze as the original was.
     fn cap_state(&self, name: &str) -> temen_interp::CapState {
+        if name == "webgpu" {
+            // The guest's ids name GPU objects, which nothing here serializes (#1699): a freeze refuses
+            // it, as natively, rather than thaw a session that knows none of them.
+            return temen_interp::CapState::Uncaptured;
+        }
         if self.get_state(name).is_none() {
-            // Nothing the guest can observe about it: `display` and `webgpu` only produce output.
+            // Nothing the guest can observe about it: `display` only produces output.
             return temen_interp::CapState::Stateless;
         }
         let (c, r) = (self.clone(), self.clone());
@@ -4824,10 +4809,15 @@ impl OnrampReactor {
             caps,
             last_trap: None,
         };
-        // Run the entry (func 0) once on the live window with no args (phase 4: the manifest slot
-        // bindings deliver the capabilities) to run the C initializer. The window (globals/BSS/heap)
-        // then persists for every `tick`.
-        r.call(0, &[]).map_err(|_| STATUS_TRAP)?;
+        // Run the entry (func 0) once on the live window (phase 4: the manifest slot bindings deliver
+        // the capabilities) to run the C initializer. A synthesized `_start` takes nothing and sets up
+        // its own stack; an entry-less reactor's `main` takes its data stack pointer, as `tick` does,
+        // and without it, a `main` with locals on the data stack ran at address 0. The window
+        // (globals/BSS/heap) then persists for every `tick`.
+        let sp = [Value::I64(r.entry_sp as i64)];
+        let takes_sp = r.module.funcs.first().is_some_and(|f| !f.params.is_empty());
+        r.call(0, if takes_sp { &sp } else { &[] })
+            .map_err(|_| STATUS_TRAP)?;
         Ok(r)
     }
 
@@ -5244,7 +5234,7 @@ pub extern "C" fn temen_run_onramp(
 // per write to a run's stdout (`fd` 1) or stderr (`fd` 2), with the chunk's `[ptr, ptr+len)` in linear
 // memory, so the page shows it as the guest produces it. `seq` numbers a run's chunks from 1 in the
 // order its buffers hold them, for an embedder that hears them from several Workers (#1414 S5a).
-// Wasm-only (like `webgpu_op`); native builds have no such import. (Plain `//`: rustdoc rejects `///`
+// Wasm-only (like the `webgpu` imports); native builds have no such import. (Plain `//`: rustdoc rejects `///`
 // on an extern block.)
 #[cfg(target_arch = "wasm32")]
 #[link(wasm_import_module = "temen_host")]

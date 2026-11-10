@@ -78,6 +78,9 @@ temen-opt = { path = "../crates/temen-opt" }
 # The durability transform (freeze/thaw IR rewrite) — used by the `gencorpus` ground truth and the
 # `run_durable` probe to instrument a module + seed the durable window. Pure (only `temen-ir`).
 temen-durable = { path = "../crates/temen-durable" }
+# The `webgpu` capability's protocol (#2665): the decoder, checks and ops every host shares, so the
+# browser serves the same streams as `temen-webgpu` natively. Pure, no dependencies.
+temen-gpu = { path = "../crates/temen-gpu" }
 # The §12 durable-snapshot artifact codec — the freeze/thaw persistence path for the browser
 # "persist a grown durable guest across a reload" consumer (#816 Slice C, `temen_durable_freeze` /
 # `temen_durable_thaw_resume`). Tooling-tier, +0-TCB; deps `temen-encode`/`temen-ir`/`temen-interp`
