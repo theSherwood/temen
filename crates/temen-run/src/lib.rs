@@ -6202,8 +6202,8 @@ impl PowerboxProgram {
         }
         if folds_to_oracle(&module) {
             return Err(
-                "PowerboxProgram: module folds off the JIT (serves / spawns demand \
-                        children); use run_powerbox"
+                "PowerboxProgram: module folds off the JIT (the JIT declines it, or it \
+                        serves); use run_powerbox"
                     .into(),
             );
         }
@@ -6656,9 +6656,15 @@ fn module_serves(m: &Module) -> bool {
 
 /// The **one** definition of the JIT routing fold (INVARIANTS #9: a veto composition must not
 /// have per-site copies — #897 found the reactor path had silently dropped a clause). True when a
-/// `Backend::Jit` run must leave the Cranelift JIT: the module statically serves without being
-/// serve-qualified or nesting (the oracle's serve arm has the fiber-park machinery). A module that
-/// could page a child no longer folds: the JIT pages a child itself (#2164).
+/// `Backend::Jit` run must leave the Cranelift JIT:
+/// - the JIT declines the module ([`temen_jit::admits`], the check its compile makes first): it
+///   has an op the JIT can't run as the oracle does, such as fork's `clone_caller`/`reap` (#2553)
+///   or `exec_module` (#2555), so the run takes the ladder rather than ending in the compile's
+///   error;
+/// - or the module statically serves without being serve-qualified or nesting (the oracle's serve
+///   arm has the fiber-park machinery).
+///
+/// A module that could page a child no longer folds: the JIT pages a child itself (#2164).
 ///
 /// Fold **down the ladder, not straight to the tree-walker** (owner decision 2026-08-13, #891):
 /// callers fold to [`Backend::Bytecode`], whose own compile gate decides the final landing —
@@ -6666,7 +6672,10 @@ fn module_serves(m: &Module) -> bool {
 /// back to the tree-walker for the rest, so a legitimate short-circuit (a shape bytecode also
 /// declines) collapses the ladder by construction rather than by caller assumption.
 fn folds_to_oracle(m: &temen_ir::Module) -> bool {
-    module_serves(m) && !temen_interp::bytecode::serve_qualifies(&m.funcs) && !module_nests(m)
+    !temen_jit::admits(m)
+        || (module_serves(m)
+            && !temen_interp::bytecode::serve_qualifies(&m.funcs)
+            && !module_nests(m))
 }
 
 /// Fold an interpreter result (`TreeWalk`/`Bytecode`) into an [`Outcome`]: a clean return, an
@@ -9740,6 +9749,36 @@ block 0 (va: i64, vb: i64) {
         let m = temen_text::parse_module(src).expect("parse");
         temen_verify::verify_module(&m).expect("verify");
         assert!(!folds_to_oracle(&m), "the JIT runs it");
+    }
+
+    /// #2553 — a module the Cranelift JIT declines folds: the routing asks the JIT's own check
+    /// (`temen_jit::admits`), so the run takes the ladder rather than ending in the compile's error.
+    /// Each self op the JIT can't run as the oracle does is enough on its own (`clone_caller`,
+    /// `reap`, `exec_module`), in a module that spawns a child, which the serve clause lets through.
+    #[test]
+    fn a_module_the_jit_declines_folds() {
+        for (op, sig, args) in [
+            (11, "(i64, i64) -> (i64)", "100, 200"),
+            (12, "(i64) -> (i64)", "3"),
+            (14, "(i64, i64, i64, i64, i64) -> (i64)", "0, 0, 0, 0, 16"),
+        ] {
+            let (consts, regs): (String, Vec<String>) = args
+                .split(", ")
+                .enumerate()
+                .map(|(i, a)| (format!("  va{i} = i64.const {a}\n"), format!("va{i}")))
+                .unzip();
+            let src = format!(
+                "memory 16\nfunc 0 (i32) -> (i64) {{\nblock 0 (vh: i32) {{\n  \
+                 vrp = i64.const 17408\n  vch = call.cap 6 17 (i64) -> (i32) vh (vrp)\n  \
+                 vz = i32.const 0\n{consts}  vt = call.cap 4294967295 {op} {sig} vz ({})\n  \
+                 return vt\n  }}\n}}\n",
+                regs.join(", ")
+            );
+            let m = temen_text::parse_module(&src).expect("parse");
+            temen_verify::verify_module(&m).expect("verify");
+            assert!(!temen_jit::admits(&m), "self-op {op}: the JIT declines it");
+            assert!(folds_to_oracle(&m), "self-op {op}: so a JIT run folds");
+        }
     }
 }
 

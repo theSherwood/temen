@@ -3761,10 +3761,7 @@ impl CompiledModule {
             sig_ctx: signal.as_ref().map_or(core::ptr::null_mut(), |s| s.ctx),
             ..InstanceAddrs::NONE
         };
-        // Calls can reach any function, so every function must be lowerable.
-        for f in &m.funcs {
-            ensure_supported(f, &m.types)?;
-        }
+        supported(m)?;
 
         // Plan the guest window if the module declares memory (allocation happens per `run`):
         // `mapped` backed RW bytes inside a host-configured `reserved` virtual range whose
@@ -3772,11 +3769,6 @@ impl CompiledModule {
         // the mask domain). All of these are baked into the code, so they are fixed at compile time.
         let (win_mapped, win_reserved, mask): (usize, usize, u64) = match m.memory {
             Some(mc) => {
-                if mc.size_log2 > MAX_JIT_WINDOW_LOG2 {
-                    return Err(JitError::Unsupported(
-                        "window too large for the reference JIT",
-                    ));
-                }
                 // Host reservation policy: at least `mapped` (fully mapped if `reserved_log2` is
                 // smaller, e.g. 0), capped so the reference JIT's reservation stays sane.
                 let reserved_log2 = reserved_log2.max(mc.size_log2).min(MAX_JIT_RESERVED_LOG2);
@@ -9023,6 +9015,30 @@ fn sig_from(params: &[ValType], results: &[ValType]) -> cranelift_codegen::ir::S
     sig
 }
 
+/// Whether the Cranelift JIT compiles `m`: it lowers every function and reserves the window. It is
+/// the check [`CompiledModule::compile`] makes before compiling anything, so a router can fold a
+/// module the JIT declines down the ladder before its run starts (temen-run's `folds_to_oracle`,
+/// INVARIANTS.md #9), as `temen_interp::bytecode::admits` is the bytecode engine's.
+pub fn admits(m: &IrModule) -> bool {
+    supported(m).is_ok()
+}
+
+/// [`admits`], with the reason for a decline.
+fn supported(m: &IrModule) -> Result<(), JitError> {
+    // Calls can reach any function, so every function must be lowerable.
+    for f in &m.funcs {
+        ensure_supported(f, &m.types)?;
+    }
+    if m.memory
+        .is_some_and(|mc| mc.size_log2 > MAX_JIT_WINDOW_LOG2)
+    {
+        return Err(JitError::Unsupported(
+            "window too large for the reference JIT",
+        ));
+    }
+    Ok(())
+}
+
 /// Reject functions using any op outside the integer slice, so `build_clif` can lower
 /// the remainder totally. Keeping the check separate keeps the lowering readable.
 fn ensure_supported(f: &Func, type_section: &[temen_ir::TypeEntry]) -> Result<(), JitError> {
@@ -9050,22 +9066,26 @@ fn ensure_supported(f: &Func, type_section: &[temen_ir::TypeEntry]) -> Result<()
     }
     for blk in &f.blocks {
         for inst in &blk.insts {
-            // FORK.md §8.6 — `exec_module` (`execve` image-replace, op 14) is eval-loop-only: the
-            // tree-walker folds it to `Step::Exec` before any host dispatch. The generic `call.cap`
-            // thunk would answer `-EINVAL` where the oracle image-replaces — a silent divergence
-            // (INVARIANTS.md #9). Decline so the run folds to a reifiable tier (OPS_PARITY.md
-            // `exec`). Decided here, before any run, since a lazily compiled module (#2594) lowers a
-            // function only once its run has started, when it can no longer decline.
+            // Three self ops the JIT can't run as the oracle does. The generic `call.cap` thunk would
+            // answer `-EINVAL` where the oracle forks a served call's caller (`clone_caller`, op 11),
+            // reaps the twin (`reap`, op 12; FORK.md §9, #2553) or replaces the image
+            // (`exec_module`, op 14, which the tree-walker folds to `Step::Exec`; FORK.md §8.6): a
+            // silent divergence (INVARIANTS.md #9). Decline, so the run folds to a tier that runs
+            // them (`admits`). Native fork here is FORK.md §9.3's capstone (#2855). Decided here,
+            // before any run, since a lazily compiled module (#2594) lowers a function only once its
+            // run has started, when it can no longer decline.
             // A call that doesn't hold to the op's contract traps `CapFault` instead, as every
             // engine's does (`served_shape_ok`, checked first by the lowering too).
             if let Inst::CapCall(c) = inst {
                 if c.type_id == temen_ir::CAP_SELF_TYPE_ID
-                    && c.op == 14
+                    && matches!(c.op, 11 | 12 | 14)
                     && temen_ir::served_shape_ok(c.type_id, c.op, sig_of(type_section, c.sig))
                 {
-                    return Err(JitError::Unsupported(
-                        "exec_module: eval-loop-only image-replace (op 14)",
-                    ));
+                    return Err(JitError::Unsupported(match c.op {
+                        11 => "clone_caller: the JIT does not fork (op 11)",
+                        12 => "reap: the JIT does not fork (op 12)",
+                        _ => "exec_module: eval-loop-only image-replace (op 14)",
+                    }));
                 }
             }
             match inst {

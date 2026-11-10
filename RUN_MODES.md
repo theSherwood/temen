@@ -121,18 +121,18 @@ The property rows are the columns' properties again.
 - *frozen and thawed* 🔶 — Cranelift JIT: on the fiber_rt targets (unix x86-64, unix aarch64, Windows x86-64); elsewhere the JIT declines the module
 
 **forks itself (clone_caller)**
-- *Cranelift JIT* 🚧 — answers clone_caller and reap -EINVAL where the oracle forks (#2553); FORK.md §9.3 plans them natively. The POSIX personality's own fork runs there (§9.5)
+- *Cranelift JIT* 🚧 — declines a module with clone_caller or reap, which an Instance run folds to the bytecode engine; FORK.md §9.3 plans them natively (#2855). The POSIX personality's own fork runs there (§9.5)
 - *under a debugger* 🚧 — tree-walk interpreter: the tree-walk Inspector blocks on a fork (#2560)
 - *under a debugger* 🚧 — bytecode, one thread: the bytecode debug scheduler declines every process seam: fork, exec, spawn, wait and pipes (#2554)
 - *frozen and thawed* 🚧 — bytecode, one thread: the bytecode tier's durable entry declines a module with threads or §14 children, and the pump hands it to the tree-walker (#2533)
-- *frozen and thawed* 🚧 — Cranelift JIT: answers clone_caller and reap -EINVAL where the oracle forks (#2553); FORK.md §9.3 plans them natively. The POSIX personality's own fork runs there (§9.5)
+- *frozen and thawed* 🚧 — Cranelift JIT: declines a module with clone_caller or reap, which an Instance run folds to the bytecode engine; FORK.md §9.3 plans them natively (#2855). The POSIX personality's own fork runs there (§9.5)
 
 **execs another image (exec_module)**
-- *Cranelift JIT* 🚧 — declines exec_module, the op C's execve replaces its image with (#2555); the POSIX personality's OP_EXECVE runs there (FORK.md §9.4)
+- *Cranelift JIT* 🚧 — declines exec_module, the op C's execve replaces its image with, and an Instance run folds the module to the bytecode engine (#2555); the POSIX personality's OP_EXECVE runs there (FORK.md §9.4)
 - *under a debugger* 🚧 — tree-walk interpreter: the tree-walk Inspector traps FiberFault on an exec (#2560)
 - *under a debugger* 🚧 — bytecode, one thread: the bytecode debug scheduler declines every process seam: fork, exec, spawn, wait and pipes (#2554)
 - *frozen and thawed* 🚧 — tree-walk interpreter; bytecode, one thread: a durable domain refuses exec_module with -EINVAL (#1696)
-- *frozen and thawed* 🚧 — Cranelift JIT: declines exec_module, the op C's execve replaces its image with (#2555); the POSIX personality's OP_EXECVE runs there (FORK.md §9.4)
+- *frozen and thawed* 🚧 — Cranelift JIT: declines exec_module, the op C's execve replaces its image with, and an Instance run folds the module to the bytecode engine (#2555); the POSIX personality's OP_EXECVE runs there (FORK.md §9.4)
 - *re-entered per frame* 🚧 — bytecode, one thread: the frame that execs drops the reactor's window, so the next frame traps Malformed (#2660)
 
 **makes a call the embedder answers**
@@ -179,8 +179,8 @@ The property rows are the columns' properties again.
 - *bytecode, one thread* 🚧 — grows its window: the bytecode tier's durable entry takes a flat window, so a thaw traps MemoryFault on a page the run mapped past its declared memory (#2628)
 - *bytecode, thread per task* 🚧 — executor 2 has no freeze across its threads yet; a durable run asked to run on it runs on the pump (#2541)
 - *Cranelift JIT* 🔶 — spawns threads; runs fibers; spawns a child domain (§14): on the fiber_rt targets (unix x86-64, unix aarch64, Windows x86-64); elsewhere the JIT declines the module
-- *Cranelift JIT* 🚧 — forks itself (clone_caller): answers clone_caller and reap -EINVAL where the oracle forks (#2553); FORK.md §9.3 plans them natively. The POSIX personality's own fork runs there (§9.5)
-- *Cranelift JIT* 🚧 — execs another image (exec_module): declines exec_module, the op C's execve replaces its image with (#2555); the POSIX personality's OP_EXECVE runs there (FORK.md §9.4)
+- *Cranelift JIT* 🚧 — forks itself (clone_caller): declines a module with clone_caller or reap, which an Instance run folds to the bytecode engine; FORK.md §9.3 plans them natively (#2855). The POSIX personality's own fork runs there (§9.5)
+- *Cranelift JIT* 🚧 — execs another image (exec_module): declines exec_module, the op C's execve replaces its image with, and an Instance run folds the module to the bytecode engine (#2555); the POSIX personality's OP_EXECVE runs there (FORK.md §9.4)
 - *Cranelift JIT* 🚧 — makes a call the embedder answers: a durable run declines a host-answered call with CapFault before its embedder sees it: no caller in a durable run parks on a call (#2504)
 - *Cranelift JIT* 🚧 — is stopped and continued (job control): serves no job control, so a stopped process runs on (#1826)
 - *Cranelift JIT* 🔶 — maps a shared region (§13): for a region over an OS shared-memory object (temen_run::new_shared_region), which the JIT maps by its descriptor; a software-only one (Host::grant_shared_region) has none, so its map answers -EINVAL there

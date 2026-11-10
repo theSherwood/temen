@@ -164,10 +164,10 @@ const NO_WASM_OP: &str = "no core-wasm opcode (relaxed-SIMD / scalar-fma only)";
 const SERVE: &str =
     "native serve-loop core (svc.poll/svc.wait) for a serve-qualified module; else folds to the oracle";
 const FORK_GAP: &str =
-    "native on tree-walk + bytecode; Cranelift answers -EINVAL where the oracle forks (#2553) — native fork there is FORK.md §9.3";
+    "native on tree-walk + bytecode; Cranelift declines the module, which an Instance run folds to the bytecode engine — native fork there is FORK.md §9.3 (#2855)";
 const FUEL_BC: &str = "declines the module (folds to the oracle) rather than adding a native op";
 const EXEC_GAP: &str =
-    "image-replace on tree-walk (Step::Exec) + bytecode (Op::ExecModule); Cranelift declines the module (#2555, FORK.md §8.6)";
+    "image-replace on tree-walk (Step::Exec) + bytecode (Op::ExecModule); Cranelift declines the module, which an Instance run folds to the bytecode engine (#2555, FORK.md §8.6)";
 
 /// Reserved cap-interface ids and self-namespace op numbers that appear **directly** in `call.cap`
 /// IR encoding. These mirror `temen_interp::cap_id` and the `temen_interp::CAP_SELF_*` op constants
@@ -220,9 +220,9 @@ fn parity_capcall(type_id: u32, op: u32) -> [Cell; 4] {
         // FORK.md §9 — `clone_caller` (11) / `reap` (12): fork-returns-twice + wait. **Native on the
         // bytecode engine** (the cooperative serve driver builds the twin over `Mem::fork_private` +
         // `Host::fork_powerbox` and reaps it; pinned bit-for-bit against the oracle by
-        // `clone_caller.rs::bytecode_forks_the_twin_identically_to_the_oracle`). Cranelift lowers
-        // both through the generic cap thunk, which answers `-EINVAL` (#2553; the run-mode matrix's
-        // fork probe). wasm-JIT leaf-folds like every cap op.
+        // `clone_caller.rs::bytecode_forks_the_twin_identically_to_the_oracle`). Cranelift declines
+        // a module that uses either (`temen_jit::admits`, #2553), and an `Instance` run folds it to
+        // the bytecode engine; native fork there is #2855. wasm-JIT leaf-folds like every cap op.
         (t, o) if t == self_ty && matches!(o, capcall::CLONE_CALLER | capcall::REAP) => {
             [F, F, cell(Status::NotYet, FORK_GAP), leaf]
         }
@@ -236,7 +236,8 @@ fn parity_capcall(type_id: u32, op: u32) -> [Cell; 4] {
         // `exec_module` (14): `execve` image-replace. The tree-walker folds it to `Step::Exec`; the
         // bytecode engine replaces the image natively (`Op::ExecModule`, #1080 — bash runs on it in
         // the browser). The JIT bails `Unsupported` (#2555), never a `-EINVAL`-vs-image-replace
-        // divergence. wasm-JIT leaf-folds every cap op.
+        // divergence, and an `Instance` run folds the module to the bytecode engine. wasm-JIT
+        // leaf-folds every cap op.
         (t, o) if t == self_ty && o == capcall::EXEC => {
             [F, F, cell(Status::NotYet, EXEC_GAP), leaf]
         }

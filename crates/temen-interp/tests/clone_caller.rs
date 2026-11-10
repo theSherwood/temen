@@ -49,15 +49,15 @@ fn module(text: &str) -> Arc<temen_ir::Module> {
     Arc::new(m)
 }
 
-/// FORK.md §9 / OPS_PARITY.md (`clone_caller`/`reap`) — `serve_qualifies` (temen-run's **Cranelift**
-/// routing predicate) still folds a forking module to the oracle: the Cranelift fork slice is
-/// unbuilt, so it must never compile fork there and answer `-EINVAL` where the oracle forks (a
-/// silent divergence, INVARIANTS.md #9). This pins the *Cranelift* side of the per-backend split —
-/// the **bytecode** engine now serves fork natively (see
-/// `bytecode_forks_the_twin_identically_to_the_oracle`), via the separate `bytecode_serves_fork`
-/// escape, so the two predicates deliberately diverge on fork until Cranelift catches up.
+/// FORK.md §9 / OPS_PARITY.md (`clone_caller`/`reap`) — `serve_qualifies` refuses a module whose
+/// handler forks or reaps: both are park seams. The **bytecode** engine serves fork all the same,
+/// through the separate `bytecode_serves_fork` escape (see
+/// `bytecode_forks_the_twin_identically_to_the_oracle`). This is not what keeps fork off the
+/// Cranelift JIT: a forking topology nests, and temen-run's serve fold leaves a nesting module on
+/// the JIT. The JIT declines fork itself (`temen_jit::admits`, #2553), pinned end to end by
+/// temen-run's `svc_parity.rs`.
 #[test]
-fn serve_qualifies_still_folds_fork_for_cranelift() {
+fn serve_qualifies_refuses_a_forking_module() {
     use temen_interp::bytecode::serve_qualifies;
     use temen_ir::{Block, Func, Inst, Terminator, ValType, CAP_SELF_TYPE_ID};
 
@@ -92,9 +92,9 @@ fn serve_qualifies_still_folds_fork_for_cranelift() {
         "a bare serve point should qualify for native serving"
     );
 
-    // Adding a handler that forks (`clone_caller`) or reaps (`reap`) makes `serve_qualifies` (the
-    // Cranelift routing predicate) fold the module — fork is not lowered on Cranelift yet. (The
-    // bytecode gate takes the `bytecode_serves_fork` escape instead; that path is proven separately.)
+    // Adding a handler that forks (`clone_caller`) or reaps (`reap`) makes `serve_qualifies` refuse
+    // the module. (The bytecode gate takes the `bytecode_serves_fork` escape instead; that path is
+    // proven separately.)
     for fork_op in [
         temen_interp::CAP_SELF_CLONE_CALLER,
         temen_interp::CAP_SELF_REAP,
@@ -113,7 +113,7 @@ fn serve_qualifies_still_folds_fork_for_cranelift() {
         });
         assert!(
             !serve_qualifies(&funcs),
-            "serve_qualifies must fold a forking module (self-op {fork_op}) for Cranelift"
+            "serve_qualifies must refuse a forking module (self-op {fork_op})"
         );
     }
 }
