@@ -64,16 +64,18 @@
 //!   cargo run --release -- --from-wasm           # Temen IR transpiled from the WAT (same bytes as wasm)
 //!   cargo run --release -- --optimize            # run temen-opt over the Temen IR before the Temen lanes
 //!   cargo run --release -- --csv                 # machine-readable line per kernel
-//!   cargo run --release -- --save-baseline FILE  # record the current ratios
+//!   cargo run --release -- --save-baseline FILE  # record this CPU's ratios
 //!   cargo run --release -- --check FILE           # rerun + flag any ratio regression
 //!   cargo run --release -- --only call,fib        # just the named kernels
 //!
 //! **Over-time regression tracking (AGENTS.md "catch regressions one commit old").** The
-//! absolute ns are machine-dependent, so the *tracked* quantity is the **ratio** (temen ÷
-//! wasm) per kernel — far more portable across machines than the raw timings. `--save-baseline`
-//! writes the three ratios per kernel (compute-vs-wasm32, compute-vs-wasm64, cold-vs-Wasmtime)
-//! to a committed file; `--check` reruns and **exits non-zero** if any ratio has grown by more
-//! than `--tol` (default 25%, i.e. temen got relatively slower) — that band absorbs runner noise
+//! absolute ns are machine-dependent, so the *tracked* quantity is a **ratio** per kernel: temen ÷
+//! wasm32, ÷ wasm64 and ÷ cold Wasmtime, interp ÷ jit, and jit ÷ native. Ratios are far more
+//! portable than the raw timings, but not across CPU models: the same commit's differ by up to 2×
+//! between the nightly's runners (#728). So the committed file keeps a section of ratios per CPU
+//! model, and `--save-baseline` writes the running CPU's. `--check` reruns and **exits non-zero**
+//! if any ratio has grown past its own CPU's section by more than `--tol` (default 25%, i.e. temen
+//! got relatively slower); on a CPU with no section it only reports. That band absorbs runner noise
 //! while still catching a real regression (e.g. losing mask-elision moved `scatter` ≈1.21→1.53,
 //! +26%; losing SSA promotion would be far larger). `--check`/`--save-baseline` default to
 //! `--reps 5` (best-of, to stabilise the comparison); plain/`--csv` use one pass for speed.
@@ -1383,6 +1385,31 @@ fn temen_call_host(m: &temen_ir::Module, entry: u32, lead: &[i64], n: i64) -> i6
     }
 }
 
+/// [`temen_call_host`] through the real capability path (#2319): `temen_run::cap_thunk` over a
+/// fresh [`dispatch_host`], whose host procedure's handle the kernel takes first (`lead`).
+fn temen_call_dispatch(m: &temen_ir::Module, entry: u32, lead: &[i64], n: i64) -> i64 {
+    let (mut host, handle) = dispatch_host();
+    assert_eq!(lead, [handle as i64], "a fresh host's first grant");
+    let ctx = &mut host as *mut temen_interp::Host as *mut c_void;
+    match compile_and_run_with_host(m, entry, &[handle as i64, n], temen_run::cap_thunk, ctx) {
+        Ok(JitOutcome::Returned(s)) => s[0],
+        other => panic!("temen jit (dispatch) produced {other:?}"),
+    }
+}
+
+/// A host granted one host procedure, `x -> x+1` (`bench_thunk`'s op 0), and its handle.
+fn dispatch_host() -> (temen_interp::Host, i32) {
+    use temen_interp::{put_results, CapState, HostProcGrant, ProcHandler};
+    let mut host = temen_interp::Host::new();
+    let handle = host.grant_host_proc(HostProcGrant::new(
+        ProcHandler::Sync(Box::new(|_op, args, out, _mem, _minter| {
+            put_results(out, &[args.first().copied().unwrap_or(0).wrapping_add(1)])
+        })),
+        CapState::Stateless,
+    ));
+    (host, handle)
+}
+
 /// What a kernel measures. `Compute` kernels run an import-less wasm module and the no-cap
 /// Temen JIT (per-iteration *compute*). `HostCall` kernels instead make one host crossing per
 /// iteration — Temen `call.cap` through a trampoline thunk vs a Wasmtime **imported host
@@ -1391,6 +1418,9 @@ fn temen_call_host(m: &temen_ir::Module, entry: u32, lead: &[i64], n: i64) -> i6
 enum Mode {
     Compute,
     HostCall,
+    /// #2319 — a `HostCall` kernel whose crossing goes where an embedder's do: `temen_run::cap_thunk`
+    /// into a `Host` that dispatches a granted host procedure ([`temen_call_dispatch`]).
+    Dispatch,
 }
 
 /// A kernel resolved for this run: IR text — hand-written, or generated from C through the
@@ -1453,10 +1483,13 @@ fn resolve_kernels(from_wasm: bool) -> Vec<Resolved> {
     }
     // Interface (host-call) kernels — the §1a "around-compute" axis the harness was missing.
     v.push(hostcall_kernel());
+    v.push(hostproc_kernel());
     v.push(hostbuf_kernel());
 
     if from_wasm {
-        for k in &mut v {
+        // #2319 — a `Dispatch` kernel stays hand-written: it calls the host's granted procedure by
+        // handle, which a transpiled import would not reach.
+        for k in v.iter_mut().filter(|k| k.mode != Mode::Dispatch) {
             // The `irreducible` kernel already *is* wasm (clang output); transpile those bytes.
             // Everything else assembles its hand-written WAT first.
             let transpiled = match &k.wasm32_bytes {
@@ -1555,6 +1588,50 @@ block 3 (v15: i64) {
         .into(),
         wat64: None,
         mode: Mode::HostCall,
+        native: None,
+        wasm32_bytes: None,
+        n_span: None,
+    }
+}
+
+/// Interface benchmark — **a host call through the real dispatch** (#2319). The crossing is
+/// `hostcall`'s (`x -> x+1` against the same Wasmtime import), but it goes where an embedder's go:
+/// `temen_run::cap_thunk` into a `Host` that dispatches the granted host procedure. `hostcall`'s
+/// [`bench_thunk`] dispatches nothing, so only this kernel sees what a call costs a real program:
+/// the window view, the dispatch and the park decision.
+fn hostproc_kernel() -> Resolved {
+    Resolved {
+        name: "hostproc".into(),
+        ir: "\
+memory 16
+func (i32, i64) -> (i64) {
+block 0 (v0: i32, v1: i64) {
+  v2 = i64.const 0
+  v3 = i64.const 0
+  br 1(v0, v1, v2, v3)
+}
+block 1 (v4: i32, v5: i64, v6: i64, v7: i64) {
+  v8 = i64.ge_s v7 v5
+  br_if v8 3(v6) 2(v4, v5, v6, v7)
+}
+block 2 (v9: i32, v10: i64, v11: i64, v12: i64) {
+  v13 = call.cap 13 0 (i64) -> (i64) v9(v12)
+  v14 = i64.add v11 v13
+  v15 = i64.const 1
+  v16 = i64.add v12 v15
+  br 1(v9, v10, v14, v16)
+}
+block 3 (v17: i64) {
+  return v17
+}
+}
+"
+        .into(),
+        entry: 0,
+        lead_args: vec![dispatch_host().1 as i64],
+        wat32: hostcall_kernel().wat32,
+        wat64: None,
+        mode: Mode::Dispatch,
         native: None,
         wasm32_bytes: None,
         n_span: None,
@@ -2147,16 +2224,17 @@ fn measure(engine: &Engine, k: &Resolved, reps: u32, optimize: bool) -> Raw {
     // cache-miss kernel does, since both ends must exceed its working set.
     let least = k.n_span.unwrap_or(match k.mode {
         Mode::Compute => (N_BIG, N_SMALL),
-        Mode::HostCall => (N_HOST_BIG, N_HOST_SMALL),
+        Mode::HostCall | Mode::Dispatch => (N_HOST_BIG, N_HOST_SMALL),
     });
     let n_small = least.1;
     let temen = |m: &temen_ir::Module, entry: u32, n: i64| match k.mode {
         Mode::Compute => temen_call(m, entry, &k.lead_args, n),
         Mode::HostCall => temen_call_host(m, entry, &k.lead_args, n),
+        Mode::Dispatch => temen_call_dispatch(m, entry, &k.lead_args, n),
     };
     let inst = |wasm: &[u8]| match k.mode {
         Mode::Compute => wasm_entry(engine, wasm),
-        Mode::HostCall => wasm_entry_host(engine, wasm),
+        Mode::HostCall | Mode::Dispatch => wasm_entry_host(engine, wasm),
     };
 
     // Cross-check every engine, and every layout, agrees before timing (never benchmark a
@@ -2287,38 +2365,116 @@ fn flag_value(args: &[String], flag: &str) -> Option<String> {
         .and_then(|i| args.get(i + 1).cloned())
 }
 
-/// Write the tracked ratios to a baseline file (`NA` for a ratio the kernel lacks — no wasm64
-/// form, or no interp/native lane). The header documents what the numbers are + how to regenerate.
-fn save_baseline(path: &str, results: &[(Resolved, Raw)]) {
-    std::fs::write(path, baseline_text(results))
-        .unwrap_or_else(|e| panic!("write baseline `{path}`: {e}"));
-    eprintln!("wrote baseline to {path}");
+/// #728 — the CPU this run is on, as Linux names it (`/proc/cpuinfo`'s `model name`; `unknown`
+/// elsewhere). It keys the run's baseline: the nightly's runners come with more than one CPU model,
+/// and the same commit's ratios differ by up to 2x between them.
+fn cpu_model() -> String {
+    std::fs::read_to_string("/proc/cpuinfo")
+        .ok()
+        .and_then(|info| {
+            info.lines().find_map(|line| {
+                let (key, value) = line.split_once(':')?;
+                (key.trim() == "model name").then(|| value.trim().to_string())
+            })
+        })
+        .unwrap_or_else(|| "unknown".into())
 }
 
-/// The baseline file [`save_baseline`] writes for `results`.
-fn baseline_text(results: &[(Resolved, Raw)]) -> String {
-    let mut out = String::from(
-        "# temen-bench baseline — the tracked signal is the RATIO (temen / wasm), which is far more\n\
-         # portable across machines than the absolute ns. `--check` flags any ratio that grew\n\
-         # past the tolerance (temen got relatively slower). Some ratios differ by up to 2x between\n\
-         # machines, so take the baseline on the machine that checks: the nightly bench job's log ends\n\
-         # with this file, as of that run. Elsewhere: cargo run --release -- --save-baseline FILE\n\
-         # columns: kernel,compute_vs_wasm32,compute_vs_wasm64,cold_vs_wasmtime,interp_vs_jit,jit_vs_native\n",
-    );
+/// A baseline file's sections in file order: a CPU model ([`cpu_model`]) and the rows taken on it
+/// ([`baseline_rows`]).
+type Sections = Vec<(String, Vec<String>)>;
+
+/// Record this run's ratios as its CPU's section of the baseline file at `path`, leaving the other
+/// CPUs' sections as they are.
+fn save_baseline(path: &str, results: &[(Resolved, Raw)]) {
+    let mut sections = match std::fs::read_to_string(path) {
+        Ok(text) => parse_sections(path, &text),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => panic!("read baseline `{path}`: {e}"),
+    };
+    let cpu = cpu_model();
+    put_section(&mut sections, &cpu, baseline_rows(results));
+    std::fs::write(path, baseline_text(&sections))
+        .unwrap_or_else(|e| panic!("write baseline `{path}`: {e}"));
+    eprintln!("wrote the baseline for `{cpu}` to {path}");
+}
+
+/// Make `rows` the section for `cpu`: in its place if it has one, at the end if not.
+fn put_section(sections: &mut Sections, cpu: &str, rows: Vec<String>) {
+    match sections.iter_mut().find(|(c, _)| c == cpu) {
+        Some(section) => section.1 = rows,
+        None => sections.push((cpu.to_string(), rows)),
+    }
+}
+
+/// This run's tracked ratios, a row per kernel (`NA` for a ratio the kernel lacks: no wasm64 form,
+/// or no interp/native lane).
+fn baseline_rows(results: &[(Resolved, Raw)]) -> Vec<String> {
     let na = |v: Option<f64>| v.map(|x| format!("{x:.3}")).unwrap_or_else(|| "NA".into());
-    for (k, raw) in results {
-        let r = raw.ratios();
-        out.push_str(&format!(
-            "{},{:.3},{},{:.3},{},{}\n",
-            k.name,
-            r.compute32,
-            na(r.compute64),
-            r.cold,
-            na(r.interp_vs_jit),
-            na(r.jit_vs_native),
-        ));
+    results
+        .iter()
+        .map(|(k, raw)| {
+            let r = raw.ratios();
+            format!(
+                "{},{:.3},{},{:.3},{},{}",
+                k.name,
+                r.compute32,
+                na(r.compute64),
+                r.cold,
+                na(r.interp_vs_jit),
+                na(r.jit_vs_native),
+            )
+        })
+        .collect()
+}
+
+/// One CPU's section of a baseline file: its `cpu:` line, then its rows.
+fn section_text(cpu: &str, rows: &[String]) -> String {
+    let mut out = format!("cpu: {cpu}\n");
+    for row in rows {
+        out.push_str(row);
+        out.push('\n');
     }
     out
+}
+
+/// A baseline file holding `sections`, under a header that says what the numbers are and how to
+/// regenerate them.
+fn baseline_text(sections: &[(String, Vec<String>)]) -> String {
+    let mut out = String::from(
+        "# temen-bench baseline — the tracked signal is the RATIO (temen / wasm), which is far more\n\
+         # portable across machines than the absolute ns. `--check` flags any ratio that grew past\n\
+         # the tolerance (temen got relatively slower). The same commit's ratios differ by up to 2x\n\
+         # between CPU models (#728), so the file keeps a section per CPU model, and a run is checked\n\
+         # only against its own CPU's section: on a CPU with none, `--check` only reports. The nightly\n\
+         # bench job's log ends with its run as a section to paste here. Elsewhere:\n\
+         # cargo run --release -- --save-baseline FILE (writes this machine's section only).\n\
+         # columns: kernel,compute_vs_wasm32,compute_vs_wasm64,cold_vs_wasmtime,interp_vs_jit,jit_vs_native\n",
+    );
+    for (cpu, rows) in sections {
+        out.push('\n');
+        out.push_str(&section_text(cpu, rows));
+    }
+    out
+}
+
+/// Split a baseline file into its [`Sections`]: a `cpu:` line starts one, and each row belongs to
+/// the `cpu:` line above it. Comments and blank lines are skipped.
+fn parse_sections(path: &str, text: &str) -> Sections {
+    let mut sections = Sections::new();
+    for line in text.lines().map(str::trim) {
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some(cpu) = line.strip_prefix("cpu:") {
+            sections.push((cpu.trim().to_string(), Vec::new()));
+        } else if let Some((_, rows)) = sections.last_mut() {
+            rows.push(line.to_string());
+        } else {
+            panic!("baseline `{path}`: row `{line}` comes before any `cpu:` line");
+        }
+    }
+    sections
 }
 
 /// One tracked baseline row loaded from a file.
@@ -2330,44 +2486,51 @@ struct BaseRow {
     jit_vs_native: Option<f64>,
 }
 
-/// Parse a baseline file written by [`save_baseline`] (comments/blank lines skipped). Older
-/// 4-field baselines (pre-interp/native) still load — the two new ratios default to absent.
-fn load_baseline(path: &str) -> std::collections::HashMap<String, BaseRow> {
-    let text =
-        std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read baseline `{path}`: {e}"));
-    let mut map = std::collections::HashMap::new();
+/// Parse one section's rows, as [`baseline_rows`] writes them.
+fn parse_rows(rows: &[String]) -> std::collections::HashMap<String, BaseRow> {
     let opt = |s: &str| (s != "NA").then(|| s.parse().expect("baseline ratio"));
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let f: Vec<&str> = line.split(',').collect();
-        assert!(
-            f.len() == 4 || f.len() == 6,
-            "baseline line `{line}`: want 4 or 6 fields"
-        );
-        map.insert(
-            f[0].to_string(),
-            BaseRow {
+    rows.iter()
+        .map(|line| {
+            let f: Vec<&str> = line.split(',').collect();
+            assert!(f.len() == 6, "baseline line `{line}`: want 6 fields");
+            let row = BaseRow {
                 compute32: f[1].parse().expect("compute32"),
                 compute64: opt(f[2]),
                 cold: f[3].parse().expect("cold"),
-                interp_vs_jit: f.get(4).and_then(|s| opt(s)),
-                jit_vs_native: f.get(5).and_then(|s| opt(s)),
-            },
-        );
-    }
-    map
+                interp_vs_jit: opt(f[4]),
+                jit_vs_native: opt(f[5]),
+            };
+            (f[0].to_string(), row)
+        })
+        .collect()
 }
 
-/// Rerun, compare each ratio to the baseline, print a table, and return `true` if **no** ratio
-/// regressed past `tol` (a fractional increase, e.g. `0.25` = 25%). A missing baseline kernel
-/// is reported but not a regression; an unexpectedly *improved* ratio just prints `ok`.
+/// Rerun, compare each ratio to this CPU's section of the baseline, print a table, and return
+/// `true` if **no** ratio regressed past `tol` (a fractional increase, e.g. `0.25` = 25%). A
+/// missing baseline kernel is reported but not a regression; an unexpectedly *improved* ratio just
+/// prints `ok`. On a CPU the baseline has no section for, it only reports (#728).
 fn check_baseline(path: &str, results: &[(Resolved, Raw)], tol: f64) -> bool {
-    let base = load_baseline(path);
+    let text =
+        std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read baseline `{path}`: {e}"));
+    let cpu = cpu_model();
+    let rows = baseline_rows(results);
+    // #2703, #728: the log ends with this run as its CPU's section, so (re-)baselining a runner's
+    // CPU is a copy from its log.
+    let this_run = format!(
+        "\nThis run as its CPU's section of {path}:\n\n{}",
+        section_text(&cpu, &rows)
+    );
+    let Some((_, base_rows)) = parse_sections(path, &text)
+        .into_iter()
+        .find(|(c, _)| *c == cpu)
+    else {
+        println!("No baseline for this CPU in {path} (cpu: {cpu}), so this run only reports.");
+        println!("{this_run}");
+        return true;
+    };
+    let base = parse_rows(&base_rows);
     println!(
-        "regression check vs {path}  (tol {:.0}%, ratio = temen/wasm, lower is better)\n",
+        "regression check vs {path}, cpu: {cpu}  (tol {:.0}%, ratio = temen/wasm, lower is better)\n",
         tol * 100.0
     );
     println!(
@@ -2427,12 +2590,7 @@ fn check_baseline(path: &str, results: &[(Resolved, Raw)], tol: f64) -> bool {
             row("jit/native", bv, cv, true);
         }
     }
-    // #2703: this run's ratios as a baseline file, so re-baselining on the machine that checks (the
-    // nightly runner) is a copy from its log.
-    println!(
-        "\nThis run as a baseline file:\n\n{}",
-        baseline_text(results)
-    );
+    println!("{this_run}");
     if ok {
         println!("\nOK - no ratio regressed past {:.0}%.", tol * 100.0);
     } else {
@@ -2624,6 +2782,41 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #728: a baseline keeps a section per CPU model. Saving one CPU's rows replaces its section
+    /// in place, or adds one at the end, and leaves the other CPUs' alone; the text round-trips.
+    #[test]
+    fn a_baseline_section_is_saved_one_cpu_at_a_time() {
+        let row = |r: &str| vec![r.to_string()];
+        let mut sections: Sections = vec![
+            ("CPU A".into(), row("alu,1,1,1.3,45,5")),
+            ("CPU B".into(), row("alu,2,NA,1.5,NA,NA")),
+        ];
+        put_section(&mut sections, "CPU A", row("alu,1.1,1,1.3,46,5"));
+        put_section(&mut sections, "CPU C", row("alu,0.9,0.9,1.2,40,4"));
+        let cpus: Vec<&str> = sections.iter().map(|(c, _)| c.as_str()).collect();
+        assert_eq!(cpus, ["CPU A", "CPU B", "CPU C"]);
+        assert_eq!(sections[0].1, row("alu,1.1,1,1.3,46,5"));
+        assert_eq!(parse_sections("test", &baseline_text(&sections)), sections);
+        let b = &parse_rows(&sections[1].1)["alu"];
+        assert!((b.compute32 - 2.0).abs() < 1e-12);
+        assert!(b.compute64.is_none() && b.interp_vs_jit.is_none() && b.jit_vs_native.is_none());
+    }
+
+    /// #728: a row must sit under the `cpu:` line of the machine it was taken on.
+    #[test]
+    #[should_panic(expected = "before any `cpu:` line")]
+    fn a_baseline_row_outside_a_cpu_section_is_refused() {
+        parse_sections("test", "# header\nalu,1.0,1.0,1.0,1.0,1.0\n");
+    }
+
+    /// The committed baseline parses: every row sits in a CPU's section and has its six fields.
+    #[test]
+    fn the_committed_baseline_parses() {
+        for (_, rows) in parse_sections("baseline.txt", include_str!("../baseline.txt")) {
+            parse_rows(&rows);
+        }
+    }
 
     /// #1134 regression guard: every resolvable kernel must **run on every tier without trapping**.
     /// `measure` asserts the Temen JIT, the reference interpreter, the wasm oracle(s), and the native

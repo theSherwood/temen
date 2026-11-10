@@ -15,7 +15,7 @@
 use std::process::Command;
 use temen_interp::Value;
 use temen_ir::Module;
-use temen_leng::Edge;
+use temen_leng::{Edge, LinkOpt};
 
 /// Locate the nimony toolchain. Honours `NIMONY_BIN`/`NIM_BIN` (directories holding `nimony`/`nim`),
 /// else looks for `nimony` on `PATH`. Returns the `PATH` value to run the compiler under (nimony
@@ -451,7 +451,7 @@ fn nim_write_runs_under_the_powerbox() {
         .iter()
         .map(|(stem, src)| temen_leng::WholeModule { stem, src })
         .collect();
-    let m = temen_leng::link_nim(&units, Edge::Caps, None, &[], false)
+    let m = temen_leng::link_nim(&units, Edge::Caps, None, &[], temen_leng::Build::default())
         .unwrap_or_else(|e| panic!("bridge link: {e}"));
     let run = temen_run::run_powerbox(&m, &[]).unwrap_or_else(|e| panic!("run_powerbox: {e}"));
     assert_eq!(
@@ -490,7 +490,7 @@ fn nim_reads_its_argv_and_env_under_the_powerbox() {
         .iter()
         .map(|(stem, src)| temen_leng::WholeModule { stem, src })
         .collect();
-    let m = temen_leng::link_nim(&units, Edge::Caps, None, &[], false)
+    let m = temen_leng::link_nim(&units, Edge::Caps, None, &[], temen_leng::Build::default())
         .unwrap_or_else(|e| panic!("bridge link: {e}"));
     let run = temen_run::run_powerbox_cfg(
         &m,
@@ -529,7 +529,7 @@ fn nim_with_no_argv_sees_an_empty_command_line() {
         .iter()
         .map(|(stem, src)| temen_leng::WholeModule { stem, src })
         .collect();
-    let m = temen_leng::link_nim(&units, Edge::Caps, None, &[], false)
+    let m = temen_leng::link_nim(&units, Edge::Caps, None, &[], temen_leng::Build::default())
         .unwrap_or_else(|e| panic!("bridge link: {e}"));
     let run = temen_run::run_powerbox(&m, &[]).unwrap_or_else(|e| panic!("run_powerbox: {e}"));
     assert_eq!(run.stdout, b"-1", "`argc = 0` ⇒ nim's `paramCount()` is -1");
@@ -555,7 +555,7 @@ fn nim_strutils_cross_module_arg_widths_verify() {
         .iter()
         .map(|(stem, src)| temen_leng::WholeModule { stem, src })
         .collect();
-    let m = temen_leng::link_nim(&units, Edge::Caps, None, &[], false)
+    let m = temen_leng::link_nim(&units, Edge::Caps, None, &[], temen_leng::Build::default())
         .unwrap_or_else(|e| panic!("bridge link: {e}"));
     temen_verify::verify_module(&m)
         .unwrap_or_else(|e| panic!("strutils linked module must verify (#1400): {e:?}"));
@@ -574,7 +574,7 @@ fn link_verify_std_module(module: &str) {
         .iter()
         .map(|(stem, src)| temen_leng::WholeModule { stem, src })
         .collect();
-    let m = temen_leng::link_nim(&units, Edge::Caps, None, &[], false)
+    let m = temen_leng::link_nim(&units, Edge::Caps, None, &[], temen_leng::Build::default())
         .unwrap_or_else(|e| panic!("bridge link `{module}`: {e}"));
     temen_verify::verify_module(&m)
         .unwrap_or_else(|e| panic!("`{module}` linked module must verify: {e:?}"));
@@ -712,13 +712,28 @@ fn a_nim_program_links_to_the_same_module_in_any_order() {
         }
         u
     };
-    let posix =
-        |reverse| temen_leng::link_nim(&units(reverse), Edge::Posix(px_vtable()), None, &[], false);
+    let posix = |reverse| {
+        temen_leng::link_nim(
+            &units(reverse),
+            Edge::Posix(px_vtable()),
+            None,
+            &[],
+            temen_leng::Build::default(),
+        )
+    };
     assert!(
         posix(false).expect("link") == posix(true).expect("link"),
         "the POSIX edge: the order the modules were listed in changed the module"
     );
-    let caps = |reverse| temen_leng::link_nim(&units(reverse), Edge::Caps, None, &[], false);
+    let caps = |reverse| {
+        temen_leng::link_nim(
+            &units(reverse),
+            Edge::Caps,
+            None,
+            &[],
+            temen_leng::Build::default(),
+        )
+    };
     assert!(
         caps(false).expect("link") == caps(true).expect("link"),
         "the capability edge: the order the modules were listed in changed the module"
@@ -758,8 +773,14 @@ fn a_nim_programs_heap_grows_past_its_window() {
         .collect();
     let want = format!("grew:{}\n", N + 7);
 
-    let posix = temen_leng::link_nim(&units, Edge::Posix(px_vtable()), Some(&libc), &[], false)
-        .expect("link");
+    let posix = temen_leng::link_nim(
+        &units,
+        Edge::Posix(px_vtable()),
+        Some(&libc),
+        &[],
+        temen_leng::Build::default(),
+    )
+    .expect("link");
     let window = 1u64 << posix.memory.expect("a window").size_log2;
     assert!(
         window < N * 8,
@@ -780,7 +801,14 @@ fn a_nim_programs_heap_grows_past_its_window() {
         );
     }
 
-    let powerbox = temen_leng::link_nim(&units, Edge::Caps, Some(&libc), &[], false).expect("link");
+    let powerbox = temen_leng::link_nim(
+        &units,
+        Edge::Caps,
+        Some(&libc),
+        &[],
+        temen_leng::Build::default(),
+    )
+    .expect("link");
     let run = temen_run::run_powerbox(&powerbox, &[]).expect("run the powerbox program");
     assert_eq!(
         String::from_utf8_lossy(&run.stdout),
@@ -837,7 +865,7 @@ fn nim_powerbox_seeds_heap_words_to_window_top() {
         .iter()
         .map(|(stem, src)| temen_leng::WholeModule { stem, src })
         .collect();
-    let m = temen_leng::link_nim(&units, Edge::Caps, None, &[], false)
+    let m = temen_leng::link_nim(&units, Edge::Caps, None, &[], temen_leng::Build::default())
         .unwrap_or_else(|e| panic!("link: {e}"));
 
     // Read an 8-byte little-endian word from the linked data image at window offset `off`.
@@ -906,8 +934,14 @@ fn run_io_program(mods: &[(String, String)]) -> Vec<u8> {
     // the link) keeps the program's `data.funcref` gvar initializers valid — the funcref-carrying
     // at-exit flush this very program registers would otherwise dispatch through a stale, off-by-one
     // index.
-    let m = temen_leng::link_nim(&units, Edge::Posix(px_vtable()), None, &[], false)
-        .unwrap_or_else(|e| panic!("powerbox manifest link: {e}"));
+    let m = temen_leng::link_nim(
+        &units,
+        Edge::Posix(px_vtable()),
+        None,
+        &[],
+        temen_leng::Build::default(),
+    )
+    .unwrap_or_else(|e| panic!("powerbox manifest link: {e}"));
     temen_verify::verify_module(&m).unwrap_or_else(|e| panic!("verify: {e:?}"));
     // The merged module carries the §3e powerbox entry shape: a paramless `_start` at function 0
     // exported by name — exactly what `run_powerbox`/`instantiate` bind manifest slots against.
@@ -1118,8 +1152,14 @@ block 0 (v0: i64, v1: i64, v2: i64) {
         .map(|(stem, src)| temen_leng::WholeModule { stem, src })
         .collect();
     for (name, edge) in edges() {
-        let m = temen_leng::link_nim(&units, edge, Some(&libc), &[&lib], false)
-            .unwrap_or_else(|e| panic!("{name}: link: {e}"));
+        let m = temen_leng::link_nim(
+            &units,
+            edge,
+            Some(&libc),
+            &[&lib],
+            temen_leng::Build::default(),
+        )
+        .unwrap_or_else(|e| panic!("{name}: link: {e}"));
         temen_verify::verify_module(&m).unwrap_or_else(|e| panic!("{name}: verify: {e:?}"));
         for engine in ENGINES {
             let ran = run_on_edge(&m, edge, &[], &[], engine)
@@ -1149,8 +1189,14 @@ fn run_libc_program(src: &str) -> Option<Vec<u8>> {
         .iter()
         .map(|(stem, src)| temen_leng::WholeModule { stem, src })
         .collect();
-    let m = temen_leng::link_nim(&units, Edge::Caps, Some(&libc), &[], false)
-        .unwrap_or_else(|e| panic!("nim→powerbox link (with libc): {e}"));
+    let m = temen_leng::link_nim(
+        &units,
+        Edge::Caps,
+        Some(&libc),
+        &[],
+        temen_leng::Build::default(),
+    )
+    .unwrap_or_else(|e| panic!("nim→powerbox link (with libc): {e}"));
     dump_module("libc_program", &m);
     temen_verify::verify_module(&m).unwrap_or_else(|e| panic!("verify: {e:?}"));
     // The guest libc's file layer resolves to stubs at link, and its streams and exit are the edge's,
@@ -1619,7 +1665,7 @@ fn real_ioring_blocked_on_conflicting_syscall_decls() {
         .iter()
         .map(|(stem, src)| temen_leng::WholeModule { stem, src })
         .collect();
-    let err = match temen_leng::link_nim(&units, Edge::Caps, guest_libc().as_deref(), &[], false) {
+    let err = match temen_leng::link_nim(&units, Edge::Caps, guest_libc().as_deref(), &[], temen_leng::Build::default()) {
         Err(e) => e.to_string(),
         Ok(_) => panic!(
             "std/ioring now links — upstream aligned the three `syscall` declarations. Restore this \
@@ -1744,7 +1790,13 @@ fn runnability_sweep() {
             .iter()
             .map(|(stem, src)| temen_leng::WholeModule { stem, src })
             .collect();
-        match temen_leng::link_nim(&units, Edge::Caps, Some(&libc), &[], false) {
+        match temen_leng::link_nim(
+            &units,
+            Edge::Caps,
+            Some(&libc),
+            &[],
+            temen_leng::Build::default(),
+        ) {
             Err(e) => unrunnable.push((m, format!("link: {e}"))),
             Ok(module) => match temen_verify::verify_module(&module) {
                 Err(e) => unrunnable.push((m, format!("verify: {e:?}"))),
@@ -2124,9 +2176,22 @@ fn edges() -> [(&'static str, Edge<'static>); 2] {
     [("posix", Edge::Posix(px_vtable())), ("caps", Edge::Caps)]
 }
 
+/// The links every corpus program runs from, by name: each of [`edges`] at the default level, and a
+/// speed link (#2816) on the POSIX edge. So the corpus is also the speed link's differential: what it
+/// inlines changes no program's output on any engine. The edge is the runtime the program links
+/// against, which the inliner does not care about, so one edge is enough.
+fn links() -> [(&'static str, Edge<'static>, LinkOpt); 3] {
+    let [(posix, p), (caps, c)] = edges();
+    [
+        (posix, p, LinkOpt::Default),
+        (caps, c, LinkOpt::Default),
+        ("posix.speed", p, LinkOpt::Speed),
+    ]
+}
+
 /// Run a program's Leng on **Temen** the way a user's build does, and diff it against `want`,
-/// native's output: link it on each of [`edges`] as `temen-link` does ([`temen_link`]), then run it
-/// on each of [`ENGINES`] on the host that edge needs ([`run_on_edge`]). Returns each way Temen
+/// native's output: link it as each of [`links`] says, as `temen-link` does ([`temen_link`]), then run
+/// it on each of [`ENGINES`] on the host that edge needs ([`run_on_edge`]). Returns each way Temen
 /// diverged, so an empty list means every engine on every edge printed exactly `want` and exited
 /// cleanly. Every failure mode (link, verify, an unbound import, a trap) is a divergence with its
 /// reason, so the differential reports *where* a program diverged rather than panicking on the
@@ -2142,10 +2207,10 @@ fn temen_divergences(
     mods: &[(String, String)],
     want: &str,
 ) -> Vec<String> {
-    edges()
+    links()
         .into_iter()
-        .flat_map(|(label, edge)| {
-            let m = match temen_link(libc, &format!("{name}.{label}"), mods, edge) {
+        .flat_map(|(label, edge, opt)| {
+            let m = match temen_link(libc, &format!("{name}.{label}"), mods, edge, opt) {
                 Ok(m) => m,
                 Err(e) => return vec![format!("{label}: {e}  (native prints {:?})", elide(want))],
             };
@@ -2260,12 +2325,17 @@ fn temen_link(
     name: &str,
     mods: &[(String, String)],
     edge: Edge,
+    opt: LinkOpt,
 ) -> Result<Module, String> {
     let units: Vec<temen_leng::WholeModule> = mods
         .iter()
         .map(|(stem, src)| temen_leng::WholeModule { stem, src })
         .collect();
-    let m = temen_leng::link_nim(&units, edge, Some(libc), &[], false)
+    let build = temen_leng::Build {
+        opt,
+        ..temen_leng::Build::default()
+    };
+    let m = temen_leng::link_nim(&units, edge, Some(libc), &[], build)
         .map_err(|e| format!("link: {e}"))?;
     dump_module(name, &m);
     Ok(m)
@@ -2455,7 +2525,7 @@ fn both_edges_serve_a_programs_streams_and_exit_status() {
         .map(|(stem, src)| temen_leng::WholeModule { stem, src })
         .collect();
     for (label, edge) in edges() {
-        let m = temen_leng::link_nim(&units, edge, None, &[], false)
+        let m = temen_leng::link_nim(&units, edge, None, &[], temen_leng::Build::default())
             .unwrap_or_else(|e| panic!("{label}: link: {e}"));
         for engine in ENGINES {
             let ran = run_on_edge(&m, edge, &["prog"], b"hello\n", engine)
@@ -2492,7 +2562,7 @@ fn a_panic_says_why_on_both_edges() {
         .map(|(stem, src)| temen_leng::WholeModule { stem, src })
         .collect();
     for (label, edge) in edges() {
-        let m = temen_leng::link_nim(&units, edge, None, &[], false)
+        let m = temen_leng::link_nim(&units, edge, None, &[], temen_leng::Build::default())
             .unwrap_or_else(|e| panic!("{label}: link: {e}"));
         for engine in ENGINES {
             let ran = run_on_edge(&m, edge, &["prog"], b"", engine)
@@ -2660,8 +2730,14 @@ fn nim_memory_maps_a_file_through_the_posix_personality() {
         .iter()
         .map(|(stem, src)| temen_leng::WholeModule { stem, src })
         .collect();
-    let m = temen_leng::link_nim(&units, Edge::Posix(px_vtable()), None, &[], false)
-        .unwrap_or_else(|e| panic!("posix-route link: {e}"));
+    let m = temen_leng::link_nim(
+        &units,
+        Edge::Posix(px_vtable()),
+        None,
+        &[],
+        temen_leng::Build::default(),
+    )
+    .unwrap_or_else(|e| panic!("posix-route link: {e}"));
     temen_verify::verify_module(&m).unwrap_or_else(|e| panic!("verify: {e:?}"));
     let posix = run_io_capture(
         &m,
@@ -2714,8 +2790,14 @@ fn nim_unmapping_a_file_gives_its_pages_back() {
         .iter()
         .map(|(stem, src)| temen_leng::WholeModule { stem, src })
         .collect();
-    let m = temen_leng::link_nim(&units, Edge::Posix(px_vtable()), None, &[], false)
-        .unwrap_or_else(|e| panic!("posix-route link: {e}"));
+    let m = temen_leng::link_nim(
+        &units,
+        Edge::Posix(px_vtable()),
+        None,
+        &[],
+        temen_leng::Build::default(),
+    )
+    .unwrap_or_else(|e| panic!("posix-route link: {e}"));
     temen_verify::verify_module(&m).unwrap_or_else(|e| panic!("verify: {e:?}"));
     for backend in [temen_run::Backend::TreeWalk, temen_run::Backend::Jit] {
         let posix = run_io_capture(
@@ -2797,7 +2879,14 @@ fn link_posix_program(path: &str, src: &str) -> temen_ir::Module {
         .iter()
         .map(|(stem, src)| temen_leng::WholeModule { stem, src })
         .collect();
-    let m = temen_leng::link_nim(&units, Edge::Posix(px_vtable()), None, &[], false).expect("link");
+    let m = temen_leng::link_nim(
+        &units,
+        Edge::Posix(px_vtable()),
+        None,
+        &[],
+        temen_leng::Build::default(),
+    )
+    .expect("link");
     temen_verify::verify_module(&m).unwrap_or_else(|e| panic!("verify: {e:?}"));
     let unbound = posix_unbound(&m);
     assert!(unbound.is_empty(), "a linked program imports {unbound:?}");
@@ -3243,8 +3332,14 @@ fn nim_reads_and_writes_files_through_the_posix_personality() {
         .iter()
         .map(|(stem, src)| temen_leng::WholeModule { stem, src })
         .collect();
-    let m = temen_leng::link_nim(&units, Edge::Posix(px_vtable()), None, &[], false)
-        .unwrap_or_else(|e| panic!("posix-route link: {e}"));
+    let m = temen_leng::link_nim(
+        &units,
+        Edge::Posix(px_vtable()),
+        None,
+        &[],
+        temen_leng::Build::default(),
+    )
+    .unwrap_or_else(|e| panic!("posix-route link: {e}"));
     temen_verify::verify_module(&m).unwrap_or_else(|e| panic!("verify: {e:?}"));
     let posix = run_io_capture(
         &m,
@@ -3386,7 +3481,7 @@ fn nifler2_links_through_leng() {
         Edge::Posix(px_vtable()),
         guest_libc().as_deref(),
         &[],
-        false,
+        temen_leng::Build::default(),
     ) {
         Ok(m) => {
             dump_module("nifler2", &m);
@@ -3988,8 +4083,14 @@ fn nimonys_thread_tests_run_on_every_engine() {
             .iter()
             .map(|(stem, src)| temen_leng::WholeModule { stem, src })
             .collect();
-        let m = temen_leng::link_nim(&units, Edge::Caps, Some(&libc), &[], false)
-            .unwrap_or_else(|e| panic!("{name}: link: {e}"));
+        let m = temen_leng::link_nim(
+            &units,
+            Edge::Caps,
+            Some(&libc),
+            &[],
+            temen_leng::Build::default(),
+        )
+        .unwrap_or_else(|e| panic!("{name}: link: {e}"));
         temen_verify::verify_module(&m).unwrap_or_else(|e| panic!("{name}: verify: {e:?}"));
         let backends = [
             temen_run::Backend::TreeWalk,

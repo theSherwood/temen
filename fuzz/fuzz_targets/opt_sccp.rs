@@ -1,6 +1,6 @@
 //! libFuzzer target: the generic optimizer (SCCP + the cleanup fixpoint, `OPT.md` Phase 2) and the
 //! passes a linker runs (`optimize_linked`: tiny callees inlined, a cleanup that folds no floats,
-//! blocks in reverse postorder, #2147)
+//! blocks in reverse postorder, #2147; and a speed link's bigger callees, #2816)
 //! are semantics-preserving. The input bytes drive the structured generator (shared with `diff` /
 //! `jit_fuzz`) to synthesize a verifier-valid module; each pass must (1) produce IR that
 //! **re-verifies** — an optimizer bug is a clean verify error, never an escape — and (2) compute the
@@ -28,9 +28,14 @@ fuzz_target!(|data: &[u8]| {
     let mut fuel_a = 5_000_000u64;
     let r0 = temen_interp::run(&m, 0, &args, &mut fuel_a);
 
-    let passes: [(&str, fn(&temen_ir::Module) -> temen_ir::Module); 2] = [
+    let passes: [(&str, fn(&temen_ir::Module) -> temen_ir::Module); 3] = [
         ("optimize_module", temen_opt::optimize_module),
-        ("optimize_linked", temen_opt::optimize_linked),
+        ("optimize_linked", |m| {
+            temen_opt::optimize_linked(m, temen_opt::LinkOpt::Default)
+        }),
+        ("optimize_linked speed", |m| {
+            temen_opt::optimize_linked(m, temen_opt::LinkOpt::Speed)
+        }),
     ];
     for (pass, run_pass) in passes {
         let opt = run_pass(&m);

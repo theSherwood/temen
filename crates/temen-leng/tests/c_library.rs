@@ -77,8 +77,14 @@ fn link() -> temen_ir::Module {
             src: PROG,
         },
     ];
-    let m = temen_leng::link_nim(&units, Edge::Caps, None, &[&library()], false)
-        .unwrap_or_else(|e| panic!("link: {e}"));
+    let m = temen_leng::link_nim(
+        &units,
+        Edge::Caps,
+        None,
+        &[&library()],
+        temen_leng::Build::default(),
+    )
+    .unwrap_or_else(|e| panic!("link: {e}"));
     temen_verify::verify_module(&m).unwrap_or_else(|e| panic!("verify: {e:?}"));
     m
 }
