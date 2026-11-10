@@ -131,6 +131,7 @@ block 0 () {
 
 /// A root that starts [`THREADS`] threads of function 1 at once, each on its own argument, and
 /// sums what they return: they race to the same first calls.
+#[cfg(unix)]
 fn threads() -> String {
     let mut s = String::from("func () -> (i64) {\nblock 0 () {\n  vsp = i64.const 4096\n");
     for t in 0..THREADS {
@@ -146,9 +147,11 @@ fn threads() -> String {
     s += &format!("  return vsum{THREADS}\n  }}\n}}\n");
     s
 }
+#[cfg(unix)]
 const THREADS: usize = 16;
 
 /// A root that runs function 2 on a fiber, which suspends between two runs of the chain.
+#[cfg(any(unix, all(windows, target_arch = "x86_64")))]
 const FIBER: &str = "func () -> (i64) {
 block 0 () {
   v0 = ref.func 2
