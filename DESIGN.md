@@ -383,12 +383,17 @@ found (#2603):
 - The decoder's coverage of what Cranelift can emit is pinned by a **completeness oracle** (#2603
   hole 17): a test synthesizes every form in Cranelift's own x64 assembler DSL
   (`cranelift-assembler-x64-meta`, what the backend's encoder is generated from) and checks the
-  decoder either rejects it or agrees with iced-x86 on its length, its memory operand and direction,
-  its GP write-set, and its control flow. A Cranelift upgrade that adds an encoding the decoder does
+  decoder either rejects it or agrees with iced-x86 on its length, its memory operand, its GP
+  write-set, its implicit rsp change and its control flow, and exactly on each access's direction
+  and width. Exactness runs both ways: a write taken for a read escapes the write checks, and a read
+  taken for a write makes a constant load look like a store to rodata, which would refuse correct
+  code once the validator fails closed (#2813). EVEX has its own read table, since EVEX puts stores
+  in opcode slots where VEX has loads. A Cranelift upgrade that adds an encoding the decoder does
   not model fails that test, not a user's compile.
 - A form whose address isn't `[base + index·scale + disp]` (fs/gs, `0x67`, `xlat`, `bt* [mem], reg`)
   is rejected, not modeled; so is an EVEX compressed-`disp8` operand, whose scale is a per-form
-  property the bytes don't carry (Cranelift's pool/stack operands use `disp0`/`disp32`).
+  property the bytes don't carry (Cranelift's pool/stack operands use `disp0`/`disp32`), and a 16-bit
+  push or pop, which moves rsp by 2 where the transfer models 8.
 - The native frame is confined by the overflow check (I5), not the window mask. The check is
   recognized by the facts it compares — a stack pointer `RED_ZONE` below the current `rsp` against
   `stack_limit` — so both the `mov r,rsp; add r,-RED_ZONE` and `lea r,[rsp−RED_ZONE]` forms qualify;
