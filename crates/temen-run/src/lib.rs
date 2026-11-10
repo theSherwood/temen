@@ -178,30 +178,30 @@ impl Drop for WindowRegionPurge {
 }
 
 /// The host trampoline bridging the JIT's [`temen_jit::CapThunk`] ABI (§9) to the reference
-/// [`Host`]'s capability dispatch — the host code a real embedder supplies. One shared copy.
+/// [`Host`]'s capability dispatch — the host code a real embedder supplies. One shared copy. The
+/// powerbox (`vm.cap_ctx`, a live `*mut Host`) and the window are the calling context's (#2534);
+/// the arguments and result slots are the call's buffer ([`temen_jit::cap_slots`]).
 ///
 /// # Safety
-/// Honours the `CapThunk` contract: `ctx` is a live `*mut Host`; `args`/`results` are valid for
-/// `n_args`/`n_results`; `mem_base` (when non-null) is the guest window with `mem_size` backed
-/// bytes inside a `mem_reserved` reservation; `vm` is the calling instance's live
-/// [`temen_jit::VmCtx`], as compiled code passes it — a park and a punted call's wait read the
-/// instance through it. A host trap is raised on it as its wire code ([`Trap::code`],
-/// [`temen_ir::trap_code`]); a call that succeeds leaves it alone, since it may already hold the
-/// domain's end, raised by a sibling vCPU during the call (#2499).
+/// Honours the `CapThunk` contract. `vm` is the calling instance's live [`temen_jit::VmCtx`], as
+/// compiled code passes it — a park and a punted call's wait read the instance through it. A host
+/// trap is raised on it as its wire code ([`Trap::code`], [`temen_ir::trap_code`]); a call that
+/// succeeds leaves it alone, since it may already hold the domain's end, raised by a sibling vCPU
+/// during the call (#2499).
 pub unsafe extern "C" fn cap_thunk(
-    ctx: *mut c_void,
-    mem_base: *mut u8,
-    mem_size: u64,
-    mem_reserved: u64,
+    vm: &temen_jit::VmCtx,
+    buf: *mut i64,
+    counts: u64,
     type_id: u32,
     op: u32,
     handle: i32,
-    args: *const i64,
-    n_args: u64,
-    results: *mut i64,
-    n_results: u64,
-    vm: &temen_jit::VmCtx,
 ) {
+    let (call_args, call_results) = temen_jit::cap_slots(buf, counts);
+    let (args, n_args) = (call_args.as_ptr(), call_args.len() as u64);
+    let (results, n_results) = (call_results.as_mut_ptr(), call_results.len() as u64);
+    let ctx = vm.cap_ctx;
+    let w = vm.window();
+    let (mem_base, mem_size, mem_reserved) = (w.base, w.mapped, w.reserved);
     // #1166: this thunk takes the `Host` as a raw `&mut`, so it serves one caller at a time. A call
     // from a `thread.spawn`ed vCPU means the guest is concurrent, and a concurrent guest runs
     // [`cap_thunk_locked`] (`jit_cap_run` picks it on `uses_concurrency`). Refuse rather than race the
@@ -377,8 +377,8 @@ unsafe fn fiber_cap_wait(
 // bookkeeping (`handler_returned`) live in the shared `temen_interp::SignalSource`, so JIT delivery is
 // byte-identical to the interpreter's per-op redirect under the differential oracle (DESIGN.md §18);
 // the JIT supplies only the redirect *codegen*. This lives in `temen-run` (not the
-// `#![forbid(unsafe_code)]` interp crate) because the thunks dereference the raw `ctx` the JIT hands
-// back — the same reason `cap_thunk` lives here.
+// `#![forbid(unsafe_code)]` interp crate) because the thunks dereference the raw delivery ctx the
+// calling context names (`VmCtx::sig_ctx`, #2534) — the same reason `cap_thunk` lives here.
 
 /// #932 — the host-side **delivery context** for a JIT run's async signals: the `Host::sig_armed`
 /// flag the JIT polls, the installed personality it consults, and the live injected-handler `depth`
@@ -421,9 +421,10 @@ pub fn jit_sig_delivery(host: &Host) -> Option<Box<JitSigDelivery>> {
 /// `SA_RESTART` come out identical to the interpreter.
 ///
 /// # Safety
-/// `ctx` must be a live `*mut JitSigDelivery` for the call; `out` must point at 3 writable `i64` slots.
-pub unsafe extern "C" fn jit_sig_take(ctx: *mut c_void, out: *mut i64) -> i32 {
-    let d = &*(ctx as *const JitSigDelivery);
+/// `vm.sig_ctx` must be a live `*mut JitSigDelivery` for the call; `out` must point at 3 writable
+/// `i64` slots.
+pub unsafe extern "C" fn jit_sig_take(vm: &temen_jit::VmCtx, out: *mut i64) -> i32 {
+    let d = &*(vm.sig_ctx as *const JitSigDelivery);
     if d.depth.get() >= temen_interp::MAX_SIG_HANDLER_NEST {
         return 0; // nesting bound reached — hold (interp: `sig_handler_stack.len() < MAX_SIG_HANDLER_NEST`)
     }
@@ -445,9 +446,9 @@ pub unsafe extern "C" fn jit_sig_take(ctx: *mut c_void, out: *mut i64) -> i32 {
 /// call returns on the JIT.
 ///
 /// # Safety
-/// `ctx` must be a live `*mut JitSigDelivery` for the call.
-pub unsafe extern "C" fn jit_sig_return(ctx: *mut c_void) {
-    let d = &*(ctx as *const JitSigDelivery);
+/// `vm.sig_ctx` must be a live `*mut JitSigDelivery` for the call.
+pub unsafe extern "C" fn jit_sig_return(vm: &temen_jit::VmCtx) {
+    let d = &*(vm.sig_ctx as *const JitSigDelivery);
     d.depth.set(d.depth.get().saturating_sub(1));
     d.source.handler_returned();
 }
@@ -709,24 +710,23 @@ fn import_dispatch(host: &Host, packed: u32) -> Option<(u32, u32, i32)> {
 /// here), so holding the lock across a plain delegate to [`cap_thunk`] is deadlock-free.
 ///
 /// # Safety
-/// Same contract as [`cap_thunk`]; additionally `ctx` is a live `*const Mutex<Host>` whose `Host`
-/// has the in-flight run's `Jit` native ctx registered, and the lock is uncontended-safe to take
-/// from any of the run's vCPU threads.
-#[allow(clippy::too_many_arguments)]
+/// Same contract as [`cap_thunk`]; additionally `vm.cap_ctx` is a live `*const Mutex<Host>` whose
+/// `Host` has the in-flight run's `Jit` native ctx registered, and the lock is uncontended-safe to
+/// take from any of the run's vCPU threads.
 pub unsafe extern "C" fn cap_thunk_locked(
-    ctx: *mut c_void,
-    mem_base: *mut u8,
-    mem_size: u64,
-    mem_reserved: u64,
+    vm: &temen_jit::VmCtx,
+    buf: *mut i64,
+    counts: u64,
     type_id: u32,
     op: u32,
     handle: i32,
-    args: *const i64,
-    n_args: u64,
-    results: *mut i64,
-    n_results: u64,
-    vm: &temen_jit::VmCtx,
 ) {
+    let (call_args, call_results) = temen_jit::cap_slots(buf, counts);
+    let (args, n_args) = (call_args.as_ptr(), call_args.len() as u64);
+    let (results, n_results) = (call_results.as_mut_ptr(), call_results.len() as u64);
+    let ctx = vm.cap_ctx;
+    let w = vm.window();
+    let (mem_base, mem_size, mem_reserved) = (w.base, w.mapped, w.reserved);
     let m = &*(ctx as *const Mutex<Host>);
     // Phase 3: translate a `CAP_IMPORT_TYPE_ID` dispatch through the binding table under a short
     // lock (released before any re-entrant path below) — same reason as [`cap_thunk`]'s translate.
@@ -2401,15 +2401,10 @@ pub unsafe extern "C" fn fast_cap_resolver(
 /// active, so the clock crossing is still taped/served faithfully.
 ///
 /// # Safety
-/// `ctx` is a live `*mut Host`; `vm` is the caller's live context — the [`temen_jit::FastCapResolver`]
-/// contract.
-unsafe extern "C" fn fast_clock_now(
-    ctx: *mut c_void,
-    _mem_base: *mut u8,
-    _mem_size: u64,
-    handle: i32,
-    vm: &temen_jit::VmCtx,
-) -> i64 {
+/// `vm` is the caller's live context, whose powerbox `vm.cap_ctx` is a live `*mut Host` — the
+/// [`temen_jit::FastCapResolver`] contract (#2534).
+unsafe extern "C" fn fast_clock_now(vm: &temen_jit::VmCtx, handle: i32) -> i64 {
+    let ctx = vm.cap_ctx;
     let host = &mut *(ctx as *mut Host);
     match host.fast_clock_now(handle) {
         Some(Ok(ns)) => ns,
@@ -3720,18 +3715,18 @@ unsafe fn request_page(
 /// - any other is asked of the child's pager ([`request_page`]), then checked again. A refusal, or a
 ///   pager that is gone, is fatal, as a pagerless fault is.
 ///
+/// The span is the code's to name and the window the context's (#2534), so a span past the
+/// window's reservation is the `MemoryFault` a guest access there is, asked of no pager.
+///
 /// # Safety
-/// `vm` is the faulting instance's live context, whose powerbox is a JIT child's shared cell;
-/// `[off, off + len)`, `len > 0`, lies in the reservation of its window at `base`.
+/// `vm` is the faulting instance's live context, whose powerbox is a JIT child's shared cell.
 #[cfg(any(unix, windows))]
-pub unsafe extern "C" fn page_miss(
-    vm: &temen_jit::VmCtx,
-    base: *mut u8,
-    off: u64,
-    len: u64,
-    flags: u64,
-) {
+pub unsafe extern "C" fn page_miss(vm: &temen_jit::VmCtx, off: u64, len: u64, flags: u64) {
     let fault = || vm.raise(temen_jit::TrapKind::MemoryFault as i64);
+    if vm.window().span(off, len).is_none() {
+        return fault();
+    }
+    let base = vm.window().base;
     let cell = &*(vm.cap_ctx as *const Mutex<Host>);
     let (win, mapped, pager) = {
         let mut g = cell.lock().unwrap_or_else(|e| e.into_inner());
@@ -3774,7 +3769,7 @@ pub unsafe extern "C" fn page_miss(
 
 /// No window backend, so no paged child (the JIT does not build here anyway).
 #[cfg(not(any(unix, windows)))]
-pub unsafe extern "C" fn page_miss(vm: &temen_jit::VmCtx, _: *mut u8, _: u64, _: u64, _: u64) {
+pub unsafe extern "C" fn page_miss(vm: &temen_jit::VmCtx, _: u64, _: u64, _: u64) {
     vm.raise(temen_jit::TrapKind::MemoryFault as i64);
 }
 

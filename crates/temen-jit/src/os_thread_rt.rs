@@ -2213,18 +2213,15 @@ fn run_child(a: SpawnArgs) {
 /// `i32` handle. Traps (`ThreadFault`, returns `-1`) on a thread-bomb.
 ///
 /// # Safety
-/// `sched` is the run's live `Domain`; the other args are the threaded context (window / table /
-/// context). Compiled only for the real (non-loom) executor.
+/// `vm` is the running context, whose `sched` is the run's live `Domain`. Compiled only for the
+/// real (non-loom) executor.
 pub(crate) unsafe extern "C" fn thread_spawn(
-    sched: *const Domain,
-    _mem_base: u64,
-    _fn_table_base: u64,
     vm: &crate::VmCtx,
     func_idx: u32,
     arg0: u64,
     arg1: u64,
 ) -> i32 {
-    let dom = current_domain(sched);
+    let dom = current_domain(vm.sched as *const Domain);
     let hub = dom.hub();
     let env = dom.env();
     let code = slot_record(env.fn_table_base as *const _, func_idx as usize).code();
@@ -2843,15 +2840,15 @@ impl Domain {
 /// to the second of two joiners racing for one child.
 ///
 /// # Safety
-/// `sched` is the run's live `Domain`, and `status_out` is valid for writes.
+/// `vm` is the running context, whose `sched` is the run's live `Domain`, and `status_out` is
+/// valid for writes.
 pub(crate) unsafe extern "C" fn thread_join(
-    sched: *const Domain,
+    vm: &crate::VmCtx,
     handle: i32,
     status_out: *mut i64,
-    vm: &crate::VmCtx,
 ) -> i64 {
     *status_out = 0;
-    let dom = current_domain(sched);
+    let dom = current_domain(vm.sched as *const Domain);
     match dom.children.name(handle) {
         ChildRef::Thread(done) => join_thread(dom, handle, &done, status_out, vm),
         // SAFETY: the nursery that filed the child outlives it.
@@ -3087,20 +3084,23 @@ unsafe fn read_phys(phys: u64, width: u32) -> u64 {
 /// possible notifier has exited fails closed via `vm` (`ThreadFault`) by the shared deadlock
 /// detection in [`futex_wait`] (no thaw-specific path; `WAIT_DEADLOCK` is intercepted below).
 ///
+/// The word is at window offset `off` of `vm`'s window, which this confines (#2534): one past the
+/// reservation is the `MemoryFault` a guest access there is, and a word the reservation holds but
+/// the window has not committed faults through the SIGSEGV guard, as the JIT's own load would.
+///
 /// # Safety
-/// `sched` is the run's live `Domain`; `phys` points at `width` readable guest bytes.
+/// `vm` is the running context, whose `sched` is the run's live `Domain`.
 pub(crate) unsafe extern "C" fn thread_wait(
-    sched: *const Domain,
-    phys: u64,
+    vm: &crate::VmCtx,
+    off: u64,
     expected: u64,
     width: u32,
     timeout: i64,
-    vm: &crate::VmCtx,
 ) -> i32 {
     // #2742 — a serve handler's futex wait gives its window's gate back meanwhile, as an event park
     // does ([`park_host_call`]); one whose domain ended meanwhile unwinds.
     let aside = crate::child_exec::handler_steps_aside(vm);
-    let status = thread_wait_here(sched, phys, expected, width, timeout, vm);
+    let status = thread_wait_here(vm, off, expected, width, timeout);
     if let Some(aside) = aside {
         if !crate::child_exec::handler_steps_back(aside, vm) {
             return 0;
@@ -3114,14 +3114,18 @@ pub(crate) unsafe extern "C" fn thread_wait(
 /// # Safety
 /// As [`thread_wait`].
 unsafe fn thread_wait_here(
-    sched: *const Domain,
-    phys: u64,
+    vm: &crate::VmCtx,
+    off: u64,
     expected: u64,
     width: u32,
     timeout: i64,
-    vm: &crate::VmCtx,
 ) -> i32 {
-    let dom = current_domain(sched);
+    let Some(phys) = vm.window().span(off, u64::from(width)) else {
+        vm.raise(crate::TrapKind::MemoryFault as i64);
+        return 0;
+    };
+    let phys = phys as u64;
+    let dom = current_domain(vm.sched as *const Domain);
     let hub = dom.hub();
     let mask = width_mask(width);
     let deadline = if timeout < 0 {
@@ -3357,16 +3361,16 @@ const FIBER_PARKED_STATUS: i64 = 3;
 /// surfaced and is a separate follow-up.
 ///
 /// # Safety
-/// `sched` is the run's live [`Domain`]; `status_out` is a live `*mut i64` cell. The
-/// running vCPU's fiber runtime is [`fiber_rt::CURRENT_RT`] (read inside `fiber_resume`).
+/// `vm` is the running context, whose `sched` is the run's live [`Domain`]; `status_out` is a live
+/// `*mut i64` cell. The running vCPU's fiber runtime is [`fiber_rt::CURRENT_RT`] (read inside
+/// `fiber_resume`).
 pub(crate) unsafe extern "C" fn fiber_resume_block(
-    sched: *const Domain,
+    vm: &crate::VmCtx,
     handle: i64,
     arg: i64,
     status_out: *mut i64,
-    vm: &crate::VmCtx,
 ) -> i64 {
-    let dom = current_domain(sched);
+    let dom = current_domain(vm.sched as *const Domain);
     let hub = dom.hub();
     // #1639 — set when the previous pass read the run as quiescent; a deadlock verdict needs the
     // reading to survive the re-poll at the top of this loop (see the test below).
@@ -3532,17 +3536,21 @@ pub(crate) unsafe extern "C" fn fiber_resume_block(
     }
 }
 
-/// `atomic.notify` thunk: wake up to `count` vCPUs parked on confined `phys`; return the `i32` count
-/// woken.
+/// `atomic.notify` thunk: wake up to `count` vCPUs parked on the word at window offset `off` of `vm`'s
+/// window; return the `i32` count woken. An offset past the reservation names a word no wait can
+/// park on (that wait faults), so it wakes none. It reads no memory.
 ///
 /// # Safety
-/// `sched` is the run's live `Domain`.
-pub(crate) unsafe extern "C" fn thread_notify(sched: *const Domain, phys: u64, count: i32) -> i32 {
+/// `vm` is the running context, whose `sched` is the run's live `Domain`.
+pub(crate) unsafe extern "C" fn thread_notify(vm: &crate::VmCtx, off: u64, count: i32) -> i32 {
+    let Some(phys) = vm.window().span(off, 4) else {
+        return 0;
+    };
     // The count is **unsigned** "wake up to N" (wasm's notify count is u32; `-1` = wake all);
     // `futex_notify` caps at the real waiter count, so reinterpret the i32 bits as u32.
     notify_key(
-        current_domain(sched).hub(),
-        futex_key_of(phys),
+        current_domain(vm.sched as *const Domain).hub(),
+        futex_key_of(phys as u64),
         count as u32,
     ) as i32
 }

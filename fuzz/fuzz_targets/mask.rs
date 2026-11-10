@@ -72,11 +72,11 @@ fn check(w: Window, addr: u64, offset: u64, width: u32) {
 /// a span `[ptr, ptr+len)` iff it lies in `[0, reserved)` (with `len == 0` an in-bounds no-op),
 /// computed overflow-free. This asserts it against a clean `u128` oracle for every input — the
 /// arithmetic is the subtle, security-critical part (a wrong bound would admit an out-of-window bulk
-/// copy). The JIT's `confine_span` emits the overflow-avoiding form of exactly this predicate.
+/// copy). The JIT's bulk-op helpers call exactly this predicate (#2534).
 fn check_span(w: Window, ptr: u64, len: u64) {
     let reserved = w.reserved();
     // The one span-OOB reference (`temen_mask::Window::span_checked`) — the arithmetic the JIT's
-    // `confine_span` emits and the interpreter calls; fuzzed here so it is not transcribed.
+    // bulk-op helpers and the interpreter call; fuzzed here so it is not transcribed.
     let masked = w.span_checked(ptr, len);
     // Independent oracle in u128 (cannot overflow): a non-empty span is in-bounds iff its end lies
     // within the reservation; an empty span is always an in-bounds no-op.

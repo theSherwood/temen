@@ -224,7 +224,7 @@ impl ChildTask {
         }
         let fault = window.fault_range();
         // The child runs as its own instance, the one its compile recorded (#1768).
-        let vm = Arc::new(VmCtx::new(code.instance));
+        let vm = Arc::new(VmCtx::new(code.instance, code.window_at(base)));
         let results: Box<[i64]> = vec![0i64; n_results.max(1)].into_boxed_slice();
         let args: Box<[i64]> = args.into_boxed_slice();
         // The child domain's own execution context and fiber table (#1469): its `cont.*` handles

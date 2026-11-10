@@ -59,6 +59,35 @@ fn addr_of_local_through_a_call() {
     }
 }
 
+/// What nimony emits once its own inliner has spliced `inc(x: var T)` in: `x[] = x[] + 1` over the
+/// local's hidden address. Dereferencing a local's address is the local (#2685), so `i` stays an SSA
+/// slot: `count` takes no stack pointer and does no load or store.
+#[test]
+fn a_dereferenced_address_of_a_local_is_the_local() {
+    let leng = "\
+(stmts
+ (proc :count.0 (params (param :n.0 . (i +64))) (i +64) .
+  (stmts .
+   (var :i.0 . (i +64) 0)
+   (while (lt (deref (addr i.0)) n.0)
+    (stmts .
+     (asgn (deref (haddr i.0)) (add (i +64) (deref (haddr i.0)) 1))))
+   (ret i.0))))";
+    let text = temen_leng::translate_to_text(leng).unwrap();
+    assert!(
+        text.contains("func (i64) -> (i64)"),
+        "count takes no stack pointer:\n{text}"
+    );
+    assert!(
+        !text.contains("load") && !text.contains("store"),
+        "i stays in a slot:\n{text}"
+    );
+    let m = temen_leng::translate(leng).unwrap_or_else(|e| panic!("translate: {e}"));
+    for n in [0i64, 1, 5, 50] {
+        assert_eq!(run(&m, 0, &[n]), n, "count({n})");
+    }
+}
+
 #[test]
 fn mixed_frame_and_ssa_locals() {
     // sum_upto(n): `acc` is a plain SSA local; `i` is address-taken (frame). Returns 0+1+…+(n-1).

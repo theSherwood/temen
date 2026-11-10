@@ -545,7 +545,7 @@ fn two_interleaved_detached_spawns_each_get_their_own_lane_and_budget() {
             parent_lane_cap: -1,
             pages: std::ptr::null(),
         };
-        let vm = temen_jit::VmCtx::new(temen_jit::InstanceAddrs::NONE);
+        let vm = temen_jit::VmCtx::new(temen_jit::InstanceAddrs::NONE, temen_jit::Window::NONE);
         let reservation = 1u64 << temen_ir::DEFAULT_RESERVED_LOG2;
         // SAFETY: `ctx` is the locked parent cell the hooks were made for; with no grant records,
         // nothing is read from the (null) window.

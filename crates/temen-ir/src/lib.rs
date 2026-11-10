@@ -50,6 +50,13 @@ pub const CAP_SELF_TYPE_ID: u32 = u32::MAX;
 /// no handle ever carries it, and a table entry can never bind to it.
 pub const CAP_IMPORT_TYPE_ID: u32 = u32::MAX - 2;
 
+/// #2534 — the most parameters, and the most results, a host-dispatched call ([`Inst::host_call`]:
+/// `call.cap`, `call.import`, `call.sym`, `call.import.dyn`) may have. A JIT passes a call's
+/// arguments and results through a buffer of this many words in its context, never through a
+/// pointer the code computes, so the verifier holds every call to it, on every tier. Sixteen is far
+/// past what any interface needs (a syscall takes seven words).
+pub const CAP_MAX_ARITY: usize = 16;
+
 /// Reserved pseudo-`type_id` for **`import.attach`** (IMPORTS.md phase 2): rebinding a
 /// [`ImportMode::Rebindable`] import slot to a capability the domain already holds. Dispatched like
 /// [`CAP_IMPORT_TYPE_ID`] — the `op` carries the import index, the single argument the handle value
