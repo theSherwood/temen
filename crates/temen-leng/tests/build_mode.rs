@@ -71,6 +71,47 @@ fn temen_link_links_a_release_build_unless_asked_for_debug() {
     temen_verify::verify_module(&release).expect("the release build verifies");
 }
 
+/// `--opt:speed` asks for a **speed link** (#2816): callees past the default link's limit are
+/// inlined, so the program makes fewer calls. A level `temen-link` does not know is a bad argument.
+#[test]
+fn temen_link_links_for_speed_when_asked() {
+    let Ok(libc) = std::fs::read("../../browser/web/assets/pg_libc.temeno") else {
+        eprintln!("SKIP: browser/web/assets/pg_libc.temeno absent");
+        return;
+    };
+    let system = std::fs::read("tests/fixtures/real_system_arc.leng.nif").expect("the system unit");
+    let units = ["prog.c.nif", "sysvq0asl.c.nif"];
+    let default = temen_link(&[&["-o:prog.temen"], &units[..]].concat(), &system, &libc);
+    let speed = temen_link(
+        &[&["--opt:speed", "-o:prog.temen"], &units[..]].concat(),
+        &system,
+        &libc,
+    );
+    temen_verify::verify_module(&speed).expect("the speed link verifies");
+    let calls = |m: &temen_ir::Module| {
+        m.funcs
+            .iter()
+            .flat_map(|f| &f.blocks)
+            .flat_map(|b| &b.insts)
+            .filter(|i| matches!(i, temen_ir::Inst::Call { .. }))
+            .count()
+    };
+    assert!(
+        calls(&speed) < calls(&default),
+        "a speed link makes fewer calls: {} against {}",
+        calls(&speed),
+        calls(&default)
+    );
+    let (names, sigs) = temen_posix::cap_vtable();
+    let status = temen_leng::link_command(
+        &["--opt:fast", "-o:x.temen", "prog.c.nif"],
+        (&names, &sigs),
+        &mut |_| None,
+        &mut |_, _| true,
+    );
+    assert_eq!(status, 1, "an unknown level is a bad argument");
+}
+
 /// `--edge:caps` links the **capability edge**: the program asks the host for its streams and its
 /// exit, and the core's memory ops its heap grows with, instead of the personality's ops. The POSIX
 /// edge is the default, and an edge `temen-link` does not know is a bad argument.

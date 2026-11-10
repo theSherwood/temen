@@ -12,7 +12,7 @@ use temen_ir::{
 };
 use temen_opt::cfg::{successors, Cfg};
 use temen_opt::interproc::{inline_calls, inline_calls_with, InlineLimits};
-use temen_opt::optimize_linked;
+use temen_opt::{optimize_linked, LinkOpt, LINKED_SPEED_MAX_CALLEE};
 use temen_verify::verify_module;
 
 /// Run `func` on the reference interpreter: its results and the fuel it burned.
@@ -472,7 +472,7 @@ fn optimize_linked_inlines_tiny_callees_and_orders_blocks() {
         entry.blocks[arm].term = br(1, vec![1]);
     }
     let m = module(vec![entry, leaf_of(2)]);
-    let o = optimize_linked(&m);
+    let o = optimize_linked(&m, LinkOpt::Default);
     verify_module(&o).expect("linked output verifies");
     assert_eq!(n_calls(&o), 0, "the tiny leaf is inlined at both sites");
     assert!(
@@ -522,7 +522,7 @@ fn optimize_linked_cleans_up_after_its_splices() {
     // The uncalled leaf makes the program big enough for the inline budget, half the program, to
     // cover the splice.
     let m = module(vec![entry, abs, leaf_of(8)]);
-    let o = optimize_linked(&m);
+    let o = optimize_linked(&m, LinkOpt::Default);
     verify_module(&o).expect("linked output verifies");
     assert_eq!(n_calls(&o), 0, "abs is inlined");
     assert_eq!(
@@ -536,6 +536,63 @@ fn optimize_linked_cleans_up_after_its_splices() {
             run(&m, 0, &[Value::I32(a)]).0,
             "a={a}"
         );
+    }
+}
+
+#[test]
+fn a_speed_link_inlines_callees_a_default_link_leaves() {
+    // A 40-instruction leaf is past the default's limit and within a speed link's (#2816); one just
+    // past a speed link's limit stays a call either way. The uncalled pad makes the program big
+    // enough that a round's budget, half the program, is not what stops either.
+    for (n, inlined) in [(40, true), (LINKED_SPEED_MAX_CALLEE + 1, false)] {
+        let m = module(vec![entry_calling(1), leaf_of(n), leaf_of(400)]);
+        let default = optimize_linked(&m, LinkOpt::Default);
+        assert_eq!(n_calls(&default), 1, "n={n}: the default leaves the call");
+        let speed = optimize_linked(&m, LinkOpt::Speed);
+        verify_module(&speed).expect("a speed link verifies");
+        assert_eq!(n_calls(&speed), usize::from(!inlined), "n={n}");
+        for a in [0, 7, -3] {
+            let want = run(&m, 0, &[Value::I32(a)]).0;
+            assert_eq!(run(&speed, 0, &[Value::I32(a)]).0, want, "n={n}, a={a}");
+        }
+    }
+}
+
+#[test]
+fn a_speed_link_inlines_the_smallest_callees_first() {
+    // entry(a) = big(a) + small(a), with big's call first. One inlining round at a speed link's
+    // limit spends its budget, half the program, on `big`, and then cannot afford `small`: on
+    // nisaba's regex kernel that left the hot loop's helpers as calls. A speed link's rounds double
+    // the limit from the default's, so `small` goes in before `big` is considered.
+    let entry = func(
+        1,
+        vec![block(
+            1,
+            vec![call(1, vec![0]), call(2, vec![0]), add(1, 2)],
+            Terminator::Return(vec![3]),
+        )],
+    );
+    let m = module(vec![entry, leaf_of(80), leaf_of(10), leaf_of(75)]);
+    let size: usize = m
+        .funcs
+        .iter()
+        .flat_map(|f| &f.blocks)
+        .map(|b| b.insts.len())
+        .sum();
+    let one_round = inline_calls_with(
+        &m,
+        InlineLimits {
+            max_callee: LINKED_SPEED_MAX_CALLEE,
+            budget: size / 2,
+        },
+    );
+    assert_eq!(n_calls(&one_round), 1, "one round leaves `small` a call");
+    let speed = optimize_linked(&m, LinkOpt::Speed);
+    verify_module(&speed).expect("a speed link verifies");
+    assert_eq!(n_calls(&speed), 0, "a speed link inlines both");
+    for a in [0, 7, -3] {
+        let want = run(&m, 0, &[Value::I32(a)]).0;
+        assert_eq!(run(&speed, 0, &[Value::I32(a)]).0, want, "a={a}");
     }
 }
 
@@ -567,7 +624,7 @@ fn optimize_linked_folds_no_floats() {
         }],
     };
     let m = module(vec![f]);
-    let o = optimize_linked(&m);
+    let o = optimize_linked(&m, LinkOpt::Default);
     verify_module(&o).expect("linked output verifies");
     let insts = &o.funcs[0].blocks[0].insts;
     assert!(
@@ -608,7 +665,7 @@ fn the_cleanup_drops_only_the_positions_it_made_stale() {
         locs: vec![loc(0, 0, 1), loc(1, 1, 2)],
         ..Default::default()
     });
-    let o = optimize_linked(&m);
+    let o = optimize_linked(&m, LinkOpt::Default);
     let d = o.debug_info.as_ref().expect("debug info kept");
     let lines: Vec<(u32, u32)> = d.locs.iter().map(|l| (l.inst, l.line)).collect();
     assert_eq!(lines, vec![(0, 2)], "only f0's position went stale");
@@ -651,7 +708,7 @@ fn a_call_that_does_not_match_its_callee_stays_unverifiable() {
     assert_eq!(n_calls(&inline_calls(&m)), 1, "the inliner leaves the call");
     assert!(
         matches!(
-            verify_module(&optimize_linked(&m)),
+            verify_module(&optimize_linked(&m, LinkOpt::Default)),
             Err(temen_verify::VerifyError::CallArgCountMismatch { .. })
         ),
         "the linked program still fails to verify"
