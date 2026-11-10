@@ -42346,7 +42346,11 @@ mod prot_tests {
                 for op in LoadOp::ALL {
                     m.store(at, 0, StoreOp::I64, Value::I64(b as i64)).unwrap();
                     let want = m.load(at, 0, op).map(Reg::from_value);
-                    assert_eq!(m.load_scalar(at, 0, op), want, "{op:?} of {b:#x} at {at:#x}");
+                    assert_eq!(
+                        m.load_scalar(at, 0, op),
+                        want,
+                        "{op:?} of {b:#x} at {at:#x}"
+                    );
                 }
                 for op in StoreOp::ALL {
                     m.store(at, 0, StoreOp::I64, Value::I64(!b as i64)).unwrap();
@@ -42355,7 +42359,11 @@ mod prot_tests {
                     let want = m.load(at, 0, LoadOp::I64).unwrap();
                     m.store(at, 0, StoreOp::I64, Value::I64(!b as i64)).unwrap();
                     m.store_scalar(at, 0, op, b).unwrap();
-                    assert_eq!(m.load(at, 0, LoadOp::I64), Ok(want), "{op:?} of {b:#x} at {at:#x}");
+                    assert_eq!(
+                        m.load(at, 0, LoadOp::I64),
+                        Ok(want),
+                        "{op:?} of {b:#x} at {at:#x}"
+                    );
                 }
             }
         }

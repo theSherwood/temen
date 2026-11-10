@@ -2921,12 +2921,14 @@ fn compile_func(f: &Func, view: &ModuleView<'_>, fuse: bool) -> Option<Program> 
                 callee: *func,
                 args: args.iter().map(|a| g(*a)).collect(),
             }),
-            Terminator::ReturnCallIndirect { ty, idx, args } => ops.push(Op::TailCallIndirect(Box::new(IndirectCall {
-                idx: g(*idx),
-                args: args.iter().map(|a| g(*a)).collect(),
-                want_params: view.sig(*ty).params.clone().into(),
-                want_results: view.sig(*ty).results.clone().into(),
-            }))),
+            Terminator::ReturnCallIndirect { ty, idx, args } => {
+                ops.push(Op::TailCallIndirect(Box::new(IndirectCall {
+                    idx: g(*idx),
+                    args: args.iter().map(|a| g(*a)).collect(),
+                    want_params: view.sig(*ty).params.clone().into(),
+                    want_results: view.sig(*ty).results.clone().into(),
+                })))
+            }
         }
         // Exactly one terminator op was pushed above (fused `BrIfCmp` or a plain terminator); pair it
         // with the terminator source entry so `src` stays the same length as `ops`.

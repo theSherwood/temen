@@ -273,7 +273,11 @@ fn a_fiber_switch_allocates_nothing() {
 #[test]
 fn a_fiber_life_allocates_no_more_than_it_did() {
     let m = fiber_lives();
-    let jit = if cfg!(target_vendor = "apple") { 5.0 } else { 4.0 };
+    let jit = if cfg!(target_vendor = "apple") {
+        5.0
+    } else {
+        4.0
+    };
     let was = [jit, 2.0, 4.0];
     let now = ENGINES.map(|e| per_op(e.run(&m, false)));
     assert!(
