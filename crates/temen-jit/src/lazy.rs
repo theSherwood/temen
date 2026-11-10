@@ -42,6 +42,7 @@ use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use cranelift_module::{FuncId, Linkage, Module, ModuleReloc, ModuleRelocTarget};
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, VecDeque};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -96,6 +97,25 @@ pub(crate) struct Code {
     pub(crate) type_contracts: Vec<Option<validate::Contract>>,
     pub(crate) own: Vec<u32>,
     pub(crate) callee_contracts: Vec<Option<validate::Contract>>,
+    /// A test's fault, taken from [`FAULT`] when the module was compiled.
+    #[cfg(test)]
+    pub(crate) fault: Option<Fault>,
+}
+
+/// A fault a test injects into the next lazy compile its thread starts ([`FAULT`]).
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Fault {
+    /// Every compile of this function panics, lazily or for the linked copy, as a bug in Cranelift
+    /// that it hits would.
+    Compile(u32),
+    /// Publishing the linked copy panics, under the arena's lock.
+    Publish,
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static FAULT: std::cell::Cell<Option<Fault>> = const { std::cell::Cell::new(None) };
 }
 
 impl Code {
@@ -229,7 +249,10 @@ struct Linked {
     left: usize,
     /// Each function's code and relocations, compiled.
     code: Vec<Option<Emitted>>,
-    /// Whether a compile of it failed. The module then keeps its lazily compiled code.
+    /// Whether it is published: every word then holds linked code, and no guest waits again.
+    published: bool,
+    /// Whether a compile or the publish of it failed. The module then keeps its lazily compiled
+    /// code, and the workers stay to compile what a guest has yet to call.
     failed: bool,
 }
 
@@ -324,6 +347,8 @@ impl Lazy {
     /// linked copy (linked, under its own id).
     fn emit(&self, f: usize, words: bool) -> Result<Emitted, String> {
         let code = &self.code;
+        #[cfg(test)]
+        assert_ne!(code.fault, Some(Fault::Compile(f as u32)), "a test's fault");
         let id = if words { code.lazy_ids[f] } else { code.ids[f] };
         let plan = code.plan(words);
         let lower = |ctx: &mut cranelift_codegen::Context| {
@@ -363,6 +388,8 @@ impl Lazy {
     fn publish_linked(&self, code: Vec<Emitted>) -> Result<(), String> {
         let ids = &self.code.ids;
         let mut jit = self.arena.lock();
+        #[cfg(test)]
+        assert_ne!(self.code.fault, Some(Fault::Publish), "a test's fault");
         for (&id, (bytes, align, relocs)) in ids.iter().zip(&code) {
             jit.define_function_bytes(id, *align, bytes, relocs)
                 .map_err(|e| e.to_string())?;
@@ -393,7 +420,7 @@ fn work(lazy: Arc<Lazy>) {
                 if let Some(job) = take(&mut st) {
                     break job;
                 }
-                if st.linked.left == 0 {
+                if st.linked.published {
                     // Every function runs its linked code now: no guest waits on a compile again.
                     return;
                 }
@@ -402,7 +429,7 @@ fn work(lazy: Arc<Lazy>) {
         };
         match job {
             Job::Lazy(f) => {
-                let out = lazy.compile(f);
+                let out = caught(&format_args!("compiling function {f}"), || lazy.compile(f));
                 let mut st = lazy.lock();
                 let i = f as usize;
                 match out {
@@ -432,7 +459,9 @@ fn work(lazy: Arc<Lazy>) {
                 lazy.done.notify_all();
             }
             Job::Linked(f) => {
-                let out = lazy.emit(f as usize, false);
+                let out = caught(&format_args!("compiling function {f} linked"), || {
+                    lazy.emit(f as usize, false)
+                });
                 let mut st = lazy.lock();
                 st.linking -= 1;
                 lazy.work.notify_one();
@@ -453,7 +482,7 @@ fn work(lazy: Arc<Lazy>) {
                 drop(st);
                 let published = code
                     .ok_or(String::new())
-                    .and_then(|c| lazy.publish_linked(c));
+                    .and_then(|c| caught(&"publishing the linked copy", || lazy.publish_linked(c)));
                 let mut st = lazy.lock();
                 match published {
                     Ok(()) => {
@@ -465,11 +494,9 @@ fn work(lazy: Arc<Lazy>) {
                         });
                         st.waited.clear();
                         st.ahead.clear();
+                        st.linked.published = true;
                     }
-                    Err(_) => {
-                        st.linked.failed = true;
-                        st.linked.left = usize::MAX;
-                    }
+                    Err(_) => st.linked.failed = true,
                 }
                 drop(st);
                 lazy.work.notify_all();
@@ -477,6 +504,15 @@ fn work(lazy: Arc<Lazy>) {
             }
         }
     }
+}
+
+/// Run a worker's `job`, a panic in it becoming an error that names `what`. A worker that unwound
+/// would leave the function it took compiling, and a guest waiting on it waiting for good.
+fn caught<T>(
+    what: &dyn std::fmt::Display,
+    job: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    catch_unwind(AssertUnwindSafe(job)).unwrap_or_else(|_| Err(format!("{what} panicked")))
 }
 
 /// The next job, marked as taken: what a guest waits on, else what is most worth compiling ahead of
@@ -557,6 +593,7 @@ impl Service {
                     next: 0,
                     left: n,
                     code: (0..n).map(|_| None).collect(),
+                    published: false,
                     failed: false,
                 },
             }),
@@ -587,7 +624,7 @@ impl Service {
     pub(crate) fn wait_linked(&self) -> bool {
         let mut st = self.lazy.lock();
         loop {
-            if st.linked.left == 0 {
+            if st.linked.published {
                 return true;
             }
             if st.linked.failed {
@@ -806,4 +843,97 @@ pub(crate) fn build_entry(
     b.seal_all_blocks();
     b.finalize();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Fault, FAULT};
+    use crate::{CompiledModule, JitError, JitOutcome, INERT_CAP_THUNK};
+
+    /// Function 0 calls the function its argument names, through `call.dyn`, on 7. Functions 1 to
+    /// 60 are a chain, each calling the next on its argument plus one; 61 to 69 add their own index
+    /// and call nothing, so only a `call.dyn` reaches one.
+    fn program() -> temen_ir::Module {
+        let mut s = String::from(
+            "func (i64) -> (i64) {\nblock 0 (v0: i64) {\n  v1 = i32.wrap_i64 v0\n  v2 = i64.const 7\n  \
+             v3 = call.dyn (i64) -> (i64) v1 (v2)\n  return v3\n  }\n}\n",
+        );
+        for f in 1..70 {
+            let body = match f {
+                1..60 => format!(
+                    "  v1 = i64.const 1\n  v2 = i64.add v0 v1\n  v3 = call {} (v2)\n  return v3\n",
+                    f + 1
+                ),
+                60 => "  return v0\n".to_string(),
+                _ => format!("  v1 = i64.const {f}\n  v2 = i64.add v0 v1\n  return v2\n"),
+            };
+            s += &format!("func (i64) -> (i64) {{\nblock 0 (v0: i64) {{\n{body}  }}\n}}\n");
+        }
+        let m = temen_text::parse_module(&s).expect("parse");
+        temen_verify::verify_module(&m).expect("verify");
+        m
+    }
+
+    /// Compile [`program`] with `fault` injected, or `None` if this process compiles nothing
+    /// lazily (`TEMEN_JIT_LAZY=off`).
+    fn compile(fault: Fault) -> Option<CompiledModule> {
+        FAULT.with(|f| f.set(Some(fault)));
+        let cm = CompiledModule::compile(
+            &program(),
+            0,
+            INERT_CAP_THUNK,
+            core::ptr::null_mut(),
+            temen_ir::DEFAULT_RESERVED_LOG2,
+            None,
+            None,
+            None,
+            None,
+            None,
+            0,
+        );
+        FAULT.with(|f| f.set(None));
+        Some(cm.expect("compile")).filter(CompiledModule::compiles_lazily)
+    }
+
+    /// Run function 0 on `f`, on a thread of its own, so that a run that waits for good fails the
+    /// test after a minute rather than hanging it. The code comes back with the answer.
+    fn answer(cm: CompiledModule, f: i64) -> (CompiledModule, Result<i64, JitError>) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut cm = cm;
+            let out = cm.run(&[f], None, None).map(|(o, ..)| match o {
+                JitOutcome::Returned(r) => r[0],
+                other => panic!("{other:?}"),
+            });
+            let _ = tx.send((cm, out));
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(60))
+            .expect("the run ends within a minute")
+    }
+
+    /// A panic in a function's compile ends the run that needs it with an error, rather than leaving
+    /// it waiting on a compile that will never finish.
+    #[test]
+    fn a_compile_that_panics_ends_the_run() {
+        let Some(cm) = compile(Fault::Compile(30)) else {
+            return;
+        };
+        match answer(cm, 1).1 {
+            Err(JitError::Backend(e)) => assert!(e.contains("function 30 panicked"), "{e}"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// A panic in the linked copy's publish leaves the lazily compiled code running, and the
+    /// workers there to compile a function no run has called yet.
+    #[test]
+    fn a_linked_copy_that_panics_leaves_the_lazy_code_running() {
+        let Some(cm) = compile(Fault::Publish) else {
+            return;
+        };
+        let (cm, out) = answer(cm, 1);
+        assert_eq!(out.expect("run"), 7 + 59);
+        assert!(!cm.wait_linked(), "the publish failed");
+        assert_eq!(answer(cm, 65).1.expect("run"), 7 + 65);
+    }
 }

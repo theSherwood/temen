@@ -4398,6 +4398,8 @@ impl CompiledModule {
                     table: table_len as u64,
                     type_contracts: dyn_contracts.clone(),
                     own: own.clone(),
+                    #[cfg(test)]
+                    fault: lazy::FAULT.with(|f| f.get()),
                 };
                 let arena = Arc::new(Arena(std::sync::Mutex::new(Some(module))));
                 let service = lazy::Service::start(
