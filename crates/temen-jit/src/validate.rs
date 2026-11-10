@@ -2419,9 +2419,11 @@ pub(crate) mod x86 {
             return;
         }
 
-        // Stack: an access through a stack pointer stays in the function's own frame. A write lands
-        // strictly below the return address (entry-relative `< 0`); a read may also reach the
-        // incoming stack arguments `[8, 8 + stack_args)`. The low bound is the current `rsp`: nothing
+        // Stack: an access through a stack pointer stays in the function's own frame: strictly below
+        // the return address (entry-relative `< 0`), or in the incoming stack arguments
+        // `[8, 8 + stack_args)`, which are the callee's under the tail convention (it pops them). A
+        // read of an argument lands there, and so does a tail call's write of its own callee's
+        // arguments (a lazy entry's tail call, #2594). The low bound is the current `rsp`: nothing
         // legitimately touches below the allocated frame. The frame is host memory outside the
         // window, so reads are bounded too, not only writes.
         if matches!(base_f, Some(Fact::Stack(_))) || matches!(index_f, Some(Fact::Stack(_))) {
@@ -2436,12 +2438,12 @@ pub(crate) mod x86 {
             let top = off.saturating_add(width as i64);
             let args = i64::from(ctx.frame.stack_args.unwrap_or(0));
             let in_frame = top <= 0;
-            let in_args = !write && off >= 8 && top <= 8 + args;
+            let in_args = off >= 8 && top <= 8 + args;
             if !(off >= cur && (in_frame || in_args)) {
                 flag(format!(
                     "stack {} [{off}, {top}) is outside the frame [{cur}, {})",
                     if write { "write" } else { "read" },
-                    if write { 0 } else { 8 + args },
+                    8 + args,
                 ));
             }
             return;

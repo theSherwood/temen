@@ -88,6 +88,11 @@ pub struct VmCtx {
     /// `EXIT_CODE` / internal code, the high 32 bits an exit code. Written once, by [`Self::raise`]
     /// (or compiled code's raise). The root context's [`Self::owned_end`].
     end: *const AtomicI64,
+    /// #2594 — the compile service of the code, when it compiles lazily (`lazy::Lazy`): what a lazy
+    /// entry's `resolve` asks for its function. A property of the code, not the instance, so the
+    /// module sets it in every instance it makes; null for code compiled whole. Never read by
+    /// compiled code.
+    pub lazy: *const c_void,
     /// The domain's end word, owned by its root context ([`Self::new`]); `None` for a vCPU's
     /// context ([`Self::vcpu`]), which points at its root's. Never read by compiled code.
     owned_end: Option<Box<AtomicI64>>,
@@ -112,6 +117,9 @@ pub struct InstanceAddrs {
     pub nursery: *const c_void,
     pub setjmp: *const c_void,
     pub pages: *const AtomicU8,
+    /// Set by the module from its own code ([`VmCtx::lazy`]): whatever an embedder passes is
+    /// replaced.
+    pub lazy: *const c_void,
 }
 
 impl InstanceAddrs {
@@ -128,6 +136,7 @@ impl InstanceAddrs {
         nursery: core::ptr::null(),
         setjmp: core::ptr::null(),
         pages: core::ptr::null(),
+        lazy: core::ptr::null(),
     };
 }
 
@@ -149,6 +158,7 @@ impl VmCtx {
             nursery: a.nursery,
             setjmp: a.setjmp,
             pages: a.pages,
+            lazy: a.lazy,
             owned_end: Some(owned_end),
             thunk_state: std::sync::OnceLock::new(),
         }
@@ -171,6 +181,7 @@ impl VmCtx {
             nursery: self.nursery,
             setjmp: self.setjmp,
             pages: self.pages,
+            lazy: self.lazy,
             owned_end: None,
             thunk_state: std::sync::OnceLock::new(),
         }

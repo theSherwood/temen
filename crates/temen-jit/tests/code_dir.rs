@@ -12,8 +12,11 @@ use temen_jit::{CodeDir, CompiledModule, JitOutcome};
 use temen_text::parse_module;
 
 /// Its `call.cap` answers 41, and function 1 adds one to that: its code calls the host and a
-/// function of its own.
-const PROGRAM: &str = "memory 16
+/// function of its own. Functions 2 on, which nothing calls, make it a module large enough to
+/// compile at first calls (#2594), which a compile that keeps its code must not.
+fn program() -> String {
+    let mut s = String::from(
+        "memory 16
 func (i32) -> (i64) {
 block 0 (v0: i32) {
   v1 = call.cap 2 0 () -> (i64) v0 ()
@@ -28,7 +31,13 @@ block 0 (v0: i64) {
   return v2
   }
 }
-";
+",
+    );
+    for _ in 0..64 {
+        s += "func (i64) -> (i64) {\nblock 0 (v0: i64) {\n  return v0\n  }\n}\n";
+    }
+    s
+}
 
 /// A `call.cap` that answers 41.
 unsafe extern "C" fn forty_one(
@@ -55,7 +64,7 @@ const DIR: &str = "TEMEN_JIT_CODE_DIR";
 const OUT: &str = "TEMEN_JIT_CODE_DIR_OUT";
 
 /// The half of each test that runs in a process of its own, so no other test's compile counts:
-/// compile [`PROGRAM`] keeping its code in `$DIR`, run it, and write how many modules the compile
+/// compile [`program`] keeping its code in `$DIR`, run it, and write how many modules the compile
 /// compiled and what the program answered.
 #[test]
 #[ignore = "run in a process of its own by the tests below"]
@@ -64,11 +73,12 @@ fn compile_and_run_here() {
         return;
     };
     let dir = CodeDir::open(PathBuf::from(dir)).expect("open the code directory");
-    let m = parse_module(PROGRAM).expect("parse");
+    let program = program();
+    let m = parse_module(&program).expect("parse");
     temen_verify::verify_module(&m).expect("verify");
     let before = temen_jit::module_compiles();
     let mut cm = CompiledModule::compile_kept(
-        Some((&dir, temen_encode::digest256(PROGRAM.as_bytes()))),
+        Some((&dir, temen_encode::digest256(program.as_bytes()))),
         &m,
         0,
         forty_one,

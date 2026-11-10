@@ -88,6 +88,7 @@ use temen_ir::{
 
 mod dwarf;
 pub mod gdb; // W5 JIT/DWARF tier (Stage 2c): in-memory ELF wrapper + the GDB JIT registration interface
+mod lazy;
 mod mem; // guest-window allocation + the §4/§5 guard-page / detect-and-kill handler // W5 JIT/DWARF tier: synthesize DWARF from the Stage 1 machine-address → source map
 mod validate; // #2481 — machine-code validator over the emitted bytes (slice 1: x86-64, shadow mode)
 
@@ -286,15 +287,19 @@ const MAX_JIT_RESERVED_LOG2: u8 = 40; // 1 TiB of reserved VA (lazy)
 const SNAP_CAP: usize = 1 << 18; // 256 KiB
 
 /// One function the `call.dyn` table can name (§3c): its signature's id (a distinct-`FuncType`
-/// index) and its finalized code. **Immutable** from the moment a slot can point at it, so a dispatch
-/// reads one record's `type_id` and `code` together, never one install's type id with another's code
-/// (#2680). `call.dyn` checks `type_id` (offset 0), then calls `code` (offset 8): the layout
-/// [`indirect_dispatch`] loads against.
+/// index) and its **code word**, the address of code that runs it. `call.dyn` checks `type_id`
+/// (offset 0), then calls the word (offset 8): the layout [`indirect_dispatch`] loads against.
+///
+/// The type id never changes from the moment a slot can point at the record, so a dispatch never
+/// pairs one install's type id with another's code (#2680). The word changes only in a lazily
+/// compiled module (#2594), and only from one address that runs the function to another: its lazy
+/// entry, then the code its compile publishes, then its linked copy. Whatever word a caller reads,
+/// calling it runs the function, so no caller checks it.
 #[repr(C)]
 pub(crate) struct FnRecord {
     type_id: u32,
     _pad: u32,
-    code: u64,
+    code: AtomicU64,
 }
 
 impl FnRecord {
@@ -302,16 +307,29 @@ impl FnRecord {
         FnRecord {
             type_id,
             _pad: 0,
-            code,
+            code: AtomicU64::new(code),
         }
     }
     /// The signature id a `call.dyn` of it must name.
     pub(crate) fn type_id(&self) -> u32 {
         self.type_id
     }
-    /// The function's code address.
+    /// The address of code that runs the function, now.
     pub(crate) fn code(&self) -> u64 {
+        self.code.load(Ordering::Acquire)
+    }
+    /// Publish `code`, which runs the same function: a release store, so a caller that reads the
+    /// word reads code already finalized.
+    pub(crate) fn publish(&self, code: u64) {
+        self.code.store(code, Ordering::Release);
+    }
+
+    /// Publish `code` only if the word still holds `from`: what a lazily compiled function's compile
+    /// publishes over its lazy entry, which must not replace a linked copy published first.
+    pub(crate) fn replace(&self, from: u64, code: u64) -> bool {
         self.code
+            .compare_exchange(from, code, Ordering::Release, Ordering::Relaxed)
+            .is_ok()
     }
 }
 
@@ -321,7 +339,7 @@ impl FnRecord {
 static PADDING: FnRecord = FnRecord {
     type_id: PADDING_TYPE_ID,
     _pad: 0,
-    code: 0,
+    code: AtomicU64::new(0),
 };
 
 /// The function table `call.dyn` dispatches through (§3c): host-owned, guest-unwritable, one slot per
@@ -368,6 +386,12 @@ impl FnTable {
             })
             .collect();
         FnTable { slots, records }
+    }
+
+    /// The records its slots may point at, shared with every instance of the same code: what a
+    /// lazily compiled module publishes its functions' code into (#2594).
+    fn records(&self) -> Arc<FnRecords> {
+        Arc::clone(&self.records)
     }
 
     /// The address running code dispatches through (`fn_table_base`).
@@ -813,6 +837,11 @@ pub const EXIT_CODE: u32 = temen_ir::trap_code::EXIT as u32;
 /// The run unwinds exactly as it does for an `Exit` and ends [`JitOutcome::HostUnwound`]. Distinct
 /// from every [`TrapKind`], from [`EXIT_CODE`] and from the internal `DOMAIN_DONE_CODE`.
 pub const HOST_UNWIND_CODE: u32 = temen_ir::trap_code::HOST_UNWIND as u32;
+
+/// #2594 — trap-cell code a lazily compiled module's [`lazy::resolve`] raises when a function the run
+/// needs failed to compile: the run returns that compile's error, as an eager compile would have.
+/// Purely internal, never a guest's outcome.
+pub(crate) const COMPILE_FAILED_CODE: u32 = temen_ir::trap_code::COMPILE_FAILED as u32;
 
 /// Trap-cell code `run_inner` stores at **domain teardown** when the root vCPU completed cleanly
 /// (owner decision 2026-07-24: "root completion ends the activation; the owner's departure ends the
@@ -2474,36 +2503,73 @@ fn run_inner(
 /// the lifetime contract "nothing that points into the code may outlive this struct": the field
 /// is declared last, so runtimes/tables/trampolines drop first, and no fiber, thread, or
 /// installed table entry survives the owner (documented on the structs). Instances sharing code
-/// ([`SharedCode`]) each hold the arena's `Arc`, so it is freed with the last of them.
-struct OwnedJit(Option<JITModule>);
+/// ([`SharedCode`]) each hold the `Arc` of it, so it is freed with the last of them.
+struct OwnedJit {
+    /// #2594 — a lazily compiled module's compile service, whose workers define into `arena`.
+    /// Declared first, so it drops first: it stops its workers, each of which holds the arena until
+    /// it has finished the compile it is in.
+    lazy: Option<lazy::Service>,
+    arena: Arc<Arena>,
+}
 
 impl OwnedJit {
     fn new(m: JITModule) -> OwnedJit {
-        OwnedJit(Some(m))
+        OwnedJit {
+            lazy: None,
+            arena: Arc::new(Arena(std::sync::Mutex::new(Some(m)))),
+        }
+    }
+}
+
+/// The code arena: the [`JITModule`], behind a lock, so that a lazily compiled module's workers can
+/// define functions into it while code from it runs (#2594). cranelift-jit puts new code in fresh
+/// pages and never writes a finalized segment again, so a define changes nothing that runs. Its
+/// memory is freed when the last holder of it drops: an [`OwnedJit`], or a lazily compiled module's
+/// last worker, which runs no guest code.
+pub(crate) struct Arena(std::sync::Mutex<Option<JITModule>>);
+
+/// The [`JITModule`] of a locked [`Arena`].
+pub(crate) struct ArenaGuard<'a>(std::sync::MutexGuard<'a, Option<JITModule>>);
+
+impl Arena {
+    /// The module, locked.
+    pub(crate) fn lock(&self) -> ArenaGuard<'_> {
+        ArenaGuard(self.0.lock().unwrap_or_else(|p| p.into_inner()))
+    }
+}
+
+impl std::ops::Deref for ArenaGuard<'_> {
+    type Target = JITModule;
+    fn deref(&self) -> &JITModule {
+        self.0.as_ref().expect("JITModule present until drop")
+    }
+}
+
+impl std::ops::DerefMut for ArenaGuard<'_> {
+    fn deref_mut(&mut self) -> &mut JITModule {
+        self.0.as_mut().expect("JITModule present until drop")
     }
 }
 
 /// #1825 — the code arena, to extend it (`define_extra`, the hosting trampolines): only while one
 /// instance holds it alone. Instances sharing code ([`SharedCode`]) run the same finalized bytes, on
-/// several threads at once, so none of them may add to it. The one way to the `JITModule` of an arena
-/// that is already an instance's.
-fn arena_mut(module: &mut Arc<OwnedJit>) -> Result<&mut JITModule, JitError> {
-    let arena = Arc::get_mut(module).ok_or(JitError::Unsupported(
+/// several threads at once, and a §22 unit's functions are one instance's, so none of them may add to
+/// it. The one way to the `JITModule` of an arena that is already an instance's, besides a lazily
+/// compiled module's workers (#2594), which define only the module's own functions.
+fn arena_mut(module: &mut Arc<OwnedJit>) -> Result<ArenaGuard<'_>, JitError> {
+    let owned = Arc::get_mut(module).ok_or(JitError::Unsupported(
         "this code is shared with another instance, so it cannot be extended",
     ))?;
-    Ok(arena.0.as_mut().expect("JITModule present until drop"))
+    Ok(owned.arena.lock())
 }
 
-// SAFETY: a shared `&OwnedJit` reaches nothing. Its `JITModule` is touched only through `&mut`
-// (`arena_mut`, on a unique `Arc`, and `Drop`), so instances sharing an arena on several threads
-// (#1825) share only the finalized code they execute.
-unsafe impl Sync for OwnedJit {}
-
-impl Drop for OwnedJit {
+impl Drop for Arena {
     fn drop(&mut self) {
-        if let Some(m) = self.0.take() {
-            // SAFETY: per the owners' documented contract, by the time this field drops no guest
-            // code from this module is executing and no `fn` pointer into it is ever called again.
+        let m = self.0.get_mut().unwrap_or_else(|p| p.into_inner()).take();
+        if let Some(m) = m {
+            // SAFETY: per the owners' documented contract, by the time the last `OwnedJit` drops no
+            // guest code from this module is executing and no `fn` pointer into it is ever called
+            // again; a lazily compiled module's workers, which may hold it longer, run none.
             unsafe { m.free_memory() };
         }
     }
@@ -3301,6 +3367,23 @@ pub struct CompiledModule {
 }
 
 impl CompiledModule {
+    /// #2594 — whether this code compiles its functions at their first calls ([`lazy`]), which the
+    /// module's size and `TEMEN_JIT_LAZY` decide: for the tests of that path.
+    #[doc(hidden)]
+    pub fn compiles_lazily(&self) -> bool {
+        self.module.lazy.is_some()
+    }
+
+    /// #2594 — wait until a lazily compiled module's linked copy is published: whether it was, which
+    /// a module compiled whole, or one whose linked copy failed to compile, never is.
+    #[doc(hidden)]
+    pub fn wait_linked(&self) -> bool {
+        self.module
+            .lazy
+            .as_ref()
+            .is_some_and(lazy::Service::wait_linked)
+    }
+
     /// Symbolize a finalized-code machine address to its source position (W5 JIT/DWARF Stage 1), or
     /// `None` if `pc` is outside any source-mapped op (a non-`-g` build, a trampoline, a prologue
     /// gap). The [`SrcRange`] map is sorted and disjoint, so this is a binary search. Host-side
@@ -3686,12 +3769,13 @@ impl CompiledModule {
             fast_resolver,
             page_miss: None, // only a §14 child is demand-paged (#2164)
         };
-        let mut module = new_jit_module(imports)?;
+        let claims = fast_claims(fast_resolver, &m.funcs, &m.types);
+        let mut module = new_jit_module(imports, &claims)?;
 
         // Declare every function (natural ABI) up front so calls can reference any of them, and
         // everything else the code calls (#2482).
         let ids: Vec<FuncId> = declare_all_funcs(&mut module, &m.funcs)?;
-        let callees = Callees::new(&mut module, &ids, &m.funcs, &m.types, fast_resolver)?;
+        let callees = Callees::new(&mut module, &ids, &m.funcs, &m.types, &claims)?;
 
         // temen#2452 — the code a `CodeDir` kept for this compile, defined in place of compiling,
         // or else a record of the code the compile emits, to keep. A module's debug info or a signal
@@ -3717,6 +3801,29 @@ impl CompiledModule {
             Some(kept) => Codegen::Replay(kept, &imports),
             None => Codegen::Compile(kept.map(|_| EmittedCode::default())),
         };
+        // #2594 — whether the module compiles lazily: each function's word starts at a copy of its
+        // signature's lazy entry, its code compiles at its first call, and a linked copy of the whole
+        // module replaces it once compiled ([`lazy`]). A compile handed a code dir compiles whole,
+        // as it did before: it replays the code kept there, or keeps what it compiles before the
+        // run, whereas a linked copy is done only once the run has gone on long enough, which a
+        // short process never does. A module with source-level debug info (`-g`: source positions,
+        // variables) compiles whole, since what its compile makes besides code names code
+        // addresses; function names alone don't. A small module gains nothing
+        // ([`lazy::MIN_FUNCS`]).
+        let source_debug = m
+            .debug_info
+            .as_ref()
+            .is_some_and(|d| !d.locs.is_empty() || !d.vars.is_empty());
+        let lazily = kept.is_none()
+            && !source_debug
+            && match lazy::mode() {
+                lazy::Mode::On => true,
+                lazy::Mode::Off => false,
+                lazy::Mode::Auto => m.funcs.len() >= lazy::MIN_FUNCS,
+            };
+        let entries = lazily
+            .then(|| lazy::Entries::declare(&mut module, &m.funcs))
+            .transpose()?;
 
         // Distinct signatures give each function (and call site) a structural type id, the
         // basis for the `call.dyn` type check (matching the interpreter). Function
@@ -3962,113 +4069,125 @@ impl CompiledModule {
             types: &dyn_contracts,
             own: &own,
         };
-        let base_bytes = define_funcs(
-            &mut module,
-            &ids,
-            &mut codegen,
-            |ctx, fi| {
-                // Stage 3a: enable Cranelift's value-label tracking so `set_val_label` (in
-                // `lower_block`) takes effect and `value_labels_ranges` is populated. Gated on `-g`
-                // vars ⇒ no effect on an ordinary build. Must be set on the fresh `ctx.func` before
-                // lowering populates it.
-                if var_labels.is_some() {
-                    ctx.func.collect_debug_info();
-                }
-                build_clif(
-                    &callees,
-                    &ids,
-                    &m.funcs,
-                    &distinct,
-                    &m.types,
-                    nesting,
-                    signals, // #932 async signal delivery (off unless a `SignalArm` was supplied)
-                    PageEnv::NONE, // #2164 — only a §14 child is demand-paged
-                    &mut ctx.func,
-                    &m.funcs[fi],
-                    mask,
-                    win_mapped as u64,
-                    guard_offset_of(win_reserved as u64),
-                    epoch_addr != 0,
-                    fuel_addr != 0,
-                    threads,                // spawned vCPUs run this code beside the root
-                    (table_len as u64) - 1, // the (possibly B2-reserved) table mask, baked per call site
-                    FuncSlots::Own,
-                    fi as u32,
-                    srcloc_map.as_ref(),
-                    var_labels,
-                )?;
-                if dump_codegen {
-                    eprintln!("=== TEMEN-JIT CLIF fn{fi} ===\n{}", ctx.func.display());
-                    ctx.set_disasm(true);
-                }
-                Ok(())
-            },
-            |module, cc, fi| {
-                // NOTE (feature `stack-check`, STACK_GUARD.md §2): soundness wants a post-compile
-                // bound rejecting any function whose frame exceeds `RED_ZONE` (so a function can't
-                // grow the stack past the limit before its callee re-checks). Cranelift 0.132 doesn't
-                // expose the final frame size on `CompiledCode` (`FrameLayout`/`total_stacksize` are
-                // ABI-internal), so this bound is DEFERRED — see the increment plan. Until then the
-                // check assumes frames ≤ RED_ZONE.
-                if dump_codegen {
-                    if let Some(d) = cc.vcode.as_ref() {
-                        eprintln!("=== TEMEN-JIT VCODE fn{fi} ===\n{d}");
+        let plan = LowerPlan {
+            callees: &callees,
+            ids: &ids,
+            funcs: &m.funcs,
+            distinct: &distinct,
+            type_section: &m.types,
+            nesting,
+            signals, // #932 async signal delivery (off unless a `SignalArm` was supplied)
+            page: PageEnv::NONE, // #2164 — only a §14 child is demand-paged
+            mask,
+            mapped: win_mapped as u64,
+            guard_offset: guard_offset_of(win_reserved as u64),
+            epoch: epoch_addr != 0,
+            fuel: fuel_addr != 0,
+            domain_poll: threads, // spawned vCPUs run this code beside the root
+            fn_table_mask: (table_len as u64) - 1, // the (possibly B2-reserved) table mask
+            slots: FuncSlots::Own { words: false },
+            srclocs: srcloc_map.as_ref(),
+            var_labels,
+        };
+        let base_bytes = match &entries {
+            Some(e) => {
+                let words = LowerPlan {
+                    slots: FuncSlots::Own { words: true },
+                    ..plan
+                };
+                e.define(&mut module, &words, &guest)?
+            }
+            None => define_funcs(
+                &mut module,
+                &ids,
+                &mut codegen,
+                |ctx, fi| {
+                    // Stage 3a: enable Cranelift's value-label tracking so `set_val_label` (in
+                    // `lower_block`) takes effect and `value_labels_ranges` is populated. Gated on `-g`
+                    // vars ⇒ no effect on an ordinary build. Must be set on the fresh `ctx.func` before
+                    // lowering populates it.
+                    if var_labels.is_some() {
+                        ctx.func.collect_debug_info();
                     }
-                }
-                if srcloc_map.is_some() {
-                    let ranges: Vec<(u32, u32, u32)> = cc
-                        .buffer
-                        .get_srclocs_sorted()
-                        .iter()
-                        .filter(|s| !s.loc.is_default())
-                        .map(|s| (s.start, s.end, s.loc.bits()))
-                        .collect();
-                    if !ranges.is_empty() {
-                        raw_srclocs.push((fi as u32, ranges));
+                    build_clif(&plan, &mut ctx.func, &m.funcs[fi], fi as u32)?;
+                    if dump_codegen {
+                        eprintln!("=== TEMEN-JIT CLIF fn{fi} ===\n{}", ctx.func.display());
+                        ctx.set_disasm(true);
                     }
-                }
-                // Stage 3a: capture this function's value-label ranges, translating each Cranelift
-                // `LabelValueLoc` to DWARF terms now (the ISA is in hand; a `Reg` we cannot map is
-                // dropped — that sub-range simply has no location, like an optimized-out gap).
-                if var_labels.is_some() {
-                    let isa = module.isa();
-                    let mut per_label: Vec<(u32, VarLocRanges)> = Vec::new();
-                    for (label, ranges) in &cc.value_labels_ranges {
-                        let mut out: VarLocRanges = Vec::new();
-                        for r in ranges {
-                            if r.end <= r.start {
-                                continue;
-                            }
-                            let loc = match r.loc {
-                                LabelValueLoc::Reg(reg) => {
-                                    match isa.map_regalloc_reg_to_dwarf(reg) {
-                                        Ok(d) => VarMachineLoc::Reg(d),
-                                        Err(_) => continue,
-                                    }
+                    Ok(())
+                },
+                |module, cc, _, fi| {
+                    // NOTE (feature `stack-check`, STACK_GUARD.md §2): soundness wants a post-compile
+                    // bound rejecting any function whose frame exceeds `RED_ZONE` (so a function can't
+                    // grow the stack past the limit before its callee re-checks). Cranelift 0.132 doesn't
+                    // expose the final frame size on `CompiledCode` (`FrameLayout`/`total_stacksize` are
+                    // ABI-internal), so this bound is DEFERRED — see the increment plan. Until then the
+                    // check assumes frames ≤ RED_ZONE.
+                    if dump_codegen {
+                        if let Some(d) = cc.vcode.as_ref() {
+                            eprintln!("=== TEMEN-JIT VCODE fn{fi} ===\n{d}");
+                        }
+                    }
+                    if srcloc_map.is_some() {
+                        let ranges: Vec<(u32, u32, u32)> = cc
+                            .buffer
+                            .get_srclocs_sorted()
+                            .iter()
+                            .filter(|s| !s.loc.is_default())
+                            .map(|s| (s.start, s.end, s.loc.bits()))
+                            .collect();
+                        if !ranges.is_empty() {
+                            raw_srclocs.push((fi as u32, ranges));
+                        }
+                    }
+                    // Stage 3a: capture this function's value-label ranges, translating each Cranelift
+                    // `LabelValueLoc` to DWARF terms now (the ISA is in hand; a `Reg` we cannot map is
+                    // dropped — that sub-range simply has no location, like an optimized-out gap).
+                    if var_labels.is_some() {
+                        let isa = module.isa();
+                        let mut per_label: Vec<(u32, VarLocRanges)> = Vec::new();
+                        for (label, ranges) in &cc.value_labels_ranges {
+                            let mut out: VarLocRanges = Vec::new();
+                            for r in ranges {
+                                if r.end <= r.start {
+                                    continue;
                                 }
-                                LabelValueLoc::CFAOffset(off) => VarMachineLoc::CfaOffset(off),
-                            };
-                            out.push((r.start, r.end, loc));
+                                let loc = match r.loc {
+                                    LabelValueLoc::Reg(reg) => {
+                                        match isa.map_regalloc_reg_to_dwarf(reg) {
+                                            Ok(d) => VarMachineLoc::Reg(d),
+                                            Err(_) => continue,
+                                        }
+                                    }
+                                    LabelValueLoc::CFAOffset(off) => VarMachineLoc::CfaOffset(off),
+                                };
+                                out.push((r.start, r.end, loc));
+                            }
+                            if !out.is_empty() {
+                                per_label.push((label.as_u32(), out));
+                            }
                         }
-                        if !out.is_empty() {
-                            per_label.push((label.as_u32(), out));
+                        if !per_label.is_empty() {
+                            raw_var_locs.push((fi as u32, per_label));
                         }
                     }
-                    if !per_label.is_empty() {
-                        raw_var_locs.push((fi as u32, per_label));
-                    }
-                }
-            },
-            &guest,
-            &|i: usize| {
-                let r = &m.funcs[i].results;
-                uses_sret(r).then_some(r.len() as u32)
-            },
-        )?;
+                },
+                &guest,
+                &|i: usize| {
+                    let r = &m.funcs[i].results;
+                    uses_sret(r).then_some(r.len() as u32)
+                },
+            )?,
+        };
         let mut ctx = module.make_context();
+        // A lazily compiled module's trampolines call through its functions' words.
+        let target = |f: u32| match &entries {
+            Some(_) => TrampTarget::Word(f),
+            None => TrampTarget::Linked(ids[f as usize]),
+        };
 
         // The buffer-ABI trampoline for the entry, exported so Rust can call it.
-        build_trampoline(&callees, &mut ctx.func, ids[func as usize], entry, false)?;
+        build_trampoline(&callees, &mut ctx.func, target(func), entry, false)?;
         let tramp = module
             .declare_function("trampoline", Linkage::Export, &ctx.func.signature)
             .map_err(|e| JitError::Backend(e.to_string()))?;
@@ -4088,7 +4207,7 @@ impl CompiledModule {
                         build_trampoline(
                             &callees,
                             &mut ctx.func,
-                            ids[f as usize],
+                            target(f),
                             &m.funcs[f as usize],
                             false,
                         )?;
@@ -4217,7 +4336,9 @@ impl CompiledModule {
         // padded (to `table_len`, possibly B2-reserved beyond the module), host-owned.
         // `call.dyn` masks the guest index into this; padding/reserved slots trap until
         // `install` fills them.
-        let fn_table = FnTable::new(own_records(&own, &module, &ids), table_len);
+        // A lazily compiled function's word starts at its copy of the lazy entry.
+        let code_ids = entries.as_ref().map_or(&ids, |e| &e.copies);
+        let fn_table = FnTable::new(own_records(&own, &module, code_ids), table_len);
 
         let tramp_code = module.get_finalized_function(tramp);
         // I36 slice 3: resolve the handler trampolines now that code is finalized.
@@ -4241,6 +4362,52 @@ impl CompiledModule {
         if replay.is_none() {
             MODULE_COMPILES.fetch_add(1, Ordering::Relaxed);
         }
+        let module = match entries {
+            None => Arc::new(OwnedJit::new(module)),
+            Some(e) => {
+                let starts = e
+                    .copies
+                    .iter()
+                    .enumerate()
+                    .map(|(f, &id)| (module.get_finalized_function(id) as u64, f as u32))
+                    .collect();
+                let code = lazy::Code {
+                    funcs: m.funcs.clone(),
+                    types: m.types.clone(),
+                    distinct: distinct.clone(),
+                    callee_contracts: callee_contracts(&module),
+                    callees,
+                    ids,
+                    lazy_ids: e.code,
+                    nesting,
+                    signals,
+                    mask,
+                    mapped: win_mapped as u64,
+                    guard_offset: guard_offset_of(win_reserved as u64),
+                    epoch: epoch_addr != 0,
+                    fuel: fuel_addr != 0,
+                    domain_poll: threads,
+                    fn_table_mask: (table_len as u64) - 1,
+                    window: guest.window,
+                    table: table_len as u64,
+                    type_contracts: dyn_contracts.clone(),
+                    own: own.clone(),
+                };
+                let arena = Arc::new(Arena(std::sync::Mutex::new(Some(module))));
+                let service = lazy::Service::start(
+                    code,
+                    jit_isa()?,
+                    Arc::clone(&arena),
+                    fn_table.records(),
+                    starts,
+                );
+                instance.lazy = service.as_ptr();
+                Arc::new(OwnedJit {
+                    lazy: Some(service),
+                    arena,
+                })
+            }
+        };
         Ok(CompiledModule {
             hosted: false,
             nests: cfg!(fiber_rt) && module_uses_instantiator(m),
@@ -4326,7 +4493,7 @@ impl CompiledModule {
                 .as_ref()
                 .map(|di| di.types.clone())
                 .unwrap_or_default(),
-            module: Arc::new(OwnedJit::new(module)),
+            module,
         })
     }
 
@@ -4485,6 +4652,8 @@ impl CompiledModule {
         mut addrs: InstanceAddrs,
         node: Option<std::sync::Arc<dyn BudgetNode>>,
     ) -> CompiledModule {
+        // A property of the code, not of the caller's instance (#2594).
+        addrs.lazy = self.instance.lazy;
         #[cfg(fiber_rt)]
         let domain = self
             .domain
@@ -5551,6 +5720,14 @@ impl CompiledModule {
             JitOutcome::Exited((cell >> 32) as i32)
         } else if code == HOST_UNWIND_CODE {
             JitOutcome::HostUnwound
+        } else if code == COMPILE_FAILED_CODE {
+            // SAFETY: `this` is live for the whole call (the caller's contract), and the run that
+            // could reach it from a handler has ended.
+            let module = unsafe { &(*this).module };
+            let failure = module.lazy.as_ref().and_then(lazy::Service::failure);
+            return Err(JitError::Backend(failure.unwrap_or_else(|| {
+                "a function the run needed did not compile".into()
+            })));
         } else {
             JitOutcome::Trapped(TrapKind::from_code(code).ok_or(JitError::Malformed)?)
         };
@@ -5619,7 +5796,7 @@ impl CompiledModule {
             }
         }
         // Shared code cannot take the unit (#1825): refused before anything is recorded.
-        let module = arena_mut(&mut self.module)?;
+        let mut module = arena_mut(&mut self.module)?;
         // Intern the unit's signatures (its functions' own + its call sites') into the
         // append-only registry BEFORE lowering, so the ids baked into this unit's dispatch
         // checks are real, stable ids — id-equality ≡ structural equality across all units
@@ -5668,7 +5845,8 @@ impl CompiledModule {
         };
 
         let nesting = self.nesting;
-        let callees = Callees::new(&mut *module, &ids, funcs, types, self.fast_resolver)?;
+        let claims = fast_claims(self.fast_resolver, funcs, types);
+        let callees = Callees::new(&mut module, &ids, funcs, types, &claims)?;
         // Byte-accurate occupancy: each function's emitted code size. A unit's code is not kept.
         // #2603 — the validator checks this unit's code against the parent's window, fn table and
         // types.
@@ -5689,36 +5867,32 @@ impl CompiledModule {
             // A unit's direct calls are linked: its code reads no slot without a type check.
             own: &[],
         };
+        let plan = LowerPlan {
+            callees: &callees,
+            ids: &ids,
+            funcs,
+            distinct: &self.distinct,
+            type_section: types,
+            nesting,
+            signals: false, // #932 — define_extra units are not signal-delivery armed (slice 1b)
+            page: self.page, // #2164 — a paged child's units check its access table, as its own code does
+            mask: self.mask,
+            mapped: self.win_mapped as u64,
+            guard_offset: guard_offset_of(self.win_reserved as u64),
+            epoch: self.epoch,
+            fuel: self.fuel, // charges the running instance's fuel cell, as the parent's functions do
+            domain_poll: self.threads, // as the parent module's functions
+            fn_table_mask: self.fn_table_mask, // the parent's table mask, NOT derived from this unit's size
+            slots: FuncSlots::Unit(ref_slots.as_deref()),
+            srclocs: None, // extra/installed units carry no source-loc map (W5 JIT/DWARF)
+            var_labels: None, // …nor value-label points (Stage 3a)
+        };
         let extra_bytes = define_funcs(
-            &mut *module,
+            &mut module,
             &ids,
             &mut Codegen::Compile(None),
-            |ctx, fi| {
-                build_clif(
-                    &callees,
-                    &ids,
-                    funcs,
-                    &self.distinct,
-                    types,
-                    nesting,
-                    false, // #932 — define_extra units are not signal-delivery armed (slice 1b)
-                    self.page, // #2164 — a paged child's units check its access table, as its own code does
-                    &mut ctx.func,
-                    &funcs[fi],
-                    self.mask,
-                    self.win_mapped as u64,
-                    guard_offset_of(self.win_reserved as u64),
-                    self.epoch,
-                    self.fuel, // charges the running instance's fuel cell, as the parent's functions do
-                    self.threads, // as the parent module's functions
-                    self.fn_table_mask, // the parent's table mask, NOT derived from this unit's size
-                    FuncSlots::Unit(ref_slots.as_deref()),
-                    0,
-                    None, // extra/installed units carry no source-loc map (W5 JIT/DWARF)
-                    None, // …nor value-label points (Stage 3a)
-                )
-            },
-            |_, _, _| {},
+            |ctx, fi| build_clif(&plan, &mut ctx.func, &funcs[fi], 0),
+            |_, _, _, _| {},
             &guest,
             &|i: usize| {
                 let r = &funcs[i].results;
@@ -5732,13 +5906,15 @@ impl CompiledModule {
             .iter()
             .zip(&ids)
             .map(|(f, id)| {
-                build_trampoline(&callees, &mut ctx.func, *id, f, false)?;
+                build_trampoline(&callees, &mut ctx.func, TrampTarget::Linked(*id), f, false)?;
                 let name = format!("xt{}", self.next_extra);
                 self.next_extra += 1;
                 let t = module
                     .declare_function(&name, Linkage::Export, &ctx.func.signature)
                     .map_err(|e| JitError::Backend(e.to_string()))?;
-                self.extra_bytes += define_verified(module, t, &mut ctx)?.code_buffer().len();
+                self.extra_bytes += define_verified(&mut module, t, &mut ctx)?
+                    .code_buffer()
+                    .len();
                 module.clear_context(&mut ctx);
                 Ok(t)
             })
@@ -5760,6 +5936,7 @@ impl CompiledModule {
                 )
             })
             .collect();
+        drop(module);
         // Publish the unit's now-finalized functions into the slots reserved above, so a `ref.func`
         // funcref (remapped to `ref_slots[N]`) resolves to the unit's own function through the
         // ordinary masked dispatch (DESIGN.md §22 "unit-own funcref"). Slots were picked from the
@@ -5855,13 +6032,13 @@ impl CompiledModule {
         let tramp = match self.call_tramp {
             Some(t) => t,
             None => {
-                let module = arena_mut(&mut self.module)?;
+                let mut module = arena_mut(&mut self.module)?;
                 let mut ctx = module.make_context();
                 build_fiber_call_trampoline(&mut ctx.func);
                 let id = module
                     .declare_function("fiber_call_tramp", Linkage::Export, &ctx.func.signature)
                     .map_err(|e| JitError::Backend(e.to_string()))?;
-                define_verified(module, id, &mut ctx)?;
+                define_verified(&mut module, id, &mut ctx)?;
                 module.clear_context(&mut ctx);
                 module
                     .finalize_definitions()
@@ -5937,13 +6114,13 @@ impl CompiledModule {
         let tramp = match self.call_tramp {
             Some(t) => t,
             None => {
-                let module = arena_mut(&mut self.module)?;
+                let mut module = arena_mut(&mut self.module)?;
                 let mut ctx = module.make_context();
                 build_fiber_call_trampoline(&mut ctx.func);
                 let id = module
                     .declare_function("fiber_call_tramp", Linkage::Export, &ctx.func.signature)
                     .map_err(|e| JitError::Backend(e.to_string()))?;
-                define_verified(module, id, &mut ctx)?;
+                define_verified(&mut module, id, &mut ctx)?;
                 module.clear_context(&mut ctx);
                 module
                     .finalize_definitions()
@@ -6294,11 +6471,14 @@ enum HostFn {
     FuelRefill,
     /// #2164 — a demand-paged child's miss thunk ([`PageMissThunk`]), the compile's own.
     PageMiss,
+    /// #2594 — what a lazy entry asks its module's compile service for its function
+    /// ([`lazy::resolve`]).
+    Resolve,
 }
 
 impl HostFn {
     /// Every host function, for [`new_jit_module`] to bind.
-    const ALL: [HostFn; 30] = [
+    const ALL: [HostFn; 31] = [
         HostFn::CapThunk,
         HostFn::SigTake,
         HostFn::SigReturn,
@@ -6329,6 +6509,7 @@ impl HostFn {
         HostFn::TrapCapture,
         HostFn::FuelRefill,
         HostFn::PageMiss,
+        HostFn::Resolve,
     ];
 
     /// Its position in [`Self::ALL`], where [`Callees`] keeps its id.
@@ -6379,6 +6560,7 @@ impl HostFn {
             HostFn::TrapCapture => "temen.trap_capture",
             HostFn::FuelRefill => "temen.fuel_refill",
             HostFn::PageMiss => "temen.page_miss",
+            HostFn::Resolve => "temen.lazy_resolve",
         }
     }
 
@@ -6405,6 +6587,8 @@ impl HostFn {
             HostFn::CapThunk => &[Any, WindowBase],
             // vmctx, mem_base, off, len, flags
             HostFn::PageMiss => &[Vmctx, WindowBase],
+            // vmctx, the lazy entry's own address
+            HostFn::Resolve => &[Vmctx],
             // k, arg, status_ptr, vmctx
             HostFn::FiberResume => &[Any, Any, STATUS, Vmctx],
             // sched, k, arg, status_ptr, vmctx
@@ -6498,6 +6682,8 @@ impl HostFn {
             FuelRefill => (&[I64], &[]),
             // (vmctx, mem_base, off, len, flags)
             PageMiss => (&[I64, I64, I64, I64, I64], &[]),
+            // (vmctx, the lazy entry's own address) -> the function it runs
+            Resolve => (&[I64, I64], &[I32]),
         };
         c_signature(cc, params, returns)
     }
@@ -6558,6 +6744,7 @@ impl HostFn {
             HostFn::StackLimit => stack_check::thread_limit as *const (),
             HostFn::TrapCapture => trap_capture_addr()?,
             HostFn::FuelRefill => fuel::fuel_refill as *const (),
+            HostFn::Resolve => lazy::resolve as *const (),
             #[allow(unreachable_patterns)]
             _ => return None,
         };
@@ -6627,7 +6814,7 @@ impl Callees {
         ids: &[FuncId],
         funcs: &[Func],
         types: &[temen_ir::TypeEntry],
-        resolver: Option<FastCapResolver>,
+        claims: &FastClaims,
     ) -> Result<Callees, JitError> {
         let frontend = module.target_config();
         let cc = frontend.default_call_conv;
@@ -6648,22 +6835,14 @@ impl Callees {
             *id = import(f.symbol(), f.signature(cc))?;
         }
         let mut fast = HashMap::new();
-        if let Some(resolver) = resolver {
-            for inst in funcs.iter().flat_map(|f| &f.blocks).flat_map(|b| &b.insts) {
-                let Inst::CapCall(c) = inst else {
-                    continue;
-                };
-                let temen_ir::CapCall {
-                    type_id, op, sig, ..
-                } = &**c;
-                let key = fast_cap_key_of(*type_id, *op, sig_of(types, *sig));
-                if let std::collections::hash_map::Entry::Vacant(slot) = fast.entry(key) {
-                    slot.insert(
-                        fast_cap_claimed(resolver, key)
-                            .then(|| import(&fast_cap_symbol(key), fast_cap_signature(cc, key)))
-                            .transpose()?,
-                    );
-                }
+        for key in cap_keys(funcs, types) {
+            if let std::collections::hash_map::Entry::Vacant(slot) = fast.entry(key) {
+                slot.insert(
+                    claims
+                        .contains_key(&key)
+                        .then(|| import(&fast_cap_symbol(key), fast_cap_signature(cc, key)))
+                        .transpose()?,
+                );
             }
         }
         Ok(Callees {
@@ -6729,10 +6908,58 @@ fn fast_cap_key_of(type_id: u32, op: u32, sig: &FuncType) -> [u32; 4] {
 /// register ABI returns a single i64; a multi-result op takes the generic thunk), and the resolver
 /// returns a specialized fn for it. The resolver gates on the arity it is passed, so it claims an op
 /// only when its fn's arity matches the `call.cap`'s.
-fn fast_cap_claimed(resolver: FastCapResolver, [type_id, op, n_args, n_res]: [u32; 4]) -> bool {
+fn fast_cap_claimed(
+    resolver: FastCapResolver,
+    [type_id, op, n_args, n_res]: [u32; 4],
+) -> Option<*const u8> {
+    if n_res > 1 {
+        return None;
+    }
     // SAFETY: `resolver` honours the `FastCapResolver` contract (the compile's caller guarantees
     // it): a pure `(type_id, op, n_args, n_res) -> *const fn` lookup with no side effects.
-    n_res <= 1 && !unsafe { resolver(type_id, op, n_args, n_res) }.is_null()
+    let target = unsafe { resolver(type_id, op, n_args, n_res) };
+    (!target.is_null()).then_some(target as *const u8)
+}
+
+/// The `(type_id, op, n_args, n_res)` key of each `call.cap` in `funcs`, in order, repeats included.
+fn cap_keys<'a>(
+    funcs: &'a [Func],
+    types: &'a [temen_ir::TypeEntry],
+) -> impl Iterator<Item = [u32; 4]> + 'a {
+    funcs
+        .iter()
+        .flat_map(|f| &f.blocks)
+        .flat_map(|b| &b.insts)
+        .filter_map(move |inst| match inst {
+            Inst::CapCall(c) => Some(fast_cap_key_of(c.type_id, c.op, sig_of(types, c.sig))),
+            _ => None,
+        })
+}
+
+/// §9/D45 — the fast-path targets a compile's resolver claims, by key: the address of each.
+type FastClaims = HashMap<[u32; 4], usize>;
+
+/// Ask `resolver` once for each key of `funcs`' `call.cap`s, on the calling thread (#2482), before
+/// any function is lowered or linked. A module binds the targets as it binds its host functions
+/// ([`new_jit_module`]), so no link asks again: one on a lazily compiled module's worker included
+/// (#2594).
+fn fast_claims(
+    resolver: Option<FastCapResolver>,
+    funcs: &[Func],
+    types: &[temen_ir::TypeEntry],
+) -> FastClaims {
+    let mut asked = std::collections::HashSet::new();
+    let mut claims = FastClaims::new();
+    if let Some(resolver) = resolver {
+        for key in cap_keys(funcs, types) {
+            if asked.insert(key) {
+                if let Some(target) = fast_cap_claimed(resolver, key) {
+                    claims.insert(key, target as usize);
+                }
+            }
+        }
+    }
+    claims
 }
 
 /// The symbol a §9/D45 fast-path `call.cap` calls its target by: the `(type_id, op, n_args,
@@ -6784,7 +7011,7 @@ fn host_import(
         return f.addr(imports).map(|_| f.signature(cc));
     }
     let key = fast_cap_key(name)?;
-    fast_cap_claimed(imports.fast_resolver?, key).then(|| fast_cap_signature(cc, key))
+    fast_cap_claimed(imports.fast_resolver?, key).map(|_| fast_cap_signature(cc, key))
 }
 
 /// Build a fresh `JITModule` with the escape-TCB ISA configuration **every** compile path shares
@@ -6798,12 +7025,15 @@ fn host_import(
 ///
 /// It binds every symbol the code calls the host by ([`HostFn`]): temen-jit's functions, and the
 /// compile's `imports`; and Cranelift's libcalls ([`libcalls`]).
-fn new_jit_module(imports: Imports) -> Result<JITModule, JitError> {
+fn new_jit_module(imports: Imports, claims: &FastClaims) -> Result<JITModule, JitError> {
     let mut builder = JITBuilder::with_isa(jit_isa()?, cranelift_module::default_libcall_names());
     for f in HostFn::ALL {
         if let Some(addr) = f.addr(&imports) {
             builder.symbol(f.symbol(), addr);
         }
+    }
+    for (&key, &target) in claims {
+        builder.symbol(fast_cap_symbol(key), target as *const u8);
     }
     for (name, addr) in libcalls() {
         builder.symbol(name, addr);
@@ -6892,6 +7122,34 @@ fn jit_isa() -> Result<cranelift_codegen::isa::OwnedTargetIsa, JitError> {
 /// or compile, or the payload of a panic in either.
 type CompiledFn = std::thread::Result<Result<(CompiledCode, Vec<ModuleReloc>), JitError>>;
 
+/// Build a guest function's CLIF with `lower` and compile it as function `id`, in a context of its
+/// own, catching a panic in Cranelift: what each compile path's workers do per function (#2482,
+/// #2594). `guest`, `callee` and `sret` are what the validator checks the code against
+/// ([`compile_verified`]).
+fn compile_fn(
+    isa: &dyn cranelift_codegen::isa::TargetIsa,
+    id: FuncId,
+    lower: impl FnOnce(&mut cranelift_codegen::Context) -> Result<(), JitError>,
+    guest: &validate::Guest,
+    callee: &(dyn Fn(u32) -> Option<validate::Contract> + Sync),
+    sret: Option<u32>,
+) -> CompiledFn {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut ctx = cranelift_codegen::Context::new();
+        ctx.func.signature.call_conv = isa.default_call_conv();
+        lower(&mut ctx)?;
+        compile_verified(
+            isa,
+            &mut ctx,
+            id,
+            validate::Entry::Guest(guest),
+            callee,
+            sret,
+        )
+        .map_err(JitError::Backend)
+    }))
+}
+
 /// Lower and define functions `0..ids.len()` (#2450, #2482), every compile path's one loop. Worker
 /// threads build function `i`'s CLIF with `lower` and compile it, each function in a context of its
 /// own, and this thread defines the code in function order, `defined` seeing each function's as it
@@ -6906,7 +7164,7 @@ fn define_funcs(
     ids: &[FuncId],
     code: &mut Codegen<'_>,
     lower: impl Fn(&mut cranelift_codegen::Context, usize) -> Result<(), JitError> + Sync,
-    mut defined: impl FnMut(&JITModule, &CompiledCode, usize),
+    mut defined: impl FnMut(&JITModule, &CompiledCode, &[ModuleReloc], usize),
     guest: &validate::Guest,
     // #2603 PR 3 — for function `i`, the count of result slots it returns through its `sret` pointer
     // (when it has more than `MAX_REG_RESULTS` results), so the validator can bound writes through
@@ -6932,14 +7190,7 @@ fn define_funcs(
             scope.spawn(move || loop {
                 let job = work_rx.lock().unwrap_or_else(|p| p.into_inner()).recv();
                 let Ok(i) = job else { break };
-                let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    let mut ctx = cranelift_codegen::Context::new();
-                    ctx.func.signature.call_conv = isa.default_call_conv();
-                    lower(&mut ctx, i)?;
-                    let entry = validate::Entry::Guest(guest);
-                    compile_verified(isa, &mut ctx, ids[i], entry, callee, sret(i))
-                        .map_err(JitError::Backend)
-                }));
+                let out = compile_fn(isa, ids[i], |ctx| lower(ctx, i), guest, callee, sret(i));
                 if done_tx.send((i, out)).is_err() {
                     break;
                 }
@@ -6980,7 +7231,7 @@ fn define_funcs(
                     *keep = None;
                 }
                 bytes += code.code_buffer().len();
-                defined(module, &code, next);
+                defined(module, &code, &relocs, next);
                 next += 1;
             }
             Ok::<(), JitError>(())
@@ -7609,6 +7860,8 @@ block 2 (v7: i32) {
                     "--ignored",
                 ])
                 .env(EMIT_TO, &path)
+                // What a whole compile emits, which these programs get unless forced (#2594).
+                .env("TEMEN_JIT_LAZY", "off")
                 .output()
                 .expect("run this test binary");
             assert!(
@@ -7639,7 +7892,13 @@ block 2 (v7: i32) {
                 let named = code
                     .windows(f.symbol().len())
                     .any(|w| w == f.symbol().as_bytes());
-                assert!(named, "no code calls {}", f.symbol());
+                // Only a lazily compiled module's lazy entries call `resolve` (#2594), and these
+                // programs compile whole.
+                assert!(
+                    named || *f == HostFn::Resolve,
+                    "no code calls {}",
+                    f.symbol()
+                );
                 let held = code.windows(8).any(|w| w == addr.to_le_bytes());
                 assert!(!held, "the code holds the address of {}", f.symbol());
             }
@@ -8035,10 +8294,10 @@ fn compile_child_windowed(
         page_miss,
         ..Imports::NONE
     };
-    let mut module = new_jit_module(imports)?;
+    let mut module = new_jit_module(imports, &FastClaims::new())?;
     let ids: Vec<FuncId> = declare_all_funcs(&mut module, funcs)?;
     // Nested child: its `call.cap`s go to the coroutine thunk, never a fast path.
-    let callees = Callees::new(&mut module, &ids, funcs, types, None)?;
+    let callees = Callees::new(&mut module, &ids, funcs, types, &FastClaims::new())?;
     // temen#2452 — the code kept for this compile, defined in place of compiling, or else a record
     // of the code it emits, to keep.
     let replay = kept
@@ -8083,36 +8342,32 @@ fn compile_child_windowed(
         types: &dyn_contracts,
         own: &own,
     };
+    let plan = LowerPlan {
+        callees: &callees,
+        ids: &ids,
+        funcs,
+        distinct: &distinct,
+        type_section: types,
+        nesting, // a child that spawns loads its own nursery from its vmctx (temen#2168)
+        signals: false, // #932 — a §14 child is not signal-delivery armed (slice 1b)
+        page,    // #2164 — its access table's check, when it is demand-paged
+        mask,
+        mapped,                                  // the committed prefix
+        guard_offset: guard_offset_of(reserved), // its own window's trailing guard
+        epoch: epoch_addr != 0, // §5 kill-path: the child polls the parent's interrupt cell
+        fuel: fuel_addr != 0, // counted fuel: the child charges its own budget cell (else un-metered)
+        domain_poll: true,    // a §14 child always runs beside its parent, which may tear it down
+        fn_table_mask,        // the child's own (reserved) table mask
+        slots: FuncSlots::Own { words: false }, // §14 child: its own window and table
+        srclocs: None,        // nested-child units carry no source-loc map (W5 JIT/DWARF)
+        var_labels: None,     // …nor value-label points (Stage 3a)
+    };
     let base_bytes = define_funcs(
         &mut module,
         &ids,
         &mut codegen,
-        |ctx, fi| {
-            build_clif(
-                &callees,
-                &ids,
-                funcs,
-                &distinct,
-                types,
-                nesting, // a child that spawns loads its own nursery from its vmctx (temen#2168)
-                false,   // #932 — a §14 child is not signal-delivery armed (slice 1b)
-                page,    // #2164 — its access table's check, when it is demand-paged
-                &mut ctx.func,
-                &funcs[fi],
-                mask,
-                mapped,                    // the committed prefix
-                guard_offset_of(reserved), // its own window's trailing guard
-                epoch_addr != 0, // §5 kill-path: the child polls the parent's interrupt cell
-                fuel_addr != 0, // counted fuel: the child charges its own budget cell (else un-metered)
-                true,           // a §14 child always runs beside its parent, which may tear it down
-                fn_table_mask,  // the child's own (reserved) table mask
-                FuncSlots::Own, // §14 child: its own window and table
-                0,
-                None, // nested-child units carry no source-loc map (W5 JIT/DWARF)
-                None, // …nor value-label points (Stage 3a)
-            )
-        },
-        |_, _, _| {},
+        |ctx, fi| build_clif(&plan, &mut ctx.func, &funcs[fi], 0),
+        |_, _, _, _| {},
         &guest,
         &|i: usize| {
             let r = &funcs[i].results;
@@ -8123,7 +8378,7 @@ fn compile_child_windowed(
     build_trampoline(
         &callees,
         &mut ctx.func,
-        ids[child_entry as usize],
+        TrampTarget::Linked(ids[child_entry as usize]),
         &entry,
         false,
     )?;
@@ -8138,7 +8393,7 @@ fn compile_child_windowed(
     build_trampoline(
         &callees,
         &mut ctx.func,
-        ids[child_entry as usize],
+        TrampTarget::Linked(ids[child_entry as usize]),
         &entry,
         true,
     )?;
@@ -8162,7 +8417,7 @@ fn compile_child_windowed(
                 build_trampoline(
                     &callees,
                     &mut ctx.func,
-                    ids[f as usize],
+                    TrampTarget::Linked(ids[f as usize]),
                     &funcs[f as usize],
                     false,
                 )?;
@@ -8617,6 +8872,24 @@ fn ensure_supported(f: &Func, type_section: &[temen_ir::TypeEntry]) -> Result<()
     }
     for blk in &f.blocks {
         for inst in &blk.insts {
+            // FORK.md §8.6 — `exec_module` (`execve` image-replace, op 14) is eval-loop-only: the
+            // tree-walker folds it to `Step::Exec` before any host dispatch. The generic `call.cap`
+            // thunk would answer `-EINVAL` where the oracle image-replaces — a silent divergence
+            // (INVARIANTS.md #9). Decline so the run folds to a reifiable tier (OPS_PARITY.md
+            // `exec`). Decided here, before any run, since a lazily compiled module (#2594) lowers a
+            // function only once its run has started, when it can no longer decline.
+            // A call that doesn't hold to the op's contract traps `CapFault` instead, as every
+            // engine's does (`served_shape_ok`, checked first by the lowering too).
+            if let Inst::CapCall(c) = inst {
+                if c.type_id == temen_ir::CAP_SELF_TYPE_ID
+                    && c.op == 14
+                    && temen_ir::served_shape_ok(c.type_id, c.op, sig_of(type_section, c.sig))
+                {
+                    return Err(JitError::Unsupported(
+                        "exec_module: eval-loop-only image-replace (op 14)",
+                    ));
+                }
+            }
             match inst {
                 Inst::ConstI32(_)
                 | Inst::ConstI64(_)
@@ -8891,13 +9164,15 @@ impl Exits {
     }
 }
 
-/// Where the functions a compile defines sit in the table its code dispatches through (§3c).
+/// Where the functions a compile defines sit in the table its code dispatches through (§3c), and so
+/// how a direct call reaches its callee.
 #[derive(Clone, Copy)]
 enum FuncSlots<'a> {
     /// Function `i` is slot `i` for the table's life: a module's or a §14 child's own functions,
-    /// which `install` never takes and `uninstall` refuses. So `ref.func i` names slot `i`, and a
-    /// direct call reads its callee's code word through that slot (#2594).
-    Own,
+    /// which `install` never takes and `uninstall` refuses. So `ref.func i` names slot `i`. A direct
+    /// call is linked to its callee, or, with `words` (a function compiled lazily, #2594, whose
+    /// callees may not be compiled yet), reads the callee's code word through its slot.
+    Own { words: bool },
     /// A §22 unit's functions (`define_extra`), unit-local indices the table names only where the
     /// unit was installed: `slots[i]` for function `i` when it names its own functions (DESIGN.md §22
     /// "unit-own funcref"), else nowhere. A guest can uninstall those slots, so the unit's direct
@@ -8982,7 +9257,7 @@ struct Lower<'a> {
     /// of a §14 child. On for code that can run beside other vCPUs (a threaded module, every §14
     /// child); a single-vCPU compile emits nothing.
     domain_poll: bool,
-    /// Every function's `FuncId`, which a §22 unit's direct calls link to ([`FuncSlots::Unit`]).
+    /// Every function's `FuncId`, which a linked direct call names.
     ids: &'a [FuncId],
     /// The functions of this compilation unit, indexed like [`Self::ids`], so a **direct** `call`
     /// can read its callee's signature, and its result types to decide the sret ABI (see
@@ -9041,86 +9316,85 @@ fn trap_capture_addr() -> Option<*const ()> {
     None
 }
 
-/// Build the natural-ABI CLIF for one IR function: `(mem_base, fn_table_base, params…)
-/// -> (results…)`. The CLIF entry block holds the native params and jumps into IR
-/// block 0 passing the parameters as its block args.
-///
-/// `fn_table_mask` is the `call.dyn` index mask — `next_pow2(table_len) - 1` for the
-/// table this function will dispatch through. It is an explicit parameter (not derived from
-/// `ids.len()`) because an **incrementally defined** function (`CompiledModule::define_extra`)
-/// has its own unit-local `ids` for direct calls but dispatches through the *parent's*
-/// function table, whose mask was fixed when the parent was compiled (the mask is baked as a
-/// constant into every call site — DESIGN.md §22 "the baked function-table mask").
-#[allow(clippy::too_many_arguments)]
-fn build_clif(
-    callees: &Callees,
-    ids: &[FuncId],
-    funcs: &[Func],
-    distinct: &[FuncType],
-    type_section: &[temen_ir::TypeEntry],
+/// What lowering a compile's functions needs besides each function itself: the same for every
+/// function of the compile, so the compile's workers share it, and so does a lazily compiled
+/// module's compile service (#2594), which lowers its functions long after the compile returned.
+#[derive(Clone, Copy)]
+struct LowerPlan<'a> {
+    /// What the code calls, declared before it is built (#2482).
+    callees: &'a Callees,
+    /// Every function's `FuncId`, which a linked direct call names.
+    ids: &'a [FuncId],
+    /// The compile's functions, indexed like `ids`.
+    funcs: &'a [Func],
+    /// Distinct module signatures, for `call.dyn` type ids.
+    distinct: &'a [FuncType],
+    /// The unit's type section (#922).
+    type_section: &'a [temen_ir::TypeEntry],
+    /// Lower `Instantiator` `call.cap`s to the §14 nesting runtime.
     nesting: bool,
+    /// #932 — emit the async-signal delivery check.
     signals: bool,
+    /// #2164 — a paged compile's page check.
     page: PageEnv,
-    clif: &mut Function,
-    f: &Func,
+    /// The §4 confinement mask (`reserved - 1`); `0` when the module has no memory.
     mask: u64,
+    /// The backed `mapped` extent in bytes.
     mapped: u64,
+    /// Offset from `mem_base` of the window's trailing guard page.
     guard_offset: u64,
+    /// Poll the §5 interrupt cell.
     epoch: bool,
+    /// Charge the counted-fuel cell.
     fuel: bool,
+    /// Poll the domain's end at loop back-edges (code that can run beside other vCPUs).
     domain_poll: bool,
+    /// The `call.dyn` index mask, `next_pow2(table_len) - 1` for the table this code dispatches
+    /// through. Not derived from `ids.len()`: a §22 unit (`CompiledModule::define_extra`) has
+    /// unit-local `ids` but dispatches through its parent's table, whose mask is baked into every
+    /// call site (DESIGN.md §22 "the baked function-table mask").
     fn_table_mask: u64,
-    slots: FuncSlots,
+    /// Where the compile's functions sit in the table, and how a direct call reaches its callee.
+    slots: FuncSlots<'a>,
+    /// `-g` source-loc lookup (W5 JIT/DWARF Stage 0); `None` without debug info.
+    srclocs: Option<&'a SrcLocMap>,
+    /// `-g` value-label points (Stage 3a); `None` without debug info.
+    var_labels: Option<&'a VarLabelMap>,
+}
+
+/// What every function of a compile opens with: a CLIF entry block holding the natural ABI's params
+/// (`mem_base`, `fn_table_base`, `vmctx`, `stack_limit`, the return-area pointer when the results
+/// spill, then `params`), the variables that carry the context pointers across blocks, and the
+/// lowering context over them. Leaves the builder in the entry block, and returns the context and
+/// the values of `params`.
+fn open_function<'a>(
+    b: &mut FunctionBuilder,
+    plan: &LowerPlan<'a>,
+    params: &[ValType],
+    results: &[ValType],
     func_idx: u32,
-    srclocs: Option<&SrcLocMap>,
-    var_labels: Option<&VarLabelMap>,
-) -> Result<(), JitError> {
-    if f.blocks.is_empty() {
-        return Err(JitError::Malformed);
-    }
-    // A value that crosses a `setjmp` reaches its later uses only through the `setjmp` block's own
-    // map, which reloads it after the second return (`launder_across_setjmp`). A forwarding param
-    // (#2448) or a capture (#2454) would read the value its own block defined, around the reload
-    // (#2600). So such a function is lowered block-local, taking no param as what it forwards.
-    let setjmp = f.uses_setjmp();
-    let block_local;
-    let f = if setjmp && f.blocks.iter().any(|b| !b.captures.is_empty()) {
-        let mut g = f.clone();
-        // Typing reads `has_memory` only to reject a memory op in a module with no window, which a
-        // verified function has none of, so `true` types it exactly.
-        g.localize(&temen_verify::func_value_types(
-            f,
-            funcs,
-            type_section,
-            true,
-        ));
-        block_local = g;
-        &block_local
-    } else {
-        f
-    };
-    clif.signature = natural_sig(f);
-    clif.name = UserFuncName::user(0, 0);
-
-    let mut fbctx = FunctionBuilderContext::new();
-    let mut b = FunctionBuilder::new(clif, &mut fbctx);
-
-    // One CLIF block per IR block, with params mirroring the IR block params, but those the
-    // lowering takes as the values they forward (#2448). A separate CLIF entry block holds the
-    // native params and jumps into IR block 0.
-    let mut blocks = Blocks {
-        clif: f.blocks.iter().map(|_| b.create_block()).collect(),
-        fwd: (!setjmp).then(|| f.forwards()),
-        vals: vec![Vec::new(); f.blocks.len()],
-    };
-    for (i, blk) in f.blocks.iter().enumerate() {
-        for (j, p) in blk.params.iter().enumerate() {
-            if blocks.taken(i, j).is_none() {
-                b.append_block_param(blocks.clif[i], clif_ty(*p));
-            }
-        }
-    }
-    let sret = uses_sret(&f.results);
+) -> Result<(Lower<'a>, Vec<Value>), JitError> {
+    let LowerPlan {
+        callees,
+        ids,
+        funcs,
+        distinct,
+        type_section,
+        nesting,
+        signals,
+        page,
+        mask,
+        mapped,
+        guard_offset,
+        epoch,
+        fuel,
+        domain_poll,
+        fn_table_mask,
+        slots,
+        srclocs,
+        var_labels,
+    } = *plan;
+    let sret = uses_sret(results);
     let entry = b.create_block();
     b.append_block_param(entry, I64); // mem_base
     b.append_block_param(entry, I64); // fn_table_base
@@ -9129,7 +9403,7 @@ fn build_clif(
     if sret {
         b.append_block_param(entry, I64); // return-area pointer (results spilled here, not returned)
     }
-    for p in &f.params {
+    for p in params {
         b.append_block_param(entry, clif_ty(*p));
     }
     b.switch_to_block(entry);
@@ -9185,7 +9459,7 @@ fn build_clif(
         limit_var,
         sret_var,
         funcs,
-        result_tys: f.results.iter().map(|t| clif_ty(*t)).collect(),
+        result_tys: results.iter().map(|t| clif_ty(*t)).collect(),
         mask,
         mapped,
         guard_offset,
@@ -9207,17 +9481,77 @@ fn build_clif(
         page,
         exits: Exits::default(),
     };
+    // The params follow the three context pointers and the stack limit, then the sret pointer.
+    let pbase = 4 + usize::from(sret);
+    Ok((lower, b.block_params(entry)[pbase..].to_vec()))
+}
 
-    // Jump into IR block 0 passing the function parameters (entry params after the three context
-    // pointers, plus the sret pointer when present). A §5 kill-path check guards the *entry* (caught
-    // before any work): this is what stops unbounded recursion and tail-call loops — each (re-)entry
-    // polls the interrupt cell. Intra-function loops are caught by the per-back-edge check in
-    // `lower_block`.
-    let pbase = 4 + usize::from(sret); // 3 context ptrs + stack_limit, then sret
-    let entry_args: Vec<BlockArg> = b.block_params(entry)[pbase..]
-        .iter()
-        .map(|v| BlockArg::from(*v))
-        .collect();
+/// Build the natural-ABI CLIF for one IR function, function `func_idx` of `plan`'s compile:
+/// `(mem_base, fn_table_base, vmctx, stack_limit, params…) -> (results…)`. The CLIF entry block
+/// holds the native params and jumps into IR block 0 passing the parameters as its block args.
+fn build_clif(
+    plan: &LowerPlan,
+    clif: &mut Function,
+    f: &Func,
+    func_idx: u32,
+) -> Result<(), JitError> {
+    let LowerPlan {
+        funcs,
+        type_section,
+        ..
+    } = *plan;
+    if f.blocks.is_empty() {
+        return Err(JitError::Malformed);
+    }
+    // A value that crosses a `setjmp` reaches its later uses only through the `setjmp` block's own
+    // map, which reloads it after the second return (`launder_across_setjmp`). A forwarding param
+    // (#2448) or a capture (#2454) would read the value its own block defined, around the reload
+    // (#2600). So such a function is lowered block-local, taking no param as what it forwards.
+    let setjmp = f.uses_setjmp();
+    let block_local;
+    let f = if setjmp && f.blocks.iter().any(|b| !b.captures.is_empty()) {
+        let mut g = f.clone();
+        // Typing reads `has_memory` only to reject a memory op in a module with no window, which a
+        // verified function has none of, so `true` types it exactly.
+        g.localize(&temen_verify::func_value_types(
+            f,
+            funcs,
+            type_section,
+            true,
+        ));
+        block_local = g;
+        &block_local
+    } else {
+        f
+    };
+    clif.signature = natural_sig(f);
+    clif.name = UserFuncName::user(0, 0);
+
+    let mut fbctx = FunctionBuilderContext::new();
+    let mut b = FunctionBuilder::new(clif, &mut fbctx);
+
+    // One CLIF block per IR block, with params mirroring the IR block params, but those the
+    // lowering takes as the values they forward (#2448). A separate CLIF entry block holds the
+    // native params and jumps into IR block 0.
+    let mut blocks = Blocks {
+        clif: f.blocks.iter().map(|_| b.create_block()).collect(),
+        fwd: (!setjmp).then(|| f.forwards()),
+        vals: vec![Vec::new(); f.blocks.len()],
+    };
+    for (i, blk) in f.blocks.iter().enumerate() {
+        for (j, p) in blk.params.iter().enumerate() {
+            if blocks.taken(i, j).is_none() {
+                b.append_block_param(blocks.clif[i], clif_ty(*p));
+            }
+        }
+    }
+    let (lower, params) = open_function(&mut b, plan, &f.params, &f.results, func_idx)?;
+
+    // Jump into IR block 0 passing the function parameters. A §5 kill-path check guards the *entry*
+    // (caught before any work): this is what stops unbounded recursion and tail-call loops — each
+    // (re-)entry polls the interrupt cell. Intra-function loops are caught by the per-back-edge check
+    // in `lower_block`.
+    let entry_args: Vec<BlockArg> = params.iter().map(|v| BlockArg::from(*v)).collect();
     emit_epoch_check(&mut b, &lower);
     // A cycle of tail calls passes no back-edge and no call return, so a function that tail-calls
     // polls on entry; any other re-entry comes back through a caller's post-call trap guard.
@@ -9693,10 +10027,18 @@ mod loop_layout_tests {
 /// enters through, since its body runs on a platform fiber's control stack whose low bound only the
 /// executor knows at resume time (the fiber's own `stack_low`), exactly as a guest fiber's entry does
 /// via the fiber call-trampoline. One flag on the one builder, not a second trampoline family.
+/// What a buffer-ABI trampoline calls: a function it links to, or, in a lazily compiled module
+/// (#2594), function `f` through its code word, which holds its lazy entry until it is compiled.
+#[derive(Clone, Copy)]
+enum TrampTarget {
+    Linked(FuncId),
+    Word(u32),
+}
+
 fn build_trampoline(
     callees: &Callees,
     clif: &mut Function,
-    entry_id: FuncId,
+    target: TrampTarget,
     entry: &Func,
     with_limit: bool,
 ) -> Result<(), JitError> {
@@ -9747,8 +10089,19 @@ fn build_trampoline(
             .load(I64, MemFlags::trusted(), args_ptr, (i * 8) as i32);
         call_args.push(decode_slot(&mut b, slot, *p));
     }
-    let callee = callees.import(b.func, entry_id)?;
-    let call = b.ins().call(callee, &call_args);
+    let call = match target {
+        TrampTarget::Linked(id) => {
+            let callee = callees.import(b.func, id)?;
+            b.ins().call(callee, &call_args)
+        }
+        TrampTarget::Word(f) => {
+            let slot = i32::try_from(u64::from(f) * 8).map_err(|_| JitError::Malformed)?;
+            let record = b.ins().load(I64, MemFlags::trusted(), fn_table_base, slot);
+            let code = code_word(&mut b, record);
+            let sig = b.import_signature(sig_from(&entry.params, &entry.results));
+            b.ins().call_indirect(sig, code, &call_args)
+        }
+    };
     if !sret {
         let rets: Vec<Value> = b.inst_results(call).to_vec();
         for (i, r) in rets.iter().enumerate() {
@@ -10158,15 +10511,6 @@ fn lower_block(
                 };
                 vals.push(v);
                 continue;
-            }
-            // FORK.md §8.6 — `exec_module` (`execve` image-replace, op 14) is eval-loop-only: the
-            // tree-walker folds it to `Step::Exec` before any host dispatch. The generic `call.cap`
-            // thunk here would answer `-EINVAL` where the oracle image-replaces — a silent divergence
-            // (INVARIANTS.md #9). Decline so the run folds to a reifiable tier (OPS_PARITY.md `exec`).
-            if *type_id == temen_ir::CAP_SELF_TYPE_ID && *op == 14 {
-                return Err(JitError::Unsupported(
-                    "exec_module: eval-loop-only image-replace (op 14)",
-                ));
             }
             // §14 `Instantiator` (iface 6): when this (parent) compile has a live `Nursery`, lower
             // `instantiate`/`join` to its thunks instead of the generic `call.cap` — spawning a child
@@ -12200,7 +12544,7 @@ fn indirect_dispatch(b: &mut FunctionBuilder, lower: &Lower, idx: Value, ty: &Fu
     emit_trap(b, lower, TrapKind::IndirectCallType);
     b.switch_to_block(matched);
     b.seal_block(matched);
-    code_word(b, lower, record)
+    code_word(b, record)
 }
 
 /// How a direct `call` or `return_call` reaches its callee.
@@ -12211,12 +12555,11 @@ enum Direct {
     Word(SigRef, Value),
 }
 
-/// The callee of a direct call of `func`. A compile's own function is reached through its code word
-/// (#2594): its slot names its record for the table's life ([`FuncSlots::Own`]), so the slot's load
-/// may move and be shared, and the record's word holds its code. Leaves the builder past the word's
-/// check.
+/// The callee of a direct call of `func`: linked, or, in a function compiled lazily, through its code
+/// word (#2594). The callee's slot names its record for the table's life ([`FuncSlots::Own`]), so
+/// the slot's load may move and be shared, and the record's word holds code that runs it.
 fn direct_callee(b: &mut FunctionBuilder, lower: &Lower, func: u32) -> Result<Direct, JitError> {
-    if let FuncSlots::Unit(_) = lower.slots {
+    if !matches!(lower.slots, FuncSlots::Own { words: true }) {
         let id = *lower.ids.get(func as usize).ok_or(JitError::Malformed)?;
         return Ok(Direct::Linked(lower.callees.import(b.func, id)?));
     }
@@ -12226,23 +12569,13 @@ fn direct_callee(b: &mut FunctionBuilder, lower: &Lower, func: u32) -> Result<Di
     let table = b.use_var(lower.fn_table_var);
     let fixed = MemFlags::trusted().with_readonly().with_can_move();
     let record = b.ins().load(I64, fixed, table, slot);
-    Ok(Direct::Word(sig, code_word(b, lower, record)))
+    Ok(Direct::Word(sig, code_word(b, record)))
 }
 
-/// The code word of the record at `record` (offset 8): the address of its function's code, which
-/// every call reads (#2594). Every word is filled before a run starts, so a zero one would be the
-/// host's bug and traps. Leaves the builder past the check.
-fn code_word(b: &mut FunctionBuilder, lower: &Lower, record: Value) -> Value {
-    let code = b.ins().load(I64, MemFlags::trusted(), record, 8);
-    let ready = b.create_block();
-    let empty = b.create_block();
-    b.ins().brif(code, ready, &[], empty, &[]);
-    b.switch_to_block(empty);
-    b.seal_block(empty);
-    emit_trap(b, lower, TrapKind::Unreachable);
-    b.switch_to_block(ready);
-    b.seal_block(ready);
-    code
+/// The code word of the record at `record` (offset 8): the address of code that runs its function,
+/// which every call reads (#2594). A word always holds callable code, so a call needs no check.
+fn code_word(b: &mut FunctionBuilder, record: Value) -> Value {
+    b.ins().load(I64, MemFlags::trusted(), record, 8)
 }
 
 /// What a call's trap check follows (#2488), which decides the word it reads.

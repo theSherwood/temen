@@ -441,6 +441,9 @@ pub mod trap_code {
     pub const DOMAIN_DONE: i64 = 14;
     /// Reserved, JIT-internal: a host thunk unwound the run on the host's behalf (`execve`).
     pub const HOST_UNWIND: i64 = 15;
+    /// Reserved, JIT-internal: a function the Cranelift JIT compiled during the run failed to
+    /// compile (#2594). The run returns the compile's error. Never surfaced to a guest.
+    pub const COMPILE_FAILED: i64 = 16;
 
     /// The code for an exit with guest status `status`.
     pub const fn exit(status: i32) -> i64 {
