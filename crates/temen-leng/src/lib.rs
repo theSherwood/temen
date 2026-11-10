@@ -1991,16 +1991,13 @@ impl Edge<'_> {
 /// whose C name a library imports takes one, as the library's callback (its heap, say). A library's
 /// other imports are the host's, in the program's manifest.
 ///
-/// `debug` links a **debug build**, which keeps the units' debug info. A **release build** drops it,
-/// so no engine pays for it (#2186): nim code carries none, but the prebuilt libc carries its own, for
-/// a debugger to step into, and the Cranelift JIT captures every explicit trap's backtrace in a module
-/// that has any.
+/// `build` says how to build it ([`Build`]).
 pub fn link_nim(
     units: &[WholeModule],
     edge: Edge,
     libc: Option<&[u8]>,
     libs: &[&[u8]],
-    debug: bool,
+    build: Build,
 ) -> Result<Module, LengError> {
     let units = &parse_whole(&link_order(units))?;
     let libs = libs
@@ -2016,11 +2013,27 @@ pub fn link_nim(
     let leaves = importc_leaves_of(units)?;
     runtime.extend(libs.into_iter().map(|l| library_unit(l, &leaves, |_| true)));
     let mut m = link_lowered(&program, &runtime, true, true)?;
-    if !debug {
+    if !build.debug {
         m.debug_info = None;
     }
-    Ok(temen_opt::optimize_linked(&m))
+    Ok(temen_opt::optimize_linked(&m, build.opt))
 }
+
+/// How [`link_nim`] builds a program: what `temen-link`'s `-g` and `--opt:` ask for. The default is
+/// a release build at the default level, as `temen-link` links with neither.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Build {
+    /// A **debug build** keeps the units' debug info. A **release build** drops it, so no engine pays
+    /// for it (#2186): nim code carries none, but the prebuilt libc carries its own, for a debugger to
+    /// step into, and the Cranelift JIT captures every explicit trap's backtrace in a module that has
+    /// any.
+    pub debug: bool,
+    /// How hard the link optimizes the program: `--opt:speed` for a program whose hot loops call
+    /// small procs, at a cost in size and compile time (#2816).
+    pub opt: LinkOpt,
+}
+
+pub use temen_opt::LinkOpt;
 
 /// The order a nim program's modules link in: the `system` module first, then the rest by stem. A
 /// program is a set of modules, so whichever order a caller lists them in — a build plan's, a
@@ -2358,7 +2371,7 @@ fn posix_runtime(
     Ok(out)
 }
 
-/// **`temen-link -o:<out.temen> [-g] [--edge:posix|caps] [--libc:<path>] <main.c.nif> <dep.c.nif>... [<lib.temeno>...]`**,
+/// **`temen-link -o:<out.temen> [-g] [--opt:speed] [--edge:posix|caps] [--libc:<path>] <main.c.nif> <dep.c.nif>... [<lib.temeno>...]`**,
 /// the command nimony's Temen backend plans after dead-code elimination (#1609): link a program's
 /// `.c.nif` modules with [`link_nim`], against the prebuilt guest libc (`/lib/temen/libc.temeno`
 /// unless `--libc:` names another; linked without one if it is absent), and write the encoded module.
@@ -2366,7 +2379,9 @@ fn posix_runtime(
 /// how a `{.link.}` pragma names one, which nimony passes after the modules, as a C build does a
 /// static library. The program links on the POSIX edge, over `personality`'s ops, unless
 /// `--edge:caps` asks for the capability edge ([`Edge`]); nimony's own build links on POSIX. A
-/// release build unless `-g` asks for a debug build, as `cc -g` does.
+/// release build unless `-g` asks for a debug build, as `cc -g` does, at the default level unless
+/// `--opt:speed` asks for a speed link ([`Build`]). nimony's own build does not ask for one, so its
+/// tools link at the default level, for their compile time.
 ///
 /// It reaches files only through `read` and `write`. The in-guest `temen-link` passes the
 /// personality's file ops; an embedder that serves the command natively passes its filesystem. Either
@@ -2382,7 +2397,7 @@ pub fn link_command(
 ) -> i32 {
     let mut out = None;
     let mut libc_path = "/lib/temen/libc.temeno";
-    let mut debug = false;
+    let mut build = Build::default();
     let mut edge = Edge::Posix(personality);
     let mut inputs = Vec::new();
     for &a in args {
@@ -2391,7 +2406,12 @@ pub fn link_command(
         } else if let Some(l) = a.strip_prefix("--libc:") {
             libc_path = l;
         } else if a == "-g" {
-            debug = true;
+            build.debug = true;
+        } else if let Some(o) = a.strip_prefix("--opt:") {
+            build.opt = match o {
+                "speed" => LinkOpt::Speed,
+                _ => return 1,
+            };
         } else if let Some(e) = a.strip_prefix("--edge:") {
             edge = match e {
                 "posix" => Edge::Posix(personality),
@@ -2424,7 +2444,7 @@ pub fn link_command(
         .collect();
     let libs: Vec<&[u8]> = libs.iter().map(Vec::as_slice).collect();
     let libc = read(libc_path);
-    let Ok(module) = link_nim(&units, edge, libc.as_deref(), &libs, debug) else {
+    let Ok(module) = link_nim(&units, edge, libc.as_deref(), &libs, build) else {
         return 3;
     };
     if !write(out, &temen_encode::encode_module(&module)) {

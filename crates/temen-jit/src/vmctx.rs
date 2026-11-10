@@ -103,6 +103,10 @@ pub struct VmCtx {
     /// which read them here rather than take them from the code. Never read by compiled code, so
     /// it sits past every field the code loads, which keep their short offsets.
     window: Window,
+    /// #2319 — the `call.cap` thunk's own state on this context, opaque to the JIT
+    /// ([`Self::thunk_state`]): made by the thunk's first call, dropped with the context. Never read
+    /// by compiled code.
+    thunk_state: std::sync::OnceLock<Box<dyn core::any::Any + Send + Sync>>,
 }
 
 /// The per-instance addresses a [`VmCtx`] is filled from — everything but the trap cell, which each
@@ -208,6 +212,7 @@ impl VmCtx {
             pages: a.pages,
             window: w,
             owned_end: Some(owned_end),
+            thunk_state: std::sync::OnceLock::new(),
         }
     }
 
@@ -230,6 +235,7 @@ impl VmCtx {
             pages: self.pages,
             window: self.window,
             owned_end: None,
+            thunk_state: std::sync::OnceLock::new(),
         }
     }
 
@@ -260,6 +266,19 @@ impl VmCtx {
         let _ = self
             .trap
             .compare_exchange(0, end, Ordering::Relaxed, Ordering::Relaxed);
+    }
+
+    /// #2319 — the `call.cap` thunk's state on this context, made by `init` on the first call that
+    /// asks: what a thunk keeps from one call to the next (temen-run's view of the run's window), so
+    /// a call need not build it again. Each context has its own, and none outlives its context.
+    /// `None` when a state of another type is already here.
+    pub fn thunk_state<T: core::any::Any + Send + Sync>(
+        &self,
+        init: impl FnOnce() -> T,
+    ) -> Option<&T> {
+        self.thunk_state
+            .get_or_init(|| Box::new(init()))
+            .downcast_ref()
     }
 
     /// The code that ended this context's domain, or `None` while it runs.

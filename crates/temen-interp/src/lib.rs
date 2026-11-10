@@ -14370,6 +14370,29 @@ impl ParkTransients {
         }
     }
 
+    /// #2319 — the dispatch left no transient: nothing to wake, nothing to park on, nothing to
+    /// serve. Most calls; an engine that checks this first skips its park decision.
+    pub fn is_empty(&self) -> bool {
+        let ParkTransients {
+            wake_readers,
+            wake_writers,
+            wake_region,
+            read_park,
+            write_park,
+            request,
+            spawn,
+            sig_intr,
+        } = self;
+        wake_readers.is_none()
+            && wake_writers.is_none()
+            && wake_region.is_none()
+            && read_park.is_none()
+            && write_park.is_none()
+            && request.is_none()
+            && spawn.is_none()
+            && !sig_intr
+    }
+
     /// Wake whoever this dispatch made runnable. **Always before the park decision**: every park
     /// arm returns, so a wake fired after one is a wake never fired — the `call.sym` bug this
     /// consolidation removes.
@@ -27904,7 +27927,15 @@ impl Host {
     /// never leak into a later call's park decision (the `take_stdin_parked` precedent).
     /// Cell encoding: `0` = none, [`u64::MAX`] = [`ParkEvent::ForkSelf`], `u64::MAX - 1` =
     /// [`ParkEvent::TaskExitAny`], else the [`ParkEvent::TaskExit`] task id.
+    ///
+    /// #2319 — a plain load comes first: almost no dispatch raises a request, and the swap is a
+    /// full barrier, about 9 ns on every call. Only the personality's own ops store to the cell
+    /// (`waitpid`, `fork`, `execve`, `posix_spawn`, through [`SignalSource::set_park_request`]), and
+    /// they run inside the dispatch, on this thread, so the load sees any request they raised.
     pub fn take_park_request(&self) -> Option<ParkEvent> {
+        if self.park_request.load(Ordering::Relaxed) == 0 {
+            return None;
+        }
         ParkEvent::decode(self.park_request.swap(0, Ordering::SeqCst))
     }
 
@@ -28838,6 +28869,15 @@ impl Host {
                 self.cap_shadow = ShadowArena::EMPTY;
                 m
             }
+        }
+    }
+
+    /// #2319 — the page map [`Host::cap_window_pages`] hands out for JIT window `base`, if this host
+    /// holds one for that window already: what a kept view of the window checks it still shares.
+    pub fn cap_window_pages_held(&self, base: usize) -> Option<&CapPageMap> {
+        match &self.cap_pages {
+            Some((b, m)) if *b == base => Some(m),
+            _ => None,
         }
     }
 
@@ -31496,6 +31536,12 @@ impl Host {
     /// #2164 — a demand-paged Cranelift JIT child's window ([`JitPaging`]).
     pub fn jit_paging(&self) -> Option<JitPaging> {
         self.jit_paging.clone()
+    }
+
+    /// #2319 — the access table of [`Host::jit_paging`], borrowed rather than shared: what a kept
+    /// view of the window checks it still writes.
+    pub fn jit_paging_table(&self) -> Option<&Arc<[AtomicU8]>> {
+        self.jit_paging.as_ref().map(|p| &p.table)
     }
 
     /// Take a served dispatch's reply (INVARIANTS #8): the handler's results, or the transport's
