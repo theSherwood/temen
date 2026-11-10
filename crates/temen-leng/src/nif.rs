@@ -86,6 +86,8 @@ pub fn nif_text(bytes: &[u8]) -> std::borrow::Cow<'_, str> {
 /// hexer's dead-code analysis, `(dce (roots …) (uses …) (offers …))`, is dropped too: hexer writes
 /// it as the first statement of a module's `.x.nif` for nimony's own DCE pass (`dce1.nim`), and it
 /// is not code. Dropping it here keeps every pass from having to skip it.
+///
+/// A dereference of an address, `(deref (haddr x))`, is read as `x` itself ([`fold_deref_of_addr`]).
 pub fn parse(src: &str) -> Result<Node, String> {
     let mut root = parse_document(src)?;
     if let Node::List(items) = &mut root {
@@ -93,7 +95,32 @@ pub fn parse(src: &str) -> Result<Node, String> {
             items.retain(|n| n.tag() != Some("dce"));
         }
     }
+    fold_deref_of_addr(&mut root);
     Ok(root)
+}
+
+/// Rewrites `(deref (haddr x))` to `x`, and the same with `addr` or `hderef`: dereferencing an
+/// lvalue's address is the lvalue (#2685). nimony's inliner splices `inc(x: var T)` and its kin in
+/// as `x[] = x[] + 1` over the local's hidden address, so every loop counter and `+=` on a local
+/// arrives this way. Read as a taken address, it put the local in the frame, a load and a store at
+/// every use; folded, the local stays an SSA slot.
+fn fold_deref_of_addr(node: &mut Node) {
+    let Node::List(items) = node else { return };
+    for child in items.iter_mut() {
+        fold_deref_of_addr(child);
+    }
+    let folded = match items.as_slice() {
+        [Node::Atom(d), Node::List(inner)] if d == "deref" || d == "hderef" => {
+            match inner.as_slice() {
+                [Node::Atom(a), x] if a == "haddr" || a == "addr" => Some(x.clone()),
+                _ => None,
+            }
+        }
+        _ => None,
+    };
+    if let Some(x) = folded {
+        *node = x;
+    }
 }
 
 fn parse_document(src: &str) -> Result<Node, String> {

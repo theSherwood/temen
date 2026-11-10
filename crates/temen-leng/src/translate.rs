@@ -16,7 +16,9 @@
 //! **Address-taken locals live in a window frame.** A local whose address is taken (`(addr x)`) is
 //! demoted from an SSA slot to a byte offset in a per-call data-stack frame; the proc gains a
 //! leading `$sp` stack-pointer param (slot 0) and reads/writes it via `load`/`store` at `sp+off`,
-//! and a call to a frame-needing proc passes `sp + frame_size` as the callee's frame.
+//! and a call to a frame-needing proc passes `sp + frame_size` as the callee's frame. An address
+//! dereferenced where it is taken, `(deref (haddr x))`, is `x` itself and takes nothing: the
+//! parser folds it (`nif::parse`), which keeps loop counters and `+=` targets in slots (#2685).
 //!
 //! **Aggregates via `lvalue_addr` (the `gen_addr` model).** Named `(type … (object …))`/`(array …)`
 //! layouts are registered up front; `dot`/`at`/`pat`/`deref` and a frame/aggregate symbol all
