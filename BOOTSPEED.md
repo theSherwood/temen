@@ -33,8 +33,17 @@ game. Everything left (decode + verify + compile + boot) is ~2.6 s.
 Two caveats baked into the guest-boot number:
 - **~1.4 s assumes no WAL recovery.** A freshly `initdb`'d cluster that never shut down cleanly pays
   recovery on first boot; ship a data image that was booted once and shut down cleanly.
-- It runs on the **bytecode interpreter** (interpreter-first). A cold eager JIT of all ~15 k functions
-  is *slower* to first result, not faster — lazy-JIT only hot query functions if steady-state warrants.
+- It runs on the **bytecode interpreter** (interpreter-first). The Cranelift JIT is slower to first
+  result even compiling lazily. Boot from the cleanly shut-down cluster through `SELECT 1+1` to
+  shutdown, natively on 4 cores, translation excluded (2026-11-10, #2594):
+
+  | engine | functions compiled | time |
+  |---|--:|--:|
+  | bytecode interpreter | — | 0.43–0.52 s |
+  | Cranelift JIT, compiling at first calls (D76) | ~2 900 of 15 079 | 1.7–1.8 s |
+  | Cranelift JIT, compiling the whole module first | 15 079 | 3.7–4.0 s |
+
+  Of the lazy JIT's time, about 0.4 s is setup before the guest's first instruction (#2825).
 
 ## The wasm tax (the browser reality)
 
@@ -80,8 +89,10 @@ snapshot/restore of the post-boot state (deferred — see the levers above).
    + re-serializes it so load skips resolve too.
 2. **Ship a cleanly-shut-down data image.** No WAL recovery on boot. Trivial (boot once, shut down,
    snapshot the data dir).
-3. **Interpreter-first, lazy-JIT.** The interpreter starts instantly and boots in ~1.4 s; never cold-JIT
-   the whole module up front.
+3. **Interpreter-first.** The interpreter starts instantly and boots fastest: 0.47 s to `SELECT 1+1`
+   natively, against 1.75 s on the Cranelift JIT, which now compiles at first calls (D76), and 3.8 s
+   compiling the whole module first (the table above). Whether the JIT wins its start back over a long
+   session's queries is unmeasured.
 4. **Snapshot/restore the post-boot state (freeze/thaw) — optional.** Run to `backend>` once, freeze the
    guest, ship the frozen image, thaw to a ready backend — skips prep *and* boot. The measured ~4–5 s
    in-browser start says this is **not required to ship**; defer it unless a demo proves ~4–5 s too slow.

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Link the guest shims (os/libc/locale/time/proc/stdio) plus the bundled guest libm (openlibm) into
 # the cached whole-program Postgres bitcode, producing `postgres_shimmed.bc` — the module the boot
-# driver translates + runs. Run after build_bitcode.sh has produced `postgres_libm.bc`. See README
+# driver translates + runs. Run after build_bitcode.sh has produced `postgres.linked.bc`. See README
 # "Booting" for the driver.
 set -euo pipefail
 CACHE="${TEMEN_PG_CACHE:-/tmp/temen_pg_cache}"
@@ -61,6 +61,6 @@ for name in $OL_SRCS; do
   OL_BCS="$OL_BCS $CACHE/ol_$name.bc"
 done
 
-llvm-link "$CACHE/postgres_libm.bc" "$CACHE/pg_shims.bc" "$CACHE/strerror_shim.bc" $OL_BCS \
+llvm-link "$CACHE/postgres.linked.bc" "$CACHE/pg_shims.bc" "$CACHE/strerror_shim.bc" $OL_BCS \
   -o "$CACHE/postgres_shimmed.bc"
 echo "linked: $(stat -c%s "$CACHE/postgres_shimmed.bc") bytes -> $CACHE/postgres_shimmed.bc"
