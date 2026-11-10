@@ -95,93 +95,84 @@ static int gpu_cap(void) {
   return gpu__h;
 }
 
-/* Appends `n` bytes, or marks the stream overflowed. temen is little-endian, so a scalar's bytes are
- * its wire form; one bulk copy keeps a large upload cheap on every engine. */
-static void gpu__put(gpu_stream *s, const void *p, unsigned long n) {
-  if (s->overflow || n > s->cap - s->len) {
+/* The encoder's only code, kept out of line: a command is its record's C struct and one or a few
+ * calls. So a guest that issues many commands stays small, which is what the JIT compiles before a
+ * run (a guest encoding field by field was half as large again). temen is little-endian, so a
+ * struct's bytes are its wire form. */
+
+/* Appends `n` bytes and zeros to the next multiple of 8, or marks the stream overflowed. */
+__attribute__((noinline)) static void gpu__put(gpu_stream *s, const void *p, unsigned long n) {
+  unsigned long pad = (8 - n % 8) % 8;
+  if (s->overflow || n + pad > s->cap - s->len) {
     s->overflow = 1;
     return;
   }
   __builtin_memcpy(s->p + s->len, p, n);
-  s->len += n;
+  __builtin_memset(s->p + s->len + n, 0, pad);
+  s->len += n + pad;
 }
-static void gpu__u32(gpu_stream *s, unsigned v) { gpu__put(s, &v, 4); }
-static void gpu__u64(gpu_stream *s, unsigned long long v) { gpu__put(s, &v, 8); }
-static void gpu__f32(gpu_stream *s, float v) { gpu__put(s, &v, 4); }
-static void gpu__f64(gpu_stream *s, double v) { gpu__put(s, &v, 8); }
-static void gpu__pad(gpu_stream *s) {
-  static const unsigned char zero[8];
-  gpu__put(s, zero, (8 - s->len % 8) % 8);
+/* Opens a record: its header, with the size `gpu__close` patches in. */
+__attribute__((noinline)) static unsigned long gpu__open(gpu_stream *s, unsigned cmd) {
+  unsigned h[2] = {cmd, 0};
+  unsigned long at = s->len;
+  gpu__put(s, h, sizeof h);
+  return at;
 }
-static void gpu__bytes(gpu_stream *s, const void *p, unsigned long n) {
+__attribute__((noinline)) static void gpu__close(gpu_stream *s, unsigned long at) {
+  if (s->overflow) return;
+  unsigned size = (unsigned)(s->len - at - 8);
+  __builtin_memcpy(s->p + at + 4, &size, 4);
+}
+/* A record that is one fixed part, the most of them. */
+__attribute__((noinline)) static void gpu__record(gpu_stream *s, unsigned cmd, const void *p,
+                                                  unsigned long n) {
+  unsigned long at = gpu__open(s, cmd);
   gpu__put(s, p, n);
-  gpu__pad(s);
+  gpu__close(s, at);
 }
 static unsigned long gpu__strlen(const char *z) {
   unsigned long n = 0;
   while (z[n]) n++;
   return n;
 }
-/* Opens a record: its header, with the size patched in by `gpu__close`. */
-static unsigned long gpu__open(gpu_stream *s, unsigned cmd) {
-  unsigned long at = s->len;
-  gpu__u32(s, cmd);
-  gpu__u32(s, 0);
-  return at;
-}
-static void gpu__close(gpu_stream *s, unsigned long at) {
-  if (s->overflow) return;
-  unsigned size = (unsigned)(s->len - at - 8);
-  for (int i = 0; i < 4; i++) s->p[at + 4 + i] = (unsigned char)(size >> (8 * i));
-}
 
 /* --- Objects --- */
 
 static void gpu_create_buffer(gpu_stream *s, unsigned id, unsigned long long size, unsigned usage) {
-  unsigned long at = gpu__open(s, 1);
-  gpu__u32(s, id);
-  gpu__u32(s, usage);
-  gpu__u64(s, size);
-  gpu__close(s, at);
+  struct { unsigned id, usage; unsigned long long size; } r = {id, usage, size};
+  gpu__record(s, 1, &r, sizeof r);
 }
 
 /* A 2D texture of one mip and one sample, which is what most guests want. */
 static void gpu_create_texture(gpu_stream *s, unsigned id, unsigned width, unsigned height,
                                unsigned format, unsigned usage) {
-  unsigned long at = gpu__open(s, 2);
-  unsigned v[10] = {id, format, usage, GPU_DIM_2D, width, height, 1, 1, 1, 0};
-  for (int i = 0; i < 10; i++) gpu__u32(s, v[i]);
-  gpu__close(s, at);
+  unsigned r[10] = {id, format, usage, GPU_DIM_2D, width, height, 1, 1, 1, 0};
+  gpu__record(s, 2, r, sizeof r);
 }
 
 static void gpu_create_view(gpu_stream *s, unsigned id, unsigned texture) {
-  unsigned long at = gpu__open(s, 3);
-  gpu__u32(s, id);
-  gpu__u32(s, texture);
-  gpu__close(s, at);
+  unsigned r[2] = {id, texture};
+  gpu__record(s, 3, r, sizeof r);
 }
 
 /* A sampler that clamps to the edge, with one filter for magnifying and minifying. */
 static void gpu_create_sampler(gpu_stream *s, unsigned id, unsigned filter) {
-  unsigned long at = gpu__open(s, 4);
-  unsigned v[9] = {id, GPU_CLAMP_TO_EDGE, GPU_CLAMP_TO_EDGE, GPU_CLAMP_TO_EDGE,
-                   filter, filter, GPU_NEAREST, 0, 1};
-  for (int i = 0; i < 9; i++) gpu__u32(s, v[i]);
-  gpu__f32(s, 0.0f);
-  gpu__f32(s, 32.0f);
-  gpu__u32(s, 0);
-  gpu__close(s, at);
+  struct { unsigned v[9]; float lod_min, lod_max; unsigned pad; } r = {
+      {id, GPU_CLAMP_TO_EDGE, GPU_CLAMP_TO_EDGE, GPU_CLAMP_TO_EDGE, filter, filter, GPU_NEAREST, 0, 1},
+      0.0f, 32.0f, 0};
+  gpu__record(s, 4, &r, sizeof r);
 }
 
 static void gpu_create_shader_module(gpu_stream *s, unsigned id, const char *wgsl) {
   unsigned long n = gpu__strlen(wgsl);
+  unsigned r[2] = {id, (unsigned)n};
   unsigned long at = gpu__open(s, 5);
-  gpu__u32(s, id);
-  gpu__u32(s, (unsigned)n);
-  gpu__bytes(s, wgsl, n);
+  gpu__put(s, r, sizeof r);
+  gpu__put(s, wgsl, n);
   gpu__close(s, at);
 }
 
+/* An attribute is laid out as the wire's `{format, location, u64 offset}`. */
 typedef struct {
   unsigned format, location;
   unsigned long long offset;
@@ -215,30 +206,26 @@ typedef struct {
 
 static void gpu_create_render_pipeline(gpu_stream *s, const gpu_render_pipeline *p) {
   unsigned long vn = gpu__strlen(p->vertex), fn = gpu__strlen(p->fragment);
-  unsigned long at = gpu__open(s, 6);
   unsigned v[12] = {p->id, p->module, p->topology, p->strip_index_format, p->front_face, p->cull,
                     p->samples, p->n_buffers, p->n_targets, (unsigned)vn, (unsigned)fn, 0};
-  for (int i = 0; i < 12; i++) gpu__u32(s, v[i]);
-  gpu__bytes(s, p->vertex, vn);
-  gpu__bytes(s, p->fragment, fn);
-  for (unsigned b = 0; b < p->n_buffers; b++) {
-    const gpu_vertex_buffer *vb = &p->buffers[b];
-    gpu__u64(s, vb->stride);
-    gpu__u32(s, vb->step);
-    gpu__u32(s, vb->n_attributes);
-    for (unsigned a = 0; a < vb->n_attributes; a++) {
-      gpu__u32(s, vb->attributes[a].format);
-      gpu__u32(s, vb->attributes[a].location);
-      gpu__u64(s, vb->attributes[a].offset);
-    }
+  unsigned long at = gpu__open(s, 6);
+  gpu__put(s, v, sizeof v);
+  gpu__put(s, p->vertex, vn);
+  gpu__put(s, p->fragment, fn);
+  for (unsigned i = 0; i < p->n_buffers; i++) {
+    const gpu_vertex_buffer *vb = &p->buffers[i];
+    struct { unsigned long long stride; unsigned step, n; } b = {vb->stride, vb->step,
+                                                               vb->n_attributes};
+    gpu__put(s, &b, sizeof b);
+    gpu__put(s, vb->attributes, vb->n_attributes * sizeof(gpu_attribute));
   }
-  for (unsigned t = 0; t < p->n_targets; t++) {
-    const gpu_target *g = &p->targets[t];
+  for (unsigned i = 0; i < p->n_targets; i++) {
+    const gpu_target *g = &p->targets[i];
     unsigned on = g->blend ? 1 : 0;
     unsigned w[10] = {g->format, g->write_mask, on,
                       on ? g->color.src : 0, on ? g->color.dst : 0, on ? g->color.op : 0,
                       on ? g->alpha.src : 0, on ? g->alpha.dst : 0, on ? g->alpha.op : 0, 0};
-    for (int i = 0; i < 10; i++) gpu__u32(s, w[i]);
+    gpu__put(s, w, sizeof w);
   }
   gpu__close(s, at);
 }
@@ -246,23 +233,17 @@ static void gpu_create_render_pipeline(gpu_stream *s, const gpu_render_pipeline 
 static void gpu_create_compute_pipeline(gpu_stream *s, unsigned id, unsigned module,
                                         const char *entry) {
   unsigned long n = gpu__strlen(entry);
+  unsigned r[4] = {id, module, (unsigned)n, 0};
   unsigned long at = gpu__open(s, 7);
-  gpu__u32(s, id);
-  gpu__u32(s, module);
-  gpu__u32(s, (unsigned)n);
-  gpu__u32(s, 0);
-  gpu__bytes(s, entry, n);
+  gpu__put(s, r, sizeof r);
+  gpu__put(s, entry, n);
   gpu__close(s, at);
 }
 
 /* Names the layout `pipeline` has for its bind group `group` (WebGPU's "auto" layout). */
 static void gpu_bind_group_layout_of(gpu_stream *s, unsigned id, unsigned pipeline, unsigned group) {
-  unsigned long at = gpu__open(s, 8);
-  gpu__u32(s, id);
-  gpu__u32(s, pipeline);
-  gpu__u32(s, group);
-  gpu__u32(s, 0);
-  gpu__close(s, at);
+  unsigned r[4] = {id, pipeline, group, 0};
+  gpu__record(s, 8, r, sizeof r);
 }
 
 /* A bind group entry: a buffer range (a size of 0 is the rest), a sampler or a view. */
@@ -273,38 +254,32 @@ typedef struct {
 
 static void gpu_create_bind_group(gpu_stream *s, unsigned id, unsigned layout, unsigned n,
                                   const gpu_bind_entry *e) {
+  unsigned r[4] = {id, layout, n, 0};
   unsigned long at = gpu__open(s, 9);
-  gpu__u32(s, id);
-  gpu__u32(s, layout);
-  gpu__u32(s, n);
-  gpu__u32(s, 0);
+  gpu__put(s, r, sizeof r);
   for (unsigned i = 0; i < n; i++) {
-    gpu__u32(s, e[i].binding);
-    gpu__u32(s, e[i].kind);
-    gpu__u32(s, e[i].resource);
-    gpu__u32(s, 0);
-    gpu__u64(s, e[i].kind == GPU_BIND_BUFFER ? e[i].offset : 0);
-    gpu__u64(s, e[i].kind == GPU_BIND_BUFFER ? e[i].size : 0);
+    int buffer = e[i].kind == GPU_BIND_BUFFER;
+    struct { unsigned binding, kind, resource, pad; unsigned long long offset, size; } w = {
+        e[i].binding, e[i].kind, e[i].resource, 0, buffer ? e[i].offset : 0,
+        buffer ? e[i].size : 0};
+    gpu__put(s, &w, sizeof w);
   }
   gpu__close(s, at);
 }
 
 static void gpu_destroy(gpu_stream *s, unsigned id) {
-  unsigned long at = gpu__open(s, 29);
-  gpu__u32(s, id);
-  gpu__u32(s, 0);
-  gpu__close(s, at);
+  unsigned r[2] = {id, 0};
+  gpu__record(s, 29, r, sizeof r);
 }
 
 /* --- The queue --- */
 
 static void gpu_write_buffer(gpu_stream *s, unsigned buffer, unsigned long long offset,
                              const void *data, unsigned long n) {
+  struct { unsigned buffer, len; unsigned long long offset; } r = {buffer, (unsigned)n, offset};
   unsigned long at = gpu__open(s, 10);
-  gpu__u32(s, buffer);
-  gpu__u32(s, (unsigned)n);
-  gpu__u64(s, offset);
-  gpu__bytes(s, data, n);
+  gpu__put(s, &r, sizeof r);
+  gpu__put(s, data, n);
   gpu__close(s, at);
 }
 
@@ -312,10 +287,10 @@ static void gpu_write_buffer(gpu_stream *s, unsigned buffer, unsigned long long 
 static void gpu_write_texture(gpu_stream *s, unsigned texture, unsigned x, unsigned y,
                               unsigned width, unsigned height, unsigned bytes_per_row,
                               const void *data, unsigned long n) {
+  unsigned r[12] = {texture, 0, x, y, 0, width, height, 1, bytes_per_row, height, (unsigned)n, 0};
   unsigned long at = gpu__open(s, 11);
-  unsigned v[12] = {texture, 0, x, y, 0, width, height, 1, bytes_per_row, height, (unsigned)n, 0};
-  for (int i = 0; i < 12; i++) gpu__u32(s, v[i]);
-  gpu__bytes(s, data, n);
+  gpu__put(s, r, sizeof r);
+  gpu__put(s, data, n);
   gpu__close(s, at);
 }
 
@@ -323,139 +298,94 @@ static void gpu_write_texture(gpu_stream *s, unsigned texture, unsigned x, unsig
  * them. The buffer needs GPU_BUFFER_COPY_SRC, and the offset and size are multiples of 4. */
 static void gpu_readback(gpu_stream *s, unsigned buffer, unsigned long long offset,
                          unsigned long long size) {
-  unsigned long at = gpu__open(s, 26);
-  gpu__u32(s, buffer);
-  gpu__u32(s, 0);
-  gpu__u64(s, offset);
-  gpu__u64(s, size);
-  gpu__close(s, at);
+  struct { unsigned buffer, pad; unsigned long long offset, size; } r = {buffer, 0, offset, size};
+  gpu__record(s, 26, &r, sizeof r);
 }
 
 /* --- Passes --- */
 
+/* A colour attachment is laid out as the wire's `{view, resolve, load, store, f64 clear[4]}`. */
 typedef struct {
   unsigned view, resolve, load, store;
   double clear[4];
 } gpu_color_attachment;
 
 static void gpu_begin_render_pass(gpu_stream *s, unsigned n, const gpu_color_attachment *a) {
+  unsigned r[2] = {n, 0};
   unsigned long at = gpu__open(s, 12);
-  gpu__u32(s, n);
-  gpu__u32(s, 0);
-  for (unsigned i = 0; i < n; i++) {
-    gpu__u32(s, a[i].view);
-    gpu__u32(s, a[i].resolve);
-    gpu__u32(s, a[i].load);
-    gpu__u32(s, a[i].store);
-    for (int k = 0; k < 4; k++) gpu__f64(s, a[i].clear[k]);
-  }
+  gpu__put(s, r, sizeof r);
+  gpu__put(s, a, n * sizeof *a);
   gpu__close(s, at);
 }
 
-static void gpu_begin_compute_pass(gpu_stream *s) { gpu__close(s, gpu__open(s, 13)); }
+static void gpu_begin_compute_pass(gpu_stream *s) { gpu__record(s, 13, 0, 0); }
 
 static void gpu_set_pipeline(gpu_stream *s, unsigned pipeline) {
-  unsigned long at = gpu__open(s, 14);
-  gpu__u32(s, pipeline);
-  gpu__u32(s, 0);
-  gpu__close(s, at);
+  unsigned r[2] = {pipeline, 0};
+  gpu__record(s, 14, r, sizeof r);
 }
 
 static void gpu_set_bind_group(gpu_stream *s, unsigned index, unsigned group) {
-  unsigned long at = gpu__open(s, 15);
-  gpu__u32(s, index);
-  gpu__u32(s, group);
-  gpu__close(s, at);
+  unsigned r[2] = {index, group};
+  gpu__record(s, 15, r, sizeof r);
 }
 
 static void gpu_set_vertex_buffer(gpu_stream *s, unsigned slot, unsigned buffer,
                                   unsigned long long offset, unsigned long long size) {
-  unsigned long at = gpu__open(s, 16);
-  gpu__u32(s, slot);
-  gpu__u32(s, buffer);
-  gpu__u64(s, offset);
-  gpu__u64(s, size);
-  gpu__close(s, at);
+  struct { unsigned slot, buffer; unsigned long long offset, size; } r = {slot, buffer, offset, size};
+  gpu__record(s, 16, &r, sizeof r);
 }
 
 static void gpu_set_index_buffer(gpu_stream *s, unsigned buffer, unsigned format,
                                  unsigned long long offset, unsigned long long size) {
-  unsigned long at = gpu__open(s, 17);
-  gpu__u32(s, buffer);
-  gpu__u32(s, format);
-  gpu__u64(s, offset);
-  gpu__u64(s, size);
-  gpu__close(s, at);
+  struct { unsigned buffer, format; unsigned long long offset, size; } r = {buffer, format, offset,
+                                                                            size};
+  gpu__record(s, 17, &r, sizeof r);
 }
 
 static void gpu_set_scissor(gpu_stream *s, unsigned x, unsigned y, unsigned w, unsigned h) {
-  unsigned long at = gpu__open(s, 18);
-  gpu__u32(s, x);
-  gpu__u32(s, y);
-  gpu__u32(s, w);
-  gpu__u32(s, h);
-  gpu__close(s, at);
+  unsigned r[4] = {x, y, w, h};
+  gpu__record(s, 18, r, sizeof r);
 }
 
 static void gpu_draw(gpu_stream *s, unsigned vertices, unsigned instances, unsigned first_vertex,
                      unsigned first_instance) {
-  unsigned long at = gpu__open(s, 19);
-  gpu__u32(s, vertices);
-  gpu__u32(s, instances);
-  gpu__u32(s, first_vertex);
-  gpu__u32(s, first_instance);
-  gpu__close(s, at);
+  unsigned r[4] = {vertices, instances, first_vertex, first_instance};
+  gpu__record(s, 19, r, sizeof r);
 }
 
 static void gpu_draw_indexed(gpu_stream *s, unsigned indices, unsigned instances,
                              unsigned first_index, int base_vertex, unsigned first_instance) {
-  unsigned long at = gpu__open(s, 20);
-  gpu__u32(s, indices);
-  gpu__u32(s, instances);
-  gpu__u32(s, first_index);
-  gpu__u32(s, (unsigned)base_vertex);
-  gpu__u32(s, first_instance);
-  gpu__u32(s, 0);
-  gpu__close(s, at);
+  unsigned r[6] = {indices, instances, first_index, (unsigned)base_vertex, first_instance, 0};
+  gpu__record(s, 20, r, sizeof r);
 }
 
 static void gpu_dispatch(gpu_stream *s, unsigned x, unsigned y, unsigned z) {
-  unsigned long at = gpu__open(s, 21);
-  gpu__u32(s, x);
-  gpu__u32(s, y);
-  gpu__u32(s, z);
-  gpu__u32(s, 0);
-  gpu__close(s, at);
+  unsigned r[4] = {x, y, z, 0};
+  gpu__record(s, 21, r, sizeof r);
 }
 
-static void gpu_end_pass(gpu_stream *s) { gpu__close(s, gpu__open(s, 22)); }
+static void gpu_end_pass(gpu_stream *s) { gpu__record(s, 22, 0, 0); }
 
 /* --- Copies --- */
 
 static void gpu_copy_buffer_to_buffer(gpu_stream *s, unsigned src, unsigned long long src_offset,
                                       unsigned dst, unsigned long long dst_offset,
                                       unsigned long long size) {
-  unsigned long at = gpu__open(s, 23);
-  gpu__u32(s, src);
-  gpu__u32(s, dst);
-  gpu__u64(s, src_offset);
-  gpu__u64(s, dst_offset);
-  gpu__u64(s, size);
-  gpu__close(s, at);
+  struct { unsigned src, dst; unsigned long long src_offset, dst_offset, size; } r = {
+      src, dst, src_offset, dst_offset, size};
+  gpu__record(s, 23, &r, sizeof r);
 }
 
+/* A buffer copy `{buffer, bytes_per_row, rows_per_image, 0, u64 offset}`, a texture copy
+ * `{texture, mip, x, y, z, 0}` and an extent `{width, height, depth, 0}`, as the wire has them. */
 static void gpu__copy(gpu_stream *s, unsigned cmd, unsigned buffer, unsigned long long offset,
                       unsigned bytes_per_row, unsigned texture, unsigned x, unsigned y,
                       unsigned width, unsigned height) {
-  unsigned long at = gpu__open(s, cmd);
-  gpu__u32(s, buffer);
-  gpu__u32(s, bytes_per_row);
-  gpu__u32(s, height);
-  gpu__u32(s, 0);
-  gpu__u64(s, offset);
-  unsigned v[10] = {texture, 0, x, y, 0, 0, width, height, 1, 0};
-  for (int i = 0; i < 10; i++) gpu__u32(s, v[i]);
-  gpu__close(s, at);
+  struct { unsigned buffer, bytes_per_row, rows_per_image, pad; unsigned long long offset;
+           unsigned t[10]; } r = {buffer, bytes_per_row, height, 0, offset,
+                                  {texture, 0, x, y, 0, 0, width, height, 1, 0}};
+  gpu__record(s, cmd, &r, sizeof r);
 }
 
 /* Copies a `width` x `height` region of a 2D texture's first mip, at (x, y), to or from a buffer
@@ -475,18 +405,14 @@ static void gpu_copy_texture_to_buffer(gpu_stream *s, unsigned texture, unsigned
 
 /* The surface's texture for this frame as `texture`, and its view as `view`. */
 static void gpu_acquire(gpu_stream *s, unsigned texture, unsigned view) {
-  unsigned long at = gpu__open(s, 27);
-  gpu__u32(s, texture);
-  gpu__u32(s, view);
-  gpu__close(s, at);
+  unsigned r[2] = {texture, view};
+  gpu__record(s, 27, r, sizeof r);
 }
 
 /* Presents the acquired texture; its two ids are free again. */
 static void gpu_present(gpu_stream *s, unsigned texture, unsigned view) {
-  unsigned long at = gpu__open(s, 28);
-  gpu__u32(s, texture);
-  gpu__u32(s, view);
-  gpu__close(s, at);
+  unsigned r[2] = {texture, view};
+  gpu__record(s, 28, r, sizeof r);
 }
 
 /* --- The ops --- */
