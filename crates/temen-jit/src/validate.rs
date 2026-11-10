@@ -870,12 +870,18 @@ pub(crate) mod x86 {
             }
         }
 
-        /// The state block `i`'s out-states `out` give the edge to block `j`.
-        fn edge(&self, out: &Out, i: usize, j: usize) -> State {
+        /// The state block `i`'s out-states `out` give the edge to block `j`, or `None` for an edge
+        /// the branch never takes.
+        fn edge(&self, out: &Out, i: usize, j: usize) -> Option<State> {
+            let taken = (out.decided != Some(false)).then(|| out.taken.clone());
+            let fall = (out.decided != Some(true)).then(|| out.fall.clone());
             match self.jcc[i] {
-                Some((Some(t), f)) if t == j && f == Some(j) => out.taken.meet(&out.fall),
-                Some((Some(t), _)) if t == j => out.taken.clone(),
-                _ => out.fall.clone(),
+                Some((Some(t), f)) if t == j && f == Some(j) => match (taken, fall) {
+                    (Some(t), Some(f)) => Some(t.meet(&f)),
+                    (t, f) => t.or(f),
+                },
+                Some((Some(t), _)) if t == j => taken,
+                _ => fall,
             }
         }
     }
@@ -1150,8 +1156,7 @@ pub(crate) mod x86 {
             for i in 0..nb {
                 let mut cur = (i == 0).then(|| State::entry(ctx.frame));
                 for &p in &preds[i] {
-                    if let Some(po) = &out_st[p] {
-                        let e = cfg.edge(po, p, i);
+                    if let Some(e) = out_st[p].as_ref().and_then(|po| cfg.edge(po, p, i)) {
                         cur = Some(match cur {
                             None => e,
                             Some(s) => s.meet(&e),
@@ -1224,7 +1229,10 @@ pub(crate) mod x86 {
                 }
             }
             for &j in &cfg.succs[i] {
-                let e = cfg.edge(&out, i, j);
+                // An edge the branch never takes constrains nothing: no run follows it.
+                let Some(e) = cfg.edge(&out, i, j) else {
+                    continue;
+                };
                 if !states[j].as_ref().is_some_and(|sj| implies(&e, sj)) {
                     findings.push(Finding {
                         at: cfg.leaders[j],
@@ -1489,6 +1497,26 @@ pub(crate) mod x86 {
         konst: Option<u64>,
     }
 
+    impl Cmp {
+        /// Whether the `jcc` condition `cc` holds after this compare, when both compared values are
+        /// known: then it holds, or doesn't, on every run, and the other edge is never taken (#2811).
+        /// Only the unsigned and equality conditions (`b`/`ae`/`e`/`ne`/`be`/`a`), which compare the
+        /// two values as unsigned `w`-byte integers (CF is `lhs < rhs`, ZF `lhs == rhs`). A
+        /// `test r, r` sets those two flags as `cmp r, 0` does.
+        fn decide(&self, cc: u8) -> Option<bool> {
+            let (a, b) = (self.lhs.konst?, self.rhs.konst?);
+            match cc {
+                0x2 => Some(a < b),
+                0x3 => Some(a >= b),
+                0x4 => Some(a == b),
+                0x5 => Some(a != b),
+                0x6 => Some(a <= b),
+                0x7 => Some(a > b),
+                _ => None,
+            }
+        }
+    }
+
     /// The fact `cmovcc dst, src` (width `w`, condition `cc`) leaves in `dst`, given the compare whose
     /// flags it tests (#2603 holes 2–4). The result is `dst`'s old value or `src`'s. It is `Confined`
     /// when one of the two is a constant (the guard) and the other is the compared value `v` plus a
@@ -1635,10 +1663,11 @@ pub(crate) mod x86 {
             // The constant operand `o` holds at width `w`: an immediate no relocation patches, a
             // register holding a constant, or the function's own unpatched rodata.
             let konst = |state: &State, o: Opnd, w: u8| {
-                let mask = if w == 8 {
-                    u64::MAX
-                } else {
-                    u64::from(u32::MAX)
+                let mask = match w {
+                    1 => 0xff,
+                    2 => 0xffff,
+                    4 => u64::from(u32::MAX),
+                    _ => u64::MAX,
                 };
                 match o {
                     Opnd::Reg(r) => match fact(state, r) {
@@ -1662,9 +1691,11 @@ pub(crate) mod x86 {
             };
             match d.eff {
                 Eff::Cmp { w, lhs, rhs } => {
+                    // A byte compare says nothing of the register beyond its low byte, so it names
+                    // no value for a refinement or a `cmov` to bound; only its constants count.
                     let side = |o: Opnd| Side {
                         sym: match o {
-                            Opnd::Reg(r) => Some(sym_of(r)),
+                            Opnd::Reg(r) if w >= 4 => Some(sym_of(r)),
                             _ => None,
                         },
                         konst: konst(&state, o, w),
@@ -2093,7 +2124,11 @@ pub(crate) mod x86 {
                 if let Some((on_taken, bound)) = plan {
                     let edge = if on_taken { &mut taken } else { &mut fall };
                     for (fa, &sy) in edge.regs.iter_mut().zip(&sym) {
-                        if sy == s {
+                        // A narrower compare bounds only the bits it compares, so it bounds the
+                        // register only when they are all of it: a 32-bit one, below `2^32`.
+                        let bits = 8 * u32::from(f.w);
+                        let whole = bits >= 64 || max_value(*fa).is_some_and(|m| m >> bits == 0);
+                        if sy == s && whole {
                             // Refine only an integer-like fact: a `Bounded` tightens to the min, and
                             // an unconfined/`Confined` value becomes `[0, bound)`. A pointer, `Const`,
                             // stack or table fact is left unchanged (sound — the refinement only adds
@@ -2108,15 +2143,30 @@ pub(crate) mod x86 {
                 }
             }
         }
-        Out { taken, fall }
+        // A branch on two known values goes one way on every run (#2811). Cranelift keeps the `brif`
+        // of a condition its optimizer folds to a constant (`xor ecx, ecx; test cl, cl; jne`), and
+        // the edge it never takes can lead to code the policy would reject, such as a demand-paged
+        // check's table read for an offset past the window.
+        let decided = match (term, flags) {
+            (Some(Kind::DirectJcc { cc, .. }), Some(f)) => f.decide(cc),
+            _ => None,
+        };
+        Out {
+            taken,
+            fall,
+            decided,
+        }
     }
 
     /// A block's out-states: `taken` on the edge a terminating `jcc` takes, `fall` on every other.
-    /// They differ only where the branch proves something (a fn-table type check).
+    /// They differ only where the branch proves something (a fn-table type check, a bound). When the
+    /// state decides the branch, `decided` says which way it goes, and the other edge carries no
+    /// state: a block only it reaches is dead, as a block nothing reaches is.
     #[derive(Clone, PartialEq, Eq)]
     struct Out {
         taken: State,
         fall: State,
+        decided: Option<bool>,
     }
 
     /// The record `mov r32, [m]` reads the type id of, if `m` is a record's first field: the value
@@ -3044,6 +3094,9 @@ pub(crate) mod x86 {
         AluRegRm(Option<Alu>),
         /// `test r/m, reg` (`85`).
         Test,
+        /// `test r/m8, r8` (`84`), the low byte of a register 4–7 when `false`, `ah`–`bh` when `true`
+        /// (no REX).
+        TestByte(bool),
         /// `movsxd reg, r/m32` (`63`).
         Movsxd,
         /// `movzx reg, r/m` from a source of this many bytes; `true` when a byte source register
@@ -3158,6 +3211,18 @@ pub(crate) mod x86 {
                     lhs: Opnd::Reg(r),
                     rhs: Opnd::Imm(0),
                 },
+                _ => Eff::NoGp,
+            },
+            // `test r8, r8` as a byte `cmp r8, 0`, so a branch on a known byte is decided (#2811);
+            // `ah`–`bh` are bits 8–15, not the low byte the compare would read.
+            I::TestByte(high) => match (rm, reg, mem) {
+                (Some(r), Some(s), false) if r == s && !(high && (4..=7).contains(&r)) => {
+                    Eff::Cmp {
+                        w: 1,
+                        lhs: Opnd::Reg(r),
+                        rhs: Opnd::Imm(0),
+                    }
+                }
                 _ => Eff::NoGp,
             },
             I::Setcc(high) => match (rm, mem) {
@@ -3469,6 +3534,16 @@ pub(crate) mod x86 {
             };
             let w = if byte { 1 } else { p.osz() };
             let d = finish_modrm(c, start, p, 0, Normal, intent)?.width(w);
+            // `xor r, r` zeroes the register whatever it held, at 32 or 64 bits: the idiom Cranelift
+            // materializes 0 with, which a decided branch reads (#2811).
+            let ops = d.operands;
+            let d = match (op & 0xF8, ops.reg, ops.rm_reg, ops.mem) {
+                (0x30, Some(a), Some(b), None) if a == b && !byte && p.osz() >= 4 => Decoded {
+                    eff: Eff::MovImm { dst: a, imm: 0 },
+                    ..d
+                },
+                _ => d,
+            };
             // A compare, and an op whose destination is its reg field, only read the r/m.
             return Some(if is_cmp || op & 0x02 != 0 {
                 d.reads()
@@ -3484,7 +3559,8 @@ pub(crate) mod x86 {
         };
         match op {
             // ModRM, no immediate.
-            0x84 => finish_modrm(c, start, p, 0, Normal, E::NoGp).map(|d| d.width(1).reads()), // test r/m8
+            0x84 => finish_modrm(c, start, p, 0, Normal, E::TestByte(!p.rex))
+                .map(|d| d.width(1).reads()), // test r/m8, r8
             0x85 => finish_modrm(c, start, p, 0, Normal, E::Test).map(|d| d.width(w).reads()),
             // The moves, `lea`, `xchg` and `pop` leave the flags (a register allocator's moves may sit
             // between a `cmp` and the `cmov` that tests it).
@@ -4415,6 +4491,11 @@ pub(crate) mod x86 {
                             // iced numbers the conditions from 1 (0 is "none").
                             assert_eq!(insn.condition_code() as u8, cc + 1, "{}", at("cmov cc"));
                         }
+                        // `xor r, r` is `mov r, 0`.
+                        Eff::MovImm { imm, .. } if insn.mnemonic() == Mnemonic::Xor => {
+                            assert_eq!(insn.op0_register(), insn.op1_register(), "{}", at("xor"));
+                            assert_eq!(imm, 0, "{}", at("xor"));
+                        }
                         Eff::MovImm { imm, .. } => {
                             assert_eq!(imm as u64, insn.immediate(1), "{}", at("mov immediate"));
                         }
@@ -5024,6 +5105,60 @@ pub(crate) mod x86 {
             assert!(has(&f, "unconfined index"), "{f:?}");
         }
 
+        /// A compare bounds only the bits it compares: `cmp eax, K; jae` proves `eax < K` on the
+        /// fall-through, which says nothing of `rax` while its upper half is unknown. A 64-bit compare,
+        /// or a 32-bit one of a register already below `2^32`, bounds the register.
+        #[test]
+        fn refine_a_compare_bounds_only_the_bits_it_compares() {
+            let guarded = |cmp: &[u8], pre: &[u8]| {
+                // pre; cmp …, 0x100; jae skip; mov rcx, [rdi + rax]; ret; skip: ret
+                [pre, cmp, &[0x73, 0x05, 0x48, 0x8b, 0x0c, 0x07, 0xc3, 0xc3]].concat()
+            };
+            let cmp32 = [0x3d, 0x00, 0x01, 0, 0]; // cmp eax, 0x100
+            let cmp64 = [0x48, 0x3d, 0x00, 0x01, 0, 0]; // cmp rax, 0x100
+            let f = findings(&guarded(&cmp32, &[]));
+            assert!(
+                has(&f, "unconfined index"),
+                "rax's upper half is unknown: {f:?}"
+            );
+            assert!(findings(&guarded(&cmp64, &[])).is_empty());
+            let zext = [0x89, 0xc0]; // mov eax, eax: rax < 2^32
+            let f = findings(&guarded(&cmp32, &zext));
+            assert!(f.is_empty(), "{f:?}");
+        }
+
+        /// #2811: Cranelift keeps the `brif` of a condition it folded to a constant, materialized as
+        /// `xor r, r` (or `mov r, 1`) and tested with `test r8, r8`. The branch goes one way on every
+        /// run, so the edge it never takes carries no state, and the code only that edge reaches (in
+        /// #2811 a page check's table read past the window) goes unchecked. `dead` is code the policy
+        /// rejects: a window access through an unconfined index.
+        #[test]
+        fn decided_branch_skips_the_edge_it_never_takes() {
+            const DEAD: [u8; 5] = [0x4a, 0x8b, 0x04, 0x07, 0xc3]; // mov rax, [rdi + r8]; ret
+            const TEST: [u8; 3] = [0x45, 0x84, 0xd2]; // test r10b, r10b
+            const RET: [u8; 1] = [0xc3];
+            let zero = [0x45, 0x31, 0xd2]; // xor r10d, r10d
+            let one = [0x41, 0xba, 1, 0, 0, 0]; // mov r10d, 1
+                                                // jne never taken: the target is dead. jne always taken: the fall-through is.
+            let never = [&zero[..], &TEST, &[0x75, 0x01], &RET, &DEAD].concat();
+            let always = [&one[..], &TEST, &[0x75, 0x05], &DEAD, &RET].concat();
+            for code in [&never, &always] {
+                let f = findings(code);
+                assert!(
+                    f.is_empty(),
+                    "a decided branch's dead edge was checked: {f:?}"
+                );
+            }
+            // Undecided (r10 unknown), both edges run, and the bad access is flagged.
+            let open = [&TEST[..], &[0x75, 0x01], &RET, &DEAD].concat();
+            assert!(has(&findings(&open), "unconfined index"));
+            // Without REX, `test dh, dh` reads bits 8–15 of rdx, not rsi's low byte, so a known esi
+            // decides nothing.
+            let esi = [0xbe, 1, 0, 0, 0]; // mov esi, 1
+            let high = [&esi[..], &[0x84, 0xf6, 0x75, 0x05], &DEAD, &RET].concat(); // test dh, dh
+            assert!(has(&findings(&high), "unconfined index"));
+        }
+
         /// A memory access whose base register has no recognized provenance (here `r9`, a guest
         /// argument) is flagged — it is neither the window, the stack, vmctx, the fn-table, nor rodata.
         #[test]
@@ -5130,14 +5265,16 @@ pub(crate) mod x86 {
         /// Cranelift lays the in-range `br_table`/array code. The validator refines that edge (the
         /// mirror of the `jb`-taken refinement), so a window access through the bounded index on the
         /// fall-through is confined. Without the `jae` refinement the index is `Unknown` and flagged.
+        /// The compare is 32-bit, so it bounds `r8` only because `r8` is already below `2^32`.
         #[test]
         fn policy_a_jae_bounds_the_fall_through_index() {
             let bytes = [
-                0x41, 0x83, 0xf8, 0x40, // [00] cmp r8d, 0x40
-                0x0f, 0x83, 0x05, 0, 0, 0, // [04] jae +5 (→ 0x0f)
-                0x42, 0x8b, 0x04, 0x87, // [0a] mov eax, [rdi + r8*4]   (fall: r8 < 0x40)
-                0xc3, // [0e] ret
-                0xc3, // [0f] ret  (jae target: out of range)
+                0x45, 0x89, 0xc0, // [00] mov r8d, r8d   (r8 < 2^32)
+                0x41, 0x83, 0xf8, 0x40, // [03] cmp r8d, 0x40
+                0x0f, 0x83, 0x05, 0, 0, 0, // [07] jae +5 (→ 0x12)
+                0x42, 0x8b, 0x04, 0x87, // [0d] mov eax, [rdi + r8*4]   (fall: r8 < 0x40)
+                0xc3, // [11] ret
+                0xc3, // [12] ret  (jae target: out of range)
             ];
             assert!(
                 findings(&bytes).is_empty(),
