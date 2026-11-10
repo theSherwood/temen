@@ -426,6 +426,13 @@ pub enum Parks {
 /// A durable run's deferred children run first ([`Domain::drive_deferred_before_park`]): one of
 /// them may be what ends the park. The caller holds no lock the run's other vCPUs need.
 ///
+/// #2823 — `spin_until`: a wait whose answer often comes within microseconds (a live call's reply)
+/// watches `still_parked` until then before it blocks, giving its core up between looks, as a block
+/// and the cross-core wake that ends it take tens. Only where the park blocks the vCPU's thread in
+/// place, and only once it has given back what it holds (its handler gate, its lanes) and run a
+/// durable run's deferred children, so the watch holds nothing another could use. A park that frees
+/// its thread for other work (a fiber's, a task's) never watches.
+///
 /// # Safety
 /// `vm` is a live JIT call's instance context; `freeze` watches the run's live window.
 #[cfg(not(loom))]
@@ -434,15 +441,16 @@ pub unsafe fn park_host_call(
     freeze: Option<FreezeWatch>,
     key: u64,
     parks: Parks,
+    spin_until: Option<Instant>,
     still_parked: impl Fn() -> bool,
 ) -> HostPark {
     // #2742 — a serve handler's event park gives its window's gate back for the wait, and takes it
     // back after; a whole-vCPU park keeps it, as on the oracle, where it blocks the serving vCPU.
     let aside = match parks {
-        Parks::Fiber => crate::child_exec::handler_steps_aside(vm),
+        Parks::Fiber => crate::child_exec::handler_steps_aside(vm, false),
         Parks::Vcpu => None,
     };
-    let parked = park_host_call_here(vm, freeze, key, parks, still_parked);
+    let parked = park_host_call_here(vm, freeze, key, parks, spin_until, still_parked);
     if let Some(aside) = aside {
         if matches!(parked, HostPark::Woken | HostPark::Frozen)
             && !crate::child_exec::handler_steps_back(aside, vm)
@@ -463,6 +471,7 @@ unsafe fn park_host_call_here(
     freeze: Option<FreezeWatch>,
     key: u64,
     parks: Parks,
+    spin_until: Option<Instant>,
     still_parked: impl Fn() -> bool,
 ) -> HostPark {
     let frozen = || freeze.filter(|f| f.landed());
@@ -508,10 +517,18 @@ unsafe fn park_host_call_here(
     let lane = dom.lane_chain();
     dom.lane_give_back(&lane);
     let hub = dom.hub();
+    let ended = || epoch_fired(dom.env().epoch_addr) || vm.ended().is_some();
+    // #2823 — the watch, with everything given back: the wait below returns at once if the answer
+    // came meanwhile.
+    if let Some(until) = spin_until {
+        while still_parked() && frozen().is_none() && !ended() && Instant::now() < until {
+            std::thread::yield_now();
+        }
+    }
     let status = futex_wait(
         &hub.park,
         FutexKey::Host(key),
-        still_parked,
+        &still_parked,
         None,
         dom.env().epoch_addr,
         freeze,
@@ -519,7 +536,6 @@ unsafe fn park_host_call_here(
         || hub.peers_live(),
         || vm.ended().is_some(),
     );
-    let ended = || epoch_fired(dom.env().epoch_addr) || vm.ended().is_some();
     if !dom.lane_acquire(&lane, ended) || ended() {
         return HostPark::Ended;
     }
@@ -559,7 +575,7 @@ pub unsafe fn wait_outside<R>(
     wait: impl FnOnce(&dyn Fn() -> bool) -> Option<R>,
 ) -> Option<R> {
     // #2742 — a serve handler's wait gives its window's gate back meanwhile ([`park_host_call`]).
-    let aside = crate::child_exec::handler_steps_aside(vm);
+    let aside = crate::child_exec::handler_steps_aside(vm, false);
     let answer = wait_outside_here(vm, rouse, wait);
     if let Some(aside) = aside {
         if !crate::child_exec::handler_steps_back(aside, vm) {
@@ -3104,7 +3120,7 @@ pub(crate) unsafe extern "C" fn thread_wait(
 ) -> i32 {
     // #2742 — a serve handler's futex wait gives its window's gate back meanwhile, as an event park
     // does ([`park_host_call`]); one whose domain ended meanwhile unwinds.
-    let aside = crate::child_exec::handler_steps_aside(vm);
+    let aside = crate::child_exec::handler_steps_aside(vm, false);
     let status = thread_wait_here(vm, off, expected, width, timeout);
     if let Some(aside) = aside {
         if !crate::child_exec::handler_steps_back(aside, vm) {
