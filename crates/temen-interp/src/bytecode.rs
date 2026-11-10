@@ -130,36 +130,59 @@ pub fn callprof_op_snapshot() -> Vec<((u32, u32, u32), u64)> {
     callprof::op_snapshot()
 }
 
-/// Block-argument moves applied on a taken edge: `(src_slot, dst_slot)` pairs (frame-relative), with
-/// a precomputed `aliasing` flag. A **non-aliasing** edge — the common case (an induction variable /
-/// accumulator reads distinct value slots and writes the successor's param slots) — is applied by a
-/// single direct pass. An **aliasing** edge, where some destination slot is also read as a source (a
+/// A function's block-argument moves, per edge: the `(src_slot, dst_slot)` pairs (frame-relative) a
+/// taken edge applies, with a precomputed `aliasing` flag. A **non-aliasing** edge — the common
+/// case (an induction variable / accumulator reads distinct value slots and writes the successor's
+/// param slots) — is applied by a single direct pass. An **aliasing** edge, where some destination slot is also read as a source (a
 /// parallel move that permutes/swaps params), must gather into `scratch` then scatter, so a value
 /// isn't clobbered before it is read. Classifying once at compile time keeps the value off the hot
 /// path (the `scratch` `push`+read per copy is only paid where correctness needs it).
+///
+/// #2486 — a function's edges keep their copies here, and an op names its edge's by index, so a
+/// branch op stays small (`Op`'s size, below) and a function's edges take two allocations, not one
+/// each. Index 0 is the edge that copies nothing.
 #[derive(Clone)]
 struct Copies {
-    pairs: Box<[(u32, u32)]>,
-    aliasing: bool,
+    /// Per edge: where its pairs start in `pairs`, how many it has, and whether it aliases.
+    edges: Vec<(u32, u32, bool)>,
+    pairs: Vec<(u32, u32)>,
 }
 impl Copies {
-    /// Build from resolved `(src, dst)` pairs, classifying `aliasing` = some `dst` is also some `src`
-    /// (so a one-pass sequential copy could clobber a not-yet-read source). An edge can carry
-    /// hundreds of copies (#2447), so the sources are sorted and each `dst` searched for. They are
-    /// sorted in `srcs`, which the caller reuses across a function's edges (#2586).
-    fn new(pairs: &[(u32, u32)], srcs: &mut Vec<u32>) -> Copies {
+    fn new() -> Copies {
+        Copies {
+            edges: vec![(0, 0, false)],
+            pairs: Vec::new(),
+        }
+    }
+
+    /// Add an edge's resolved `(src, dst)` pairs and return its index, classifying `aliasing` = some
+    /// `dst` is also some `src` (so a one-pass sequential copy could clobber a not-yet-read source).
+    /// An edge can carry hundreds of copies (#2447), so the sources are sorted and each `dst` searched
+    /// for. They are sorted in `srcs`, which the caller reuses across a function's edges (#2586).
+    fn add(&mut self, pairs: &[(u32, u32)], srcs: &mut Vec<u32>) -> u32 {
+        if pairs.is_empty() {
+            return 0;
+        }
         srcs.clear();
         srcs.extend(pairs.iter().map(|&(s, _)| s));
         srcs.sort_unstable();
         let aliasing = pairs.iter().any(|&(_, d)| srcs.binary_search(&d).is_ok());
-        Copies {
-            pairs: pairs.into(),
-            aliasing,
-        }
+        self.edges
+            .push((self.pairs.len() as u32, pairs.len() as u32, aliasing));
+        self.pairs.extend_from_slice(pairs);
+        (self.edges.len() - 1) as u32
+    }
+
+    /// Edge `edge`'s pairs, and whether they alias.
+    #[inline]
+    fn get(&self, edge: u32) -> (&[(u32, u32)], bool) {
+        let (at, len, aliasing) = self.edges[edge as usize];
+        (&self.pairs[at as usize..][..len as usize], aliasing)
     }
 }
-/// A resolved branch edge: its arg copies plus the target op index (`pc`).
-type Edge = (Copies, u32);
+/// A resolved branch edge: its copies' index in the function's [`Copies`], and the target op index
+/// (`pc`).
+type Edge = (u32, u32);
 
 /// Which of the child lifecycle probes an [`Op::ChildCtl`] is (PROCESS.md S3, Instantiator ops
 /// 9/10/12).
@@ -332,14 +355,14 @@ enum Op {
         offset: u64,
     },
     Br {
-        copies: Copies,
+        copies: u32,
         target: u32,
     },
     BrIf {
         cond: u32,
-        then_copies: Copies,
+        then_copies: u32,
         then_pc: u32,
-        else_copies: Copies,
+        else_copies: u32,
         else_pc: u32,
     },
     /// Slice 5a superinstruction: a block-final `IntCmp` fused with the `BrIf` that is its sole
@@ -351,9 +374,9 @@ enum Op {
         b: u32,
         ty: IntTy,
         op: CmpOp,
-        then_copies: Copies,
+        then_copies: u32,
         then_pc: u32,
-        else_copies: Copies,
+        else_copies: u32,
         else_pc: u32,
     },
     /// [`Op::BrIfCmp`] fused from an [`Op::IntCmpImm`]: the compare's right operand is `imm`.
@@ -362,9 +385,9 @@ enum Op {
         imm: i64,
         ty: IntTy,
         op: CmpOp,
-        then_copies: Copies,
+        then_copies: u32,
         then_pc: u32,
-        else_copies: Copies,
+        else_copies: u32,
         else_pc: u32,
     },
     BrTable {
@@ -382,11 +405,8 @@ enum Op {
     /// resolved function's signature is checked against `want_params`/`want_results` (a forged or
     /// mistyped slot is an inert [`Trap::IndirectCallType`], matching [`super::dispatch_indirect`]).
     CallIndirect {
-        idx: u32,
-        args: Box<[u32]>,
+        call: Box<IndirectCall>,
         dst: u32,
-        want_params: Box<[ValType]>,
-        want_results: Box<[ValType]>,
     },
     /// Synchronous capability call (§3c) through the host powerbox — the guest is suspended, the
     /// host computes a result, and execution continues in the same activation (no scheduler/fiber).
@@ -395,18 +415,7 @@ enum Op {
     /// fall back to the tree-walker. Args/results cross as `i64` slots (the host-dispatch ABI);
     /// `results` carries `sig.results` so each returned slot is re-typed exactly as the tree-walker
     /// does.
-    CapCall {
-        type_id: u32,
-        op: u32,
-        handle: u32,
-        args: Box<[u32]>,
-        dst: u32,
-        /// The call's `sig.params` — carried so an **import-bound** call that resolves to a §22 `Jit`
-        /// driver op (`invoke`/`install`/`uninstall`) can be marshalled to the driver like a static
-        /// `call.cap (JIT, op)` (which lowers straight to [`Op::JitInvoke`]). Empty when unused.
-        params: Box<[ValType]>,
-        results: Box<[ValType]>,
-    },
+    CapCall(Box<CapCallOp>),
     /// §3.6 serve-loop core (ISSUES.md I36 slice 1): `svc.poll` (`call.cap CAP_SELF 9`) — drain
     /// the domain's inbound queue, running each servable dispatch as a **handler fiber** of the
     /// serving task (#2742, the tree-walk serve arm's shape): the driver starts it ([`serve`]),
@@ -605,14 +614,7 @@ enum Op {
     /// shared window/powerbox; its results land at `dst…`. `params`/`results` are the unit entry's
     /// expected signature (the `call.cap` sig minus the leading code-handle param), used to marshal
     /// args/results through the i64-slot ABI.
-    JitInvoke {
-        handle: u32,
-        code: u32,
-        args: Box<[u32]>,
-        dst: u32,
-        params: Box<[ValType]>,
-        results: Box<[ValType]>,
-    },
+    JitInvoke(Box<JitInvokeOp>),
     /// §GC `gc.roots(heap_lo, heap_hi, mask, buf, cap)`: conservative root enumeration. Escapes to
     /// the driver, which scans every live activation of the vCPU's continuation (the active window,
     /// its call stack, its resume-chain ancestors, parked fibers, and coroutines) for words that —
@@ -638,12 +640,7 @@ enum Op {
     },
     /// `return_call.dyn`: an indirect tail call — resolve through the runtime dispatch table
     /// (possibly cross-module), then reuse the current window like [`Op::TailCall`].
-    TailCallIndirect {
-        idx: u32,
-        args: Box<[u32]>,
-        want_params: Box<[ValType]>,
-        want_results: Box<[ValType]>,
-    },
+    TailCallIndirect(Box<IndirectCall>),
     Unreachable,
     /// A `CapFault` trap: an `Instantiator` call that isn't a live op at its contracted shape
     /// (`temen_ir::served_contract`), which the oracle refuses after the handle resolves (a
@@ -680,6 +677,48 @@ enum Op {
     },
 }
 
+// #2486 — the payloads of the ops a run seldom executes, boxed so that every op fits in half a
+// cache line (the assertion below); each is one call, which costs far more than the indirection.
+
+/// The operands of [`Op::CallIndirect`] and [`Op::TailCallIndirect`].
+#[derive(Clone)]
+struct IndirectCall {
+    idx: u32,
+    args: Box<[u32]>,
+    want_params: Box<[ValType]>,
+    want_results: Box<[ValType]>,
+}
+
+/// [`Op::CapCall`]'s operands.
+#[derive(Clone)]
+struct CapCallOp {
+    type_id: u32,
+    op: u32,
+    handle: u32,
+    args: Box<[u32]>,
+    dst: u32,
+    /// The call's `sig.params` — carried so an **import-bound** call that resolves to a §22 `Jit`
+    /// driver op (`invoke`/`install`/`uninstall`) can be marshalled to the driver like a static
+    /// `call.cap (JIT, op)` (which lowers straight to [`Op::JitInvoke`]). Empty when unused.
+    params: Box<[ValType]>,
+    results: Box<[ValType]>,
+}
+
+/// [`Op::JitInvoke`]'s operands.
+#[derive(Clone)]
+struct JitInvokeOp {
+    handle: u32,
+    code: u32,
+    args: Box<[u32]>,
+    dst: u32,
+    params: Box<[ValType]>,
+    results: Box<[ValType]>,
+}
+
+/// #2486 — every op fits in half a cache line: the loop reads one per dispatch, and at 72 bytes the
+/// dispatch's read of the op was two thirds of the loop's L1 misses.
+const _: () = assert!(std::mem::size_of::<Op>() <= 32);
+
 /// Marks a [`Program::src`] entry as a **terminator** op's location (OR-ed into the `inst` field).
 /// [`vm_trap_bt`] needs terminators distinguished from instructions: a trap at an instruction is
 /// reported one past it (the tree-walker's cursor advance), a trap at a terminator (`unreachable`,
@@ -700,6 +739,8 @@ struct Program {
     /// reports both, keeping the engine's step/breakpoint location trace identical to the
     /// tree-walker's [`crate::IrPc`] sequence op-for-op.
     src: Box<[Option<(u32, u32)>]>,
+    /// Its edges' copies, which its branch ops name by index (#2486).
+    copies: Copies,
 }
 
 thread_local! {
@@ -2572,10 +2613,10 @@ fn compile_func(f: &Func, view: &ModuleView<'_>, fuse: bool) -> Option<Program> 
             }
         }
     }
-    // An edge's copies are gathered in `pairs`, then boxed at their size: most edges carry one to
-    // three, which a vector grown per edge, shrunk to a box, and sorted in a copy of its own took
-    // three allocations to hold (#2586).
-    let (mut pairs, mut srcs) = (Vec::new(), Vec::new());
+    // An edge's copies are gathered in `pairs`, then added to the function's `copies`, which holds
+    // every edge's in one arena (#2486): most edges carry one to three, which a vector grown per
+    // edge, shrunk to a box, and sorted in a copy of its own took three allocations to hold (#2586).
+    let (mut pairs, mut srcs, mut copies) = (Vec::new(), Vec::new(), Copies::new());
     for (bi, b) in f.blocks.iter().enumerate() {
         block_pc[bi] = ops.len() as u32;
         // operand: block-local index -> frame slot
@@ -2613,7 +2654,7 @@ fn compile_func(f: &Func, view: &ModuleView<'_>, fuse: bool) -> Option<Program> 
             // and its removal can't affect the gather/scatter of the other (aliasing) copies. Applies
             // uniformly to every terminator's edges (Br/BrIf/BrIfCmp/BrTable), fused or not.
             pairs.retain(|(src, dst)| src != dst);
-            (Copies::new(&pairs, &mut srcs), bidx as u32) // block index; patched to entry pc below
+            (copies.add(&pairs, &mut srcs), bidx as u32) // block index; patched to entry pc below
         };
         match &b.term {
             Terminator::Br { target, args } => {
@@ -2640,8 +2681,9 @@ fn compile_func(f: &Func, view: &ModuleView<'_>, fuse: bool) -> Option<Program> 
                 let fusable = |dst: u32| {
                     dst == cond_slot
                         && !read_forwarded[cond_slot as usize]
-                        && !then_copies.pairs.iter().any(|(s, _)| *s == cond_slot)
-                        && !else_copies.pairs.iter().any(|(s, _)| *s == cond_slot)
+                        && ![then_copies, else_copies]
+                            .iter()
+                            .any(|&e| copies.get(e).0.iter().any(|(s, _)| *s == cond_slot))
                 };
                 let fused = match ops.last() {
                     Some(&Op::IntCmp { dst, a, b, ty, op }) if fuse && fusable(dst) => {
@@ -2714,12 +2756,14 @@ fn compile_func(f: &Func, view: &ModuleView<'_>, fuse: bool) -> Option<Program> 
                 callee: *func,
                 args: args.iter().map(|a| g(*a)).collect(),
             }),
-            Terminator::ReturnCallIndirect { ty, idx, args } => ops.push(Op::TailCallIndirect {
-                idx: g(*idx),
-                args: args.iter().map(|a| g(*a)).collect(),
-                want_params: view.sig(*ty).params.clone().into(),
-                want_results: view.sig(*ty).results.clone().into(),
-            }),
+            Terminator::ReturnCallIndirect { ty, idx, args } => {
+                ops.push(Op::TailCallIndirect(Box::new(IndirectCall {
+                    idx: g(*idx),
+                    args: args.iter().map(|a| g(*a)).collect(),
+                    want_params: view.sig(*ty).params.clone().into(),
+                    want_results: view.sig(*ty).results.clone().into(),
+                })))
+            }
         }
         // Exactly one terminator op was pushed above (fused `BrIfCmp` or a plain terminator); pair it
         // with the terminator source entry so `src` stays the same length as `ops`.
@@ -2764,6 +2808,7 @@ fn compile_func(f: &Func, view: &ModuleView<'_>, fuse: bool) -> Option<Program> 
         ops,
         nslots,
         src: src.into_boxed_slice(),
+        copies,
     })
 }
 
@@ -2983,11 +3028,13 @@ fn compile_inst(
         Inst::CallIndirect(c) => {
             let temen_ir::CallIndirect { ty, idx, args } = &**c;
             Op::CallIndirect {
-                idx: g(*idx),
-                args: args.iter().map(|a| g(*a)).collect(),
+                call: Box::new(IndirectCall {
+                    idx: g(*idx),
+                    args: args.iter().map(|a| g(*a)).collect(),
+                    want_params: view.sig(*ty).params.clone().into(),
+                    want_results: view.sig(*ty).results.clone().into(),
+                }),
                 dst,
-                want_params: view.sig(*ty).params.clone().into(),
-                want_results: view.sig(*ty).results.clone().into(),
             }
         }
         // Synchronous capability call: the generic powerbox path (guest suspended, host computes,
@@ -3094,7 +3141,7 @@ fn compile_inst(
                 sig,
                 args,
             } = &**c;
-            Op::CapCall {
+            Op::CapCall(Box::new(CapCallOp {
                 type_id: temen_ir::CAP_IMPORT_TYPE_ID,
                 // §3.5: the reserved import dispatch packs `(slot | consumer_op << 16)`.
                 op: *import | (*op << 16),
@@ -3103,7 +3150,7 @@ fn compile_inst(
                 args: args.iter().map(|a| g(*a)).collect(),
                 dst,
                 results: view.sig(*sig).results.clone().into(),
-            }
+            }))
         }
         // §7/§22 symbolic call: when bound at instantiation it is a flat import dispatch
         // (op 0); the legacy handle operand is a live register the dispatch ignores.
@@ -3111,7 +3158,7 @@ fn compile_inst(
             let temen_ir::CallSym {
                 import, sig, args, ..
             } = &**c;
-            Op::CapCall {
+            Op::CapCall(Box::new(CapCallOp {
                 type_id: temen_ir::CAP_IMPORT_TYPE_ID,
                 op: *import,
                 handle: u32::MAX,
@@ -3119,7 +3166,7 @@ fn compile_inst(
                 args: args.iter().map(|a| g(*a)).collect(),
                 dst,
                 results: view.sig(*sig).results.clone().into(),
-            }
+            }))
         }
         // §3.5 dynamic-mode dispatch by type-section reference: the reserved dyn entry packs
         // `(type_idx | op << 16)`; the handle register is live.
@@ -3131,7 +3178,7 @@ fn compile_inst(
                 handle,
                 args,
             } = &**c;
-            Op::CapCall {
+            Op::CapCall(Box::new(CapCallOp {
                 type_id: temen_ir::CAP_DYN_TYPE_ID,
                 op: *ty | (*op << 16),
                 handle: g(*handle),
@@ -3139,7 +3186,7 @@ fn compile_inst(
                 args: args.iter().map(|a| g(*a)).collect(),
                 dst,
                 results: view.sig(*sig).results.clone().into(),
-            }
+            }))
         }
         // §3.5 self-namespace extensions (see `Op::CapSelfExt`).
         Inst::ExportHandle { export } => Op::CapSelfExt {
@@ -3159,7 +3206,7 @@ fn compile_inst(
         },
         // Phase-2 `import.attach` (IMPORTS.md): the attach sentinel with the handle value as the
         // one argument — the same shared host entry as the tree-walker and the JIT.
-        Inst::ImportAttach { import, handle } => Op::CapCall {
+        Inst::ImportAttach { import, handle } => Op::CapCall(Box::new(CapCallOp {
             type_id: temen_ir::CAP_IMPORT_ATTACH_TYPE_ID,
             op: *import,
             handle: g(*handle),
@@ -3167,7 +3214,7 @@ fn compile_inst(
             args: [g(*handle)].into(),
             dst,
             results: [ValType::I32].into(),
-        },
+        })),
         // §12.8 4A.5: serviced from the running `Vm`'s region base (the reference `eval_inst` has no
         // context), so it gets a dedicated op rather than the `Eval` fallback.
         Inst::DurableShadowBase => Op::DurableShadowBase { dst },
@@ -3266,7 +3313,7 @@ fn lower_cap_call(
             slot: g(args[0]),
             dst,
         },
-        (cap_id::JIT, 1) if !args.is_empty() => Op::JitInvoke {
+        (cap_id::JIT, 1) if !args.is_empty() => Op::JitInvoke(Box::new(JitInvokeOp {
             handle: g(*handle),
             code: g(args[0]),
             args: args[1..].iter().map(|a| g(*a)).collect(),
@@ -3281,7 +3328,7 @@ fn lower_cap_call(
                 .to_vec()
                 .into(),
             results: view.sig(*sig).results.clone().into(),
-        },
+        })),
         // A live op this lowering has no arm for declines to the oracle.
         (cap_id::INSTANTIATOR, _) => return None,
         (cap_id::SHARED_REGION, 4) => return None,
@@ -3330,7 +3377,7 @@ fn lower_cap_call(
             dst,
         },
         // Generic synchronous powerbox dispatch (Stream/Clock/Memory/host-fn/JIT compile/…).
-        _ => Op::CapCall {
+        _ => Op::CapCall(Box::new(CapCallOp {
             type_id: *type_id,
             op: *op,
             handle: g(*handle),
@@ -3338,7 +3385,7 @@ fn lower_cap_call(
             args: args.iter().map(|a| g(*a)).collect(),
             dst,
             results: view.sig(*sig).results.clone().into(),
-        },
+        })),
     })
 }
 
@@ -20035,10 +20082,13 @@ impl Vm {
         // The current function's ops, which every op reads (`ops[pc]`). Set again wherever the
         // current function changes (`enter!`), so the per-op read is one index and checks nothing.
         let mut ops: &[Op] = &c.prog(cur).ops;
+        // Its edges' copies, which a taken branch reads (#2486); set with `ops`.
+        let mut edges: &Copies = &c.prog(cur).copies;
         macro_rules! enter {
-            () => {
-                ops = &c.prog(cur).ops
-            };
+            () => {{
+                let prog = c.prog(cur);
+                (ops, edges) = (&prog.ops, &prog.copies);
+            }};
         }
 
         // #1146 async signal delivery (the bytecode twin of the tree-walker's #796 L2 safepoint
@@ -20078,21 +20128,21 @@ impl Vm {
         // Apply edge copies parallel-safely (a self-loop can alias src/dst): gather then scatter.
         macro_rules! edge {
             ($copies:expr) => {{
-                let cp = $copies;
-                if cp.aliasing {
+                let (pairs, aliasing) = edges.get($copies);
+                if aliasing {
                     // A destination is re-read as a source: gather all sources, then scatter, so a
                     // value isn't clobbered before it is read (a param swap/rotation).
                     self.scratch.clear();
-                    for &(s, _) in cp.pairs.iter() {
+                    for &(s, _) in pairs {
                         self.scratch.push(self.regs[base + s as usize]);
                     }
-                    for (k, &(_, d)) in cp.pairs.iter().enumerate() {
+                    for (k, &(_, d)) in pairs.iter().enumerate() {
                         self.regs[base + d as usize] = self.scratch[k];
                     }
                 } else {
                     // Non-aliasing (the common induction/accumulator edge): copy directly in one pass,
                     // no `scratch` traffic — sources and destinations are disjoint slot sets.
-                    for &(s, d) in cp.pairs.iter() {
+                    for &(s, d) in pairs {
                         let v = self.regs[base + s as usize];
                         self.regs[base + d as usize] = v;
                     }
@@ -20463,7 +20513,7 @@ impl Vm {
                 }
                 Op::Br { copies, target } => {
                     backedge!(*target);
-                    edge!(copies);
+                    edge!(*copies);
                     pc = *target as usize;
                 }
                 Op::BrIf {
@@ -20475,11 +20525,11 @@ impl Vm {
                 } => {
                     if r!(*cond).i32() != 0 {
                         backedge!(*then_pc);
-                        edge!(then_copies);
+                        edge!(*then_copies);
                         pc = *then_pc as usize;
                     } else {
                         backedge!(*else_pc);
-                        edge!(else_copies);
+                        edge!(*else_copies);
                         pc = *else_pc as usize;
                     }
                 }
@@ -20502,11 +20552,11 @@ impl Vm {
                     };
                     if taken {
                         backedge!(*then_pc);
-                        edge!(then_copies);
+                        edge!(*then_copies);
                         pc = *then_pc as usize;
                     } else {
                         backedge!(*else_pc);
-                        edge!(else_copies);
+                        edge!(*else_copies);
                         pc = *else_pc as usize;
                     }
                 }
@@ -20526,11 +20576,11 @@ impl Vm {
                     };
                     if taken {
                         backedge!(*then_pc);
-                        edge!(then_copies);
+                        edge!(*then_copies);
                         pc = *then_pc as usize;
                     } else {
                         backedge!(*else_pc);
-                        edge!(else_copies);
+                        edge!(*else_copies);
                         pc = *else_pc as usize;
                     }
                 }
@@ -20538,7 +20588,7 @@ impl Vm {
                     let i = r!(*idx).i32() as u32 as usize;
                     let (copies, target) = arms.get(i).unwrap_or(default);
                     backedge!(*target);
-                    edge!(copies);
+                    edge!(*copies);
                     pc = *target as usize;
                 }
                 // `<setjmp.h>` `setjmp`: checkpoint the resume point (the op after this, in this
@@ -20662,13 +20712,13 @@ impl Vm {
                     base = nb;
                     pc = 0;
                 }
-                Op::CallIndirect {
-                    idx,
-                    args,
-                    dst,
-                    want_params,
-                    want_results,
-                } => {
+                Op::CallIndirect { call, dst } => {
+                    let IndirectCall {
+                        idx,
+                        args,
+                        want_params,
+                        want_results,
+                    } = &**call;
                     safepoint!(); // fuel unification: function-entry safepoint
 
                     // Resolve through the **runtime dispatch table** (slot ⇒ (module, func)); an empty
@@ -20775,12 +20825,13 @@ impl Vm {
                     enter!();
                     pc = 0;
                 }
-                Op::TailCallIndirect {
-                    idx,
-                    args,
-                    want_params,
-                    want_results,
-                } => {
+                Op::TailCallIndirect(call) => {
+                    let IndirectCall {
+                        idx,
+                        args,
+                        want_params,
+                        want_results,
+                    } = &**call;
                     safepoint!(); // fuel unification: function-entry safepoint
                     let slot = (r!(*idx).i32() as u32 as usize) & (table.len() - 1);
                     let ts = table.slot(slot);
@@ -20811,15 +20862,16 @@ impl Vm {
                     enter!();
                     pc = 0;
                 }
-                Op::CapCall {
-                    type_id,
-                    op,
-                    handle,
-                    params,
-                    args,
-                    dst,
-                    results,
-                } => {
+                Op::CapCall(call) => {
+                    let CapCallOp {
+                        type_id,
+                        op,
+                        handle,
+                        params,
+                        args,
+                        dst,
+                        results,
+                    } = &**call;
                     // Generic synchronous powerbox dispatch — the same path and ABI the tree-walker's
                     // generic `CapCall` arm uses (`cap_dispatch_slots`): handle as an i32, args/results
                     // as i64 slots, results re-typed by the call's `sig.results`. Via [`HostCell`] so a
@@ -21588,14 +21640,15 @@ impl Vm {
                     self.pc = pc + 1;
                     return Ok(Outcome::JitUninstall { h, slot, dst });
                 }
-                Op::JitInvoke {
-                    handle,
-                    code,
-                    args,
-                    dst,
-                    params,
-                    results,
-                } => {
+                Op::JitInvoke(call) => {
+                    let JitInvokeOp {
+                        handle,
+                        code,
+                        args,
+                        dst,
+                        params,
+                        results,
+                    } = &**call;
                     let h = r!(*handle).i32();
                     let code = r!(*code).i64() as i32;
                     let argv: Box<[i64]> = args.iter().map(|a| r!(*a).i64()).collect();

@@ -37912,23 +37912,37 @@ impl Mem {
     /// recoverable demand fault) falls to the cold path, which keeps the exact trap + `last_fault`
     /// semantics. Returns the [`Reg`] slot directly, dropping the `Value` round-trip the bytecode
     /// engine paid via `Reg::from_value(load(..))`.
-    #[inline]
+    ///
+    /// #2486: the fast path inlines into the engine's loop, and the cold path stays out of line, so
+    /// a load the run admits costs no call.
+    #[inline(always)]
     fn load_scalar(&self, addr: u64, offset: u64, op: LoadOp) -> Result<Reg, Trap> {
-        let (_, rty, width, signed) = op.info();
-        if let Some(abs) = self.fast_access(addr, offset, width, false) {
+        let (width, sext) = load_shape(op);
+        match self.fast_access(addr, offset, width, false) {
             // The run holds no `Backed` page, so the bytes live in `back` (no §13 redirect); the
             // cooperative bytecode engine is the sole accessor, so a single non-atomic word read is
             // sound (and one instruction, not `width` atomic byte loads).
-            let raw = self.back.read_word(abs, width);
-            return Ok(Reg::from_value(decode_loaded(rty, width, signed, raw)));
+            Some(abs) => Ok(loaded_slot(self.back.read_word(abs, width), width, sext)),
+            None => self.load_scalar_cold(addr, offset, width, sext),
         }
-        // Cold path — the access leaves the [`FastRun`] (an unmapped or aliased page, the NULL
-        // guard, the reserved tail). Run the *exact* confine + protection check the oracle
-        // [`Mem::load`] does (identical trap / `last_fault` / demand-fault semantics), but when `back`
-        // is contiguous (no §13 region redirect) still finish with **one** wide non-atomic read rather
-        // than `load`'s per-byte atomic `read_le` — the same cooperative sole-accessor contract as the
-        // fast path above. The profile showed this byte-at-a-time read dominating rodata guests, whose
-        // hot Lua-stack accesses are all to plain `Rw` pages yet took the per-byte path.
+    }
+
+    /// [`Mem::load_scalar`] for an access that leaves the [`FastRun`] (an unmapped or aliased page,
+    /// the NULL guard, the reserved tail). It runs the *exact* confine + protection check the oracle
+    /// [`Mem::load`] does (identical trap / `last_fault` / demand-fault semantics), but when `back` is
+    /// contiguous (no §13 region redirect) still finishes with **one** wide non-atomic read rather
+    /// than `load`'s per-byte atomic `read_le` — the same cooperative sole-accessor contract as the
+    /// fast path. The profile showed this byte-at-a-time read dominating rodata guests, whose hot
+    /// Lua-stack accesses are all to plain `Rw` pages yet took the per-byte path.
+    #[cold]
+    #[inline(never)]
+    fn load_scalar_cold(
+        &self,
+        addr: u64,
+        offset: u64,
+        width: u32,
+        sext: bool,
+    ) -> Result<Reg, Trap> {
         let base = self.confine_checked(addr, offset, width)?;
         self.check_prot(base, width, false)?;
         let raw = if self.has_regions.load(Ordering::Relaxed) {
@@ -37936,22 +37950,35 @@ impl Mem {
         } else {
             self.back.read_word(base, width)
         };
-        Ok(Reg::from_value(decode_loaded(rty, width, signed, raw)))
+        Ok(loaded_slot(raw, width, sext))
     }
 
     /// Bytecode-engine scalar store (Phase 2): the fast path of [`Mem::store`], taking the value as
     /// raw slot `lo` bits (no `Value` wrap). Same fast-path gate + cold fallback as
-    /// [`Mem::load_scalar`]; `write_le` truncates to the op width.
-    #[inline]
+    /// [`Mem::load_scalar`], inlined the same way (#2486); `write_le` truncates to the op width.
+    #[inline(always)]
     fn store_scalar(&mut self, addr: u64, offset: u64, op: StoreOp, lo: u64) -> Result<(), Trap> {
         let (_, _, width) = op.info();
-        if let Some(abs) = self.fast_access(addr, offset, width, true) {
-            self.back.write_word(abs, width, lo);
-            self.writes += 1;
-            return Ok(());
+        match self.fast_access(addr, offset, width, true) {
+            Some(abs) => self.back.write_word(abs, width, lo),
+            None => self.store_scalar_cold(addr, offset, width, lo)?,
         }
-        // Cold path, same reasoning as [`Mem::load_scalar`]: the exact confine + protection check the
-        // oracle [`Mem::store`] does, then one wide non-atomic write when `back` is contiguous.
+        self.writes += 1;
+        Ok(())
+    }
+
+    /// [`Mem::store_scalar`] for an access that leaves the [`FastRun`], by the reasoning of
+    /// [`Mem::load_scalar_cold`]: the exact confine + protection check the oracle [`Mem::store`]
+    /// does, then one wide non-atomic write when `back` is contiguous.
+    #[cold]
+    #[inline(never)]
+    fn store_scalar_cold(
+        &mut self,
+        addr: u64,
+        offset: u64,
+        width: u32,
+        lo: u64,
+    ) -> Result<(), Trap> {
         let base = self.confine_checked(addr, offset, width)?;
         self.check_prot(base, width, true)?;
         if self.has_regions.load(Ordering::Relaxed) {
@@ -37959,7 +37986,6 @@ impl Mem {
         } else {
             self.back.write_word(base, width, lo);
         }
-        self.writes += 1;
         Ok(())
     }
 
@@ -39204,6 +39230,37 @@ impl GuestMem for SoleMem<'_> {
     fn shadow(&self) -> ShadowArena {
         self.0.shadow()
     }
+}
+
+/// #2486 — how a load of `op` fills its slot ([`loaded_slot`]): its width in bytes, and whether its
+/// bytes sign-extend. An i32 slot holds its value sign-extended ([`Reg::from_i32`]), so a
+/// full-width i32 load sign-extends too; a float's bits zero-extend. The slot [`decode_loaded`]'s
+/// `Value` makes, without the `Value` (`load_shape_matches_decode_loaded`).
+#[inline(always)]
+fn load_shape(op: LoadOp) -> (u32, bool) {
+    match op {
+        LoadOp::I32 => (4, true),
+        LoadOp::I64 | LoadOp::F64 => (8, false),
+        LoadOp::F32 => (4, false),
+        LoadOp::I32_8S | LoadOp::I64_8S => (1, true),
+        LoadOp::I32_8U | LoadOp::I64_8U => (1, false),
+        LoadOp::I32_16S | LoadOp::I64_16S => (2, true),
+        LoadOp::I32_16U | LoadOp::I64_16U => (2, false),
+        LoadOp::I64_32S => (4, true),
+        LoadOp::I64_32U => (4, false),
+    }
+}
+
+/// The slot a load of [`load_shape`] `(width, sext)` leaves: `raw`, the `width` bytes read
+/// zero-extended, sign-extended from their top bit when `sext`.
+#[inline(always)]
+fn loaded_slot(raw: u64, width: u32, sext: bool) -> Reg {
+    let shift = 64 - 8 * width;
+    let lo = match sext {
+        true => (((raw << shift) as i64) >> shift) as u64,
+        false => raw,
+    };
+    Reg { lo, hi: 0 }
 }
 
 /// Turn `width` raw little-endian bytes into the loaded value, sign- or zero-
@@ -42215,6 +42272,61 @@ mod prot_tests {
             m.load_scalar(top + p, 0, LoadOp::I64),
             Ok(Reg::from_value(Value::I64(9)))
         );
+    }
+
+    /// #2486 — the bytecode engine's scalar loads and stores leave what the oracle's do, on the fast
+    /// path and the cold one, for every op: [`load_shape`] and [`loaded_slot`] stand in for
+    /// [`decode_loaded`]'s `Value`, and [`Mem::store_scalar`] for [`Mem::store`].
+    #[test]
+    fn scalar_loads_and_stores_match_the_oracle_on_both_paths() {
+        let p = page();
+        let mut m = Mem::with_reservation(22, 20, None);
+        assert_eq!(m.unmap(2 * p, p), 0);
+        // Unaligned on purpose; above the hole is outside the run, so the cold path serves it.
+        let (fast, cold) = (p + 3, 3 * p + 5);
+        assert!(m.in_fast_run(fast, fast + 7, true));
+        assert!(!m.in_fast_run(cold, cold + 7, false));
+        let bits = [
+            0,
+            0x7f,
+            0x80,
+            0xff,
+            0x7fff,
+            0x8000,
+            0xffff,
+            0x7fff_ffff,
+            0x8000_0000,
+            0xffff_ffff,
+            0x0123_4567_89ab_cdef,
+            0x8000_0000_0000_0000,
+            u64::MAX,
+        ];
+        for at in [fast, cold] {
+            for &b in &bits {
+                for op in LoadOp::ALL {
+                    m.store(at, 0, StoreOp::I64, Value::I64(b as i64)).unwrap();
+                    let want = m.load(at, 0, op).map(Reg::from_value);
+                    assert_eq!(
+                        m.load_scalar(at, 0, op),
+                        want,
+                        "{op:?} of {b:#x} at {at:#x}"
+                    );
+                }
+                for op in StoreOp::ALL {
+                    m.store(at, 0, StoreOp::I64, Value::I64(!b as i64)).unwrap();
+                    let v = Reg::from_i64(b as i64).to_value(op.info().1);
+                    m.store(at, 0, op, v).unwrap();
+                    let want = m.load(at, 0, LoadOp::I64).unwrap();
+                    m.store(at, 0, StoreOp::I64, Value::I64(!b as i64)).unwrap();
+                    m.store_scalar(at, 0, op, b).unwrap();
+                    assert_eq!(
+                        m.load(at, 0, LoadOp::I64),
+                        Ok(want),
+                        "{op:?} of {b:#x} at {at:#x}"
+                    );
+                }
+            }
+        }
     }
 
     /// #2577 — the run is the address space's, so a page one vCPU protects leaves it for every vCPU
