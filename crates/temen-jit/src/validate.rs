@@ -90,6 +90,10 @@ pub(crate) enum Ret {
     /// `_setjmp` ([`ArgTag::JmpBuf`]), which saves the frame's registers into it. A `_setjmp` handed
     /// anything else would write them wherever the code said.
     JmpBuf,
+    /// `_setjmp`'s: it returns once, and again each time a `_longjmp` re-enters it, with `rsp` and
+    /// the callee-saved registers restored from the `jmp_buf` but each frame slot holding its latest
+    /// write, which may be any later one (#2801).
+    Twice,
 }
 
 /// What one call argument must be, for the validator to accept the call (#2534). The host confines
@@ -555,6 +559,60 @@ pub(crate) mod x86 {
         fact: Fact,
     }
 
+    /// A write to the frame: the bytes `[lo, hi)` of entry-relative offsets, with the fact of the
+    /// value when it fills exactly one 8-byte slot (`Unknown` otherwise), or anywhere at all, or
+    /// any data slot (a callee handed a frame pointer it may write through, which spares the
+    /// callee-saved save area, as [`State::clear_data_slots`] does).
+    #[derive(Clone, Copy)]
+    enum FrameWrite {
+        At { lo: i64, hi: i64, fact: Fact },
+        Anywhere,
+        DataAnywhere,
+    }
+
+    /// Whether `w` keeps every fact `reentry` promises a slot holds across a `_setjmp`'s second
+    /// return (#2801): a write that fills one of those slots exactly must write a value with its
+    /// fact, and no other write may touch it.
+    fn keeps(reentry: &[Slot], w: FrameWrite) -> bool {
+        reentry.iter().all(|s| match w {
+            FrameWrite::At { lo, hi, fact } => {
+                let touches = lo < s.off.saturating_add(8) && s.off < hi;
+                !touches || (lo == s.off && hi == lo + 8 && fact.meet(s.fact) == s.fact)
+            }
+            FrameWrite::Anywhere => false,
+            FrameWrite::DataAnywhere => matches!(s.fact, Fact::Saved(_)),
+        })
+    }
+
+    /// The slots a `_setjmp`'s second return can keep, given every write the function makes to its
+    /// frame: on a re-entry each slot holds its latest write, from wherever in the function, so it
+    /// keeps the fact all of its writes imply (the meet over them). That is the JIT's `setjmp` save
+    /// area, which only the stores before the call write, and the prologue's callee-saved saves.
+    fn reentry_facts(writes: &[FrameWrite]) -> Vec<Slot> {
+        let mut slots: Vec<Slot> = Vec::new();
+        for &w in writes {
+            if let FrameWrite::At { lo, hi, fact } = w {
+                if hi == lo + 8 && fact != Fact::Unknown && slots.iter().all(|s| s.off != lo) {
+                    slots.push(Slot { off: lo, fact });
+                }
+            }
+        }
+        for &w in writes {
+            for s in &mut slots {
+                if !keeps(&[*s], w) {
+                    s.fact = match w {
+                        FrameWrite::At { lo, hi, fact } if lo == s.off && hi == lo + 8 => {
+                            s.fact.meet(fact)
+                        }
+                        _ => Fact::Unknown,
+                    };
+                }
+            }
+        }
+        slots.retain(|s| s.fact != Fact::Unknown);
+        slots
+    }
+
     /// The abstract state at a program point: a fact per GP register, the tracked spill slots, and
     /// whether the prologue's stack-overflow check (`emit_stack_check`, I5) has run on every path
     /// here. `checked` starts false, is set on the safe edge of the recognized check, and meets by
@@ -723,6 +781,10 @@ pub(crate) mod x86 {
         relocs: &'a [Reloc],
         guest: Guest<'a>,
         frame: Frame,
+        /// The slot facts a `_setjmp`'s second return keeps ([`reentry_facts`]), which verify
+        /// checks against every frame write. `None` keeps every slot: only propose's first round
+        /// runs so, and [`verify`] never does.
+        reentry: Option<&'a [Slot]>,
     }
 
     /// The facts of no module: what the decode and control-flow layers run under for a trampoline,
@@ -942,7 +1004,7 @@ pub(crate) mod x86 {
         let Some(r) = d.operands.rm_reg else {
             return Err("indirect jmp through memory".into());
         };
-        let out = transfer_block(insns, State::top(), None, ctx, false).fall;
+        let out = transfer_block(insns, State::top(), None, ctx, false, None).fall;
         let Fact::TableTarget { at, n } = out.regs[r as usize & 15] else {
             return Err(format!(
                 "indirect jmp through r{r}, which holds no jump-table target"
@@ -1109,6 +1171,7 @@ pub(crate) mod x86 {
             relocs,
             guest,
             frame,
+            reentry: None,
         };
         let cfg = Cfg::build(ctx, &mut findings);
         if let Entry::Host = entry {
@@ -1124,9 +1187,58 @@ pub(crate) mod x86 {
             }
             return findings;
         }
-        let states = propose(&cfg, ctx);
-        verify(&cfg, &states, ctx, &mut findings);
+        let (states, reentry) = propose_reentry(&cfg, ctx);
+        verify(&cfg, &states, &reentry, ctx, &mut findings);
         findings
+    }
+
+    /// Whether the function calls `_setjmp`, which returns twice (#2801).
+    fn calls_setjmp(ctx: Ctx) -> bool {
+        ctx.relocs
+            .iter()
+            .any(|r| r.callee.is_some_and(|c| c.ret == Ret::Twice))
+    }
+
+    /// [`propose`], and for a function that calls `_setjmp` the slot facts its second return keeps,
+    /// [`reentry_facts`] of the frame writes the proposed states imply. The first round keeps every
+    /// slot across the call, and each round after it keeps only what the last round's writes imply,
+    /// until that holds steady: the facts only fall, so it settles, and from above, so a save the
+    /// JIT repeats each time round a loop keeps its fact. The round cap only bounds the cost:
+    /// [`verify`] checks every write against what comes out.
+    fn propose_reentry(cfg: &Cfg, ctx: Ctx) -> (Vec<Option<State>>, Vec<Slot>) {
+        let mut states = propose(cfg, ctx);
+        let mut reentry = Vec::new();
+        if !calls_setjmp(ctx) {
+            return (states, reentry);
+        }
+        for round in 0..8 {
+            let at = Ctx {
+                reentry: (round > 0).then_some(&reentry[..]),
+                ..ctx
+            };
+            if round > 0 {
+                states = propose(cfg, at);
+            }
+            let mut writes = Vec::new();
+            for (i, s) in states.iter().enumerate() {
+                if let Some(s) = s {
+                    transfer_block(
+                        &cfg.blocks[i],
+                        s.clone(),
+                        None,
+                        at,
+                        false,
+                        Some(&mut writes),
+                    );
+                }
+            }
+            let next = reentry_facts(&writes.iter().map(|&(_, w)| w).collect::<Vec<_>>());
+            if round > 0 && next == reentry {
+                break;
+            }
+            reentry = next;
+        }
+        (states, reentry)
     }
 
     /// The untrusted half of layer 3: forward dataflow toward a fixpoint, proposing an in-state for
@@ -1171,8 +1283,14 @@ pub(crate) mod x86 {
                     // so only a block whose in-state moved is re-run: the same fixpoint, without
                     // re-transferring every settled block each round.
                     if in_st[i].as_ref() != Some(&s) {
-                        out_st[i] =
-                            Some(transfer_block(&cfg.blocks[i], s.clone(), None, ctx, false));
+                        out_st[i] = Some(transfer_block(
+                            &cfg.blocks[i],
+                            s.clone(),
+                            None,
+                            ctx,
+                            false,
+                            None,
+                        ));
                         in_st[i] = Some(s);
                         changed = true;
                     }
@@ -1192,7 +1310,19 @@ pub(crate) mod x86 {
     /// covered by a state that over-approximates every execution reaching it, so the policy findings
     /// hold for every run. A block whose successor has no state, or an edge the proposal doesn't
     /// hold on, is a finding.
-    fn verify(cfg: &Cfg, states: &[Option<State>], ctx: Ctx, findings: &mut Vec<Finding>) {
+    fn verify(
+        cfg: &Cfg,
+        states: &[Option<State>],
+        reentry: &[Slot],
+        ctx: Ctx,
+        findings: &mut Vec<Finding>,
+    ) {
+        // A `_setjmp`'s second return keeps exactly `reentry`, which every frame write must respect.
+        let ctx = Ctx {
+            reentry: Some(reentry),
+            ..ctx
+        };
+        let mut writes = calls_setjmp(ctx).then(Vec::new);
         if !states
             .first()
             .and_then(Option::as_ref)
@@ -1217,7 +1347,7 @@ pub(crate) mod x86 {
                 }
                 None => false,
             };
-            let out = transfer_block(insns, s, Some(findings), ctx, exit);
+            let out = transfer_block(insns, s, Some(findings), ctx, exit, writes.as_mut());
             // An indirect `jmp` with no jump table leaves the function: a tail call, so its target
             // must be a callee the state identifies.
             if let (Some(why), Some(&(at, d))) = (&cfg.exits[i], insns.last()) {
@@ -1243,6 +1373,16 @@ pub(crate) mod x86 {
                         ),
                     });
                 }
+            }
+        }
+        // Every write to the frame keeps what a `_setjmp`'s second return assumes its slots hold.
+        for (at, w) in writes.into_iter().flatten() {
+            if !keeps(reentry, w) {
+                findings.push(Finding {
+                    at,
+                    why: "a frame write breaks a slot fact a `_setjmp`'s second return keeps"
+                        .into(),
+                });
             }
         }
     }
@@ -1585,13 +1725,15 @@ pub(crate) mod x86 {
     /// Run block `insns` from `state`, returning the out-state. With `findings = Some`, also apply
     /// the memory-access policy (layer 3) at each access. A compare's flags and the symbolic values
     /// are block-local, but the `Confined` fact a `cmov` derives from them flows across blocks through
-    /// the lattice, so a guard Cranelift hoists out of a loop is still seen at the access.
+    /// the lattice, so a guard Cranelift hoists out of a loop is still seen at the access. With
+    /// `writes = Some`, also log each write to the frame with where it is (#2801).
     fn transfer_block(
         insns: &[(usize, Decoded)],
         mut state: State,
         mut findings: Option<&mut Vec<Finding>>,
         ctx: Ctx,
         exit: bool,
+        mut writes: Option<&mut Vec<(usize, FrameWrite)>>,
     ) -> Out {
         let mut sym: [Sym; 16] = std::array::from_fn(|r| Sym {
             id: r as u32,
@@ -1653,10 +1795,19 @@ pub(crate) mod x86 {
                 }
                 _ => None,
             };
-            match slot_effect(&mut state, &d) {
-                Some(Some((lo, hi))) => slot_vals.retain(|&(o, _)| o >= hi || o + 8 <= lo),
-                Some(None) => slot_vals.clear(),
-                None => {}
+            let mut frame_write = |w: FrameWrite| {
+                if let Some(log) = writes.as_deref_mut() {
+                    log.push((pos, w));
+                }
+            };
+            if let Some(w) = slot_effect(&mut state, &d) {
+                match w {
+                    FrameWrite::At { lo, hi, .. } => {
+                        slot_vals.retain(|&(o, _)| o >= hi || o + 8 <= lo)
+                    }
+                    _ => slot_vals.clear(),
+                }
+                frame_write(w);
             }
             let fact = |state: &State, r: u8| state.regs[r as usize & 15];
             let sym_of = |r: u8| sym[r as usize & 15];
@@ -1850,14 +2001,23 @@ pub(crate) mod x86 {
                             state.clobber(o - 8, o);
                             state.slot_set(o - 8, f);
                             slot_vals.retain(|&(x, _)| x >= o || x + 8 <= o - 8);
+                            frame_write(FrameWrite::At {
+                                lo: o - 8,
+                                hi: o,
+                                fact: f,
+                            });
                             Fact::Stack(Some(o - 8))
                         }
                         Fact::Stack(None) => {
                             state.clear_slots();
                             slot_vals.clear();
+                            frame_write(FrameWrite::Anywhere);
                             Fact::Stack(None)
                         }
-                        _ => Fact::Unknown,
+                        _ => {
+                            frame_write(FrameWrite::Anywhere);
+                            Fact::Unknown
+                        }
                     };
                     set(&mut state, reg::RSP, rsp);
                 }
@@ -1876,6 +2036,7 @@ pub(crate) mod x86 {
                         None => {
                             state.clear_slots();
                             slot_vals.clear();
+                            frame_write(FrameWrite::Anywhere);
                         }
                     }
                 }
@@ -1946,13 +2107,13 @@ pub(crate) mod x86 {
                 // handed it writes the caller's result slots, not ours.)
                 let conservative = callee.is_none();
                 let mut unexpected = false;
-                let mut writes: Vec<(i64, i64)> = Vec::new();
+                let mut buffers: Vec<(i64, i64)> = Vec::new();
                 for (i, &r) in reg::ARG_REGS.iter().enumerate() {
                     let f = fact(&state, r);
                     match c.args.get(i) {
                         Some(ArgTag::StackSlot { len, write: true }) => match f {
                             Fact::Stack(Some(off)) => {
-                                writes.push((off, off.saturating_add(i64::from(*len))))
+                                buffers.push((off, off.saturating_add(i64::from(*len))))
                             }
                             // A write buffer at an unknown offset: clear conservatively.
                             _ => unexpected = true,
@@ -1971,11 +2132,38 @@ pub(crate) mod x86 {
                 if unexpected {
                     state.clear_data_slots();
                     slot_vals.clear();
+                    frame_write(FrameWrite::DataAnywhere);
                 } else {
-                    for (lo, hi) in writes {
+                    for (lo, hi) in buffers {
                         state.clobber(lo, hi);
                         slot_vals.retain(|&(o, _)| o >= hi || o + 8 <= lo);
+                        frame_write(FrameWrite::At {
+                            lo,
+                            hi,
+                            fact: Fact::Unknown,
+                        });
                     }
+                }
+                // `_setjmp` returns again whenever a `_longjmp` re-enters it, with `rsp` and the
+                // callee-saved registers as at the call (from the `jmp_buf`, so their facts hold)
+                // but each frame slot holding its latest write, which can come from anywhere after
+                // this return. So a slot keeps only the fact every write to it implies
+                // (`ctx.reentry`, which verify checks against every write), and no register stays
+                // tied to a slot: a callee-saved one can come from an older execution of the call
+                // than the slot's latest write (#2801).
+                if c.ret == Ret::Twice {
+                    if let Some(reentry) = ctx.reentry {
+                        state.slots = state
+                            .slots
+                            .iter()
+                            .filter_map(|s| {
+                                let k = reentry.iter().find(|r| r.off == s.off)?;
+                                let fact = s.fact.meet(k.fact);
+                                (fact != Fact::Unknown).then_some(Slot { off: s.off, fact })
+                            })
+                            .collect();
+                    }
+                    slot_vals.clear();
                 }
                 let rsp = match (fact(&state, reg::RSP), c.pops) {
                     (Fact::Stack(Some(h)), Some(p)) => Fact::Stack(h.checked_add(i64::from(p))),
@@ -2375,14 +2563,14 @@ pub(crate) mod x86 {
     /// when its offset is unknown. An access that cannot reach the stack leaves the slots alone (one
     /// through a wild base is itself a policy finding). Returns the frame bytes it writes: `None` for
     /// none, `Some(None)` when where is unknown.
-    fn slot_effect(state: &mut State, d: &Decoded) -> Option<Option<(i64, i64)>> {
+    fn slot_effect(state: &mut State, d: &Decoded) -> Option<FrameWrite> {
         let m = d.operands.mem?;
         if !writes_memory(d) {
             return None;
         }
         let Some(off) = frame_addr(state, &m)? else {
             state.clear_slots();
-            return Some(None);
+            return Some(FrameWrite::Anywhere);
         };
         let (w, fact) = match d.eff {
             Eff::StoreReg { src, w } => (
@@ -2401,9 +2589,10 @@ pub(crate) mod x86 {
                 Fact::Unknown,
             ),
         };
-        state.clobber(off, off.saturating_add(w));
-        state.slot_set(off, fact);
-        Some(Some((off, off.saturating_add(w))))
+        let (lo, hi) = (off, off.saturating_add(w));
+        state.clobber(lo, hi);
+        state.slot_set(lo, fact);
+        Some(FrameWrite::At { lo, hi, fact })
     }
 
     /// The GP registers an instruction writes: its effect's destinations plus a call's clobbers and
@@ -4329,6 +4518,7 @@ pub(crate) mod x86 {
             relocs,
             guest: NO_GUEST,
             frame: Frame::UNKNOWN,
+            reentry: None,
         };
         let mut findings = Vec::new();
         Cfg::build(ctx, &mut findings)
@@ -5091,9 +5281,10 @@ pub(crate) mod x86 {
                 relocs,
                 guest: G,
                 frame: Frame::UNKNOWN,
+                reentry: None,
             };
             let (insns, _) = decode_block(ctx, 0, bytes.len(), &mut fs);
-            transfer_block(&insns, State::entry(Frame::UNKNOWN), None, ctx, false).fall
+            transfer_block(&insns, State::entry(Frame::UNKNOWN), None, ctx, false, None).fall
         }
 
         /// A window access through an index that was **not** confined by the D63 sequence is the
@@ -5538,6 +5729,7 @@ pub(crate) mod x86 {
                 relocs: &[],
                 guest: G,
                 frame: Frame::UNKNOWN,
+                reentry: None,
             };
             let mut fs = Vec::new();
             let cfg = Cfg::build(ctx, &mut fs);
@@ -5556,7 +5748,7 @@ pub(crate) mod x86 {
             s.copies[9] = Some(-0x10); // the spill `[rsp+8]`, after `sub rsp, 0x18`
             lie[join] = Some(s);
             let mut f = Vec::new();
-            verify(&cfg, &lie, ctx, &mut f);
+            verify(&cfg, &lie, &[], ctx, &mut f);
             assert!(has(&f, "does not hold on the edge"), "{f:?}");
         }
 
@@ -5825,6 +6017,145 @@ pub(crate) mod x86 {
                 Frame::UNKNOWN,
             );
             assert!(has(&f, "call argument 0 is Saved(3), not JmpBuf"), "{f:?}");
+        }
+
+        /// #2801 — `_setjmp` returns twice. On the second return, through a `_longjmp`, `rsp` and the
+        /// callee-saved registers are as at the call, but each frame slot holds its latest write,
+        /// which can come after the first return. So a slot keeps a fact across the call only when
+        /// every write to it in the function implies the fact: the JIT's save area, which only the
+        /// stores before the call write, and the prologue's callee-saved saves.
+        #[test]
+        fn setjmp_returns_twice() {
+            const SETJMP: Contract = Contract {
+                clobbers: SYSV_CLOBBERS,
+                pops: Some(0),
+                args: &[],
+                safepoint: false,
+                ret: Ret::Twice,
+            };
+            const CALL: [u8; 12] = [0x48, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xd0]; // movabs; call rax
+            const FRAME: [u8; 4] = [0x48, 0x83, 0xec, 0x10]; // sub rsp, 16
+            const SAVE: [u8; 5] = [0x48, 0x89, 0x7c, 0x24, 0x08]; // mov [rsp+8], rdi   (mem_base)
+            const RELOAD: [u8; 5] = [0x48, 0x8b, 0x7c, 0x24, 0x08]; // mov rdi, [rsp+8]
+            const STORE: [u8; 2] = [0x89, 0x0f]; // mov [rdi], ecx: a window store through it
+            const LEAVE: [u8; 5] = [0x48, 0x83, 0xc4, 0x10, 0xc3]; // add rsp, 16; ret
+                                                                   // `pre`, the call, `post`, with the call's relocation.
+            let code = |pre: &[u8], post: &[u8]| {
+                let body = [pre, &CALL, post].concat();
+                let reloc = Reloc {
+                    at: (CHECK_LEN + pre.len() + 2) as u32,
+                    kind: R::Abs8,
+                    addend: 0,
+                    callee: Some(SETJMP),
+                };
+                (checked(&body), reloc)
+            };
+            let run = |pre: &[u8], post: &[u8]| {
+                let (bytes, reloc) = code(pre, post);
+                check(&bytes, &[reloc], Entry::Guest(&G), Frame::UNKNOWN)
+            };
+            let pre = [&FRAME[..], &SAVE].concat();
+            // The JIT's save: written only before the call, so it is still mem_base on both returns.
+            let f = run(&pre, &[&RELOAD[..], &STORE, &LEAVE].concat());
+            assert!(f.is_empty(), "{f:?}");
+            // The issue's escape: the first return overwrites the slot with a guest value and then
+            // `_longjmp`s back (here a `ud2` ends that path), so the second return reloads it.
+            let overwrite = [0x4c, 0x89, 0x44, 0x24, 0x08]; // mov [rsp+8], r8
+            let again = [&[0x85, 0xc0, 0x75, 0x07][..], &overwrite, &[0x0f, 0x0b]].concat(); // test eax, eax; jne +7; …; ud2
+            let escape = [&again[..], &RELOAD, &STORE, &LEAVE].concat();
+            assert!(has(&run(&pre, &escape), "unrecognized provenance"));
+            // A save the JIT repeats each time round a loop keeps its fact: the facts are proposed
+            // from above, so the save that feeds on the reload holds.
+            let back = -((CALL.len() + RELOAD.len() + STORE.len() + SAVE.len() + 5) as i8);
+            let looped = [
+                &RELOAD[..],
+                &STORE,
+                &SAVE,
+                &[0x45, 0x85, 0xc9, 0x75, back as u8],
+                &LEAVE,
+            ];
+            let f = run(&pre, &looped.concat()); // …; test r9d, r9d; jne <the call>
+            assert!(f.is_empty(), "{f:?}");
+            // The prologue's callee-saved save is written once, so the epilogue still restores it.
+            let push = [0x53, 0x48, 0x83, 0xec, 0x08]; // push rbx; sub rsp, 8
+            let pop = [0x48, 0x83, 0xc4, 0x08, 0x5b, 0xc3]; // add rsp, 8; pop rbx; ret
+            let f = run(&push, &pop);
+            assert!(f.is_empty(), "{f:?}");
+            // And verify holds a proposal to every write: claiming the escape's slot keeps mem_base
+            // is caught at the overwrite.
+            let (bytes, reloc) = code(&pre, &escape);
+            let relocs = [reloc];
+            let lie = [Slot {
+                off: -8,
+                fact: Fact::MemBase,
+            }];
+            let ctx = Ctx {
+                bytes: &bytes,
+                relocs: &relocs,
+                guest: G,
+                frame: Frame::UNKNOWN,
+                reentry: Some(&lie),
+            };
+            let mut fs = Vec::new();
+            let cfg = Cfg::build(ctx, &mut fs);
+            let states = propose(&cfg, ctx);
+            let mut f = Vec::new();
+            verify(&cfg, &states, &lie, ctx, &mut f);
+            assert!(has(&f, "breaks a slot fact"), "{f:?}");
+            // No register stays tied to a slot across the call. Here the first return overwrites
+            // r12's spill and `_longjmp`s back, so the second return's `cmp r12` and the `cmov` of a
+            // reload of the spill compare and select different values: the access is unconfined.
+            let pre = [
+                0x48, 0x83, 0xec, 0x18, // sub rsp, 0x18
+                0x48, 0x89, 0x3c,
+                0x24, // mov [rsp], rdi        (mem_base, for after the call)
+                0x4c, 0x89, 0x64, 0x24,
+                0x08, // mov [rsp+8], r12  (spill r12: a register-slot tie)
+            ];
+            let post = [
+                &[0x85, 0xc0, 0x75, 0x07][..], // test eax, eax; jne +7   (the second return)
+                &[0x48, 0x89, 0x4c, 0x24, 0x08, 0x0f, 0x0b], // mov [rsp+8], rcx; ud2  (overwrite; …)
+                &[0x48, 0x8b, 0x3c, 0x24],                   // mov rdi, [rsp]
+                &[0x49, 0xba, 0, 0, 0, 0, 0x20, 0, 0, 0],    // mov r10, guard
+                &[0x49, 0x81, 0xfc, 0xf0, 0xff, 0xff, 0x7f], // cmp r12, 0x7fff_fff0
+                &[0x4c, 0x8b, 0x4c, 0x24, 0x08],             // mov r9, [rsp+8]
+                &[0x4c, 0x89, 0xc8, 0x49, 0x0f, 0x43, 0xc2], // mov rax, r9; cmovae rax, r10
+                &[0x8b, 0x04, 0x07, 0x48, 0x83, 0xc4, 0x18, 0xc3], // mov eax, [rdi + rax]; …; ret
+            ]
+            .concat();
+            assert!(has(&run(&pre, &post), "unconfined index"));
+        }
+
+        /// #2801 — the rules a frame write meets a `_setjmp`'s re-entry facts by, and the facts the
+        /// writes give: a write that fills a slot exactly must imply its fact; a partial write, a
+        /// write anywhere, or a callee handed a frame pointer breaks it, except that last spares the
+        /// callee-saved save area.
+        #[test]
+        fn frame_writes_against_reentry_facts() {
+            let at = |lo: i64, hi: i64, fact: Fact| FrameWrite::At { lo, hi, fact };
+            let base = [Slot {
+                off: -8,
+                fact: Fact::MemBase,
+            }];
+            let saved = [Slot {
+                off: -8,
+                fact: Fact::Saved(3),
+            }];
+            assert!(keeps(&base, at(-8, 0, Fact::MemBase)));
+            assert!(keeps(&base, at(-16, -8, Fact::Unknown))); // the slot below: no overlap
+            assert!(!keeps(&base, at(-8, 0, Fact::Unknown)));
+            assert!(!keeps(&base, at(-4, 0, Fact::Unknown))); // half of it
+            assert!(!keeps(&base, at(-8, 8, Fact::MemBase))); // more than it
+            assert!(!keeps(&base, FrameWrite::Anywhere));
+            assert!(!keeps(&base, FrameWrite::DataAnywhere));
+            assert!(keeps(&saved, FrameWrite::DataAnywhere));
+            let twice = [at(-8, 0, Fact::MemBase), at(-8, 0, Fact::MemBase)];
+            assert!(reentry_facts(&twice) == base);
+            assert!(reentry_facts(&[twice[0], at(-8, 0, Fact::Unknown)]).is_empty());
+            assert!(reentry_facts(&[twice[0], at(-2, 6, Fact::Unknown)]).is_empty());
+            assert!(reentry_facts(&[twice[0], FrameWrite::DataAnywhere]).is_empty());
+            let callee_saved = [at(-8, 0, Fact::Saved(3)), FrameWrite::DataAnywhere];
+            assert!(reentry_facts(&callee_saved) == saved);
         }
 
         /// #2534 — the `-g` trap capture walks the frame chain from its argument, so it must be this
@@ -6150,6 +6481,7 @@ pub(crate) mod x86 {
                 relocs: &[],
                 guest: G,
                 frame: Frame::UNKNOWN,
+                reentry: None,
             };
             let mut fs = Vec::new();
             let cfg = Cfg::build(ctx, &mut fs);
@@ -6574,19 +6906,20 @@ pub(crate) mod x86 {
                 relocs: &[],
                 guest: G,
                 frame: Frame::UNKNOWN,
+                reentry: None,
             };
             let mut fs = Vec::new();
             let cfg = Cfg::build(ctx, &mut fs);
             assert!(fs.is_empty());
             let honest = propose(&cfg, ctx);
             let mut f = Vec::new();
-            verify(&cfg, &honest, ctx, &mut f);
+            verify(&cfg, &honest, &[], ctx, &mut f);
             assert!(has(&f, "unrecognized provenance"), "{f:?}");
 
             let mut lie = honest.clone();
             lie[1] = Some(State::entry(Frame::UNKNOWN));
             let mut f = Vec::new();
-            verify(&cfg, &lie, ctx, &mut f);
+            verify(&cfg, &lie, &[], ctx, &mut f);
             assert!(has(&f, "does not hold on the edge"), "{f:?}");
 
             let mut bad_entry = honest;
@@ -6594,7 +6927,7 @@ pub(crate) mod x86 {
             s.regs[0] = Fact::MemBase;
             bad_entry[0] = Some(s);
             let mut f = Vec::new();
-            verify(&cfg, &bad_entry, ctx, &mut f);
+            verify(&cfg, &bad_entry, &[], ctx, &mut f);
             assert!(has(&f, "entry contract"), "{f:?}");
         }
 
