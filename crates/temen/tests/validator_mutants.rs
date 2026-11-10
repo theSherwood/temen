@@ -52,10 +52,16 @@ fn sweep(seeds: impl Iterator<Item = u64>, mix: u64) -> Sweep {
     }
 }
 
-/// Over a fixed seed corpus: every mutant is rejected, every baseline is clean, and every operator
-/// makes at least one mutant (so a `make` that silently stops matching real code fails here, not
-/// only in the libFuzzer twin). The mutation is thorough — one validator run per mutation site —
-/// so the corpus is kept modest; the libFuzzer target explores unboundedly from the same generator.
+/// Over a fixed seed corpus: every mutant is rejected and every baseline is clean. The mutation is
+/// thorough — one validator run per mutation site — so the corpus is kept modest; the libFuzzer
+/// target explores unboundedly from the same generator.
+///
+/// Which operators fire, and how many mutants each makes, is **not** asserted: the operators match
+/// shapes in the compiled bytes, and the bytes depend on the host's Cranelift lowering (which
+/// `cranelift_native` tunes to the runner's CPU), so the window/D63/jump-table operators that fire
+/// freely on one host make nothing on another over the same seeds. The per-operator counts are
+/// printed under `--nocapture` instead, and every operator's liveness is pinned locally (the
+/// mutation tables in the PR) and explored by the libFuzzer twin. The gate is the two invariants.
 #[test]
 fn every_mutant_is_rejected() {
     let n: u64 = std::env::var("MUT_SEEDS")
@@ -63,6 +69,9 @@ fn every_mutant_is_rejected() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(2000);
     let s = sweep(0..n, 0x2799_2799);
+    for (op, made) in &s.made {
+        eprintln!("made {op}: {made}");
+    }
     assert!(
         s.unclean.is_empty(),
         "the validator flags its own accepted code ({} findings):\n{}",
@@ -75,15 +84,13 @@ fn every_mutant_is_rejected() {
         s.survivors.len(),
         s.survivors.join("\n")
     );
-    let idle: Vec<_> = s
-        .made
-        .iter()
-        .filter(|(_, &v)| v == 0)
-        .map(|(k, _)| *k)
-        .collect();
+    // A weak host-robust tripwire: the engine made *some* mutants (every host has calls, frames and
+    // branches, so the frame/call/jump operators always fire). A total of zero would mean the engine
+    // or the capture broke, not a host difference.
+    let total: usize = s.made.values().sum();
     assert!(
-        idle.is_empty(),
-        "operators that made no mutant over {n} seeds: {idle:?}"
+        total > 0,
+        "the mutation engine made no mutants at all over {n} seeds"
     );
 }
 
