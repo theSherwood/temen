@@ -614,7 +614,8 @@ impl Window {
             return false;
         }
         // Read after the release, as a waiter counts itself before it last looks at the gate: one
-        // of the two sees the other.
+        // of the two sees the other. (loom models no host park, so no waiter parks there.)
+        #[cfg(not(loom))]
         if self.gate_waiters.load(Ordering::SeqCst) != 0 {
             // SAFETY: the window's handler context names its live domain, whose hub its parks use.
             unsafe { os_thread_rt::wake_host_parks_in(self.vm.sched as usize, self.gate_key()) };
@@ -624,6 +625,7 @@ impl Window {
 
     /// The key gate waiters park on, in the run's hub: the window's address, tagged clear of every
     /// bell's key.
+    #[cfg(not(loom))]
     fn gate_key(&self) -> u64 {
         (1 << 62) | self as *const Window as u64
     }
@@ -652,30 +654,43 @@ impl Window {
             // Looked at again once counted, before parking: a release before the count is seen
             // here, and one after it sees the count and wakes this wait, parked or still on its way
             // to the park (a task's park checks only once woken, and a wake meanwhile is latched).
-            let parked = if free() {
-                os_thread_rt::HostPark::Woken
-            } else {
-                os_thread_rt::park_host_call(
-                    vm,
-                    None,
-                    self.gate_key(),
-                    os_thread_rt::Parks::Fiber,
-                    || !free() && vm.ended().is_none(),
-                )
-            };
+            let looks_again = free() || self.park_waiter(vm, &free);
             self.gate_waiters.fetch_sub(1, Ordering::SeqCst);
-            match parked {
-                os_thread_rt::HostPark::Woken | os_thread_rt::HostPark::Frozen => {}
-                os_thread_rt::HostPark::Deadlock => {
-                    vm.raise(TrapKind::ThreadFault as i64);
-                    return false;
-                }
-                os_thread_rt::HostPark::Ended => {
-                    vm.raise(TrapKind::ThreadFault as i64);
-                    return false;
-                }
+            if !looks_again {
+                return false;
             }
         }
+    }
+
+    /// One park of a gate waiter, as `vm`'s (the waiter's context), until `free` may hold: `false`
+    /// when no live vCPU could ever end it (the deadlock verdict) or the run ended it, `vm`'s trap
+    /// cell then set.
+    ///
+    /// # Safety
+    /// As [`Self::wait_take`].
+    #[cfg(not(loom))]
+    unsafe fn park_waiter(&self, vm: &VmCtx, free: &dyn Fn() -> bool) -> bool {
+        let parked = os_thread_rt::park_host_call(
+            vm,
+            None,
+            self.gate_key(),
+            os_thread_rt::Parks::Fiber,
+            || !free() && vm.ended().is_none(),
+        );
+        match parked {
+            os_thread_rt::HostPark::Woken | os_thread_rt::HostPark::Frozen => true,
+            os_thread_rt::HostPark::Deadlock | os_thread_rt::HostPark::Ended => {
+                vm.raise(TrapKind::ThreadFault as i64);
+                false
+            }
+        }
+    }
+
+    /// loom models no host park, nor the fibers handlers run on, so no gate waiter parks there; this
+    /// arm keeps the crate compiling under `--cfg loom`, as `os_thread_rt`'s fiber arms do.
+    #[cfg(loom)]
+    unsafe fn park_waiter(&self, _vm: &VmCtx, _free: &dyn Fn() -> bool) -> bool {
+        unreachable!("loom models no host park")
     }
 }
 
