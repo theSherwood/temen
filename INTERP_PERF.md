@@ -632,6 +632,41 @@ To find what a real program allocates and where, run it under valgrind:
 
 `--smc-check=all-non-file` makes valgrind see code the JIT writes.
 
+## Loads, stores and op size (#2486)
+
+The #2486 survey ran QuickJS and chibicc on the bytecode engine under callgrind's cache
+simulation. Two costs led its run time:
+
+- **A load cost about 92 instructions, a store 79**, 17–22% of all instructions. Phase 2's fast
+  path was an out-of-line call that decoded its `LoadOp` through a jump table, dispatched on the
+  backing once for its bound and again for the access, and built a `Value` only to unpack it.
+  Now the fast path inlines into the loop, and the exact path stays out of line (`*_cold`). A
+  flat backing's `read_word`/`write_word` inline too, as a bound and one load, against one
+  snapshot of the backing (`Region::backing_for`). A load fills its slot from its width and
+  sign extension (`load_shape`, `loaded_slot`), which a test pins to the oracle's `Mem::load`
+  for every op on both paths.
+- **An op was 72 bytes**, more than a cache line, and the dispatch's load of each op's tag was
+  58–64% of the loop's L1 read misses. The conditional branches carried two inline edge-copy
+  lists. Now a function's edges keep their copies in one table on its `Program`, which a branch
+  names by index. The rarely run call ops box their operands. A const assertion keeps `Op` at 32
+  bytes or fewer.
+
+QuickJS `fib(22)` (instructions and misses in callgrind's simulation; allocations and peak heap in
+DHAT, over the whole start and run):
+
+| | before | inlined loads and stores | 32-byte ops |
+|---|--:|--:|--:|
+| instructions | 2,952M | 2,630M | 2,572M |
+| L1 read misses | 16.0M | 16.0M | 3.96M |
+| allocations | 129,676 | 129,676 | 118,586 |
+| peak heap | 26.1 MB | 26.1 MB | 23.7 MB |
+
+On chibicc, compiling a 1,000-function file, the inlined loads and stores take its instructions
+from 19,295M to 17,462M. On the dev box (an AMD EPYC 9V74), the fastest of 11 alternating runs of
+QuickJS `fib(25)` went 0.888 s → 0.835 s → 0.829 s, and of chibicc 1.675 s → 1.593 s → 1.657 s.
+The smaller op's fewer misses don't show in that time beyond the VM's noise; what it measurably buys
+is memory.
+
 ## Validation strategy (every phase)
 
 - Full differential oracle must stay green: `jit_diff`, `jit_fuzz`, `fiber_fuzz`, `concurrent_fuzz`,
