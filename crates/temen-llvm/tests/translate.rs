@@ -767,6 +767,20 @@ fn byval_and_sret_large_struct() {
 }
 
 #[test]
+fn byval_param_written_by_callee() {
+    // A struct passed by value that its callee writes to (`byval`, #2857): clang passes the caller's own
+    // object and leaves the copy to the call, so `f`'s write through `&s` must reach neither the
+    // caller's `s` nor its second call to `f`. Natively 9108108; without the copy, 3108008.
+    let src = "typedef struct { long a, b, c, d; int t; } S; void step(S *); long f(S); \
+               long run(long x){ S s = {x, 2, 3, 4, 9}; long r1 = f(s); long r2 = f(s); \
+                                 return r1 * 1000 + r2 + s.t * 1000000; } \
+               __attribute__((noinline)) void step(S *s){ s->t = 3; } \
+               __attribute__((noinline)) long f(S s){ long r = 0; \
+                 while (s.t == 9) { step(&s); r += 100; } return r + s.t + s.a; }";
+    check("bvwrite", src, &[Value::I64(5)], &[Value::I64(9_108_108)]);
+}
+
+#[test]
 fn int_minmax_bit_intrinsics() {
     // `a > b ? a : b` → `llvm.smax`; the bit builtins → `llvm.ctlz`/`ctpop`; `abs` → `llvm.abs`.
     check(

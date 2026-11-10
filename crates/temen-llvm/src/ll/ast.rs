@@ -739,6 +739,9 @@ pub trait HasDebugLoc {
 pub struct Parameter {
     pub name: Name,
     pub ty: TypeRef,
+    /// `byval(<ty>)`: the type the callee gets its own copy of, and the `align N` given with it (0 for
+    /// none). The parser makes the copy (`copy_byval_params`) and clears this.
+    pub byval: Option<(TypeRef, u32)>,
 }
 
 /// A defined function. Mirrors the `llvm_ir::Function` fields the translator reads (the rest —

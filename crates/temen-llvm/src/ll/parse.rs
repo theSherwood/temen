@@ -85,7 +85,9 @@ pub fn parse_module_with_debug(
     let mut p = Parser::new(toks);
     p.symbols = pre.symbols;
     p.collect_di_metadata();
-    let m = p.module()?;
+    let mut m = p.module()?;
+    // Before the debug info is built, which counts the copies' allocas as the lowering does.
+    copy_byval_params(&mut m)?;
     let ba = p.take_block_addrs(&m);
     let debug = super::debug::build(
         &p.di_meta,
@@ -95,6 +97,80 @@ pub fn parse_module_with_debug(
         p.func_names,
     );
     Ok((m, debug, ba))
+}
+
+/// LLVM's `byval` gives the callee its own copy of the pointee, made at the call, and nothing in the
+/// IR makes it: the caller passes its object's address, and a callee that writes to its parameter
+/// must not reach the caller's object. So a function that takes a `byval` parameter starts by
+/// copying it. The parameter is renamed, and under its old name an `alloca` of the type, filled from
+/// it by a `memcpy`, takes its place, which the lowering already handles.
+fn copy_byval_params(m: &mut Module) -> PResult<()> {
+    for f in &mut m.functions {
+        if f.basic_blocks.is_empty() {
+            continue;
+        }
+        let mut prologue = Vec::new();
+        for p in &mut f.parameters {
+            let Some((ty, align)) = p.byval.take() else {
+                continue;
+            };
+            let what =
+                |e: crate::Error| ParseError::new(0, format!("byval in `{}`: {e:?}", f.name));
+            let size = crate::type_size(&ty, &m.types).map_err(what)?;
+            let align = crate::type_align(&ty, &m.types)
+                .map_err(what)?
+                .max(align as u64);
+            let copy = p.name.clone();
+            p.name = Name::Name(Box::new(match &copy {
+                Name::Name(s) => format!("{s}.byval"),
+                Name::Number(n) => format!("{n}.byval"),
+            }));
+            let ptr = m.types.pointer(0);
+            let int = |bits, value| {
+                Operand::ConstantOperand(ConstantRef::new(Constant::Int { bits, value }))
+            };
+            let local = |name: &Name| Operand::LocalOperand {
+                name: name.clone(),
+                ty: ptr.clone(),
+            };
+            let memcpy_ty = m.types.func_type(
+                m.types.void(),
+                vec![ptr.clone(), ptr.clone(), m.types.int(64), m.types.bool()],
+                false,
+            );
+            prologue.push(Instruction::Alloca(Alloca {
+                allocated_type: ty,
+                num_elements: int(32, 1),
+                dest: copy.clone(),
+                alignment: align as u32,
+                debugloc: None,
+            }));
+            prologue.push(Instruction::Call(Call {
+                function: Either::Right(Operand::ConstantOperand(ConstantRef::new(
+                    Constant::GlobalReference {
+                        name: Name::Name(Box::new("llvm.memcpy.p0.p0.i64".into())),
+                        ty: memcpy_ty.clone(),
+                    },
+                ))),
+                function_ty: memcpy_ty,
+                arguments: vec![
+                    (local(&copy), Vec::new()),
+                    (local(&p.name), Vec::new()),
+                    (int(64, size as u128), Vec::new()),
+                    (int(1, 0), Vec::new()),
+                ],
+                dest: None,
+                is_tail_call: false,
+                debugloc: None,
+            }));
+        }
+        if !prologue.is_empty() {
+            let entry = &mut f.basic_blocks[0].instrs;
+            prologue.append(entry);
+            *entry = prologue;
+        }
+    }
+    Ok(())
 }
 
 /// A `blockaddress` target as it appears in the text: `(@func name, %block label)`.
@@ -1016,9 +1092,25 @@ impl Parser {
             // Skip parameter attributes (barewords / `align N` / `byval(<ty>)` / `dereferenceable(N)` /
             // attribute-group `#N`) until the name, the comma, or the closing paren — tracking nesting
             // so a paren/bracket-payload attr's own delimiters aren't mistaken for the list's end.
+            // `byval(<ty>)` and its `align N` are kept: the callee must copy that argument.
             let mut depth = 0i32;
+            let (mut byval, mut align) = (None, 0u32);
             loop {
                 match self.peek() {
+                    Some(Token::Word(w))
+                        if depth == 0 && w == "byval" && self.peek2() == Some(&Token::LParen) =>
+                    {
+                        self.pos += 2;
+                        byval = Some(self.type_()?);
+                        self.expect(&Token::RParen)?;
+                    }
+                    Some(Token::Word(w)) if depth == 0 && w == "align" => {
+                        self.pos += 1;
+                        if let Some(Token::Int(n)) = self.peek() {
+                            align = n.parse().unwrap_or(0);
+                            self.pos += 1;
+                        }
+                    }
                     Some(Token::LParen) | Some(Token::LBracket) | Some(Token::Lt) => {
                         depth += 1;
                         self.pos += 1;
@@ -1045,7 +1137,11 @@ impl Parser {
                 // An unnamed parameter (a `declare`-style prototype) — give it its positional number.
                 _ => Name::Number(params.len()),
             };
-            params.push(Parameter { name, ty });
+            params.push(Parameter {
+                name,
+                ty,
+                byval: byval.map(|t| (t, align)),
+            });
             if !self.eat(&Token::Comma) {
                 break;
             }
