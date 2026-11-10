@@ -266,16 +266,18 @@ fn a_fiber_switch_allocates_nothing() {
 }
 
 /// What a fiber's life allocates (#2486), until it allocates nothing: four times on the JIT and
-/// the tree-walker, twice on the bytecode engine. Any change fails here: one allocation more is a
-/// regression, and one fewer brings this pin down with it.
+/// the tree-walker, twice on the bytecode engine. Apple's JIT allocates once more: std's mutex
+/// there is a pthread mutex, boxed the first time it is locked, and the JIT gives each fiber a slot
+/// with mutexes of its own. Any change fails here: one allocation more is a regression, and one
+/// fewer brings this pin down with it.
 #[test]
 fn a_fiber_life_allocates_no_more_than_it_did() {
     let m = fiber_lives();
-    for (e, was) in ENGINES.into_iter().zip([4.0, 2.0, 4.0]) {
-        let now = per_op(e.run(&m, false));
-        assert!(
-            (now - was).abs() < 0.01,
-            "{e:?}: a fiber's life allocates {now:.3} times, not {was}: update this when it falls"
-        );
-    }
+    let jit = if cfg!(target_vendor = "apple") { 5.0 } else { 4.0 };
+    let was = [jit, 2.0, 4.0];
+    let now = ENGINES.map(|e| per_op(e.run(&m, false)));
+    assert!(
+        now.iter().zip(was).all(|(n, w)| (n - w).abs() < 0.01),
+        "a fiber's life allocates {now:?} times on {ENGINES:?}, not {was:?}: update this when it falls"
+    );
 }

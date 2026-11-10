@@ -620,7 +620,9 @@ sizes so compiling and setting up cancel out.
 | a fiber switch | 0 | 0 | 0 |
 | a fiber's life (start, run to its return) | 4 | 2 | 4 |
 
-The last row is pinned at what it is, so it can only come down.
+The last row is pinned at what it is, so it can only come down. On Apple targets the JIT's is 5:
+std's mutex there is a pthread mutex, boxed the first time it is locked, and the JIT gives each
+fiber a slot with mutexes of its own.
 
 To find what a real program allocates and where, run it under valgrind:
 
