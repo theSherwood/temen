@@ -304,9 +304,30 @@ tracked enhancement, not a blocker.
       61% more instructions than the default link. The cleanup is the default's: after the rounds,
       every optional pass saves 0.1% of the kernel's instructions, and takes `hexer`'s link from 18 s
       to 4–5 minutes. On the kernel (a 1 MB search, `-d:danger`) it runs 34% fewer instructions and
-      36% less time on Cranelift, from a program 63% larger. On `hexer d` it runs 7% fewer
-      instructions, too few to show in 100 timed runs, from a program 2.8× as large that takes twice
-      as long to compile; the self-hosted toolchain keeps the default.
+      36% less time on Cranelift, from a program 63% larger. The self-hosted toolchain keeps the
+      default.
+    - **A speed round grows no caller past `LINKED_SPEED_MAX_CALLER` (8,192) instructions** (#2833).
+      A splice is rescanned and the later rounds inline into the copies earlier ones made, so a DAG
+      of small callees unfolded into one caller, a copy at every path, bounded only by each round's
+      budget. Two functions of unir's store unit grew from 368 and 269 instructions to 494,265 and
+      88,032, and `hexer`'s speed link stopped finishing:
+
+      | a speed link of | before | limit 65,536 | limit 8,192 | the default link |
+      |---|--:|--:|--:|--:|
+      | unir's store unit and a 6-line program: link | 158.6 s, 6.24 GB | 43.9 s, 1.93 GB | 5.8 s, 0.25 GB | 1.6 s, 0.13 GB |
+      | its start on Cranelift | 35.3 s, 6.48 GB | 20.8 s, 2.27 GB | 2.1 s, 0.16 GB | 1.0 s, 0.11 GB |
+      | `hexer`: link | unfinished at 12 min, 12.6 GB | unfinished at 6.7 min | 13.6 s, 0.51 GB | 6.9 s, 0.39 GB |
+      | `hexer`: the program | | | 5.51 MB | 2.08 MB |
+
+      65,536 still left many functions near the limit, and an in-place splice rebuilds its whole
+      block, so building each is quadratic. nisaba's regex and transform kernels, whose largest
+      function is 1,752 instructions, link byte for byte as without the limit, and so does every
+      default link: the default round and the optimizer's inliner take no limit (`usize::MAX`).
+      A function already past the limit, as `hexer`'s `evalImpl` (8,869), takes no more inlining.
+      On `hexer d` the capped speed link runs 10.6% fewer instructions than the default link:
+      4,620 M a run against 5,165 M (callgrind over two runs less one, with an eager compile,
+      `TEMEN_JIT_LAZY=off`). Its decode, verify and compile take 51.6 G instructions against
+      24.5 G.
     Fuel is charged per taken back edge (INVARIANTS #9), which every engine reads off the block
     indices: a branch to an equal-or-earlier block. In reverse postorder that is exactly a loop's back
     edge, while leng's own order puts an `if`'s join before its arms; on `hexer` that was 63% of its

@@ -236,6 +236,12 @@ pub struct InlineLimits {
     pub max_callee: usize,
     /// Instructions the pass may splice in all.
     pub budget: usize,
+    /// The largest a caller may grow to, in instructions: no splice takes it past this. Without it,
+    /// a DAG of small callees unfolds into one function, a copy at every path through it, as far as
+    /// the budget goes: under a speed link two functions of unir's store unit grew from 368 and 269
+    /// instructions to 494,265 and 88,032, and Cranelift's compile of one function grows faster than
+    /// linearly in its size (#2833). `usize::MAX` for none.
+    pub max_caller: usize,
 }
 
 impl InlineLimits {
@@ -244,6 +250,7 @@ impl InlineLimits {
     pub const OPTIMIZER: InlineLimits = InlineLimits {
         max_callee: 24,
         budget: 4096,
+        max_caller: usize::MAX,
     };
 }
 
@@ -622,7 +629,8 @@ pub fn inline_calls(m: &Module) -> Module {
 /// **Budgeted direct-call inliner.** Splice small callees into direct `call` sites in one forward
 /// pass — functions in index order, their blocks in order (including the blocks a splice appends),
 /// and each spliced body rescanned in place so its own calls inline too — until no eligible site
-/// remains or `limits.budget` is spent. A straight-line single-block callee is spliced
+/// remains, `limits.budget` is spent, or a splice would take its caller past `limits.max_caller`.
+/// A straight-line single-block callee is spliced
 /// in place ([`inline_single_block_call`]); a callee with internal control flow has its CFG spliced in
 /// ([`inline_multi_block_call`]). Direct self-recursion is skipped, and every inline spends budget, so
 /// cycles of small functions terminate.
@@ -646,6 +654,9 @@ pub fn inline_calls_with(m: &Module, limits: InlineLimits) -> Module {
     let mut touched = vec![false; funcs.len()];
 
     for ci in 0..funcs.len() {
+        // What the caller has grown to, counted from above: each splice adds its callee's size whole,
+        // though the call it replaces goes.
+        let mut caller_size = callee_total_insts(&funcs[ci]);
         // `blocks.len()` is re-read each time: a multi-block splice appends the callee's blocks and
         // the continuation, and the pass reaches them in turn.
         let mut bi = 0;
@@ -668,12 +679,15 @@ pub fn inline_calls_with(m: &Module, limits: InlineLimits) -> Module {
                     && callee < funcs.len()
                     && funcs[callee].params.len() == argc
                     && is_inlinable(&funcs[callee], limits.max_callee)
-                    && callee_total_insts(&funcs[callee]) <= budget;
+                    && callee_total_insts(&funcs[callee]) <= budget
+                    && callee_total_insts(&funcs[callee])
+                        <= limits.max_caller.saturating_sub(caller_size);
                 if !fits {
                     ii += 1;
                     continue;
                 }
                 budget -= callee_total_insts(&funcs[callee]);
+                caller_size += callee_total_insts(&funcs[callee]);
                 touched[ci] = true;
                 if funcs[callee].blocks.len() == 1 {
                     // Straight-line callee: its body now starts at `ii`, where the scan resumes.
