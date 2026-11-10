@@ -311,10 +311,15 @@ keep theirs.
 **The rules the transfer must get exactly right**, each a published escape class or a hole a review
 found (#2603):
 - Only a 64-bit write carries a fact; a narrower one clobbers its destination. The exact exceptions
-  are a 32-bit `mov r, imm`, a 32-bit `cmp`/`cmov` pair, and a 32-bit reg-reg `mov` (it zero-extends,
+  are a 32-bit `mov r, imm`, a 32-bit `cmp`/`cmov` pair, a 32-bit reg-reg `mov` (it zero-extends,
   so it keeps a bounded source's bound, clamped to `2^32` — a spilled/moved window index stays
-  confined, #2784). CVE-2021-32629 was a 32-bit spill reloaded with sign extension into code that
-  relied on the zero-extended upper half, so a *narrower* spill or reload restores nothing.
+  confined, #2784), and every other 32-bit ALU or shift write of a register, which zero-extends too,
+  so it leaves a value below `2^32` even when it wraps: a lowering elides D63 for an index computed in
+  32 bits on that bound (#2815), as Cranelift elides the `uextend` after one. An 8- or 16-bit write
+  keeps the register's upper bits, so it stays a clobber whatever the operand-size prefixes say. A
+  64-bit `shr` or `shl` by a known count keeps a bound, `shl` only while it cannot carry out.
+  CVE-2021-32629 was a 32-bit spill reloaded with sign extension into code that relied on the
+  zero-extended upper half, so a *narrower* spill or reload restores nothing.
 - A `cmov` confines only when it tests the flags of a `cmp` against a known bound, with no flag write
   in between, and its condition takes the compared value only while it is below that bound.
 - No constant is read from bytes a relocation patches. D63's bound is a constant-pool operand, since
