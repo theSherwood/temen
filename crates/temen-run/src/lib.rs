@@ -294,7 +294,7 @@ impl HostParkReq {
         };
         let key = probe.as_ref().map_or(Self::STDIN, |p| p.gid() as u64);
         let still_parked = || probe.as_ref().is_none_or(|p| !p.ready());
-        match temen_jit::park_host_call(vm, freeze, key, Parks::Fiber, still_parked) {
+        match temen_jit::park_host_call(vm, freeze, key, Parks::Fiber, None, still_parked) {
             temen_jit::HostPark::Woken => true,
             temen_jit::HostPark::Frozen | temen_jit::HostPark::Ended => false,
             temen_jit::HostPark::Deadlock => {
@@ -2992,7 +2992,8 @@ unsafe fn ring(g: &Host) {
 /// counted for the run's deadlock verdict as every other park is, ends on a kill or the domain's
 /// teardown, and a task's wait parks the task rather than its worker thread. With no bell nothing
 /// can ring it: it ends only on the verdict, a kill or the teardown. A wait that `freeze` watches
-/// also ends when a freeze lands.
+/// also ends when a freeze lands. One with `spin_until` watches the bell until then before it blocks,
+/// where it would block its thread (#2823).
 ///
 /// # Safety
 /// `vm` is the live call's context, and the caller holds no lock.
@@ -3002,9 +3003,10 @@ unsafe fn park_on_bell(
     seen: u64,
     parks: Parks,
     freeze: Option<temen_jit::FreezeWatch>,
+    spin_until: Option<std::time::Instant>,
 ) -> temen_jit::HostPark {
     let key = bell.map_or(1 << 63, bell_key);
-    temen_jit::park_host_call(vm, freeze, key, parks, || {
+    temen_jit::park_host_call(vm, freeze, key, parks, spin_until, || {
         bell.is_none_or(|b| b.load(std::sync::atomic::Ordering::Acquire) == seen)
     })
 }
@@ -3215,18 +3217,23 @@ unsafe fn serve_locked(
         if frozen() {
             break Some(0);
         }
-        if !wait || count != 0 {
+        // #2842 — a handler of this window whose call into this domain is in flight is not back
+        // yet, though this loop may have answered it: the oracle's serve op would find it woken
+        // and resume it first, so wait for it here as for any other ring.
+        let self_calls = site.as_ref().is_some_and(|s| s.self_calls_in_flight());
+        if (!wait || count != 0) && !self_calls {
             break Some(count);
         }
         // #1217 — a client of this domain has finished since its last wait: answer the timed form's
         // no-progress `0`, so the server reaches its `join` instead of waiting on a caller that is
         // gone. A server with other live clients sees a spurious `0` and waits again.
-        if guard.take_client_gone() {
+        if !self_calls && guard.take_client_gone() {
             break Some(0);
         }
-        // Empty queue on `svc.wait`, nothing served, and no handler of this window woken: the arm-5
-        // park, until the bell rings — a new dispatch, a handler's end, a gate given back. The gate
-        // goes back for the park, so a woken handler of this window runs meanwhile.
+        // Empty queue, nothing to answer yet (nothing served on `svc.wait`, or a handler's call into
+        // this domain still in flight) and no handler of this window woken: the arm-5 park, until
+        // the bell rings — a new dispatch, a handler's end, a gate given back. The gate goes back for
+        // the park, so a woken handler of this window runs meanwhile.
         // A caller finding the serve op parked (published) may start its own call's handler on its
         // own thread, taking the gate (the direct handoff, [`live_reply`]).
         let seen = bell_now(bell.as_ref());
@@ -3237,7 +3244,7 @@ unsafe fn serve_locked(
         }
         drop(guard);
         let serving = freeze.map(temen_jit::FreezeWatch::serving);
-        let parked = park_on_bell(vm, bell.as_ref(), seen, Parks::Fiber, serving);
+        let parked = park_on_bell(vm, bell.as_ref(), seen, Parks::Fiber, serving, None);
         guard = lock();
         if let Some(s) = &site {
             guard.withdraw_site(Arc::as_ptr(s) as *const ());
@@ -3410,7 +3417,10 @@ unsafe fn live_reply(
     // #2742 — a serve handler's call gives its window's gate back for the call, as on the oracle,
     // where a handler's call parks it, and takes it back once the call is answered: the window's
     // serve op serves meanwhile, a call the handler's own call makes into its domain included.
-    let aside = temen_jit::handler_steps_aside(vm);
+    // #2842 — that one, a call into the handler's own domain (its powerbox is the callee's), keeps
+    // the serve op in its serve op until the handler is back: the serve op answers it.
+    let self_call = matches!(caller, CallerHost::Cell(own) if std::ptr::eq(*own, callee));
+    let aside = temen_jit::handler_steps_aside(vm, self_call);
     let reply = live_call(caller, callee, export, fast, op, args, params, vm);
     if let Some(aside) = aside {
         if !temen_jit::handler_steps_back(aside, vm) {
@@ -3477,7 +3487,7 @@ unsafe fn live_call(
         // `FIBER_PARKED`, as on the oracle. `seen` was read before the enqueue, so a settle since
         // has moved the bell past it, and the park ends at the fiber's next resume.
         drop(guard);
-        if !park_until_rung(&bell, seen, Parks::Fiber, vm) {
+        if !park_until_rung(&bell, seen, Parks::Fiber, None, vm) {
             return None;
         }
         guard = callee.lock().unwrap_or_else(|e| e.into_inner());
@@ -3561,7 +3571,7 @@ unsafe fn handoff_call(
         }
         // Parked, its end rings the callee's bell; a callee that ends first drains it, which ends
         // it with `CAP_REVOKED`.
-        if !park_until_rung(&bell, seen, Parks::Fiber, vm) {
+        if !park_until_rung(&bell, seen, Parks::Fiber, None, vm) {
             return None;
         }
     }
@@ -3609,7 +3619,8 @@ fn handoff_site(
 /// serve loop to settle `ticket`. The result, `CAP_REVOKED` when the callee's serve loop is gone with
 /// it unserved (the dead-callee edge, probeable, never a hang: D37 death-is-revocation), or `None`
 /// when the wait ended without one: the deadlock verdict, a kill, or this domain's teardown, with the
-/// trap cell set to unwind the caller.
+/// trap cell set to unwind the caller. Before a park blocks the caller's thread, it watches the bell
+/// for [`SETTLE_SPIN`], in all, for the reply (#2823).
 unsafe fn await_settle<'a>(
     callee: &'a Mutex<Host>,
     mut guard: std::sync::MutexGuard<'a, Host>,
@@ -3618,6 +3629,8 @@ unsafe fn await_settle<'a>(
     parks: Parks,
     vm: &temen_jit::VmCtx,
 ) -> Option<Reply> {
+    // One watch for the whole wait: a ring for anything else does not extend it.
+    let spin_until = Some(std::time::Instant::now() + SETTLE_SPIN);
     loop {
         if let Some(r) = guard.svc_result(ticket) {
             return Some(r);
@@ -3628,23 +3641,30 @@ unsafe fn await_settle<'a>(
         // Until the callee's settle (or its end) rings its bell.
         let seen = bell_now(Some(bell));
         drop(guard);
-        if !park_until_rung(bell, seen, parks, vm) {
+        if !park_until_rung(bell, seen, parks, spin_until, vm) {
             return None;
         }
         guard = callee.lock().unwrap_or_else(|e| e.into_inner());
     }
 }
 
-/// Park on `bell`, as `parks` says, until it rings past `seen`: `true`, or `false` with the trap
-/// cell set — nothing live can ring it (the oracle's deadlock verdict), a kill, or this domain's
-/// teardown.
+/// #2823 — how long, in all, a caller waiting for a live call's reply watches the callee's bell
+/// before its park blocks, where it would block the caller's thread ([`temen_jit::park_host_call`]).
+/// A callee's reply takes a few microseconds; a block and the wake that ends it take tens when the
+/// two run on different cores.
+const SETTLE_SPIN: std::time::Duration = std::time::Duration::from_micros(20);
+
+/// Park on `bell`, as `parks` says, until it rings past `seen` (watching it until `spin_until` first,
+/// [`park_on_bell`]): `true`, or `false` with the trap cell set — nothing live can ring it (the
+/// oracle's deadlock verdict), a kill, or this domain's teardown.
 unsafe fn park_until_rung(
     bell: &Arc<std::sync::atomic::AtomicU64>,
     seen: u64,
     parks: Parks,
+    spin_until: Option<std::time::Instant>,
     vm: &temen_jit::VmCtx,
 ) -> bool {
-    match park_on_bell(vm, Some(bell), seen, parks, None) {
+    match park_on_bell(vm, Some(bell), seen, parks, None, spin_until) {
         temen_jit::HostPark::Woken => true,
         temen_jit::HostPark::Deadlock => {
             vm.raise(temen_jit::TrapKind::ThreadFault as i64);
@@ -3688,7 +3708,7 @@ unsafe fn request_page(
         }
         let seen = bell_now(Some(&bell));
         drop(guard);
-        if !park_until_rung(&bell, seen, Parks::Vcpu, vm) {
+        if !park_until_rung(&bell, seen, Parks::Vcpu, None, vm) {
             return None;
         }
         guard = pager.lock().unwrap_or_else(|e| e.into_inner());

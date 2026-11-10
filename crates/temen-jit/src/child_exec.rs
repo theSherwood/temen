@@ -471,6 +471,13 @@ pub(crate) struct Window {
     /// How many wait to take the gate, parked on its key ([`Window::wait_take`]): a release wakes
     /// them only when there are some.
     gate_waiters: AtomicUsize,
+    /// Its handlers' live calls into its own domain in flight, each from the gate its handler gave
+    /// back for it until the handler takes the gate back ([`handler_steps_aside`]). Its serve op
+    /// answers such a call, and on the oracle the answer wakes the handler at once, so the serve op
+    /// resumes it before it returns. Here the handler may not be back from its call yet, nor filed
+    /// with the pool, so the serve op cannot see it woken: it stays in its serve op until the
+    /// handler is back ([`ServeSite::self_calls_in_flight`]).
+    self_calls: AtomicUsize,
 }
 
 // SAFETY: a window is shared by its serve op and its handlers, wherever they run. Its fields are
@@ -686,6 +693,7 @@ impl Window {
             None,
             self.gate_key(),
             os_thread_rt::Parks::Fiber,
+            None,
             || !free() && vm.ended().is_none(),
         );
         match parked {
@@ -709,6 +717,19 @@ impl Window {
 pub struct GateAside {
     window: *const Window,
     me: u64,
+    /// The wait is a live call into the handler's own domain ([`Window::self_calls`]), in flight
+    /// until this goes, after the handler has stepped back or its domain has ended.
+    self_call: bool,
+}
+
+impl Drop for GateAside {
+    fn drop(&mut self) {
+        if self.self_call {
+            // SAFETY: a handler context's window outlives every handler running as it, and this
+            // lives in a handler's own frame.
+            unsafe { (*self.window).self_calls.fetch_sub(1, Ordering::SeqCst) };
+        }
+    }
 }
 
 /// #2742 — code running as a serve handler parks on an event, or makes a live call: if it holds its
@@ -716,7 +737,9 @@ pub struct GateAside {
 /// meanwhile, as on the oracle, where a handler's park frees its serving vCPU. A handler on a fiber
 /// of its own and one on a caller's stack alike. `None` when `vm` is no handler's context, or the
 /// gate is not held here (it was given back already, for the live call this park is part of).
-pub fn handler_steps_aside(vm: &VmCtx) -> Option<GateAside> {
+/// `self_call`: the wait is a live call into the handler's own domain, which counts as in flight
+/// until the handler steps back ([`Window::self_calls`]).
+pub fn handler_steps_aside(vm: &VmCtx, self_call: bool) -> Option<GateAside> {
     let window = vm.handler_window.load(Ordering::Acquire);
     // A guest fiber's park parks the fiber alone, and the handler's own code runs on, as the fiber's
     // resumer, with the gate.
@@ -725,17 +748,40 @@ pub fn handler_steps_aside(vm: &VmCtx) -> Option<GateAside> {
     }
     let me = fiber_rt::context_id();
     // SAFETY: a handler context's window outlives every handler running as it.
-    unsafe { (*window).release(me) }.then_some(GateAside { window, me })
+    let w = unsafe { &*window };
+    if !w.held_by(me) {
+        return None;
+    }
+    // #2842 — the `vcpu.tls` word goes with the gate, to whichever handler of the window or its
+    // serve op takes it next (R2: the word goes with execution), and the call counts before the gate
+    // goes, so the serve op that takes it next sees both.
+    w.tls.store(vcpu_tls::get(), Ordering::Relaxed);
+    if self_call {
+        w.self_calls.fetch_add(1, Ordering::SeqCst);
+    }
+    let released = w.release(me);
+    debug_assert!(released, "the gate's holder gives it back");
+    Some(GateAside {
+        window,
+        me,
+        self_call,
+    })
 }
 
 /// #2742 — ...and takes it back after, before the handler's code runs on: waiting while the window
-/// is shut or another holds the gate. `false` when the handler's domain has ended meanwhile, its trap
-/// cell then set to unwind it.
+/// is shut or another holds the gate, the `vcpu.tls` word as the window's other handlers left it with
+/// it. `false` when the handler's domain has ended meanwhile, its trap cell then set to unwind it. A
+/// call into its own domain is back once the handler holds the gate again, or its domain has ended.
 ///
 /// # Safety
 /// `vm` is the context `aside` was given back from.
 pub unsafe fn handler_steps_back(aside: GateAside, vm: &VmCtx) -> bool {
-    (*aside.window).wait_take(aside.me, vm)
+    let window = &*aside.window;
+    if !window.wait_take(aside.me, vm) {
+        return false;
+    }
+    vcpu_tls::seed(window.tls.load(Ordering::Relaxed));
+    true
 }
 
 /// #2742 — a window's handlers, as the run's deadlock predicate counts them: in the domain's `live`
@@ -954,6 +1000,7 @@ impl ServeSite {
             open: std::sync::atomic::AtomicBool::new(false),
             gate: AtomicU64::new(0),
             gate_waiters: AtomicUsize::new(0),
+            self_calls: AtomicUsize::new(0),
         });
         // Its handler context names it, for the gate a handler's park gives back.
         window
@@ -1047,6 +1094,12 @@ impl ServeSite {
     /// [`Self::resume_woken`] worth its pool lock.
     pub fn holds_handlers(&self) -> bool {
         self.window.pooled.load(Ordering::Acquire) != 0
+    }
+
+    /// Whether a handler of this window has a live call into this domain in flight, which the serve
+    /// op answers: it does not leave its serve op until the handler is back ([`Window::self_calls`]).
+    pub fn self_calls_in_flight(&self) -> bool {
+        self.window.self_calls.load(Ordering::SeqCst) != 0
     }
 
     /// Resume a woken handler of this window here, holding the gate: what the serve op does first,
@@ -1630,11 +1683,16 @@ impl ChildExec {
         let mut g = lock(&self.state);
         let id = g.next_id;
         g.next_id += 1;
+        // #2845 — one whose domain has ended meanwhile (it parked on a caller's thread while a trap
+        // or the root's end and its drain ran) is drained on arrival: its window never opens again,
+        // and the domain's drain, which takes this lock after it records the end, may have run
+        // without it, so nothing else would run it to unwind.
         let w = g
             .windows
             .entry(h.window.key())
             .or_insert_with(|| WindowCount {
                 open: h.window.open.load(Ordering::Acquire),
+                draining: h.window.vm.ended().is_some(),
                 ..WindowCount::default()
             });
         w.domain = h.window.vm.domain_key();
@@ -2327,7 +2385,12 @@ impl ChildExec {
             shadow: None,
         };
         let (outcome, tls, handlers) = self.reside(r, pool);
-        h.window.tls.store(tls, Ordering::Relaxed);
+        // #2842 — the word is the gate holder's: one that gave the gate back for a wait gave the
+        // word back with it ([`handler_steps_aside`]), and whoever holds the gate now may have
+        // changed it since.
+        if h.window.held_by(h.id()) {
+            h.window.tls.store(tls, Ordering::Relaxed);
+        }
         h.serve_handlers = handlers;
         h.reusable = matches!(outcome, Outcome::Done);
         outcome
