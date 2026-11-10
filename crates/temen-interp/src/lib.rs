@@ -13140,12 +13140,13 @@ impl FiberRegistry {
 /// The first argument is `cont.new`'s `arg0`, the creator's word (a §3d frontend passes the
 /// fiber's data-stack base there, as its functions take their data-SP first); the second carries
 /// the first-resume value in, and the result carries the final value out (a window pointer can
-/// carry richer payloads).
-fn fiber_sig() -> FuncType {
-    FuncType {
+/// carry richer payloads). Built once: every fiber start type-checks its entry against it (#2486).
+fn fiber_sig() -> &'static FuncType {
+    static SIG: std::sync::LazyLock<FuncType> = std::sync::LazyLock::new(|| FuncType {
         params: vec![ValType::I64, ValType::I64],
         results: vec![ValType::I64],
-    }
+    });
+    &SIG
 }
 
 /// #2043 D1 — a domain's children: its `thread.spawn` threads and its §14 children, in one
@@ -15002,6 +15003,8 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
     // Value buffers of returned frames, which calls reuse ([`callee_vals`]): a call then allocates
     // nothing once warmed. A few suffice, as the pool only bridges a return to the next call.
     let mut spare: Vec<Vals> = Vec::new();
+    // #2486 — the frame stack of the fiber that last returned, which the next fiber's start reuses.
+    let mut spare_frames: Vec<Frame> = Vec::new();
     // Reusable scratch for `return` results. The common case (a callee returning to a caller in
     // the same fiber) gathers results here and copies them straight into the caller's value
     // file, so a call/return pair no longer allocates a results `Vec` per return. The rarer
@@ -18096,22 +18099,23 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             // in submitted units). A forged / wrong-type funcref is a **fiber** fault
                             // (the fault arose from a `cont.*` op), joining the forged-handle / dead /
                             // bomb family and matching the JIT's first-resume type-check.
-                            let (cmod, cfunc) = dispatch_indirect(
-                                dt,
-                                &funcs,
-                                units,
-                                invoked,
-                                funcref,
-                                &fiber_sig(),
-                            )
-                            .map_err(|_| Trap::FiberFault)?;
-                            vec![Frame {
+                            let (cmod, cfunc) =
+                                dispatch_indirect(dt, &funcs, units, invoked, funcref, fiber_sig())
+                                    .map_err(|_| Trap::FiberFault)?;
+                            // #2486 — the frames and values of a fiber that returned, so a
+                            // fiber's start allocates nothing once warmed.
+                            let mut vals = spare_vals(&mut spare);
+                            vals.extend([Reg::from_i64(arg0), Reg::from_i64(av)]);
+                            let mut f = std::mem::take(&mut spare_frames);
+                            f.clear(); // already empty, as a returned fiber's stack is
+                            f.push(Frame {
                                 func: cfunc,
                                 module: cmod,
                                 block: 0,
                                 inst: 0,
-                                vals: vec![Reg::from_i64(arg0), Reg::from_i64(av)].into(),
-                            }]
+                                vals,
+                            });
+                            f
                         }
                         Claimed::Live(mut f) => {
                             f.last_mut()
@@ -19002,11 +19006,18 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         leaving,
                         *cur,
                     );
-                    *frames = if *cur == ROOT_FIBER {
-                        root_parked.take().ok_or(Trap::Malformed)?
-                    } else {
-                        registry.unpark_resumer(*cur)?
-                    };
+                    let returned = std::mem::replace(
+                        frames,
+                        if *cur == ROOT_FIBER {
+                            root_parked.take().ok_or(Trap::Malformed)?
+                        } else {
+                            registry.unpark_resumer(*cur)?
+                        },
+                    );
+                    // #2486 — the next fiber's start takes the returned one's (empty) frames.
+                    if returned.capacity() <= SPARE_FRAMES {
+                        spare_frames = returned;
+                    }
                     *parked_frames -= frames.len();
                     let rtop = frames.len() - 1;
                     // CALLS.md 4a — a returning **offer-animation** handler settles cross-world here
@@ -19122,6 +19133,9 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         frames[rtop]
                             .vals
                             .push(ret_buf.first().copied().unwrap_or(Reg::from_i64(0)));
+                    }
+                    if let Some(p) = popped {
+                        recycle(&mut spare, p.vals);
                     }
                 }
             }
@@ -22355,6 +22369,11 @@ pub struct NodeRef {
 }
 
 impl NodeRef {
+    /// Whether this names the same node of the same tree as `other`.
+    pub fn same(&self, other: &NodeRef) -> bool {
+        Arc::ptr_eq(&self.tree, &other.tree) && self.node == other.node
+    }
+
     /// A draw of up to [`FUEL_CHUNK`] from the chain, charged to every level: `None` when every level
     /// is unbounded (nothing to meter), `Some(0)` when the chain is spent.
     pub fn draw(&self) -> Option<u64> {
@@ -39641,12 +39660,23 @@ fn branch(
 
 /// A called frame's values: `args` of its caller's `vals`, in a buffer from `spare` when it has one.
 fn callee_vals(spare: &mut Vec<Vals>, vals: &[Reg], args: &[ValIdx]) -> Result<Vals, Trap> {
-    let mut callee = spare.pop().unwrap_or_default();
-    callee.above.clear();
-    callee.chain.clear();
+    let mut callee = spare_vals(spare);
     collect_into(&mut callee.cur, vals, args)?;
     Ok(callee)
 }
+
+/// An empty frame's values, in a buffer from `spare` when it has one.
+fn spare_vals(spare: &mut Vec<Vals>) -> Vals {
+    let mut vals = spare.pop().unwrap_or_default();
+    vals.cur.clear();
+    vals.above.clear();
+    vals.chain.clear();
+    vals
+}
+
+/// #2486 — the most frames a returned fiber's stack may hold room for and still be kept for the
+/// next fiber's start: a fiber that recursed deep frees its stack rather than holding it.
+const SPARE_FRAMES: usize = 16;
 
 /// Return a finished frame's value buffer to `spare` for a later call.
 fn recycle(spare: &mut Vec<Vals>, vals: Vals) {

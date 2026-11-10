@@ -1,5 +1,5 @@
 //! #2486 — what a guest does once per operation allocates nothing, on any engine: a capability
-//! call, a call to a guest function, a fiber switch.
+//! call, a call to a guest function, a fiber switch, a fiber's whole life.
 //!
 //! A counting allocator stands in for the global one, and each path runs at two sizes. What the
 //! larger run allocates beyond the smaller is what its extra operations allocated; compiling and
@@ -265,23 +265,12 @@ fn a_fiber_switch_allocates_nothing() {
     }
 }
 
-/// What a fiber's life allocates (#2486), until it allocates nothing: four times on the JIT and
-/// the tree-walker, twice on the bytecode engine. Apple's JIT allocates once more: std's mutex
-/// there is a pthread mutex, boxed the first time it is locked, and the JIT gives each fiber a slot
-/// with mutexes of its own. Any change fails here: one allocation more is a regression, and one
-/// fewer brings this pin down with it.
+/// A fiber's life, started and run to its return: what a finished fiber held (its slot, its `Vm`,
+/// its frames) serves the next, and its stack comes from the arena.
 #[test]
-fn a_fiber_life_allocates_no_more_than_it_did() {
+fn a_fiber_life_allocates_nothing() {
     let m = fiber_lives();
-    let jit = if cfg!(target_vendor = "apple") {
-        5.0
-    } else {
-        4.0
-    };
-    let was = [jit, 2.0, 4.0];
-    let now = ENGINES.map(|e| per_op(e.run(&m, false)));
-    assert!(
-        now.iter().zip(was).all(|(n, w)| (n - w).abs() < 0.01),
-        "a fiber's life allocates {now:?} times on {ENGINES:?}, not {was:?}: update this when it falls"
-    );
+    for e in ENGINES {
+        assert_free(&format!("{e:?} fiber life"), per_op(e.run(&m, false)));
+    }
 }

@@ -123,7 +123,7 @@ mod switch_tests {
     #[test]
     fn switch_roundtrip_accumulates() {
         let stack = Stack::new(64 * 1024).unwrap();
-        let mut ctx = unsafe { make(&stack, summer) };
+        let mut ctx = unsafe { make(&stack, 0, summer) };
         for (payload, want) in [(5u64, 5u64), (10, 15), (100, 115), (1, 116)] {
             let t = unsafe { jump(ctx, payload) };
             ctx = t.fctx;
@@ -152,7 +152,7 @@ mod switch_tests {
     fn runs_on_the_fiber_stack() {
         let stack = Stack::new(64 * 1024).unwrap();
         let (lo, hi) = stack.usable_range();
-        let ctx = unsafe { make(&stack, report_sp) };
+        let ctx = unsafe { make(&stack, 0, report_sp) };
         let t = unsafe { jump(ctx, 0) };
         let addr = t.data as usize;
         assert!(
@@ -179,7 +179,7 @@ mod switch_tests {
     #[test]
     fn recursion_on_fiber_stack() {
         let stack = Stack::new(256 * 1024).unwrap();
-        let ctx = unsafe { make(&stack, fibber) };
+        let ctx = unsafe { make(&stack, 0, fibber) };
         let t = unsafe { jump(ctx, 25) };
         assert_eq!(t.data, 75025); // fib(25)
     }
@@ -188,7 +188,7 @@ mod switch_tests {
     #[test]
     fn many_switches_are_stable() {
         let stack = Stack::new(64 * 1024).unwrap();
-        let mut ctx = unsafe { make(&stack, summer) };
+        let mut ctx = unsafe { make(&stack, 0, summer) };
         let mut expect = 0u64;
         for i in 0..100_000u64 {
             expect = expect.wrapping_add(i | 1); // never u64::MAX
@@ -203,8 +203,8 @@ mod switch_tests {
     fn two_fibers_independent() {
         let sa = Stack::new(64 * 1024).unwrap();
         let sb = Stack::new(64 * 1024).unwrap();
-        let mut a = unsafe { make(&sa, summer) };
-        let mut b = unsafe { make(&sb, summer) };
+        let mut a = unsafe { make(&sa, 0, summer) };
+        let mut b = unsafe { make(&sb, 0, summer) };
         let ta = unsafe { jump(a, 3) };
         a = ta.fctx;
         let tb = unsafe { jump(b, 7) };

@@ -312,9 +312,10 @@ pub(crate) struct FiberSlot {
     /// it in lockstep. Purely diagnostic: exclusivity itself is the `Ownership` CAS.
     running_on: AtomicU64,
     /// The parked native fiber. `Some` while the slot is `OWNED` (fresh) or `RUNNABLE`
-    /// (suspended); the box stays in place during a resume (`RUNNING` guarantees the claimant
-    /// exclusive access) and is dropped — its stack unmapped — when the fiber returns (`finish`).
-    fiber: Mutex<Option<Box<Fiber>>>,
+    /// (suspended); it stays in place during a resume (`RUNNING` guarantees the claimant exclusive
+    /// access, and the slot's `Arc` keeps it at one address) and is dropped, its stack unmapped,
+    /// when the fiber returns (`finish`).
+    fiber: Mutex<Option<Fiber>>,
     /// **Durable** (DURABILITY.md §12.8): this fiber's saved shadow-SP — the extent of its
     /// continuation in its in-window shadow region. Initialized to the region base (empty); on a
     /// durable run the resume/return swap saves the live word here and restores it on the next
@@ -559,7 +560,7 @@ impl SharedFiberTable {
     /// `claim_gen` — and only when none is free does the table grow. `None` if a racing allocation
     /// filled the domain quota since [`Self::has_room`]. `charge` is the fiber's
     /// ([`Self::fiber_charge`]), held while the slot is its; a refusal drops it, handing it back.
-    fn create(&self, fiber: Box<Fiber>, func: i32, arg0: i64, charge: FiberCharge) -> Option<i64> {
+    fn create(&self, fiber: Fiber, func: i32, arg0: i64, charge: FiberCharge) -> Option<i64> {
         let mut t = self.lock();
         let reuse = t.free.peek().map(|&Reverse(s)| s);
         if reuse.is_none() && t.slots.len() + 1 >= self.max_fibers {
@@ -572,26 +573,25 @@ impl SharedFiberTable {
         } else {
             0
         };
-        let new_slot = Arc::new(FiberSlot {
-            own: Ownership::new_owned_at(generation),
-            running_on: AtomicU64::new(NOT_RUNNING),
-            fiber: Mutex::new(Some(fiber)),
-            // Fresh/reused: the shadow region starts empty (SP at the region base).
-            shadow_sp: AtomicU64::new(self.shadow.frame_base(slot + 1)), // §12.8 4A.5: empty = frame base (past the SP + thaw words)
-            func,
-            arg0,
-            event_park: AtomicBool::new(false),
-            park_deadline: Mutex::new(None),
-            park_on: Mutex::new(ParkOn::Event),
-            consumed: AtomicBool::new(false),
-            pending: Mutex::new(None),
-        });
+        let own = Ownership::new_owned_at(generation);
+        // Fresh/reused: the shadow region starts empty (SP at the region base). §12.8 4A.5: empty =
+        // frame base (past the SP + thaw words).
+        let shadow_sp = self.shadow.frame_base(slot + 1);
         if reuse.is_some() {
             t.free.pop();
-            t.slots[slot] = new_slot;
+            // #2486 — a reused slot no claimant still holds is the new fiber's in place: its
+            // allocation and its locks serve again.
+            match Arc::get_mut(&mut t.slots[slot]) {
+                Some(s) => s.reset(own, Some(fiber), shadow_sp, func, arg0, false),
+                None => {
+                    let fresh = FiberSlot::new(own, Some(fiber), shadow_sp, func, arg0, false);
+                    t.slots[slot] = Arc::new(fresh);
+                }
+            }
             t.charges[slot] = charge;
         } else {
-            t.slots.push(new_slot);
+            let fresh = FiberSlot::new(own, Some(fiber), shadow_sp, func, arg0, false);
+            t.slots.push(Arc::new(fresh));
             t.charges.push(charge);
         }
         Some(fiber_handle(slot, generation))
@@ -631,19 +631,71 @@ impl FiberSlot {
     /// park the fiber" branch serve a child task with no second park mechanism (INVARIANTS #15).
     /// A durable child's shadow region is seeded per residency by the executor (#1361 step 4).
     pub(crate) fn platform(fiber: Fiber) -> Arc<FiberSlot> {
-        Arc::new(FiberSlot {
-            own: Ownership::new_owned_at(0),
+        let own = Ownership::new_owned_at(0);
+        Arc::new(FiberSlot::new(own, Some(fiber), 0, -1, 0, false))
+    }
+
+    /// A slot holding `fiber` (`None`: a free slot), owned per `own`, its shadow-SP at `shadow_sp`
+    /// and its entry operands `func`/`arg0`; `consumed` is a thaw's (#1538). Not running, not
+    /// event-parked, with nothing pending.
+    fn new(
+        own: Ownership,
+        fiber: Option<Fiber>,
+        shadow_sp: u64,
+        func: i32,
+        arg0: i64,
+        consumed: bool,
+    ) -> FiberSlot {
+        FiberSlot {
+            own,
             running_on: AtomicU64::new(NOT_RUNNING),
-            fiber: Mutex::new(Some(Box::new(fiber))),
-            shadow_sp: AtomicU64::new(0),
-            func: -1,
-            arg0: 0,
+            fiber: Mutex::new(fiber),
+            shadow_sp: AtomicU64::new(shadow_sp),
+            func,
+            arg0,
+            consumed: AtomicBool::new(consumed),
+            pending: Mutex::new(None),
             event_park: AtomicBool::new(false),
             park_deadline: Mutex::new(None),
             park_on: Mutex::new(ParkOn::Event),
-            consumed: AtomicBool::new(false),
-            pending: Mutex::new(None),
-        })
+        }
+    }
+
+    /// #2486 — make this slot, which no one else holds, [`FiberSlot::new`]'s, in place. Every
+    /// field, so that one the slot gains is reset here too; its locks are reset through `get_mut`,
+    /// so none is made again.
+    fn reset(
+        &mut self,
+        own: Ownership,
+        fiber: Option<Fiber>,
+        shadow_sp: u64,
+        func: i32,
+        arg0: i64,
+        consumed: bool,
+    ) {
+        let FiberSlot {
+            own: o,
+            running_on,
+            fiber: f,
+            shadow_sp: sp,
+            func: fu,
+            arg0: a0,
+            consumed: c,
+            pending,
+            event_park,
+            park_deadline,
+            park_on,
+        } = self;
+        *o = own;
+        *running_on.get_mut() = NOT_RUNNING;
+        *f.get_mut().unwrap_or_else(|e| e.into_inner()) = fiber;
+        *sp.get_mut() = shadow_sp;
+        (*fu, *a0) = (func, arg0);
+        *c.get_mut() = consumed;
+        *pending.get_mut().unwrap_or_else(|e| e.into_inner()) = None;
+        *event_park.get_mut() = false;
+        *park_deadline.get_mut().unwrap_or_else(|e| e.into_inner()) = None;
+        *park_on.get_mut().unwrap_or_else(|e| e.into_inner()) = ParkOn::Event;
     }
 
     /// #1469 — whether this is a task's platform slot rather than a guest fiber's: the running
@@ -711,7 +763,7 @@ impl FiberSlot {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .as_mut()
-            .map(|b| &mut **b as *mut Fiber)
+            .map(|f| f as *mut Fiber)
     }
 }
 
@@ -723,7 +775,7 @@ impl SharedFiberTable {
     /// with its flattened shadow-SP restored so the swap re-points the active word to its region.
     fn seed_frozen(
         &self,
-        fiber: Box<Fiber>,
+        fiber: Fiber,
         func: i32,
         arg0: i64,
         shadow_sp: u64,
@@ -732,21 +784,12 @@ impl SharedFiberTable {
     ) -> usize {
         let mut t = self.lock();
         let slot = t.slots.len();
-        t.slots.push(Arc::new(FiberSlot {
-            // Re-seed at the freeze-time generation (recycling step 2), so a guest handle to a
-            // recycled fiber still resolves; 0 for a non-recycled fiber (handle == slot).
-            own: Ownership::new_owned_at(generation),
-            running_on: AtomicU64::new(NOT_RUNNING),
-            fiber: Mutex::new(Some(fiber)),
-            shadow_sp: AtomicU64::new(shadow_sp),
-            func,
-            arg0,
-            event_park: AtomicBool::new(false),
-            park_deadline: Mutex::new(None),
-            park_on: Mutex::new(ParkOn::Event),
-            consumed: AtomicBool::new(consumed), // #1538: delivers at its rewound suspend
-            pending: Mutex::new(None),
-        }));
+        // Re-seed at the freeze-time generation (recycling step 2), so a guest handle to a recycled
+        // fiber still resolves; 0 for a non-recycled fiber (handle == slot). A consumed one
+        // delivers at its rewound suspend (#1538).
+        let own = Ownership::new_owned_at(generation);
+        let seeded = FiberSlot::new(own, Some(fiber), shadow_sp, func, arg0, consumed);
+        t.slots.push(Arc::new(seeded));
         // #2112 — the fiber handed its charge back as the freeze flattened it, or as its domain
         // ended.
         let charge = FiberCharge::force(&self.node);
@@ -759,19 +802,9 @@ impl SharedFiberTable {
     fn seed_free(&self, generation: u64) -> usize {
         let mut t = self.lock();
         let slot = t.slots.len();
-        t.slots.push(Arc::new(FiberSlot {
-            own: Ownership::new_free_at(generation),
-            running_on: AtomicU64::new(NOT_RUNNING),
-            fiber: Mutex::new(None),
-            shadow_sp: AtomicU64::new(self.shadow.frame_base(slot + 1)),
-            func: 0,
-            arg0: 0,
-            event_park: AtomicBool::new(false),
-            park_deadline: Mutex::new(None),
-            consumed: AtomicBool::new(false),
-            pending: Mutex::new(None),
-            park_on: Mutex::new(ParkOn::Event),
-        }));
+        let own = Ownership::new_free_at(generation);
+        let free = FiberSlot::new(own, None, self.shadow.frame_base(slot + 1), 0, 0, false);
+        t.slots.push(Arc::new(free));
         t.charges.push(FiberCharge::none());
         t.free.push(Reverse(slot));
         slot
@@ -1196,10 +1229,7 @@ pub(crate) unsafe extern "C" fn fiber_new(vm: u64, funcref: i32, arg0: u64) -> i
     };
 
     let rt = &*rt;
-    match rt
-        .table
-        .create(Box::new(fiber), funcref, arg0 as i64, charge)
-    {
+    match rt.table.create(fiber, funcref, arg0 as i64, charge) {
         Some(handle) => handle,
         None => {
             fault(vm); // a sibling vCPU filled the domain quota since the pre-check
@@ -1307,7 +1337,7 @@ pub(crate) unsafe extern "C" fn fiber_resume(
             .unwrap_or_else(|e| e.into_inner())
             .as_mut()
         {
-            Some(b) => &mut **b as *mut Fiber,
+            Some(f) => f as *mut Fiber,
             // Unreachable by invariant (a claimable slot holds its fiber); fail closed, leaving
             // the slot claimed (inert thereafter) rather than aliasing anything.
             None => {
@@ -1816,14 +1846,9 @@ pub(crate) unsafe fn seed_frozen_fibers(
             fault(vm);
             return false;
         };
-        let got = r.table.seed_frozen(
-            Box::new(fiber),
-            f.func,
-            f.arg0,
-            f.shadow_sp,
-            f.generation,
-            f.consumed,
-        );
+        let got = r
+            .table
+            .seed_frozen(fiber, f.func, f.arg0, f.shadow_sp, f.generation, f.consumed);
         debug_assert_eq!(got, expected, "frozen fibers re-seed densely from slot 0");
         debug_assert_eq!(got, f.slot, "re-seeded slot matches the recorded handle");
     }
