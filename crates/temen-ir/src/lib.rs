@@ -7278,6 +7278,15 @@ pub fn reachable_funcs(
     m: &Module,
     roots: impl IntoIterator<Item = FuncIdx>,
 ) -> Result<Vec<bool>, GcError> {
+    reachable_in(&m.funcs, roots)
+}
+
+/// [`reachable_funcs`] over `funcs` alone: what a caller holding a module's functions without the
+/// module asks (the JIT's child compile, [`seams::handler_never_parks`]).
+pub fn reachable_in(
+    funcs: &[Func],
+    roots: impl IntoIterator<Item = FuncIdx>,
+) -> Result<Vec<bool>, GcError> {
     fn push(f: FuncIdx, live: &mut [bool], work: &mut Vec<FuncIdx>) -> Result<(), GcError> {
         let seen = live.get_mut(f as usize).ok_or(GcError::BadRoot(f))?;
         if !*seen {
@@ -7286,13 +7295,13 @@ pub fn reachable_funcs(
         }
         Ok(())
     }
-    let mut live = alloc::vec![false; m.funcs.len()];
+    let mut live = alloc::vec![false; funcs.len()];
     let mut work: Vec<FuncIdx> = Vec::new();
     for f in roots {
         push(f, &mut live, &mut work)?;
     }
     while let Some(f) = work.pop() {
-        for b in &m.funcs[f as usize].blocks {
+        for b in &funcs[f as usize].blocks {
             for inst in &b.insts {
                 if let Inst::Call { func, .. }
                 | Inst::RefFunc { func }
@@ -7759,6 +7768,7 @@ pub mod dominance;
 pub mod handles;
 pub mod immediates;
 pub mod par;
+pub mod seams;
 pub use dominance::{Captured, Moves};
 
 /// **Compile-time confinement bound analysis** (§1a "guard-when-bounded", D36–D38/D63) — the shared,

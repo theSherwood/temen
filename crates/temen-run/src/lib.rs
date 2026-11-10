@@ -3474,10 +3474,11 @@ unsafe fn live_call(
 }
 
 /// #2742 — the direct handoff of a call to handler `func` of the callee's serve op parked at `site`,
-/// whose gate the caller holds: the handler starts on the caller's thread. Its dispatch is the
-/// caller's own, so it takes no ticket: its end leaves the reply in a slot the caller reads, at once
-/// when it ended here, else once the pool ends it (a handler that parks). It counts in the serve
-/// op's served count, whose bell the gate's release rings ([`leave_site`]).
+/// whose gate the caller holds: the handler runs on the caller's thread, on the caller's own stack
+/// when it cannot park ([`temen_jit::ServeSite::run_inline`]), else on a fiber of its own. Its
+/// dispatch is the caller's own, so it takes no ticket: its end leaves the reply in a slot the caller
+/// reads, at once when it ended here, else once the pool ends it (a handler that parks). It counts
+/// in the serve op's served count, whose bell the gate's release rings ([`leave_site`]).
 unsafe fn handoff_call(
     caller: &mut CallerHost,
     callee: &Mutex<Host>,
@@ -3502,6 +3503,17 @@ unsafe fn handoff_call(
     } else {
         args
     };
+    // A handler that cannot park runs on this stack: it never gives the gate back, and returns or
+    // traps here.
+    if site.inline_ok(func) {
+        // SAFETY: the gate is held, its serve op parked in its serve loop, and `inline_ok`.
+        let end = site.run_inline(func, args);
+        leave_site(site, callee);
+        return Some(match end {
+            Ok(end) => handoff_reply(end),
+            Err(_) => Reply::Failed(EAGAIN),
+        });
+    }
     // A handler that parks leaves its reply here, once the pool has ended it.
     let mut slot: Option<Arc<std::sync::OnceLock<Reply>>> = None;
     // SAFETY: the gate is held, and its serve op is parked in its serve loop.

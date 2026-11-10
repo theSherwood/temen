@@ -3096,10 +3096,9 @@ pub struct CompiledModule {
     /// `compile_child_windowed` product has one; null on a root (`compile`) module.
     tramp_code_limited: *const u8,
     /// I36 slice 3 (§3.6 JIT serve loop) — one buffer-ABI trampoline per **impl-export
-    /// handler**: `(funcidx, code, n_params, n_results)`, invocable over the live window via
-    /// [`Self::invoke_extra`] from the embedder's serve arm ([`Self::handler_tramp`]). Empty
-    /// for a module with no impl exports.
-    serve_tramps: Vec<(u32, *const u8, usize, usize)>,
+    /// handler**, invocable over the live window from the embedder's serve arm
+    /// ([`Self::handler_tramp`]). Empty for a module with no impl exports.
+    serve_tramps: Vec<ServeTramp>,
     /// The entry's parameter count — `run` rejects shorter `args` (the trampoline reads
     /// exactly this many slots).
     n_params: usize,
@@ -4229,16 +4228,17 @@ impl CompiledModule {
 
         let tramp_code = module.get_finalized_function(tramp);
         // I36 slice 3: resolve the handler trampolines now that code is finalized.
-        let serve_tramps: Vec<(u32, *const u8, usize, usize)> = serve_ids
+        let serve_tramps: Vec<ServeTramp> = serve_ids
             .iter()
             .map(|&(f, id)| {
                 let fu = &m.funcs[f as usize];
-                (
-                    f,
-                    module.get_finalized_function(id),
-                    fu.params.len(),
-                    fu.results.len(),
-                )
+                ServeTramp {
+                    func: f,
+                    code: module.get_finalized_function(id),
+                    n_params: fu.params.len(),
+                    n_results: fu.results.len(),
+                    never_parks: temen_ir::seams::handler_never_parks(&m.funcs, f),
+                }
             })
             .collect();
         #[cfg(not(fiber_rt))]
@@ -4847,8 +4847,16 @@ impl CompiledModule {
     pub fn handler_tramp(&self, func: u32) -> Option<(*const u8, usize, usize)> {
         self.serve_tramps
             .iter()
-            .find(|&&(f, ..)| f == func)
-            .map(|&(_, code, np, nr)| (code, np, nr))
+            .find(|t| t.func == func)
+            .map(|t| (t.code, t.n_params, t.n_results))
+    }
+
+    /// #2742 — whether handler `func` can never park, so a direct handoff may run it on the caller's
+    /// own stack ([`ServeTramp::never_parks`]).
+    pub(crate) fn handler_never_parks(&self, func: u32) -> bool {
+        self.serve_tramps
+            .iter()
+            .any(|t| t.func == func && t.never_parks)
     }
 
     /// Invoke an extra trampoline **over the live window of an in-flight run** — the engine of
@@ -6187,6 +6195,19 @@ pub unsafe fn handler_tramp_of(
 unsafe impl Send for CompiledModule {}
 #[cfg(fiber_rt)]
 unsafe impl Sync for CompiledModule {}
+
+/// I36 slice 3, #2742 — a serve handler's buffer-ABI trampoline ([`CompiledModule::handler_tramp`]).
+#[derive(Clone, Copy)]
+struct ServeTramp {
+    func: u32,
+    code: *const u8,
+    n_params: usize,
+    n_results: usize,
+    /// Nothing the handler reaches can park ([`temen_ir::seams::handler_never_parks`]), and the
+    /// module is not paged: it runs to completion or traps, so a direct handoff may run it on the
+    /// caller's own stack.
+    never_parks: bool,
+}
 
 /// #1825 — compiled code more than one instance runs ([`CompiledModule::share`]): a fork twin its
 /// parent's program, every `execve` of a command the one compile of it. Each [`Self::instance`] is a
@@ -8233,16 +8254,18 @@ fn compile_child_windowed(
 
     let code = module.get_finalized_function(tramp);
     let code_limited = module.get_finalized_function(tramp_limited);
-    let serve_tramps: Vec<(u32, *const u8, usize, usize)> = serve_ids
+    let serve_tramps: Vec<ServeTramp> = serve_ids
         .iter()
         .map(|&(f, id)| {
             let fu = &funcs[f as usize];
-            (
-                f,
-                module.get_finalized_function(id),
-                fu.params.len(),
-                fu.results.len(),
-            )
+            ServeTramp {
+                func: f,
+                code: module.get_finalized_function(id),
+                n_params: fu.params.len(),
+                n_results: fu.results.len(),
+                // A paged child's access may wait on its pager.
+                never_parks: !page.paged && temen_ir::seams::handler_never_parks(funcs, f),
+            }
         })
         .collect();
     if let (Some((dir, key)), Codegen::Compile(Some(emitted))) = (kept, &codegen) {

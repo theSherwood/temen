@@ -100,6 +100,14 @@ pub struct VmCtx {
     /// window's gate by. Never read by compiled code.
     #[cfg(fiber_rt)]
     pub(crate) handler_window: std::sync::atomic::AtomicPtr<crate::child_exec::Window>,
+    /// #2742 — the domain's serve handlers not yet ended that its end must wait for: those the pool
+    /// holds, and those running on a caller's stack. Shared by every context of the domain, as its
+    /// end word is; owned by its root context ([`Self::owned_handlers`]). Never read by compiled
+    /// code.
+    #[cfg(fiber_rt)]
+    handlers: *const std::sync::atomic::AtomicUsize,
+    #[cfg(fiber_rt)]
+    owned_handlers: Option<Box<std::sync::atomic::AtomicUsize>>,
 }
 
 /// The per-instance addresses a [`VmCtx`] is filled from — everything but the trap cell, which each
@@ -141,6 +149,8 @@ impl VmCtx {
     pub fn new(a: InstanceAddrs) -> VmCtx {
         // Boxed, so the word stays put when the context moves.
         let owned_end = Box::new(AtomicI64::new(0));
+        #[cfg(fiber_rt)]
+        let owned_handlers = Box::new(std::sync::atomic::AtomicUsize::new(0));
         VmCtx {
             trap: AtomicI64::new(0),
             end: &*owned_end,
@@ -159,6 +169,10 @@ impl VmCtx {
             serve_site: std::sync::OnceLock::new(),
             #[cfg(fiber_rt)]
             handler_window: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
+            #[cfg(fiber_rt)]
+            handlers: &*owned_handlers,
+            #[cfg(fiber_rt)]
+            owned_handlers: Some(owned_handlers),
         }
     }
 
@@ -184,7 +198,20 @@ impl VmCtx {
             serve_site: std::sync::OnceLock::new(),
             #[cfg(fiber_rt)]
             handler_window: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
+            #[cfg(fiber_rt)]
+            handlers: self.handlers,
+            #[cfg(fiber_rt)]
+            owned_handlers: None,
         }
+    }
+
+    /// #2742 — the domain's count of serve handlers its end waits for
+    /// ([`crate::child_exec::HANDLERS_ENDING`]).
+    #[cfg(fiber_rt)]
+    pub(crate) fn handlers(&self) -> &std::sync::atomic::AtomicUsize {
+        // SAFETY: as the end word's: the root context's boxed count, which outlives every context of
+        // its domain.
+        unsafe { &*self.handlers }
     }
 
     /// The domain's end word.

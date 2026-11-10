@@ -463,6 +463,22 @@ pub(crate) struct Window {
 /// #2742 — how many idle handler fibers a window keeps.
 const IDLE_SHELLS: usize = 4;
 
+/// #2742 — set in a domain's handler count ([`VmCtx::handlers`]) once its end waits for its
+/// handlers: the last of them to end re-offers the domain's retiring task.
+pub(crate) const HANDLERS_ENDING: usize = 1 << (usize::BITS - 1);
+
+/// #2742 — the stack a direct handoff's handler needs left on the caller's to run there: a fresh
+/// handler fiber's half ([`ServeSite::run_inline`]).
+const HANDOFF_ROOM: u64 = TASK_STACK as u64 / 2;
+
+/// #2742 — whether this stack has room for a handler run on it ([`HANDOFF_ROOM`]).
+fn handoff_room() -> bool {
+    let limit = crate::stack_check::thread_limit();
+    let here = 0u8;
+    let sp = &here as *const u8 as u64;
+    limit != 0 && sp.saturating_sub(limit) >= HANDOFF_ROOM
+}
+
 /// #2742 — a serve trampoline's run on a handler fiber: its entry, and the arguments its guarded
 /// entry shape takes.
 #[derive(Clone, Copy)]
@@ -976,6 +992,69 @@ impl ServeSite {
         Some(self.exec.reside_here(id, task))
     }
 
+    /// #2742 — whether a direct handoff may run handler `func` on the caller's own stack
+    /// ([`Self::run_inline`]): nothing it reaches can park, so it runs to completion or traps and
+    /// never gives its gate back, and this stack has room for it. A handler that can park runs on a
+    /// fiber of its own ([`Self::start`]).
+    pub fn inline_ok(&self, func: u32) -> bool {
+        // SAFETY: the site's module is live while the site is.
+        let never_parks = unsafe { (*self.cc).handler_never_parks(func) };
+        never_parks && handoff_room()
+    }
+
+    /// #2742 — the direct handoff of a handler that cannot park ([`Self::inline_ok`]): run handler
+    /// `func` with `args` on this thread's own stack, as the window's vCPU (its thread-local word,
+    /// counted as a serve handler), for a caller whose call waits on it anyway. It never parks, so
+    /// the gate the caller holds stays with it throughout. It counts in its domain's handlers until
+    /// it ends, so the domain's end (a kill, a trap of another vCPU) waits for it before its window
+    /// and code go.
+    ///
+    /// # Safety
+    /// The caller holds the gate, the site's vCPU is parked in its serve op, and `inline_ok(func)`.
+    pub unsafe fn run_inline(&self, func: u32, args: &[i64]) -> Result<HandlerEnd, ServeRefused> {
+        let cc = &*self.cc;
+        let Some((code, n_params, n_results)) = cc.handler_tramp(func) else {
+            return Err(ServeRefused::NoHandler);
+        };
+        if args.len() != n_params {
+            return Err(ServeRefused::NoHandler);
+        }
+        let vm = &*self.window.vm;
+        vm.handlers().fetch_add(1, Ordering::SeqCst);
+        let mut results = vec![0i64; n_results.max(1)];
+        let caller_tls = vcpu_tls::get();
+        vcpu_tls::seed(self.window.tls.load(Ordering::Relaxed));
+        let caller_handlers = vcpu_tls::serve_handlers();
+        vcpu_tls::set_serve_handlers(caller_handlers + 1);
+        let (lo, hi) = mem::fault_range_of(self.mem_base, self.mem_reserved as usize);
+        let faulted = mem::run_guarded_range(
+            code,
+            args.as_ptr(),
+            results.as_mut_ptr(),
+            self.mem_base,
+            cc.fn_table.base(),
+            vm,
+            lo,
+            hi,
+        );
+        vcpu_tls::set_serve_handlers(caller_handlers);
+        self.window.tls.store(vcpu_tls::get(), Ordering::Relaxed);
+        vcpu_tls::seed(caller_tls);
+        if faulted {
+            vm.raise(mem::FAULT_TRAP);
+        }
+        let end = match vm.ended() {
+            Some(code) => HandlerEnd::Trapped(code),
+            None => {
+                results.truncate(n_results);
+                self.window.served.fetch_add(1, Ordering::AcqRel);
+                HandlerEnd::Returned(results)
+            }
+        };
+        self.exec.handler_ended(vm);
+        Ok(end)
+    }
+
     /// Start handler `func` with `args` on a fiber of its own, here, holding the gate. One that ends
     /// here gives its end back ([`Ran::end`]); one that parks is given the `done` that `make_done`
     /// makes then, which gets its end wherever the pool ends it. So the common call makes none.
@@ -1431,20 +1510,25 @@ impl ChildExec {
         mut h: HandlerTask,
         make_done: &mut dyn FnMut() -> HandlerDone,
     ) -> Ran {
-        // The starter's gate goes to the handler for its run, and comes back if it ends here.
+        // The starter's gate goes to the handler for its run, and comes back if it ends here. Its
+        // domain's end waits for it from now, wherever it ends.
         let me = fiber_rt::context_id();
         let handed = h.window.hand(me, h.id());
         debug_assert!(handed, "a handler starts under its starter's gate");
+        h.window.vm.handlers().fetch_add(1, Ordering::SeqCst);
         h.holds_lanes = true;
         let outcome = self.run_handler(&mut h, HERE, false);
         match outcome {
             Outcome::Done | Outcome::Finished => {
                 let reusable = h.reusable;
                 let held = h.window.hand(h.id(), me);
+                let window = Arc::clone(&h.window);
+                let end = h.conclude(reusable);
+                self.handler_ended(&window.vm);
                 Ran {
                     held,
                     ended: true,
-                    end: h.conclude(reusable),
+                    end,
                 }
             }
             // It keeps the gate for a quantum's end or a whole-vCPU park, and gives it back for any
@@ -1956,9 +2040,11 @@ impl ChildExec {
         // retires; a retiring task finishes once they have all ended. #2742 — and once the handlers
         // of its serve loops have: none of them can run again, so once its vCPUs have ended they
         // are ended too ([`Self::drain`]).
+        // The look marks the domain ending, so the last of its handlers to end re-offers it, whether
+        // the pool holds it or it runs on a caller's stack or thread.
         let handlers = match &*task {
             Task::Child(t) if matches!(outcome, Outcome::Finished | Outcome::Retiring) => {
-                self.handlers_of(t.vm.domain_key())
+                t.vm.handlers().fetch_or(HANDLERS_ENDING, Ordering::SeqCst) & !HANDLERS_ENDING != 0
             }
             _ => false,
         };
@@ -2301,17 +2387,18 @@ impl ChildExec {
             d.handler_finished();
             self.wake_vcpus_if_quiescent(&g);
         }
-        if draining {
+        if window.vm.handlers().fetch_sub(1, Ordering::SeqCst) == HANDLERS_ENDING + 1 || draining {
             self.wake_parked(&mut g, Wake::All);
         }
     }
 
-    /// #2742 — whether the domain `domain` ([`VmCtx::domain_key`]) has a handler not yet ended.
-    fn handlers_of(&self, domain: usize) -> bool {
-        let g = lock(&self.state);
-        g.windows
-            .values()
-            .any(|w| w.domain == domain && w.handlers > 0)
+    /// #2742 — a handler that did not end in the pool has ended (one started here that ended here,
+    /// [`Self::run_here`]; one run on a caller's stack, [`ServeSite::run_inline`]): out of its
+    /// domain's count, the last of an ending domain's re-offering its retiring task.
+    fn handler_ended(self: &Arc<Self>, vm: &VmCtx) {
+        if vm.handlers().fetch_sub(1, Ordering::SeqCst) == HANDLERS_ENDING + 1 {
+            self.wake_locked(Wake::All);
+        }
     }
 
     /// #2742 — domain `domain` has ended by a trap or a kill, every vCPU of it, with handlers of its
