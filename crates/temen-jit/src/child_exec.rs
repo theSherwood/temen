@@ -54,10 +54,6 @@ use crate::{mem, vcpu_tls, CompiledModule, TrapKind, VmCtx};
 /// `StackOverflow` cleanly instead of relying on the OS guard.
 const TASK_STACK: usize = 1 << 18;
 
-/// #2742 — the claim token of a residency on the thread that admitted a handler
-/// ([`ChildExec::run_here`]), not a pool worker's.
-const HERE: u64 = u64::MAX - 1;
-
 /// #2722 — process-wide count of child-executor residencies ([`ChildExec::run_once`]): each time a
 /// pool worker resumes a task's fiber. A parked task advances it only when something genuinely
 /// re-offers it (a wake or its deadline), never on an idle cadence — the observable
@@ -448,8 +444,9 @@ pub(crate) struct Window {
     /// charging the domain's fuel, so a trap ends the domain through its one end word (#2499). One
     /// does for every handler of the window, which run one at a time.
     vm: Arc<VmCtx>,
-    /// Idle handler fibers, each with its slot and execution context, for the next dispatches.
-    shells: Mutex<Vec<Shell>>,
+    /// Idle handler fibers, each with its slot and execution context, for the next dispatches. Only
+    /// the thread whose context holds the gate touches them ([`Window::idle`]), so they need no lock.
+    idle: std::cell::UnsafeCell<Vec<Shell>>,
     /// Its handlers the pool holds (promoted, [`ChildExec::promote`], and not yet ended): with none
     /// there, its serve op opens and shuts it and gives its gate back without the pool's lock.
     pooled: AtomicUsize,
@@ -464,6 +461,11 @@ pub(crate) struct Window {
     /// them only when there are some.
     gate_waiters: AtomicUsize,
 }
+
+// SAFETY: a window is shared by its serve op and its handlers, wherever they run. Its fields are
+// atomic, immutable or `Sync`, but its idle shells, which only the thread whose context holds the
+// gate touches ([`Window::idle`]).
+unsafe impl Sync for Window {}
 
 /// #2742 — how many idle handler fibers a window keeps.
 const IDLE_SHELLS: usize = 4;
@@ -526,8 +528,8 @@ pub(crate) struct Shell {
 }
 
 // SAFETY: as `ChildTask`'s — its fiber, runtime and buffers move between threads only with the shell,
-// and its job's pointers are left by the thread that resumes the fiber, under the slot's claim,
-// before the resume that reads them.
+// and its job's pointers are left by the thread that resumes the fiber, which owns the shell, before
+// the resume that reads them.
 unsafe impl Send for Shell {}
 
 impl Shell {
@@ -577,6 +579,20 @@ impl Window {
     /// Whether `me` holds the gate.
     fn held_by(&self, me: u64) -> bool {
         self.gate.load(Ordering::Acquire) == me
+    }
+
+    /// Its idle handler fibers, for `me`, which holds the gate.
+    ///
+    /// # Safety
+    /// `me` holds the gate as this thread's context or as a handler that ended on this thread, and
+    /// the borrow ends before the gate goes to anyone else.
+    #[allow(clippy::mut_from_ref)] // the gate is the exclusion
+    unsafe fn idle(&self, me: u64) -> &mut Vec<Shell> {
+        debug_assert!(
+            self.held_by(me),
+            "a window's idle shells are its gate holder's"
+        );
+        &mut *self.idle.get()
     }
 
     /// Hand the gate from `from`, which holds it, to `to`: a starter to the handler it runs, and back
@@ -750,8 +766,8 @@ pub(crate) struct HandlerTask {
 }
 
 // SAFETY: as `ChildTask`'s — the raw pointers a handler task holds (its window, its domain) are the
-// callee's, live until the callee's end drains its handlers, and only the worker holding the task's
-// claim touches them.
+// callee's, live until the callee's end drains its handlers, and only the thread that owns the task
+// (the one its window's gate admitted, or the pool's worker unwinding it) touches them.
 unsafe impl Send for HandlerTask {}
 
 /// How a serve handler ended ([`HandlerTask`]).
@@ -787,8 +803,10 @@ impl HandlerTask {
     /// It has ended: its `done` runs with its end, or, when it was given none (it ended on the
     /// thread that started it), its end comes back for that thread to deliver. It counts as served
     /// if it returned, and its fiber goes back to its window for the next dispatch, unless a fault
-    /// left it unusable (`reusable`).
-    fn conclude(mut self, reusable: bool) -> Option<HandlerEnd> {
+    /// left it unusable (`reusable`) or it ended without the gate (it unwound at its domain's end):
+    /// the idle fibers are the gate holder's, the handler's or the thread's it handed the gate to.
+    /// Its window comes back with its end.
+    fn conclude(mut self, reusable: bool) -> (Option<HandlerEnd>, Arc<Window>) {
         let end = self.end();
         let served = matches!(end, HandlerEnd::Returned(_));
         let end = match self.done.take() {
@@ -803,12 +821,19 @@ impl HandlerTask {
             self.window.served.fetch_add(1, Ordering::AcqRel);
         }
         if reusable {
-            let mut shells = lock(&self.window.shells);
-            if shells.len() < IDLE_SHELLS {
-                shells.push(self.shell);
+            let holder = [self.id(), fiber_rt::context_id()]
+                .into_iter()
+                .find(|&id| self.window.held_by(id));
+            if let Some(holder) = holder {
+                // SAFETY: `holder` holds the gate: the handler, which ended on this thread, or this
+                // thread's context, which it handed the gate back to.
+                let idle = unsafe { self.window.idle(holder) };
+                if idle.len() < IDLE_SHELLS {
+                    idle.push(self.shell);
+                }
             }
         }
-        end
+        (end, self.window)
     }
 }
 
@@ -898,7 +923,7 @@ impl ServeSite {
             ring: ring(),
             served: AtomicU64::new(0),
             vm: Arc::new(vm.vcpu((*(cc as *const CompiledModule)).instance.fuel)),
-            shells: Mutex::new(Vec::new()),
+            idle: std::cell::UnsafeCell::new(Vec::new()),
             pooled: AtomicUsize::new(0),
             open: std::sync::atomic::AtomicBool::new(false),
             gate: AtomicU64::new(0),
@@ -1079,7 +1104,9 @@ impl ServeSite {
         if args.len() != n_params {
             return Err(ServeRefused::NoHandler);
         }
-        let idle = lock(&self.window.shells).pop();
+        // SAFETY: the starter holds the gate (the caller's contract), as this thread's context.
+        let me = fiber_rt::context_id();
+        let idle = self.window.idle(me).pop();
         let mut shell = match idle {
             Some(shell) => shell,
             None => Shell::new(cc, &self.table).ok_or(ServeRefused::NoStack)?,
@@ -1109,7 +1136,7 @@ impl ServeSite {
             reusable: false,
             done: None,
         };
-        Ok(self.exec.run_here(h, make_done))
+        Ok(self.exec.run_here(h, me, make_done))
     }
 }
 
@@ -1204,7 +1231,7 @@ impl Task {
 /// either kind of task.
 struct Residency<'a> {
     slot: &'a Arc<FiberSlot>,
-    /// The fiber the slot holds, which the residency resumes once it has claimed the slot.
+    /// The fiber the slot holds, which the residency resumes: its task's, owned by this thread.
     fib: *mut Fiber,
     rt: &'a mut FiberRuntime,
     fault: (usize, usize),
@@ -1245,7 +1272,7 @@ extern "C" fn resume_shim(
     _t: *const core::ffi::c_void,
     _tc: *mut i64,
 ) {
-    // SAFETY: `a` is the `&mut ResumeCall` the worker passed; `fib` is the claimed task's fiber.
+    // SAFETY: `a` is the `&mut ResumeCall` the resumer passed; `fib` is its task's fiber.
     unsafe {
         let c = a as *mut ResumeCall;
         (*c).state = Some((*(*c).fib).resume(0));
@@ -1513,22 +1540,21 @@ impl ChildExec {
     pub(crate) fn run_here(
         self: &Arc<Self>,
         mut h: HandlerTask,
+        me: u64,
         make_done: &mut dyn FnMut() -> HandlerDone,
     ) -> Ran {
-        // The starter's gate goes to the handler for its run, and comes back if it ends here. Its
-        // domain's end waits for it from now, wherever it ends.
-        let me = fiber_rt::context_id();
+        // The starter's gate (`me`'s) goes to the handler for its run, and comes back if it ends
+        // here. Its domain's end waits for it from now, wherever it ends.
         let handed = h.window.hand(me, h.id());
         debug_assert!(handed, "a handler starts under its starter's gate");
         h.window.vm.handlers().fetch_add(1, Ordering::SeqCst);
         h.holds_lanes = true;
-        let outcome = self.run_handler(&mut h, HERE, false);
+        let outcome = self.run_handler(&mut h, false);
         match outcome {
             Outcome::Done | Outcome::Finished => {
                 let reusable = h.reusable;
                 let held = h.window.hand(h.id(), me);
-                let window = Arc::clone(&h.window);
-                let end = h.conclude(reusable);
+                let (end, window) = h.conclude(reusable);
                 self.handler_ended(&window.vm);
                 Ran {
                     held,
@@ -1632,7 +1658,7 @@ impl ChildExec {
             "a woken handler is resumed under its resumer's gate"
         );
         h.holds_lanes = true;
-        let outcome = self.run_once(&mut task, HERE, false);
+        let outcome = self.run_handler(h, false);
         let keep = task.keep_lanes(&outcome);
         let ended = matches!(outcome, Outcome::Finished | Outcome::Done);
         // One that ended gives the gate back to its resumer before its end is told; one that parked
@@ -2222,17 +2248,28 @@ impl ChildExec {
                     // #1361 step 4 — a durable child spills into its own window's context-0 region.
                     shadow: t.done.durable.as_ref().map(|d| d.shadow.region_base(0)),
                 };
-                let (outcome, tls, handlers) = self.reside(r, worker, pool);
+                // D66 — the single-owner claim for the residency: back to the pool after it, or
+                // retired with the task.
+                assert!(
+                    t.slot.claim_for_worker(worker),
+                    "pool task dispatched while claimed"
+                );
+                let (outcome, tls, handlers) = self.reside(r, pool);
+                match outcome {
+                    Outcome::Finished => t.slot.finish_task(),
+                    _ => t.slot.release_to_pool(),
+                }
                 (t.tls, t.serve_handlers) = (tls, handlers);
                 outcome
             }
-            Task::Handler(h) => self.run_handler(h, worker, pool),
+            Task::Handler(h) => self.run_handler(h, pool),
         }
     }
 
     /// #2742 — one residency of handler `h`, which runs as its serving vCPU: its `vcpu.tls` word is
-    /// its window's.
-    fn run_handler(self: &Arc<Self>, h: &mut HandlerTask, worker: u64, pool: bool) -> Outcome {
+    /// its window's. It takes no slot claim: the thread running it owns its task, as its window's
+    /// gate admits it ([`Self::pick`], [`Self::run_here`]).
+    fn run_handler(self: &Arc<Self>, h: &mut HandlerTask, pool: bool) -> Outcome {
         let r = Residency {
             slot: &h.shell.slot,
             fib: h.shell.fib,
@@ -2244,25 +2281,21 @@ impl ChildExec {
             domain: h.domain,
             shadow: None,
         };
-        let (outcome, tls, handlers) = self.reside(r, worker, pool);
+        let (outcome, tls, handlers) = self.reside(r, pool);
         h.window.tls.store(tls, Ordering::Relaxed);
         h.serve_handlers = handlers;
         h.reusable = matches!(outcome, Outcome::Done);
         outcome
     }
 
-    /// The residency itself: claim the task's slot, seed this thread's per-task state, resume its
-    /// fiber under a guard bracket over its own fault range, classify the yield, reset the thread.
-    fn reside(self: &Arc<Self>, r: Residency<'_>, worker: u64, pool: bool) -> (Outcome, i64, u32) {
+    /// The residency itself: seed this thread's per-task state, resume the task's fiber under a guard
+    /// bracket over its own fault range, classify the yield, reset the thread.
+    fn reside(self: &Arc<Self>, r: Residency<'_>, pool: bool) -> (Outcome, i64, u32) {
         // #2722 — a pool worker is about to resume this task's fiber (the cost a cadence sweep used
         // to spend on parked tasks that could not advance). `pool_resumes` observes it.
         if pool {
             POOL_RESUMES.fetch_add(1, Ordering::Relaxed);
         }
-        assert!(
-            r.slot.claim_for_worker(worker),
-            "pool task dispatched while claimed"
-        );
         let prev_rt = fiber_rt::set_current(&mut *r.rt as *mut FiberRuntime);
         // The durable shadow register is per OS thread: seed it for this residency and give the
         // thread's back after.
@@ -2314,7 +2347,6 @@ impl ChildExec {
         fiber_rt::set_current(prev_rt);
         if faulted {
             r.vm.raise(mem::FAULT_TRAP);
-            r.slot.finish_task();
             return (Outcome::Finished, tls, handlers);
         }
         let outcome = match call.state {
@@ -2324,7 +2356,6 @@ impl ChildExec {
                 // Read the park's own deadline before the slot goes back to the pool (#1631).
                 let deadline = r.slot.took_park_deadline();
                 let yielded = matches!(r.slot.parked_on(), fiber_rt::ParkOn::Yield);
-                r.slot.release_to_pool();
                 if yielded {
                     Outcome::Yielded
                 } else {
@@ -2332,20 +2363,13 @@ impl ChildExec {
                 }
             }
             // #2742 — a handler fiber done with its dispatch, waiting for the next.
-            Some(State::Yielded(fiber_rt::JOB_DONE)) if r.slot.is_platform() => {
-                r.slot.release_to_pool();
-                Outcome::Done
-            }
+            Some(State::Yielded(fiber_rt::JOB_DONE)) if r.slot.is_platform() => Outcome::Done,
             Some(State::Yielded(_)) => {
                 // Unreachable by construction; fail closed rather than resume an unknown yield.
                 r.vm.raise(TrapKind::ThreadFault as i64);
-                r.slot.finish_task();
                 Outcome::Finished
             }
-            Some(State::Complete(_)) | None => {
-                r.slot.finish_task();
-                Outcome::Finished
-            }
+            Some(State::Complete(_)) | None => Outcome::Finished,
         };
         (outcome, tls, handlers)
     }
@@ -2363,11 +2387,10 @@ impl ChildExec {
     /// drop it from the run's live count.
     fn finish_handler(self: &Arc<Self>, h: HandlerTask) {
         let key = h.window.key();
-        let window = Arc::clone(&h.window);
         let hid = h.id();
-        window.pooled.fetch_sub(1, Ordering::AcqRel);
+        h.window.pooled.fetch_sub(1, Ordering::AcqRel);
         let reusable = h.reusable;
-        let _given = h.conclude(reusable);
+        let (_given, window) = h.conclude(reusable);
         debug_assert!(_given.is_none(), "a pooled handler was given its done");
         // Whoever waits on its dispatch is woken before it leaves the live count, as a joiner is
         // settled before its joinee leaves it (#1820): else a waiter that re-checks the deadlock
