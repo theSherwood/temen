@@ -1101,19 +1101,21 @@ pub(crate) unsafe fn make_task_fiber(
 /// Returns the fiber handle (the domain-shared table's slot index — the same numbering as the interp
 /// registry), or traps (`-1`) on a fiber-bomb (the **per-domain** bound, or its `Budget.mem`).
 ///
+/// The fiber runs over its creator's window and function table, charging its counted-fuel cell
+/// (null ⇒ un-armed, for [`make_fiber`]'s start refund): all read from `vm`, its creator's context,
+/// never taken from the code (#2534).
+///
 /// # Safety
-/// `fn_table_base`/`vm` are the threaded context; `fuel_addr` is this compile's counted-fuel
-/// cell (`0` ⇒ un-armed), for [`make_fiber`]'s start refund. The running vCPU's fiber runtime is read
-/// from the [`CURRENT_RT`] thread-local. The funcref is resolved (and type-checked) lazily on first
-/// resume, matching the interpreter.
-pub(crate) unsafe extern "C" fn fiber_new(
-    mem_base: u64,
-    fn_table_base: u64,
-    vm: u64,
-    funcref: i32,
-    arg0: u64,
-    fuel_addr: u64,
-) -> i64 {
+/// `vm` is the threaded context. The running vCPU's fiber runtime is read from the [`CURRENT_RT`]
+/// thread-local. The funcref is resolved (and type-checked) lazily on first resume, matching the
+/// interpreter.
+pub(crate) unsafe extern "C" fn fiber_new(vm: u64, funcref: i32, arg0: u64) -> i64 {
+    let ctx = crate::VmCtx::at(vm);
+    let (mem_base, fn_table_base, fuel_addr) = (
+        ctx.window().base as u64,
+        ctx.window().fn_table as u64,
+        ctx.fuel as u64,
+    );
     let rt = current();
     if rt.is_null() {
         fault(vm);
@@ -1838,15 +1840,15 @@ unsafe fn scan_words(
 /// fibers are scanned normally.
 ///
 /// # Safety
-/// `mem_base`/`mask`/`mapped`/`vm` are the threaded guest-window context (as for
-/// `call.cap`). `payload_mask` is the §GC tagged-pointer mask (distinct from the window-confinement
-/// `mask`). The running vCPU's fiber runtime is read from [`CURRENT_RT`]; a null runtime, an
-/// out-of-window `buf`, a non-STW call (a fiber running on another vCPU), or a `payload_mask` that
-/// clears more than the top byte faults (`FiberFault`).
-/// The nine `gc.roots` arguments, marshalled by the JIT into one stack slot so the flush trampoline
-/// ([`temen_gc_roots_flush`]) can hand them to [`gc_roots`] as a single pointer with no per-argument
-/// register/stack reshuffle. Field order is the historical argument order. `#[repr(C)]` so the JIT's
-/// 8-byte-slot stores line up with these reads.
+/// `payload_mask` is the §GC tagged-pointer mask (distinct from the window-confinement mask). The
+/// window `buf` is confined to, and its access table if demand-paged, are `vm`'s (#2534). The
+/// running vCPU's fiber runtime is read from [`CURRENT_RT`]; a null runtime, an out-of-window
+/// `buf`, a non-STW call (a fiber running on another vCPU), or a `payload_mask` that clears more
+/// than the top byte faults (`FiberFault`).
+/// The five `gc.roots` operands, guest values all, marshalled by the JIT into one stack slot so the
+/// flush trampoline ([`temen_gc_roots_flush`]) hands them, with the context, to [`gc_roots`] in two
+/// argument registers on every ABI, with no per-argument register/stack reshuffle. `#[repr(C)]` so
+/// the JIT's 8-byte-slot stores line up with these reads.
 #[repr(C)]
 pub(crate) struct GcRootsArgs {
     heap_lo: u64,
@@ -1854,13 +1856,6 @@ pub(crate) struct GcRootsArgs {
     payload_mask: u64,
     buf: u64,
     cap: i64,
-    mem_base: u64,
-    mask: u64,
-    mapped: u64,
-    vm: u64,
-    /// #2164 — a demand-paged instance's declared page count, which bounds its access table
-    /// ([`crate::VmCtx::pages`]); `0` for any other.
-    pages: u64,
 }
 
 /// The scan itself. Reached **only** via [`temen_gc_roots_flush`], which has already spilled the
@@ -1869,22 +1864,17 @@ pub(crate) struct GcRootsArgs {
 /// reintroduce the register-flush gap (GC.md; the "spilled-only" note above).
 ///
 /// # Safety
-/// `args` points at a live [`GcRootsArgs`] (the JIT's stack slot, valid for the call).
-pub(crate) unsafe extern "C" fn gc_roots(args: *const GcRootsArgs) -> i64 {
-    // SAFETY: the JIT hands the address of a live 10-field slot; the flush trampoline is the only
+/// `vm` is the calling context; `args` points at a live [`GcRootsArgs`] (the JIT's stack slot,
+/// valid for the call).
+pub(crate) unsafe extern "C" fn gc_roots(vm: u64, args: *const GcRootsArgs) -> i64 {
+    // SAFETY: the JIT hands the address of a live 5-field slot; the flush trampoline is the only
     // caller.
     let a = unsafe { &*args };
-    let (heap_lo, heap_hi, payload_mask, buf, cap, mem_base, mask, mapped, vm) = (
-        a.heap_lo,
-        a.heap_hi,
-        a.payload_mask,
-        a.buf,
-        a.cap,
-        a.mem_base,
-        a.mask,
-        a.mapped,
-        a.vm,
-    );
+    let (heap_lo, heap_hi, payload_mask, buf, cap) =
+        (a.heap_lo, a.heap_hi, a.payload_mask, a.buf, a.cap);
+    // The window the buffer is confined to (#826: the **reserved** span bounds it), from the context.
+    let w = *crate::VmCtx::at(vm).window();
+    let (mem_base, mask, mapped) = (w.base as u64, w.reserved.saturating_sub(1), w.reserved);
     let rt = current();
     if rt.is_null() {
         fault(vm);
@@ -1996,8 +1986,8 @@ pub(crate) unsafe extern "C" fn gc_roots(args: *const GcRootsArgs) -> i64 {
     let nwrite = total.min(cap.max(0) as usize);
     if nwrite > 0 {
         // Confine the buffer offset exactly like the JIT's `mask_addr`: the window `[0, bound)`,
-        // physically at `mem_base + off`. #826: `bound` (the `mapped`
-        // slot) carries the **reserved** span, so a roots buffer in a `map`-grown tail page is
+        // physically at `mem_base + off`. #826: `bound` (`mapped` here) is the **reserved**
+        // span, so a roots buffer in a `map`-grown tail page is
         // admitted where the interpreter's live page map admits it; a write into an uncommitted or
         // `Ro` page faults through the SIGSEGV guard (`MemoryFault`), exactly like a guest store.
         let masked = buf & mask;
@@ -2006,10 +1996,10 @@ pub(crate) unsafe extern "C" fn gc_roots(args: *const GcRootsArgs) -> i64 {
         // them: a page the table does not let it write faults, as the interpreters' checked buffer
         // write does (never paged in: they write the buffer from the host, as this does).
         let refused = masked.checked_add(nbytes).is_none_or(|end| end > mapped)
-            || (a.pages != 0
+            || (w.pages != 0
                 && !crate::table_admits(
                     crate::VmCtx::at(vm).pages,
-                    a.pages,
+                    w.pages,
                     masked,
                     nbytes,
                     temen_ir::PAGE_WRITE,
@@ -2035,13 +2025,13 @@ pub(crate) unsafe extern "C" fn gc_roots(args: *const GcRootsArgs) -> i64 {
 // stack walk in [`gc_roots`] scans *memory*, not registers, so such a root would be missed (a
 // conservative-GC under-report; not a VM escape — it stays within the guest window). Each trampoline
 // spills every callee-saved register onto the stack *before* [`gc_roots`] runs, so those roots land in
-// the scanned `[current_sp, top)` region. The single `args` pointer rides in the first argument
-// register untouched, so there is no per-argument reshuffle. The cost (a handful of push/pops) is paid
+// the scanned `[current_sp, top)` region. `vm` and the `args` pointer ride in the first two argument
+// registers untouched, so there is no per-argument reshuffle. The cost (a handful of push/pops) is paid
 // only on a `gc.roots` call — a gc-opting guest; other guests never reach it.
 #[cfg(all(unix, target_arch = "x86_64"))]
 #[unsafe(naked)]
-pub(crate) unsafe extern "C" fn temen_gc_roots_flush(args: *const GcRootsArgs) -> i64 {
-    // SysV callee-saved GPRs: rbx, rbp, r12-r15. `args` is in rdi (untouched). Entry `rsp % 16 == 8`;
+pub(crate) unsafe extern "C" fn temen_gc_roots_flush(vm: u64, args: *const GcRootsArgs) -> i64 {
+    // SysV callee-saved GPRs: rbx, rbp, r12-r15. `vm`/`args` are in rdi/rsi (untouched). Entry `rsp % 16 == 8`;
     // 6 pushes keep it at 8, so `sub rsp, 8` re-aligns to 0 (SysV requires `rsp % 16 == 0` at `call`).
     core::arch::naked_asm!(
         "push rbp",
@@ -2066,8 +2056,8 @@ pub(crate) unsafe extern "C" fn temen_gc_roots_flush(args: *const GcRootsArgs) -
 
 #[cfg(all(unix, target_arch = "aarch64"))]
 #[unsafe(naked)]
-pub(crate) unsafe extern "C" fn temen_gc_roots_flush(args: *const GcRootsArgs) -> i64 {
-    // AArch64 callee-saved: x19-x28 + fp(x29)/lr(x30). `args` is in x0 (untouched). Each `stp`
+pub(crate) unsafe extern "C" fn temen_gc_roots_flush(vm: u64, args: *const GcRootsArgs) -> i64 {
+    // AArch64 callee-saved: x19-x28 + fp(x29)/lr(x30). `vm`/`args` are in x0/x1 (untouched). Each `stp`
     // pre-decrements sp by 16 (kept 16-aligned). d8-d15 (callee-saved FP) can't hold an integer heap
     // pointer, so flushing the GPRs (+ fp/lr) suffices.
     core::arch::naked_asm!(
@@ -2091,8 +2081,8 @@ pub(crate) unsafe extern "C" fn temen_gc_roots_flush(args: *const GcRootsArgs) -
 
 #[cfg(all(windows, target_arch = "x86_64"))]
 #[unsafe(naked)]
-pub(crate) unsafe extern "C" fn temen_gc_roots_flush(args: *const GcRootsArgs) -> i64 {
-    // Win64 callee-saved GPRs: rbx, rbp, rdi, rsi, r12-r15 (8). `args` is in rcx (untouched). Reserve
+pub(crate) unsafe extern "C" fn temen_gc_roots_flush(vm: u64, args: *const GcRootsArgs) -> i64 {
+    // Win64 callee-saved GPRs: rbx, rbp, rdi, rsi, r12-r15 (8). `vm`/`args` are in rcx/rdx (untouched). Reserve
     // the 32-byte shadow space + 8 for alignment before the call: entry `rsp % 16 == 8`, 8 pushes keep
     // it at 8, so `sub rsp, 40` re-aligns to 0. (xmm6-15 are callee-saved but hold no integer root.)
     core::arch::naked_asm!(
@@ -2212,7 +2202,7 @@ mod flatten_claim_tests {
         let rt = Box::into_raw(Box::new(FiberRuntime::new(table, 0, 0)));
         let prev = set_current(rt);
         let mut status = 0i64;
-        let ctx = crate::VmCtx::new(crate::InstanceAddrs::NONE);
+        let ctx = crate::VmCtx::new(crate::InstanceAddrs::NONE, crate::Window::NONE);
         let vm = &ctx as *const crate::VmCtx as u64;
         // SAFETY: `rt` is published as this thread's runtime for every call, and each claim fails
         // before any stack switch, so no fiber runs.

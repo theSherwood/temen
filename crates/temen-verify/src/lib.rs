@@ -153,6 +153,9 @@ pub enum VerifyError {
     /// does not name a [`temen_ir::TypeEntry::Func`]. Fail-closed: the index feeds arg/result
     /// typing and SSA-slot layout ([`temen_ir::Inst::result_count`]), so a bad index is rejected.
     CallSigInvalid { func: u32, block: u32, sig: u32 },
+    /// #2534 — a host-dispatched call ([`temen_ir::Inst::host_call`]) whose signature has more than
+    /// [`temen_ir::CAP_MAX_ARITY`] parameters or results.
+    HostCallArity { func: u32, block: u32, sig: u32 },
     /// Two [`Module::imports`] entries share a name — imports must be uniquely resolvable by the
     /// host's instantiation policy (IMPORTS.md phase 1), mirroring [`VerifyError::DuplicateExport`].
     DuplicateImport { import: u32 },
@@ -871,6 +874,21 @@ fn type_inst<'a>(
         types,
         check,
     };
+    // #2534 — every host-dispatched call fits the JIT's argument buffer (`CAP_MAX_ARITY` words each
+    // way). A signature index that names no function is the arm's own `CallSigInvalid` below.
+    if let (true, Some((sig, _))) = (check, inst.host_call()) {
+        if let Some(ft) = func_sig(type_section, sig) {
+            if ft.params.len() > temen_ir::CAP_MAX_ARITY
+                || ft.results.len() > temen_ir::CAP_MAX_ARITY
+            {
+                return Err(VerifyError::HostCallArity {
+                    func: fi,
+                    block: bi,
+                    sig,
+                });
+            }
+        }
+    }
     // `Store` is the only instruction that yields no value; handle it up front so the
     // main match can produce a single result type.
     if let Inst::Store {

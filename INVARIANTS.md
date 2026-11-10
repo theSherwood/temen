@@ -31,10 +31,12 @@ serve loop reused `invoke_extra`). (DESIGN.md §1a/§4; the fuzzed hinge.)
 redirect is a no-op and the address is exactly `mem_base + (addr+offset)`; on a misspeculated
 out-of-bounds access it lands on the `PROT_NONE` guard. `temen-mask`'s own header states it
 plainly — *"there is **no masking** — an out-of-bounds address is never aliased back into the
-window, it faults."* The old AND clamp survives in the bulk-span path and the wasm-JIT tier;
-those are the two places to converge or record, and until one of those happens the name
-`temen-mask`/`mask_addr` is legacy vocabulary for a retired design (INVARIANTS #13 — a rename is
-tracked, not assumed). Nothing about the security property changed here; the invariant's
+window, it faults."* The old AND clamp survives in the wasm-JIT tier; that is the place to
+converge or record. (The Cranelift JIT's bulk-span path converged in #2534: a dynamic-length
+`mem.copy`/`mem.fill` is a host helper that bounds both spans through `temen-mask`'s
+`span_checked` before it copies, as Wasmtime's `memory.copy` builtin is.) Until the wasm tier
+converges, the name `temen-mask`/`mask_addr` is legacy vocabulary for a retired design
+(INVARIANTS #13 — a rename is tracked, not assumed). Nothing about the security property changed here; the invariant's
 description of it was simply stale, on the one page a reader is told to read first.
 
 ## 3. Authority moves only down the grant graph

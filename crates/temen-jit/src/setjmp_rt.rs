@@ -9,10 +9,12 @@
 //!
 //! **The one correctness invariant.** `_setjmp` is emitted inline in the guest frame, never wrapped in
 //! a Rust thunk that `setjmp`s and returns — that helper's frame would be gone by `longjmp` time, and
-//! `longjmp` into a returned frame is UB. So only the *slot* alloc/lookup are host thunks
-//! ([`rt_setjmp_slot`]/[`rt_setjmp_lookup`]); they merely return a pointer and their own frames
-//! returning is harmless. The `SetJmp` lowering is therefore *two* calls — `rt_setjmp_slot` then an
-//! inline `_setjmp(slot)`; `LongJmp` is `rt_setjmp_lookup` then an inline `_longjmp(slot, val)`.
+//! `longjmp` into a returned frame is UB. So only the *slot* alloc is a host thunk
+//! ([`rt_setjmp_slot`]); it merely returns a pointer and its own frame returning is harmless. The
+//! `SetJmp` lowering is therefore *two* calls — `rt_setjmp_slot` then an inline `_setjmp(slot)`.
+//! `LongJmp` is *one*, [`rt_longjmp`], which looks the slot up and `_longjmp`s from its own frame:
+//! jumping out of a frame (one that holds nothing to drop) is what `longjmp` is for, and the code
+//! never holds a host `jmp_buf` pointer it could pass a forged one in place of (#2534).
 //!
 //! Unix-only (the `setjmp_rt` cfg = `fiber_rt && unix`): `libc` is a unix-only dependency here and the
 //! plain `_setjmp`/`_longjmp` symbols are unix; Windows `setjmp` is SEH-coupled (a follow-on).
@@ -36,11 +38,6 @@ extern "C" {
 /// Address of libc `_setjmp`, which each `SetJmp` site calls inline (`HostFn::Setjmp`).
 pub(crate) fn setjmp_addr() -> *const () {
     _setjmp as *const ()
-}
-
-/// Address of libc `_longjmp`, which each `LongJmp` site calls inline (`HostFn::Longjmp`).
-pub(crate) fn longjmp_addr() -> *const () {
-    _longjmp as *const ()
 }
 
 /// One host-owned libc `jmp_buf`, over-aligned and generously sized (glibc/musl `jmp_buf` ≈ 200 B; the
@@ -79,44 +76,40 @@ impl SetjmpRuntime {
     }
 }
 
-/// `rt_setjmp_slot(rt, guest_buf)` — return the stable host `jmp_buf` pointer for the guest buffer at
+/// `rt_setjmp_slot(vm, guest_buf)` — return the stable host `jmp_buf` pointer for the guest buffer at
 /// window address `guest_buf`, allocating it on the first `setjmp` to that address (a re-`setjmp` to the
 /// same buffer reuses and overwrites the slot, matching the interpreters). The returned pointer is then
 /// handed to an **inline** `_setjmp` in the guest frame. Infallible (allocation aborts on OOM, as any
-/// `Box`).
+/// `Box`). The table is `vm`'s instance's (`VmCtx::setjmp`), never one the code names (#2534).
 ///
 /// # Safety
-/// `rt` is the per-run [`SetjmpRuntime`] address baked into the site by the lowering; valid for the run.
-pub(crate) unsafe extern "C" fn rt_setjmp_slot(
-    rt: *mut SetjmpRuntime,
-    guest_buf: u64,
-) -> *mut c_void {
-    let rt = &*rt;
+/// `vm` is the calling instance's live context, whose code uses `setjmp`, so its table is set.
+pub(crate) unsafe extern "C" fn rt_setjmp_slot(vm: &crate::VmCtx, guest_buf: u64) -> *mut c_void {
+    let rt = &*(vm.setjmp as *const SetjmpRuntime);
     let mut slots = rt.slots.lock().unwrap_or_else(|e| e.into_inner());
     let cell = slots.entry(guest_buf).or_insert_with(JmpBufCell::boxed);
     cell.as_ptr()
 }
 
-/// `rt_setjmp_lookup(rt, guest_buf, vm)` — find the host `jmp_buf` for `guest_buf` (set by a prior
-/// `setjmp`). On a **miss** — a stale/forged token, or a buffer never `setjmp`'d — raise the
-/// [`TrapKind::SetjmpFault`] marker on `vm` and return null; the JIT's trap-propagate check then
-/// bails *before* the (skipped) `_longjmp`, matching the interpreters' `Trap::Malformed` (§3b
-/// totality). Never `_longjmp`s into a missing slot.
+/// `rt_longjmp(vm, guest_buf, val)` — `_longjmp(slot, val)` to the host `jmp_buf` a prior `setjmp` to
+/// `guest_buf` filled, from this frame, never returning. On a **miss** — a stale/forged token, or a
+/// buffer never `setjmp`'d — raise the [`TrapKind::SetjmpFault`] marker on `vm` and return: the JIT's
+/// trap-propagate check then bails, matching the interpreters' `Trap::Malformed` (§3b totality). Never
+/// `_longjmp`s into a missing slot. The lock is released before the jump, so this frame holds nothing
+/// `_longjmp` would skip dropping.
 ///
 /// # Safety
-/// `rt` is valid for the run (threaded by the lowering).
-pub(crate) unsafe extern "C" fn rt_setjmp_lookup(
-    rt: *mut SetjmpRuntime,
-    guest_buf: u64,
-    vm: &crate::VmCtx,
-) -> *mut c_void {
-    let rt = &*rt;
-    let slots = rt.slots.lock().unwrap_or_else(|e| e.into_inner());
-    match slots.get(&guest_buf) {
-        Some(cell) => cell.as_ptr(),
-        None => {
-            vm.raise(TrapKind::SetjmpFault as i64);
-            core::ptr::null_mut()
-        }
+/// `vm` is the calling instance's live context, whose code uses `setjmp`, so its table is set.
+pub(crate) unsafe extern "C" fn rt_longjmp(vm: &crate::VmCtx, guest_buf: u64, val: c_int) {
+    let rt = &*(vm.setjmp as *const SetjmpRuntime);
+    let slot = rt
+        .slots
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&guest_buf)
+        .map(|cell| cell.as_ptr());
+    match slot {
+        Some(env) => _longjmp(env, val),
+        None => vm.raise(TrapKind::SetjmpFault as i64),
     }
 }

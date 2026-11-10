@@ -44,6 +44,9 @@ cranelift-jit = "0.132.0"
 cranelift-module = "0.132.0"
 cranelift-native = "0.132.0"
 temen-ir.workspace = true
+# #2534 — `Window::span_checked`, the one definition of the span-OOB arithmetic, which the host
+# functions that touch the window on the code's behalf confine through.
+temen-mask.workspace = true
 # `func_value_types`: the types a function lowered block-local needs for the params it gains (#2600).
 temen-verify.workspace = true
 # `digest256`: the kept code's keys and checksums (`code_dir`).
