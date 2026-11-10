@@ -5138,6 +5138,45 @@ pub(crate) mod x86 {
             }
         }
 
+        /// #2814: a demand-paged page check scales its index by 8 with a 64-bit `shl`, then reads the
+        /// access table at `(index·8 + 0x4007) >> 12`, which the `shl`'s bound keeps below `0x44`.
+        /// These are `paging_bench`'s instructions, with `rsi`/`r8` for its callee-saved `rbx`/`r12`:
+        /// clean against a 256-page window's 0x101-byte table, flagged against a 64-page window's
+        /// 0x41 bytes.
+        #[test]
+        fn page_check_index_through_shl_stays_in_the_table() {
+            let mut bytes = vec![0x48, 0x8b, 0xb2]; // mov rsi, [rdx + PAGES]   (the access table)
+            bytes.extend_from_slice(&crate::vmctx::PAGES.to_le_bytes());
+            bytes.extend_from_slice(&[
+                0x49, 0x81, 0xe0, 0xff, 0x7f, 0, 0, // and r8, 0x7fff
+                0x4c, 0x89, 0xc0, // mov rax, r8
+                0x48, 0xc1, 0xe0, 0x03, // shl rax, 3
+                0x48, 0x81, 0xc0, 0x07, 0x40, 0, 0, // add rax, 0x4007
+                0x48, 0xc1, 0xe8, 0x0c, // shr rax, 12
+                0x48, 0x0f, 0xb6, 0x04, 0x06, // movzx rax, byte [rsi + rax]
+                0xc3,
+            ]);
+            let with_pages = |pages: u64| {
+                let window = Some(WindowLayout {
+                    mask: (1u64 << 37) - 1,
+                    guard_offset: 1u64 << 37,
+                    pages,
+                });
+                check(
+                    &bytes,
+                    &[],
+                    Entry::Guest(&Guest { window, ..G }),
+                    Frame::UNKNOWN,
+                )
+            };
+            assert!(with_pages(0x100).is_empty(), "{:?}", with_pages(0x100));
+            assert!(
+                has(&with_pages(0x40), "access-table read reaches +0x44"),
+                "{:?}",
+                with_pages(0x40)
+            );
+        }
+
         /// #2784 (G3): a function that spills **more than 32** confined window indices to distinct
         /// frame slots and reloads each keeps every one — the slot store is a `Vec`, not a fixed
         /// 32-entry array whose overflow would drop a later slot and read its reload as `Unknown`.
