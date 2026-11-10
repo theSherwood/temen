@@ -2272,7 +2272,8 @@ pub enum LinkOpt {
 /// [`LINKED_SPEED_MAX_CALLEE`]. Each round's budget is half the program it starts from, as step 1's
 /// is. The rounds put the smallest callees first: one round at the largest limit spends its budget on
 /// whatever big callees come first in the program, and on nisaba's regex kernel it then never reaches
-/// the hot loop's helpers, running 61% more instructions than the default link. Step 2 stays as it is:
+/// the hot loop's helpers, running 61% more instructions than the default link. A speed round splices
+/// nothing into a caller past [`LINKED_SPEED_MAX_CALLER`] instructions (#2833). Step 2 stays as it is:
 /// after the rounds, every optional pass saves 0.1% of the kernel's instructions and takes hexer's link
 /// from 18 s to 4–5 minutes.
 ///
@@ -2289,12 +2290,12 @@ pub enum LinkOpt {
 /// more instructions.
 pub fn optimize_linked(m: &Module, opt: LinkOpt) -> Module {
     let local = block_local(m);
-    let mut out = inline_round(&local, LINKED_MAX_CALLEE);
+    let mut out = inline_round(&local, LINKED_MAX_CALLEE, usize::MAX);
     if opt == LinkOpt::Speed {
         let mut max_callee = LINKED_MAX_CALLEE;
         while max_callee < LINKED_SPEED_MAX_CALLEE {
             max_callee = (2 * max_callee).min(LINKED_SPEED_MAX_CALLEE);
-            out = inline_round(&out, max_callee);
+            out = inline_round(&out, max_callee, LINKED_SPEED_MAX_CALLER);
         }
     }
     let cfg = OptConfig {
@@ -2328,10 +2329,22 @@ pub const LINKED_MAX_CALLEE: usize = 6;
 /// 0.2% more and make the program 1.8× or 3.4× as large.
 pub const LINKED_SPEED_MAX_CALLEE: usize = 96;
 
+/// The largest a speed link lets a caller grow ([`LinkOpt::Speed`], #2833). A splice is rescanned and
+/// later rounds inline into the copies earlier ones made, so without a limit a DAG of small callees
+/// unfolds into one caller, a copy at every path, as far as each round's budget goes. In unir's store
+/// unit two functions grew from 368 and 269 instructions to 494,265 and 88,032: that program took
+/// 159 s to link and 35 s to start on Cranelift, and `hexer`'s speed link did not finish in 12
+/// minutes. With the limit they link in 5.8 s and 13.6 s. At 65,536 they took 44 s and over 6
+/// minutes, because an in-place splice rebuilds its whole block. nisaba's regex and transform
+/// kernels, whose largest function is 1,752 instructions, link byte for byte as without it. A
+/// function already past the limit, as `hexer`'s `evalImpl` (8,869), takes no more inlining.
+pub const LINKED_SPEED_MAX_CALLER: usize = 8_192;
+
 /// One round of [`optimize_linked`]'s inlining: direct callees of at most `max_callee` instructions,
-/// until half the program's size has been spliced. At the default's limit the budget only bounds a
-/// pathological cycle; at a speed link's it also bounds how much the program grows.
-fn inline_round(m: &Module, max_callee: usize) -> Module {
+/// until half the program's size has been spliced, into callers of at most `max_caller`. At the
+/// default's limit the budget only bounds a pathological cycle; at a speed link's it also bounds how
+/// much the program grows.
+fn inline_round(m: &Module, max_callee: usize, max_caller: usize) -> Module {
     let size: usize = m
         .funcs
         .iter()
@@ -2341,6 +2354,7 @@ fn inline_round(m: &Module, max_callee: usize) -> Module {
     let limits = interproc::InlineLimits {
         max_callee,
         budget: size / 2,
+        max_caller,
     };
     interproc::inline_calls_with(m, limits)
 }

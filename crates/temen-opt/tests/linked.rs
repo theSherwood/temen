@@ -12,7 +12,7 @@ use temen_ir::{
 };
 use temen_opt::cfg::{successors, Cfg};
 use temen_opt::interproc::{inline_calls, inline_calls_with, InlineLimits};
-use temen_opt::{optimize_linked, LinkOpt, LINKED_SPEED_MAX_CALLEE};
+use temen_opt::{optimize_linked, LinkOpt, LINKED_SPEED_MAX_CALLEE, LINKED_SPEED_MAX_CALLER};
 use temen_verify::verify_module;
 
 /// Run `func` on the reference interpreter: its results and the fuel it burned.
@@ -350,10 +350,12 @@ fn the_inliner_stops_at_its_size_limit() {
     let six = InlineLimits {
         max_callee: 6,
         budget: 1000,
+        max_caller: usize::MAX,
     };
     let seven = InlineLimits {
         max_callee: 7,
         budget: 1000,
+        max_caller: usize::MAX,
     };
     assert_eq!(
         n_calls(&inline_calls_with(&m, six)),
@@ -584,6 +586,7 @@ fn a_speed_link_inlines_the_smallest_callees_first() {
         InlineLimits {
             max_callee: LINKED_SPEED_MAX_CALLEE,
             budget: size / 2,
+            max_caller: usize::MAX,
         },
     );
     assert_eq!(n_calls(&one_round), 1, "one round leaves `small` a call");
@@ -593,6 +596,86 @@ fn a_speed_link_inlines_the_smallest_callees_first() {
     for a in [0, 7, -3] {
         let want = run(&m, 0, &[Value::I32(a)]).0;
         assert_eq!(run(&speed, 0, &[Value::I32(a)]).0, want, "a={a}");
+    }
+}
+
+/// `node(a) = callee(callee(a))` and five adds: seven instructions, two of them calls to `callee`.
+fn node(callee: u32) -> Func {
+    let mut insts = vec![call(callee, vec![0]), call(callee, vec![1])];
+    for v in 2..7 {
+        insts.push(add(v, 1));
+    }
+    func(1, vec![block(1, insts, Terminator::Return(vec![7]))])
+}
+
+/// `entry → n1 → … → n7 → leaf`, each node calling the next twice: a DAG of nine functions that
+/// unfolds into a tree of 256 leaves.
+fn dag() -> Module {
+    let mut funcs: Vec<Func> = (0..8).map(|k| node(k + 1)).collect();
+    funcs.push(leaf_of(8));
+    module(funcs)
+}
+
+fn size(f: &Func) -> usize {
+    f.blocks.iter().map(|b| b.insts.len()).sum()
+}
+
+#[test]
+fn the_inliner_stops_growing_a_caller_at_its_limit() {
+    // A splice is rescanned so its own calls inline too, so in index order the entry reaches n1
+    // before n1's calls are inlined and copies the DAG's whole tree, 256 leaves, as far as the
+    // budget goes. Under a speed link that grew two functions of unir's store unit to 494,265 and
+    // 88,032 instructions (#2833). `max_caller` stops each caller at its limit instead.
+    let m = dag();
+    let limits = InlineLimits {
+        max_callee: 96,
+        budget: 1_000_000,
+        max_caller: usize::MAX,
+    };
+    let unbounded = inline_calls_with(&m, limits);
+    assert!(
+        size(&unbounded.funcs[0]) > 3000,
+        "the tree unfolds into the entry"
+    );
+    let bounded = inline_calls_with(
+        &m,
+        InlineLimits {
+            max_caller: 300,
+            ..limits
+        },
+    );
+    verify_module(&bounded).expect("bounded output verifies");
+    for (i, f) in bounded.funcs.iter().enumerate() {
+        assert!(size(f) <= 300, "function {i} grew to {}", size(f));
+    }
+    for a in [0, 7, -3] {
+        let want = run(&m, 0, &[Value::I32(a)]).0;
+        assert_eq!(run(&bounded, 0, &[Value::I32(a)]).0, want, "a={a}");
+    }
+}
+
+#[test]
+fn a_speed_link_stops_growing_a_caller_at_its_limit() {
+    // A caller of `n` instructions whose last is a call to a 40-instruction leaf, which a speed
+    // link's rounds inline unless that takes the caller past `LINKED_SPEED_MAX_CALLER` (#2833).
+    let caller = |n: usize| -> Func {
+        let mut f = leaf_of(n - 1);
+        let last = (n - 1) as u32;
+        f.blocks[0].insts.push(call(1, vec![last]));
+        f.blocks[0].term = Terminator::Return(vec![last + 1]);
+        f
+    };
+    for (n, inlined) in [
+        (LINKED_SPEED_MAX_CALLER - 100, true),
+        (LINKED_SPEED_MAX_CALLER - 10, false),
+    ] {
+        let m = module(vec![caller(n), leaf_of(40)]);
+        let speed = optimize_linked(&m, LinkOpt::Speed);
+        verify_module(&speed).expect("a speed link verifies");
+        assert_eq!(n_calls(&speed), usize::from(!inlined), "n={n}");
+        assert!(size(&speed.funcs[0]) <= LINKED_SPEED_MAX_CALLER, "n={n}");
+        let want = run(&m, 0, &[Value::I32(3)]).0;
+        assert_eq!(run(&speed, 0, &[Value::I32(3)]).0, want, "n={n}");
     }
 }
 
