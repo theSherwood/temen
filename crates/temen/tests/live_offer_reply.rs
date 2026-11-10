@@ -914,22 +914,17 @@ fn a_serve_loop_that_returns_revokes_its_parked_handler_s_call() {
     assert_eq!(r, Ok(vec![Value::I64(77 * 1_000_000 + CAP_REVOKED)]));
 }
 
-/// #2742 — the same where the bytecode engine runs it: the handler parks on a call back into its
-/// parent, which never serves it (the parent's own call waits on the handler), so only the serve
-/// loop's end can answer the parent. The parent grants its child a live self-serve offer over its
-/// export `back` (#744), mints an offer over the child and calls `hang(1, 2)`; the handler sets the
-/// flag and calls `back.back(1, 2)`; the child's main polls until it sees the flag and returns 77.
-/// The parent answers `join · 1_000_000 + call`. The parent's offer and the child's grant hold each
-/// other's hosts, which the tree-walker's end of run cannot unwrap (#2830), so the bytecode engine's
-/// two executors and the JIT run it, against the oracle's answer.
-#[test]
-fn a_handler_parked_on_its_parent_when_its_serve_loop_returns_is_revoked() {
+/// The caller of the self-serve grant's tests: it grants its child a live self-serve offer over its
+/// export `back` (#744), whose `back(a, b)` answers `a + b`, mints an offer over the child, calls
+/// the offer's op 0 with `(1, 2)`, joins the child and answers `join · 1_000_000 + call`. Its offer
+/// and the child's grant hold each other's hosts (#2830).
+fn granting_caller() -> String {
     let child = temen_ir::SpawnRec {
         grants_ptr: 17536,
         grants_n: 1,
         ..temen_ir::SpawnRec::default()
     };
-    let caller = format!(
+    format!(
         r#"memory 17
 data 17600 "back"
 type 0 func (i64, i64) -> (i64)
@@ -968,7 +963,17 @@ block 0 (va: i64, vb: i64) {{
         tag = temen_interp::GRANT_SERVE_LIVE_TAG as i32,
         grant = rec::grant("ge", 17536, 17600, 4, "vgh"),
         rec = rec::segment(17408, &child),
-    );
+    )
+}
+
+/// #2742 — [`a_serve_loop_that_returns_revokes_its_parked_handler_s_call`]'s rule, in a shape the
+/// bytecode engine runs too: the handler parks on a call back into its parent, which never serves it
+/// (the parent's own call waits on the handler), so only the serve loop's end can answer the parent. The parent ([`granting_caller`]) calls `hang(1, 2)`; the
+/// handler sets the flag and calls `back.back(1, 2)`; the child's main polls until it sees the flag
+/// and returns 77. Every engine runs it (the tree-walker since #2830), against the oracle's answer.
+#[test]
+fn a_handler_parked_on_its_parent_when_its_serve_loop_returns_is_revoked() {
+    let caller = granting_caller();
     let server = r#"memory 17
 data 16384 "back"
 type 0 func (i64, i64) -> (i64)
@@ -1011,8 +1016,28 @@ block 0 (va: i64, vb: i64) {
         "the bytecode engine runs the caller"
     );
     assert!(bytecode::admits(&module(server)), "and the serving child");
-    let r = agree(&caller, server, &ENGINES[1..]);
+    let r = agree(&caller, server, &ENGINES);
     assert_eq!(r, Ok(vec![Value::I64(77 * 1_000_000 + CAP_REVOKED)]));
+}
+
+/// #2830 — a parent that holds an offer over a child holding its live self-serve grant ends its run
+/// as every engine does. The two hold each other's hosts, and the tree-walker's end of run used to
+/// require its root's cell to itself, so it panicked the host there. Nothing parks, and nothing calls
+/// back through the grant: the child serves `add(1, 2)` once and returns.
+#[test]
+fn a_parent_s_offer_over_a_child_holding_its_self_serve_grant_ends_its_run() {
+    let types = "type 0 func (i64, i64) -> (i64)
+type 1 interface { add: 0 }
+export 0 interface \"add\" 1 { add: 1 }";
+    let add = r#"func (i64, i64) -> (i64) {
+block 0 (va: i64, vb: i64) {
+  vs = i64.add va vb
+  return vs
+  }
+}
+"#;
+    let r = run(&granting_caller(), &server(types, add));
+    assert_eq!(r, served(3));
 }
 
 /// #2742 — a serving vCPU's end revokes the calls of the handlers it parked at once, while its

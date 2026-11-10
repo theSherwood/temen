@@ -2706,13 +2706,10 @@ fn drive_arc(
         handoff,
         jit_reapply,
     );
-    // Every vCPU (which held an Arc clone) is finished and dropped now, so the shared host is
-    // uniquely owned — unwrap it back into the caller so it observes the run's effects (stdout,
-    // grants, clock…).
-    *host = Arc::try_unwrap(host_shared)
-        .unwrap_or_else(|_| unreachable!("all vCPUs dropped before host readback"))
-        .into_inner()
-        .unwrap_or_else(|e| e.into_inner());
+    // Every vCPU (which held an Arc clone) is finished and dropped now: take the shared host back
+    // into the caller so it observes the run's effects (stdout, grants, clock…). A child's live offer
+    // back into the cell may still hold it (#2830), which keeps an empty host.
+    *host = Host::take_from_cell(host_shared);
     r
 }
 
@@ -24892,8 +24889,10 @@ pub fn read_slice(window: &[u8], off: u64, len: usize) -> Result<Vec<u8>, Trap> 
 /// until its `svc.wait` serve loop replies: a parent serving its child's `"exec"` with **its own
 /// code** (the none-the-wiser nested shell). Mediation-consistent by construction (PROCESS.md §4 S9):
 /// the offer exists only in the grantee's table, handed *down* the granter's own grant graph — the
-/// granter never holds a self-referential cap (no reference cycle, nothing for it to mis-call), and no
-/// new peer arrow appears.
+/// granter never holds a self-referential cap (nothing for it to mis-call), and no new peer arrow
+/// appears. A granter that also holds an offer over the grantee does hold the grantee's powerbox,
+/// which holds the granter's cell: a cycle, which the end of the run breaks by taking the granter's
+/// host out of its cell ([`Host::take_from_cell`], #2830).
 ///
 /// Why a tagged handle and not the record's reserved `flags` word: `flags` is documented
 /// reserved-and-**ignored**, and real callers (the C shims' unwritten `pad`, hand-built manager
@@ -31734,16 +31733,24 @@ impl Host {
     }
 
     /// Take a host back out of the cell [`Host::into_cell`] made, once its run is over: no longer a
-    /// shared cell. A clone of the cell some straggler still holds (a child's live offer to it)
-    /// keeps an empty host.
+    /// shared cell ([`Host::take_from_cell`]).
     pub fn from_cell(cell: Arc<Mutex<Host>>) -> Host {
-        let mut host = match Arc::try_unwrap(cell) {
-            Ok(m) => m.into_inner().unwrap_or_else(|e| e.into_inner()),
-            Err(cell) => std::mem::take(&mut *cell.lock_unpoisoned()),
-        };
+        let mut host = Host::take_from_cell(cell);
         host.self_cell = None;
         host.svc_bell = None;
         host
+    }
+
+    /// Take a host out of a shared cell once its run is over: the cell's own host when nothing else
+    /// holds the cell, else its contents, leaving an empty host to the straggler that does. One is a
+    /// child's live offer back into the cell (#744), which holds it in a cycle with this host's own
+    /// offer over that child: taking the host out of the cell breaks the cycle, so both go once the
+    /// caller drops what it takes (#2830). Every engine's end of run reads its host back so.
+    pub(crate) fn take_from_cell(cell: Arc<Mutex<Host>>) -> Host {
+        match Arc::try_unwrap(cell) {
+            Ok(m) => m.into_inner().unwrap_or_else(|e| e.into_inner()),
+            Err(cell) => std::mem::take(&mut *cell.lock_unpoisoned()),
+        }
     }
 
     /// #2742 — publish a serve op of this domain parked at an empty queue; see
@@ -33568,8 +33575,10 @@ impl Host {
     /// callee is this domain's own running cell `cell`, over its impl-export. The child's calls
     /// enqueue on this domain's inbound queue and park until its `svc.wait` serve loop replies. Only
     /// the child's table holds the entry (granter → grantee, down the grant graph), so the granter
-    /// never holds a self-referential `Arc`: no cycle, nothing for it to mis-call. `callee_task:
-    /// None` — non-durable (freeze refuses), the deferred durability story (#1681).
+    /// never holds a self-referential `Arc`: nothing for it to mis-call. One that holds an offer over
+    /// the child too sits in a cycle with it, broken at the run's end ([`Host::take_from_cell`],
+    /// #2830). `callee_task: None` — non-durable (freeze refuses), the deferred durability story
+    /// (#1681).
     fn grant_into_child(
         &mut self,
         cell: Option<&Arc<Mutex<Host>>>,
@@ -44043,3 +44052,46 @@ mod detached_freeze_tests;
 
 #[cfg(test)]
 mod freeze_census_tests;
+
+#[cfg(test)]
+mod take_from_cell_tests {
+    use super::*;
+
+    /// #2830 — a parent's offer over a child holding a live offer back into the parent's cell is a
+    /// cycle. Taking the parent's host out of its cell at its run's end breaks it: once the caller
+    /// drops the host it took, the child's powerbox goes, and the emptied cell with it.
+    #[test]
+    fn taking_a_host_out_of_its_cell_frees_the_cycle_through_a_child_s_grant() {
+        let no_ops = || {
+            (
+                Arc::from(Vec::<String>::new()),
+                Arc::from(Vec::<FuncType>::new()),
+            )
+        };
+        let cell = Arc::new(Mutex::new(Host::new()));
+        let child = Arc::new(Mutex::new(Host::new()));
+        let (names, sigs) = no_ops();
+        child
+            .lock_unpoisoned()
+            .install_live_impl(Arc::clone(&cell), 0, names, sigs, None);
+        let (names, sigs) = no_ops();
+        cell.lock_unpoisoned()
+            .install_live_impl(Arc::clone(&child), 0, names, sigs, None);
+        let (cell_alive, child_alive) = (Arc::downgrade(&cell), Arc::downgrade(&child));
+        drop(child);
+        let host = Host::take_from_cell(cell);
+        assert!(
+            cell_alive.upgrade().is_some(),
+            "the child's offer still holds the emptied cell"
+        );
+        drop(host);
+        assert!(
+            child_alive.upgrade().is_none(),
+            "the child's powerbox goes with the parent's offer"
+        );
+        assert!(
+            cell_alive.upgrade().is_none(),
+            "and the cell with the child's"
+        );
+    }
+}
