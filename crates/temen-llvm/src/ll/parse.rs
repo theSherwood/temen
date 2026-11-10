@@ -646,9 +646,14 @@ impl Parser {
             other => return self.err(format!("expected an alias @name, found {other:?}")),
         };
         self.expect(&Token::Equals)?;
+        let mut local = false;
         while !self.eat_word("alias") {
             match self.peek() {
-                Some(Token::Word(_)) => self.pos += 1, // linkage / visibility / unnamed_addr / …
+                // linkage / visibility / unnamed_addr / …
+                Some(Token::Word(w)) => {
+                    local |= w == "internal" || w == "private";
+                    self.pos += 1;
+                }
                 other => return self.err(format!("expected `alias`, found {other:?}")),
             }
         }
@@ -661,6 +666,7 @@ impl Parser {
             name: name_from_local(&name),
             aliasee,
             ty,
+            local,
         });
         // Optional trailing `, partition "…"` — skip it *only if present* (an unconditional
         // boundary-skip would swallow the next top-level item, whose leading `@name` this consumes).

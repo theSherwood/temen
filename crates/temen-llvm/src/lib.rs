@@ -1453,12 +1453,28 @@ fn translate_impl(
     }
     // A link unit exports only external-linkage names (#1746); a whole module exports every defined
     // function, as before.
-    let exported: Vec<(String, u32)> = defined
+    let mut exported: Vec<(String, u32)> = defined
         .iter()
         .enumerate()
         .filter(|(_, f)| !(opts.link_unit && f.local))
         .map(|(i, f)| (f.name.clone(), base + i as u32))
         .collect();
+    // A link unit's exports are its interface, and identical-code folding must not change it
+    // (#2827): a function folded into an alias of another (`@a = alias …, ptr @b`) stays exported,
+    // at its aliasee's index. `name2idx` already resolves alias chains to a defined function, and
+    // holds nothing else, so an alias of a data global or of an import is not exported.
+    if opts.link_unit {
+        for ga in m.global_aliases.iter().filter(|ga| !ga.local) {
+            let Name::Name(name) = &ga.name else {
+                continue;
+            };
+            if let Some(&idx) = name2idx.get(name.as_str()) {
+                if !exported.iter().any(|(e, _)| e == name.as_str()) {
+                    exported.push((name.to_string(), idx));
+                }
+            }
+        }
+    }
     let types = sig_types.into_inner();
     let mut t = Translated {
         module: Module {
@@ -5923,6 +5939,7 @@ fn link_heap(m: Cow<'_, LModule>) -> Result<Cow<'_, LModule>, Error> {
     for (name, target) in wanted {
         m.func_declarations.retain(|d| d.name != name);
         let ptr = m.types.pointer(0);
+        // A resolution alias inside one program, not part of any unit's interface.
         m.global_aliases.push(GlobalAlias {
             name: Name::Name(Box::new(name.to_string())),
             aliasee: ConstantRef::new(Constant::GlobalReference {
@@ -5930,6 +5947,7 @@ fn link_heap(m: Cow<'_, LModule>) -> Result<Cow<'_, LModule>, Error> {
                 ty: ptr.clone(),
             }),
             ty: ptr,
+            local: true,
         });
     }
     Ok(Cow::Owned(m))

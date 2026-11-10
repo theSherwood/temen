@@ -375,3 +375,58 @@ fn a_link_unit_takes_the_address_of_another_units_function() {
         );
     }
 }
+
+/// #2827 — identical-code folding must not change a unit's interface. rustc's
+/// `-Zmerge-functions=aliases` turns `@service_disarm`, whose body matches `@home_disarm`'s, into an
+/// alias of it, and `@chained` aliases that alias. Every external alias stays exported, at its
+/// aliasee's index; a local one does not, as a local function does not.
+const FOLDED_LIB: &str = r#"
+define i64 @home_disarm(i64 %h) {
+entry:
+  %r = add i64 %h, 7
+  ret i64 %r
+}
+
+@service_disarm = unnamed_addr alias i64 (i64), ptr @home_disarm
+@chained = alias i64 (i64), ptr @service_disarm
+@private_alias = internal alias i64 (i64), ptr @home_disarm
+"#;
+
+/// A program that reaches the library only through its folded names.
+const FOLDED_APP: &str = r#"
+declare i64 @service_disarm(i64)
+declare i64 @chained(i64)
+
+define i64 @run() {
+entry:
+  %a = call i64 @service_disarm(i64 1)
+  %b = call i64 @chained(i64 10)
+  %r = mul i64 %a, %b
+  ret i64 %r
+}
+"#;
+
+#[test]
+fn a_link_unit_exports_a_function_folded_into_an_alias() {
+    let lib = link_unit(FOLDED_LIB);
+    let exports: Vec<(&str, u32)> = lib
+        .exports
+        .iter()
+        .map(|e| (e.name.as_str(), e.func))
+        .collect();
+    let at = lib
+        .resolve_export("home_disarm")
+        .expect("the aliasee is exported");
+    assert_eq!(
+        exports,
+        [("home_disarm", at), ("service_disarm", at), ("chained", at)],
+        "every external alias at its aliasee's index, and no local one"
+    );
+    temen_verify::verify_module(&lib).expect("two names for one function verify");
+    // A program that calls the folded names links against the unit, and reaches the one body.
+    let units = vec![unit(lib), unit(link_unit(FOLDED_APP))];
+    assert_eq!(
+        link_and_run(units, "run"),
+        temen_run::Outcome::Returned(vec![Value::I64(8 * 17)])
+    );
+}

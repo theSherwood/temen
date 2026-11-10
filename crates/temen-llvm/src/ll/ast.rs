@@ -787,6 +787,9 @@ pub struct GlobalAlias {
     pub name: Name,
     pub aliasee: ConstantRef,
     pub ty: TypeRef,
+    /// `internal`/`private` linkage: a link unit does not export it (#2827), as it does not export a
+    /// local function.
+    pub local: bool,
 }
 
 /// A basic block. Mirrors `llvm_ir::BasicBlock`.
