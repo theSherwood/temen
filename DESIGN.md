@@ -2521,15 +2521,21 @@ re-issues on thaw (O10 at-least-once).
 
 Interp: inline animation (the caller's thread switches worlds and runs the handler fiber — the
 §14 coroutine-drive shape); promotion is free by construction since interp fibers are reified
-data. JIT (#2742): a serve op's handlers run on fibers of their own, of the serving vCPU's
-**window**. The serve op holds the window's gate whenever it is not parked, so its handlers run
-one at a time and never beside it, and only while it is inside a serve op. A handler starts on the
-thread that holds the gate: the serve op's own, or a caller's under the direct handoff (arm 4),
-whose call then takes no ticket. One that parks joins the run's pool, which resumes it when its
-wait ends, on a worker, or on the serve op's thread when the serve op finds it woken. Each
-crossing has a stack of its own, so a chain of crossings needs no depth bound. A run with no pool
-(no §14 child, so no live offer reaches it), and a domain a freeze can land in (a handler fiber
-cannot ride the snapshot yet, #2804), keep each handler on the serve op's own stack. Bytecode: declines
+data. JIT (#2742): a serve op's handlers run against the serving vCPU's **window**, one at a
+time under its gate, and only while the serve op is inside a serve op. The gate records its
+holder: the serve op whenever it is not parked, or the thread of control running a handler. A
+handler gives the gate back around each live call it makes and each event park (a futex wait, a
+host-call park, an outside wait) and takes it back after, as on the oracle, where a handler's park
+frees its serving vCPU; a whole-vCPU park and a quantum's end keep it. A handler the serve op
+starts runs on a fiber of its own; one that parks joins the run's pool, which resumes it when its
+wait ends, on a worker, or on the serve op's thread when the serve op finds it woken. Under the
+direct handoff (arm 4) the caller's call takes no ticket, and its handler runs on the caller's own
+stack when it can never park (`temen_ir::seams::handler_never_parks`: nothing its call closure
+reaches can park) and the stack has room for it: it runs to completion or traps, and never gives
+its gate back. Every other handoff runs its handler on a fiber of its own, so a chain of crossings
+needs no depth bound. A domain retires until its handlers have ended, wherever they run. A run with
+no pool (no §14 child, so no live offer reaches it), and a domain a freeze can land in (a handler
+fiber cannot ride the snapshot yet, #2804), keep each handler on the serve op's own stack. Bytecode: declines
 to the tree-walker. Observable results and provider state are identical across
 backends (§18 oracle); scheduling interleavings are quarantined in the deterministic explorer.
 The two transports — animated (library) and serve-loop (process/live callee) — are **kept on
@@ -2544,7 +2550,12 @@ round trip, +15%). On the JIT a handler that ends without parking, the common ca
 fiber its window keeps for the next dispatch and never meets the pool; one that parks is
 promoted into the pool then. Weighed and set aside (#2771): run a handler inline and promote it to a fiber
 only when it parks. That wins most of the cost back, but it is a second way to run a handler, and
-the JIT cannot do the same, since its frames cannot leave the stack they run on. The lock-held
+the JIT cannot do the same, since its frames cannot leave the stack they run on. The JIT's one
+inline case is a direct handoff of a handler that can never park (owner, 2026-11-10): it needs no
+promotion, its caller waits on it anyway, and a fiber per handoff cost 45–95% of the round trip.
+A handler that can park and runs on the caller's stack (weighed and set aside the same day) would
+park as its caller, where its wake reaches no serve loop: the oracle resumes a woken handler
+before its serve loop's `svc.wait` returns, and that order would be lost. The lock-held
 nested sub-interpreter, its acyclicity/deadlock argument, and provider-pays fuel all left the
 TCB; the caller's powerbox lock is held only at the two `cap`-slot translation edges.
 
