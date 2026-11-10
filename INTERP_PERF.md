@@ -607,6 +607,29 @@ before the entry runs. A start runs a fraction of its image: a QuickJS start tha
 
   Run time is within noise.
 
+## Allocations per operation (#2486)
+
+What a guest does once per operation allocates nothing on any engine.
+`crates/temen-run/tests/alloc_free.rs` pins it: a counting allocator, and each path run at two
+sizes so compiling and setting up cancel out.
+
+| per operation | JIT | bytecode | tree-walker |
+|---|--:|--:|--:|
+| a capability call (`Clock.now`, a host procedure) | 0 | 0 | 0 |
+| a guest call | 0 | 0 | 0 |
+| a fiber switch | 0 | 0 | 0 |
+| a fiber's life (start, run to its return) | 4 | 2 | 4 |
+
+The last row is pinned at what it is, so it can only come down.
+
+To find what a real program allocates and where, run it under valgrind:
+
+- `valgrind --tool=dhat --smc-check=all-non-file PROGRAM` writes every allocation site, with its
+  count, bytes and backtrace, to `dhat.out.<pid>`, which `dh_view.html` (valgrind's) shows.
+- `valgrind --tool=cachegrind --smc-check=all-non-file PROGRAM` counts cache misses per function.
+
+`--smc-check=all-non-file` makes valgrind see code the JIT writes.
+
 ## Validation strategy (every phase)
 
 - Full differential oracle must stay green: `jit_diff`, `jit_fuzz`, `fiber_fuzz`, `concurrent_fuzz`,
