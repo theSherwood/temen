@@ -203,6 +203,19 @@ enum Backing<'a> {
     Foreign(&'a Foreign),
 }
 
+impl Backing<'_> {
+    /// The addressable length `[0, size)` of this snapshot.
+    #[inline]
+    fn len(&self) -> u64 {
+        match self {
+            Backing::Raw(s) => s.size,
+            Backing::Paged(p) => p.size,
+            Backing::Sparse(p) => p.size,
+            Backing::Foreign(f) => f.len.load(Ordering::Acquire),
+        }
+    }
+}
+
 impl Region {
     /// A region addressing `[0, size)` bytes, all reading as zero until written. `page` is the
     /// host page granularity (the unit [`Region::zero`] re-zeroes and the `Paged` chunk size).
@@ -339,7 +352,7 @@ impl Region {
     /// [`Shared`] — `Mapped` *is* a `Shared` plus an owned `mmap` — so a single `Raw` arm serves
     /// them; `Paged` (the safe reference) and `Foreign` (the proxied table) are the other two. No
     /// `Mapped`/`Shared` duplication to keep in step.
-    #[inline]
+    #[inline(always)]
     fn backing(&self) -> Backing<'_> {
         match self {
             #[cfg(unix)]
@@ -355,7 +368,7 @@ impl Region {
 
     /// The flat raw body, if this region has one (`Paged`/`Foreign` do not). By value: a `Growable`
     /// region's `(base, size)` is read live, so there is no stable `&Shared` to lend.
-    #[inline]
+    #[inline(always)]
     fn flat(&self) -> Option<Shared> {
         match self.backing() {
             Backing::Raw(s) => Some(s),
@@ -365,12 +378,7 @@ impl Region {
 
     /// The addressable length `[0, size)`.
     pub fn len(&self) -> u64 {
-        match self.backing() {
-            Backing::Raw(s) => s.size,
-            Backing::Paged(p) => p.size,
-            Backing::Sparse(p) => p.size,
-            Backing::Foreign(f) => f.len.load(Ordering::Acquire),
-        }
+        self.backing().len()
     }
 
     /// #816: the raw base address of a **flat** (raw-backed `Shared`/`Mapped`) region — the pointer
@@ -409,10 +417,10 @@ impl Region {
     /// Read one byte; an untouched address reads zero. Out of range reads zero (the caller already
     /// confined into `[0, len)`; this is belt-and-suspenders).
     pub fn byte(&self, off: u64) -> u8 {
-        if off >= self.len() {
+        let Some(backing) = self.backing_for(off, 1) else {
             return 0;
-        }
-        match self.backing() {
+        };
+        match backing {
             Backing::Raw(s) => s.byte(off),
             Backing::Paged(p) => p.byte(off),
             Backing::Sparse(p) => p.byte(off),
@@ -422,10 +430,10 @@ impl Region {
 
     /// Write one byte. Out-of-range writes are dropped (the caller confines first).
     pub fn set_byte(&self, off: u64, b: u8) {
-        if off >= self.len() {
+        let Some(backing) = self.backing_for(off, 1) else {
             return;
-        }
-        match self.backing() {
+        };
+        match backing {
             Backing::Raw(s) => s.set_byte(off, b),
             Backing::Paged(p) => p.set_byte(off, b),
             Backing::Sparse(p) => p.set_byte(off, b),
@@ -529,15 +537,19 @@ impl Region {
         }
     }
 
-    /// Whether `[off, off+width)` lies inside the region — the one bound every word/atomic accessor
-    /// enforces (#1191). The interpreter confines an access to the window's *reservation* and its
-    /// page map, not to this backing, and a caller-provided backing (`Region::shared` over a browser
-    /// window slice) can be narrower than the reservation: an admitted page past the backing's end
-    /// must read as zero / drop the write here, never touch the host memory behind the buffer.
+    /// The backing, when `[off, off+width)` lies inside the region: the one bound every byte, word
+    /// and atomic accessor enforces (#1191). The interpreter confines an access to the window's
+    /// *reservation* and its page map, not to this backing, and a caller-provided backing
+    /// (`Region::shared` over a browser window slice) can be narrower than the reservation: an
+    /// admitted page past the backing's end must read as zero / drop the write here, never touch the
+    /// host memory behind the buffer. The bound and the access read the one [`Backing`] this returns:
+    /// one dispatch on the variant, and one snapshot of a `Growable` region's `(base, size)` (#2486).
     #[inline]
-    fn in_range(&self, off: u64, width: u32) -> bool {
+    fn backing_for(&self, off: u64, width: u32) -> Option<Backing<'_>> {
+        let b = self.backing();
         off.checked_add(width as u64)
-            .is_some_and(|end| end <= self.len())
+            .is_some_and(|end| end <= b.len())
+            .then_some(b)
     }
 
     /// **Non-atomic** width-specialized (1/2/4/8) little-endian read — one (possibly unaligned)
@@ -546,12 +558,25 @@ impl Region {
     /// time (no race), so it can take this path; the genuinely concurrent tree-walker / §12 atomics
     /// keep the per-byte [`Region::byte`] / [`Region::atomic_load`] paths. Out-of-range reads
     /// return 0 (like [`Region::byte`]); the caller confines to the window, this bounds to the backing.
-    #[inline]
+    ///
+    /// #2486: a flat backing's read inlines into the caller as a bound and one load, so the bytecode
+    /// engine's loads pay no call and no second dispatch; the others take [`Region::read_word_other`].
+    #[inline(always)]
     pub fn read_word(&self, off: u64, width: u32) -> u64 {
-        if !self.in_range(off, width) {
-            return 0;
+        match self.flat() {
+            Some(s) if s.holds(off, width) => s.read_word(off, width),
+            Some(_) => 0,
+            None => self.read_word_other(off, width),
         }
-        match self.backing() {
+    }
+
+    /// [`Region::read_word`] off a flat backing.
+    #[inline(never)]
+    fn read_word_other(&self, off: u64, width: u32) -> u64 {
+        let Some(backing) = self.backing_for(off, width) else {
+            return 0;
+        };
+        match backing {
             Backing::Raw(s) => s.read_word(off, width),
             Backing::Paged(p) => p.read_word(off, width),
             Backing::Sparse(p) => p.read_word(off, width),
@@ -561,12 +586,23 @@ impl Region {
 
     /// **Non-atomic** width-specialized little-endian write — the store counterpart of
     /// [`Region::read_word`] (same single-threaded contract). Keeps only the low `width` bytes.
-    #[inline]
+    /// Inlined like [`Region::read_word`] (#2486).
+    #[inline(always)]
     pub fn write_word(&self, off: u64, width: u32, val: u64) {
-        if !self.in_range(off, width) {
-            return;
+        match self.flat() {
+            Some(s) if s.holds(off, width) => s.write_word(off, width, val),
+            Some(_) => {}
+            None => self.write_word_other(off, width, val),
         }
-        match self.backing() {
+    }
+
+    /// [`Region::write_word`] off a flat backing.
+    #[inline(never)]
+    fn write_word_other(&self, off: u64, width: u32, val: u64) {
+        let Some(backing) = self.backing_for(off, width) else {
+            return;
+        };
+        match backing {
             Backing::Raw(s) => s.write_word(off, width, val),
             Backing::Paged(p) => p.write_word(off, width, val),
             Backing::Sparse(p) => p.write_word(off, width, val),
@@ -577,10 +613,10 @@ impl Region {
     /// `width`-byte (4 or 8) sequentially-consistent atomic load (§12). The caller guarantees
     /// natural alignment and in-window bounds.
     pub fn atomic_load(&self, off: u64, width: u32) -> u64 {
-        if !self.in_range(off, width) {
+        let Some(backing) = self.backing_for(off, width) else {
             return 0;
-        }
-        match self.backing() {
+        };
+        match backing {
             Backing::Raw(s) => s.atomic_load(off, width),
             Backing::Paged(p) => p.atomic_load(off, width),
             Backing::Sparse(p) => p.atomic_load(off, width),
@@ -590,10 +626,10 @@ impl Region {
 
     /// `width`-byte seq-cst atomic store.
     pub fn atomic_store(&self, off: u64, width: u32, val: u64) {
-        if !self.in_range(off, width) {
+        let Some(backing) = self.backing_for(off, width) else {
             return;
-        }
-        match self.backing() {
+        };
+        match backing {
             Backing::Raw(s) => s.atomic_store(off, width, val),
             Backing::Paged(p) => p.atomic_store(off, width, val),
             Backing::Sparse(p) => p.atomic_store(off, width, val),
@@ -605,10 +641,10 @@ impl Region {
 
     /// `width`-byte seq-cst read-modify-write; returns the **old** value.
     pub fn atomic_rmw(&self, off: u64, width: u32, op: RmwOp, val: u64) -> u64 {
-        if !self.in_range(off, width) {
+        let Some(backing) = self.backing_for(off, width) else {
             return 0;
-        }
-        match self.backing() {
+        };
+        match backing {
             Backing::Raw(s) => s.atomic_rmw(off, width, op, val),
             Backing::Paged(p) => p.atomic_rmw(off, width, op, val),
             Backing::Sparse(p) => p.atomic_rmw(off, width, op, val),
@@ -619,10 +655,10 @@ impl Region {
     /// `width`-byte seq-cst compare-exchange: store `replacement` iff the current value equals
     /// `expected`; always return the **old** value.
     pub fn atomic_cmpxchg(&self, off: u64, width: u32, expected: u64, replacement: u64) -> u64 {
-        if !self.in_range(off, width) {
+        let Some(backing) = self.backing_for(off, width) else {
             return 0;
-        }
-        match self.backing() {
+        };
+        match backing {
             Backing::Raw(s) => s.atomic_cmpxchg(off, width, expected, replacement),
             Backing::Paged(p) => p.atomic_cmpxchg(off, width, expected, replacement),
             Backing::Sparse(p) => p.atomic_cmpxchg(off, width, expected, replacement),
@@ -837,8 +873,8 @@ mod shared {
     // or a relaxed single byte (`byte`/`set_byte`), both defined under races; bulk `zero`/`read_into`
     // are control-plane. The embedder guarantees the backing is genuinely shared across the threads
     // that hold this region and outlives it; `Region` bounds every access to `[0, size)` before
-    // dispatching (`byte`/`set_byte` per byte, `in_range` for the word/atomic paths, `clamp_len` for
-    // the bulk paths).
+    // dispatching (`backing_for` for the byte, word and atomic paths, `clamp_len` for the bulk
+    // paths).
     unsafe impl Send for Shared {}
     unsafe impl Sync for Shared {}
 
@@ -866,6 +902,13 @@ mod shared {
             unsafe { self.base.add(off as usize) }
         }
 
+        /// Whether `[off, off + width)` lies in this body: the bound its unchecked accessors need.
+        #[inline(always)]
+        pub(super) fn holds(&self, off: u64, width: u32) -> bool {
+            off.checked_add(width as u64)
+                .is_some_and(|end| end <= self.size)
+        }
+
         pub(super) fn byte(&self, off: u64) -> u8 {
             // SAFETY: `off < size`; `*mut u8` is 1-aligned for `AtomicU8`. Relaxed → defined under races.
             unsafe { AtomicU8::from_ptr(self.ptr(off)).load(Relaxed) }
@@ -876,6 +919,7 @@ mod shared {
             unsafe { AtomicU8::from_ptr(self.ptr(off)).store(b, Relaxed) }
         }
 
+        #[inline]
         pub(super) fn read_word(&self, off: u64, width: u32) -> u64 {
             let p = self.ptr(off);
             // SAFETY: caller confined `[off, off+width) ⊆ [0, size)`; `read_unaligned` needs no align.
@@ -890,6 +934,7 @@ mod shared {
             }
         }
 
+        #[inline]
         pub(super) fn write_word(&self, off: u64, width: u32, val: u64) {
             let p = self.ptr(off);
             // SAFETY: as `read_word`.
@@ -1289,6 +1334,7 @@ mod growable {
         /// The current `(base, size)` as a by-value [`Shared`] — what every accessor dispatches
         /// through. `size` is loaded **first** so that an (contract-violating) interleaved grow can
         /// only ever pair a *stale, smaller* size with a newer, larger buffer, never the reverse.
+        #[inline]
         pub(super) fn snapshot(&self) -> Shared {
             let size = self.size.load(Acquire);
             Shared::new(self.base.load(Acquire), size)
