@@ -6,3 +6,19 @@
 # bench job's log ends with its run as a section to paste here. Elsewhere:
 # cargo run --release -- --save-baseline FILE (writes this machine's section only).
 # columns: kernel,compute_vs_wasm32,compute_vs_wasm64,cold_vs_wasmtime,interp_vs_jit,jit_vs_native
+
+cpu: AMD EPYC 9V74 80-Core Processor
+alu,1.008,1.008,1.435,60.198,5.044
+memsum,1.006,0.719,1.252,300.918,1.008
+scatter,1.006,0.693,1.218,271.570,1.289
+simd,1.012,1.012,1.383,261.570,NA
+float,1.006,1.006,1.391,53.784,1.006
+calli,1.188,1.188,0.937,63.626,1.258
+calli_poly,1.009,1.010,0.886,20.966,1.037
+cache,0.966,0.712,1.265,193.142,1.130
+alu_c,1.003,1.003,1.864,106.059,5.017
+locals_c,1.201,0.858,1.697,487.118,1.201
+irreducible,0.336,NA,1.496,374.420,NA
+hostcall,0.928,NA,1.554,NA,NA
+hostproc,12.738,NA,1.589,NA,NA
+hostbuf,0.449,NA,1.166,NA,NA

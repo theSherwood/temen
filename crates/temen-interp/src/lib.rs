@@ -10584,7 +10584,12 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 if !froze {
                     if let Some(t) = &died {
                         teardown_domain(&mut s, key, t, &dying_host);
-                        wake_dead_tickets(&mut s, key, own_tickets);
+                    }
+                    // #2742 — the handlers this vCPU parked can never run again, however it ended
+                    // (owner, 2026-11-09): each one's call answers `CAP_REVOKED` now, as its own
+                    // reply would, whether its caller has parked yet or not (D37).
+                    for t in own_tickets {
+                        reply_locked(&mut s, t, Reply::Failed(CAP_REVOKED), &dying_host);
                     }
                     if (id == ROOT_TASK && !rests) || (died.is_some() && key == s.root_domain) {
                         teardown_run(&mut s);
@@ -15924,9 +15929,11 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     // is registered yet) — take it and continue. If the handler parks mid-handoff
                     // (no reply) or the provider is ineligible, fall through to the enqueue+wake+park
                     // path on the same ticket `t` (4d.2: the handler completes later and replies
-                    // via `t`).
+                    // via `t`). #1952, #2742 — a guest fiber's call takes the queue: it parks the
+                    // fiber, whose resumer sees `FIBER_PARKED`, and a handoff would answer it first,
+                    // which no resumer of a fiber may tell from the queue.
                     if let SchedRef::Real(sr) = sched {
-                        if sr.handoff {
+                        if sr.handoff && *cur == ROOT_FIBER {
                             if let Some(provider) = sr.take_parked_serve_loop(callee_id as usize) {
                                 dispatch(sr, provider);
                                 let served = callee.lock_unpoisoned().svc_results.remove(&t);
@@ -26222,28 +26229,11 @@ pub struct Host {
     /// serve loop's next `svc.wait` that would park with nothing served answers `0` instead, so the
     /// server reaches its `join` (the tree-walker keeps the same token in its scheduler).
     client_gone: bool,
-    /// CALLS.md 5c.2 — the child's **published serve activation** while its serve loop is parked
-    /// at an empty-queue `svc.wait`: `(serve_ctx, mem_base, mem_reserved)` — everything a claiming
-    /// caller needs to invoke a handler inline over the child's live window (the §10.2 arm-4
-    /// direct handoff, JIT twin). Published/cleared only by the child's own serve loop, under the
-    /// cell's lock; `None` whenever the child is running, serving, or gone.
-    serve_activation: Option<(usize, usize, u64)>,
-    /// CALLS.md 5c.2 — the activation **claim** flag: set (under the lock, atomically with the
-    /// activation check) by the one caller serving inline. While set: no second claimer, the
-    /// child's serve loop neither pops nor exits (its window must stay alive under the claimer),
-    /// and interrupt exits defer until release.
-    handoff_claimed: bool,
-    /// CALLS.md 5c.2 — dispatches served **by claimers** since the child last folded its count:
-    /// the §10.2 settlement rule ("a handoff-served dispatch counts in the callee's serve
-    /// accounting") — the child's parked `svc.wait` completes with the same served-count
-    /// observation the enqueue path would have delivered.
-    handoff_served: i64,
-    /// CALLS.md 5c.2 — a trap raised by a handoff-served handler (`0` ⇒ none). The inline invoke
-    /// runs child code on the **claimer's** thread, but a handler trap is the *child's* outcome
-    /// (under the enqueue path the child's own serve loop would have died with it): the claimer
-    /// records it here and answers `CAP_REVOKED` (the dying-callee errno); the child's serve loop
-    /// folds it on wake and exits with it as its own trap — same observables on both transports.
-    handoff_trap: i64,
+    /// #2742 — the serve ops of this domain parked at an empty queue (the Cranelift JIT's
+    /// `temen_jit::ServeSite`s, opaque here): a caller that finds one may start its own call's
+    /// handler on its own thread, taking the serve op's gate (the §10.2 arm-4 direct handoff).
+    /// Published and withdrawn by the serve op only, under the cell's lock.
+    parked_sites: Vec<Arc<dyn std::any::Any + Send + Sync>>,
     /// §3.6 slice 3 — live-callee offer entries ([`Binding::LiveImpl`] indexes here).
     live_impls: Vec<LiveImplEntry>,
     /// §13.4 slice 4d — restored `LiveImpl` handles awaiting **re-link** to their re-launched §14
@@ -27100,10 +27090,7 @@ impl Host {
             svc_bell: None,
             self_cell: None,
             client_gone: false,
-            serve_activation: None,
-            handoff_claimed: false,
-            handoff_served: 0,
-            handoff_trap: 0,
+            parked_sites: Vec::new(),
             live_impls: Vec::new(),
             pending_live_impls: Vec::new(),
             pending_inherited: Vec::new(),
@@ -31641,6 +31628,11 @@ impl Host {
             .map(|d| (d.export, d.op, d.args, d.ticket))
     }
 
+    /// The dispatches queued and not yet popped.
+    pub fn svc_queued(&self) -> usize {
+        self.svc_queue.len()
+    }
+
     /// I36 slice 3 — settle ticket `ticket`'s completion cell with `reply`: the embedder serve
     /// loop's counterpart of the eval-loop settle (the enqueuer claims it via
     /// [`Host::svc_result`]).
@@ -31735,53 +31727,21 @@ impl Host {
         host
     }
 
-    /// CALLS.md 5c.2 — publish / clear this child's parked serve activation; see
-    /// [`Host::serve_activation`]. Child serve loop only, under the cell's lock.
-    pub fn set_serve_activation(&mut self, a: Option<(usize, usize, u64)>) {
-        self.serve_activation = a;
+    /// #2742 — publish a serve op of this domain parked at an empty queue; see
+    /// [`Host::parked_sites`]. The serve op itself, under the cell's lock.
+    pub fn publish_site(&mut self, site: Arc<dyn std::any::Any + Send + Sync>) {
+        self.parked_sites.push(site);
     }
 
-    /// CALLS.md 5c.2 — try to claim the published activation (atomic with the check under the
-    /// cell's lock): `Some((serve_ctx, mem_base, mem_size))` and the claim is held; `None` when
-    /// nothing is published or another claimer holds it.
-    pub fn try_claim_handoff(&mut self) -> Option<(usize, usize, u64)> {
-        if self.handoff_claimed {
-            return None;
-        }
-        let a = self.serve_activation?;
-        self.handoff_claimed = true;
-        Some(a)
+    /// #2742 — withdraw the serve op at `site` (its address), once its park has ended.
+    pub fn withdraw_site(&mut self, site: *const ()) {
+        self.parked_sites
+            .retain(|s| Arc::as_ptr(s) as *const () != site);
     }
 
-    /// CALLS.md 5c.2 — release the claim after the inline serve, recording `served` dispatches
-    /// into the callee's serve accounting (the §10.2 settlement rule). The caller then notifies
-    /// the cell's Condvar so the child folds the count and completes its `svc.wait`.
-    pub fn release_handoff(&mut self, served: i64) {
-        self.handoff_claimed = false;
-        self.handoff_served += served;
-    }
-
-    /// Whether a claimer currently holds this child's activation (the child's serve loop must
-    /// neither pop, exit, nor honor interrupts while it does — the claimer runs over the child's
-    /// live window).
-    pub fn handoff_claimed(&self) -> bool {
-        self.handoff_claimed
-    }
-
-    /// CALLS.md 5c.2 — fold and reset the handoff-served count (the child's serve loop, on wake).
-    pub fn take_handoff_served(&mut self) -> i64 {
-        std::mem::take(&mut self.handoff_served)
-    }
-
-    /// CALLS.md 5c.2 — record a handoff-served handler's trap as the **child's** outcome; see
-    /// [`Host::handoff_trap`].
-    pub fn set_handoff_trap(&mut self, t: i64) {
-        self.handoff_trap = t;
-    }
-
-    /// Fold and reset the handoff trap (the child's serve loop, on wake; nonzero ⇒ exit with it).
-    pub fn take_handoff_trap(&mut self) -> i64 {
-        std::mem::take(&mut self.handoff_trap)
+    /// #2742 — the serve op of this domain parked latest at an empty queue.
+    pub fn parked_site(&self) -> Option<Arc<dyn std::any::Any + Send + Sync>> {
+        self.parked_sites.last().cloned()
     }
 
     /// §3.6 — the shape of THIS domain's impl-export `export` (its op signatures, in op
@@ -37952,23 +37912,37 @@ impl Mem {
     /// recoverable demand fault) falls to the cold path, which keeps the exact trap + `last_fault`
     /// semantics. Returns the [`Reg`] slot directly, dropping the `Value` round-trip the bytecode
     /// engine paid via `Reg::from_value(load(..))`.
-    #[inline]
+    ///
+    /// #2486: the fast path inlines into the engine's loop, and the cold path stays out of line, so
+    /// a load the run admits costs no call.
+    #[inline(always)]
     fn load_scalar(&self, addr: u64, offset: u64, op: LoadOp) -> Result<Reg, Trap> {
-        let (_, rty, width, signed) = op.info();
-        if let Some(abs) = self.fast_access(addr, offset, width, false) {
+        let (width, sext) = load_shape(op);
+        match self.fast_access(addr, offset, width, false) {
             // The run holds no `Backed` page, so the bytes live in `back` (no §13 redirect); the
             // cooperative bytecode engine is the sole accessor, so a single non-atomic word read is
             // sound (and one instruction, not `width` atomic byte loads).
-            let raw = self.back.read_word(abs, width);
-            return Ok(Reg::from_value(decode_loaded(rty, width, signed, raw)));
+            Some(abs) => Ok(loaded_slot(self.back.read_word(abs, width), width, sext)),
+            None => self.load_scalar_cold(addr, offset, width, sext),
         }
-        // Cold path — the access leaves the [`FastRun`] (an unmapped or aliased page, the NULL
-        // guard, the reserved tail). Run the *exact* confine + protection check the oracle
-        // [`Mem::load`] does (identical trap / `last_fault` / demand-fault semantics), but when `back`
-        // is contiguous (no §13 region redirect) still finish with **one** wide non-atomic read rather
-        // than `load`'s per-byte atomic `read_le` — the same cooperative sole-accessor contract as the
-        // fast path above. The profile showed this byte-at-a-time read dominating rodata guests, whose
-        // hot Lua-stack accesses are all to plain `Rw` pages yet took the per-byte path.
+    }
+
+    /// [`Mem::load_scalar`] for an access that leaves the [`FastRun`] (an unmapped or aliased page,
+    /// the NULL guard, the reserved tail). It runs the *exact* confine + protection check the oracle
+    /// [`Mem::load`] does (identical trap / `last_fault` / demand-fault semantics), but when `back` is
+    /// contiguous (no §13 region redirect) still finishes with **one** wide non-atomic read rather
+    /// than `load`'s per-byte atomic `read_le` — the same cooperative sole-accessor contract as the
+    /// fast path. The profile showed this byte-at-a-time read dominating rodata guests, whose hot
+    /// Lua-stack accesses are all to plain `Rw` pages yet took the per-byte path.
+    #[cold]
+    #[inline(never)]
+    fn load_scalar_cold(
+        &self,
+        addr: u64,
+        offset: u64,
+        width: u32,
+        sext: bool,
+    ) -> Result<Reg, Trap> {
         let base = self.confine_checked(addr, offset, width)?;
         self.check_prot(base, width, false)?;
         let raw = if self.has_regions.load(Ordering::Relaxed) {
@@ -37976,22 +37950,35 @@ impl Mem {
         } else {
             self.back.read_word(base, width)
         };
-        Ok(Reg::from_value(decode_loaded(rty, width, signed, raw)))
+        Ok(loaded_slot(raw, width, sext))
     }
 
     /// Bytecode-engine scalar store (Phase 2): the fast path of [`Mem::store`], taking the value as
     /// raw slot `lo` bits (no `Value` wrap). Same fast-path gate + cold fallback as
-    /// [`Mem::load_scalar`]; `write_le` truncates to the op width.
-    #[inline]
+    /// [`Mem::load_scalar`], inlined the same way (#2486); `write_le` truncates to the op width.
+    #[inline(always)]
     fn store_scalar(&mut self, addr: u64, offset: u64, op: StoreOp, lo: u64) -> Result<(), Trap> {
         let (_, _, width) = op.info();
-        if let Some(abs) = self.fast_access(addr, offset, width, true) {
-            self.back.write_word(abs, width, lo);
-            self.writes += 1;
-            return Ok(());
+        match self.fast_access(addr, offset, width, true) {
+            Some(abs) => self.back.write_word(abs, width, lo),
+            None => self.store_scalar_cold(addr, offset, width, lo)?,
         }
-        // Cold path, same reasoning as [`Mem::load_scalar`]: the exact confine + protection check the
-        // oracle [`Mem::store`] does, then one wide non-atomic write when `back` is contiguous.
+        self.writes += 1;
+        Ok(())
+    }
+
+    /// [`Mem::store_scalar`] for an access that leaves the [`FastRun`], by the reasoning of
+    /// [`Mem::load_scalar_cold`]: the exact confine + protection check the oracle [`Mem::store`]
+    /// does, then one wide non-atomic write when `back` is contiguous.
+    #[cold]
+    #[inline(never)]
+    fn store_scalar_cold(
+        &mut self,
+        addr: u64,
+        offset: u64,
+        width: u32,
+        lo: u64,
+    ) -> Result<(), Trap> {
         let base = self.confine_checked(addr, offset, width)?;
         self.check_prot(base, width, true)?;
         if self.has_regions.load(Ordering::Relaxed) {
@@ -37999,7 +37986,6 @@ impl Mem {
         } else {
             self.back.write_word(base, width, lo);
         }
-        self.writes += 1;
         Ok(())
     }
 
@@ -39244,6 +39230,37 @@ impl GuestMem for SoleMem<'_> {
     fn shadow(&self) -> ShadowArena {
         self.0.shadow()
     }
+}
+
+/// #2486 — how a load of `op` fills its slot ([`loaded_slot`]): its width in bytes, and whether its
+/// bytes sign-extend. An i32 slot holds its value sign-extended ([`Reg::from_i32`]), so a
+/// full-width i32 load sign-extends too; a float's bits zero-extend. The slot [`decode_loaded`]'s
+/// `Value` makes, without the `Value` (`load_shape_matches_decode_loaded`).
+#[inline(always)]
+fn load_shape(op: LoadOp) -> (u32, bool) {
+    match op {
+        LoadOp::I32 => (4, true),
+        LoadOp::I64 | LoadOp::F64 => (8, false),
+        LoadOp::F32 => (4, false),
+        LoadOp::I32_8S | LoadOp::I64_8S => (1, true),
+        LoadOp::I32_8U | LoadOp::I64_8U => (1, false),
+        LoadOp::I32_16S | LoadOp::I64_16S => (2, true),
+        LoadOp::I32_16U | LoadOp::I64_16U => (2, false),
+        LoadOp::I64_32S => (4, true),
+        LoadOp::I64_32U => (4, false),
+    }
+}
+
+/// The slot a load of [`load_shape`] `(width, sext)` leaves: `raw`, the `width` bytes read
+/// zero-extended, sign-extended from their top bit when `sext`.
+#[inline(always)]
+fn loaded_slot(raw: u64, width: u32, sext: bool) -> Reg {
+    let shift = 64 - 8 * width;
+    let lo = match sext {
+        true => (((raw << shift) as i64) >> shift) as u64,
+        false => raw,
+    };
+    Reg { lo, hi: 0 }
 }
 
 /// Turn `width` raw little-endian bytes into the loaded value, sign- or zero-
@@ -42255,6 +42272,61 @@ mod prot_tests {
             m.load_scalar(top + p, 0, LoadOp::I64),
             Ok(Reg::from_value(Value::I64(9)))
         );
+    }
+
+    /// #2486 — the bytecode engine's scalar loads and stores leave what the oracle's do, on the fast
+    /// path and the cold one, for every op: [`load_shape`] and [`loaded_slot`] stand in for
+    /// [`decode_loaded`]'s `Value`, and [`Mem::store_scalar`] for [`Mem::store`].
+    #[test]
+    fn scalar_loads_and_stores_match_the_oracle_on_both_paths() {
+        let p = page();
+        let mut m = Mem::with_reservation(22, 20, None);
+        assert_eq!(m.unmap(2 * p, p), 0);
+        // Unaligned on purpose; above the hole is outside the run, so the cold path serves it.
+        let (fast, cold) = (p + 3, 3 * p + 5);
+        assert!(m.in_fast_run(fast, fast + 7, true));
+        assert!(!m.in_fast_run(cold, cold + 7, false));
+        let bits = [
+            0,
+            0x7f,
+            0x80,
+            0xff,
+            0x7fff,
+            0x8000,
+            0xffff,
+            0x7fff_ffff,
+            0x8000_0000,
+            0xffff_ffff,
+            0x0123_4567_89ab_cdef,
+            0x8000_0000_0000_0000,
+            u64::MAX,
+        ];
+        for at in [fast, cold] {
+            for &b in &bits {
+                for op in LoadOp::ALL {
+                    m.store(at, 0, StoreOp::I64, Value::I64(b as i64)).unwrap();
+                    let want = m.load(at, 0, op).map(Reg::from_value);
+                    assert_eq!(
+                        m.load_scalar(at, 0, op),
+                        want,
+                        "{op:?} of {b:#x} at {at:#x}"
+                    );
+                }
+                for op in StoreOp::ALL {
+                    m.store(at, 0, StoreOp::I64, Value::I64(!b as i64)).unwrap();
+                    let v = Reg::from_i64(b as i64).to_value(op.info().1);
+                    m.store(at, 0, op, v).unwrap();
+                    let want = m.load(at, 0, LoadOp::I64).unwrap();
+                    m.store(at, 0, StoreOp::I64, Value::I64(!b as i64)).unwrap();
+                    m.store_scalar(at, 0, op, b).unwrap();
+                    assert_eq!(
+                        m.load(at, 0, LoadOp::I64),
+                        Ok(want),
+                        "{op:?} of {b:#x} at {at:#x}"
+                    );
+                }
+            }
+        }
     }
 
     /// #2577 — the run is the address space's, so a page one vCPU protects leaves it for every vCPU

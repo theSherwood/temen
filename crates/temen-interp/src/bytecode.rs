@@ -41,6 +41,7 @@
 //! Like the reference interpreter, it is total and panic-free: every slot/pc index is in range by
 //! construction of the compiler, and `compile_module` rejects anything it can't lower.
 
+use temen_ir::seams::{scan_seams, Seams};
 use temen_ir::{
     default_reserved_log2, window_reserved_log2, BinOp, CastOp, CmpOp, ConvOp, DebugInfo, FBinOp,
     FCmpOp, FToI, FUnOp, FloatTy, Func, FuncIdx, IToF, Inst, IntTy, IntUnOp, LoadOp, Module,
@@ -129,36 +130,59 @@ pub fn callprof_op_snapshot() -> Vec<((u32, u32, u32), u64)> {
     callprof::op_snapshot()
 }
 
-/// Block-argument moves applied on a taken edge: `(src_slot, dst_slot)` pairs (frame-relative), with
-/// a precomputed `aliasing` flag. A **non-aliasing** edge — the common case (an induction variable /
-/// accumulator reads distinct value slots and writes the successor's param slots) — is applied by a
-/// single direct pass. An **aliasing** edge, where some destination slot is also read as a source (a
+/// A function's block-argument moves, per edge: the `(src_slot, dst_slot)` pairs (frame-relative) a
+/// taken edge applies, with a precomputed `aliasing` flag. A **non-aliasing** edge — the common
+/// case (an induction variable / accumulator reads distinct value slots and writes the successor's
+/// param slots) — is applied by a single direct pass. An **aliasing** edge, where some destination slot is also read as a source (a
 /// parallel move that permutes/swaps params), must gather into `scratch` then scatter, so a value
 /// isn't clobbered before it is read. Classifying once at compile time keeps the value off the hot
 /// path (the `scratch` `push`+read per copy is only paid where correctness needs it).
+///
+/// #2486 — a function's edges keep their copies here, and an op names its edge's by index, so a
+/// branch op stays small (`Op`'s size, below) and a function's edges take two allocations, not one
+/// each. Index 0 is the edge that copies nothing.
 #[derive(Clone)]
 struct Copies {
-    pairs: Box<[(u32, u32)]>,
-    aliasing: bool,
+    /// Per edge: where its pairs start in `pairs`, how many it has, and whether it aliases.
+    edges: Vec<(u32, u32, bool)>,
+    pairs: Vec<(u32, u32)>,
 }
 impl Copies {
-    /// Build from resolved `(src, dst)` pairs, classifying `aliasing` = some `dst` is also some `src`
-    /// (so a one-pass sequential copy could clobber a not-yet-read source). An edge can carry
-    /// hundreds of copies (#2447), so the sources are sorted and each `dst` searched for. They are
-    /// sorted in `srcs`, which the caller reuses across a function's edges (#2586).
-    fn new(pairs: &[(u32, u32)], srcs: &mut Vec<u32>) -> Copies {
+    fn new() -> Copies {
+        Copies {
+            edges: vec![(0, 0, false)],
+            pairs: Vec::new(),
+        }
+    }
+
+    /// Add an edge's resolved `(src, dst)` pairs and return its index, classifying `aliasing` = some
+    /// `dst` is also some `src` (so a one-pass sequential copy could clobber a not-yet-read source).
+    /// An edge can carry hundreds of copies (#2447), so the sources are sorted and each `dst` searched
+    /// for. They are sorted in `srcs`, which the caller reuses across a function's edges (#2586).
+    fn add(&mut self, pairs: &[(u32, u32)], srcs: &mut Vec<u32>) -> u32 {
+        if pairs.is_empty() {
+            return 0;
+        }
         srcs.clear();
         srcs.extend(pairs.iter().map(|&(s, _)| s));
         srcs.sort_unstable();
         let aliasing = pairs.iter().any(|&(_, d)| srcs.binary_search(&d).is_ok());
-        Copies {
-            pairs: pairs.into(),
-            aliasing,
-        }
+        self.edges
+            .push((self.pairs.len() as u32, pairs.len() as u32, aliasing));
+        self.pairs.extend_from_slice(pairs);
+        (self.edges.len() - 1) as u32
+    }
+
+    /// Edge `edge`'s pairs, and whether they alias.
+    #[inline]
+    fn get(&self, edge: u32) -> (&[(u32, u32)], bool) {
+        let (at, len, aliasing) = self.edges[edge as usize];
+        (&self.pairs[at as usize..][..len as usize], aliasing)
     }
 }
-/// A resolved branch edge: its arg copies plus the target op index (`pc`).
-type Edge = (Copies, u32);
+/// A resolved branch edge: its copies' index in the function's [`Copies`], and the target op index
+/// (`pc`).
+type Edge = (u32, u32);
 
 /// Which of the child lifecycle probes an [`Op::ChildCtl`] is (PROCESS.md S3, Instantiator ops
 /// 9/10/12).
@@ -331,14 +355,14 @@ enum Op {
         offset: u64,
     },
     Br {
-        copies: Copies,
+        copies: u32,
         target: u32,
     },
     BrIf {
         cond: u32,
-        then_copies: Copies,
+        then_copies: u32,
         then_pc: u32,
-        else_copies: Copies,
+        else_copies: u32,
         else_pc: u32,
     },
     /// Slice 5a superinstruction: a block-final `IntCmp` fused with the `BrIf` that is its sole
@@ -350,9 +374,9 @@ enum Op {
         b: u32,
         ty: IntTy,
         op: CmpOp,
-        then_copies: Copies,
+        then_copies: u32,
         then_pc: u32,
-        else_copies: Copies,
+        else_copies: u32,
         else_pc: u32,
     },
     /// [`Op::BrIfCmp`] fused from an [`Op::IntCmpImm`]: the compare's right operand is `imm`.
@@ -361,9 +385,9 @@ enum Op {
         imm: i64,
         ty: IntTy,
         op: CmpOp,
-        then_copies: Copies,
+        then_copies: u32,
         then_pc: u32,
-        else_copies: Copies,
+        else_copies: u32,
         else_pc: u32,
     },
     BrTable {
@@ -381,11 +405,8 @@ enum Op {
     /// resolved function's signature is checked against `want_params`/`want_results` (a forged or
     /// mistyped slot is an inert [`Trap::IndirectCallType`], matching [`super::dispatch_indirect`]).
     CallIndirect {
-        idx: u32,
-        args: Box<[u32]>,
+        call: Box<IndirectCall>,
         dst: u32,
-        want_params: Box<[ValType]>,
-        want_results: Box<[ValType]>,
     },
     /// Synchronous capability call (§3c) through the host powerbox — the guest is suspended, the
     /// host computes a result, and execution continues in the same activation (no scheduler/fiber).
@@ -394,18 +415,7 @@ enum Op {
     /// fall back to the tree-walker. Args/results cross as `i64` slots (the host-dispatch ABI);
     /// `results` carries `sig.results` so each returned slot is re-typed exactly as the tree-walker
     /// does.
-    CapCall {
-        type_id: u32,
-        op: u32,
-        handle: u32,
-        args: Box<[u32]>,
-        dst: u32,
-        /// The call's `sig.params` — carried so an **import-bound** call that resolves to a §22 `Jit`
-        /// driver op (`invoke`/`install`/`uninstall`) can be marshalled to the driver like a static
-        /// `call.cap (JIT, op)` (which lowers straight to [`Op::JitInvoke`]). Empty when unused.
-        params: Box<[ValType]>,
-        results: Box<[ValType]>,
-    },
+    CapCall(Box<CapCallOp>),
     /// §3.6 serve-loop core (ISSUES.md I36 slice 1): `svc.poll` (`call.cap CAP_SELF 9`) — drain
     /// the domain's inbound queue, running each servable dispatch as a **handler fiber** of the
     /// serving task (#2742, the tree-walk serve arm's shape): the driver starts it ([`serve`]),
@@ -422,7 +432,7 @@ enum Op {
         wait: bool,
     },
     /// FORK.md §9.2 — `clone_caller` (self-op 11): fork-returns-twice, servicer side. Compiled only
-    /// in a fork-serving module ([`Seams::bytecode_serves_fork`]). From within a serve handler, it
+    /// in a fork-serving module ([`bytecode_serves_fork`]). From within a serve handler, it
     /// duplicates the caller parked on this dispatch into a live twin and replies differently to each.
     /// The twin build needs the driver's task/env set, so the op resolves its reply args here and
     /// surfaces to the cooperative driver ([`Outcome::CloneCaller`]); the driver reads the running
@@ -604,14 +614,7 @@ enum Op {
     /// shared window/powerbox; its results land at `dst…`. `params`/`results` are the unit entry's
     /// expected signature (the `call.cap` sig minus the leading code-handle param), used to marshal
     /// args/results through the i64-slot ABI.
-    JitInvoke {
-        handle: u32,
-        code: u32,
-        args: Box<[u32]>,
-        dst: u32,
-        params: Box<[ValType]>,
-        results: Box<[ValType]>,
-    },
+    JitInvoke(Box<JitInvokeOp>),
     /// §GC `gc.roots(heap_lo, heap_hi, mask, buf, cap)`: conservative root enumeration. Escapes to
     /// the driver, which scans every live activation of the vCPU's continuation (the active window,
     /// its call stack, its resume-chain ancestors, parked fibers, and coroutines) for words that —
@@ -637,12 +640,7 @@ enum Op {
     },
     /// `return_call.dyn`: an indirect tail call — resolve through the runtime dispatch table
     /// (possibly cross-module), then reuse the current window like [`Op::TailCall`].
-    TailCallIndirect {
-        idx: u32,
-        args: Box<[u32]>,
-        want_params: Box<[ValType]>,
-        want_results: Box<[ValType]>,
-    },
+    TailCallIndirect(Box<IndirectCall>),
     Unreachable,
     /// A `CapFault` trap: an `Instantiator` call that isn't a live op at its contracted shape
     /// (`temen_ir::served_contract`), which the oracle refuses after the handle resolves (a
@@ -679,6 +677,48 @@ enum Op {
     },
 }
 
+// #2486 — the payloads of the ops a run seldom executes, boxed so that every op fits in half a
+// cache line (the assertion below); each is one call, which costs far more than the indirection.
+
+/// The operands of [`Op::CallIndirect`] and [`Op::TailCallIndirect`].
+#[derive(Clone)]
+struct IndirectCall {
+    idx: u32,
+    args: Box<[u32]>,
+    want_params: Box<[ValType]>,
+    want_results: Box<[ValType]>,
+}
+
+/// [`Op::CapCall`]'s operands.
+#[derive(Clone)]
+struct CapCallOp {
+    type_id: u32,
+    op: u32,
+    handle: u32,
+    args: Box<[u32]>,
+    dst: u32,
+    /// The call's `sig.params` — carried so an **import-bound** call that resolves to a §22 `Jit`
+    /// driver op (`invoke`/`install`/`uninstall`) can be marshalled to the driver like a static
+    /// `call.cap (JIT, op)` (which lowers straight to [`Op::JitInvoke`]). Empty when unused.
+    params: Box<[ValType]>,
+    results: Box<[ValType]>,
+}
+
+/// [`Op::JitInvoke`]'s operands.
+#[derive(Clone)]
+struct JitInvokeOp {
+    handle: u32,
+    code: u32,
+    args: Box<[u32]>,
+    dst: u32,
+    params: Box<[ValType]>,
+    results: Box<[ValType]>,
+}
+
+/// #2486 — every op fits in half a cache line: the loop reads one per dispatch, and at 72 bytes the
+/// dispatch's read of the op was two thirds of the loop's L1 misses.
+const _: () = assert!(std::mem::size_of::<Op>() <= 32);
+
 /// Marks a [`Program::src`] entry as a **terminator** op's location (OR-ed into the `inst` field).
 /// [`vm_trap_bt`] needs terminators distinguished from instructions: a trap at an instruction is
 /// reported one past it (the tree-walker's cursor advance), a trap at a terminator (`unreachable`,
@@ -699,6 +739,8 @@ struct Program {
     /// reports both, keeping the engine's step/breakpoint location trace identical to the
     /// tree-walker's [`crate::IrPc`] sequence op-for-op.
     src: Box<[Option<(u32, u32)>]>,
+    /// Its edges' copies, which its branch ops name by index (#2486).
+    copies: Copies,
 }
 
 thread_local! {
@@ -1621,74 +1663,17 @@ fn jit_uninstall_from(
     }
 }
 
-/// The concurrency/park seams some functions' instructions touch — one linear scan feeding the
-/// [`compile_module`] combination vetoes, the cross-backend serve qualification
-/// ([`serve_qualifies`]) and, over a serve handler's closure, the [`bytecode_serves_children`]
-/// escape.
-#[derive(Default)]
-struct Seams {
-    has_fiber: bool,
-    has_thread: bool,
-    has_instantiate: bool,
-    has_gc: bool,
-    has_svc: bool,
-    has_park_seam: bool,
-    /// I38's **timed** `svc.wait`: the scheduler's deadline machinery, oracle-only (it is a
-    /// `has_park_seam` too).
-    has_timed_wait: bool,
-    /// FORK.md §9 — `clone_caller` / `reap` (self-ops 11, 12): the fork servicer primitives. A
-    /// distinct seam because the **bytecode** engine services them natively ([`bytecode_serves_fork`]),
-    /// while the Cranelift routing still folds them (`svc_park_veto` keeps it).
-    has_fork: bool,
-    /// #744 — a call whose callee is unknown until it runs: an indirect call, a dynamic-mode import,
-    /// or a `call.cap` on an interface outside the built-ins that never park (a live offer parks
-    /// its caller on a ticket, an embedder's `HostProc` or the `Blocking` cap can punt, a `Jit`
-    /// invoke runs any unit). Read over a serve handler's closure only.
-    has_opaque_call: bool,
-}
-
-impl Seams {
-    /// The **serve-qualification veto**: a service point (`svc.poll` / `svc.wait`) coexisting with
-    /// any seam that could park or unwind a handler mid-dispatch. This is the single definition of
-    /// that disjunction — consulted by both the bytecode compile gate ([`compile_module`]) and the
-    /// exported [`serve_qualifies`] that temen-run's JIT routing folds on — so the two backends can
-    /// never drift over which modules serve natively vs. decline to the tree-walk oracle. Adding a
-    /// new park-capable seam means extending this one list. (INVARIANTS.md §9: one veto predicate,
-    /// one definition.)
-    ///
-    /// **Fork rides this veto for Cranelift** (`has_fork` is in the disjunction), so temen-run's JIT
-    /// routing still folds a forking module to the oracle — the Cranelift fork slice is unbuilt
-    /// (FORK.md §9.1). The **bytecode** engine, in contrast, services `clone_caller`/`reap` natively;
-    /// its compile gate takes the [`bytecode_serves_fork`] escape past this veto (a per-backend split,
-    /// the one the two-predicate structure exists to allow — the bytecode gate and `serve_qualifies`
-    /// legitimately diverge on fork until Cranelift catches up).
-    fn svc_park_veto(&self) -> bool {
-        self.has_svc
-            && (self.has_park_seam
-                || self.has_fiber
-                || self.has_thread
-                || self.has_instantiate
-                || self.has_gc
-                || self.has_fork)
-    }
-
-    /// FORK.md §9.2 — the **bytecode fork-serving escape**: a serving module the bytecode engine can
-    /// run `clone_caller` in natively even though [`svc_park_veto`] folds it (for Cranelift). The
-    /// bounded shape: it serves (`has_svc`) and forks (`has_fork`), the manager may spawn children
-    /// (`has_instantiate` — the fork topology needs it), and **no other** seam that could park a
-    /// *handler* mid-dispatch is present. `clone_caller` itself never parks the handler (it reshapes
-    /// the parked caller and returns), so the serve rewind linkage stays intact; the manager's
-    /// instantiate/join park ordinary tasks, not handlers. Deliberately narrow (fork-shaped modules
-    /// only) to bound the blast radius vs. the general serve+spawn case, which stays folded. A fork
-    /// handler that *also* parked (e.g. joined) is out of this shape and is not admitted here.
-    fn bytecode_serves_fork(&self) -> bool {
-        self.has_svc
-            && self.has_fork
-            && !self.has_park_seam
-            && !self.has_fiber
-            && !self.has_thread
-            && !self.has_gc
-    }
+/// FORK.md §9.2 — the **bytecode fork-serving escape**: a serving module the bytecode engine can
+/// run `clone_caller` in natively even though [`Seams::svc_park_veto`] folds it (for Cranelift). The
+/// bounded shape: it serves (`has_svc`) and forks (`has_fork`), the manager may spawn children
+/// (`has_instantiate` — the fork topology needs it), and **no other** seam that could park a
+/// *handler* mid-dispatch is present. `clone_caller` itself never parks the handler (it reshapes
+/// the parked caller and returns), so the serve rewind linkage stays intact; the manager's
+/// instantiate/join park ordinary tasks, not handlers. Deliberately narrow (fork-shaped modules
+/// only) to bound the blast radius vs. the general serve+spawn case, which stays folded. A fork
+/// handler that *also* parked (e.g. joined) is out of this shape and is not admitted here.
+fn bytecode_serves_fork(s: &Seams) -> bool {
+    s.has_svc && s.has_fork && !s.has_park_seam && !s.has_fiber && !s.has_thread && !s.has_gc
 }
 
 /// #744 — the **serve-children escape**: a serving module that spawns ([`Seams::svc_park_veto`] folds
@@ -1699,7 +1684,7 @@ impl Seams {
 /// impl-export op reaches ([`temen_ir::reachable_funcs`]) may hold a park seam, a spawn or join, or
 /// a call whose callee is unknown until it runs. The rest of the module may park: a root joining its
 /// children, a child parked on a call into its parent, a blocking import. Like
-/// [`Seams::bytecode_serves_fork`] the shape is bounded module-wide: no fibers, threads, coroutines
+/// [`bytecode_serves_fork`] the shape is bounded module-wide: no fibers, threads, coroutines
 /// or gc roots, no fork (its own escape) and no timed `svc.wait` (oracle-only).
 fn bytecode_serves_children(m: &Module) -> bool {
     let s = scan_seams(&m.funcs);
@@ -1725,122 +1710,13 @@ fn bytecode_serves_children(m: &Module) -> bool {
     !(h.has_park_seam || h.has_instantiate || h.has_opaque_call)
 }
 
-/// Whether a `call.cap` on interface `type_id` can never park its caller, by the interface alone:
-/// a built-in whose every op runs to completion (the parking ops of the stream, instantiator and
-/// self interfaces are classified by op, before this is asked). Any other interface is a live
-/// offer, a wired guest impl or embedder-defined, and may park.
-fn iface_never_parks(type_id: u32) -> bool {
-    use super::cap_id::*;
-    matches!(
-        type_id,
-        STREAM
-            | EXIT
-            | CLOCK
-            | SHARED_REGION
-            | ADDRESS_SPACE
-            | MODULE_LOADER
-            | MODULE
-            | JIT_CODE
-            | BUDGET
-            | FREEZE_AUTHORITY
-            | temen_ir::CAP_SELF_TYPE_ID
-            | temen_ir::CAP_IMPORT_ATTACH_TYPE_ID
-    )
-}
-
-fn scan_seams<'a>(funcs: impl IntoIterator<Item = &'a Func>) -> Seams {
-    let mut s = Seams::default();
-    for f in funcs {
-        for b in &f.blocks {
-            if let Terminator::ReturnCallIndirect { .. } = b.term {
-                s.has_opaque_call = true;
-            }
-            for inst in &b.insts {
-                match inst {
-                    // Every live op (`temen_ir::served_contract`) drives executor children,
-                    // scheduler-driven. Every other INSTANTIATOR op traps `CapFault`
-                    // (`Op::CapFault`), so it is no seam.
-                    Inst::CapCall(c)
-                        if c.type_id == super::cap_id::INSTANTIATOR
-                            && temen_ir::served_contract(super::cap_id::INSTANTIATOR, c.op)
-                                .is_some() =>
-                    {
-                        s.has_instantiate = true
-                    }
-                    Inst::CapCall(c) if c.type_id == super::cap_id::INSTANTIATOR => {}
-                    // I38's **timed** `svc.wait` (op 10 with the optional timeout arg) needs
-                    // the scheduler's deadline machinery — oracle-only; veto like a park seam
-                    // so both fast backends decline the module.
-                    Inst::CapCall(c)
-                        if c.type_id == temen_ir::CAP_SELF_TYPE_ID
-                            && c.op == 10
-                            && !c.args.is_empty() =>
-                    {
-                        s.has_svc = true;
-                        s.has_park_seam = true;
-                        s.has_timed_wait = true;
-                    }
-                    // §3.6 service points (I36 slice 1): svc.poll/svc.wait sites — natively
-                    // servable only when nothing in the module could park a handler (below).
-                    Inst::CapCall(c)
-                        if c.type_id == temen_ir::CAP_SELF_TYPE_ID && matches!(c.op, 9 | 10) =>
-                    {
-                        s.has_svc = true
-                    }
-                    // FORK.md §9 — `clone_caller` (11) / `reap` (12): the fork servicer primitives.
-                    // The bytecode engine services both natively (the [`bytecode_serves_fork`] escape
-                    // admits the fork topology; the `VcpuStop::CloneCaller`/`Reap` driver arms build
-                    // the twin and reap it), so they are the `has_fork` seam — folded for Cranelift
-                    // (`svc_park_veto` keeps `has_fork`) but run natively on bytecode.
-                    Inst::CapCall(c)
-                        if c.type_id == temen_ir::CAP_SELF_TYPE_ID && matches!(c.op, 11 | 12) =>
-                    {
-                        s.has_fork = true
-                    }
-                    // A blocking stream `read` (type 0 op 0) can stdin-park, and an import call
-                    // can be *bound* to one at spawn — either inside a handler would need the
-                    // tree-walker's FIBER_PARKED (completed-but-not-replied) machinery.
-                    Inst::CapCall(c)
-                        if (c.type_id, c.op) == (super::cap_id::STREAM, 0)
-                            || c.type_id == temen_ir::CAP_IMPORT_TYPE_ID =>
-                    {
-                        s.has_park_seam = true
-                    }
-                    Inst::CallImport(_) | Inst::SetJmp { .. } | Inst::LongJmp { .. } => {
-                        s.has_park_seam = true
-                    }
-                    Inst::ContNew { .. }
-                    | Inst::ContResume { .. } // I48: `block` flag is advisory here
-                    | Inst::Suspend { .. } => s.has_fiber = true,
-                    Inst::ThreadSpawn { .. }
-                    | Inst::ThreadJoin { .. }
-                    | Inst::MemoryWait { .. }
-                    | Inst::MemoryNotify { .. } => s.has_thread = true,
-                    // #1936 — a post's `signal` is a notify: it stops for its driver, which wakes
-                    // the word's waiters ([`Outcome::WakeRegion`]).
-                    Inst::CapCall(c) if (c.type_id, c.op) == (super::cap_id::SHARED_REGION, 7) => {
-                        s.has_thread = true
-                    }
-                    Inst::GcRoots { .. } => s.has_gc = true,
-                    Inst::CallIndirect(_) | Inst::CallImportDyn(_) => {
-                        s.has_opaque_call = true
-                    }
-                    Inst::CapCall(c) if !iface_never_parks(c.type_id) => s.has_opaque_call = true,
-                    _ => {}
-                }
-            }
-        }
-    }
-    s
-}
-
 /// §3.6 (I36): the **serve qualification** — `funcs` contain a service point (`svc.poll` /
 /// `svc.wait`) and no seam that could park or unwind a handler mid-dispatch, so a fast backend
 /// may run the serve loop natively (every handler runs to completion or traps; the tree-walk
 /// oracle's fiber-park machinery is never needed). The veto is module-wide, so it covers
 /// handlers' transitive callees for free. This is the veto [`compile_module`] applies too (one
 /// definition, no drift), exported for temen-run's JIT routing; each engine's escapes past it are
-/// its own ([`Seams::bytecode_serves_fork`] and [`bytecode_serves_children`] here). A module with no
+/// its own ([`bytecode_serves_fork`] and [`bytecode_serves_children`] here). A module with no
 /// service point returns `false` (it has nothing to serve natively; the caller decides what that
 /// means).
 pub fn serve_qualifies(funcs: &[Func]) -> bool {
@@ -2506,7 +2382,7 @@ fn admits_funcs(funcs: &[Func], types: &[temen_ir::TypeEntry], escape: bool) -> 
     // FORK.md §9.2 — the bytecode fork-serving escape: a fork-shaped module (`bytecode_serves_fork`)
     // is admitted natively even though `svc_park_veto` folds it for Cranelift (the per-backend split).
     // #744 — so is a module whose serve handlers cannot park, on a driver that serves its children.
-    if s.svc_park_veto() && !s.bytecode_serves_fork() && !escape {
+    if s.svc_park_veto() && !bytecode_serves_fork(&s) && !escape {
         return false;
     }
     // [`lower_cap_call`] is the only lowering that declines, so trying each cap call is the check.
@@ -2737,10 +2613,10 @@ fn compile_func(f: &Func, view: &ModuleView<'_>, fuse: bool) -> Option<Program> 
             }
         }
     }
-    // An edge's copies are gathered in `pairs`, then boxed at their size: most edges carry one to
-    // three, which a vector grown per edge, shrunk to a box, and sorted in a copy of its own took
-    // three allocations to hold (#2586).
-    let (mut pairs, mut srcs) = (Vec::new(), Vec::new());
+    // An edge's copies are gathered in `pairs`, then added to the function's `copies`, which holds
+    // every edge's in one arena (#2486): most edges carry one to three, which a vector grown per
+    // edge, shrunk to a box, and sorted in a copy of its own took three allocations to hold (#2586).
+    let (mut pairs, mut srcs, mut copies) = (Vec::new(), Vec::new(), Copies::new());
     for (bi, b) in f.blocks.iter().enumerate() {
         block_pc[bi] = ops.len() as u32;
         // operand: block-local index -> frame slot
@@ -2778,7 +2654,7 @@ fn compile_func(f: &Func, view: &ModuleView<'_>, fuse: bool) -> Option<Program> 
             // and its removal can't affect the gather/scatter of the other (aliasing) copies. Applies
             // uniformly to every terminator's edges (Br/BrIf/BrIfCmp/BrTable), fused or not.
             pairs.retain(|(src, dst)| src != dst);
-            (Copies::new(&pairs, &mut srcs), bidx as u32) // block index; patched to entry pc below
+            (copies.add(&pairs, &mut srcs), bidx as u32) // block index; patched to entry pc below
         };
         match &b.term {
             Terminator::Br { target, args } => {
@@ -2805,8 +2681,9 @@ fn compile_func(f: &Func, view: &ModuleView<'_>, fuse: bool) -> Option<Program> 
                 let fusable = |dst: u32| {
                     dst == cond_slot
                         && !read_forwarded[cond_slot as usize]
-                        && !then_copies.pairs.iter().any(|(s, _)| *s == cond_slot)
-                        && !else_copies.pairs.iter().any(|(s, _)| *s == cond_slot)
+                        && ![then_copies, else_copies]
+                            .iter()
+                            .any(|&e| copies.get(e).0.iter().any(|(s, _)| *s == cond_slot))
                 };
                 let fused = match ops.last() {
                     Some(&Op::IntCmp { dst, a, b, ty, op }) if fuse && fusable(dst) => {
@@ -2879,12 +2756,14 @@ fn compile_func(f: &Func, view: &ModuleView<'_>, fuse: bool) -> Option<Program> 
                 callee: *func,
                 args: args.iter().map(|a| g(*a)).collect(),
             }),
-            Terminator::ReturnCallIndirect { ty, idx, args } => ops.push(Op::TailCallIndirect {
-                idx: g(*idx),
-                args: args.iter().map(|a| g(*a)).collect(),
-                want_params: view.sig(*ty).params.clone().into(),
-                want_results: view.sig(*ty).results.clone().into(),
-            }),
+            Terminator::ReturnCallIndirect { ty, idx, args } => {
+                ops.push(Op::TailCallIndirect(Box::new(IndirectCall {
+                    idx: g(*idx),
+                    args: args.iter().map(|a| g(*a)).collect(),
+                    want_params: view.sig(*ty).params.clone().into(),
+                    want_results: view.sig(*ty).results.clone().into(),
+                })))
+            }
         }
         // Exactly one terminator op was pushed above (fused `BrIfCmp` or a plain terminator); pair it
         // with the terminator source entry so `src` stays the same length as `ops`.
@@ -2929,6 +2808,7 @@ fn compile_func(f: &Func, view: &ModuleView<'_>, fuse: bool) -> Option<Program> 
         ops,
         nslots,
         src: src.into_boxed_slice(),
+        copies,
     })
 }
 
@@ -3148,11 +3028,13 @@ fn compile_inst(
         Inst::CallIndirect(c) => {
             let temen_ir::CallIndirect { ty, idx, args } = &**c;
             Op::CallIndirect {
-                idx: g(*idx),
-                args: args.iter().map(|a| g(*a)).collect(),
+                call: Box::new(IndirectCall {
+                    idx: g(*idx),
+                    args: args.iter().map(|a| g(*a)).collect(),
+                    want_params: view.sig(*ty).params.clone().into(),
+                    want_results: view.sig(*ty).results.clone().into(),
+                }),
                 dst,
-                want_params: view.sig(*ty).params.clone().into(),
-                want_results: view.sig(*ty).results.clone().into(),
             }
         }
         // Synchronous capability call: the generic powerbox path (guest suspended, host computes,
@@ -3259,7 +3141,7 @@ fn compile_inst(
                 sig,
                 args,
             } = &**c;
-            Op::CapCall {
+            Op::CapCall(Box::new(CapCallOp {
                 type_id: temen_ir::CAP_IMPORT_TYPE_ID,
                 // §3.5: the reserved import dispatch packs `(slot | consumer_op << 16)`.
                 op: *import | (*op << 16),
@@ -3268,7 +3150,7 @@ fn compile_inst(
                 args: args.iter().map(|a| g(*a)).collect(),
                 dst,
                 results: view.sig(*sig).results.clone().into(),
-            }
+            }))
         }
         // §7/§22 symbolic call: when bound at instantiation it is a flat import dispatch
         // (op 0); the legacy handle operand is a live register the dispatch ignores.
@@ -3276,7 +3158,7 @@ fn compile_inst(
             let temen_ir::CallSym {
                 import, sig, args, ..
             } = &**c;
-            Op::CapCall {
+            Op::CapCall(Box::new(CapCallOp {
                 type_id: temen_ir::CAP_IMPORT_TYPE_ID,
                 op: *import,
                 handle: u32::MAX,
@@ -3284,7 +3166,7 @@ fn compile_inst(
                 args: args.iter().map(|a| g(*a)).collect(),
                 dst,
                 results: view.sig(*sig).results.clone().into(),
-            }
+            }))
         }
         // §3.5 dynamic-mode dispatch by type-section reference: the reserved dyn entry packs
         // `(type_idx | op << 16)`; the handle register is live.
@@ -3296,7 +3178,7 @@ fn compile_inst(
                 handle,
                 args,
             } = &**c;
-            Op::CapCall {
+            Op::CapCall(Box::new(CapCallOp {
                 type_id: temen_ir::CAP_DYN_TYPE_ID,
                 op: *ty | (*op << 16),
                 handle: g(*handle),
@@ -3304,7 +3186,7 @@ fn compile_inst(
                 args: args.iter().map(|a| g(*a)).collect(),
                 dst,
                 results: view.sig(*sig).results.clone().into(),
-            }
+            }))
         }
         // §3.5 self-namespace extensions (see `Op::CapSelfExt`).
         Inst::ExportHandle { export } => Op::CapSelfExt {
@@ -3324,7 +3206,7 @@ fn compile_inst(
         },
         // Phase-2 `import.attach` (IMPORTS.md): the attach sentinel with the handle value as the
         // one argument — the same shared host entry as the tree-walker and the JIT.
-        Inst::ImportAttach { import, handle } => Op::CapCall {
+        Inst::ImportAttach { import, handle } => Op::CapCall(Box::new(CapCallOp {
             type_id: temen_ir::CAP_IMPORT_ATTACH_TYPE_ID,
             op: *import,
             handle: g(*handle),
@@ -3332,7 +3214,7 @@ fn compile_inst(
             args: [g(*handle)].into(),
             dst,
             results: [ValType::I32].into(),
-        },
+        })),
         // §12.8 4A.5: serviced from the running `Vm`'s region base (the reference `eval_inst` has no
         // context), so it gets a dedicated op rather than the `Eval` fallback.
         Inst::DurableShadowBase => Op::DurableShadowBase { dst },
@@ -3431,7 +3313,7 @@ fn lower_cap_call(
             slot: g(args[0]),
             dst,
         },
-        (cap_id::JIT, 1) if !args.is_empty() => Op::JitInvoke {
+        (cap_id::JIT, 1) if !args.is_empty() => Op::JitInvoke(Box::new(JitInvokeOp {
             handle: g(*handle),
             code: g(args[0]),
             args: args[1..].iter().map(|a| g(*a)).collect(),
@@ -3446,7 +3328,7 @@ fn lower_cap_call(
                 .to_vec()
                 .into(),
             results: view.sig(*sig).results.clone().into(),
-        },
+        })),
         // A live op this lowering has no arm for declines to the oracle.
         (cap_id::INSTANTIATOR, _) => return None,
         (cap_id::SHARED_REGION, 4) => return None,
@@ -3464,7 +3346,7 @@ fn lower_cap_call(
         },
         (temen_ir::CAP_SELF_TYPE_ID, 9 | 10) => return None,
         // FORK.md §9.2 — `clone_caller` (op 11) / `reap` (op 12): compiled to the native fork
-        // ops (the module reached here only via the [`Seams::bytecode_serves_fork`] escape).
+        // ops (the module reached here only via the [`bytecode_serves_fork`] escape).
         // The reply/pid args are register operands, resolved in the driver.
         (temen_ir::CAP_SELF_TYPE_ID, 11) => Op::CloneCaller {
             args: args.iter().map(|a| g(*a)).collect(),
@@ -3495,7 +3377,7 @@ fn lower_cap_call(
             dst,
         },
         // Generic synchronous powerbox dispatch (Stream/Clock/Memory/host-fn/JIT compile/…).
-        _ => Op::CapCall {
+        _ => Op::CapCall(Box::new(CapCallOp {
             type_id: *type_id,
             op: *op,
             handle: g(*handle),
@@ -3503,7 +3385,7 @@ fn lower_cap_call(
             args: args.iter().map(|a| g(*a)).collect(),
             dst,
             results: view.sig(*sig).results.clone().into(),
-        },
+        })),
     })
 }
 
@@ -5221,14 +5103,7 @@ fn journal_state(
         + cont
             .fibers
             .iter()
-            .map(|f| match f {
-                FiberState::Parked { vm, .. }
-                | FiberState::WaitParked { vm, .. }
-                | FiberState::CapParked { vm, .. }
-                | FiberState::HostParked { vm, .. }
-                | FiberState::TicketParked { vm, .. } => vm.clone_slots(),
-                _ => 0,
-            })
+            .map(|f| f.parked_vm().map_or(0, Vm::clone_slots))
             .sum::<u64>()
         + cont
             .child_domains
@@ -9698,6 +9573,20 @@ struct FiberTables {
     meta: Vec<FiberMeta>,
 }
 
+impl FiberState {
+    /// A parked fiber's continuation: what it resumes, and what a scan of its frames reads.
+    fn parked_vm(&self) -> Option<&Vm> {
+        match self {
+            FiberState::Parked { vm, .. }
+            | FiberState::WaitParked { vm, .. }
+            | FiberState::CapParked { vm, .. }
+            | FiberState::HostParked { vm, .. }
+            | FiberState::TicketParked { vm, .. } => Some(vm),
+            _ => None,
+        }
+    }
+}
+
 impl FiberTables {
     /// These tables, owned by the caller, as the registry a fiber transition runs over.
     fn cell(&mut self) -> FiberCell<'_> {
@@ -10176,7 +10065,7 @@ fn return_from_fiber(
     // #2742 — a handler's return answers its dispatch, and its serve loop, back at its serve op,
     // counts it. The serve op's one result is not the resumer's `(status, value)` pair.
     if let Some(ticket) = vt.active.dispatch() {
-        answer_dispatch(host, fibers, mem, ticket, &vals);
+        answer_dispatch(host, fibers, mem, ticket, Ok(&vals));
         release_handler(fibers, id);
         let mut handler = std::mem::replace(&mut vt.active, resumer);
         vt.active.tls = handler.tls;
@@ -10376,34 +10265,45 @@ fn answer_dispatch(
     fibers: &mut FiberCell,
     mem: &Option<Mem>,
     ticket: u64,
-    vals: &[Value],
+    answer: Result<&[Value], i64>,
 ) {
-    let mut results: Vec<i64> = vals.iter().map(|v| super::val_to_slot(*v)).collect();
-    let own = host.with(|p| {
-        if let Some(first) = results.first_mut() {
-            *first = p.settle_page(ticket, *first, mem.as_ref().map(|m| m as _));
-        }
-        p.domain_id()
+    let (reply, own) = host.with(|p| {
+        let reply = match answer {
+            Ok(vals) => {
+                let mut results: Vec<i64> = vals.iter().map(|v| super::val_to_slot(*v)).collect();
+                if let Some(first) = results.first_mut() {
+                    *first = p.settle_page(ticket, *first, mem.as_ref().map(|m| m as _));
+                }
+                super::Reply::Results(results)
+            }
+            // A page request's sink goes, as for any errno reply (#2164).
+            Err(errno) => super::Reply::Failed(p.settle_page(ticket, errno, None)),
+        };
+        (reply, p.domain_id())
     });
-    let mut results = Some(results);
+    let mut reply = Some(reply);
     fibers.with(|f, _, _| {
         for fib in f.iter_mut() {
             if let FiberState::TicketParked {
                 ticket: t,
                 callee_id,
+                sig,
                 woken: woken @ None,
                 ..
             } = fib
             {
                 if *t == ticket && *callee_id == own {
-                    *woken = results.take().map(Ok);
+                    *woken = reply.take().map(|r| match r {
+                        super::Reply::Results(results) => Ok(results),
+                        super::Reply::Failed(errno) => super::failed_slots(errno, sig.results()),
+                    });
                     return;
                 }
             }
         }
     });
-    host.with(|p| match results {
-        Some(results) => _ = p.svc_results.insert(ticket, super::Reply::Results(results)),
+    host.with(|p| match reply {
+        Some(reply) => _ = p.svc_results.insert(ticket, reply),
         None => _ = p.svc_payers.remove(&ticket),
     });
 }
@@ -11080,15 +10980,8 @@ fn gc_scan_beneath(
         // completion) holds live frames exactly like a suspended one — scan all three, or a
         // root held across a fiber's blocking point would be missed (unsound for GC.md §3.2).
         let mut scan = |fibers: &[FiberState]| {
-            for fib in fibers {
-                if let FiberState::Parked { vm, .. }
-                | FiberState::WaitParked { vm, .. }
-                | FiberState::CapParked { vm, .. }
-                | FiberState::HostParked { vm, .. }
-                | FiberState::TicketParked { vm, .. } = fib
-                {
-                    scan_vm_roots(vm, source, &mut consider);
-                }
+            for vm in fibers.iter().filter_map(FiberState::parked_vm) {
+                scan_vm_roots(vm, source, &mut consider);
             }
         };
         for r in &view.fibers {
@@ -18797,6 +18690,8 @@ fn complete(tasks: &mut [TaskSlot], envs: &mut [Domain], ti: usize, res: Result<
         if let Some(a) = tasks[done].answers.take() {
             answer(*a, &res, &envs[tasks[done].domain]);
         }
+        let domain = tasks[done].domain;
+        revoke_handlers(&mut tasks[done], &mut envs[domain]);
         let joiners: Vec<(usize, i32, u32)> = (0..tasks.len())
             .filter_map(|j| match tasks[j].state {
                 TaskState::BlockedJoin { child, handle, dst } if child == done => {
@@ -18818,6 +18713,32 @@ fn complete(tasks: &mut [TaskSlot], envs: &mut [Domain], ti: usize, res: Result<
                 }
                 Err(trap) => work.push((j, Err(trap))),
             }
+        }
+    }
+}
+
+/// #2742 — task `t` of domain `d` has ended, however it ended (owner, 2026-11-09): the handlers its
+/// serve loop parked can never run again, so each one's dispatch answers `CAP_REVOKED`, as the
+/// oracle answers a dead vCPU's parked handlers, and its fiber slot goes. Not under a freeze, whose
+/// cut carries them.
+fn revoke_handlers(t: &mut TaskSlot, d: &mut Domain) {
+    let Domain {
+        host, fibers, mem, ..
+    } = d;
+    if is_unwinding(mem) {
+        return;
+    }
+    let parked = match t.vm.vt.active.rare.as_mut() {
+        Some(r) => std::mem::take(&mut r.handlers),
+        None => return,
+    };
+    let mut host = HostCell::Shared(host);
+    let mut fibers = fibers.cell();
+    for k in parked {
+        let ticket = fibers.with(|f, _, _| f.get(k)?.parked_vm()?.dispatch());
+        release_handler(&mut fibers, k);
+        if let Some(ticket) = ticket {
+            answer_dispatch(&mut host, &mut fibers, mem, ticket, Err(super::CAP_REVOKED));
         }
     }
 }
@@ -20161,10 +20082,13 @@ impl Vm {
         // The current function's ops, which every op reads (`ops[pc]`). Set again wherever the
         // current function changes (`enter!`), so the per-op read is one index and checks nothing.
         let mut ops: &[Op] = &c.prog(cur).ops;
+        // Its edges' copies, which a taken branch reads (#2486); set with `ops`.
+        let mut edges: &Copies = &c.prog(cur).copies;
         macro_rules! enter {
-            () => {
-                ops = &c.prog(cur).ops
-            };
+            () => {{
+                let prog = c.prog(cur);
+                (ops, edges) = (&prog.ops, &prog.copies);
+            }};
         }
 
         // #1146 async signal delivery (the bytecode twin of the tree-walker's #796 L2 safepoint
@@ -20204,21 +20128,21 @@ impl Vm {
         // Apply edge copies parallel-safely (a self-loop can alias src/dst): gather then scatter.
         macro_rules! edge {
             ($copies:expr) => {{
-                let cp = $copies;
-                if cp.aliasing {
+                let (pairs, aliasing) = edges.get($copies);
+                if aliasing {
                     // A destination is re-read as a source: gather all sources, then scatter, so a
                     // value isn't clobbered before it is read (a param swap/rotation).
                     self.scratch.clear();
-                    for &(s, _) in cp.pairs.iter() {
+                    for &(s, _) in pairs {
                         self.scratch.push(self.regs[base + s as usize]);
                     }
-                    for (k, &(_, d)) in cp.pairs.iter().enumerate() {
+                    for (k, &(_, d)) in pairs.iter().enumerate() {
                         self.regs[base + d as usize] = self.scratch[k];
                     }
                 } else {
                     // Non-aliasing (the common induction/accumulator edge): copy directly in one pass,
                     // no `scratch` traffic — sources and destinations are disjoint slot sets.
-                    for &(s, d) in cp.pairs.iter() {
+                    for &(s, d) in pairs {
                         let v = self.regs[base + s as usize];
                         self.regs[base + d as usize] = v;
                     }
@@ -20589,7 +20513,7 @@ impl Vm {
                 }
                 Op::Br { copies, target } => {
                     backedge!(*target);
-                    edge!(copies);
+                    edge!(*copies);
                     pc = *target as usize;
                 }
                 Op::BrIf {
@@ -20601,11 +20525,11 @@ impl Vm {
                 } => {
                     if r!(*cond).i32() != 0 {
                         backedge!(*then_pc);
-                        edge!(then_copies);
+                        edge!(*then_copies);
                         pc = *then_pc as usize;
                     } else {
                         backedge!(*else_pc);
-                        edge!(else_copies);
+                        edge!(*else_copies);
                         pc = *else_pc as usize;
                     }
                 }
@@ -20628,11 +20552,11 @@ impl Vm {
                     };
                     if taken {
                         backedge!(*then_pc);
-                        edge!(then_copies);
+                        edge!(*then_copies);
                         pc = *then_pc as usize;
                     } else {
                         backedge!(*else_pc);
-                        edge!(else_copies);
+                        edge!(*else_copies);
                         pc = *else_pc as usize;
                     }
                 }
@@ -20652,11 +20576,11 @@ impl Vm {
                     };
                     if taken {
                         backedge!(*then_pc);
-                        edge!(then_copies);
+                        edge!(*then_copies);
                         pc = *then_pc as usize;
                     } else {
                         backedge!(*else_pc);
-                        edge!(else_copies);
+                        edge!(*else_copies);
                         pc = *else_pc as usize;
                     }
                 }
@@ -20664,7 +20588,7 @@ impl Vm {
                     let i = r!(*idx).i32() as u32 as usize;
                     let (copies, target) = arms.get(i).unwrap_or(default);
                     backedge!(*target);
-                    edge!(copies);
+                    edge!(*copies);
                     pc = *target as usize;
                 }
                 // `<setjmp.h>` `setjmp`: checkpoint the resume point (the op after this, in this
@@ -20788,13 +20712,13 @@ impl Vm {
                     base = nb;
                     pc = 0;
                 }
-                Op::CallIndirect {
-                    idx,
-                    args,
-                    dst,
-                    want_params,
-                    want_results,
-                } => {
+                Op::CallIndirect { call, dst } => {
+                    let IndirectCall {
+                        idx,
+                        args,
+                        want_params,
+                        want_results,
+                    } = &**call;
                     safepoint!(); // fuel unification: function-entry safepoint
 
                     // Resolve through the **runtime dispatch table** (slot ⇒ (module, func)); an empty
@@ -20901,12 +20825,13 @@ impl Vm {
                     enter!();
                     pc = 0;
                 }
-                Op::TailCallIndirect {
-                    idx,
-                    args,
-                    want_params,
-                    want_results,
-                } => {
+                Op::TailCallIndirect(call) => {
+                    let IndirectCall {
+                        idx,
+                        args,
+                        want_params,
+                        want_results,
+                    } = &**call;
                     safepoint!(); // fuel unification: function-entry safepoint
                     let slot = (r!(*idx).i32() as u32 as usize) & (table.len() - 1);
                     let ts = table.slot(slot);
@@ -20937,15 +20862,16 @@ impl Vm {
                     enter!();
                     pc = 0;
                 }
-                Op::CapCall {
-                    type_id,
-                    op,
-                    handle,
-                    params,
-                    args,
-                    dst,
-                    results,
-                } => {
+                Op::CapCall(call) => {
+                    let CapCallOp {
+                        type_id,
+                        op,
+                        handle,
+                        params,
+                        args,
+                        dst,
+                        results,
+                    } = &**call;
                     // Generic synchronous powerbox dispatch — the same path and ABI the tree-walker's
                     // generic `CapCall` arm uses (`cap_dispatch_slots`): handle as an i32, args/results
                     // as i64 slots, results re-typed by the call's `sig.results`. Via [`HostCell`] so a
@@ -21714,14 +21640,15 @@ impl Vm {
                     self.pc = pc + 1;
                     return Ok(Outcome::JitUninstall { h, slot, dst });
                 }
-                Op::JitInvoke {
-                    handle,
-                    code,
-                    args,
-                    dst,
-                    params,
-                    results,
-                } => {
+                Op::JitInvoke(call) => {
+                    let JitInvokeOp {
+                        handle,
+                        code,
+                        args,
+                        dst,
+                        params,
+                        results,
+                    } = &**call;
                     let h = r!(*handle).i32();
                     let code = r!(*code).i64() as i32;
                     let argv: Box<[i64]> = args.iter().map(|a| r!(*a).i64()).collect();

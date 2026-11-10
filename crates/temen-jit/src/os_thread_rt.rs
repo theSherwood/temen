@@ -436,6 +436,35 @@ pub unsafe fn park_host_call(
     parks: Parks,
     still_parked: impl Fn() -> bool,
 ) -> HostPark {
+    // #2742 — a serve handler's event park gives its window's gate back for the wait, and takes it
+    // back after; a whole-vCPU park keeps it, as on the oracle, where it blocks the serving vCPU.
+    let aside = match parks {
+        Parks::Fiber => crate::child_exec::handler_steps_aside(vm),
+        Parks::Vcpu => None,
+    };
+    let parked = park_host_call_here(vm, freeze, key, parks, still_parked);
+    if let Some(aside) = aside {
+        if matches!(parked, HostPark::Woken | HostPark::Frozen)
+            && !crate::child_exec::handler_steps_back(aside, vm)
+        {
+            return HostPark::Ended;
+        }
+    }
+    parked
+}
+
+/// [`park_host_call`]'s park itself.
+///
+/// # Safety
+/// As [`park_host_call`].
+#[cfg(not(loom))]
+unsafe fn park_host_call_here(
+    vm: &crate::VmCtx,
+    freeze: Option<FreezeWatch>,
+    key: u64,
+    parks: Parks,
+    still_parked: impl Fn() -> bool,
+) -> HostPark {
     let frozen = || freeze.filter(|f| f.landed());
     // #1952 — a fiber's park takes the fiber alone: it yields `FIBER_PARKED` to its resumer, which
     // runs on, and re-checks each time a `cont.resume` polls it. It parks before the first re-check,
@@ -525,6 +554,27 @@ pub unsafe fn park_host_call(
 /// The caller holds no lock the run's other vCPUs need.
 #[cfg(not(loom))]
 pub unsafe fn wait_outside<R>(
+    vm: &crate::VmCtx,
+    rouse: Box<dyn Fn() + Send + Sync>,
+    wait: impl FnOnce(&dyn Fn() -> bool) -> Option<R>,
+) -> Option<R> {
+    // #2742 — a serve handler's wait gives its window's gate back meanwhile ([`park_host_call`]).
+    let aside = crate::child_exec::handler_steps_aside(vm);
+    let answer = wait_outside_here(vm, rouse, wait);
+    if let Some(aside) = aside {
+        if !crate::child_exec::handler_steps_back(aside, vm) {
+            return None;
+        }
+    }
+    answer
+}
+
+/// [`wait_outside`]'s wait itself.
+///
+/// # Safety
+/// As [`wait_outside`].
+#[cfg(not(loom))]
+unsafe fn wait_outside_here<R>(
     vm: &crate::VmCtx,
     rouse: Box<dyn Fn() + Send + Sync>,
     wait: impl FnOnce(&dyn Fn() -> bool) -> Option<R>,
@@ -1206,11 +1256,16 @@ impl Domain {
     }
 
     /// #2488 — a vCPU ended: its cell hands back what it did not burn, and its context waits for
-    /// the next spawn.
+    /// the next spawn. #2742 — without the serve site the vCPU had, whose handlers it parked can
+    /// never run again, so their calls answer `CAP_REVOKED` now ([`crate::ServeSite::revoke`]); the
+    /// next vCPU on the context starts a window of its own.
     fn put_vcpu_ctx(&self, mut ctx: Box<VcpuCtx>) {
         if let Some(cell) = ctx.cell.as_deref_mut() {
             // SAFETY: a live cell; a fiber still charging it is `settle`'s documented race.
             unsafe { crate::FuelCell::settle(cell) };
+        }
+        if let Some(site) = ctx.vm.serve_site.take() {
+            site.revoke();
         }
         lock(&self.vcpu_ctxs).push(ctx);
     }
@@ -1376,6 +1431,34 @@ impl Domain {
         cell_unpark(flag, &self.hub().parked);
     }
 
+    /// #2742 — a serve handler started in an open window: a live task of the run until it ends or its
+    /// window shuts, for the deadlock predicate. It is no vCPU, so no vCPU ceiling counts it.
+    pub(crate) fn handler_started(&self) {
+        lock(&self.threads).live += 1;
+    }
+
+    /// #2742 — a handler of an open window ended: out of the live count. The executor then wakes
+    /// the parks that decide the deadlock verdict if the run is quiescent, as at a killed task's
+    /// end; no parked task is re-offered, since a handler's end satisfies no task's park, and its
+    /// settle and its gate rang the bells that do.
+    pub(crate) fn handler_finished(&self) {
+        lock(&self.threads).live -= 1;
+    }
+
+    /// #2742 — a serving vCPU's window opened (`open`) or shut, with `handlers` started and `parked`
+    /// of them counted blocked: they count in the deadlock predicate only while it is open. A shut
+    /// window wakes no waiter: its vCPU is running, so the predicate cannot hold.
+    pub(crate) fn count_window(&self, open: bool, handlers: usize, parked: usize) {
+        let mut t = lock(&self.threads);
+        if open {
+            t.live += handlers;
+            self.parked.fetch_add(parked, Ordering::AcqRel);
+        } else {
+            t.live -= handlers;
+            self.parked.fetch_sub(parked, Ordering::AcqRel);
+        }
+    }
+
     /// The §14 child finished — drop it from the live count (see [`Self::child_started`]), and if
     /// that leaves the run quiescent wake its parked vCPUs, whose indefinite parks it has made
     /// deadlocks, exactly as when a spawned vCPU exits ([`run_child`]): nothing re-checks on a
@@ -1511,6 +1594,11 @@ impl Domain {
     /// nested nursery, which has no futex either, so nothing can park).
     pub(crate) fn set_child_exec(&self, exec: std::sync::Arc<crate::child_exec::ChildExec>) {
         *lock(&self.child_exec) = Some(exec);
+    }
+
+    /// #2742 — the run's child-domain executor, if its nursery registered one. Asked of the hub.
+    pub(crate) fn child_exec(&self) -> Option<std::sync::Arc<crate::child_exec::ChildExec>> {
+        lock(&self.child_exec).clone()
     }
 
     /// D66 — re-offer the parked child tasks `which` names, each to re-check its own predicate.
@@ -1865,6 +1953,13 @@ std::thread_local! {
 /// Publish `dom` as this thread's current domain (see [`CURRENT_DOMAIN`]); returns the previous one.
 pub(crate) fn set_current_domain(dom: *const Domain) -> *const Domain {
     CURRENT_DOMAIN.with(|c| c.replace(dom))
+}
+
+/// #2742 — this thread's current domain as [`CURRENT_DOMAIN`] holds it: null where the vmctx's
+/// `sched` is the domain. Not inlined, for the reason [`current_domain`] is not.
+#[inline(never)]
+pub(crate) fn current_domain_ptr() -> *const Domain {
+    CURRENT_DOMAIN.with(|c| c.get())
 }
 
 /// The domain a thread thunk acts in: this thread's current one, else the vmctx's `sched`. Not
@@ -3001,6 +3096,29 @@ unsafe fn read_phys(phys: u64, width: u32) -> u64 {
 /// # Safety
 /// `vm` is the running context, whose `sched` is the run's live `Domain`.
 pub(crate) unsafe extern "C" fn thread_wait(
+    vm: &crate::VmCtx,
+    off: u64,
+    expected: u64,
+    width: u32,
+    timeout: i64,
+) -> i32 {
+    // #2742 — a serve handler's futex wait gives its window's gate back meanwhile, as an event park
+    // does ([`park_host_call`]); one whose domain ended meanwhile unwinds.
+    let aside = crate::child_exec::handler_steps_aside(vm);
+    let status = thread_wait_here(vm, off, expected, width, timeout);
+    if let Some(aside) = aside {
+        if !crate::child_exec::handler_steps_back(aside, vm) {
+            return 0;
+        }
+    }
+    status
+}
+
+/// [`thread_wait`]'s wait itself.
+///
+/// # Safety
+/// As [`thread_wait`].
+unsafe fn thread_wait_here(
     vm: &crate::VmCtx,
     off: u64,
     expected: u64,

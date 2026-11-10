@@ -2974,8 +2974,8 @@ fn bell_key(bell: &Arc<std::sync::atomic::AtomicU64>) -> u64 {
 }
 
 /// #2173 — ring a shared cell's bell, under its lock, after a change a wait parked on the cell may
-/// be waiting for: each such wait — its serve loop, a caller of it, its server waiting out a claimed
-/// handoff — wakes and re-checks its own state. A cell with no bell has no waits to wake.
+/// be waiting for: each such wait — its serve loop, waiting for a dispatch or for its gate, a caller
+/// of it — wakes and re-checks its own state. A cell with no bell has no waits to wake.
 ///
 /// # Safety
 /// `g` is the locked host of a live cell, whose park hub (if any) is its live run's.
@@ -3016,17 +3016,27 @@ fn bell_now(bell: Option<&Arc<std::sync::atomic::AtomicU64>>) -> u64 {
 
 /// §3.6, CALLS.md 5c.1b, #2166 — the JIT's **one serve loop**: a domain's `svc.poll`/`svc.wait`,
 /// root or §14 child, serviced on its own thread over its locked powerbox cell (a serving root runs
-/// locked for this, [`jit_proc::locked`]). Pops and serves queued dispatches through the domain's
-/// registered serve context ([`temen_jit::handler_tramp_of`] / [`temen_jit::invoke_handler`] — the
-/// guard is **dropped** around every handler invoke, so the handler's own `call.cap`s relock freely
-/// and an enqueuing caller is never blocked out); each settle rings the cell's bell, waking the
-/// caller parked on its ticket.
+/// locked for this, [`jit_proc::locked`]). It serves queued dispatches through the domain's
+/// registered serve context ([`temen_jit::handler_tramp_of`]), the guard **dropped** around each
+/// handler, so the handler's own `call.cap`s relock freely and an enqueuing caller is never blocked
+/// out; each settle rings the cell's bell, waking the caller parked on its ticket.
 ///
-/// An empty-queue `svc.wait` **parks** until the bell rings (the arm-5 park, [`park_on_bell`]),
-/// counted for the run's deadlock verdict: a wait nothing can end — no bell, or every live vCPU
-/// parked — fails closed (`ThreadFault`), the oracle's answer (#2173, ISSUES.md I36). No serve
-/// context ⇒ the probeable `-EINVAL`; so is the timed `svc.wait` form (a timeout arg), and a
-/// **nested** serve under a handler, refused as the interp refuses it (#2160).
+/// #2742 — each dispatch runs as a **handler fiber** of the serving vCPU (DESIGN.md §12a), through
+/// its [`temen_jit::ServeSite`]: a handler that parks parks alone, and the loop goes on to the next
+/// dispatch, as on the oracle. The serve op holds its window's gate whenever it is not parked, so
+/// its handlers run one at a time and never beside it; it resumes a woken handler of its own before
+/// the next dispatch, its dispatch being the older. Its handlers run nowhere else but in its serve
+/// ops (the window is shut outside them), on a pool worker or a caller's thread while it parks.
+/// Every handler's end, wherever it runs, settles its dispatch ([`handler_done`]) and counts in this
+/// loop's served count. A run with no pool (no §14 child, so no live offer reaches it), and a domain
+/// a freeze can land in (a handler fiber cannot ride the snapshot yet), runs each handler inline on
+/// the serve op's stack instead ([`temen_jit::invoke_handler`]).
+///
+/// An empty-queue `svc.wait` with nothing served **parks** until the bell rings (the arm-5 park,
+/// [`park_on_bell`]), counted for the run's deadlock verdict: a wait nothing can end — no bell, or
+/// every live vCPU parked — fails closed (`ThreadFault`), the oracle's answer (#2173, ISSUES.md
+/// I36). No serve context ⇒ the probeable `-EINVAL`; so is the timed `svc.wait` form (a timeout
+/// arg), and a **nested** serve under a handler, refused as the interp refuses it (#2160).
 ///
 /// #2627 — under a landed freeze a serve op makes no progress, as on the oracle (DURABILITY.md
 /// §13.4): it serves nothing more, ends its wait, and answers `0`. Its trailing poll unwinds with
@@ -3053,7 +3063,8 @@ unsafe fn serve_locked(
     if temen_jit::serve_handlers() != 0 || n_args != 0 {
         return put(EINVAL);
     }
-    let mut guard = m.lock().unwrap_or_else(|e| e.into_inner());
+    let lock = || m.lock().unwrap_or_else(|e| e.into_inner());
+    let mut guard = lock();
     let (serve_ctx, bell) = (guard.serve_ctx(), guard.svc_bell().cloned());
     if serve_ctx == 0 {
         // No serve context (an embedder entry that registers none, or a child already released).
@@ -3065,46 +3076,76 @@ unsafe fn serve_locked(
         .flatten();
     // SAFETY: the watched window is this domain's, live while its serve op runs.
     let frozen = || freeze.is_some_and(|f| unsafe { f.landed() });
+    let cell = guard.own_cell().map(|c| Arc::downgrade(&c));
+    // A handler fiber cannot ride a freeze yet (its frames are on no shadow region the snapshot
+    // takes, #2804), so a domain a freeze can land in keeps its handlers on the serve op's own
+    // stack.
+    let site = cell
+        .clone()
+        .filter(|_| bell.is_some() && freeze.is_none())
+        .and_then(|cell| {
+            temen_jit::ServeSite::of(
+                vm,
+                serve_ctx as *const c_void,
+                mem_base,
+                mem_reserved,
+                || Box::new(move || ring_cell(&cell)),
+            )
+        });
+    let window = (mem_base as usize, mem_size, mem_reserved);
+    if let Some(s) = &site {
+        s.begin();
+    }
+    // Whether this serve op holds its window's gate: always, but while it parks, or after a handler
+    // it ran kept the gate (a whole-vCPU park, a quantum's end).
+    let mut held = true;
     let mut count: i64 = 0;
-    loop {
-        // CALLS.md 5c.2 — fold handoff settlements (§10.2: a handoff-served dispatch counts in
-        // THIS serve loop's accounting), and a handler trap under handoff is this domain's own
-        // death, exactly as if it had served the dispatch itself on the enqueue path.
-        count += guard.take_handoff_served();
-        let handoff_trap = guard.take_handoff_trap();
-        if handoff_trap != 0 {
-            guard.set_serve_activation(None);
-            drop(guard);
-            vm.raise(handoff_trap);
-            return;
+    // How the loop ends: with a count, or unwinding (the trap cell set).
+    let answer = loop {
+        if vm.ended().is_some() {
+            break None; // a handler trap or fault (incl. Exit) — terminal for the domain
         }
-        if guard.handoff_claimed() {
-            // A claimer is running a handler inline over this domain's window: neither pop nor
-            // exit (the window must stay alive under it) — wait for its release, which rings the
-            // bell. A kill, the teardown or the verdict cannot end this wait early: the claimer
-            // sees the same kill and releases, so until then re-check on a short sleep.
-            let seen = bell_now(bell.as_ref());
-            drop(guard);
-            let parked = park_on_bell(vm, bell.as_ref(), seen, Parks::Fiber, None);
-            if parked != temen_jit::HostPark::Woken {
-                std::thread::sleep(std::time::Duration::from_millis(1));
+        if let Some(s) = &site {
+            if !held {
+                // Take the gate back, waiting while a handler holds it: one that ended its domain,
+                // or a deadlock, ends the loop (the trap cell says which).
+                if !s.try_enter() {
+                    drop(guard);
+                    let entered = s.wait_enter(vm);
+                    guard = lock();
+                    if !entered {
+                        break None;
+                    }
+                }
+                held = true;
             }
-            guard = m.lock().unwrap_or_else(|e| e.into_inner());
-            continue;
+            // With the gate: every handler that let go of it has settled and counted.
+            count += s.take_served();
+            // A woken handler of this window first: its dispatch is older than any queued.
+            if s.holds_handlers() {
+                drop(guard);
+                let resumed = s.resume_woken();
+                guard = lock();
+                if let Some(ran) = resumed {
+                    held = ran.held;
+                    if ran.ended {
+                        ring(&guard); // for whoever waits on its dispatch
+                    }
+                    continue;
+                }
+            }
         }
-        while !frozen() {
-            let Some((export, dop, args, ticket)) = guard.svc_pop() else {
-                break;
-            };
+        let next = if frozen() { None } else { guard.svc_pop() };
+        if let Some((export, dop, args, ticket)) = next {
             let Some(fidx) = guard.svc_handler(export, dop) else {
                 vm.raise(temen_jit::TrapKind::CapFault as i64);
-                return;
+                break None;
             };
             let Some((code, n_params, n_res)) =
                 temen_jit::handler_tramp_of(serve_ctx as *const c_void, fidx)
             else {
                 vm.raise(temen_jit::TrapKind::CapFault as i64);
-                return;
+                break None;
             };
             if args.len() != n_params {
                 let v = guard.settle_page(ticket, EINVAL, None); // a page request's sink goes too
@@ -3112,96 +3153,178 @@ unsafe fn serve_locked(
                 ring(&guard);
                 continue;
             }
-            let mut res = vec![0i64; n_res];
-            // Run the handler with the cell UNLOCKED (its own call.cap calls relock; an enqueuer
-            // never blocks behind a running handler). SAFETY: `serve_ctx` is the live module
-            // (cleared only after the domain's guest code — including this serve — has returned);
-            // `mem_base` is this domain's live window, handed to this very thunk call. Served on
-            // the domain's own thread, inside its own run: the thunk's `vm` is its `VmCtx`.
             drop(guard);
-            temen_jit::invoke_handler(
-                serve_ctx as *const c_void,
-                code,
-                &args,
-                &mut res,
-                mem_base,
-                mem_reserved,
-                vm as *const temen_jit::VmCtx,
-            );
-            if vm.ended().is_some() {
-                return; // a handler trap or fault (incl. Exit) — terminal for the domain
+            match (&site, &cell) {
+                // SAFETY: the gate is held, and this vCPU is in its serve op.
+                (Some(s), Some(cell)) => {
+                    let ran = s.start(fidx, &args, &mut || handler_done(cell, ticket, window));
+                    let mut g = lock();
+                    let ended = match ran {
+                        Ok(ran) => {
+                            held = ran.held;
+                            if let Some(end) = ran.end {
+                                settle_handler(&mut g, ticket, end, window);
+                            }
+                            ran.ended
+                        }
+                        // The OS refused its stack: probeable backpressure.
+                        Err(_) => {
+                            let v = g.settle_page(ticket, EAGAIN, None);
+                            g.svc_settle(ticket, Reply::Failed(v));
+                            true
+                        }
+                    };
+                    // For whoever waits on the dispatch, once it is settled.
+                    if ended {
+                        ring(&g);
+                    }
+                    guard = g;
+                    continue;
+                }
+                _ => {
+                    let mut res = vec![0i64; n_res];
+                    // SAFETY: `serve_ctx` is the live module (cleared only after the domain's guest
+                    // code — including this serve — has returned); `mem_base` is this domain's live
+                    // window, handed to this very thunk call. Served on the domain's own thread,
+                    // inside its own run: the thunk's `vm` is its `VmCtx`.
+                    temen_jit::invoke_handler(
+                        serve_ctx as *const c_void,
+                        code,
+                        &args,
+                        &mut res,
+                        mem_base,
+                        mem_reserved,
+                        vm as *const temen_jit::VmCtx,
+                    );
+                    guard = lock();
+                    if vm.ended().is_some() {
+                        break None;
+                    }
+                    settle_handler(
+                        &mut guard,
+                        ticket,
+                        temen_jit::HandlerEnd::Returned(res),
+                        window,
+                    );
+                    ring(&guard);
+                    count += 1;
+                    continue;
+                }
             }
-            guard = m.lock().unwrap_or_else(|e| e.into_inner());
-            // §2.2 / #2164 — a page request's bytes move now, out of this domain's window, the
-            // pager's, before the reply wakes the child and before the pager can reuse its buffer.
-            // Its status is the handler's one result. INVARIANTS #8: the reply is every result.
-            #[cfg(any(unix, windows))]
-            if let Some(first) = res.first_mut() {
-                let pager = MprotectWindow::of(&mut guard, mem_base, mem_size, mem_reserved);
-                *first = guard.settle_page(ticket, *first, Some(&pager));
-            }
-            guard.svc_settle(ticket, Reply::Results(res));
-            ring(&guard);
-            count += 1;
         }
         if frozen() {
-            count = 0;
-            break;
+            break Some(0);
         }
         if !wait || count != 0 {
-            break;
+            break Some(count);
         }
         // #1217 — a client of this domain has finished since its last wait: answer the timed form's
         // no-progress `0`, so the server reaches its `join` instead of waiting on a caller that is
         // gone. A server with other live clients sees a spurious `0` and waits again.
         if guard.take_client_gone() {
-            break;
+            break Some(0);
         }
-        // Empty queue on `svc.wait` and nothing served yet: the arm-5 park, until the bell rings.
-        // CALLS.md 5c.2 — publish the activation for the park's duration: a caller finding it
-        // (under this same lock) may claim and serve inline over `mem_base`'s window, which stays
-        // alive exactly because this frame stays parked until the release (the claimed-wait arm
-        // above). Cleared on every wake — the activation never outlives the park.
+        // Empty queue on `svc.wait`, nothing served, and no handler of this window woken: the arm-5
+        // park, until the bell rings — a new dispatch, a handler's end, a gate given back. The gate
+        // goes back for the park, so a woken handler of this window runs meanwhile.
+        // A caller finding the serve op parked (published) may start its own call's handler on its
+        // own thread, taking the gate (the direct handoff, [`live_reply`]).
         let seen = bell_now(bell.as_ref());
-        guard.set_serve_activation(Some((serve_ctx, mem_base as usize, mem_reserved)));
+        if let Some(s) = &site {
+            s.step_aside();
+            held = false;
+            guard.publish_site(Arc::clone(s) as Arc<dyn std::any::Any + Send + Sync>);
+        }
         drop(guard);
         let serving = freeze.map(temen_jit::FreezeWatch::serving);
         let parked = park_on_bell(vm, bell.as_ref(), seen, Parks::Fiber, serving);
-        guard = m.lock().unwrap_or_else(|e| e.into_inner());
-        guard.set_serve_activation(None);
-        // A claim taken during the park holds this domain until its release (the arm above); a
-        // freeze that ended it is answered above.
-        if matches!(
-            parked,
-            temen_jit::HostPark::Woken | temen_jit::HostPark::Frozen
-        ) || guard.handoff_claimed()
-        {
-            continue;
+        guard = lock();
+        if let Some(s) = &site {
+            guard.withdraw_site(Arc::as_ptr(s) as *const ());
         }
-        drop(guard);
-        vm.raise(match parked {
-            temen_jit::HostPark::Deadlock => temen_jit::TrapKind::ThreadFault as i64,
-            // A kill; the domain's teardown has already raised why it ended, which outranks this.
-            _ => temen_jit::TrapKind::OutOfFuel as i64,
-        });
-        return;
-    }
-    guard.set_serve_activation(None);
+        if let Some(end) = bell_park_end(parked, vm) {
+            break end;
+        }
+    };
     drop(guard);
-    put(count);
+    if let Some(s) = &site {
+        s.end(held);
+    }
+    if let Some(count) = answer {
+        put(count);
+    }
 }
 
-/// CALLS.md 5c.3 / §10.4 — the per-thread **crossing-depth bound**: inline handoff crossings are
-/// real native frames on the claiming thread, so re-entrant chains must bound and **decline to
-/// the parked transport** at the rim (fail-closed toward the slower correct transport, never a
-/// wrong answer): a handler run inline can itself call through an offer, from a locked domain
-/// too (#2139).
-const CROSSING_DEPTH_MAX: u32 = 64;
-thread_local! {
-    static CROSSING_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+/// How a serve op's bell park ended: on with the loop (`None`), or the loop's end — unwinding, the
+/// trap cell set: no live vCPU could ring it (`ThreadFault`, the oracle's deadlock verdict), or a
+/// kill (the domain's teardown has already raised why it ended, which outranks this).
+fn bell_park_end(parked: temen_jit::HostPark, vm: &temen_jit::VmCtx) -> Option<Option<i64>> {
+    match parked {
+        temen_jit::HostPark::Woken | temen_jit::HostPark::Frozen => None,
+        temen_jit::HostPark::Deadlock => {
+            vm.raise(temen_jit::TrapKind::ThreadFault as i64);
+            Some(None)
+        }
+        temen_jit::HostPark::Ended => {
+            vm.raise(temen_jit::TrapKind::OutOfFuel as i64);
+            Some(None)
+        }
+    }
 }
-fn crossing_depth_ok() -> bool {
-    CROSSING_DEPTH.with(|d| d.get() < CROSSING_DEPTH_MAX)
+
+/// #2742 — what a serve handler's end does, wherever it ends (the serve op's thread, a pool worker,
+/// a caller's thread): settle dispatch `ticket` on the serving domain's cell. Whoever ran the handler
+/// rings the cell's bell once it is done with it (`temen_jit::Ran`), so one ring wakes both the
+/// dispatch's caller and a serve op waiting on the handler's gate. A page request's bytes move first, out of the serving domain's `window` (`(base, size, reserved)`,
+/// the pager's), before the reply wakes the child and before the pager can reuse its buffer; its
+/// status is the handler's one result (§2.2 / #2164). INVARIANTS #8: the reply is every result. A
+/// handler that trapped ended the serving domain: its caller gets the dying-callee errno now, as
+/// every other caller gets it at the domain's end.
+fn handler_done(
+    cell: &std::sync::Weak<Mutex<Host>>,
+    ticket: u64,
+    window: (usize, u64, u64),
+) -> temen_jit::HandlerDone {
+    let cell = cell.clone();
+    Box::new(move |end| {
+        if let Some(cell) = cell.upgrade() {
+            let mut g = cell.lock().unwrap_or_else(|e| e.into_inner());
+            settle_handler(&mut g, ticket, end, window);
+        }
+    })
+}
+
+/// The settle [`handler_done`] runs, under the serving domain's lock `g`; the caller rings.
+fn settle_handler(
+    g: &mut Host,
+    ticket: u64,
+    end: temen_jit::HandlerEnd,
+    #[cfg_attr(not(any(unix, windows)), allow(unused_variables))] window: (usize, u64, u64),
+) {
+    match end {
+        temen_jit::HandlerEnd::Returned(mut res) => {
+            #[cfg(any(unix, windows))]
+            if let Some(first) = res.first_mut() {
+                let (base, size, reserved) = window;
+                let pager = MprotectWindow::of(g, base as *mut u8, size, reserved);
+                *first = g.settle_page(ticket, *first, Some(&pager));
+            }
+            g.svc_settle(ticket, Reply::Results(res));
+        }
+        temen_jit::HandlerEnd::Trapped(_) => {
+            let v = g.settle_page(ticket, CAP_REVOKED, None);
+            g.svc_settle(ticket, Reply::Failed(v));
+        }
+    }
+}
+
+/// #2742 — [`ring`] a cell held weakly: a serve site's, which may outlive its cell's run.
+fn ring_cell(cell: &std::sync::Weak<Mutex<Host>>) {
+    if let Some(cell) = cell.upgrade() {
+        let g = cell.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: `g` is the locked host of a live cell, whose park hub (if any) is its live run's.
+        unsafe { ring(&g) };
+    }
 }
 
 /// The `n_results` result slots of a cap call at `results`, which compiled code zeroes before the call.
@@ -3255,16 +3378,24 @@ unsafe fn live_impl_call(
 }
 
 /// The transport of a [`live_impl_call`]: its callee's reply, or `None` with the trap cell set to
-/// unwind the caller. Enqueue on the callee child's shared cell (ticket `t`), then park on the cell's
-/// bell until the child's serve loop settles `t` ([`await_settle`]: a task's fiber yields, an OS
-/// vCPU waits, #2173) — the §10.2 arm-5 transport, caller half. Fail-closed edges: full callee queue
-/// ⇒ `-EAGAIN` (probeable backpressure, the interp's exact answer); a callee cell with no bell (not
-/// a shared JIT child) ⇒ `-EINVAL` (the pre-5c.1 dispatch answer); a callee whose serve ctx cleared
-/// (child exited without serving) ⇒ `CAP_REVOKED` (-9, the D37 dead-callee errno); epoch/trap fire ⇒
-/// unwind via the trap cell. `fast` is the caller's handoff knob, read by the caller from its own
-/// powerbox before the call (a locked caller with its domain guard released first, #2139).
-/// INVARIANTS #8: the call's handles (a `cap` of `params`, the op's) are granted into the callee
-/// before its handler sees them.
+/// unwind the caller. The call is a dispatch on the callee child's shared cell (ticket `t`), and the
+/// caller parks on the cell's bell until it is settled ([`await_settle`]: a task's fiber yields, an OS
+/// vCPU waits, #2173) — the §10.2 arm-5 transport, caller half.
+///
+/// #2742 — the direct handoff (§10.2 arm 4): when the callee's serve op is parked at an empty queue
+/// and `fast` (the caller's handoff knob, read by the caller from its own powerbox before the call,
+/// a locked caller with its domain guard released first, #2139), the caller starts its dispatch's
+/// handler itself, on its own thread: no wake, no worker, and a handler that returns at once answers
+/// before the caller parks. It takes the serve op's gate first, so neither the serve op nor another
+/// handler of its window runs meanwhile, and gives it back once the handler has ended or parked; a
+/// handler that parks is the pool's, as one its serve op started is ([`handoff_call`]). Each
+/// handler has a stack of its own, so a chain of crossings needs no depth bound.
+///
+/// Fail-closed edges: full callee queue ⇒ `-EAGAIN` (probeable backpressure, the interp's exact
+/// answer); a callee cell with no bell (not a shared JIT child) ⇒ `-EINVAL` (the pre-5c.1 dispatch
+/// answer); a callee whose serve ctx cleared (child exited without serving) ⇒ `CAP_REVOKED` (-9, the
+/// D37 dead-callee errno); epoch/trap fire ⇒ unwind via the trap cell. INVARIANTS #8: the call's
+/// handles (a `cap` of `params`, the op's) are granted into the callee before its handler sees them.
 #[allow(clippy::too_many_arguments)]
 unsafe fn live_reply(
     caller: &mut CallerHost,
@@ -3276,81 +3407,52 @@ unsafe fn live_reply(
     params: &[temen_ir::ValType],
     vm: &temen_jit::VmCtx,
 ) -> Option<Reply> {
-    let mut guard = callee.lock().unwrap_or_else(|e| e.into_inner());
-    // CALLS.md 5c.2 — the thunk fast path (§10.2 arm 4): the callee's serve loop is parked at an
-    // empty-queue `svc.wait` (activation published) and unclaimed — claim it (atomic with the
-    // check, under the cell's lock) and run the handler INLINE on this thread over the child's
-    // live window: no enqueue, no wake, no reply round-trip. Gated by the run's handoff knob
-    // (`Host::set_handoff`, the 4d toggle now spanning both tiers) and the §10.4 crossing-depth
-    // bound (5c.3); every miss releases and declines to the parked transport below — toward the
-    // slower correct transport, never a wrong answer (§9).
-    if fast && crossing_depth_ok() {
-        if let Some((sctx, cbase, creserved)) = guard.try_claim_handoff() {
-            let tramp = guard
-                .svc_handler(export, op)
-                .and_then(|f| temen_jit::handler_tramp_of(sctx as *const c_void, f));
-            match tramp {
-                Some((code, n_params, n_res)) if args.len() == n_params => {
-                    drop(guard);
-                    let mut args = std::borrow::Cow::Borrowed(args);
-                    // INVARIANTS #8: the call's handles, granted into the callee before its
-                    // handler sees them; a call with none borrows its arguments as they are.
-                    if params.contains(&temen_ir::ValType::Cap)
-                        && temen_interp::grant_live_args(caller, callee, params, args.to_mut())
-                            .is_err()
-                    {
-                        let mut g2 = callee.lock().unwrap_or_else(|e| e.into_inner());
-                        g2.release_handoff(0);
-                        ring(&g2);
-                        vm.raise(TrapKind::CapFault as i64);
-                        return None;
-                    }
-                    let mut res = vec![0i64; n_res];
-                    // The handler runs on THIS thread but as the CHILD's instance — its powerbox,
-                    // never the caller's (#1768). A handler trap/fault under handoff is the child's
-                    // outcome (on the enqueue path the child would have died serving this dispatch):
-                    // it lands in this context's own cell, never the caller's trap cell.
-                    let child_vm =
-                        temen_jit::handler_vmctx(sctx as *const c_void, cbase as *mut u8);
-                    CROSSING_DEPTH.with(|d| d.set(d.get() + 1));
-                    temen_jit::invoke_handler(
-                        sctx as *const c_void,
-                        code,
-                        &args,
-                        &mut res,
-                        cbase as *mut u8,
-                        creserved,
-                        &child_vm,
-                    );
-                    CROSSING_DEPTH.with(|d| d.set(d.get() - 1));
-                    let child_trap = child_vm.ended().unwrap_or(0);
-                    let mut g2 = callee.lock().unwrap_or_else(|e| e.into_inner());
-                    if child_trap != 0 {
-                        // Route the trap to the child (it folds + dies on wake) and answer the
-                        // dying-callee errno — the enqueue path's exact observables.
-                        g2.set_handoff_trap(child_trap);
-                        g2.release_handoff(0);
-                        ring(&g2);
-                        return Some(Reply::Failed(CAP_REVOKED));
-                    }
-                    g2.release_handoff(1);
-                    ring(&g2);
-                    return Some(Reply::Results(res));
-                }
-                _ => {
-                    // Unknown handler / arity mismatch: decline to the parked transport (the
-                    // enqueue below answers exactly as the oracle would).
-                    guard.release_handoff(0);
-                }
-            }
+    // #2742 — a serve handler's call gives its window's gate back for the call, as on the oracle,
+    // where a handler's call parks it, and takes it back once the call is answered: the window's
+    // serve op serves meanwhile, a call the handler's own call makes into its domain included.
+    let aside = temen_jit::handler_steps_aside(vm);
+    let reply = live_call(caller, callee, export, fast, op, args, params, vm);
+    if let Some(aside) = aside {
+        if !temen_jit::handler_steps_back(aside, vm) {
+            return None;
         }
     }
-    let Some(bell) = guard.svc_bell().cloned() else {
+    reply
+}
+
+/// [`live_reply`]'s call itself.
+///
+/// # Safety
+/// As [`live_reply`].
+#[allow(clippy::too_many_arguments)]
+unsafe fn live_call(
+    caller: &mut CallerHost,
+    callee: &Mutex<Host>,
+    export: u32,
+    fast: bool,
+    op: u32,
+    args: &[i64],
+    params: &[temen_ir::ValType],
+    vm: &temen_jit::VmCtx,
+) -> Option<Reply> {
+    let guard = callee.lock().unwrap_or_else(|e| e.into_inner());
+    if guard.svc_bell().is_none() {
         // Not a JIT run's shared cell (e.g. an interp-tier callee reached from a JIT run): no
         // serve loop here can ever answer, so keep the pre-5c.1 probeable answer.
         return Some(Reply::Failed(EINVAL));
-    };
+    }
+    // A guest fiber's call takes the queue: it parks the fiber at least once, as the oracle's
+    // register-then-recheck does (#1952), and a handoff would answer it before it could.
+    let in_fiber = temen_jit::in_guest_fiber();
+    if fast && !in_fiber {
+        if let Some((site, func)) = handoff_site(&guard, export, op, args.len()) {
+            drop(guard);
+            return handoff_call(caller, callee, &site, func, args, params, vm);
+        }
+    }
+    let bell = guard.svc_bell().cloned().expect("checked above");
     drop(guard);
+    let seen = bell_now(Some(&bell));
     let ticket = match temen_interp::enqueue_live_call(
         caller,
         callee,
@@ -3362,15 +3464,145 @@ unsafe fn live_reply(
     ) {
         Ok((Some(ticket), _)) => ticket,
         // A full queue / unservable op: probeable backpressure.
-        Ok((None, _)) => return Some(Reply::Failed(EAGAIN)),
+        Ok(_) => return Some(Reply::Failed(EAGAIN)),
         Err(_) => {
             vm.raise(TrapKind::CapFault as i64);
             return None;
         }
     };
-    let guard = callee.lock().unwrap_or_else(|e| e.into_inner());
+    let mut guard = callee.lock().unwrap_or_else(|e| e.into_inner());
     ring(&guard); // the callee's serve loop, parked on its empty queue
+    if in_fiber {
+        // #1952 — however soon its answer comes, the fiber parks once: its resumer sees
+        // `FIBER_PARKED`, as on the oracle. `seen` was read before the enqueue, so a settle since
+        // has moved the bell past it, and the park ends at the fiber's next resume.
+        drop(guard);
+        if !park_until_rung(&bell, seen, Parks::Fiber, vm) {
+            return None;
+        }
+        guard = callee.lock().unwrap_or_else(|e| e.into_inner());
+    }
     await_settle(callee, guard, &bell, ticket, Parks::Fiber, vm)
+}
+
+/// #2742 — the direct handoff of a call to handler `func` of the callee's serve op parked at `site`,
+/// whose gate the caller holds: the handler runs on the caller's thread, on the caller's own stack
+/// when it cannot park ([`temen_jit::ServeSite::run_inline`]), else on a fiber of its own. Its
+/// dispatch is the caller's own, so it takes no ticket: its end leaves the reply in a slot the caller
+/// reads, at once when it ended here, else once the pool ends it (a handler that parks). It counts
+/// in the serve op's served count, whose bell the gate's release rings ([`leave_site`]).
+unsafe fn handoff_call(
+    caller: &mut CallerHost,
+    callee: &Mutex<Host>,
+    site: &temen_jit::ServeSite,
+    func: u32,
+    args: &[i64],
+    params: &[temen_ir::ValType],
+    vm: &temen_jit::VmCtx,
+) -> Option<Reply> {
+    // INVARIANTS #8: the call's handles, granted into the callee before its handler sees them; a
+    // call with none passes its arguments as they are.
+    let granted;
+    let args = if params.contains(&temen_ir::ValType::Cap) {
+        let mut a = args.to_vec();
+        if temen_interp::grant_live_args(caller, callee, params, &mut a).is_err() {
+            leave_site(site, callee);
+            vm.raise(TrapKind::CapFault as i64);
+            return None;
+        }
+        granted = a;
+        &granted[..]
+    } else {
+        args
+    };
+    // A handler that cannot park runs on this stack: it never gives the gate back, and returns or
+    // traps here.
+    if site.inline_ok(func) {
+        // SAFETY: the gate is held, its serve op parked in its serve loop, and `inline_ok`.
+        let end = site.run_inline(func, args);
+        leave_site(site, callee);
+        return Some(match end {
+            Ok(end) => handoff_reply(end),
+            Err(_) => Reply::Failed(EAGAIN),
+        });
+    }
+    // A handler that parks leaves its reply here, once the pool has ended it.
+    let mut slot: Option<Arc<std::sync::OnceLock<Reply>>> = None;
+    // SAFETY: the gate is held, and its serve op is parked in its serve loop.
+    let ran = site.start(func, args, &mut || {
+        let reply = Arc::new(std::sync::OnceLock::new());
+        slot = Some(Arc::clone(&reply));
+        Box::new(move |end| {
+            let _ = reply.set(handoff_reply(end));
+        })
+    });
+    if ran.as_ref().map_or(true, |ran| ran.held) {
+        leave_site(site, callee);
+    }
+    let ran = match ran {
+        Ok(ran) => ran,
+        // The OS refused the handler's stack: probeable backpressure.
+        Err(_) => return Some(Reply::Failed(EAGAIN)),
+    };
+    if let Some(end) = ran.end {
+        return Some(handoff_reply(end));
+    }
+    let reply = slot.expect("a handler that parks is given its done");
+    let bell = (callee
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .svc_bell()
+        .cloned())
+    .expect("a serving cell has a bell");
+    loop {
+        let seen = bell_now(Some(&bell));
+        if let Some(r) = reply.get() {
+            return Some(r.clone());
+        }
+        // Parked, its end rings the callee's bell; a callee that ends first drains it, which ends
+        // it with `CAP_REVOKED`.
+        if !park_until_rung(&bell, seen, Parks::Fiber, vm) {
+            return None;
+        }
+    }
+}
+
+/// #2742 — a caller that started a handler at `site` gives its gate back: a woken handler of the
+/// window may run on the pool, and the bell of `callee`, the site's cell, rings for the serve op,
+/// which counts the dispatch served or waits to take the gate.
+unsafe fn leave_site(site: &temen_jit::ServeSite, callee: &Mutex<Host>) {
+    site.step_aside();
+    // SAFETY: the callee's cell is live, its hub its live run's.
+    ring(&callee.lock().unwrap_or_else(|e| e.into_inner()));
+}
+
+/// #2742 — the reply a handler's end gives a direct handoff's caller: its results, or, for a handler
+/// that ended the callee, the dying-callee errno.
+fn handoff_reply(end: temen_jit::HandlerEnd) -> Reply {
+    match end {
+        temen_jit::HandlerEnd::Returned(results) => Reply::Results(results),
+        temen_jit::HandlerEnd::Trapped(_) => Reply::Failed(CAP_REVOKED),
+    }
+}
+
+/// #2742 — the callee's parked serve op, its gate taken, for a direct handoff of a call of op `op` of
+/// export `export` with `n_args` arguments: its queue is empty, and the op's handler exists and takes
+/// that many. `None` otherwise: the call is queued, and its serve loop answers it, refusals included.
+fn handoff_site(
+    g: &Host,
+    export: u32,
+    op: u32,
+    n_args: usize,
+) -> Option<(Arc<temen_jit::ServeSite>, u32)> {
+    if g.svc_queued() != 0 {
+        return None;
+    }
+    let site = g.parked_site()?.downcast::<temen_jit::ServeSite>().ok()?;
+    let func = g.svc_handler(export, op)?;
+    // SAFETY: a published site's serve context is live while its serve op parks.
+    let (_, n_params, _) =
+        unsafe { temen_jit::handler_tramp_of(g.serve_ctx() as *const c_void, func)? };
+    (n_params == n_args && site.try_enter()).then_some((site, func))
 }
 
 /// The arm-5 caller park: wait, from `guard` on `callee`'s cell, parked as `parks` says, for its

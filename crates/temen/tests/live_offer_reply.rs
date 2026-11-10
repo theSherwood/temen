@@ -177,6 +177,9 @@ fn run_on(entry: Entry, caller: &str, server: &str, handoff: bool) -> Result<Vec
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let mut host = Host::new();
+        // The caller's own module, as an embedder's instantiation records it: what a live
+        // self-serve grant over one of its exports offers its child (#744).
+        host.set_self_module(&std::sync::Arc::new(a.clone()));
         host.set_handoff(handoff);
         let args = [
             host.grant_instantiator(),
@@ -191,29 +194,44 @@ fn run_on(entry: Entry, caller: &str, server: &str, handoff: bool) -> Result<Vec
 }
 
 /// Run `caller` with the serving child `server` on the tree-walker, natively on the bytecode engine's
-/// two executors, and on the Cranelift JIT, and answer their one result.
-fn run(caller: &str, server: &str, handoff: bool) -> Result<Vec<Value>, Trap> {
-    let oracle = interpreted(caller, server, handoff);
-    let jitted = run_on(jit, caller, server, handoff);
-    assert_eq!(jitted, oracle, "the JIT answers as the tree-walker does");
-    oracle
-}
-
-/// [`run`] on the tree-walker and the bytecode engine's two executors alone.
-fn interpreted(caller: &str, server: &str, handoff: bool) -> Result<Vec<Value>, Trap> {
+/// two executors, and on the Cranelift JIT, each with the direct handoff off and on, and answer their
+/// one result: every engine and transport answers as the tree-walker does with the handoff off.
+fn run(caller: &str, server: &str) -> Result<Vec<Value>, Trap> {
     assert!(
         bytecode::admits(&module(caller)),
         "the bytecode engine runs the caller"
     );
     assert!(bytecode::admits(&module(server)), "and the serving child");
-    let oracle = run_on(tree_walker, caller, server, handoff);
-    let fast = run_on(bytecode_engine, caller, server, handoff);
-    assert_eq!(
-        fast, oracle,
-        "the bytecode engine answers as the tree-walker does"
-    );
-    let par = run_on(parallel, caller, server, handoff);
-    assert_eq!(par, oracle, "executor 2 answers as the tree-walker does");
+    agree(caller, server, &ENGINES)
+}
+
+/// Every engine of this file, by name.
+const ENGINES: [(&str, Entry); 4] = [
+    ("the tree-walker", tree_walker),
+    ("the bytecode engine", bytecode_engine),
+    ("executor 2", parallel),
+    ("the JIT", jit),
+];
+
+/// Run `caller` with the serving child `server` on each of `engines` (the tree-walker first, the
+/// oracle), each with the direct handoff off and on, and answer the oracle's result, which every
+/// other run must give.
+fn agree(caller: &str, server: &str, engines: &[(&str, Entry)]) -> Result<Vec<Value>, Trap> {
+    let oracle = run_on(engines[0].1, caller, server, false);
+    for &(name, entry) in engines {
+        for handoff in [false, true] {
+            if (name, handoff) == (engines[0].0, false) {
+                continue;
+            }
+            assert_eq!(
+                run_on(entry, caller, server, handoff),
+                oracle,
+                "{name} with the handoff {} answers as {} does",
+                if handoff { "on" } else { "off" },
+                engines[0].0,
+            );
+        }
+    }
     oracle
 }
 
@@ -224,21 +242,7 @@ fn served(call: i64) -> Result<Vec<Value>, Trap> {
 
 #[test]
 fn a_parked_root_gets_both_results() {
-    let r = run(
-        &caller(ADDMUL_CALL, ""),
-        &server(ADDMUL_TYPES, ADDMUL),
-        false,
-    );
-    assert_eq!(r, served(42_080));
-}
-
-#[test]
-fn a_call_served_by_handoff_gets_both_results() {
-    let r = run(
-        &caller(ADDMUL_CALL, ""),
-        &server(ADDMUL_TYPES, ADDMUL),
-        true,
-    );
+    let r = run(&caller(ADDMUL_CALL, ""), &server(ADDMUL_TYPES, ADDMUL));
     assert_eq!(r, served(42_080));
 }
 
@@ -247,7 +251,6 @@ fn a_parked_fiber_gets_both_results() {
     let r = run(
         &caller(IN_A_FIBER, ADDMUL_FIBER),
         &server(ADDMUL_TYPES, ADDMUL),
-        false,
     );
     assert_eq!(r, served(42_080));
 }
@@ -270,7 +273,7 @@ block 0 (vc: cap) {
 "#;
     let call = r#"
   vcall = call.cap 268435456 0 (cap) -> (i64) v7 (v3)"#;
-    let r = run(&caller(call, ""), &server(types, handler), false);
+    let r = run(&caller(call, ""), &server(types, handler));
     assert_eq!(r, served(1000), "the child read a clock of its own");
 }
 
@@ -299,7 +302,7 @@ block 0 (vc: cap) {
   vten = i64.const 10
   vokten = i64.mul vok64 vten
   vcall = i64.add vfresh64 vokten"#;
-    let r = run(&caller(call, ""), &server(types, handler), false);
+    let r = run(&caller(call, ""), &server(types, handler));
     assert_eq!(r, served(11), "a fresh caller-side clock handle");
 }
 
@@ -313,11 +316,7 @@ block 0 (va: i64, vb: i64) {
   }
 }
 "#;
-    let r = run(
-        &caller(ADDMUL_CALL, ""),
-        &server(ADDMUL_TYPES, handler),
-        false,
-    );
+    let r = run(&caller(ADDMUL_CALL, ""), &server(ADDMUL_TYPES, handler));
     // The child trapped, so its join answers its trap, not a count.
     let Ok(v) = r else {
         panic!("the caller survives a dead callee: {r:?}")
@@ -345,7 +344,6 @@ block 0 (va: i64, vb: i64) {
     let r = run(
         &caller(IN_A_FIBER, ADDMUL_FIBER),
         &server(ADDMUL_TYPES, handler),
-        false,
     );
     let Ok(v) = r else {
         panic!("the caller survives a dead callee: {r:?}")
@@ -376,7 +374,7 @@ block 0 (va: i64) {
   va = i64.const 1
   vf, vi = call.cap 268435456 0 (i64) -> (f64, i64) v7 (va)
   vcall = i64.const 0"#;
-    let r = run(&caller(call, ""), &server(types, handler), false);
+    let r = run(&caller(call, ""), &server(types, handler));
     assert_eq!(r, Err(Trap::CapFault));
 }
 
@@ -403,7 +401,7 @@ block 0 (va: i64) {
   vfive = i32.const 5
   vsame = i32.eq vh vfive
   vcall = i64.extend_i32_u vsame"#;
-    let r = run(&caller(call, ""), &server(types, handler), false);
+    let r = run(&caller(call, ""), &server(types, handler));
     assert_eq!(r, served(1), "the number, untranslated");
 }
 
@@ -415,7 +413,7 @@ fn a_call_of_another_arity_faults() {
   va = i64.const 40
   vb = i64.const 2
   vcall = call.cap 268435456 0 (i64, i64) -> (i64) v7 (va, vb)"#;
-    let r = run(&caller(call, ""), &server(ADDMUL_TYPES, ADDMUL), false);
+    let r = run(&caller(call, ""), &server(ADDMUL_TYPES, ADDMUL));
     assert_eq!(r, Err(Trap::CapFault));
 }
 
@@ -455,7 +453,7 @@ block 0 (vh: i64) {
   vin = call.cap 6 19 (i32, i64) -> (i32) v0 (v5, v764)
   vin64 = i64.extend_i32_s vin
   vcall = call.cap 268435456 0 (i64) -> (i64) v7 (vin64)"#;
-    let r = run(&caller(call, ""), server, false);
+    let r = run(&caller(call, ""), server);
     assert_eq!(r, Err(Trap::ThreadFault), "the deadlock verdict");
 }
 
@@ -464,14 +462,43 @@ block 0 (vh: i64) {
 /// index of it. That handler calls `again(h, 0)` through `h`, which queues on the child's own queue,
 /// and answers its reply plus one. The child's one `svc.wait` serves both: the handler parked on
 /// its own domain's call parks alone, as a fiber of the serve loop, and takes the reply at once.
-/// The Cranelift JIT runs a handler on its serve loop's stack, so there its park parks the whole
-/// loop and the call deadlocks: this case leaves it out.
 #[test]
 fn a_handler_calling_its_own_domain_is_served_meanwhile() {
-    let r = interpreted(&caller(AGAIN_CALL, ""), &server(AGAIN_TYPES, AGAIN), false);
+    let r = run(&caller(AGAIN_CALL, ""), &server(AGAIN_TYPES, AGAIN));
     // Two dispatches served, and the call answers 7 + 1.
     assert_eq!(r, Ok(vec![Value::I64(2_000_008)]));
 }
+
+/// #2742 — a handler parked when its domain ends is ended with it: its caller answers `CAP_REVOKED`,
+/// as every caller of a dead callee does, and no engine leaves it behind to run over the dead
+/// domain's window. The parent calls `again(h, 1)`, `h` the child's offer over itself; that handler
+/// calls `boom` through `h`, which the child's one `svc.wait` serves while the first handler waits,
+/// and which traps, ending the child.
+#[test]
+fn a_handler_parked_when_its_domain_ends_answers_its_caller_revoked() {
+    let r = run(&caller(AGAIN_CALL, ""), &server(BOOM_TYPES, BOOM));
+    assert_eq!(r, Ok(vec![Value::I64(CAP_REVOKED)]));
+}
+
+const BOOM_TYPES: &str = "type 0 func (i64, i64) -> (i64)
+type 1 interface { again: 0, boom: 0 }
+export 0 interface \"again\" 1 { again: 1, boom: 2 }";
+
+/// `again(h, n)` calls `boom(h, n)` through `h`; `boom` traps.
+const BOOM: &str = r#"func (i64, i64) -> (i64) {
+block 0 (vh: i64, vn: i64) {
+  vself = i32.wrap_i64 vh
+  vr = call.cap 268435456 1 (i64, i64) -> (i64) vself (vh, vn)
+  return vr
+  }
+}
+
+func (i64, i64) -> (i64) {
+block 0 (vh: i64, vn: i64) {
+  unreachable
+  }
+}
+"#;
 
 const AGAIN_TYPES: &str = "type 0 func (i64, i64) -> (i64)
 type 1 interface { again: 0 }
@@ -581,7 +608,6 @@ fn a_fiber_s_thread_local_word_survives_its_park() {
     let r = run(
         &caller(TLS_READER, TLS_FIBER),
         &server(ADDMUL_TYPES, ADDMUL),
-        false,
     );
     assert_eq!(r, served(42 * 100_000 + 42_080));
 }
@@ -594,7 +620,6 @@ fn a_polled_fiber_making_a_call_parks_alone() {
     let r = run(
         &caller(POLLED_FIBER, ADDMUL_FIBER),
         &server(ADDMUL_TYPES, ADDMUL),
-        false,
     );
     assert_eq!(r, served(3 * 100_000 + 42_080));
 }
@@ -640,7 +665,7 @@ block 0 (v0: i32, v1: i32, v2: i32, v3: i32) {{
 {rec}"#,
         rec = rec::segment(17408, &temen_ir::SpawnRec::default())
     );
-    let r = run(&caller, &server(AGAIN_TYPES, AGAIN), false);
+    let r = run(&caller, &server(AGAIN_TYPES, AGAIN));
     assert_eq!(r, Ok(vec![Value::I64(1_001_008)]));
 }
 
@@ -700,7 +725,7 @@ block 0 (vsp: i64, voff: i64) {
 /// only defense, and it used to be inert there. The process died with SIGSEGV.
 #[test]
 fn a_handler_recursing_past_its_stack_traps() {
-    let r = run(&caller(REC_CALL, ""), &server(REC_TYPES, REC), false);
+    let r = run(&caller(REC_CALL, ""), &server(REC_TYPES, REC));
     assert_eq!(r, Ok(vec![Value::I64(CAP_REVOKED)]));
 }
 
@@ -708,10 +733,544 @@ fn a_handler_recursing_past_its_stack_traps() {
 /// handler on the caller fiber's own stack, where the check must hold too.
 #[test]
 fn a_handler_recursing_past_its_stack_traps_under_handoff_from_a_fiber() {
-    let r = run(
-        &caller(IN_A_FIBER, REC_FIBER),
-        &server(REC_TYPES, REC),
-        true,
-    );
+    let r = run(&caller(IN_A_FIBER, REC_FIBER), &server(REC_TYPES, REC));
     assert_eq!(r, Ok(vec![Value::I64(CAP_REVOKED)]));
+}
+
+/// #2742 — a handler runs as its serving vCPU, so it shares the vCPU's thread-local word
+/// (`vcpu.tls`) with the serve loop and with the loop's other handlers, across a park: the word goes
+/// with execution. The child's main sets the word to 5 and serves; the parent calls `again(h, 1)`
+/// through the child's offer over itself. That handler reads 5, sets 51 and calls `again(h, 0)`,
+/// parking; the inner handler reads 51, sets 77 and answers 51; the outer one, resumed, reads 77
+/// and answers `51 · 1000 + 77`. The child's main reads 77 after its `svc.wait`, which served both,
+/// and answers `2 · 1000 + 77`.
+#[test]
+fn a_handler_shares_its_serve_loop_s_thread_local_word() {
+    let r = run(&caller(AGAIN_CALL, ""), TLS_SERVER);
+    assert_eq!(r, Ok(vec![Value::I64(2_077 * 1_000_000 + 51_077)]));
+}
+
+const TLS_SERVER: &str = r#"memory 12
+type 0 func (i64, i64) -> (i64)
+type 1 interface { again: 0 }
+export 0 interface "again" 1 { again: 1 }
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vfive = i64.const 5
+  vcpu.tls.set vfive
+  vz = i32.const 0
+  vn = svc.wait vz
+  vt = vcpu.tls.get
+  vk = i64.const 1000
+  vnk = i64.mul vn vk
+  vr = i64.add vnk vt
+  return vr
+  }
+}
+
+func (i64, i64) -> (i64) {
+block 0 (vh: i64, vn: i64) {
+  vt0 = vcpu.tls.get
+  vzero = i64.const 0
+  vlast = i64.eq vn vzero
+  br_if vlast 1(vt0) 2(vh, vn, vt0)
+}
+block 1 (wt0: i64) {
+  vsev = i64.const 77
+  vcpu.tls.set vsev
+  return wt0
+}
+block 2 (wh: i64, wn: i64, xt0: i64) {
+  vten = i64.const 10
+  vt1 = i64.mul xt0 vten
+  vt2 = i64.add vt1 wn
+  vcpu.tls.set vt2
+  vone = i64.const 1
+  wn1 = i64.sub wn vone
+  vself = i32.wrap_i64 wh
+  vr = call.cap 268435456 0 (i64, i64) -> (i64) vself (wh, wn1)
+  vt3 = vcpu.tls.get
+  vthou = i64.const 1000
+  vrk = i64.mul vr vthou
+  vres = i64.add vrk vt3
+  return vres
+  }
+}
+"#;
+
+/// DESIGN.md §12a: cycles are legal, and each crossing is a handler fiber of its own. Two children
+/// play ping-pong: the parent calls `ping(99)` on the first, whose handler calls `ping(98)` on the
+/// second, and so on down to `ping(0)`: 100 nested calls, each child serving 50 of them while every
+/// outer handler waits. The JIT bounded such a chain at 64 crossings once; each now runs on a stack
+/// of its own. Each child serves until it has served its 50 (one `svc.wait` may return before),
+/// and answers its count. The parent answers `50 · 1_000_000 + 50 · 1_000 + 99`.
+#[test]
+fn a_hundred_crossings_ping_pong_between_two_domains() {
+    let caller = format!(
+        r#"memory 17
+
+func (i32, i32, i32, i32) -> (i64) {{
+block 0 (v0: i32, v1: i32, v2: i32, v3: i32) {{
+  vrm = i64.const 17416
+  i32.store vrm v1
+  vrb = i64.const 17420
+  i32.store vrb v2
+  vrp = i64.const 17408
+  va = call.cap 6 17 (i64) -> (i32) v0 (vrp)
+  vb = call.cap 6 17 (i64) -> (i32) v0 (vrp)
+  vz = i64.const 0
+  vtoa = call.cap 6 14 (i32, i64) -> (i32) v0 (va, vz)
+  vtob = call.cap 6 14 (i32, i64) -> (i32) v0 (vb, vz)
+  vtoa64 = i64.extend_i32_u vtoa
+  vtob64 = i64.extend_i32_u vtob
+  vina = call.cap 6 19 (i32, i64) -> (i32) v0 (va, vtob64)
+  vinb = call.cap 6 19 (i32, i64) -> (i32) v0 (vb, vtoa64)
+  vina64 = i64.extend_i32_s vina
+  vinb64 = i64.extend_i32_s vinb
+  vn = i64.const 99
+  vcall = call.cap 268435456 0 (i64, i64, i64) -> (i64) vtoa (vina64, vinb64, vn)
+  vja_st, vja = call.cap 6 1 (i32) -> (i64, i64) v0 (va)
+  vjb_st, vjb = call.cap 6 1 (i32) -> (i64, i64) v0 (vb)
+  vmil = i64.const 1000000
+  vk = i64.const 1000
+  vma = i64.mul vja vmil
+  vmb = i64.mul vjb vk
+  vs1 = i64.add vma vmb
+  vs = i64.add vs1 vcall
+  return vs
+  }}
+}}
+{rec}"#,
+        rec = rec::segment(17408, &temen_ir::SpawnRec::default())
+    );
+    let r = run(&caller, PING_SERVER);
+    assert_eq!(r, Ok(vec![Value::I64(50_050_099)]));
+}
+
+/// A child that serves until it has served 50 dispatches, and answers the count; `ping(mine,
+/// theirs, n)` answers `n`, through `n` nested calls alternating between the two children (`mine`
+/// is this child's index of the other's offer, `theirs` the other's index of this child's).
+const PING_SERVER: &str = r#"memory 12
+type 0 func (i64, i64, i64) -> (i64)
+type 1 interface { ping: 0 }
+export 0 interface "ping" 1 { ping: 1 }
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vt0 = i64.const 0
+  br 1(vt0)
+}
+block 1 (wt: i64) {
+  vz = i32.const 0
+  vn = svc.wait vz
+  wt1 = i64.add wt vn
+  vk = i64.const 50
+  vless = i64.lt_s wt1 vk
+  br_if vless 1(wt1) 2(wt1)
+}
+block 2 (xt: i64) {
+  return xt
+  }
+}
+
+func (i64, i64, i64) -> (i64) {
+block 0 (vme: i64, vth: i64, vn: i64) {
+  vz = i64.const 0
+  vlast = i64.eq vn vz
+  br_if vlast 1() 2(vme, vth, vn)
+}
+block 1 () {
+  vzero = i64.const 0
+  return vzero
+}
+block 2 (wme: i64, wth: i64, wn: i64) {
+  vone = i64.const 1
+  wn1 = i64.sub wn vone
+  vh = i32.wrap_i64 wme
+  vr = call.cap 268435456 0 (i64, i64, i64) -> (i64) vh (wth, wme, wn1)
+  vr1 = i64.add vr vone
+  return vr1
+  }
+}
+"#;
+
+/// #2742 — a serve loop that returns while one of its handlers is still parked revokes the
+/// handler's call, as a trap or a kill does (owner, 2026-11-09): a serving vCPU's end leaves nothing
+/// to resume its handlers, so their calls answer `CAP_REVOKED` (D37). The handler sets a flag in its
+/// domain's memory and parks on a futex nothing wakes; the child's main polls until it sees the
+/// flag, and returns 77. The bytecode engine's serve veto declines a serving module that waits on a
+/// futex (#2789), so the tree-walker and the JIT run it; the next test pins the same on every
+/// engine.
+#[test]
+fn a_serve_loop_that_returns_revokes_its_parked_handler_s_call() {
+    let call = r#"
+  va = i64.const 1
+  vb = i64.const 2
+  vcall = call.cap 268435456 0 (i64, i64) -> (i64) v7 (va, vb)"#;
+    let r = agree(
+        &caller(call, ""),
+        POLL_UNTIL_PARKED,
+        &[ENGINES[0], ENGINES[3]],
+    );
+    assert_eq!(r, Ok(vec![Value::I64(77 * 1_000_000 + CAP_REVOKED)]));
+}
+
+/// #2742 — the same where the bytecode engine runs it: the handler parks on a call back into its
+/// parent, which never serves it (the parent's own call waits on the handler), so only the serve
+/// loop's end can answer the parent. The parent grants its child a live self-serve offer over its
+/// export `back` (#744), mints an offer over the child and calls `hang(1, 2)`; the handler sets the
+/// flag and calls `back.back(1, 2)`; the child's main polls until it sees the flag and returns 77.
+/// The parent answers `join · 1_000_000 + call`. The parent's offer and the child's grant hold each
+/// other's hosts, which the tree-walker's end of run cannot unwrap (#2830), so the bytecode engine's
+/// two executors and the JIT run it, against the oracle's answer.
+#[test]
+fn a_handler_parked_on_its_parent_when_its_serve_loop_returns_is_revoked() {
+    let child = temen_ir::SpawnRec {
+        grants_ptr: 17536,
+        grants_n: 1,
+        ..temen_ir::SpawnRec::default()
+    };
+    let caller = format!(
+        r#"memory 17
+data 17600 "back"
+type 0 func (i64, i64) -> (i64)
+type 1 interface {{ back: 0 }}
+export 0 interface "back" 1 {{ back: 1 }}
+
+func (i32, i32, i32, i32) -> (i64) {{
+block 0 (v0: i32, v1: i32, v2: i32, v3: i32) {{
+  vrm = i64.const 17416
+  i32.store vrm v1
+  vrb = i64.const 17420
+  i32.store vrb v2
+  vgh = i32.const {tag}
+{grant}  vrp = i64.const 17408
+  v5 = call.cap 6 17 (i64) -> (i32) v0 (vrp)
+  v6 = i64.const 0
+  v7 = call.cap 6 14 (i32, i64) -> (i32) v0 (v5, v6)
+  va = i64.const 1
+  vb = i64.const 2
+  vcall = call.cap 268435456 0 (i64, i64) -> (i64) v7 (va, vb)
+  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) v0 (v5)
+  vk = i64.const 1000000
+  vm = i64.mul vj vk
+  vs = i64.add vm vcall
+  return vs
+  }}
+}}
+
+func (i64, i64) -> (i64) {{
+block 0 (va: i64, vb: i64) {{
+  vs = i64.add va vb
+  return vs
+  }}
+}}
+{rec}"#,
+        tag = temen_interp::GRANT_SERVE_LIVE_TAG as i32,
+        grant = rec::grant("ge", 17536, 17600, 4, "vgh"),
+        rec = rec::segment(17408, &child),
+    );
+    let server = r#"memory 17
+data 16384 "back"
+type 0 func (i64, i64) -> (i64)
+type 1 interface { hang: 0 }
+export 0 interface "hang" 1 { hang: 1 }
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  br 1()
+}
+block 1 () {
+  vz = i32.const 0
+  vn = call.cap 4294967295 9 () -> (i64) vz ()
+  vfa = i64.const 17416
+  vflag = i64.load vfa
+  vzero = i64.const 0
+  vset = i64.ne vflag vzero
+  br_if vset 2() 1()
+}
+block 2 () {
+  vr = i64.const 77
+  return vr
+  }
+}
+
+func (i64, i64) -> (i64) {
+block 0 (va: i64, vb: i64) {
+  vfa = i64.const 17416
+  vone = i64.const 1
+  i64.store vfa vone
+  vnp = i64.const 16384
+  vl4 = i64.const 4
+  vback = self.resolve vnp vl4
+  vr = call.cap 268435456 0 (i64, i64) -> (i64) vback (va, vb)
+  return vr
+  }
+}
+"#;
+    assert!(
+        bytecode::admits(&module(&caller)),
+        "the bytecode engine runs the caller"
+    );
+    assert!(bytecode::admits(&module(server)), "and the serving child");
+    let r = agree(&caller, server, &ENGINES[1..]);
+    assert_eq!(r, Ok(vec![Value::I64(77 * 1_000_000 + CAP_REVOKED)]));
+}
+
+/// #2742 — a serving vCPU's end revokes the calls of the handlers it parked at once, while its
+/// domain runs on: the parent's next call needs that answer first. The parent calls `hang(1, 2)`
+/// and then `add(3, 4)`, answering `join · 1_000_000 + first · 1_000 + second`. The handler sets the
+/// flag and parks on a futex nothing wakes. The child's two cases: [`SERVED_BY_A_THREAD`], whose
+/// thread serves `hang` and ends before the main serves `add`, and [`A_THREAD_OUTLIVES_THE_ROOT`],
+/// whose main serves `hang` and returns, leaving a thread to serve `add`. Only the serving vCPU's
+/// own end can answer `hang` in time: the domain's end waits on the `add` that waits on it. TW and
+/// JIT, as above.
+#[test]
+fn a_serving_vcpu_s_end_revokes_its_parked_handler_s_call_at_once() {
+    let call = r#"
+  va = i64.const 1
+  vb = i64.const 2
+  vfirst = call.cap 268435456 0 (i64, i64) -> (i64) v7 (va, vb)
+  vc = i64.const 3
+  vd = i64.const 4
+  vsecond = call.cap 268435456 1 (i64, i64) -> (i64) v7 (vc, vd)
+  vthou = i64.const 1000
+  vf = i64.mul vfirst vthou
+  vcall = i64.add vf vsecond"#;
+    for server in [SERVED_BY_A_THREAD, A_THREAD_OUTLIVES_THE_ROOT] {
+        let r = agree(
+            &caller(call, ""),
+            &format!("{HANG_ADD}{server}"),
+            &[ENGINES[0], ENGINES[3]],
+        );
+        assert_eq!(
+            r,
+            Ok(vec![Value::I64(77 * 1_000_000 + CAP_REVOKED * 1_000 + 7)])
+        );
+    }
+}
+
+/// The interface of [`a_serving_vcpu_s_end_revokes_its_parked_handler_s_call_at_once`]'s child, its
+/// handlers, and its poll loop, func 1 of each case: it serves until `hang` has set the flag.
+const HANG_ADD: &str = r#"memory 17
+type 0 func (i64, i64) -> (i64)
+type 1 interface { hang: 0, add: 0 }
+export 0 interface "hang" 1 { hang: 2, add: 3 }
+"#;
+
+/// The child's main spawns a thread that polls until `hang` has parked and returns; the main joins
+/// it, then serves `add` and returns 77.
+const SERVED_BY_A_THREAD: &str = r#"func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vz = i64.const 0
+  vt = thread.spawn 1 vz vz
+  vt_st, vtr = thread.join vt
+  vw = i32.const 0
+  vn = svc.wait vw
+  vr = i64.const 77
+  return vr
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (va: i64, vb: i64) {
+  br 1()
+}
+block 1 () {
+  vz = i32.const 0
+  vn = call.cap 4294967295 9 () -> (i64) vz ()
+  vfa = i64.const 17416
+  vflag = i64.load vfa
+  vzero = i64.const 0
+  vset = i64.ne vflag vzero
+  br_if vset 2() 1()
+}
+block 2 () {
+  vr = i64.const 5
+  return vr
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (va: i64, vb: i64) {
+  vfa = i64.const 17416
+  vone = i64.const 1
+  i64.store vfa vone
+  vw = i64.const 17408
+  vexp = i32.const 0
+  vto = i64.const -1
+  vst = i32.atomic.wait vw vexp vto
+  vst64 = i64.extend_i32_u vst
+  return vst64
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (va: i64, vb: i64) {
+  vs = i64.add va vb
+  return vs
+  }
+}
+"#;
+
+/// The child's main polls until `hang` has parked, spawns a thread that serves `add`, and returns
+/// 77 without joining it.
+const A_THREAD_OUTLIVES_THE_ROOT: &str = r#"func (i64) -> (i64) {
+block 0 (v0: i64) {
+  br 1()
+}
+block 1 () {
+  vz = i32.const 0
+  vn = call.cap 4294967295 9 () -> (i64) vz ()
+  vfa = i64.const 17416
+  vflag = i64.load vfa
+  vzero = i64.const 0
+  vset = i64.ne vflag vzero
+  br_if vset 2() 1()
+}
+block 2 () {
+  vz0 = i64.const 0
+  vt = thread.spawn 1 vz0 vz0
+  vr = i64.const 77
+  return vr
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (va: i64, vb: i64) {
+  vw = i32.const 0
+  vn = svc.wait vw
+  return vn
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (va: i64, vb: i64) {
+  vfa = i64.const 17416
+  vone = i64.const 1
+  i64.store vfa vone
+  vw = i64.const 17408
+  vexp = i32.const 0
+  vto = i64.const -1
+  vst = i32.atomic.wait vw vexp vto
+  vst64 = i64.extend_i32_u vst
+  return vst64
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (va: i64, vb: i64) {
+  vs = i64.add va vb
+  return vs
+  }
+}
+"#;
+
+/// #2742 — the same, its main ending in a trap: the handler's call answers `CAP_REVOKED`.
+#[test]
+fn a_serve_loop_that_traps_revokes_its_parked_handler_s_call() {
+    let call = r#"
+  va = i64.const 1
+  vb = i64.const 2
+  vcall = call.cap 268435456 0 (i64, i64) -> (i64) v7 (va, vb)"#;
+    let server = POLL_UNTIL_PARKED.replace(
+        "block 2 () {\n  vr = i64.const 77\n  return vr\n  }",
+        "block 2 () {\n  unreachable\n  }",
+    );
+    assert_ne!(server, POLL_UNTIL_PARKED);
+    let r = agree(&caller(call, ""), &server, &[ENGINES[0], ENGINES[3]]);
+    assert_eq!(r, Ok(vec![Value::I64(CAP_REVOKED)]));
+}
+
+/// The child of [`a_serve_loop_that_returns_revokes_its_parked_handler_s_call`]: `hang` sets the flag
+/// at 17416 and waits on the futex word at 17408 for ever.
+const POLL_UNTIL_PARKED: &str = r#"memory 17
+type 0 func (i64, i64) -> (i64)
+type 1 interface { hang: 0 }
+export 0 interface "hang" 1 { hang: 1 }
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  br 1()
+}
+block 1 () {
+  vz = i32.const 0
+  vn = call.cap 4294967295 9 () -> (i64) vz ()
+  vfa = i64.const 17416
+  vflag = i64.load vfa
+  vzero = i64.const 0
+  vset = i64.ne vflag vzero
+  br_if vset 2() 1()
+}
+block 2 () {
+  vr = i64.const 77
+  return vr
+  }
+}
+
+func (i64, i64) -> (i64) {
+block 0 (va: i64, vb: i64) {
+  vfa = i64.const 17416
+  vone = i64.const 1
+  i64.store vfa vone
+  vw = i64.const 17408
+  vexp = i32.const 0
+  vto = i64.const -1
+  vst = i32.atomic.wait vw vexp vto
+  vst64 = i64.extend_i32_u vst
+  return vst64
+  }
+}
+"#;
+
+/// #2742 — a serving child killed while its handler is parked ends with the handler in it, and the
+/// handler's call answers `CAP_REVOKED`, whether the kill lands before the dispatch is served or
+/// after its handler parked. The parent's fiber makes the call; the parent kills the child once the
+/// fiber has parked, then resumes the fiber until it returns. TW and JIT, as above.
+#[test]
+fn a_serving_child_killed_with_a_parked_handler_revokes_its_call() {
+    let call = r#"
+  vf = ref.func 1
+  vfsp = i64.const 24576
+  vfk = cont.new vf vfsp
+  voff = i64.extend_i32_u v7
+  vs1, vv1 = cont.resume vfk voff
+  vkill = call.cap 6 12 (i32) -> (i32) v0 (v5)
+  br 1(v0, v5, vfk, voff)
+}
+block 1 (x0: i32, x5: i32, xk: i64, xoff: i64) {
+  xs, xv = cont.resume.block xk xoff
+  xone = i32.const 1
+  xdone = i32.eq xs xone
+  br_if xdone 2(x0, x5, xv) 1(x0, x5, xk, xoff)
+}
+block 2 (v0: i32, v5: i32, vcall: i64) {"#;
+    let fiber = r#"
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, voff: i64) {
+  v7 = i32.wrap_i64 voff
+  va = i64.const 1
+  vb = i64.const 2
+  vr = call.cap 268435456 0 (i64, i64) -> (i64) v7 (va, vb)
+  return vr
+  }
+}
+"#;
+    let server = server(
+        "type 0 func (i64, i64) -> (i64)
+type 1 interface { hang: 0 }
+export 0 interface \"hang\" 1 { hang: 1 }",
+        r#"func (i64, i64) -> (i64) {
+block 0 (va: i64, vb: i64) {
+  vw = i64.const 17408
+  vexp = i32.const 0
+  vto = i64.const -1
+  vst = i32.atomic.wait vw vexp vto
+  vst64 = i64.extend_i32_u vst
+  return vst64
+  }
+}
+"#,
+    )
+    .replace("memory 12", "memory 17");
+    let r = agree(&caller(call, fiber), &server, &[ENGINES[0], ENGINES[3]]);
+    let Ok(v) = &r else {
+        panic!("the parent ran: {r:?}")
+    };
+    assert_eq!(
+        v[0],
+        Value::I64(CAP_REVOKED),
+        "a killed child joins as 0, and the call is revoked"
+    );
 }
