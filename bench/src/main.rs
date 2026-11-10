@@ -66,6 +66,7 @@
 //!   cargo run --release -- --csv                 # machine-readable line per kernel
 //!   cargo run --release -- --save-baseline FILE  # record this CPU's ratios
 //!   cargo run --release -- --check FILE           # rerun + flag any ratio regression
+//!   cargo run --release -- --only call,fib        # just the named kernels
 //!
 //! **Over-time regression tracking (AGENTS.md "catch regressions one commit old").** The
 //! absolute ns are machine-dependent, so the *tracked* quantity is a **ratio** per kernel: temen ÷
@@ -368,7 +369,9 @@ block 3 (v20: i64) {
     n_span: None,
 };
 
-const KERNELS: &[Kernel] = &[ALU, MEMSUM, SCATTER, SIMD, FLOAT, CALLI, CALLI_POLY, CACHE];
+const KERNELS: &[Kernel] = &[
+    ALU, MEMSUM, SCATTER, SIMD, FLOAT, CALLI, CALLI_POLY, CALL, FIB, CACHE,
+];
 
 /// `(i64 n) -> i64`: like `memsum` but the store and the load go to **different, per-iter
 /// varying** slots — write slot `(i·M1)&1023`, read slot `(i·M2)&1023` (M1,M2 odd, so each
@@ -746,6 +749,166 @@ block 0 (v0: i64) {
     n_span: None,
 };
 
+/// `(i64 n) -> i64`: a **direct `call`** loop — `calli` with a direct call of the leaf `x -> x+1`,
+/// against a Wasmtime `call`. The JIT reaches a direct callee through its code word (#2594), and this
+/// is that path in a loop. Result = Σ (i+1).
+const CALL: Kernel = Kernel {
+    name: "call",
+    ir: "\
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  v1 = i64.const 0
+  v2 = i64.const 0
+  br 1(v0, v1, v2)
+}
+block 1 (v3: i64, v4: i64, v5: i64) {
+  v6 = i64.ge_s v5 v3
+  br_if v6 3(v4) 2(v3, v4, v5)
+}
+block 2 (v7: i64, v8: i64, v9: i64) {
+  v10 = call 1 (v9)
+  v11 = i64.add v8 v10
+  v12 = i64.const 1
+  v13 = i64.add v9 v12
+  br 1(v7, v11, v13)
+}
+block 3 (v14: i64) {
+  return v14
+}
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  v1 = i64.const 1
+  v2 = i64.add v0 v1
+  return v2
+}
+}
+",
+    wat32: r#"
+(module
+  (func $leaf (param i64) (result i64) (i64.add (local.get 0) (i64.const 1)))
+  (func (export "run") (param $n i64) (result i64)
+    (local $acc i64) (local $i i64)
+    (block $done
+      (loop $loop
+        (br_if $done (i64.ge_s (local.get $i) (local.get $n)))
+        (local.set $acc (i64.add (local.get $acc) (call $leaf (local.get $i))))
+        (local.set $i (i64.add (local.get $i) (i64.const 1)))
+        (br $loop)))
+    (local.get $acc)))
+"#,
+    wat64: Some(
+        r#"
+(module
+  (memory i64 1)
+  (func $leaf (param i64) (result i64) (i64.add (local.get 0) (i64.const 1)))
+  (func (export "run") (param $n i64) (result i64)
+    (local $acc i64) (local $i i64)
+    (block $done
+      (loop $loop
+        (br_if $done (i64.ge_s (local.get $i) (local.get $n)))
+        (local.set $acc (i64.add (local.get $acc) (call $leaf (local.get $i))))
+        (local.set $i (i64.add (local.get $i) (i64.const 1)))
+        (br $loop)))
+    (local.get $acc)))
+"#,
+    ),
+    native: Some(native_call),
+    n_span: None,
+};
+
+/// `(i64 n) -> i64`: **recursion** — each iteration adds `fib(12)`, 465 direct calls deep in a call
+/// tree, so calls and returns are most of the work. Unlike `call`'s loop, no call site repeats
+/// within a frame, so nothing about reaching the callee can be hoisted. Result = 144·n. An iteration
+/// takes about a microsecond, so the span starts small: at the default's 2 M iterations a sample ran
+/// for seconds.
+const FIB: Kernel = Kernel {
+    name: "fib",
+    ir: "\
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  v1 = i64.const 0
+  v2 = i64.const 0
+  br 1(v0, v1, v2)
+}
+block 1 (v3: i64, v4: i64, v5: i64) {
+  v6 = i64.ge_s v5 v3
+  br_if v6 3(v4) 2(v3, v4, v5)
+}
+block 2 (v7: i64, v8: i64, v9: i64) {
+  v10 = i64.const 12
+  v11 = call 1 (v10)
+  v12 = i64.add v8 v11
+  v13 = i64.const 1
+  v14 = i64.add v9 v13
+  br 1(v7, v12, v14)
+}
+block 3 (v15: i64) {
+  return v15
+}
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  v1 = i64.const 2
+  v2 = i64.lt_s v0 v1
+  br_if v2 1(v0) 2(v0)
+}
+block 1 (v3: i64) {
+  return v3
+}
+block 2 (v4: i64) {
+  v5 = i64.const 1
+  v6 = i64.sub v4 v5
+  v7 = call 1 (v6)
+  v8 = i64.const 2
+  v9 = i64.sub v4 v8
+  v10 = call 1 (v9)
+  v11 = i64.add v7 v10
+  return v11
+}
+}
+",
+    wat32: r#"
+(module
+  (func $fib (param $x i64) (result i64)
+    (if (result i64) (i64.lt_s (local.get $x) (i64.const 2))
+      (then (local.get $x))
+      (else (i64.add (call $fib (i64.sub (local.get $x) (i64.const 1)))
+                     (call $fib (i64.sub (local.get $x) (i64.const 2)))))))
+  (func (export "run") (param $n i64) (result i64)
+    (local $acc i64) (local $i i64)
+    (block $done
+      (loop $loop
+        (br_if $done (i64.ge_s (local.get $i) (local.get $n)))
+        (local.set $acc (i64.add (local.get $acc) (call $fib (i64.const 12))))
+        (local.set $i (i64.add (local.get $i) (i64.const 1)))
+        (br $loop)))
+    (local.get $acc)))
+"#,
+    wat64: Some(
+        r#"
+(module
+  (memory i64 1)
+  (func $fib (param $x i64) (result i64)
+    (if (result i64) (i64.lt_s (local.get $x) (i64.const 2))
+      (then (local.get $x))
+      (else (i64.add (call $fib (i64.sub (local.get $x) (i64.const 1)))
+                     (call $fib (i64.sub (local.get $x) (i64.const 2)))))))
+  (func (export "run") (param $n i64) (result i64)
+    (local $acc i64) (local $i i64)
+    (block $done
+      (loop $loop
+        (br_if $done (i64.ge_s (local.get $i) (local.get $n)))
+        (local.set $acc (i64.add (local.get $acc) (call $fib (i64.const 12))))
+        (local.set $i (i64.add (local.get $i) (i64.const 1)))
+        (br $loop)))
+    (local.get $acc)))
+"#,
+    ),
+    native: Some(native_fib),
+    n_span: Some((2_000, 100)),
+};
+
 /// `(i64 n) -> i64`: a **memory-latency** loop — like `scatter` but over a 1 MiB array (mask
 /// `0x1FFFF` ⇒ 128 Ki `i64` slots), so the hashed store/load addresses miss L1/L2 (and on smaller
 /// machines L3). The interesting question: temen's confinement mask (§4) is ~one `AND`; once an access
@@ -966,6 +1129,36 @@ fn native_calli(n: i64) -> i64 {
     for i in 0..n {
         let f = black_box(table[1]);
         acc = acc.wrapping_add(f(i));
+    }
+    acc
+}
+
+/// Native twin of `CALL`: a direct call of a leaf the compiler may not inline.
+fn native_call(n: i64) -> i64 {
+    #[inline(never)]
+    fn leaf(x: i64) -> i64 {
+        x.wrapping_add(1)
+    }
+    let mut acc: i64 = 0;
+    for i in 0..n {
+        acc = acc.wrapping_add(leaf(black_box(i)));
+    }
+    acc
+}
+
+/// Native twin of `FIB`: the same call tree, its depth `black_box`'d so it isn't folded.
+fn native_fib(n: i64) -> i64 {
+    #[inline(never)]
+    fn fib(x: i64) -> i64 {
+        if x < 2 {
+            x
+        } else {
+            fib(x - 1).wrapping_add(fib(x - 2))
+        }
+    }
+    let mut acc: i64 = 0;
+    for _ in 0..n {
+        acc = acc.wrapping_add(fib(black_box(12)));
     }
     acc
 }
@@ -2541,8 +2734,13 @@ fn main() {
         return;
     }
 
+    let only = flag_value(&args, "--only");
     let results: Vec<(Resolved, Raw)> = resolve_kernels(from_wasm)
         .into_iter()
+        .filter(|k| {
+            only.as_ref()
+                .is_none_or(|o| o.split(',').any(|n| n == k.name))
+        })
         .map(|k| {
             let raw = measure(&engine, &k, reps, optimize);
             (k, raw)

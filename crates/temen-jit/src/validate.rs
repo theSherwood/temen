@@ -271,8 +271,9 @@ fn libcall_contract(
 }
 
 /// What temen knows of a guest function's module, which its machine code is checked against: the
-/// window's geometry (`None` for a memoryless module), how many entries the fn table holds, and the
-/// contract of a function of each type id, which a `call.dyn` whose type check matched reaches.
+/// window's geometry (`None` for a memoryless module), how many entries the fn table holds, the
+/// contract of a function of each type id, which a `call.dyn` whose type check matched reaches, and
+/// the type id of each own function, whose record slot `i` holds for the table's life (#2594).
 // Only the x86-64 validator reads the facts (aarch64's is #2642).
 #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 #[derive(Clone, Copy, Debug)]
@@ -280,6 +281,7 @@ pub(crate) struct Guest<'a> {
     pub window: Option<WindowLayout>,
     pub table: u64,
     pub types: &'a [Option<Contract>],
+    pub own: &'a [u32],
 }
 
 /// What the validator knows of a function's entry (#2603). A guest function enters with its context
@@ -327,7 +329,21 @@ pub(crate) struct CapturedFn {
     pub window: Option<WindowLayout>,
     pub table: u64,
     pub types: Vec<Option<Contract>>,
+    pub own: Vec<u32>,
     pub contract: Option<Contract>,
+}
+
+#[cfg(all(test, target_arch = "x86_64"))]
+impl CapturedFn {
+    /// The module facts it was compiled against.
+    pub fn guest(&self) -> Guest<'_> {
+        Guest {
+            window: self.window,
+            table: self.table,
+            types: &self.types,
+            own: &self.own,
+        }
+    }
 }
 
 #[cfg(all(test, target_arch = "x86_64"))]
@@ -440,8 +456,9 @@ pub(crate) mod x86 {
         /// The address of a callee whose contract is known: one a relocation names (`movabs r, sym`),
         /// or a host function a fuel cell points to. A call through the register runs the contract.
         FnAddr(Contract),
-        /// The address of an immutable fn-table record, what a slot holds: one whose type id the
-        /// code compared equal to `ty` when `Some(ty)`, since a record never changes.
+        /// The address of an immutable fn-table record, what a slot holds: one of type `ty` when
+        /// `Some(ty)`, because the code compared its type id equal to `ty` or because the slot is an
+        /// own function's, which names that function's record for the table's life (#2594).
         Record(Option<u32>),
         /// The code pointer of a record whose type id is `ty`: a function of type `ty`.
         FnPtr(u32),
@@ -714,6 +731,7 @@ pub(crate) mod x86 {
         window: None,
         table: 0,
         types: &[],
+        own: &[],
     };
 
     impl Ctx<'_> {
@@ -1769,7 +1787,7 @@ pub(crate) mod x86 {
                     let f = d
                         .operands
                         .mem
-                        .map_or(Fact::Unknown, |m| load_fact(&state, &m));
+                        .map_or(Fact::Unknown, |m| load_fact(&state, &m, &ctx.guest));
                     set(&mut state, dst, f);
                 }
                 Eff::LoadZx32 { dst } => {
@@ -2142,14 +2160,18 @@ pub(crate) mod x86 {
         ret: Ret::Unknown,
     };
 
-    /// What a 64-bit load from `m` yields: the fact a tracked spill slot holds, the code pointer of a
-    /// fn-table entry whose type was checked, what a vmctx field points to, or a fuel cell's function.
-    fn load_fact(state: &State, m: &Mem) -> Fact {
+    /// What a 64-bit load from `m` yields: the fact a tracked spill slot holds, a fn-table record (of
+    /// a known type when the slot is an own function's), the code pointer of a record whose type is
+    /// known, what a vmctx field points to, or a fuel cell's function.
+    fn load_fact(state: &State, m: &Mem, guest: &Guest) -> Fact {
         if let Some(Some(off)) = frame_addr(state, m) {
             return state.slot_get(off);
         }
-        if let Some(Ok(_)) = table_reach(m, state) {
-            return Fact::Record(None);
+        if let Some(Ok(at)) = table_reach(m, state) {
+            // A slot at a fixed offset (no index) that an own function holds names that function's
+            // record for the table's life (#2594): a direct call's callee, of the function's type.
+            let own = m.index.is_none().then(|| guest.own.get((at / 8) as usize));
+            return Fact::Record(own.flatten().copied());
         }
         let fact = |r: Option<u8>| r.map(|x| state.regs[x as usize & 15]);
         let (base, index) = (fact(m.base), fact(m.index));
@@ -2229,7 +2251,7 @@ pub(crate) mod x86 {
     /// type a fn-table entry's type check proved. Anything else is unidentified.
     fn indirect_callee(state: &State, d: &Decoded, ctx: Ctx) -> Option<Contract> {
         let target = match (d.operands.mem, d.operands.rm_reg) {
-            (Some(m), _) => load_fact(state, &m),
+            (Some(m), _) => load_fact(state, &m, &ctx.guest),
             (None, Some(r)) => state.regs[r as usize & 15],
             (None, None) => return None,
         };
@@ -2473,9 +2495,11 @@ pub(crate) mod x86 {
             return;
         }
 
-        // Stack: an access through a stack pointer stays in the function's own frame. A write lands
-        // strictly below the return address (entry-relative `< 0`); a read may also reach the
-        // incoming stack arguments `[8, 8 + stack_args)`. The low bound is the current `rsp`: nothing
+        // Stack: an access through a stack pointer stays in the function's own frame: strictly below
+        // the return address (entry-relative `< 0`), or in the incoming stack arguments
+        // `[8, 8 + stack_args)`, which are the callee's under the tail convention (it pops them). A
+        // read of an argument lands there, and so does a tail call's write of its own callee's
+        // arguments (a lazy entry's tail call, #2594). The low bound is the current `rsp`: nothing
         // legitimately touches below the allocated frame. The frame is host memory outside the
         // window, so reads are bounded too, not only writes.
         if matches!(base_f, Some(Fact::Stack(_))) || matches!(index_f, Some(Fact::Stack(_))) {
@@ -2490,12 +2514,12 @@ pub(crate) mod x86 {
             let top = off.saturating_add(width as i64);
             let args = i64::from(ctx.frame.stack_args.unwrap_or(0));
             let in_frame = top <= 0;
-            let in_args = !write && off >= 8 && top <= 8 + args;
+            let in_args = off >= 8 && top <= 8 + args;
             if !(off >= cur && (in_frame || in_args)) {
                 flag(format!(
                     "stack {} [{off}, {top}) is outside the frame [{cur}, {})",
                     if write { "write" } else { "read" },
-                    if write { 0 } else { 8 + args },
+                    8 + args,
                 ));
             }
             return;
@@ -4411,11 +4435,7 @@ pub(crate) mod x86 {
                         _ => {}
                     }
                 }
-                let guest = Guest {
-                    window: f.window,
-                    table: f.table,
-                    types: &f.types,
-                };
+                let guest = f.guest();
                 let entry = Entry::Guest(&guest);
                 let frame = Frame {
                     stack_args: f.contract.and_then(|c| c.pops),
@@ -4590,6 +4610,22 @@ pub(crate) mod x86 {
             cross_check(&format!(
                 "func (i64) -> (i64) {{\nblock 0 (v0: i64) {{\n  v1 = i32.wrap_i64 v0\n  \
                  return_call.dyn (i64) -> (i64) v1 (v0)\n  }}\n}}\n{leaf}"
+            ));
+        }
+
+        /// #2594 — `call` and `return_call` through the callee's code word: the own slot's load at a
+        /// fixed offset, with no type check, names the callee's record, whose code word is a function
+        /// of the callee's type. Two callees of different types, so each call is checked against its
+        /// own callee's contract.
+        #[test]
+        fn direct_calls_through_the_code_word() {
+            let leaves = "func (i64) -> (i64) {\nblock 0 (v0: i64) {\n  v1 = i64.const 1\n  \
+                          v2 = i64.add v0 v1\n  return v2\n  }\n}\n\
+                          func (i64, i64) -> (i64) {\nblock 0 (v0: i64, v1: i64) {\n  \
+                          v2 = i64.mul v0 v1\n  return v2\n  }\n}\n";
+            cross_check(&format!(
+                "func (i64) -> (i64) {{\nblock 0 (v0: i64) {{\n  v1 = call 1 (v0)\n  \
+                 v2 = call 2 (v1, v0)\n  return_call 1(v2)\n  }}\n}}\n{leaves}"
             ));
         }
 
@@ -4803,6 +4839,7 @@ pub(crate) mod x86 {
             window: WIN,
             table: 4,
             types: &[Some(TAIL0), Some(TAIL16)],
+            own: &[],
         };
 
         /// The length of the overflow-check prologue [`checked`] prepends.

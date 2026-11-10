@@ -89,6 +89,13 @@ jobs:
       # the runner agent (no logs, step frozen "in_progress"). Cap build parallelism to bound
       # concurrent links; the step is warm-cache dominated, so the wall-clock cost is small.
       - run: cargo test --workspace -j 2
+      # #2594 — the Cranelift JIT compiles a module of 64 functions or more at its functions' first
+      # calls (D76), so most of the suites' modules compile whole. Run the JIT's own tests and the
+      # temen differential suites again with every module compiled lazily. `-p` unifies features
+      # over fewer crates than `--workspace`, so seven crates rebuild (about a minute).
+      - run: cargo test -p temen-jit -p temen -j 2
+        env:
+          TEMEN_JIT_LAZY: "on"
       - run: rustup target add x86_64-pc-windows-gnu
       # The §5 W3 trap-capture C shim (trap_capture.c) is compiled for windows targets too, so the
       # windows-gnu cross-check needs the mingw cross-compiler. (The MSVC build runs on windows-latest.)
