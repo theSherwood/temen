@@ -3811,10 +3811,10 @@ impl CompiledModule {
         };
         // #2594 — whether the module compiles lazily: each function's word starts at a copy of its
         // signature's lazy entry, its code compiles at its first call, and a linked copy of the whole
-        // module replaces it once compiled ([`lazy`]). A compile handed a code dir compiles whole,
-        // as it did before: it replays the code kept there, or keeps what it compiles before the
-        // run, whereas a linked copy is done only once the run has gone on long enough, which a
-        // short process never does. A module with source-level debug info (`-g`: source positions,
+        // module replaces it once compiled ([`lazy`]). A compile whose code a code dir keeps
+        // compiles whole, as it did before: it replays the code kept there, or keeps what it
+        // compiles before the run, whereas a linked copy is done only once the run has gone on long
+        // enough, which a short process never does. A module with source-level debug info (`-g`: source positions,
         // variables) compiles whole, since what its compile makes besides code names code
         // addresses; function names alone don't. A small module gains nothing
         // ([`lazy::MIN_FUNCS`]).
