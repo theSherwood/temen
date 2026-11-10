@@ -125,7 +125,7 @@ post-boot state. See `LLVM.md` slices BM–CO, and "Booting" below.
 
 ## Booting
 
-`build_bitcode.sh` produces `postgres_libm.bc` (the whole-program module). `link_shims.sh` `llvm-link`s
+`build_bitcode.sh` produces `postgres.linked.bc` (the whole-program module). `link_shims.sh` `llvm-link`s
 the guest shims **and the bundled guest libm (openlibm)** into it → `postgres_shimmed.bc`: `pg_shims.c`
 (mem/os/libc/locale/time/proc/event/ipc/stdio/printf + `../strtod/strtod.c` + `scanf_shim.c`),
 `strerror_shim.c` compiled separately with `-D_GNU_SOURCE`, and openlibm's double set (the 28-file
@@ -149,5 +149,13 @@ As of slice CO the module runs real backend init, opens the catalog, performs **
 text)`, `INSERT`s, then `SELECT *`, `count`/`sum`/`avg`, **`ORDER BY … DESC`**, `UPDATE`, `DELETE`, and
 `GROUP BY … ORDER BY` all return the correct rows. (Slice CO's fix: `ORDER BY` cost estimation calls `log`
 via `cost_tuplesort`'s `LOG2` model — an undefined transcendental until openlibm was llvm-linked into the
-module; the capstone's `SELECT 1+1` never reached one.) Cutting the ~100 s cold-boot time (snapshot/restore
-of the post-recovery state) is the remaining work for a browser demo.
+module; the capstone's `SELECT 1+1` never reached one.)
+
+**Run it natively:** `make -C $TEMEN_PG_CACHE/postgresql-17.5 install`, then `setup_cluster.sh` (as an
+unprivileged user: `initdb` refuses root) builds the cleanly shut-down demo cluster, and temen-llvm's
+`pg_single` example boots it on any engine, from `crates/temen-llvm`:
+
+    cargo run --release --example pg_single -- $TEMEN_PG_CACHE/postgres_shimmed.bc \
+        $TEMEN_PG_CACHE/pgdata [sql-file] [bytecode|treewalk|jit]
+
+Boot timings on each engine, and what each lever buys, are in `BOOTSPEED.md`.

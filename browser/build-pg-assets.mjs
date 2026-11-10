@@ -22,7 +22,7 @@
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
-import { existsSync, mkdirSync, copyFileSync, statSync } from 'node:fs';
+import { existsSync, mkdirSync, statSync } from 'node:fs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO = dirname(HERE);
@@ -50,9 +50,7 @@ if (existsSync(shimmedBc)) {
   // compiled-in `--prefix` ($INST) the guest resolves at runtime is populated.
   const src = join(CACHE, `postgresql-${process.env.TEMEN_PG_VER ?? '17.5'}`);
   sh('make', ['-C', src, 'install'], { stdio: 'inherit' });
-  // `link_shims.sh` reads `postgres_libm.bc`; `build_bitcode.sh` emits the same module as
-  // `postgres.linked.bc`. Bridge the name, then link the guest shims + bundled openlibm.
-  copyFileSync(join(CACHE, 'postgres.linked.bc'), join(CACHE, 'postgres_libm.bc'));
+  // Link the guest shims + bundled openlibm into `build_bitcode.sh`'s `postgres.linked.bc`.
   sh('bash', [join(PGDIR, 'link_shims.sh')]);
   console.log(`✓ built bitcode: postgres_shimmed.bc (${mb(shimmedBc)} MB)`);
 }
