@@ -1,0 +1,10 @@
+[package]
+name = "temen-gpu"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+description = "The WebGPU capability's protocol (DESIGN.md §17, #2665): the command stream a guest submits, its total decoder and validation, and the WebGPU JS form the browser executes. No dependencies, and no_std, so a Rust guest encodes with it too."
+
+[dependencies]

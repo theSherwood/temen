@@ -1006,11 +1006,12 @@ variable arr   variable lim
     url: './assets/gpu_shader.temen',
     mode: 'io',
     webgpu: true,
-    desc: 'crates/temen-run/demos/display/gpu_shader.c — a sandboxed C guest ships a WGSL fragment ' +
-      'shader once through a `webgpu` capability, then asks the host to present a frame each tick. ' +
-      'The Mandelbrot escape-time loop runs on the **GPU** (via the browser’s WebGPU / navigator.gpu), ' +
-      'so it stays smooth at 640×480 while zooming into a seahorse valley — only the tiny (frame, w, h) ' +
-      'scalars cross the capability boundary per frame, and the guest never holds a GPU pointer. ' +
+    desc: 'crates/temen-run/demos/display/gpu_shader.c — a sandboxed C guest builds a render pipeline ' +
+      'from a WGSL fragment shader through the `webgpu` capability, then draws and presents a frame each ' +
+      'tick. The Mandelbrot escape-time loop runs on the **GPU** (via the browser’s WebGPU / navigator.gpu), ' +
+      'so it stays smooth at 640×480 while zooming into a seahorse valley. Per frame only a short command ' +
+      'stream crosses the capability boundary — the same protocol temen serves natively over wgpu — and ' +
+      'the guest never holds a GPU pointer. ' +
       'Needs a WebGPU-capable browser (Chrome/Edge, recent Firefox). Click Stop to end.',
   },
   'DOOM (1993 — arrow keys, Ctrl fires)': {
@@ -3955,7 +3956,7 @@ function saveStateRender(c) {
 // very much still open, so what to tear down is keyed on `activeReactorCard`, not on the loop. The
 // reactor closes once the frame in flight, if any, has ended; the returned promise resolves then.
 function stopReactor() {
-  teardownWebGPU(); // drop any GPU device + the servicer (no-op for non-webgpu reactors)
+  teardownWebGPU(); // drop any GPU device + the executor (no-op for non-webgpu reactors)
   if (activeReactorCard) activeReactorCard.el.gpucanvas.hidden = true;
   if (reactorRAF !== null) {
     cancelAnimationFrame(reactorRAF);
@@ -4012,8 +4013,8 @@ async function runReactor(c, opts = {}) {
     runEnd(rec, { ok: false });
     return;
   }
-  // A GPU demo: bring up a `navigator.gpu` device + the WebGPU canvas and install the servicer BEFORE
-  // the reactor's first `tick`, so the guest's `webgpu` capability calls (set_shader/present) render.
+  // A GPU demo: bring up a `navigator.gpu` device + the WebGPU canvas and install the executor BEFORE
+  // the guest's `main`, which reads the surface's size and format and builds its pipeline.
   if (ex.webgpu) {
     if (!webgpuAvailable()) {
       setState(c, 'error', 'no WebGPU in this browser — the GPU demo needs it (try Chrome/Edge)');
@@ -4023,8 +4024,11 @@ async function runReactor(c, opts = {}) {
     }
     try {
       c.el.gpucanvas.hidden = false;
+      // The guest renders at the surface's size: the canvas's own, set before the device sees it.
+      c.el.gpucanvas.width = 640;
+      c.el.gpucanvas.height = 480;
       await initWebGPU(c.el.gpucanvas);
-      logTo(c, 'WebGPU device ready — the guest ships one WGSL shader; the GPU renders every frame');
+      logTo(c, 'WebGPU device ready — the guest builds one pipeline; the GPU renders every frame');
     } catch (e) {
       setState(c, 'error', `WebGPU init failed: ${e.message}`);
       c.el.gpucanvas.hidden = true;

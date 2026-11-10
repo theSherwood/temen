@@ -19,10 +19,9 @@ self.onmessage = async (e) => {
   // with the panic site the hook captured.
   let ex;
   try {
-  // The engine imports `temen_host.webgpu_op` (the `webgpu` capability's host seam). A Worker has
-  // no GPU surface (the playground's GPU reactor runs on the main thread via par.js), so stub it to a
-  // no-op — a guest that resolves the `webgpu` cap here gets -1 and skips. Without it the instantiate
-  // fails with "Import temen_host: module is not an object or function".
+  // The engine imports the `webgpu` capability's seams (`temen_host.webgpu_*`). A Worker installs no
+  // executor (the playground's GPU reactor runs on the main thread via par.js), so a guest granted the
+  // cap here finds no device (-19) and skips.
   // `stream_chunk` (the live output tee, #1414 S5a) posts each chunk a thread of this Worker wrote to
   // the page, which orders them by `seq`, when the page asked for the run's output (`onOutput`).
   // The parallel driver's platform (#1414 B6, `X2_PLATFORM` in lib.rs): each thread of its run is a

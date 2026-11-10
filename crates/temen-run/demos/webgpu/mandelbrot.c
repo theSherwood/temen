@@ -1,7 +1,8 @@
 /* mandelbrot.c — the WebGPU **compute → image → PNG** demo (LLVM.md WebGPU demo 3): a WGSL compute
  * shader renders a Mandelbrot set into an RGBA buffer, the guest reads it back, self-validates it,
  * and writes the raw pixels out through the granted `fs` capability (the host test encodes the PNG).
- * Exercises the `webgpu` compute cap and the `fs` cap **together**, on the bare powerbox.
+ * Exercises the `webgpu` capability's command streams (temen-gpu, #2665) and the `fs` cap
+ * **together**, on the bare powerbox.
  *
  * Self-validation without a fragile hardcoded hash: the imaginary-axis mapping is exactly symmetric
  * (`y0(py) = -y0(H-1-py)`), and the Mandelbrot set is symmetric about the real axis, so row `py` must
@@ -13,11 +14,9 @@
 #include <stdio.h>
 
 #ifdef TEMEN_GUEST
-#include "wgpu_shim.c"
+#include "temen_gpu.h"
 
 /* Minimal `fs` cap file write (the same §7 host-call surface, op protocol from temen-run/src/fs.rs). */
-extern int __vm_cap_resolve(const char *name, long len);
-extern long __vm_host_call(int h, int op, long a, long b, long c, long d);
 enum { FS_OPEN = 0, FS_WRITE = 2, FS_CLOSE = 4 };
 enum { FS_O_WRITE = 2, FS_O_TRUNC = 8, FS_O_CREATE = 16 };
 static int g_fs = -2;
@@ -86,13 +85,30 @@ static const char shader[] =
     "  img[idx] = (255u << 24u) | (b << 16u) | (g << 8u) | r;\n"
     "}\n";
 
-int main(void) {
-  int buf = gpu_buffer(W * H * 4);
-  int pipe = gpu_shader(shader, sizeof shader - 1);
-  gpu_dispatch(pipe, buf, -1, (W * H + 63) / 64);
-  gpu_read(buf, img, W * H * 4);
+static unsigned char stream[8 << 10];
+static char why[256];
 
-  int ok = (buf >= 0 && pipe >= 0);
+int main(void) {
+  enum { BUF = 1, MOD, PIPE, LAYOUT, GROUP };
+  gpu_stream s;
+  gpu_stream_init(&s, stream, sizeof stream);
+  gpu_create_buffer(&s, BUF, W * H * 4, GPU_BUFFER_STORAGE | GPU_BUFFER_COPY_SRC);
+  gpu_create_shader_module(&s, MOD, shader);
+  gpu_create_compute_pipeline(&s, PIPE, MOD, "main");
+  gpu_bind_group_layout_of(&s, LAYOUT, PIPE, 0);
+  gpu_bind_entry e[] = {{0, GPU_BIND_BUFFER, BUF, 0, 0}};
+  gpu_create_bind_group(&s, GROUP, LAYOUT, 1, e);
+  gpu_begin_compute_pass(&s);
+  gpu_set_pipeline(&s, PIPE);
+  gpu_set_bind_group(&s, 0, GROUP);
+  gpu_dispatch(&s, (W * H + 63) / 64, 1, 1);
+  gpu_end_pass(&s);
+  gpu_readback(&s, BUF, 0, W * H * 4);
+  long r = gpu_submit(&s);
+  long n = r == 0 ? gpu_read_wait(BUF, img, W * H * 4) : r;
+  if (gpu_error(why, sizeof why) > 0) printf("webgpu error: %s\n", why);
+
+  int ok = (r == 0 && n == W * H * 4);
   /* structural self-check: exact top/bottom mirror symmetry (float-implementation independent) */
   int symmetric = 1;
   for (int py = 0; py < H / 2 && symmetric; py++) {

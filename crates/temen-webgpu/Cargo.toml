@@ -4,22 +4,24 @@ version = "0.0.0"
 edition = "2021"
 publish = false
 
-# A **headless WebGPU compute capability** for the Temen (LLVM.md §"GPU via a WebGPU capability").
-# The host holds a real GPU device via `wgpu`; the guest drives it over the generic §7
-# host-defined-capability surface (`__vm_cap_resolve` + `__vm_host_call`), so it needs **no
-# translator change** and is never on the escape-TCB — the cap is re-verified IR like any other.
+# The `webgpu` capability natively, over `wgpu` (#2665): the backend that runs `temen-gpu`'s command
+# streams on a wgpu device, and the `HostCap` that grants it. The guest drives it over the generic §7
+# host-defined-capability surface (`__vm_cap_resolve` + `__vm_host_call`), so it needs no translator
+# change and is never on the escape-TCB.
 #
 # Kept **out of the workspace** (root `Cargo.toml` `exclude`, like `temen-llvm`/`fuzz`/`bench`) so the
-# heavy `wgpu` dependency never enters the default `cargo build`/`test`. Runs headless via lavapipe
-# (Mesa software Vulkan) in CI — no physical GPU required.
+# heavy `wgpu` dependency never enters the default `cargo build`/`test`. Its tests run on any adapter,
+# lavapipe (Mesa software Vulkan) in CI, and fail on a host with none.
 
 [dependencies]
+temen-gpu = { path = "../temen-gpu" }
 temen-run = { path = "../temen-run" }
 temen-interp = { path = "../temen-interp" }
 wgpu = "24"
 pollster = "0.4"
 
 [dev-dependencies]
+temen-gpu = { path = "../temen-gpu" }
 temen-llvm = { path = "../temen-llvm" }
 temen-verify = { path = "../temen-verify" }
 # Encode the guest-rendered RGBA into a PNG (demo 3 artifact) in the test.

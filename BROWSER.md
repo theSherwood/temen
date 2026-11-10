@@ -216,7 +216,7 @@ no RO data is unaffected.
   mandatory at instantiation for *every* entry, so the first pass put the host-backed powerbox
   (`temen_run_live`: two fixed capabilities bridged to `temen_host.host_write`/`host_now_ns`) behind
   `--features live`, keeping the default build import-free. That is no longer the shape: the wasm32
-  build declares host imports unconditionally (`webgpu_op`, `stream_chunk`, the `foreign_*` family),
+  build declares host imports unconditionally (`webgpu_*`, `stream_chunk`, the `foreign_*` family),
   every embedder already supplies them as stubs, and **`temen_jspb_*` binds *arbitrary* named
   capabilities to page functions** through one import — which subsumed the two hard-coded ones. The
   `live` feature and its entry are deleted (invariant 15: one path per behaviour); see the
@@ -600,7 +600,8 @@ Every other run entry in the cdylib hands the guest a powerbox whose capabilitie
 **Rust-side**: `powerbox_exec`'s fixed §3e prefix (stdout/stdin/exit/…), `grant_onramp_caps`'
 `display`/`keyboard`/`fs`. The `webgpu` capability already showed what a *JS-implemented* capability
 looks like — a `HostProc` closure that marshals each op out through a wasm import — but it is one
-hard-coded capability with a fixed op vocabulary, chosen by Rust.
+hard-coded capability with a fixed op vocabulary, chosen by Rust. (Its protocol is now `temen-gpu`'s,
+which the native host shares; JS only makes the WebGPU calls the engine has decoded and checked.)
 
 `browser/src/jspb.rs` generalizes exactly that shape into the general case, so an embedder can define
 **its own** capabilities without touching Rust. They join the **on-ramp powerbox** of any open — a

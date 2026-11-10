@@ -49,11 +49,13 @@
 //!   chunked load/stores (widest-first 8/4/2/1, the `temen-wasm` plan); copies load-all-then-store-all
 //!   (overlap-safe); `memset` replicates the fill byte across an `i64`. The data stack is page-aligned
 //!   above the globals so a stack write never faults on a read-only global's page (D40).
-//! - **J — by-value aggregates (`sret`/`byval`).** Works with **no dedicated code**: clang does the
-//!   x86-64-SysV classification *in the IR* — a small struct is coerced to scalar register(s)
-//!   (`{i32,i32}`→`i64`, `{int×3}`→`(i64,i32)`, SSE→`double`s), a large one passes via a `byval`/
-//!   `sret` pointer (the caller `alloca`s + `memcpy`s + passes the pointer). So slices A–I (scalar
-//!   params, memory, calls, struct GEP, memcpy) already cover it; this slice is the test lock-in.
+//! - **J — by-value aggregates (`sret`/`byval`).** clang does the x86-64-SysV classification *in the
+//!   IR* — a small struct is coerced to scalar register(s) (`{i32,i32}`→`i64`, `{int×3}`→`(i64,i32)`,
+//!   SSE→`double`s), and a large one passes via a pointer: `sret` to a slot the caller allocates, or
+//!   `byval` to the caller's own object. `byval` promises the callee a copy that nothing in the IR
+//!   makes, so the parser has each function that takes one copy it into an `alloca` of its own first
+//!   (`ll::parse::copy_byval_params`). Slices A–I (scalar params, memory, calls, struct GEP, memcpy)
+//!   cover the rest.
 //! - **K — relocations (pointer-valued globals).** A global initializer holding a function pointer,
 //!   `&other_global`, or arithmetic over those resolves via a constexpr evaluator (`GlobalReference`
 //!   → address/funcref, `ptrtoint`/`sub`/`add`/`trunc`). The globals layout is two-phase (assign all
@@ -1453,12 +1455,28 @@ fn translate_impl(
     }
     // A link unit exports only external-linkage names (#1746); a whole module exports every defined
     // function, as before.
-    let exported: Vec<(String, u32)> = defined
+    let mut exported: Vec<(String, u32)> = defined
         .iter()
         .enumerate()
         .filter(|(_, f)| !(opts.link_unit && f.local))
         .map(|(i, f)| (f.name.clone(), base + i as u32))
         .collect();
+    // A link unit's exports are its interface, and identical-code folding must not change it
+    // (#2827): a function folded into an alias of another (`@a = alias …, ptr @b`) stays exported,
+    // at its aliasee's index. `name2idx` already resolves alias chains to a defined function, and
+    // holds nothing else, so an alias of a data global or of an import is not exported.
+    if opts.link_unit {
+        for ga in m.global_aliases.iter().filter(|ga| !ga.local) {
+            let Name::Name(name) = &ga.name else {
+                continue;
+            };
+            if let Some(&idx) = name2idx.get(name.as_str()) {
+                if !exported.iter().any(|(e, _)| e == name.as_str()) {
+                    exported.push((name.to_string(), idx));
+                }
+            }
+        }
+    }
     let types = sig_types.into_inner();
     let mut t = Translated {
         module: Module {
@@ -5923,6 +5941,7 @@ fn link_heap(m: Cow<'_, LModule>) -> Result<Cow<'_, LModule>, Error> {
     for (name, target) in wanted {
         m.func_declarations.retain(|d| d.name != name);
         let ptr = m.types.pointer(0);
+        // A resolution alias inside one program, not part of any unit's interface.
         m.global_aliases.push(GlobalAlias {
             name: Name::Name(Box::new(name.to_string())),
             aliasee: ConstantRef::new(Constant::GlobalReference {
@@ -5930,6 +5949,7 @@ fn link_heap(m: Cow<'_, LModule>) -> Result<Cow<'_, LModule>, Error> {
                 ty: ptr.clone(),
             }),
             ty: ptr,
+            local: true,
         });
     }
     Ok(Cow::Owned(m))

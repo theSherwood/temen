@@ -504,6 +504,27 @@ jobs:
           TEMEN_CHECK_TOOLCHAIN_fuzz: nightly-2026-07-01
         run: scripts/ci/check-excluded.sh
 
+  webgpu:
+    name: webgpu (the GPU capability on lavapipe, all three engines)
+    # `crates/temen-webgpu`'s tests run guest programs through the `webgpu` capability on a real
+    # adapter: compute, a pixel-exact render, a Mandelbrot to PNG, and guest errors as values (#2665,
+    # #2330 A). They fail on a host with no adapter rather than skip, so this lane gives them one:
+    # lavapipe (Mesa's software Vulkan), from Ubuntu's archive in the same apt run that installs the
+    # pinned clang the demos are built with. No physical GPU.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with: { toolchain: "${{ env.RUST_STABLE }}" }
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with: { workspaces: crates/temen-webgpu }
+      - name: install LLVM/clang (+ lavapipe)
+        uses: ./.github/actions/install-llvm
+        with: { packages: mesa-vulkan-drivers }
+      - name: webgpu tests
+        run: cargo test --locked --manifest-path crates/temen-webgpu/Cargo.toml
+
   loom:
     name: loom (parallel scheduler model check)
     runs-on: ubuntu-latest
@@ -1027,9 +1048,9 @@ jobs:
       # LLVM is needed on EVERY run, not just a cold one: build-pg-assets.mjs hands the translator
       # `postgres_shimmed.bc`, and the `.bc` path shells `llvm-dis` out-of-process (temen-llvm links no
       # libLLVM). clang/flex/bison are Postgres's own build deps — used only on a cold input cache.
-      - name: install LLVM/clang (+ Postgres build deps)
+      - name: install LLVM/clang (+ Postgres build deps, + lavapipe for the WebGPU test)
         uses: ./.github/actions/install-llvm
-        with: { packages: flex bison }
+        with: { packages: flex bison mesa-vulkan-drivers }
 
       # Regenerate the Postgres artifacts from current code and stage them into web/assets/, so the
       # `browser-test.mjs` Postgres check BOOTS instead of SKIPping (it skips when unstaged). That boot
@@ -1094,6 +1115,12 @@ jobs:
             -Clink-arg=--export=__wasm_init_tls" \
             cargo +nightly build -Z build-std=std,panic_abort --release --lib --target wasm32-unknown-unknown
           node browser-test.mjs
+          # The `webgpu` capability in real Chromium (#2665): the engine serves the protocol temen
+          # serves natively, against `navigator.gpu`. `render.temen`, the exact-pixel program the native
+          # `webgpu` job runs, must give every pixel of its model here too, and the playground's GPU card
+          # must run. Only those two on-ramp assets are built (a PR builds no others).
+          ONLY=gpu_shader,render node build-onramp-assets.mjs
+          node browser-webgpu-test.mjs
           # Region::Foreign (#1284): the engine addresses a second, JS-owned WebAssembly.Memory through an
           # accessor instance's functions in its own table (#1414 5d) — 20k-op differential vs the safe Paged
           # reference, with and without multi-memory, + the per-access cost ratio the decline path is gated on.

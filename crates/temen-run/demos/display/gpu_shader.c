@@ -1,28 +1,24 @@
-/* GPU fragment-shader demo for the playground — a Mandelbrot zoom rendered on the **GPU** through a
+/* GPU fragment-shader demo for the playground — a Mandelbrot zoom rendered on the **GPU** through the
  * `webgpu` capability, presented to the page's <canvas>. Unlike `mandelzoom.c` (which computes every
- * pixel on the CPU in-guest), here the guest ships a **WGSL fragment shader** once and then just asks
- * the host to present a frame each tick with an updated time — the massively-parallel escape-time
- * loop runs on the GPU, so it stays smooth at full resolution.
+ * pixel on the CPU in-guest), here the guest builds one render pipeline from a **WGSL fragment shader**
+ * and each tick draws a frame with an updated time — the massively-parallel escape-time loop runs on
+ * the GPU, so it stays smooth at full resolution.
  *
- * The `webgpu` capability (browser: serviced against `navigator.gpu`; the guest never holds a GPU
- * pointer, only a small integer handle — validation, not raw access, is the boundary, §2a):
- *   g = __vm_cap_resolve("webgpu", 6);
- *   __vm_host_call(g, 0, wgsl_ptr, wgsl_len, 0, 0);   // op 0 = set_shader(wgsl): compile once → 0/-1
- *   __vm_host_call(g, 1, frame, W, H, 0);             // op 1 = present(frame, w, h): render + show
- *
- * A reactor: `main()` sets the shader once; the host calls `tick()` once per animation frame, which
- * presents with an incrementing frame counter (the shader zooms/animates off it). No CPU pixel work,
- * no readback — only the tiny (frame, w, h) scalars cross the boundary per frame. */
+ * The capability's protocol is the one every host shares (`crates/temen-gpu/temen_gpu.h`, #2665): the
+ * guest names objects by ids it chooses and submits command streams, and never holds a GPU object —
+ * validation, not raw access, is the boundary (§2a). `main()` makes the pipeline for the surface's
+ * size and format; the host calls `tick()` once per animation frame, which writes the frame counter
+ * to a uniform, then acquires the canvas's texture, draws, and presents. Only the stream crosses the
+ * boundary per frame. */
 
-extern int __vm_cap_resolve(const char *name, long len);
-extern long __vm_host_call(int h, int op, long a, long b, long c, long d);
+#include "temen_gpu.h"
 
-enum { GPU_SET_SHADER = 0, GPU_PRESENT = 1 };
+enum { UNIFORM = 1, MODULE, PIPELINE, LAYOUT, GROUP, FRAME, FRAME_VIEW };
 
-#define W 640
-#define H 480
-
-static int gpu;
+static gpu_stream s;
+static unsigned char stream[8 << 10];
+static gpu_surface_info surface;
+static int live;
 static int frame;
 
 /* A fullscreen-triangle vertex shader + a Mandelbrot-zoom fragment shader. `p.frame` drives the zoom
@@ -57,17 +53,36 @@ static const char shader[] =
     "}\n";
 
 int main(void) {
-  gpu = __vm_cap_resolve("webgpu", 6);
-  if (gpu >= 0) {
-    __vm_host_call(gpu, GPU_SET_SHADER, (long)shader, sizeof shader - 1, 0, 0);
-  }
+  gpu_stream_init(&s, stream, sizeof stream);
+  live = gpu_surface(&surface) == 0;
+  if (!live) return 0;
+  gpu_create_buffer(&s, UNIFORM, 16, GPU_BUFFER_UNIFORM | GPU_BUFFER_COPY_DST);
+  gpu_create_shader_module(&s, MODULE, shader);
+  gpu_target target = {surface.format, GPU_WRITE_ALL, 0, {0, 0, 0}, {0, 0, 0}};
+  gpu_render_pipeline p = {PIPELINE, MODULE, "vs", "fs", GPU_TRIANGLE_LIST, 0, GPU_CCW,
+                           GPU_CULL_NONE, 1, 0, 0, 1, &target};
+  gpu_create_render_pipeline(&s, &p);
+  gpu_bind_group_layout_of(&s, LAYOUT, PIPELINE, 0);
+  gpu_bind_entry e[] = {{0, GPU_BIND_BUFFER, UNIFORM, 0, 0}};
+  gpu_create_bind_group(&s, GROUP, LAYOUT, 1, e);
+  live = gpu_submit(&s) == 0;
   frame = 0;
   return 0;
 }
 
 int tick(void) {
-  if (gpu >= 0) {
-    __vm_host_call(gpu, GPU_PRESENT, frame, W, H, 0);
+  if (live) {
+    float u[4] = {(float)frame, (float)surface.width, (float)surface.height, 0};
+    gpu_write_buffer(&s, UNIFORM, 0, u, sizeof u);
+    gpu_acquire(&s, FRAME, FRAME_VIEW);
+    gpu_color_attachment color = {FRAME_VIEW, 0, GPU_LOAD_CLEAR, GPU_STORE_STORE, {0, 0, 0, 1}};
+    gpu_begin_render_pass(&s, 1, &color);
+    gpu_set_pipeline(&s, PIPELINE);
+    gpu_set_bind_group(&s, 0, GROUP);
+    gpu_draw(&s, 3, 1, 0, 0);
+    gpu_end_pass(&s);
+    gpu_present(&s, FRAME, FRAME_VIEW);
+    live = gpu_submit(&s) == 0;
   }
   frame++;
   return 0;

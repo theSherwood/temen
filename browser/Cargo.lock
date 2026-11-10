@@ -185,6 +185,7 @@ dependencies = [
  "temen-durable",
  "temen-encode",
  "temen-fs",
+ "temen-gpu",
  "temen-interp",
  "temen-ir",
  "temen-leng",
@@ -232,6 +233,10 @@ dependencies = [
  "temen-interp",
  "temen-ir",
 ]
+
+[[package]]
+name = "temen-gpu"
+version = "0.0.0"
 
 [[package]]
 name = "temen-interp"

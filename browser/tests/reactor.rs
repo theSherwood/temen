@@ -194,3 +194,39 @@ fn reactor_mandelzoom_renders_and_animates() {
         "the view zooms / the palette cycles → the frame animates between ticks"
     );
 }
+
+/// An entry-less reactor's `main` runs with its data stack, as `tick` does. With no synthesized
+/// `_start`, the open calls `main` itself, and once called it with no stack pointer: a `main` that
+/// keeps a local on the data stack (`gpu_shader.c`'s pipeline description, #2665) trapped at the
+/// open. This `main` stores to its frame and reads it back into a global.
+#[test]
+fn an_entry_less_main_runs_on_its_data_stack() {
+    let m = temen_text::parse_module(
+        "memory 18
+export 0 func \"main\" 0
+export 1 func \"tick\" 1
+func 0 (i64) -> (i32) {
+  block 0 (v0: i64) {
+    v1 = i64.const -16
+    v2 = i64.add v0 v1
+    v3 = i32.const 7
+    i32.store v2 v3
+    v4 = i32.load v2
+    v5 = i64.const 65536
+    i32.store v5 v4
+    v6 = i32.const 0
+    return v6
+  }
+}
+func 1 (i64) -> (i32) {
+  block 0 (v0: i64) {
+    v1 = i32.const 0
+    return v1
+  }
+}
+",
+    )
+    .expect("parse");
+    let mut r = OnrampReactor::open(&m).expect("main runs on its data stack");
+    assert_eq!(r.frame().0, STATUS_OK);
+}

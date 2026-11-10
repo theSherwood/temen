@@ -4,59 +4,18 @@
 //! float-implementation-independent invariant — plus an in-set/escaped sanity pair), and writes the
 //! raw pixels out through the granted `fs` capability. The test drives it on all three Temen engines,
 //! asserts the guest's self-check, and encodes the pixels to a PNG (exercising the readback → image
-//! path). Exercises the `webgpu` and `fs` capabilities together. Skips cleanly with no GPU adapter.
+//! path). Exercises the `webgpu` and `fs` capabilities together. Fails with no GPU adapter.
 
-use std::process::Command;
+mod common;
 
 const W: u32 = 320;
 const H: u32 = 240;
 
 #[test]
 fn demo_webgpu_mandelbrot() {
-    if !temen_webgpu::adapter_available() {
-        eprintln!(
-            "note: skipping webgpu mandelbrot (no wgpu adapter — install mesa-vulkan-drivers)"
-        );
-        return;
-    }
-    let demo = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../temen-run/demos/webgpu/mandelbrot.c");
-    let bc = std::env::temp_dir().join(format!("temen_webgpu_mandel_{}.ll", std::process::id()));
-    let built = Command::new("clang")
-        .args([
-            "-O2",
-            "-emit-llvm",
-            "-S",
-            "-DTEMEN_GUEST",
-            "-fno-vectorize",
-            "-fno-slp-vectorize",
-        ])
-        .arg(&demo)
-        .arg("-o")
-        .arg(&bc)
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-    if !built {
-        eprintln!("note: skipping webgpu mandelbrot (clang unavailable)");
-        return;
-    }
-
-    let t = temen_llvm::translate_ll_path(&bc).expect("translate mandelbrot bitcode");
-    let inst = temen_run::instantiate(t.module).expect("instantiate");
-    let config = || temen_run::RunConfig {
-        stdin: vec![],
-        memory_size_log2: None,
-        args: vec![],
-        env: vec![],
-        ..temen_run::RunConfig::default()
-    };
-
-    for backend in [
-        temen_run::Backend::TreeWalk,
-        temen_run::Backend::Bytecode,
-        temen_run::Backend::Jit,
-    ] {
+    common::require_adapter();
+    let inst = common::guest("mandelbrot");
+    for backend in common::ENGINES {
         let root = std::env::temp_dir().join(format!(
             "temen_webgpu_mandel_{}_{:?}",
             std::process::id(),
@@ -64,17 +23,14 @@ fn demo_webgpu_mandelbrot() {
         ));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).expect("out dir");
-        let out = inst
-            .run_with_caps(
-                backend,
-                &config(),
-                &[
-                    ("webgpu", temen_webgpu::webgpu_cap()),
-                    ("fs", temen_run::fs::host_fs(root.clone())),
-                ],
-            )
-            .unwrap_or_else(|e| panic!("mandelbrot run ({backend:?}): {e}"));
-        let stdout = String::from_utf8_lossy(&out.stdout);
+        let caps = [
+            (
+                "webgpu",
+                temen_webgpu::webgpu_cap(temen_webgpu::Surface::None),
+            ),
+            ("fs", temen_run::fs::host_fs(root.clone())),
+        ];
+        let stdout = common::run(&inst, backend, &caps);
         assert!(
             stdout.contains("symmetric=1 center_in=1 corner_out=1")
                 && stdout.contains("webgpu mandelbrot: ALL OK"),

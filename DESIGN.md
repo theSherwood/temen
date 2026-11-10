@@ -3239,7 +3239,10 @@ browser — good enough here.
   sandboxed process, contained by that sandbox + the IOMMU — not the kernel, not
   other guests.
 - **Validated API, not raw command buffers** — every call host-validated and
-  bounds-checked; no operation can express raw DMA.
+  bounds-checked; no operation can express raw DMA. *Built (#2665):* one protocol for every
+  host, `crates/temen-gpu`. A guest submits command streams over objects it names by id; each
+  stream is decoded totally and checked against the live ids before any of it runs, and WebGPU
+  validates the rest. Being plain data, the same streams can cross to the broker below.
 - **Host-recompiled shaders** — guest WGSL/SPIR-V is validated, every
   array/buffer/texture access clamped in-bounds, UB stripped, then re-emitted for
   the driver (Tint/Naga-style). This is the GPU analog of our verifier+JIT.

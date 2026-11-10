@@ -1,6 +1,6 @@
 /* wgpu_demo.c — the headless WebGPU **compute → readback → assert-vs-CPU** demo (LLVM.md WebGPU
- * demo 1). Proves the whole data plane — upload → WGSL compute → readback — with zero windowing, on
- * the bare powerbox plus the granted `webgpu` capability. Two kernels:
+ * demo 1), on the `webgpu` capability's command streams (temen-gpu, #2665). Proves the whole data
+ * plane — upload → WGSL compute → readback — with zero windowing. Two kernels:
  *   (1) an in-place `u32` map (`b[i] = b[i]*3 + 7`) over one storage buffer;
  *   (2) a two-buffer kernel (`c[i] = a[i]*a[i] + i`) — a read-only input at binding 0 and a
  *       read_write output at binding 1 — exercising multi-buffer bind groups.
@@ -12,7 +12,7 @@
 #include <stdio.h>
 
 #ifdef TEMEN_GUEST
-#include "wgpu_shim.c"
+#include "temen_gpu.h"
 #endif
 
 #define N 1024
@@ -24,9 +24,32 @@ static unsigned fnv(const unsigned *a, int n) {
 }
 
 static unsigned in[N], out[N], a[N], c[N];
+static unsigned char stream[16 << 10];
+static char why[256];
+
+/* The ids this program gives its objects. */
+enum { BUF = 1, MOD1, PIPE1, LAYOUT1, GROUP1, BA, BC, MOD2, PIPE2, LAYOUT2, GROUP2 };
+
+/* Runs `pipe` over `groups` workgroups with `group` bound, then reads `buf` back into `dst`. */
+static int run(gpu_stream *s, unsigned pipe, unsigned group, unsigned groups, unsigned buf,
+               unsigned *dst) {
+  gpu_begin_compute_pass(s);
+  gpu_set_pipeline(s, pipe);
+  gpu_set_bind_group(s, 0, group);
+  gpu_dispatch(s, groups, 1, 1);
+  gpu_end_pass(s);
+  gpu_readback(s, buf, 0, N * 4);
+  long r = gpu_submit(s);
+  long n = r == 0 ? gpu_read_wait(buf, dst, N * 4) : r;
+  if (gpu_error(why, sizeof why) > 0) printf("webgpu error: %s\n", why);
+  return r == 0 && n == N * 4;
+}
 
 int main(void) {
   int fail = 0;
+  gpu_stream s;
+  gpu_stream_init(&s, stream, sizeof stream);
+  const unsigned storage = GPU_BUFFER_STORAGE | GPU_BUFFER_COPY_DST | GPU_BUFFER_COPY_SRC;
 
   /* --- kernel 1: in-place mul-add over a single storage buffer --------------------------------- */
   for (int i = 0; i < N; i++) in[i] = (unsigned)i * 2654435761u >> 8;
@@ -37,12 +60,14 @@ int main(void) {
       "  let i = g.x;\n"
       "  if (i < arrayLength(&b)) { b[i] = b[i] * 3u + 7u; }\n"
       "}\n";
-  int buf = gpu_buffer(N * 4);
-  gpu_write(buf, in, N * 4);
-  int p1 = gpu_shader(sh1, sizeof sh1 - 1);
-  gpu_dispatch(p1, buf, -1, (N + 63) / 64);
-  gpu_read(buf, out, N * 4);
-  int ok1 = (buf >= 0 && p1 >= 0);
+  gpu_create_buffer(&s, BUF, N * 4, storage);
+  gpu_write_buffer(&s, BUF, 0, in, N * 4);
+  gpu_create_shader_module(&s, MOD1, sh1);
+  gpu_create_compute_pipeline(&s, PIPE1, MOD1, "main");
+  gpu_bind_group_layout_of(&s, LAYOUT1, PIPE1, 0);
+  gpu_bind_entry e1[] = {{0, GPU_BIND_BUFFER, BUF, 0, 0}};
+  gpu_create_bind_group(&s, GROUP1, LAYOUT1, 1, e1);
+  int ok1 = run(&s, PIPE1, GROUP1, (N + 63) / 64, BUF, out);
   for (int i = 0; i < N && ok1; i++) {
     if (out[i] != in[i] * 3u + 7u) ok1 = 0;
   }
@@ -59,12 +84,15 @@ int main(void) {
       "  let i = g.x;\n"
       "  if (i < arrayLength(&a)) { c[i] = a[i] * a[i] + i; }\n"
       "}\n";
-  int ba = gpu_buffer(N * 4), bc = gpu_buffer(N * 4);
-  gpu_write(ba, a, N * 4);
-  int p2 = gpu_shader(sh2, sizeof sh2 - 1);
-  gpu_dispatch(p2, ba, bc, (N + 63) / 64);
-  gpu_read(bc, c, N * 4);
-  int ok2 = (ba >= 0 && bc >= 0 && p2 >= 0);
+  gpu_create_buffer(&s, BA, N * 4, storage);
+  gpu_create_buffer(&s, BC, N * 4, storage);
+  gpu_write_buffer(&s, BA, 0, a, N * 4);
+  gpu_create_shader_module(&s, MOD2, sh2);
+  gpu_create_compute_pipeline(&s, PIPE2, MOD2, "main");
+  gpu_bind_group_layout_of(&s, LAYOUT2, PIPE2, 0);
+  gpu_bind_entry e2[] = {{0, GPU_BIND_BUFFER, BA, 0, 0}, {1, GPU_BIND_BUFFER, BC, 0, 0}};
+  gpu_create_bind_group(&s, GROUP2, LAYOUT2, 2, e2);
+  int ok2 = run(&s, PIPE2, GROUP2, (N + 63) / 64, BC, c);
   for (int i = 0; i < N && ok2; i++) {
     if (c[i] != a[i] * a[i] + (unsigned)i) ok2 = 0;
   }

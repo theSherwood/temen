@@ -8,13 +8,14 @@
 //
 // Every clang-translated asset uses the guarded powerbox layout (#964/#1094): scratch/args one guard
 // up so a NULL dereference traps on every tier. This covers a `main` program's synthesized `_start`
-// and **entry-less reactor kernels** too (gradient, bounce, mandelzoom, gpu_shader — `tick` only, no
+// and **entry-less reactor kernels** too (gradient, bounce, mandelzoom, gpu_shader, render — `tick` only, no
 // `main`): temen-llvm bases their globals one guard up, so a NULL deref in a kernel traps like
 // everywhere else. The guard is **unconditional** now (#1094 — the one canonical layout; the
 // `--null-guard` flag is a redundant no-op and the `__null_guard` marker export is retired). Old
 // assets a host still runs are seeded the same way, so mixed old/new assets coexist harmlessly.
 //
 // Usage:  node build-onramp-assets.mjs           (builds whatever the toolchain + caches allow)
+//         ONLY=gpu_shader,render node build-onramp-assets.mjs   (builds only the named assets)
 // Needs `clang`/`llvm-dis` on PATH. SQLite/Lua sources are fetched-and-cached (skipped offline).
 // Outputs to `web/assets/*.temen` (gitignored except the tiny committed `hello_c.temen`).
 
@@ -48,6 +49,7 @@ const WARM = 'main,warmup,eval_run';
 
 // clang a C source to bitcode, then translate to a 64 KiB-page `.temen`. Extra clang flags per guest.
 function buildC(name, src, keep, includes = [], defines = []) {
+  if (!want(name)) return;
   const bc = join(ASSETS, `${name}.bc`);
   const temen = join(ASSETS, `${name}.temen`);
   const flags = ['-O2', '-emit-llvm', '-c', '-fno-vectorize', '-fno-slp-vectorize'];
@@ -60,11 +62,17 @@ function buildC(name, src, keep, includes = [], defines = []) {
 // Translate an **already-committed** `.bc` fixture to a 64 KiB-page `.temen` (no clang step — the
 // bitcode is a golden input in the tree, e.g. the Lua test fixtures).
 function buildBc(name, bcPath) {
+  if (!want(name)) return;
   const temen = join(ASSETS, `${name}.temen`);
   execFileSync(TR, [bcPath, '-o', temen, '--host-page', HOST_PAGE, '--null-guard'], { stdio: 'inherit' });
   const size = execFileSync('wc', ['-c', temen]).toString().trim().split(/\s+/)[0];
   console.log(`  ✓ ${name}.temen (${size} B)`);
 }
+
+// `ONLY=a,b` builds only the named assets (their `.temen` stems), as `scripts/rebuild-assets.sh`'s
+// `ONLY` does: a lane that needs two assets need not fetch and build the rest.
+const ONLY = process.env.ONLY ? new Set(process.env.ONLY.split(',')) : null;
+const want = (...names) => !ONLY || names.some((n) => ONLY.has(n));
 
 ensureTranslator();
 
@@ -110,12 +118,24 @@ try {
   console.log(`  ✗ mandelzoom: ${e.message}`);
 }
 
-// 1f) gpu_shader — the GPU demo: the guest ships a WGSL fragment shader through the `webgpu` capability
-//     and the browser renders it (a Mandelbrot zoom) each frame on the real GPU via navigator.gpu.
+// 1f) gpu_shader — the GPU demo: the guest builds a render pipeline from a WGSL fragment shader through
+//     the `webgpu` capability's command streams (crates/temen-gpu, #2665), and draws a Mandelbrot zoom
+//     with it each frame on the real GPU via navigator.gpu.
+const GPU_INCLUDE = join(REPO, 'crates', 'temen-gpu');
 try {
-  buildC('gpu_shader', join(REPO, 'crates', 'temen-run', 'demos', 'display', 'gpu_shader.c'), REACTOR);
+  buildC('gpu_shader', join(REPO, 'crates', 'temen-run', 'demos', 'display', 'gpu_shader.c'), REACTOR,
+    [GPU_INCLUDE]);
 } catch (e) {
   console.log(`  ✗ gpu_shader: ${e.message}`);
+}
+
+// 1g) render — not a card: the exact-pixel WebGPU program the native tests run (#2665), built as a
+//     reactor, which `browser-webgpu-test.mjs` runs against navigator.gpu.
+try {
+  buildC('render', join(REPO, 'crates', 'temen-run', 'demos', 'webgpu', 'render.c'), REACTOR,
+    [GPU_INCLUDE], ['-DTEMEN_GUEST', '-DGPU_REACTOR']);
+} catch (e) {
+  console.log(`  ✗ render: ${e.message}`);
 }
 
 // 2) SQLite (interactive) — the unmodified 3.50.2 amalgamation with a driver that reads a SQL script
@@ -137,7 +157,9 @@ function ensureAmalgamation() {
     return false;
   }
 }
-if (ensureAmalgamation()) {
+if (!want('sqlite_repl')) {
+  // not asked for
+} else if (ensureAmalgamation()) {
   try {
     buildC('sqlite_repl', join(REPO, 'crates', 'temen-run', 'demos', 'sqlite', 'sqlite_repl.c'), PROGRAM, [AMALG]);
   } catch (e) {
@@ -241,7 +263,9 @@ function buildQuickJS() {
     console.log(`  ✓ ${out} (${size} B)`);
   }
 }
-if (ensureQuickJS() && ensureOpenlibm()) {
+if (!want('qjs_repl')) {
+  // not asked for
+} else if (ensureQuickJS() && ensureOpenlibm()) {
   try {
     buildQuickJS();
   } catch (e) {
@@ -263,7 +287,7 @@ if (ensureQuickJS() && ensureOpenlibm()) {
 //         #805 follow-on). Runs byte-identical to native (`demo_tcl_init_stdin`).
 //     The playground warm Tcl card uses the snapshot asset. Fail-soft: skipped (example absent) if the
 //     toolchain/fetch is unavailable, like SQLite/Doom/chibicc offline.
-try {
+if (want('tcl_repl', 'tcl_snapshot')) try {
   const tclScript = join(REPO, 'crates', 'temen-run', 'demos', 'tcl', 'build_bitcode.sh');
   execFileSync('bash', [tclScript], { stdio: 'inherit' });
   const cache = process.env.TEMEN_TCL_CACHE ?? '/tmp/temen_tcl_cache';
@@ -290,7 +314,7 @@ try {
 //         = `mp_embed_init`, `eval_run` = exec-only), so the playground warms the interpreter once and
 //         evals per Run (slice B/C). Runs byte-identical to native (`demo_micropython_repl_stdin`).
 //     Fail-soft: skipped if the toolchain/clone is unavailable, like SQLite/Tcl offline.
-try {
+if (want('micropython_repl', 'micropython_snapshot')) try {
   const mpScript = join(REPO, 'crates', 'temen-run', 'demos', 'micropython', 'build_bitcode.sh');
   execFileSync('bash', [mpScript], { stdio: 'inherit' });
   const cache = process.env.TEMEN_MICROPYTHON_CACHE ?? '/tmp/temen_micropython_cache';
@@ -354,10 +378,12 @@ function vendoredWad() {
 
 // Stage the WAD first, unconditionally — it's committed, so it's always reachable regardless of the
 // toolchain. The module build is the only fail-soft half now.
-copyFileSync(vendoredWad(), join(ASSETS, 'doom1.wad'));
-const doomModule = ensureDoomModule();
+if (want('doom1.wad', 'doom')) copyFileSync(vendoredWad(), join(ASSETS, 'doom1.wad'));
+const doomModule = want('doom') ? ensureDoomModule() : null;
 const mb = (n) => (readFileSync(n).length / (1024 * 1024)).toFixed(2);
-if (doomModule) {
+if (!want('doom')) {
+  // not asked for
+} else if (doomModule) {
   copyFileSync(doomModule, join(ASSETS, 'doom.temen'));
   console.log(`  ✓ doom.temen (${mb(doomModule)} MB) + doom1.wad (vendored, ${mb(join(ASSETS, 'doom1.wad'))} MB)`);
 } else {
@@ -369,7 +395,7 @@ if (doomModule) {
 // `chibicc.temen` copied in. The playground compiles a C source with it, `temen_parse`s the emitted IR,
 // and runs the result. Fail-soft: no clang/llvm ⇒ the demo is simply absent (the card shows a build
 // hint), like Lua/Doom.
-try {
+if (want('chibicc')) try {
   const chibiccScript = join(REPO, 'crates', 'temen-run', 'demos', 'chibicc_selfhost', 'build_chibicc_temen.sh');
   const chibiccCache = process.env.TEMEN_CHIBICC_CACHE ?? '/tmp/temen_chibicc_cache';
   execFileSync('bash', [chibiccScript], { stdio: 'inherit' });
@@ -388,7 +414,7 @@ try {
 // bytes are the committed in-tree asset (`crates/temen-run/demos/leng_selfhost/temen-leng.temen`, kept in
 // sync with `temen-leng` by that demo's own code-coupling gate). Copy it in (offline-safe); rebuild with
 // `bash crates/temen-run/demos/leng_selfhost/build_leng_temen.sh` when `temen-leng`/the encoder changes.
-try {
+if (want('temen-leng')) try {
   const lengAsset = join(REPO, 'crates', 'temen-run', 'demos', 'leng_selfhost', 'temen-leng.temen');
   if (!existsSync(lengAsset)) throw new Error('demos/leng_selfhost/temen-leng.temen missing (run build_leng_temen.sh)');
   copyFileSync(lengAsset, join(ASSETS, 'temen-leng.temen'));
@@ -406,7 +432,7 @@ try {
 //   cargo test -p temen --test c_shell -- --ignored --exact gen_browser_shell_fixture
 // Copy it into web/assets/ (offline-safe, like the committed hello_c.temen); rebuild the fixture with
 // the command above when the shell source changes.
-try {
+if (want('shell', 'stage_runner', 'primes', 'upper')) try {
   const fixture = join(HERE, 'tests', 'fixtures', 'shell.temen');
   if (!existsSync(fixture)) throw new Error('tests/fixtures/shell.temen missing (run the generator)');
   copyFileSync(fixture, join(ASSETS, 'shell.temen'));

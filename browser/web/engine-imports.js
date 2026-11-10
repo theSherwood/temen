@@ -13,12 +13,27 @@ function engineImports(memory, hooks = {}) {
   const temen_host = {
     // #1284 `Region::Foreign`: detached children's own memories; only the threads build imports them.
     ...(memory ? foreignImports(memory) : {}),
-    // The `webgpu` capability's seam: a page installs a servicer backed by its <canvas> and
-    // `navigator.gpu` (play.js). i64 args arrive as BigInt; it returns a BigInt.
-    webgpu_op: (op, a, b, c, ptr, len) => {
-      const h = globalThis.__temen_webgpu_op;
-      return h ? BigInt(h(op, a, b, c, ptr, len, memory)) : -1n;
+    // The `webgpu` capability's seams (#2665): a page installs `web/webgpu.js`'s executor, backed by
+    // its <canvas> and `navigator.gpu` (play.js). The engine decodes and checks each stream itself and
+    // hands these only checked work. With no executor there is no device: -19 (ENODEV), and no
+    // readback (-2) or error (0). Each returns a BigInt.
+    webgpu_submit: (session, json, jsonLen, blob, blobLen) => {
+      const g = globalThis.__temen_webgpu;
+      return BigInt(g ? g.submit(session, memory, json, jsonLen, blob, blobLen) : -19);
     },
+    webgpu_read: (session, buffer, dst, cap) => {
+      const g = globalThis.__temen_webgpu;
+      return BigInt(g ? g.read(session, memory, buffer, dst, cap) : -2);
+    },
+    webgpu_error: (session, dst, cap) => {
+      const g = globalThis.__temen_webgpu;
+      return BigInt(g ? g.error(session, memory, dst, cap) : 0);
+    },
+    webgpu_surface: (dims, name, cap) => {
+      const g = globalThis.__temen_webgpu;
+      return BigInt(g ? g.surface(memory, dims, name, cap) : -19);
+    },
+    webgpu_drop: (session) => globalThis.__temen_webgpu?.drop(session),
     // One call to a JS capability (#1419, #2579): `slot` names it, `mem` is the opaque handle to the
     // calling guest's window. The coop driver installs a servicer for a run's `onCap`, and
     // `definePowerbox` for its run (`web/coop-driver.js`'s `jsCapServicer`). -ENOSYS with none.
