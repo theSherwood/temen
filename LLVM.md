@@ -2996,7 +2996,9 @@ Because a stream is plain data, a GPU broker in another process (§17) takes the
 - **In the browser,** the engine runs the same decoder and checks, and hands `web/webgpu.js` the WebGPU
   calls a checked stream stands for, as JSON steps it makes by name against `navigator.gpu`. The JS
   holds no knowledge of WebGPU's API of its own. Each capability handler is its own session there, so a
-  fork twin's ids never meet its parent's. The surface is the page's `<canvas>`.
+  fork twin's ids never meet its parent's. The surface is the page's `<canvas>`. A reactor holds the
+  capability only if the page had a device when it opened, as a native host grants it only with one: a
+  freeze refuses it on both hosts (#1699), so a reactor with no GPU to use must not hold it.
 
 **Demos and tests** (`crates/temen-run/demos/webgpu/`, run by `crates/temen-webgpu/tests/` on **all
 three engines**; a host with no adapter fails them, saying what to install, rather than skipping):

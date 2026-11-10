@@ -94,18 +94,7 @@ impl Backend for Js {
     }
 
     fn surface(&mut self) -> Option<SurfaceInfo> {
-        let (mut dims, mut name) = ([0u32; 2], [0u8; 32]);
-        // SAFETY: the import writes two `u32`s to `dims` and at most `name.len()` bytes to `name`.
-        let n = unsafe { webgpu_surface(dims.as_mut_ptr(), name.as_mut_ptr(), name.len()) };
-        if n < 0 {
-            return None;
-        }
-        let name = std::str::from_utf8(name.get(..n as usize)?).ok()?;
-        Some(SurfaceInfo {
-            width: dims[0],
-            height: dims[1],
-            format: TextureFormat::from_name(name)?,
-        })
+        page_surface()
     }
 
     fn take_error(&mut self) -> Option<String> {
@@ -118,6 +107,28 @@ impl Backend for Js {
         b.truncate((n as usize).min(b.len()));
         Some(String::from_utf8_lossy(&b).into_owned())
     }
+}
+
+/// The page's canvas, or `None` with no device in the page.
+fn page_surface() -> Option<SurfaceInfo> {
+    let (mut dims, mut name) = ([0u32; 2], [0u8; 32]);
+    // SAFETY: the import writes two `u32`s to `dims` and at most `name.len()` bytes to `name`.
+    let n = unsafe { webgpu_surface(dims.as_mut_ptr(), name.as_mut_ptr(), name.len()) };
+    if n < 0 {
+        return None;
+    }
+    let name = std::str::from_utf8(name.get(..n as usize)?).ok()?;
+    Some(SurfaceInfo {
+        width: dims[0],
+        height: dims[1],
+        format: TextureFormat::from_name(name)?,
+    })
+}
+
+/// Whether the page has a device to serve. `web/webgpu.js` brings one up, with its canvas, only for a
+/// card that asks for the GPU, and before that card opens its reactor (`web/play.js`).
+pub fn available() -> bool {
+    page_surface().is_some()
 }
 
 /// The guest's window, as the protocol reaches it.

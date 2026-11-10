@@ -2613,8 +2613,9 @@ type FsCursors = std::sync::Arc<std::sync::Mutex<Vec<u64>>>;
 /// `fs` server's cursors. A reactor holds these next to its window because together they are its whole
 /// state — the window image carries the guest's memory, and this carries the rest.
 ///
-/// Every field is an `Arc`, so a clone *shares* the cells rather than copying them — which is what
-/// lets the state hooks and a thaw registrar close over the same capabilities the reactor is holding.
+/// Every field is an `Arc` or fixed at open, so a clone *shares* the cells rather than copying them —
+/// which is what lets the state hooks and a thaw registrar close over the same capabilities the
+/// reactor is holding.
 #[derive(Clone)]
 struct OnrampCaps {
     frame: std::sync::Arc<std::sync::Mutex<Option<Frame>>>,
@@ -2623,6 +2624,11 @@ struct OnrampCaps {
     /// The served file and its per-`open` cursors — `Some` iff a file was served. The bytes are
     /// `Arc`ed because every handler this mints closes over them, and a thaw mints a second one.
     fs: Option<(String, std::sync::Arc<Vec<u8>>, FsCursors)>,
+    /// Whether the page had a GPU when the reactor opened, which `webgpu` is served only with. A freeze
+    /// refuses `webgpu` ([`cap_state`](Self::cap_state)), so a reactor that has no GPU to use must not
+    /// hold it, or nothing the page opens could be saved.
+    #[cfg(target_arch = "wasm32")]
+    gpu: bool,
 }
 
 impl OnrampCaps {
@@ -2639,6 +2645,8 @@ impl OnrampCaps {
                     std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
                 )
             }),
+            #[cfg(target_arch = "wasm32")]
+            gpu: webgpu::available(),
         }
     }
 
@@ -2740,11 +2748,12 @@ impl OnrampCaps {
             // `webgpu` — the GPU, through the protocol every host shares (`temen-gpu`, #2665): the guest
             // submits command streams naming objects by its own ids, and this handler decodes and checks
             // each one, then runs it against the page's `navigator.gpu` (`src/webgpu.rs`). The guest
-            // never holds a GPU object; validation, not raw access, is the boundary (§2a). Only granted
-            // in the wasm build (native has no page); a guest resolves `-1` and skips elsewhere. Each
-            // handler is a session of its own, so a fork twin's ids never meet its parent's.
+            // never holds a GPU object; validation, not raw access, is the boundary (§2a). Served only
+            // to a reactor opened while the page has a device (`gpu`), as a native host grants it only
+            // with one; a guest resolves `-1` elsewhere. Each handler is a session of its own, so a
+            // fork twin's ids never meet its parent's.
             #[cfg(target_arch = "wasm32")]
-            "webgpu" => {
+            "webgpu" if self.gpu => {
                 let mut gpu = temen_gpu::Gpu::new(webgpu::Js::new());
                 Some(Box::new(
                     move |op,
@@ -3100,6 +3109,7 @@ fn grant_onramp_caps(
     // a thaw re-grants through — one definition of what each on-ramp capability does, used by both.
     // `fs` is last in `NAMES` — a read-only in-memory file (Doom slice 4: the WAD read path), granted
     // only when the host supplies one; a guest that resolves no `fs` cap (bounce/life) is unaffected.
+    // `webgpu` is granted only while the page has a device (`OnrampCaps::gpu`).
     let caps = OnrampCaps::new(fs);
     for name in OnrampCaps::NAMES {
         caps.grant(host, name);
