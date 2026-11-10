@@ -3744,11 +3744,12 @@ proc produce(x: int): int {.exportc.} =
   result = Count
 "#;
 
-/// The producer's futex pair, and its child entry: `produce` on a stack at `data.top`, as the
-/// powerbox `_start` gives `main` one. Each side re-checks before it waits, so no wake is lost; a
-/// wait that still runs 30 s traps (the consumer returns -1), so a broken wake fails rather than
-/// hangs.
-const RING_GLUE: &str = r#"import 0 "produce" (i64, i64) -> (i64)
+/// The producer's futex pair, and its child entry, which calls `produce`. `produce` keeps every local
+/// in a slot, so it takes no stack pointer: its loop counter's `inc`, once nimony inlines it, is a
+/// dereference of the counter's address, which temen-leng reads as the counter itself (#2685). Each
+/// side re-checks before it waits, so no wake is lost; a wait that still runs 30 s traps (the
+/// consumer returns -1), so a broken wake fails rather than hangs.
+const RING_GLUE: &str = r#"import 0 "produce" (i64) -> (i64)
 func (i64, i64) -> () {
 block 0 (p: i64, seen: i64) {
   e = i32.wrap_i64 seen
@@ -3774,8 +3775,7 @@ block 0 (p: i64) {
 }
 func (i64) -> (i64) {
 block 0 (x: i64) {
-  sp = data.top
-  r = call.import 0 (sp, x)
+  r = call.import 0 (x)
   return r
   }
 }
