@@ -108,6 +108,10 @@ pub struct VmCtx {
     handlers: *const std::sync::atomic::AtomicUsize,
     #[cfg(fiber_rt)]
     owned_handlers: Option<Box<std::sync::atomic::AtomicUsize>>,
+    /// #2319 — the `call.cap` thunk's own state on this context, opaque to the JIT
+    /// ([`Self::thunk_state`]): made by the thunk's first call, dropped with the context. Never read
+    /// by compiled code.
+    thunk_state: std::sync::OnceLock<Box<dyn core::any::Any + Send + Sync>>,
 }
 
 /// The per-instance addresses a [`VmCtx`] is filled from — everything but the trap cell, which each
@@ -173,6 +177,7 @@ impl VmCtx {
             handlers: &*owned_handlers,
             #[cfg(fiber_rt)]
             owned_handlers: Some(owned_handlers),
+            thunk_state: std::sync::OnceLock::new(),
         }
     }
 
@@ -202,6 +207,7 @@ impl VmCtx {
             handlers: self.handlers,
             #[cfg(fiber_rt)]
             owned_handlers: None,
+            thunk_state: std::sync::OnceLock::new(),
         }
     }
 
@@ -242,6 +248,19 @@ impl VmCtx {
     /// context of the domain shares.
     pub(crate) fn domain_key(&self) -> usize {
         self.end as usize
+    }
+
+    /// #2319 — the `call.cap` thunk's state on this context, made by `init` on the first call that
+    /// asks: what a thunk keeps from one call to the next (temen-run's view of the run's window), so
+    /// a call need not build it again. Each context has its own, and none outlives its context.
+    /// `None` when a state of another type is already here.
+    pub fn thunk_state<T: core::any::Any + Send + Sync>(
+        &self,
+        init: impl FnOnce() -> T,
+    ) -> Option<&T> {
+        self.thunk_state
+            .get_or_init(|| Box::new(init()))
+            .downcast_ref()
     }
 
     /// The code that ended this context's domain, or `None` while it runs.

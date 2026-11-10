@@ -5712,9 +5712,10 @@ fn dbg_refund_ended_windows(tasks: &mut [TaskSlot], envs: &mut [Domain], run_end
             if let Some((env, lease)) = t.lease.take() {
                 envs[env].host.lock_unpoisoned().release_detached(lease);
                 if t.domain != 0 {
-                    // #1936 — and its end post is signalled, its waiters woken below.
+                    // #1936 — and its end post is signalled, its task done, its waiters woken
+                    // below.
                     let end = envs[t.domain].host.lock_unpoisoned().release_memory();
-                    ends.extend(end);
+                    ends.extend(end.map(super::EndPost::signal));
                 }
             }
         }
@@ -12092,7 +12093,9 @@ fn refund_ended_windows(tasks: &mut [TaskSlot], envs: &mut [Domain], run_ended: 
         for e in envs.iter_mut().skip(1) {
             // The run is over: no waiter is left to wake. An end post is still signalled, so its bits
             // are there for whoever reads the region next.
-            let _ = e.host.lock_unpoisoned().release_memory();
+            if let Some(end) = e.host.lock_unpoisoned().release_memory() {
+                let _ = end.signal();
+            }
             e.fibers = FiberTables::default();
         }
     }
@@ -13244,9 +13247,9 @@ fn settle_wakes(
     for k in 1..domains.len() {
         if seen[k - 1] && !live[k - 1] && released.domains.insert(k) {
             let mut h = domains[k].host.lock_unpoisoned();
-            // #1936 — its end post is signalled, its waiters woken below, in this settle: before the
-            // run can be read as deadlocked.
-            ends.extend(h.release_memory());
+            // #1936 — its end post is signalled, every task of it done, its waiters woken below, in
+            // this settle: before the run can be read as deadlocked.
+            ends.extend(h.release_memory().map(super::EndPost::signal));
             h.release_pipe_ends();
             // #1217 — a §14 child's end releases every service it held a live offer to, and the
             // pager its faults called (#2164): it can no longer call one, so a `svc.wait` there

@@ -494,13 +494,24 @@ unsafe fn cap_thunk_impl(
     // windows — the same software-page-map model, only the syscalls differ. The page map is the
     // **per-run** one from the `Host` (keyed by window base), so growth committed in an earlier
     // `call.cap` is still seen committed here — a borrow of a guest-grown page doesn't fail-closed.
+    // #2319 — the view is the run's, kept on the calling context ([`RunView`]); a call made while
+    // another holds it builds a view of its own.
     #[cfg(any(unix, windows))]
-    let mut wm = MprotectWindow::of(host, mem_base, mem_size, mem_reserved);
+    let (mut lease, mut own);
     #[cfg(any(unix, windows))]
     let gm: Option<&mut dyn GuestMem> = if mem_base.is_null() {
         None
     } else {
-        Some(&mut wm)
+        lease = vm
+            .thunk_state(RunView::default)
+            .and_then(|run| run.lease(host, mem_base, mem_size, mem_reserved));
+        match &mut lease {
+            Some(held) => Some(held.window()),
+            None => {
+                own = MprotectWindow::of(host, mem_base, mem_size, mem_reserved);
+                Some(&mut own)
+            }
+        }
     };
     // Any other target has no window backend (the JIT, `temen-jit`, does not build there anyway).
     #[cfg(not(any(unix, windows)))]
@@ -589,6 +600,11 @@ unsafe fn cap_thunk_impl(
             // later call.
             let parks = host.take_park_transients();
             let stdin_park = host.take_stdin_parked();
+            // #2319 — an op that left none has nothing to wake, park on or serve (most calls), and
+            // `*park` stays `None`.
+            if parks.is_empty() && !stdin_park {
+                return;
+            }
             // #1936 — a post's signal: its word's waiters wake by the key a §13 `map` gave it.
             if let Some((backing, off)) = parks.wake_region.as_ref().and_then(|w| w.os_key()) {
                 temen_jit::notify_region(vm, backing, off);
@@ -2824,6 +2840,7 @@ pub fn production_grant_hooks(ctx: CapCtx) -> temen_jit::GrantChildHooks {
             budget_mem_give
         },
         child_ended,
+        child_end_signal,
         lane_give: if locked { lane_give_locked } else { lane_give },
         premap_admit: if locked {
             premap_admit_locked
@@ -4154,17 +4171,30 @@ pub unsafe extern "C" fn budget_mem_give(
 }
 
 /// #1936 — [`temen_jit::ChildEnded`]: a detached child's domain ended, at its root's end. What it
-/// holds goes back ([`Host::release_memory`]) and its end post is signalled, its waiters woken in its
-/// run, before the child leaves the run's live count, so none of them reads the run as deadlocked.
+/// holds goes back ([`Host::release_memory`]), and its end post is answered, with the run it wakes
+/// waiters in, for [`child_end_signal`] once the end is published (#2800).
 ///
 /// # Safety
 /// `child` is a live [`temen_jit::GrantChild::ctx`].
-pub unsafe extern "C" fn child_ended(child: *mut c_void) {
+pub unsafe extern "C" fn child_ended(child: *mut c_void) -> *mut c_void {
     let child = &*(child as *const Mutex<Host>);
     let mut g = child.lock().unwrap_or_else(|e| e.into_inner());
-    let end = g.release_memory();
-    if let Some((backing, off)) = end.as_ref().and_then(|w| w.os_key()) {
-        temen_jit::notify_region_in(g.park_hub(), backing, off);
+    match g.release_memory() {
+        Some(end) => Box::into_raw(Box::new((end, g.park_hub()))) as *mut c_void,
+        None => core::ptr::null_mut(),
+    }
+}
+
+/// #2800 — [`temen_jit::ChildEndSignal`]: signal the end post [`child_ended`] answered, and wake its
+/// waiters in its run.
+///
+/// # Safety
+/// `post` is what [`child_ended`] answered, not null, and not yet signalled; the run whose park hub
+/// it names is live (it outlives every task).
+pub unsafe extern "C" fn child_end_signal(post: *mut c_void) {
+    let (end, hub) = *Box::from_raw(post as *mut (temen_interp::EndPost, usize));
+    if let Some((backing, off)) = end.signal().os_key() {
+        temen_jit::notify_region_in(hub, backing, off);
     }
 }
 
@@ -4382,10 +4412,10 @@ pub struct MprotectWindow {
     page: u64,
     /// Page index ⇒ explicit [`PageState`]; absent ⇒ region default (rw in
     /// `[0, mapped)`, unmapped in the reserved tail). Mirrors `temen_interp`'s page map so the two
-    /// backends agree page-for-page. **Shared** ([`Arc<Mutex<…>>`]) so it persists across the run's
-    /// `call.cap`s (the JIT rebuilds the window view per call): guest-grown pages stay borrowable. The
-    /// persistent home is the `Host` ([`Host::cap_window_pages`]); a one-off [`MprotectWindow::new`]
-    /// gets a private fresh map.
+    /// backends agree page-for-page. **Shared** ([`Arc<Mutex<…>>`]) so every view of the window sees
+    /// the same pages: the run's own ([`RunView`]), a re-entrant call's, and one built after the run's
+    /// is replaced. So guest-grown pages stay borrowable. The persistent home is the `Host`
+    /// ([`Host::cap_window_pages`]); a one-off [`MprotectWindow::new`] gets a private fresh map.
     prot: CapPageMap,
     /// #964: the marked module's reserved NULL region (`0` = unguarded, the default). `[0, guard)`
     /// reports unmapped to borrow checks and is **refused** to `map`/`unmap`/`protect` (the
@@ -4408,6 +4438,85 @@ pub struct MprotectWindow {
 
 #[cfg(any(unix, windows))]
 use temen_ir::PageState;
+
+/// #2319 — the run's view of its window, kept on the calling context
+/// ([`temen_jit::VmCtx::thunk_state`]): built by the first call that touches the window, then fitted
+/// to each call ([`MprotectWindow::fit`]). So a call neither builds a view nor takes a reference to
+/// the page map, which cost 30 of a 74 ns `call.cap`. A call made while another holds the view
+/// (guest code under `Jit.invoke` calling back in) builds a view of its own, as every call once did.
+#[cfg(any(unix, windows))]
+#[derive(Default)]
+struct RunView {
+    /// The view and the `Host` it is of; `None` until the first call.
+    view: core::cell::UnsafeCell<Option<(*const Host, MprotectWindow)>>,
+    /// A call holds the view.
+    busy: core::sync::atomic::AtomicBool,
+}
+
+// SAFETY: a context serves one `call.cap` at a time (`cap_thunk` one caller, #1166;
+// `cap_thunk_locked` each under the domain's lock), so only that call's thread reaches the view,
+// and `busy` keeps a re-entrant call on the same thread off it ([`RunView::lease`]). The view's raw
+// pointers are the window and the host the run itself holds.
+#[cfg(any(unix, windows))]
+unsafe impl Send for RunView {}
+#[cfg(any(unix, windows))]
+unsafe impl Sync for RunView {}
+
+#[cfg(any(unix, windows))]
+impl RunView {
+    /// Hold the view of `host`'s window `[base, base + mapped)`, in a `reserved` reservation, for
+    /// one call: the kept one fitted to the call, or a new one where the kept one is of another
+    /// window. `None` while another call holds it.
+    fn lease(
+        &self,
+        host: &mut Host,
+        base: *mut u8,
+        mapped: u64,
+        reserved: u64,
+    ) -> Option<ViewLease<'_>> {
+        use core::sync::atomic::Ordering::Relaxed;
+        // A load and a store, not a swap: only the context's own thread comes here (the `Sync`
+        // impl's argument), and a swap would cost about what keeping the view saves.
+        if self.busy.load(Relaxed) {
+            return None;
+        }
+        self.busy.store(true, Relaxed);
+        // Lets the view go however this call ends.
+        let lease = ViewLease(self);
+        let me: *const Host = host;
+        // SAFETY: `busy` gives this call the view until the lease drops.
+        let kept = unsafe { &mut *self.view.get() };
+        match kept {
+            Some((of, w)) if core::ptr::eq(*of, me) && w.views(host, base) => {
+                w.fit(host, mapped, reserved)
+            }
+            _ => *kept = Some((me, MprotectWindow::of(host, base, mapped, reserved))),
+        }
+        Some(lease)
+    }
+}
+
+/// A call's hold on its context's [`RunView`]; the next call has the view once this drops.
+#[cfg(any(unix, windows))]
+struct ViewLease<'a>(&'a RunView);
+
+#[cfg(any(unix, windows))]
+impl ViewLease<'_> {
+    fn window(&mut self) -> &mut MprotectWindow {
+        // SAFETY: the lease holds `busy`, so this is the view's only reference.
+        let kept = unsafe { &mut *self.0.view.get() };
+        &mut kept.as_mut().expect("a held view is built").1
+    }
+}
+
+#[cfg(any(unix, windows))]
+impl Drop for ViewLease<'_> {
+    fn drop(&mut self) {
+        self.0
+            .busy
+            .store(false, core::sync::atomic::Ordering::Relaxed);
+    }
+}
 
 #[cfg(any(unix, windows))]
 impl MprotectWindow {
@@ -4450,6 +4559,30 @@ impl MprotectWindow {
     fn of(host: &mut Host, base: *mut u8, mapped: u64, reserved: u64) -> MprotectWindow {
         let pages = host.cap_window_pages(base as usize);
         let mut wm = MprotectWindow::new_shared(base, mapped, reserved, pages);
+        wm.table = host.jit_paging().map(|p| p.table);
+        wm.fit(host, mapped, reserved);
+        wm
+    }
+
+    /// #2319 — this view is still of `host`'s window at `base`: it shares the host's page map and
+    /// access table for it, so [`MprotectWindow::fit`] makes it the view [`MprotectWindow::of`] would
+    /// build. Those two are what a view holds of the host; the rest it takes from each call.
+    fn views(&self, host: &Host, base: *mut u8) -> bool {
+        let pages = host.cap_window_pages_held(base as usize);
+        self.base == base
+            && pages.is_some_and(|m| Arc::ptr_eq(m, &self.prot))
+            && match (host.jit_paging_table(), &self.table) {
+                (None, None) => true,
+                (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+                _ => false,
+            }
+    }
+
+    /// The part of [`MprotectWindow::of`] each call sets: the window's backed size and reservation,
+    /// the NULL guard (which engages only on a window that holds it), and the shadow arena.
+    fn fit(&mut self, host: &Host, mapped: u64, reserved: u64) {
+        self.mapped = mapped;
+        self.reserved = reserved.max(mapped);
         // #964/#1094: carry the NULL guard into the window backend, so `[0, guard)` is refused to
         // page ops and reads as unmapped to borrow checks, matching the interpreter oracle. Read from
         // `module_null_guard()` — the single chokepoint every tier reads the extent from (INVARIANTS
@@ -4459,12 +4592,11 @@ impl MprotectWindow {
         // guard `0` and let a guest `map`/`unmap`/`protect` inside the reserved region the
         // interpreter refuses. The `diff` fuzz target found it: `map(off=8192, len=4096)` is
         // `-EINVAL` on the interpreter and `0` on the JIT.
-        wm.set_null_guard(temen_ir::module_null_guard());
+        self.null_guard = 0;
+        self.set_null_guard(temen_ir::module_null_guard());
         // #2426: and the runtime-private pages of a durable module's window, as its start recorded
         // them.
-        wm.set_shadow(host.cap_window_shadow());
-        wm.table = host.jit_paging().map(|p| p.table);
-        wm
+        self.set_shadow(host.cap_window_shadow());
     }
 
     /// #2426: install the shadow arena the window's module declared (see the `shadow` field).
@@ -9673,5 +9805,81 @@ mod nim_module_suffix_tests {
             nim_module_suffix("lib/system/basic_types.nim", &["other"]),
             nim_module_suffix("lib/system/basic_types.nim", &[])
         );
+    }
+}
+
+#[cfg(all(test, any(unix, windows)))]
+mod run_view_tests {
+    //! #2319 — the run's kept window view ([`RunView`]): fitted to each call, held by one call at a
+    //! time, and rebuilt once the host's page map is not the one it shares. A view never touches
+    //! its window here, so any base will do.
+    use super::*;
+
+    fn window() -> Vec<u8> {
+        vec![0; 1 << 16]
+    }
+
+    /// Two calls get the same view, each with its own call's backed size, and the NULL guard engages
+    /// once the window holds it (#964).
+    #[test]
+    fn a_kept_view_is_fitted_to_each_call() {
+        let (mut host, mut mem) = (Host::new(), window());
+        let base = mem.as_mut_ptr();
+        let guard = temen_ir::module_null_guard();
+        let engaged = if guard.is_multiple_of(host_page_size()) {
+            guard
+        } else {
+            0
+        };
+        let run = RunView::default();
+        let first: *const MprotectWindow = {
+            let mut held = run
+                .lease(&mut host, base, guard / 2, 1 << 16)
+                .expect("free");
+            let w = held.window();
+            assert_eq!((w.mapped, w.null_guard), (guard / 2, 0), "the guard is off");
+            w
+        };
+        let mut held = run
+            .lease(&mut host, base, guard * 2, 1 << 16)
+            .expect("free");
+        let w = held.window();
+        assert!(std::ptr::eq(first, w), "the kept view");
+        assert_eq!((w.mapped, w.null_guard), (guard * 2, engaged), "fitted");
+    }
+
+    /// A call made while another holds the view (guest code under `Jit.invoke` calling back in) gets
+    /// none, so it builds its own; the next call has it again.
+    #[test]
+    fn a_call_while_the_view_is_held_gets_none() {
+        let (mut host, mut mem) = (Host::new(), window());
+        let base = mem.as_mut_ptr();
+        let run = RunView::default();
+        let held = run.lease(&mut host, base, 4096, 1 << 16);
+        assert!(held.is_some());
+        assert!(run.lease(&mut host, base, 4096, 1 << 16).is_none());
+        drop(held);
+        assert!(run.lease(&mut host, base, 4096, 1 << 16).is_some());
+    }
+
+    /// A new window start replaces the host's page map (#2268, as a thaw's does), and a view of it is
+    /// rebuilt over the new one; so is a view another host asks for.
+    #[test]
+    fn a_view_of_a_replaced_page_map_is_rebuilt() {
+        let (mut host, mut mem) = (Host::new(), window());
+        let base = mem.as_mut_ptr();
+        let shares = |host: &Host, w: &MprotectWindow| {
+            host.cap_window_pages_held(base as usize)
+                .is_some_and(|m| Arc::ptr_eq(m, &w.prot))
+        };
+        let run = RunView::default();
+        drop(run.lease(&mut host, base, 4096, 1 << 16));
+        host.start_window_pages(base as usize, temen_interp::ShadowArena::EMPTY);
+        let mut held = run.lease(&mut host, base, 4096, 1 << 16).expect("free");
+        assert!(shares(&host, held.window()));
+        drop(held);
+        let mut other = Host::new();
+        let mut held = run.lease(&mut other, base, 4096, 1 << 16).expect("free");
+        assert!(shares(&other, held.window()));
     }
 }

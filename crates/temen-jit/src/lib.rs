@@ -1192,11 +1192,17 @@ pub type ChildBudgetNode =
 
 /// #1936 — a detached child's domain has ended: its root returned or trapped, or a kill or its fuel
 /// ended it, and no freeze captured it. Called once for a child that ran, with its powerbox (a
-/// [`GrantChild::ctx`]), when its root ends: before the child leaves the run's live count and before
-/// its join sees the end. What the end wakes (its end post's waiters) is runnable by then, so none
-/// of them is read as deadlocked, and the end lands where the oracle's does, at the root's end,
-/// even while threads the child spawned still run.
-pub type ChildEnded = unsafe extern "C" fn(child: *mut core::ffi::c_void);
+/// [`GrantChild::ctx`]), when its root ends, before its teardown frees the powerbox: the end lands
+/// where the oracle's does, at the root's end, even while threads the child spawned still run.
+/// Answers the child's end post, taken and not yet signalled, opaque (null: it has none), for
+/// [`ChildEndSignal`] to signal once the end is published (#2800).
+pub type ChildEnded = unsafe extern "C" fn(child: *mut core::ffi::c_void) -> *mut core::ffi::c_void;
+
+/// #2800 — signal the end post [`ChildEnded`] answered, and wake its waiters. Called once for each
+/// post it answered, once the child's end is published (its parent's `poll` and `join` see it), so
+/// a waiter it wakes finds the end it was told of, and before the child leaves the run's live
+/// count, so none of them is read as deadlocked.
+pub type ChildEndSignal = unsafe extern "C" fn(post: *mut core::ffi::c_void);
 
 #[derive(Clone, Copy)]
 pub struct GrantChildHooks {
@@ -1210,8 +1216,10 @@ pub struct GrantChildHooks {
     pub budget_mem_take: BudgetMemTaker,
     /// #1587 — its undo for a spawn that fails after the take (see [`BudgetMemGiver`]).
     pub budget_mem_give: BudgetMemGiver,
-    /// #1936 — a detached child's domain ended (see [`ChildEnded`]).
+    /// #1936 — a detached child's domain ended (see [`ChildEnded`]), and its end post is signalled
+    /// once the end is published (see [`ChildEndSignal`]).
     pub child_ended: ChildEnded,
+    pub child_end_signal: ChildEndSignal,
     /// D66 — return a reaped detached child's lane (see [`LaneGiver`]).
     pub lane_give: LaneGiver,
     /// A spawn's pre-mapped region — the host sides of one child-side `map` (see [`PremapAdmit`],
