@@ -599,13 +599,14 @@ unsafe fn cap_thunk_impl(
         Ok(()) => {
             // Every transient the op left is drained, acted on or not: one left set would land on a
             // later call.
-            let parks = host.take_park_transients();
             let stdin_park = host.take_stdin_parked();
-            // #2319 — an op that left none has nothing to wake, park on or serve (most calls), and
-            // `*park` stays `None`.
-            if parks.is_empty() && !stdin_park {
-                return;
-            }
+            let parks = match host.take_park_transients() {
+                Some(parks) => parks,
+                // #2319 — an op that left none has nothing to wake, park on or serve (most calls),
+                // and `*park` stays `None`.
+                None if !stdin_park => return,
+                None => temen_interp::ParkTransients::default(),
+            };
             // #1936 — a post's signal: its word's waiters wake by the key a §13 `map` gave it.
             if let Some((backing, off)) = parks.wake_region.as_ref().and_then(|w| w.os_key()) {
                 temen_jit::notify_region(vm, backing, off);
