@@ -294,7 +294,14 @@ the edge it proves — the taken edge of `jb`/`jbe`, or the **fall-through** of 
 is how a demand-paged child bounds its access-table index (#2164: `off < declared` gates the
 `table[off >> page_shift]` read; the shift keeps the bound, and the read must land in the table's
 `pages + 1` bytes); the second is how Cranelift's `br_table`/array bounds check lays out the in-range
-code (`cmp idx, len; jae default`, #2784).
+code (`cmp idx, len; jae default`, #2784). A compare bounds only the bits it compares: a 32-bit `cmp`
+bounds the register only when its upper half is already known zero, since `cmp eax, K; jb` says
+nothing of the rest of `rax`. A branch on two known values goes one way on every run, and the edge it
+never takes carries no state, so a block only it reaches is dead, as an unreached block is (#2811).
+Cranelift keeps the `brif` of a condition its optimizer folds to a constant, as `xor ecx, ecx; test
+cl, cl; jne`, and the code behind it can be what the policy rejects, such as a demand-paged check's
+table read for an offset past the window. Only the unsigned and equality conditions are decided, as
+plain unsigned comparisons of the two values at the compare's width.
 
 Only a check is trusted. An untrusted fixpoint proposes a state for each block. One linear pass then
 verifies that the entry contract implies the entry block's state, that every edge's out-state implies
@@ -324,6 +331,15 @@ found (#2603):
   in between, and its condition takes the compared value only while it is below that bound.
 - No constant is read from bytes a relocation patches. D63's bound is a constant-pool operand, since
   the reservation doesn't fit an `imm32`.
+- `_setjmp` returns twice (#2801). On the second return, through a `_longjmp`, `rsp` and the
+  callee-saved registers come back from the `jmp_buf`, so their facts at the call hold, but each frame
+  slot holds its latest write, which can come after the first return. So after the call a slot keeps
+  only the fact every write to it in the function implies, and no register stays tied to a slot. The
+  fixpoint proposes those per-slot facts along with the states (from above, so a save the JIT repeats
+  round a loop keeps its fact), and the checking pass holds every frame write to them: a store, a
+  push, a `pop` to memory, a call's write buffer, a callee handed a frame pointer. What survives is
+  the JIT's setjmp save area (#2537), which only the stores before the call write, and the prologue's
+  callee-saved saves.
 - A call runs its callee's contract: it clobbers the registers that contract names and the flags, and
   moves `rsp` by what the callee pops (a `Tail` callee its stack arguments). The callee is known only
   from a relocation, a vmctx cell, or a fn-table entry whose type the code checked; any other is
