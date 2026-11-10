@@ -6710,10 +6710,12 @@ impl HostFn {
     }
 
     /// #2534 — what this host function returns, as far as the validator models it: `SetjmpSlot`'s
-    /// host `jmp_buf`, which only `Setjmp` takes; every other result is a guest value.
+    /// host `jmp_buf`, which only `Setjmp` takes, and `Setjmp`'s second return through a `_longjmp`
+    /// (#2801); every other result is a guest value.
     fn ret(self) -> validate::Ret {
         match self {
             HostFn::SetjmpSlot => validate::Ret::JmpBuf,
+            HostFn::Setjmp => validate::Ret::Twice,
             _ => validate::Ret::Unknown,
         }
     }

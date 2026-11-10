@@ -90,6 +90,10 @@ pub(crate) enum Ret {
     /// `_setjmp` ([`ArgTag::JmpBuf`]), which saves the frame's registers into it. A `_setjmp` handed
     /// anything else would write them wherever the code said.
     JmpBuf,
+    /// `_setjmp`'s: it returns once, and again each time a `_longjmp` re-enters it, with `rsp` and
+    /// the callee-saved registers restored from the `jmp_buf` but each frame slot holding its latest
+    /// write, which may be any later one (#2801).
+    Twice,
 }
 
 /// What one call argument must be, for the validator to accept the call (#2534). The host confines
@@ -555,6 +559,60 @@ pub(crate) mod x86 {
         fact: Fact,
     }
 
+    /// A write to the frame: the bytes `[lo, hi)` of entry-relative offsets, with the fact of the
+    /// value when it fills exactly one 8-byte slot (`Unknown` otherwise), or anywhere at all, or
+    /// any data slot (a callee handed a frame pointer it may write through, which spares the
+    /// callee-saved save area, as [`State::clear_data_slots`] does).
+    #[derive(Clone, Copy)]
+    enum FrameWrite {
+        At { lo: i64, hi: i64, fact: Fact },
+        Anywhere,
+        DataAnywhere,
+    }
+
+    /// Whether `w` keeps every fact `reentry` promises a slot holds across a `_setjmp`'s second
+    /// return (#2801): a write that fills one of those slots exactly must write a value with its
+    /// fact, and no other write may touch it.
+    fn keeps(reentry: &[Slot], w: FrameWrite) -> bool {
+        reentry.iter().all(|s| match w {
+            FrameWrite::At { lo, hi, fact } => {
+                let touches = lo < s.off.saturating_add(8) && s.off < hi;
+                !touches || (lo == s.off && hi == lo + 8 && fact.meet(s.fact) == s.fact)
+            }
+            FrameWrite::Anywhere => false,
+            FrameWrite::DataAnywhere => matches!(s.fact, Fact::Saved(_)),
+        })
+    }
+
+    /// The slots a `_setjmp`'s second return can keep, given every write the function makes to its
+    /// frame: on a re-entry each slot holds its latest write, from wherever in the function, so it
+    /// keeps the fact all of its writes imply (the meet over them). That is the JIT's `setjmp` save
+    /// area, which only the stores before the call write, and the prologue's callee-saved saves.
+    fn reentry_facts(writes: &[FrameWrite]) -> Vec<Slot> {
+        let mut slots: Vec<Slot> = Vec::new();
+        for &w in writes {
+            if let FrameWrite::At { lo, hi, fact } = w {
+                if hi == lo + 8 && fact != Fact::Unknown && slots.iter().all(|s| s.off != lo) {
+                    slots.push(Slot { off: lo, fact });
+                }
+            }
+        }
+        for &w in writes {
+            for s in &mut slots {
+                if !keeps(&[*s], w) {
+                    s.fact = match w {
+                        FrameWrite::At { lo, hi, fact } if lo == s.off && hi == lo + 8 => {
+                            s.fact.meet(fact)
+                        }
+                        _ => Fact::Unknown,
+                    };
+                }
+            }
+        }
+        slots.retain(|s| s.fact != Fact::Unknown);
+        slots
+    }
+
     /// The abstract state at a program point: a fact per GP register, the tracked spill slots, and
     /// whether the prologue's stack-overflow check (`emit_stack_check`, I5) has run on every path
     /// here. `checked` starts false, is set on the safe edge of the recognized check, and meets by
@@ -723,6 +781,10 @@ pub(crate) mod x86 {
         relocs: &'a [Reloc],
         guest: Guest<'a>,
         frame: Frame,
+        /// The slot facts a `_setjmp`'s second return keeps ([`reentry_facts`]), which verify
+        /// checks against every frame write. `None` keeps every slot: only propose's first round
+        /// runs so, and [`verify`] never does.
+        reentry: Option<&'a [Slot]>,
     }
 
     /// The facts of no module: what the decode and control-flow layers run under for a trampoline,
@@ -870,12 +932,18 @@ pub(crate) mod x86 {
             }
         }
 
-        /// The state block `i`'s out-states `out` give the edge to block `j`.
-        fn edge(&self, out: &Out, i: usize, j: usize) -> State {
+        /// The state block `i`'s out-states `out` give the edge to block `j`, or `None` for an edge
+        /// the branch never takes.
+        fn edge(&self, out: &Out, i: usize, j: usize) -> Option<State> {
+            let taken = (out.decided != Some(false)).then(|| out.taken.clone());
+            let fall = (out.decided != Some(true)).then(|| out.fall.clone());
             match self.jcc[i] {
-                Some((Some(t), f)) if t == j && f == Some(j) => out.taken.meet(&out.fall),
-                Some((Some(t), _)) if t == j => out.taken.clone(),
-                _ => out.fall.clone(),
+                Some((Some(t), f)) if t == j && f == Some(j) => match (taken, fall) {
+                    (Some(t), Some(f)) => Some(t.meet(&f)),
+                    (t, f) => t.or(f),
+                },
+                Some((Some(t), _)) if t == j => taken,
+                _ => fall,
             }
         }
     }
@@ -936,7 +1004,7 @@ pub(crate) mod x86 {
         let Some(r) = d.operands.rm_reg else {
             return Err("indirect jmp through memory".into());
         };
-        let out = transfer_block(insns, State::top(), None, ctx, false).fall;
+        let out = transfer_block(insns, State::top(), None, ctx, false, None).fall;
         let Fact::TableTarget { at, n } = out.regs[r as usize & 15] else {
             return Err(format!(
                 "indirect jmp through r{r}, which holds no jump-table target"
@@ -1103,6 +1171,7 @@ pub(crate) mod x86 {
             relocs,
             guest,
             frame,
+            reentry: None,
         };
         let cfg = Cfg::build(ctx, &mut findings);
         if let Entry::Host = entry {
@@ -1118,9 +1187,58 @@ pub(crate) mod x86 {
             }
             return findings;
         }
-        let states = propose(&cfg, ctx);
-        verify(&cfg, &states, ctx, &mut findings);
+        let (states, reentry) = propose_reentry(&cfg, ctx);
+        verify(&cfg, &states, &reentry, ctx, &mut findings);
         findings
+    }
+
+    /// Whether the function calls `_setjmp`, which returns twice (#2801).
+    fn calls_setjmp(ctx: Ctx) -> bool {
+        ctx.relocs
+            .iter()
+            .any(|r| r.callee.is_some_and(|c| c.ret == Ret::Twice))
+    }
+
+    /// [`propose`], and for a function that calls `_setjmp` the slot facts its second return keeps,
+    /// [`reentry_facts`] of the frame writes the proposed states imply. The first round keeps every
+    /// slot across the call, and each round after it keeps only what the last round's writes imply,
+    /// until that holds steady: the facts only fall, so it settles, and from above, so a save the
+    /// JIT repeats each time round a loop keeps its fact. The round cap only bounds the cost:
+    /// [`verify`] checks every write against what comes out.
+    fn propose_reentry(cfg: &Cfg, ctx: Ctx) -> (Vec<Option<State>>, Vec<Slot>) {
+        let mut states = propose(cfg, ctx);
+        let mut reentry = Vec::new();
+        if !calls_setjmp(ctx) {
+            return (states, reentry);
+        }
+        for round in 0..8 {
+            let at = Ctx {
+                reentry: (round > 0).then_some(&reentry[..]),
+                ..ctx
+            };
+            if round > 0 {
+                states = propose(cfg, at);
+            }
+            let mut writes = Vec::new();
+            for (i, s) in states.iter().enumerate() {
+                if let Some(s) = s {
+                    transfer_block(
+                        &cfg.blocks[i],
+                        s.clone(),
+                        None,
+                        at,
+                        false,
+                        Some(&mut writes),
+                    );
+                }
+            }
+            let next = reentry_facts(&writes.iter().map(|&(_, w)| w).collect::<Vec<_>>());
+            if round > 0 && next == reentry {
+                break;
+            }
+            reentry = next;
+        }
+        (states, reentry)
     }
 
     /// The untrusted half of layer 3: forward dataflow toward a fixpoint, proposing an in-state for
@@ -1150,8 +1268,7 @@ pub(crate) mod x86 {
             for i in 0..nb {
                 let mut cur = (i == 0).then(|| State::entry(ctx.frame));
                 for &p in &preds[i] {
-                    if let Some(po) = &out_st[p] {
-                        let e = cfg.edge(po, p, i);
+                    if let Some(e) = out_st[p].as_ref().and_then(|po| cfg.edge(po, p, i)) {
                         cur = Some(match cur {
                             None => e,
                             Some(s) => s.meet(&e),
@@ -1166,8 +1283,14 @@ pub(crate) mod x86 {
                     // so only a block whose in-state moved is re-run: the same fixpoint, without
                     // re-transferring every settled block each round.
                     if in_st[i].as_ref() != Some(&s) {
-                        out_st[i] =
-                            Some(transfer_block(&cfg.blocks[i], s.clone(), None, ctx, false));
+                        out_st[i] = Some(transfer_block(
+                            &cfg.blocks[i],
+                            s.clone(),
+                            None,
+                            ctx,
+                            false,
+                            None,
+                        ));
                         in_st[i] = Some(s);
                         changed = true;
                     }
@@ -1187,7 +1310,19 @@ pub(crate) mod x86 {
     /// covered by a state that over-approximates every execution reaching it, so the policy findings
     /// hold for every run. A block whose successor has no state, or an edge the proposal doesn't
     /// hold on, is a finding.
-    fn verify(cfg: &Cfg, states: &[Option<State>], ctx: Ctx, findings: &mut Vec<Finding>) {
+    fn verify(
+        cfg: &Cfg,
+        states: &[Option<State>],
+        reentry: &[Slot],
+        ctx: Ctx,
+        findings: &mut Vec<Finding>,
+    ) {
+        // A `_setjmp`'s second return keeps exactly `reentry`, which every frame write must respect.
+        let ctx = Ctx {
+            reentry: Some(reentry),
+            ..ctx
+        };
+        let mut writes = calls_setjmp(ctx).then(Vec::new);
         if !states
             .first()
             .and_then(Option::as_ref)
@@ -1212,7 +1347,7 @@ pub(crate) mod x86 {
                 }
                 None => false,
             };
-            let out = transfer_block(insns, s, Some(findings), ctx, exit);
+            let out = transfer_block(insns, s, Some(findings), ctx, exit, writes.as_mut());
             // An indirect `jmp` with no jump table leaves the function: a tail call, so its target
             // must be a callee the state identifies.
             if let (Some(why), Some(&(at, d))) = (&cfg.exits[i], insns.last()) {
@@ -1224,7 +1359,10 @@ pub(crate) mod x86 {
                 }
             }
             for &j in &cfg.succs[i] {
-                let e = cfg.edge(&out, i, j);
+                // An edge the branch never takes constrains nothing: no run follows it.
+                let Some(e) = cfg.edge(&out, i, j) else {
+                    continue;
+                };
                 if !states[j].as_ref().is_some_and(|sj| implies(&e, sj)) {
                     findings.push(Finding {
                         at: cfg.leaders[j],
@@ -1235,6 +1373,16 @@ pub(crate) mod x86 {
                         ),
                     });
                 }
+            }
+        }
+        // Every write to the frame keeps what a `_setjmp`'s second return assumes its slots hold.
+        for (at, w) in writes.into_iter().flatten() {
+            if !keeps(reentry, w) {
+                findings.push(Finding {
+                    at,
+                    why: "a frame write breaks a slot fact a `_setjmp`'s second return keeps"
+                        .into(),
+                });
             }
         }
     }
@@ -1489,6 +1637,26 @@ pub(crate) mod x86 {
         konst: Option<u64>,
     }
 
+    impl Cmp {
+        /// Whether the `jcc` condition `cc` holds after this compare, when both compared values are
+        /// known: then it holds, or doesn't, on every run, and the other edge is never taken (#2811).
+        /// Only the unsigned and equality conditions (`b`/`ae`/`e`/`ne`/`be`/`a`), which compare the
+        /// two values as unsigned `w`-byte integers (CF is `lhs < rhs`, ZF `lhs == rhs`). A
+        /// `test r, r` sets those two flags as `cmp r, 0` does.
+        fn decide(&self, cc: u8) -> Option<bool> {
+            let (a, b) = (self.lhs.konst?, self.rhs.konst?);
+            match cc {
+                0x2 => Some(a < b),
+                0x3 => Some(a >= b),
+                0x4 => Some(a == b),
+                0x5 => Some(a != b),
+                0x6 => Some(a <= b),
+                0x7 => Some(a > b),
+                _ => None,
+            }
+        }
+    }
+
     /// The fact `cmovcc dst, src` (width `w`, condition `cc`) leaves in `dst`, given the compare whose
     /// flags it tests (#2603 holes 2–4). The result is `dst`'s old value or `src`'s. It is `Confined`
     /// when one of the two is a constant (the guard) and the other is the compared value `v` plus a
@@ -1557,13 +1725,15 @@ pub(crate) mod x86 {
     /// Run block `insns` from `state`, returning the out-state. With `findings = Some`, also apply
     /// the memory-access policy (layer 3) at each access. A compare's flags and the symbolic values
     /// are block-local, but the `Confined` fact a `cmov` derives from them flows across blocks through
-    /// the lattice, so a guard Cranelift hoists out of a loop is still seen at the access.
+    /// the lattice, so a guard Cranelift hoists out of a loop is still seen at the access. With
+    /// `writes = Some`, also log each write to the frame with where it is (#2801).
     fn transfer_block(
         insns: &[(usize, Decoded)],
         mut state: State,
         mut findings: Option<&mut Vec<Finding>>,
         ctx: Ctx,
         exit: bool,
+        mut writes: Option<&mut Vec<(usize, FrameWrite)>>,
     ) -> Out {
         let mut sym: [Sym; 16] = std::array::from_fn(|r| Sym {
             id: r as u32,
@@ -1625,20 +1795,30 @@ pub(crate) mod x86 {
                 }
                 _ => None,
             };
-            match slot_effect(&mut state, &d) {
-                Some(Some((lo, hi))) => slot_vals.retain(|&(o, _)| o >= hi || o + 8 <= lo),
-                Some(None) => slot_vals.clear(),
-                None => {}
+            let mut frame_write = |w: FrameWrite| {
+                if let Some(log) = writes.as_deref_mut() {
+                    log.push((pos, w));
+                }
+            };
+            if let Some(w) = slot_effect(&mut state, &d) {
+                match w {
+                    FrameWrite::At { lo, hi, .. } => {
+                        slot_vals.retain(|&(o, _)| o >= hi || o + 8 <= lo)
+                    }
+                    _ => slot_vals.clear(),
+                }
+                frame_write(w);
             }
             let fact = |state: &State, r: u8| state.regs[r as usize & 15];
             let sym_of = |r: u8| sym[r as usize & 15];
             // The constant operand `o` holds at width `w`: an immediate no relocation patches, a
             // register holding a constant, or the function's own unpatched rodata.
             let konst = |state: &State, o: Opnd, w: u8| {
-                let mask = if w == 8 {
-                    u64::MAX
-                } else {
-                    u64::from(u32::MAX)
+                let mask = match w {
+                    1 => 0xff,
+                    2 => 0xffff,
+                    4 => u64::from(u32::MAX),
+                    _ => u64::MAX,
                 };
                 match o {
                     Opnd::Reg(r) => match fact(state, r) {
@@ -1662,9 +1842,11 @@ pub(crate) mod x86 {
             };
             match d.eff {
                 Eff::Cmp { w, lhs, rhs } => {
+                    // A byte compare says nothing of the register beyond its low byte, so it names
+                    // no value for a refinement or a `cmov` to bound; only its constants count.
                     let side = |o: Opnd| Side {
                         sym: match o {
-                            Opnd::Reg(r) => Some(sym_of(r)),
+                            Opnd::Reg(r) if w >= 4 => Some(sym_of(r)),
                             _ => None,
                         },
                         konst: konst(&state, o, w),
@@ -1819,14 +2001,23 @@ pub(crate) mod x86 {
                             state.clobber(o - 8, o);
                             state.slot_set(o - 8, f);
                             slot_vals.retain(|&(x, _)| x >= o || x + 8 <= o - 8);
+                            frame_write(FrameWrite::At {
+                                lo: o - 8,
+                                hi: o,
+                                fact: f,
+                            });
                             Fact::Stack(Some(o - 8))
                         }
                         Fact::Stack(None) => {
                             state.clear_slots();
                             slot_vals.clear();
+                            frame_write(FrameWrite::Anywhere);
                             Fact::Stack(None)
                         }
-                        _ => Fact::Unknown,
+                        _ => {
+                            frame_write(FrameWrite::Anywhere);
+                            Fact::Unknown
+                        }
                     };
                     set(&mut state, reg::RSP, rsp);
                 }
@@ -1845,6 +2036,7 @@ pub(crate) mod x86 {
                         None => {
                             state.clear_slots();
                             slot_vals.clear();
+                            frame_write(FrameWrite::Anywhere);
                         }
                     }
                 }
@@ -1915,13 +2107,13 @@ pub(crate) mod x86 {
                 // handed it writes the caller's result slots, not ours.)
                 let conservative = callee.is_none();
                 let mut unexpected = false;
-                let mut writes: Vec<(i64, i64)> = Vec::new();
+                let mut buffers: Vec<(i64, i64)> = Vec::new();
                 for (i, &r) in reg::ARG_REGS.iter().enumerate() {
                     let f = fact(&state, r);
                     match c.args.get(i) {
                         Some(ArgTag::StackSlot { len, write: true }) => match f {
                             Fact::Stack(Some(off)) => {
-                                writes.push((off, off.saturating_add(i64::from(*len))))
+                                buffers.push((off, off.saturating_add(i64::from(*len))))
                             }
                             // A write buffer at an unknown offset: clear conservatively.
                             _ => unexpected = true,
@@ -1940,11 +2132,38 @@ pub(crate) mod x86 {
                 if unexpected {
                     state.clear_data_slots();
                     slot_vals.clear();
+                    frame_write(FrameWrite::DataAnywhere);
                 } else {
-                    for (lo, hi) in writes {
+                    for (lo, hi) in buffers {
                         state.clobber(lo, hi);
                         slot_vals.retain(|&(o, _)| o >= hi || o + 8 <= lo);
+                        frame_write(FrameWrite::At {
+                            lo,
+                            hi,
+                            fact: Fact::Unknown,
+                        });
                     }
+                }
+                // `_setjmp` returns again whenever a `_longjmp` re-enters it, with `rsp` and the
+                // callee-saved registers as at the call (from the `jmp_buf`, so their facts hold)
+                // but each frame slot holding its latest write, which can come from anywhere after
+                // this return. So a slot keeps only the fact every write to it implies
+                // (`ctx.reentry`, which verify checks against every write), and no register stays
+                // tied to a slot: a callee-saved one can come from an older execution of the call
+                // than the slot's latest write (#2801).
+                if c.ret == Ret::Twice {
+                    if let Some(reentry) = ctx.reentry {
+                        state.slots = state
+                            .slots
+                            .iter()
+                            .filter_map(|s| {
+                                let k = reentry.iter().find(|r| r.off == s.off)?;
+                                let fact = s.fact.meet(k.fact);
+                                (fact != Fact::Unknown).then_some(Slot { off: s.off, fact })
+                            })
+                            .collect();
+                    }
+                    slot_vals.clear();
                 }
                 let rsp = match (fact(&state, reg::RSP), c.pops) {
                     (Fact::Stack(Some(h)), Some(p)) => Fact::Stack(h.checked_add(i64::from(p))),
@@ -2093,7 +2312,11 @@ pub(crate) mod x86 {
                 if let Some((on_taken, bound)) = plan {
                     let edge = if on_taken { &mut taken } else { &mut fall };
                     for (fa, &sy) in edge.regs.iter_mut().zip(&sym) {
-                        if sy == s {
+                        // A narrower compare bounds only the bits it compares, so it bounds the
+                        // register only when they are all of it: a 32-bit one, below `2^32`.
+                        let bits = 8 * u32::from(f.w);
+                        let whole = bits >= 64 || max_value(*fa).is_some_and(|m| m >> bits == 0);
+                        if sy == s && whole {
                             // Refine only an integer-like fact: a `Bounded` tightens to the min, and
                             // an unconfined/`Confined` value becomes `[0, bound)`. A pointer, `Const`,
                             // stack or table fact is left unchanged (sound — the refinement only adds
@@ -2108,15 +2331,30 @@ pub(crate) mod x86 {
                 }
             }
         }
-        Out { taken, fall }
+        // A branch on two known values goes one way on every run (#2811). Cranelift keeps the `brif`
+        // of a condition its optimizer folds to a constant (`xor ecx, ecx; test cl, cl; jne`), and
+        // the edge it never takes can lead to code the policy would reject, such as a demand-paged
+        // check's table read for an offset past the window.
+        let decided = match (term, flags) {
+            (Some(Kind::DirectJcc { cc, .. }), Some(f)) => f.decide(cc),
+            _ => None,
+        };
+        Out {
+            taken,
+            fall,
+            decided,
+        }
     }
 
     /// A block's out-states: `taken` on the edge a terminating `jcc` takes, `fall` on every other.
-    /// They differ only where the branch proves something (a fn-table type check).
+    /// They differ only where the branch proves something (a fn-table type check, a bound). When the
+    /// state decides the branch, `decided` says which way it goes, and the other edge carries no
+    /// state: a block only it reaches is dead, as a block nothing reaches is.
     #[derive(Clone, PartialEq, Eq)]
     struct Out {
         taken: State,
         fall: State,
+        decided: Option<bool>,
     }
 
     /// The record `mov r32, [m]` reads the type id of, if `m` is a record's first field: the value
@@ -2325,14 +2563,14 @@ pub(crate) mod x86 {
     /// when its offset is unknown. An access that cannot reach the stack leaves the slots alone (one
     /// through a wild base is itself a policy finding). Returns the frame bytes it writes: `None` for
     /// none, `Some(None)` when where is unknown.
-    fn slot_effect(state: &mut State, d: &Decoded) -> Option<Option<(i64, i64)>> {
+    fn slot_effect(state: &mut State, d: &Decoded) -> Option<FrameWrite> {
         let m = d.operands.mem?;
         if !writes_memory(d) {
             return None;
         }
         let Some(off) = frame_addr(state, &m)? else {
             state.clear_slots();
-            return Some(None);
+            return Some(FrameWrite::Anywhere);
         };
         let (w, fact) = match d.eff {
             Eff::StoreReg { src, w } => (
@@ -2351,9 +2589,10 @@ pub(crate) mod x86 {
                 Fact::Unknown,
             ),
         };
-        state.clobber(off, off.saturating_add(w));
-        state.slot_set(off, fact);
-        Some(Some((off, off.saturating_add(w))))
+        let (lo, hi) = (off, off.saturating_add(w));
+        state.clobber(lo, hi);
+        state.slot_set(lo, fact);
+        Some(FrameWrite::At { lo, hi, fact })
     }
 
     /// The GP registers an instruction writes: its effect's destinations plus a call's clobbers and
@@ -3044,6 +3283,9 @@ pub(crate) mod x86 {
         AluRegRm(Option<Alu>),
         /// `test r/m, reg` (`85`).
         Test,
+        /// `test r/m8, r8` (`84`), the low byte of a register 4–7 when `false`, `ah`–`bh` when `true`
+        /// (no REX).
+        TestByte(bool),
         /// `movsxd reg, r/m32` (`63`).
         Movsxd,
         /// `movzx reg, r/m` from a source of this many bytes; `true` when a byte source register
@@ -3158,6 +3400,18 @@ pub(crate) mod x86 {
                     lhs: Opnd::Reg(r),
                     rhs: Opnd::Imm(0),
                 },
+                _ => Eff::NoGp,
+            },
+            // `test r8, r8` as a byte `cmp r8, 0`, so a branch on a known byte is decided (#2811);
+            // `ah`–`bh` are bits 8–15, not the low byte the compare would read.
+            I::TestByte(high) => match (rm, reg, mem) {
+                (Some(r), Some(s), false) if r == s && !(high && (4..=7).contains(&r)) => {
+                    Eff::Cmp {
+                        w: 1,
+                        lhs: Opnd::Reg(r),
+                        rhs: Opnd::Imm(0),
+                    }
+                }
                 _ => Eff::NoGp,
             },
             I::Setcc(high) => match (rm, mem) {
@@ -3469,6 +3723,16 @@ pub(crate) mod x86 {
             };
             let w = if byte { 1 } else { p.osz() };
             let d = finish_modrm(c, start, p, 0, Normal, intent)?.width(w);
+            // `xor r, r` zeroes the register whatever it held, at 32 or 64 bits: the idiom Cranelift
+            // materializes 0 with, which a decided branch reads (#2811).
+            let ops = d.operands;
+            let d = match (op & 0xF8, ops.reg, ops.rm_reg, ops.mem) {
+                (0x30, Some(a), Some(b), None) if a == b && !byte && p.osz() >= 4 => Decoded {
+                    eff: Eff::MovImm { dst: a, imm: 0 },
+                    ..d
+                },
+                _ => d,
+            };
             // A compare, and an op whose destination is its reg field, only read the r/m.
             return Some(if is_cmp || op & 0x02 != 0 {
                 d.reads()
@@ -3484,7 +3748,8 @@ pub(crate) mod x86 {
         };
         match op {
             // ModRM, no immediate.
-            0x84 => finish_modrm(c, start, p, 0, Normal, E::NoGp).map(|d| d.width(1).reads()), // test r/m8
+            0x84 => finish_modrm(c, start, p, 0, Normal, E::TestByte(!p.rex))
+                .map(|d| d.width(1).reads()), // test r/m8, r8
             0x85 => finish_modrm(c, start, p, 0, Normal, E::Test).map(|d| d.width(w).reads()),
             // The moves, `lea`, `xchg` and `pop` leave the flags (a register allocator's moves may sit
             // between a `cmp` and the `cmov` that tests it).
@@ -4253,6 +4518,7 @@ pub(crate) mod x86 {
             relocs,
             guest: NO_GUEST,
             frame: Frame::UNKNOWN,
+            reentry: None,
         };
         let mut findings = Vec::new();
         Cfg::build(ctx, &mut findings)
@@ -4414,6 +4680,11 @@ pub(crate) mod x86 {
                         Eff::Cmov { cc, .. } => {
                             // iced numbers the conditions from 1 (0 is "none").
                             assert_eq!(insn.condition_code() as u8, cc + 1, "{}", at("cmov cc"));
+                        }
+                        // `xor r, r` is `mov r, 0`.
+                        Eff::MovImm { imm, .. } if insn.mnemonic() == Mnemonic::Xor => {
+                            assert_eq!(insn.op0_register(), insn.op1_register(), "{}", at("xor"));
+                            assert_eq!(imm, 0, "{}", at("xor"));
                         }
                         Eff::MovImm { imm, .. } => {
                             assert_eq!(imm as u64, insn.immediate(1), "{}", at("mov immediate"));
@@ -5010,9 +5281,10 @@ pub(crate) mod x86 {
                 relocs,
                 guest: G,
                 frame: Frame::UNKNOWN,
+                reentry: None,
             };
             let (insns, _) = decode_block(ctx, 0, bytes.len(), &mut fs);
-            transfer_block(&insns, State::entry(Frame::UNKNOWN), None, ctx, false).fall
+            transfer_block(&insns, State::entry(Frame::UNKNOWN), None, ctx, false, None).fall
         }
 
         /// A window access through an index that was **not** confined by the D63 sequence is the
@@ -5022,6 +5294,60 @@ pub(crate) mod x86 {
         fn policy_flags_unconfined_window_index() {
             let f = findings(&[0x4a, 0x8b, 0x04, 0x07, 0xc3]); // mov rax,[rdi+r8*1]; ret
             assert!(has(&f, "unconfined index"), "{f:?}");
+        }
+
+        /// A compare bounds only the bits it compares: `cmp eax, K; jae` proves `eax < K` on the
+        /// fall-through, which says nothing of `rax` while its upper half is unknown. A 64-bit compare,
+        /// or a 32-bit one of a register already below `2^32`, bounds the register.
+        #[test]
+        fn refine_a_compare_bounds_only_the_bits_it_compares() {
+            let guarded = |cmp: &[u8], pre: &[u8]| {
+                // pre; cmp …, 0x100; jae skip; mov rcx, [rdi + rax]; ret; skip: ret
+                [pre, cmp, &[0x73, 0x05, 0x48, 0x8b, 0x0c, 0x07, 0xc3, 0xc3]].concat()
+            };
+            let cmp32 = [0x3d, 0x00, 0x01, 0, 0]; // cmp eax, 0x100
+            let cmp64 = [0x48, 0x3d, 0x00, 0x01, 0, 0]; // cmp rax, 0x100
+            let f = findings(&guarded(&cmp32, &[]));
+            assert!(
+                has(&f, "unconfined index"),
+                "rax's upper half is unknown: {f:?}"
+            );
+            assert!(findings(&guarded(&cmp64, &[])).is_empty());
+            let zext = [0x89, 0xc0]; // mov eax, eax: rax < 2^32
+            let f = findings(&guarded(&cmp32, &zext));
+            assert!(f.is_empty(), "{f:?}");
+        }
+
+        /// #2811: Cranelift keeps the `brif` of a condition it folded to a constant, materialized as
+        /// `xor r, r` (or `mov r, 1`) and tested with `test r8, r8`. The branch goes one way on every
+        /// run, so the edge it never takes carries no state, and the code only that edge reaches (in
+        /// #2811 a page check's table read past the window) goes unchecked. `dead` is code the policy
+        /// rejects: a window access through an unconfined index.
+        #[test]
+        fn decided_branch_skips_the_edge_it_never_takes() {
+            const DEAD: [u8; 5] = [0x4a, 0x8b, 0x04, 0x07, 0xc3]; // mov rax, [rdi + r8]; ret
+            const TEST: [u8; 3] = [0x45, 0x84, 0xd2]; // test r10b, r10b
+            const RET: [u8; 1] = [0xc3];
+            let zero = [0x45, 0x31, 0xd2]; // xor r10d, r10d
+            let one = [0x41, 0xba, 1, 0, 0, 0]; // mov r10d, 1
+                                                // jne never taken: the target is dead. jne always taken: the fall-through is.
+            let never = [&zero[..], &TEST, &[0x75, 0x01], &RET, &DEAD].concat();
+            let always = [&one[..], &TEST, &[0x75, 0x05], &DEAD, &RET].concat();
+            for code in [&never, &always] {
+                let f = findings(code);
+                assert!(
+                    f.is_empty(),
+                    "a decided branch's dead edge was checked: {f:?}"
+                );
+            }
+            // Undecided (r10 unknown), both edges run, and the bad access is flagged.
+            let open = [&TEST[..], &[0x75, 0x01], &RET, &DEAD].concat();
+            assert!(has(&findings(&open), "unconfined index"));
+            // Without REX, `test dh, dh` reads bits 8–15 of rdx, not rsi's low byte, so a known esi
+            // decides nothing.
+            let esi = [0xbe, 1, 0, 0, 0]; // mov esi, 1
+            let high = [&esi[..], &[0x84, 0xf6, 0x75, 0x05], &DEAD, &RET].concat(); // test dh, dh
+            assert!(has(&findings(&high), "unconfined index"));
         }
 
         /// A memory access whose base register has no recognized provenance (here `r9`, a guest
@@ -5130,14 +5456,16 @@ pub(crate) mod x86 {
         /// Cranelift lays the in-range `br_table`/array code. The validator refines that edge (the
         /// mirror of the `jb`-taken refinement), so a window access through the bounded index on the
         /// fall-through is confined. Without the `jae` refinement the index is `Unknown` and flagged.
+        /// The compare is 32-bit, so it bounds `r8` only because `r8` is already below `2^32`.
         #[test]
         fn policy_a_jae_bounds_the_fall_through_index() {
             let bytes = [
-                0x41, 0x83, 0xf8, 0x40, // [00] cmp r8d, 0x40
-                0x0f, 0x83, 0x05, 0, 0, 0, // [04] jae +5 (→ 0x0f)
-                0x42, 0x8b, 0x04, 0x87, // [0a] mov eax, [rdi + r8*4]   (fall: r8 < 0x40)
-                0xc3, // [0e] ret
-                0xc3, // [0f] ret  (jae target: out of range)
+                0x45, 0x89, 0xc0, // [00] mov r8d, r8d   (r8 < 2^32)
+                0x41, 0x83, 0xf8, 0x40, // [03] cmp r8d, 0x40
+                0x0f, 0x83, 0x05, 0, 0, 0, // [07] jae +5 (→ 0x12)
+                0x42, 0x8b, 0x04, 0x87, // [0d] mov eax, [rdi + r8*4]   (fall: r8 < 0x40)
+                0xc3, // [11] ret
+                0xc3, // [12] ret  (jae target: out of range)
             ];
             assert!(
                 findings(&bytes).is_empty(),
@@ -5401,6 +5729,7 @@ pub(crate) mod x86 {
                 relocs: &[],
                 guest: G,
                 frame: Frame::UNKNOWN,
+                reentry: None,
             };
             let mut fs = Vec::new();
             let cfg = Cfg::build(ctx, &mut fs);
@@ -5419,7 +5748,7 @@ pub(crate) mod x86 {
             s.copies[9] = Some(-0x10); // the spill `[rsp+8]`, after `sub rsp, 0x18`
             lie[join] = Some(s);
             let mut f = Vec::new();
-            verify(&cfg, &lie, ctx, &mut f);
+            verify(&cfg, &lie, &[], ctx, &mut f);
             assert!(has(&f, "does not hold on the edge"), "{f:?}");
         }
 
@@ -5688,6 +6017,145 @@ pub(crate) mod x86 {
                 Frame::UNKNOWN,
             );
             assert!(has(&f, "call argument 0 is Saved(3), not JmpBuf"), "{f:?}");
+        }
+
+        /// #2801 — `_setjmp` returns twice. On the second return, through a `_longjmp`, `rsp` and the
+        /// callee-saved registers are as at the call, but each frame slot holds its latest write,
+        /// which can come after the first return. So a slot keeps a fact across the call only when
+        /// every write to it in the function implies the fact: the JIT's save area, which only the
+        /// stores before the call write, and the prologue's callee-saved saves.
+        #[test]
+        fn setjmp_returns_twice() {
+            const SETJMP: Contract = Contract {
+                clobbers: SYSV_CLOBBERS,
+                pops: Some(0),
+                args: &[],
+                safepoint: false,
+                ret: Ret::Twice,
+            };
+            const CALL: [u8; 12] = [0x48, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xd0]; // movabs; call rax
+            const FRAME: [u8; 4] = [0x48, 0x83, 0xec, 0x10]; // sub rsp, 16
+            const SAVE: [u8; 5] = [0x48, 0x89, 0x7c, 0x24, 0x08]; // mov [rsp+8], rdi   (mem_base)
+            const RELOAD: [u8; 5] = [0x48, 0x8b, 0x7c, 0x24, 0x08]; // mov rdi, [rsp+8]
+            const STORE: [u8; 2] = [0x89, 0x0f]; // mov [rdi], ecx: a window store through it
+            const LEAVE: [u8; 5] = [0x48, 0x83, 0xc4, 0x10, 0xc3]; // add rsp, 16; ret
+                                                                   // `pre`, the call, `post`, with the call's relocation.
+            let code = |pre: &[u8], post: &[u8]| {
+                let body = [pre, &CALL, post].concat();
+                let reloc = Reloc {
+                    at: (CHECK_LEN + pre.len() + 2) as u32,
+                    kind: R::Abs8,
+                    addend: 0,
+                    callee: Some(SETJMP),
+                };
+                (checked(&body), reloc)
+            };
+            let run = |pre: &[u8], post: &[u8]| {
+                let (bytes, reloc) = code(pre, post);
+                check(&bytes, &[reloc], Entry::Guest(&G), Frame::UNKNOWN)
+            };
+            let pre = [&FRAME[..], &SAVE].concat();
+            // The JIT's save: written only before the call, so it is still mem_base on both returns.
+            let f = run(&pre, &[&RELOAD[..], &STORE, &LEAVE].concat());
+            assert!(f.is_empty(), "{f:?}");
+            // The issue's escape: the first return overwrites the slot with a guest value and then
+            // `_longjmp`s back (here a `ud2` ends that path), so the second return reloads it.
+            let overwrite = [0x4c, 0x89, 0x44, 0x24, 0x08]; // mov [rsp+8], r8
+            let again = [&[0x85, 0xc0, 0x75, 0x07][..], &overwrite, &[0x0f, 0x0b]].concat(); // test eax, eax; jne +7; …; ud2
+            let escape = [&again[..], &RELOAD, &STORE, &LEAVE].concat();
+            assert!(has(&run(&pre, &escape), "unrecognized provenance"));
+            // A save the JIT repeats each time round a loop keeps its fact: the facts are proposed
+            // from above, so the save that feeds on the reload holds.
+            let back = -((CALL.len() + RELOAD.len() + STORE.len() + SAVE.len() + 5) as i8);
+            let looped = [
+                &RELOAD[..],
+                &STORE,
+                &SAVE,
+                &[0x45, 0x85, 0xc9, 0x75, back as u8],
+                &LEAVE,
+            ];
+            let f = run(&pre, &looped.concat()); // …; test r9d, r9d; jne <the call>
+            assert!(f.is_empty(), "{f:?}");
+            // The prologue's callee-saved save is written once, so the epilogue still restores it.
+            let push = [0x53, 0x48, 0x83, 0xec, 0x08]; // push rbx; sub rsp, 8
+            let pop = [0x48, 0x83, 0xc4, 0x08, 0x5b, 0xc3]; // add rsp, 8; pop rbx; ret
+            let f = run(&push, &pop);
+            assert!(f.is_empty(), "{f:?}");
+            // And verify holds a proposal to every write: claiming the escape's slot keeps mem_base
+            // is caught at the overwrite.
+            let (bytes, reloc) = code(&pre, &escape);
+            let relocs = [reloc];
+            let lie = [Slot {
+                off: -8,
+                fact: Fact::MemBase,
+            }];
+            let ctx = Ctx {
+                bytes: &bytes,
+                relocs: &relocs,
+                guest: G,
+                frame: Frame::UNKNOWN,
+                reentry: Some(&lie),
+            };
+            let mut fs = Vec::new();
+            let cfg = Cfg::build(ctx, &mut fs);
+            let states = propose(&cfg, ctx);
+            let mut f = Vec::new();
+            verify(&cfg, &states, &lie, ctx, &mut f);
+            assert!(has(&f, "breaks a slot fact"), "{f:?}");
+            // No register stays tied to a slot across the call. Here the first return overwrites
+            // r12's spill and `_longjmp`s back, so the second return's `cmp r12` and the `cmov` of a
+            // reload of the spill compare and select different values: the access is unconfined.
+            let pre = [
+                0x48, 0x83, 0xec, 0x18, // sub rsp, 0x18
+                0x48, 0x89, 0x3c,
+                0x24, // mov [rsp], rdi        (mem_base, for after the call)
+                0x4c, 0x89, 0x64, 0x24,
+                0x08, // mov [rsp+8], r12  (spill r12: a register-slot tie)
+            ];
+            let post = [
+                &[0x85, 0xc0, 0x75, 0x07][..], // test eax, eax; jne +7   (the second return)
+                &[0x48, 0x89, 0x4c, 0x24, 0x08, 0x0f, 0x0b], // mov [rsp+8], rcx; ud2  (overwrite; …)
+                &[0x48, 0x8b, 0x3c, 0x24],                   // mov rdi, [rsp]
+                &[0x49, 0xba, 0, 0, 0, 0, 0x20, 0, 0, 0],    // mov r10, guard
+                &[0x49, 0x81, 0xfc, 0xf0, 0xff, 0xff, 0x7f], // cmp r12, 0x7fff_fff0
+                &[0x4c, 0x8b, 0x4c, 0x24, 0x08],             // mov r9, [rsp+8]
+                &[0x4c, 0x89, 0xc8, 0x49, 0x0f, 0x43, 0xc2], // mov rax, r9; cmovae rax, r10
+                &[0x8b, 0x04, 0x07, 0x48, 0x83, 0xc4, 0x18, 0xc3], // mov eax, [rdi + rax]; …; ret
+            ]
+            .concat();
+            assert!(has(&run(&pre, &post), "unconfined index"));
+        }
+
+        /// #2801 — the rules a frame write meets a `_setjmp`'s re-entry facts by, and the facts the
+        /// writes give: a write that fills a slot exactly must imply its fact; a partial write, a
+        /// write anywhere, or a callee handed a frame pointer breaks it, except that last spares the
+        /// callee-saved save area.
+        #[test]
+        fn frame_writes_against_reentry_facts() {
+            let at = |lo: i64, hi: i64, fact: Fact| FrameWrite::At { lo, hi, fact };
+            let base = [Slot {
+                off: -8,
+                fact: Fact::MemBase,
+            }];
+            let saved = [Slot {
+                off: -8,
+                fact: Fact::Saved(3),
+            }];
+            assert!(keeps(&base, at(-8, 0, Fact::MemBase)));
+            assert!(keeps(&base, at(-16, -8, Fact::Unknown))); // the slot below: no overlap
+            assert!(!keeps(&base, at(-8, 0, Fact::Unknown)));
+            assert!(!keeps(&base, at(-4, 0, Fact::Unknown))); // half of it
+            assert!(!keeps(&base, at(-8, 8, Fact::MemBase))); // more than it
+            assert!(!keeps(&base, FrameWrite::Anywhere));
+            assert!(!keeps(&base, FrameWrite::DataAnywhere));
+            assert!(keeps(&saved, FrameWrite::DataAnywhere));
+            let twice = [at(-8, 0, Fact::MemBase), at(-8, 0, Fact::MemBase)];
+            assert!(reentry_facts(&twice) == base);
+            assert!(reentry_facts(&[twice[0], at(-8, 0, Fact::Unknown)]).is_empty());
+            assert!(reentry_facts(&[twice[0], at(-2, 6, Fact::Unknown)]).is_empty());
+            assert!(reentry_facts(&[twice[0], FrameWrite::DataAnywhere]).is_empty());
+            let callee_saved = [at(-8, 0, Fact::Saved(3)), FrameWrite::DataAnywhere];
+            assert!(reentry_facts(&callee_saved) == saved);
         }
 
         /// #2534 — the `-g` trap capture walks the frame chain from its argument, so it must be this
@@ -6013,6 +6481,7 @@ pub(crate) mod x86 {
                 relocs: &[],
                 guest: G,
                 frame: Frame::UNKNOWN,
+                reentry: None,
             };
             let mut fs = Vec::new();
             let cfg = Cfg::build(ctx, &mut fs);
@@ -6437,19 +6906,20 @@ pub(crate) mod x86 {
                 relocs: &[],
                 guest: G,
                 frame: Frame::UNKNOWN,
+                reentry: None,
             };
             let mut fs = Vec::new();
             let cfg = Cfg::build(ctx, &mut fs);
             assert!(fs.is_empty());
             let honest = propose(&cfg, ctx);
             let mut f = Vec::new();
-            verify(&cfg, &honest, ctx, &mut f);
+            verify(&cfg, &honest, &[], ctx, &mut f);
             assert!(has(&f, "unrecognized provenance"), "{f:?}");
 
             let mut lie = honest.clone();
             lie[1] = Some(State::entry(Frame::UNKNOWN));
             let mut f = Vec::new();
-            verify(&cfg, &lie, ctx, &mut f);
+            verify(&cfg, &lie, &[], ctx, &mut f);
             assert!(has(&f, "does not hold on the edge"), "{f:?}");
 
             let mut bad_entry = honest;
@@ -6457,7 +6927,7 @@ pub(crate) mod x86 {
             s.regs[0] = Fact::MemBase;
             bad_entry[0] = Some(s);
             let mut f = Vec::new();
-            verify(&cfg, &bad_entry, ctx, &mut f);
+            verify(&cfg, &bad_entry, &[], ctx, &mut f);
             assert!(has(&f, "entry contract"), "{f:?}");
         }
 
