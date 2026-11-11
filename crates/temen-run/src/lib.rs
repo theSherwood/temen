@@ -1445,7 +1445,7 @@ pub fn jit_cap_run(
     // A fresh window: its page map is `init`'s, none from an earlier run (see `reset_cap_pages`).
     host.reset_cap_pages(init.page_map());
     // #2958 — a program `jit_kernel::admit` admits runs its vCPUs as executor 2's tasks.
-    if let Ok(admitted) = jit_kernel::admit(m, host, Some(init)) {
+    if let Ok(admitted) = jit_kernel::admit(m, host, Some(init), false) {
         let start = jit_kernel::Start {
             entry,
             args,
@@ -7621,7 +7621,7 @@ fn jit_run(
     // level meters nothing, and the run's code compiles without fuel checks.
     limits.grant(host);
     // #2958 — a program `jit_kernel::admit` admits runs its vCPUs as executor 2's tasks.
-    if let Ok(admitted) = jit_kernel::admit(m, host, None) {
+    if let Ok(admitted) = jit_kernel::admit(m, host, None, code.is_some()) {
         let end = with_deadline(limits.deadline, |kill| {
             let start = jit_kernel::Start {
                 entry: func,

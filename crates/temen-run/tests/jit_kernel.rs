@@ -234,7 +234,7 @@ fn fueled(m: &temen_ir::Module, budget: u64) -> [(Result<Vec<i64>, Trap>, u64); 
     )
     .expect("jit");
     let mut host = Host::new();
-    let admitted = jit_kernel::admit(m, &host, None).expect("in the kernel's scope");
+    let admitted = jit_kernel::admit(m, &host, None, false).expect("in the kernel's scope");
     let start = jit_kernel::Start {
         entry: 0,
         args: &[],

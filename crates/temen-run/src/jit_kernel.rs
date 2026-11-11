@@ -31,19 +31,25 @@ use temen_jit::{CompiledModule, FuelCell, JitOutcome, TrapKind};
 pub struct Admitted<'m>(&'m Module);
 
 /// Whether `m`, started from `init` under `host`, runs its vCPUs as the kernel's tasks:
-/// `temen_interp::bytecode::native_scope`, plus the start's own clause:
+/// `temen_interp::bytecode::native_scope`, plus the start's own clauses:
 /// - **`restored`**: a window started from a captured layout, not a fresh seed (the JIT re-applies
 ///   its page map; the kernel's `Mem` would seed over it). One page map (#2958 slice 3) removes it.
+/// - **`kept code`**: the embedder keeps the run's compile for later runs (a `JitCodeCache`,
+///   #2389), whose shared code the kernel route does not instance yet (#2981).
 ///
 /// `Err` names the clause that keeps it on the JIT's own runtime, with nothing taken from `host`.
 pub fn admit<'m>(
     m: &'m Module,
     host: &Host,
     init: Option<&temen_interp::MemLayout>,
+    kept_code: bool,
 ) -> Result<Admitted<'m>, &'static str> {
     temen_interp::bytecode::native_scope(m, host)?;
     if init.is_some_and(|l| !l.is_seed()) {
         return Err("restored");
+    }
+    if kept_code {
+        return Err("kept code");
     }
     Ok(Admitted(m))
 }
@@ -92,7 +98,7 @@ pub fn run_fresh(
     kill: Option<&Arc<temen_jit::Interrupt>>,
 ) -> Result<(JitOutcome, u64), &'static str> {
     let mut host = Host::new();
-    let admitted = admit(m, &host, None)?;
+    let admitted = admit(m, &host, None, false)?;
     let start = Start {
         entry,
         args,
@@ -435,7 +441,7 @@ block 0 (va: i64, vb: i64) {
         let m = temen_text::parse_module(INTERPRETED_ROOT).expect("parse");
         temen_verify::verify_module(&m).expect("verify");
         let mut host = Host::new();
-        assert_eq!(admit(&m, &host, None).err(), Some("imports"));
+        assert_eq!(admit(&m, &host, None, false).err(), Some("imports"));
         let start = Start {
             entry: 0,
             args: &[],

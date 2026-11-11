@@ -60,7 +60,7 @@ fn today<'a>(m: &'a Module, entry: u32, host: Host, locked: bool) -> Lane<'a> {
 fn kernel(m: &Module, entry: u32) -> Lane<'_> {
     Box::new(move |args| {
         let mut h = Host::new();
-        let admitted = jit_kernel::admit(m, &h, None).expect("in the kernel's scope");
+        let admitted = jit_kernel::admit(m, &h, None, false).expect("in the kernel's scope");
         let start = jit_kernel::Start {
             entry,
             args,
@@ -135,7 +135,7 @@ pub fn run(reps: usize) {
         for k in [&crate::ALU, &crate::MEMSUM] {
             let m = parse(k.ir);
             assert_eq!(
-                jit_kernel::admit(&m, &Host::new(), None).err(),
+                jit_kernel::admit(&m, &Host::new(), None, false).err(),
                 Some("no §12 op")
             );
             let mut lanes = [("today", today(&m, 0, Host::new(), false))];
