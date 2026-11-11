@@ -16,7 +16,8 @@
 //! engine's per-run *compile*), leaving steady-state op cost. Times are the **min** over repetitions
 //! (robust to a noisy box). Uses only `std`.
 //!
-//! Run: `cargo run --release --bin temen-bench` (`-- --threads` for the concurrency section only)
+//! Run: `cargo run --release --bin temen-bench` (`-- --threads` for the concurrency section only,
+//! `-- --threads pingpong mutex` for the kernels named)
 
 use std::time::Instant;
 
@@ -26,8 +27,13 @@ use temen_interp::{bytecode, Value};
 fn main() {
     // `--threads`: only the concurrency section (the slow, noisy one), for A/B runs of a scheduler
     // change.
+    // `--threads name…`: only the kernels named.
     if std::env::args().any(|a| a == "--threads") {
-        concurrency();
+        let only: Vec<String> = std::env::args()
+            .skip_while(|a| a != "--threads")
+            .skip(1)
+            .collect();
+        concurrency(&only);
         return;
     }
     // ---- escape-TCB hot paths (decode/verify) ----------------------------------------------
@@ -80,7 +86,7 @@ fn main() {
         });
         println!("{name:>12}  {tw:>10.2}ns  {bc:>10.2}ns  {:>7.2}×", tw / bc);
     }
-    concurrency();
+    concurrency(&[]);
 }
 
 /// **Bytecode concurrency** (#1414 slice 3e): the same threaded and fiber kernels on the cooperative
@@ -88,7 +94,7 @@ fn main() {
 /// per task, on the pump's rules). Per-iteration cost by subtraction, as the A/B above, so each
 /// run's compile, window and thread start-up cancel out. The parallel column is real OS threads, so
 /// it is noisier: compare runs of two builds on the same box, interleaved.
-fn concurrency() {
+fn concurrency(only: &[String]) {
     println!("\nconcurrency (ns per iteration, compute-isolated by subtraction):");
     println!(
         "{:>14}  {:>12}  {:>12}  {:>12}",
@@ -96,15 +102,25 @@ fn concurrency() {
     );
     // (name, source, small_n, large_n).
     let kernels = [
-        ("par_compute", PAR_COMPUTE, 1_000, 101_000),
-        ("mutex", MUTEX, 100, 10_100),
-        ("pingpong", PINGPONG, 100, 5_100),
-        ("spawn_join", SPAWN_JOIN, 10, 1_010),
-        ("fiber_switch", FIBER_SWITCH, 1_000, 101_000),
-        ("fiber_wait", FIBER_WAIT, 1_000, 101_000),
+        ("par_compute", PAR_COMPUTE.into(), 1_000, 101_000),
+        ("mutex", MUTEX.into(), 100, 10_100),
+        ("pingpong", PINGPONG.into(), 100, 5_100),
+        ("pingpong_idle", pingpong_idle(IDLE_PARKED), 100, 2_100),
+        ("spawn_join", SPAWN_JOIN.into(), 10, 1_010),
+        ("fiber_switch", FIBER_SWITCH.into(), 1_000, 101_000),
+        ("fiber_wait", FIBER_WAIT.into(), 1_000, 101_000),
+        (
+            "fiber_wait_idle",
+            fiber_wait_idle(IDLE_PARKED),
+            1_000,
+            21_000,
+        ),
     ];
     for (name, src, small, large) in kernels {
-        let m = ir_from_text(src);
+        if !only.is_empty() && !only.iter().any(|o| o == name) {
+            continue;
+        }
+        let m = ir_from_text(&src);
         let tw = per_iter(&m, small, large, |m, n| {
             let mut fuel = u64::MAX;
             let r = temen_interp::run(m, 0, &[Value::I32(n)], &mut fuel);
@@ -338,6 +354,84 @@ block 4 () {
 }
 "#;
 
+/// How many threads [`pingpong_idle`] parks for good, and fibers [`fiber_wait_idle`].
+const IDLE_PARKED: u32 = 1_000;
+
+/// #2868 — [`PINGPONG`] beside `k` threads parked for good on a word nothing notifies: what a
+/// hand-off costs while idle threads wait, as a thread per idle connection does. A scheduler whose
+/// rounds or notifies walk every park pays for each of them on every hand-off. The root returns
+/// without them: its return ends the run.
+fn pingpong_idle(k: u32) -> String {
+    let partner = &PINGPONG[PINGPONG.find("func (i64, i64)").expect("the partner")..];
+    format!(
+        r#"memory 16
+func (i32) -> (i64) {{
+block 0 (vn: i32) {{
+  vk = i64.const {k}
+  br 1(vn, vk)
+  }}
+block 1 (vn: i32, vk: i64) {{
+  vz = i64.const 0
+  vmore = i64.ne vk vz
+  br_if vmore 2(vn, vk) 3(vn)
+  }}
+block 2 (vn: i32, vk: i64) {{
+  vz = i64.const 0
+  vh = thread.spawn 2 vz vz
+  vone = i64.const 1
+  vk2 = i64.sub vk vone
+  br 1(vn, vk2)
+  }}
+block 3 (vn: i32) {{
+  vz = i64.const 0
+  vn64 = i64.extend_i32_u vn
+  vt = thread.spawn 1 vz vn64
+  br 4(vn64, vt)
+  }}
+block 4 (vi: i64, vt: i32) {{
+  vw = i64.const 16384
+  vcur = i32.atomic.load vw
+  vzero = i32.const 0
+  vmine = i32.eq vcur vzero
+  br_if vmine 6(vi, vt) 5(vi, vt, vcur)
+  }}
+block 5 (vi: i64, vt: i32, vcur: i32) {{
+  vw = i64.const 16384
+  vto = i64.const -1
+  vst = i32.atomic.wait vw vcur vto
+  br 4(vi, vt)
+  }}
+block 6 (vi: i64, vt: i32) {{
+  vw = i64.const 16384
+  vone = i32.const 1
+  i32.atomic.store vw vone
+  vcnt = i32.const 1
+  vk = atomic.notify vw vcnt
+  vone64 = i64.const 1
+  vi2 = i64.sub vi vone64
+  vz = i64.const 0
+  vmore = i64.ne vi2 vz
+  br_if vmore 4(vi2, vt) 7(vt)
+  }}
+block 7 (vt: i32) {{
+  vr_st, vr = thread.join vt
+  return vr
+  }}
+}}
+{partner}func (i64, i64) -> (i64) {{
+block 0 (vsp: i64, varg: i64) {{
+  vw = i64.const 16400
+  vzero = i32.const 0
+  vto = i64.const -1
+  vst = i32.atomic.wait vw vzero vto
+  vr = i64.const 0
+  return vr
+  }}
+}}
+"#
+    )
+}
+
 /// The root spawns a thread that returns its argument and joins it, `n` times in a row.
 const SPAWN_JOIN: &str = r#"memory 16
 func (i32) -> (i64) {
@@ -445,6 +539,69 @@ block 1 () {
   }
 }
 "#;
+
+/// #2868 — [`FIBER_WAIT`] beside `k` fibers parked for good on a word nothing notifies (16400), as
+/// a guest M:N scheduler parks a fiber per idle connection. A notify that walks every parked fiber
+/// for its waiters pays for each of them on every round.
+fn fiber_wait_idle(k: u32) -> String {
+    let waiter = &FIBER_WAIT[FIBER_WAIT.find("func (i64, i64)").expect("the waiter")..];
+    format!(
+        r#"memory 16
+func (i32) -> (i64) {{
+block 0 (vn: i32) {{
+  vk = i64.const {k}
+  br 1(vn, vk)
+  }}
+block 1 (vn: i32, vk: i64) {{
+  vz = i64.const 0
+  vmore = i64.ne vk vz
+  br_if vmore 2(vn, vk) 3(vn)
+  }}
+block 2 (vn: i32, vk: i64) {{
+  vf = ref.func 2
+  vz = i64.const 0
+  vc = cont.new vf vz
+  vs, vv = cont.resume vc vz
+  vone = i64.const 1
+  vk2 = i64.sub vk vone
+  br 1(vn, vk2)
+  }}
+block 3 (vn: i32) {{
+  vf = ref.func 1
+  vz = i64.const 0
+  vk = cont.new vf vz
+  vs0, vv0 = cont.resume vk vz
+  vn64 = i64.extend_i32_u vn
+  br 4(vk, vn64)
+  }}
+block 4 (vk: i64, vi: i64) {{
+  vw = i64.const 16384
+  vcnt = i32.const 1
+  vwoken = atomic.notify vw vcnt
+  vz = i64.const 0
+  vs, vv = cont.resume vk vz
+  vone = i64.const 1
+  vi2 = i64.sub vi vone
+  vmore = i64.ne vi2 vz
+  br_if vmore 4(vk, vi2) 5(vv)
+  }}
+block 5 (vv: i64) {{
+  return vv
+  }}
+}}
+{waiter}func (i64, i64) -> (i64) {{
+block 0 (vsp: i64, varg: i64) {{
+  vw = i64.const 16400
+  vexp = i32.const 0
+  vto = i64.const -1
+  vst = i32.atomic.wait vw vexp vto
+  vr = i64.const 0
+  return vr
+  }}
+}}
+"#
+    )
+}
 
 /// `acc += n; n -= 1` until zero — a pure scalar/branch recurrence (the ALU kernel).
 const ALU: &str = r#"

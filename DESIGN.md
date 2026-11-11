@@ -2378,6 +2378,21 @@ iteration on the pump, ~57 µs on executor 2, which starts a thread per task. Th
 keeps its full scans: it never prunes, so its inspection still reads where an ended thread stopped.
 Pinned in `tasks_tests`.
 
+**A thread parked on a futex costs nothing until its word is notified (#2868, 2026-11-11).** A task
+waiting for good was still live, so every round walked it about a dozen times, the kill check took
+its domain's host lock for it, and every `notify` re-keyed it through its window. Beside 1,000
+threads parked on a word nothing notifies, a pingpong hand-off cost 64 µs on the pump and 200 µs on
+executor 2, against 0.5 and about 9 µs beside none. A futex wait now waits aside from the live list
+(`Waits`): filed under the key its park took, in task order, and under its deadline when it has one.
+A `notify` takes its waiters from its word's queue, lowest task index first as before, so it costs
+what it wakes; a deadline is the deadline index's; a kill, a domain's end and a freeze reach the
+waiters through the members the rules ask for (`Tasks::members`). Each puts the task back in the
+live list. The same hand-off now costs 0.59 µs on the pump and about 10 µs on executor 2, the cost
+of a hand-off beside none. The kill check asks a domain's host once per run of its tasks in the
+live list, not once per task. The debug scheduler files its waits too, and files them again under the keys their sites have once a restore
+or an undo has rebuilt the windows. Pinned in `tasks_tests` and by `temen-bench --threads
+pingpong_idle`.
+
 Pinned constraints (tests in `temen/tests/host_park.rs`, `temen-run/tests/fast_cap.rs`): a parkable
 registration is **never** `fast_cap_resolver`-claimed; **sync ops never pay for parkable ops'
 existence** — no completion id, no table touch unless a handler already returned `Offload`

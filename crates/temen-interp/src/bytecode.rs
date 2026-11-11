@@ -6418,10 +6418,9 @@ fn service_advance(
             }
             Outcome::MemoryNotify { base, count, dst } => {
                 *turn += 1;
-                let win = |env: usize| domains[env].mem.as_ref();
-                let key = futex_key_in(win(tasks[ti].domain), base);
+                let key = futex_key_in(domains[tasks[ti].domain].mem.as_ref(), base);
                 let want = count as u32;
-                let mut woken = wake_waiters(tasks, key, want, win);
+                let mut woken = tasks.notify(key, want);
                 let regs = domains.iter_mut().flat_map(|e| e.fibers.fibers.iter_mut());
                 woken += wake_fiber_waiters(regs, key, want - woken);
                 tasks[ti].deliver(dst, Reg::from_i32(woken as i32));
@@ -8278,6 +8277,9 @@ impl ScheduledDebugRun {
                 aliased,
                 "a checkpoint's aliases name the regions it carries"
             );
+            drop(host);
+            // A wait on an aliased page keys on the region it names now.
+            self.refile_waits();
         }
         self.turn = turn;
         self.clock = c.clock;
@@ -8357,7 +8359,8 @@ impl ScheduledDebugRun {
                     (s, _) => s.clone(),
                 },
                 at_bp: ts.at_bp,
-                answers: None, // a debug session holds no domain
+                answers: None,  // a debug session holds no domain
+                waits_on: None, // filed once the windows are back ([`Self::refile_waits`])
                 lease: ts.lease,
                 // #2001 — a live thread is charged again; the task it replaces hands its charge
                 // back as it drops.
@@ -8372,6 +8375,14 @@ impl ScheduledDebugRun {
         // #1866 — last, once the replaced tasks have handed their charges back: the tree as it stood,
         // which already holds every charge the restored tasks and windows carry.
         self.host().set_budget_tree(&c.budgets);
+        self.refile_waits();
+    }
+
+    /// #2868 — each futex wait filed under its key in the windows as they are now, once a restore or
+    /// an undo has rebuilt the tasks or the windows.
+    fn refile_waits(&mut self) {
+        let domains = &self.domains;
+        self.tasks.file_waits(|env| domains[env].mem.as_ref());
     }
 
     /// The run's result once the root has finished (`None` while still running).
@@ -10583,6 +10594,58 @@ mod tasks_tests {
         let walked: Vec<usize> = tasks.live_mut().map(|(i, _)| i).collect();
         assert_eq!(walked, [0, 2, 3, 4]);
     }
+
+    /// Park task `i` of `tasks` on a futex wait on `key`, timed out at `deadline` if any.
+    fn wait(tasks: &mut Tasks, i: usize, key: super::super::FutexKey, deadline: Option<u64>) {
+        tasks[i].state = TaskState::BlockedWait {
+            addr: 0,
+            site: super::super::FutexSite::Anon(0),
+            deadline,
+            dst: 0,
+        };
+        tasks.park_wait(i, key);
+    }
+
+    /// #2868 — a futex wait waits aside: out of the live list each round walks, still a live task, and
+    /// back in the list, runnable, once a notify on its own word takes it (the lowest task index
+    /// first), its deadline passes, or it ends. A notify costs what it wakes.
+    #[test]
+    fn a_futex_wait_waits_aside_until_its_word_its_deadline_or_its_end() {
+        use super::super::FutexKey;
+        let (a, b) = (FutexKey::Anon(1, 16), FutexKey::Anon(1, 24));
+        let mut tasks: Tasks = (0..5).map(|_| stalled_tests::runnable()).collect();
+        wait(&mut tasks, 3, a, None);
+        wait(&mut tasks, 1, a, None);
+        wait(&mut tasks, 2, b, Some(50));
+        wait(&mut tasks, 4, a, Some(90));
+        assert_eq!(tasks.live().collect::<Vec<_>>(), [0], "only what can move");
+        assert_eq!(tasks.live_count(), 5, "a waiter is live");
+        assert_eq!(tasks.members(), [0, 1, 2, 3, 4]);
+        assert_eq!(tasks.next_deadline(), Some(50));
+        assert_eq!(tasks.notify(a, 2), 2);
+        assert_eq!(
+            tasks.live().collect::<Vec<_>>(),
+            [0, 1, 3],
+            "the lowest indices first"
+        );
+        assert!(matches!(tasks[1].state, TaskState::Runnable));
+        tasks.time_out(60);
+        assert_eq!(tasks.live().collect::<Vec<_>>(), [0, 1, 2, 3]);
+        assert_eq!(
+            tasks.next_deadline(),
+            Some(90),
+            "task 2's deadline has gone with it"
+        );
+        assert_eq!(tasks.notify(b, 1), 0, "nothing waits on b now");
+        // An end takes a waiter out wherever it waits, as `complete` does: here task 4, on `a` and
+        // its deadline.
+        tasks.unpark_wait(4);
+        tasks[4].state = TaskState::Done(Err(Trap::ThreadFault));
+        assert_eq!(tasks.notify(a, u32::MAX), 0);
+        assert_eq!(tasks.next_deadline(), None);
+        tasks.prune();
+        assert_eq!(tasks.live().collect::<Vec<_>>(), [0, 1, 2, 3]);
+    }
 }
 
 /// #1198 — whether task `t`'s process is stopped (SIGTSTP/SIGTTIN/SIGTTOU, before its SIGCONT): a
@@ -12179,6 +12242,27 @@ struct Tasks {
     /// process's trap is its parent's business, reaped as a status, so it does not end the run. The
     /// run's end publishes them for [`super::last_twin_traps`], as the oracle's does (#1665).
     twin_traps: Vec<super::TwinTrap>,
+    /// #2868 — the tasks parked on a futex wait, aside from [`Self::live`].
+    waits: Waits,
+}
+
+/// #2868 — the tasks parked on a futex wait, held aside from the live list ([`Tasks::live`]), so a
+/// round's rules walk only what can move: a thread parked for good costs nothing until its word is
+/// notified, its wait times out, or its domain ends. A notify takes its waiters from its word's
+/// queue, lowest task index first, as a scan of the tasks woke them, and so costs what it wakes.
+/// What ends a wait goes through [`Tasks::end_wait`], which puts the task back in the live list. A
+/// waiting task names its key itself ([`TaskSlot::waits_on`]).
+#[derive(Default)]
+struct Waits {
+    /// Each word's waiters in index order, by the key their parks took ([`site_key_in`]).
+    on: std::collections::HashMap<super::FutexKey, std::collections::VecDeque<usize>>,
+    /// The timed waits, by deadline.
+    due: std::collections::BTreeSet<(u64, usize)>,
+    /// How many wait.
+    n: usize,
+    /// How many wait in each domain that has had a waiter: a domain whose every other task has
+    /// ended is still alive. A domain's count goes with it ([`Tasks::forget_domain`]).
+    in_domain: std::collections::BTreeMap<usize, usize>,
 }
 
 impl std::ops::Deref for Tasks {
@@ -12221,11 +12305,156 @@ impl Tasks {
     }
 
     fn enter(&mut self, i: usize) {
+        self.enter_live(i);
+        if let TaskState::Done(Err(_)) = self.slots[i].state {
+            self.failed.push(i);
+        }
+    }
+
+    fn enter_live(&mut self, i: usize) {
         if let Err(at) = self.live.binary_search(&i) {
             self.live.insert(at, i);
         }
-        if let TaskState::Done(Err(_)) = self.slots[i].state {
-            self.failed.push(i);
+    }
+
+    /// #2868 — task `i`, just parked on a futex wait (`BlockedWait`), keyed `key`, leaves the live
+    /// list until its wait ends ([`Waits`]).
+    fn park_wait(&mut self, i: usize, key: super::FutexKey) {
+        let TaskState::BlockedWait { deadline, .. } = self.slots[i].state else {
+            unreachable!("only a futex wait parks aside");
+        };
+        if let Ok(at) = self.live.binary_search(&i) {
+            self.live.remove(at);
+        }
+        let w = &mut self.waits;
+        let q = w.on.entry(key).or_default();
+        if let Err(at) = q.binary_search(&i) {
+            q.insert(at, i);
+        }
+        if let Some(d) = deadline {
+            w.due.insert((d, i));
+        }
+        w.n += 1;
+        *w.in_domain.entry(self.slots[i].domain).or_default() += 1;
+        self.slots[i].waits_on = Some(key);
+    }
+
+    /// #2868 — task `i` no longer waits aside, however its wait ended: it is back in the live list.
+    /// One that does not wait aside is left as it is.
+    fn unpark_wait(&mut self, i: usize) {
+        let Some(key) = self.slots[i].waits_on.take() else {
+            return;
+        };
+        let w = &mut self.waits;
+        if let Some(q) = w.on.get_mut(&key) {
+            if let Ok(at) = q.binary_search(&i) {
+                q.remove(at);
+            }
+            if q.is_empty() {
+                w.on.remove(&key);
+            }
+        }
+        if let TaskState::BlockedWait {
+            deadline: Some(d), ..
+        } = self.slots[i].state
+        {
+            w.due.remove(&(d, i));
+        }
+        w.n -= 1;
+        if let Some(n) = w.in_domain.get_mut(&self.slots[i].domain) {
+            *n -= 1;
+        }
+        self.enter_live(i);
+    }
+
+    /// #2868 — end task `i`'s futex wait with `status` at its `dst`: it runs on.
+    fn end_wait(&mut self, i: usize, status: i32) {
+        self.unpark_wait(i);
+        if let TaskState::BlockedWait { dst, .. } = self.slots[i].state {
+            self.slots[i].deliver(dst, Reg::from_i32(status));
+            self.slots[i].state = TaskState::Runnable;
+        }
+    }
+
+    /// `memory.notify` on futex `key`: wake up to `count` of its waiting tasks, lowest task index
+    /// first (deterministic), and answer how many it woke.
+    fn notify(&mut self, key: super::FutexKey, count: u32) -> u32 {
+        let mut woken = 0;
+        while woken < count {
+            let Some(&i) = self.waits.on.get(&key).and_then(|q| q.front()) else {
+                break;
+            };
+            self.end_wait(i, super::WAIT_WOKEN);
+            woken += 1;
+        }
+        woken
+    }
+
+    /// Wake every task whose futex wait's deadline the logical `clock` has reached,
+    /// `WAIT_TIMED_OUT` at its `dst`.
+    fn time_out(&mut self, clock: u64) {
+        while let Some(&(due, i)) = self.waits.due.first() {
+            if due > clock {
+                break;
+            }
+            self.end_wait(i, super::WAIT_TIMED_OUT);
+        }
+    }
+
+    /// The earliest deadline among the tasks' futex waits: what the logical clock advances to when no
+    /// task is runnable. An infinite wait has none, so a run whose every waiter is indefinite reaches
+    /// its driver's deadlock exit instead of a `WAIT_TIMED_OUT` the guest never asked for (#1638).
+    fn next_deadline(&self) -> Option<u64> {
+        self.waits.due.first().map(|&(due, _)| due)
+    }
+
+    /// The tasks waiting aside on a futex wait, in no order.
+    fn waiting(&self) -> impl Iterator<Item = usize> + '_ {
+        self.waits.on.values().flatten().copied()
+    }
+
+    /// Whether a task waits aside on a futex wait.
+    fn any_waiting(&self) -> bool {
+        self.waits.n != 0
+    }
+
+    /// The domains a task waits aside in.
+    fn waiting_domains(&self) -> impl Iterator<Item = usize> + '_ {
+        (self.waits.in_domain.iter()).filter_map(|(&k, &n)| (n != 0).then_some(k))
+    }
+
+    /// Whether a task of domain `k` waits aside on a futex wait.
+    fn waits_in(&self, k: usize) -> bool {
+        self.waits.in_domain.get(&k).is_some_and(|&n| n != 0)
+    }
+
+    /// Domain `k` has ended, every task of it gone: its count goes too.
+    fn forget_domain(&mut self, k: usize) {
+        self.waits.in_domain.remove(&k);
+    }
+
+    /// Every task a domain-wide rule reaches (a kill, a domain's end): the live ones and those
+    /// waiting aside, in index order.
+    fn members(&self) -> Vec<usize> {
+        let mut all: Vec<usize> = self.live().chain(self.waiting()).collect();
+        all.sort_unstable();
+        all
+    }
+
+    /// #2868 — file every futex wait under the key its site has in the windows `win` names now: after
+    /// a debug restore or undo rebuilt the tasks or their windows, under the same sites
+    /// ([`super::FutexSite`]).
+    fn file_waits<'a>(&mut self, win: impl Fn(usize) -> Option<&'a Mem>) {
+        let waiting: Vec<usize> = (self.members().into_iter())
+            .filter(|&i| matches!(self.slots[i].state, TaskState::BlockedWait { .. }))
+            .collect();
+        for &i in &waiting {
+            self.unpark_wait(i);
+        }
+        for i in waiting {
+            if let TaskState::BlockedWait { addr, site, .. } = self.slots[i].state {
+                self.park_wait(i, site_key_in(win(self.slots[i].domain), addr, site));
+            }
         }
     }
 
@@ -12253,11 +12482,12 @@ impl Tasks {
     }
 
     /// How many tasks are live: what the `MAX_VCPUS` anti-bomb gate counts, as the oracle's
-    /// scheduler counts `live`.
+    /// scheduler counts `live`. A task waiting aside is live.
     fn live_count(&self) -> usize {
-        (self.live())
+        let running = (self.live())
             .filter(|&i| !matches!(self.slots[i].state, TaskState::Done(_)))
-            .count()
+            .count();
+        running + self.waits.n
     }
 
     /// Drop the tasks that have ended from [`Self::live`], once each executor's rules have seen
@@ -12265,6 +12495,14 @@ impl Tasks {
     /// with them: what a joiner or a reaper reads of an ended task is its result. The debug
     /// scheduler never prunes, so its inspection still reads where a thread ended.
     fn prune(&mut self) {
+        // #2868 — a futex wait waits aside from the first round after its park.
+        debug_assert!(
+            (self.live.iter())
+                .all(|&i| !matches!(self.slots[i].state, TaskState::BlockedWait { .. }))
+                && (self.waiting())
+                    .all(|i| matches!(self.slots[i].state, TaskState::BlockedWait { .. })),
+            "a futex wait waits aside, and only a futex wait does"
+        );
         let slots = &mut self.slots;
         (self.live).retain(|&i| {
             let t = &mut slots[i];
@@ -12304,6 +12542,8 @@ struct TaskSlot {
     /// #2695 step 2 — `Some` on an **activation** of a held domain: a call it runs, at the op's
     /// handler, on the fuel of the caller it answers. It charges its domain no vCPU.
     answers: Option<Box<Answers>>,
+    /// #2868 — the key of the futex wait the task waits aside on ([`Waits`]), while it does.
+    waits_on: Option<super::FutexKey>,
 }
 
 /// #2695 step 2 — the call an activation of a held domain answers ([`TaskSlot::answers`]).
@@ -12330,6 +12570,7 @@ impl TaskSlot {
             live,
             at_bp: false,
             answers: None,
+            waits_on: None,
         }
     }
 
@@ -12790,17 +13031,20 @@ fn freeze_rule_here(site: super::ParkSite) -> super::FreezeRule {
 /// [`freeze_step`]). `true` when it re-admitted one.
 fn admit_parks(tasks: &mut Tasks) -> bool {
     use super::FreezeRule;
-    let mut admitted = false;
+    // The freeze ended each futex wait, not its event: the thaw re-issues it (#1769). #2868 — they
+    // wait aside.
+    debug_assert!(freeze_rule_here(super::ParkSite::Futex) == FreezeRule::Reissue);
+    let waiting: Vec<usize> = tasks.waiting().collect();
+    let mut admitted = !waiting.is_empty();
+    for i in waiting {
+        tasks.end_wait(i, temen_ir::durable_abi::WAIT_FROZEN);
+    }
     for (_, t) in tasks.live_mut() {
         let Some(site) = t.state.park_site() else {
             continue;
         };
         if freeze_rule_here(site) != FreezeRule::Reissue {
             continue;
-        }
-        // The freeze ended this wait, not its event: the thaw re-issues it (#1769).
-        if let TaskState::BlockedWait { dst, .. } = t.state {
-            t.deliver(dst, Reg::from_i32(temen_ir::durable_abi::WAIT_FROZEN));
         }
         t.state = TaskState::Runnable;
         admitted = true;
@@ -12811,13 +13055,14 @@ fn admit_parks(tasks: &mut Tasks) -> bool {
 /// The oracle's `quiesced_parks_only`: something is parked that a freeze could re-admit — a
 /// `svc.wait` (or a resumer idling beside it) or a futex wait — and no futex wait has a deadline.
 fn quiesced_parks_only(tasks: &Tasks, fibers: &[FiberState]) -> bool {
-    let mut any = false;
+    // #2868 — the futex waits wait aside.
+    if tasks.next_deadline().is_some() {
+        return false;
+    }
+    let mut any = tasks.any_waiting();
     for i in tasks.live() {
-        match tasks[i].state {
-            TaskState::BlockedSvc | TaskState::BlockedOnFiber { .. } => any = true,
-            TaskState::BlockedWait { deadline: None, .. } => any = true,
-            TaskState::BlockedWait { .. } => return false,
-            _ => {}
+        if let TaskState::BlockedSvc | TaskState::BlockedOnFiber { .. } = tasks[i].state {
+            any = true;
         }
     }
     for f in fibers {
@@ -13015,7 +13260,7 @@ fn fail_call(
 /// bounce, so only these stops can wait in a leaf's; any other refuses, as a bounce that cannot wait
 /// does. `win` is the task's window, which a futex wait's site is taken on.
 fn hand_off(
-    tasks: &mut [TaskSlot],
+    tasks: &mut Tasks,
     forked_twins: &mut std::collections::BTreeSet<usize>,
     hooked_twins: &std::collections::BTreeSet<usize>,
     ti: usize,
@@ -13034,12 +13279,14 @@ fn hand_off(
         VcpuStop::Wait {
             base, timeout, dst, ..
         } => {
+            let site = win.ok_or(Trap::CapFault)?.futex_site(base);
             tasks[ti].state = TaskState::BlockedWait {
                 addr: base,
-                site: win.ok_or(Trap::CapFault)?.futex_site(base),
+                site,
                 deadline: timeout.map(|t| clock.saturating_add(t)),
                 dst,
             };
+            tasks.park_wait(ti, site_key_in(win, base, site));
             return Ok(None);
         }
         VcpuStop::SpawnSelf { cmd, plan, dst } => {
@@ -13516,17 +13763,35 @@ fn settle_wakes(
     // still mid-step on its thread is marked done too, and its thread drops the stop it brings
     // back). It runs before the exit-hook step below, so the twin retires (WIFSIGNALED via
     // `term_sig`) and the signaller's `waitpid` reaps it in the same settle. Domain-scoped
-    // (invariant 12).
-    let killed: Vec<usize> = (tasks.live())
-        .filter(|&ti2| {
-            let t = &tasks[ti2];
-            !matches!(t.state, TaskState::Done(_))
-                && (domains[t.domain].host.lock_unpoisoned().signal_poll())
-                    .is_some_and(|(_, s)| s.killed())
-        })
-        .collect();
-    for ti2 in killed {
-        complete(tasks, domains, ti2, Err(Trap::ThreadFault));
+    // (invariant 12). #2868 — a domain is asked once for each run of its tasks in the list, and a
+    // task waiting aside is one of a killed domain's members.
+    let mut killed_domains: Vec<usize> = Vec::new();
+    let mut last = None;
+    let alive = (tasks.live())
+        .filter(|&i| !matches!(tasks[i].state, TaskState::Done(_)))
+        .map(|i| tasks[i].domain);
+    for k in alive.chain(tasks.waiting_domains()) {
+        // A domain's tasks are mostly side by side in the list.
+        if last == Some(k) {
+            continue;
+        }
+        last = Some(k);
+        let killed =
+            || (domains[k].host.lock_unpoisoned().signal_poll()).is_some_and(|(_, s)| s.killed());
+        if !killed_domains.contains(&k) && killed() {
+            killed_domains.push(k);
+        }
+    }
+    if !killed_domains.is_empty() {
+        let killed: Vec<usize> = (tasks.members().into_iter())
+            .filter(|&i| {
+                !matches!(tasks[i].state, TaskState::Done(_))
+                    && killed_domains.contains(&tasks[i].domain)
+            })
+            .collect();
+        for ti2 in killed {
+            complete(tasks, domains, ti2, Err(Trap::ThreadFault));
+        }
     }
     // FORK.md §8.6 / #1807 — a child domain that has finished (every task on its domain done, cleanly
     // or not) releases its pipe ends once: the tree-walker's domain-finish `drop_all_pipe_*`. A
@@ -13535,6 +13800,7 @@ fn settle_wakes(
     // is the run's, which its teardown handles.
     // #2229 — a domain's last task to end is in the live list, done, until the next prune: the
     // domains to look at are those of the live list's tasks, each with whether one is still live.
+    // #2868 — a task waiting aside is alive too.
     let mut live = std::collections::BTreeMap::<usize, bool>::new();
     for i in tasks.live() {
         let t = &tasks[i];
@@ -13545,7 +13811,8 @@ fn settle_wakes(
     let mut finished: Vec<usize> = Vec::new();
     let mut ends = Vec::new();
     for (k, live) in live {
-        if !live && released.domains.insert(k) {
+        if !live && !tasks.waits_in(k) && released.domains.insert(k) {
+            tasks.forget_domain(k);
             let mut h = domains[k].host.lock_unpoisoned();
             // #1936 — its end post is signalled, every task of it done, its waiters woken below, in
             // this settle: before the run can be read as deadlocked.
@@ -14232,7 +14499,7 @@ impl CoopSched {
             // #2538 — and while a task waits on a call: its answer is drained between quanta, so a
             // lone runnable task must yield to let it through, or a thread that waits on the world
             // never wakes while another spins on it.
-            let (quantum, preemptible) = if next_wait_deadline(tasks).is_some() || {
+            let (quantum, preemptible) = if tasks.next_deadline().is_some() || {
                 let (mut runnable, mut awaits_call) = (0, false);
                 for t in tasks.live().map(|i| &tasks[i]) {
                     if matches!(t.state, TaskState::Runnable) {
@@ -15441,10 +15708,9 @@ impl SchedCore {
                 // notifying task's own memory + backing identity (mirrors the wait arm), so a notify
                 // from one child's window matches a waiter parked from another child's window on the
                 // same `SharedRegion` byte.
-                let win = |env: usize| domains[env].mem.as_ref();
-                let key = futex_key_in(win(tasks[ti].domain), base);
+                let key = futex_key_in(domains[tasks[ti].domain].mem.as_ref(), base);
                 let want = count as u32;
-                let mut woken = wake_waiters(tasks, key, want, win);
+                let mut woken = tasks.notify(key, want);
                 // §3.6 slice 5a: then event-parked FIBER waiters, in every domain: the root's
                 // registry, then each child domain's.
                 let regs = domains.iter_mut().flat_map(|e| e.fibers.fibers.iter_mut());
@@ -18798,6 +19064,14 @@ impl ThreadRun {
                 g.rouse(j);
             }
         }
+        // #2868 — a task waiting aside needs a rule to go on, until the run is over.
+        if over {
+            for j in g.core.tasks.waiting().collect::<Vec<_>>() {
+                if g.parks.get(j).is_some_and(|p| p.asleep) {
+                    g.rouse(j);
+                }
+            }
+        }
         g.core.tasks.prune();
     }
 
@@ -18899,11 +19173,13 @@ impl ThreadRun {
     /// still counts, as does a runnable task of a stopped process, which the pump's pick skips: only
     /// another task, or an embedder through the external-wake bell, wakes it.
     fn idle(&self, core: &SchedCore) -> bool {
-        core.tasks.live().all(|j| match core.tasks[j].state {
-            TaskState::Done(_) => true,
-            TaskState::Runnable => self.stopped(core, j),
-            _ => matches!(self.park_for(core, j), ParkFor::Wake | ParkFor::Ring(None)),
-        })
+        // #2868 — a futex wait waits aside: one with a deadline moves on its own.
+        core.tasks.next_deadline().is_none()
+            && core.tasks.live().all(|j| match core.tasks[j].state {
+                TaskState::Done(_) => true,
+                TaskState::Runnable => self.stopped(core, j),
+                _ => matches!(self.park_for(core, j), ParkFor::Wake | ParkFor::Ring(None)),
+            })
     }
 
     /// Whether no task can run now: each is done, parked, or a runnable task of a stopped process.
@@ -19209,6 +19485,9 @@ enum Watched {
 fn complete(tasks: &mut Tasks, envs: &mut [Domain], ti: usize, res: Result<Vec<Value>, Trap>) {
     let mut work = vec![(ti, res)];
     while let Some((done, res)) = work.pop() {
+        // #2868 — a task killed in its futex wait ends in the live list, where the rules that look
+        // for an end find it.
+        tasks.unpark_wait(done);
         // #2229 — its domain's teardown finds it here.
         if res.is_err() {
             tasks.failed.push(done);
@@ -19448,7 +19727,7 @@ fn child_ctl(
 /// spawned, as the tree-walker's kill ends a child and its subtree. A domain with nothing left alive
 /// is left as it is, its children with it: killing a child that has ended does nothing.
 fn kill_domain(tasks: &mut Tasks, envs: &mut [Domain], k: usize) {
-    let live: Vec<usize> = (tasks.live())
+    let live: Vec<usize> = (tasks.members().into_iter())
         .filter(|&i| tasks[i].domain == k && !matches!(tasks[i].state, TaskState::Done(_)))
         .collect();
     if live.is_empty() {
@@ -19482,14 +19761,14 @@ fn site_key_in(m: Option<&Mem>, addr: u64, site: super::FutexSite) -> super::Fut
 
 /// `memory.wait` at `base` in task `ti`'s window `mem`: `WAIT_NOT_EQUAL` at `dst` now if the word
 /// already changed (the cooperative analogue of the futex compare-under-lock), else park the task at
-/// its address's site until a `notify` ([`wake_waiters`]) or the `deadline` on the logical `clock` —
+/// its address's site until a `notify` ([`Tasks::notify`]) or the `deadline` on the logical `clock` —
 /// `None` for an infinite wait, which ends by `notify` or not at all (#1638). The site is taken
 /// before the word is read, as Linux takes the key: a page another thread remaps in between is
 /// then read through its new mapping, and the wait answers not-equal instead of parking on a key
 /// the read did not see.
 #[allow(clippy::too_many_arguments)] // the wait op's operands
 fn wait_task(
-    tasks: &mut [TaskSlot],
+    tasks: &mut Tasks,
     ti: usize,
     mem: Option<&Mem>,
     clock: u64,
@@ -19509,6 +19788,7 @@ fn wait_task(
             deadline: timeout.map(|t| clock.saturating_add(t)),
             dst,
         };
+        tasks.park_wait(ti, site_key_in(mem, base, site));
     }
 }
 
@@ -19521,7 +19801,7 @@ fn wait_task(
 /// only for a fiber's park. The one wait rule of the pump and the debugger (#2215).
 #[allow(clippy::too_many_arguments)] // the wait op's operands
 fn futex_wait(
-    tasks: &mut [TaskSlot],
+    tasks: &mut Tasks,
     ti: usize,
     fibers: &mut [FiberState],
     fiber_sp: &mut [u64],
@@ -19569,7 +19849,7 @@ fn futex_wait(
     }
 }
 
-/// `memory.notify`'s fiber half: after the task waiters ([`wake_waiters`]), wake up to `want`
+/// `memory.notify`'s fiber half: after the task waiters ([`Tasks::notify`]), wake up to `want`
 /// event-parked fibers on `key`, in `fibers` order — each domain's registry in turn, lowest slot
 /// first, so the wake order is deterministic like the task scan. Returns how many it woke; a woken
 /// fiber's status is delivered when a `cont.resume` claims it.
@@ -19628,7 +19908,7 @@ fn next_timeout<'a>(tasks: &Tasks, fibers: impl Iterator<Item = &'a FiberState>)
     };
     fibers
         .filter_map(fiber_deadline)
-        .chain(next_wait_deadline(tasks))
+        .chain(tasks.next_deadline())
         .min()
 }
 
@@ -19741,7 +20021,7 @@ fn interrupt_parks(tasks: &mut Tasks, domains: &[Domain]) -> bool {
 /// Time out every futex wait whose deadline `clock` has reached: a task's (`WAIT_TIMED_OUT` at its
 /// `dst`), and an event-parked fiber's in any domain's registry (`fibers`), made claimable with it.
 fn time_out_due(tasks: &mut Tasks, fibers: &mut [&mut Vec<FiberState>], clock: u64) {
-    time_out_waits(tasks, clock);
+    tasks.time_out(clock);
     for f in fibers.iter_mut().flat_map(|reg| reg.iter_mut()) {
         if let FiberState::WaitParked {
             deadline: Some(deadline),
@@ -19756,72 +20036,14 @@ fn time_out_due(tasks: &mut Tasks, fibers: &mut [&mut Vec<FiberState>], clock: u
     }
 }
 
-/// `memory.notify` on futex `key`: wake up to `count` waiting tasks whose key matches, lowest task
-/// index first (deterministic), each keyed through its own window, `win(env)` ([`site_key_in`]).
-/// Returns how many it woke.
-fn wake_waiters<'a>(
-    tasks: &mut Tasks,
-    key: super::FutexKey,
-    count: u32,
-    win: impl Fn(usize) -> Option<&'a Mem>,
-) -> u32 {
-    let mut woken = 0u32;
-    for (_, t) in tasks.live_mut() {
-        if woken >= count {
-            break;
-        }
-        if let TaskState::BlockedWait {
-            addr, site, dst, ..
-        } = t.state
-        {
-            if site_key_in(win(t.domain), addr, site) == key {
-                t.deliver(dst, Reg::from_i32(super::WAIT_WOKEN));
-                t.state = TaskState::Runnable;
-                woken += 1;
-            }
-        }
-    }
-    woken
-}
-
 /// #1936 — wake every task and event-parked fiber waiting on region word `w`, in every domain: a
 /// post's `signal` ([`Outcome::WakeRegion`]), or a child's end post at its end. `memory.notify` with
 /// no count, keyed as the word's waiters keyed their parks, whichever window they map it in.
 fn wake_region(tasks: &mut Tasks, domains: &mut [Domain], w: &super::RegionWake) {
     let key = w.key();
-    wake_waiters(tasks, key, u32::MAX, |env| domains[env].mem.as_ref());
+    tasks.notify(key, u32::MAX);
     let regs = domains.iter_mut().flat_map(|e| e.fibers.fibers.iter_mut());
     wake_fiber_waiters(regs, key, u32::MAX);
-}
-
-/// The earliest deadline among the tasks' futex waits — what the logical clock advances to when no
-/// task is runnable. An infinite wait has none, so a run whose every waiter is indefinite reaches
-/// its driver's deadlock exit instead of a `WAIT_TIMED_OUT` the guest never asked for (#1638).
-fn next_wait_deadline(tasks: &Tasks) -> Option<u64> {
-    (tasks.live().map(|i| &tasks[i]))
-        .filter_map(|t| match t.state {
-            TaskState::BlockedWait { deadline, .. } => deadline,
-            _ => None,
-        })
-        .min()
-}
-
-/// Wake every task whose futex wait's deadline the logical `clock` has reached, `WAIT_TIMED_OUT` at
-/// its `dst`.
-fn time_out_waits(tasks: &mut Tasks, clock: u64) {
-    for (_, t) in tasks.live_mut() {
-        if let TaskState::BlockedWait {
-            deadline: Some(deadline),
-            dst,
-            ..
-        } = t.state
-        {
-            if deadline <= clock {
-                t.deliver(dst, Reg::from_i32(super::WAIT_TIMED_OUT));
-                t.state = TaskState::Runnable;
-            }
-        }
-    }
 }
 
 /// Domain lifetime & teardown, cooperative-bytecode form (DESIGN.md §12, owner 2026-07-24;
@@ -19857,9 +20079,11 @@ fn teardown_domains(
                     // The root domain: a live member left means the sweep hasn't run yet (once
                     // every member is Done the caller's root check ends the run).
                     0 if !rests
-                        && tasks.live().any(|u| {
-                            tasks[u].domain == 0 && !matches!(tasks[u].state, TaskState::Done(_))
-                        }) =>
+                        && (tasks.waits_in(0)
+                            || tasks.live().any(|u| {
+                                tasks[u].domain == 0
+                                    && !matches!(tasks[u].state, TaskState::Done(_))
+                            })) =>
                     {
                         return Some((0, *trap));
                     }
@@ -19887,7 +20111,9 @@ fn teardown_domains(
         if env == 0 && rests {
             ended = Some(trap);
         }
-        let members: Vec<usize> = (tasks.live()).filter(|&i| tasks[i].domain == env).collect();
+        let members: Vec<usize> = (tasks.members().into_iter())
+            .filter(|&i| tasks[i].domain == env)
+            .collect();
         for i in members {
             // A kill that reaches a joiner may have ended a later member already.
             if !matches!(tasks[i].state, TaskState::Done(_)) {
