@@ -2792,7 +2792,7 @@ impl Domain {
         // those bits stay clear — a post-thaw spawn correctly reuses them.)
         if let Some(table) = self.fiber_table() {
             let mask: u64 = runs.iter().fold(0, |m, r| m | (1u64 << r.ctx));
-            table.seed_vcpu_mask(mask);
+            table.seed_vcpu_contexts(mask);
         }
 
         // (2) §12.8 concurrent-thaw stage 2: **re-spawn each frozen vCPU on its own OS thread**, rewinding

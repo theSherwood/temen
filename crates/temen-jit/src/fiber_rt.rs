@@ -131,6 +131,7 @@ const FIBER_STACK: usize = temen_ir::FIBER_STACK as usize;
 // register the instrumented IR reads) points at the running context's region — no shared SP word.
 /// The shadow arena — one definition of placement (see the module note above).
 pub use temen_ir::durable_abi::ShadowArena;
+use temen_ir::durable_abi::ShadowContexts;
 /// State-word value meaning "freeze armed" — the mid-run freeze trigger (must match
 /// `temen-interp`'s `STATE_ARMED`). On an armed durable run the runtime counts down the arena's
 /// fiber-safepoint countdown at each fiber safepoint and promotes the freeze word to `UNWINDING` at 0.
@@ -421,12 +422,9 @@ struct TableState {
     /// (so handle values match across backends). A freed slot keeps its bumped generation, so reuse
     /// is ABA-safe; the table is bounded by the *peak concurrent* fiber count, not the lifetime total.
     free: BinaryHeap<Reverse<usize>>,
-    /// **Occupied** durable vCPU shadow contexts (slice 3.3), a bitmask over contexts
-    /// `1..=MAX_SHADOW_CTX` (bit `c` set ⇒ context `c` is live) — the JIT mirror of the interp
-    /// registry's `vcpu_mask`. Spawned vCPUs grow **down** from `MAX_SHADOW_CTX` while fibers grow
-    /// **up** from context 1; a child's bit is freed when it finishes, so the bound is *peak
-    /// concurrent* vCPUs. Only touched on a durable run (state ≠ NORMAL ⇒ single-worker).
-    vcpu_mask: u64,
+    /// The durable shadow contexts the domain's spawned vCPUs hold — the allocator every engine
+    /// shares ([`ShadowContexts`], #2878). Only touched on a durable run.
+    contexts: ShadowContexts,
     /// #2112 — per slot: its fiber's charge on the domain's node, handed back when the fiber returns
     /// ([`SharedFiberTable::free_slot`]) or its domain ends ([`SharedFiberTable::release_charges`]).
     /// Grows with `slots` (same index), as the interpreter registry's charges do.
@@ -496,7 +494,7 @@ impl SharedFiberTable {
             state: Mutex::new(TableState {
                 slots: Vec::new(),
                 free: BinaryHeap::new(),
-                vcpu_mask: 0,
+                contexts: ShadowContexts::default(),
                 charges: Vec::new(),
             }),
             max_fibers: max_fibers.clamp(1, MAX_FIBERS),
@@ -510,40 +508,24 @@ impl SharedFiberTable {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Reserve the **highest free** durable vCPU shadow context above the fiber pool (slice 3.3,
-    /// mirroring the interp's `reserve_vcpu_context`): spawned vCPUs grow down from `MAX_SHADOW_CTX`
-    /// while fibers occupy contexts `1..=slots.len()`, so the picked context must stay clear of them.
-    /// Reusing a freed (cleared) bit is the recycling that bounds the pool to peak-concurrent vCPUs.
-    /// `None` if the reserve is full (the vCPU pool growing down would meet the fibers growing up).
+    /// Reserve a durable vCPU shadow context for a spawned child: the highest free one above the
+    /// fiber pool ([`ShadowContexts::reserve`]). `None` if the reserve is full.
     pub(crate) fn reserve_vcpu_context(&self) -> Option<usize> {
         let mut t = self.lock();
-        let floor = t.slots.len(); // fibers occupy contexts 1..=slots.len()
-        let mut c = self.shadow.ctx_ceiling();
-        while c > floor {
-            if t.vcpu_mask & (1u64 << c) == 0 {
-                t.vcpu_mask |= 1u64 << c;
-                return Some(c);
-            }
-            c -= 1;
-        }
-        None
+        let fiber_slots = t.slots.len();
+        t.contexts.reserve(self.shadow, fiber_slots)
     }
 
-    /// Free a spawned vCPU's shadow context for reuse (slice 3.3): called when the child genuinely
-    /// finishes (a freeze-unwound child keeps it for thaw). A no-op for an out-of-range context.
+    /// Free a spawned vCPU's shadow context when the child genuinely finishes (a freeze-unwound child
+    /// keeps it for thaw).
     pub(crate) fn free_vcpu_context(&self, ctx: usize) {
-        if (1..=self.shadow.ctx_ceiling()).contains(&ctx) {
-            self.lock().vcpu_mask &= !(1u64 << ctx);
-        }
+        self.lock().contexts.free(ctx);
     }
 
-    /// Seed the durable vCPU-context occupancy a **thaw** re-establishes (§12.8 4A.6): the re-attached
-    /// children reclaim exactly the contexts they held at freeze (derived from their restored
-    /// shadow-SPs, which can be a sparse/gappy set after recycling), so a post-thaw spawn allocates into a
-    /// genuinely-free context instead of colliding with a re-attached sibling. Called by the concurrent
-    /// `thaw_reattach_and_run`.
-    pub(crate) fn seed_vcpu_mask(&self, mask: u64) {
-        self.lock().vcpu_mask = mask;
+    /// Seed the vCPU contexts a **thaw** re-establishes (§12.8 4A.6): the re-attached children reclaim
+    /// exactly the contexts they held at freeze, so a post-thaw spawn allocates into a free one.
+    pub(crate) fn seed_vcpu_contexts(&self, mask: u64) {
+        self.lock().contexts.seed(self.shadow, mask);
     }
 
     /// Ceiling pre-check (no allocation yet): would one more fiber pass [`MAX_FIBERS`]? Checked
@@ -560,13 +542,26 @@ impl SharedFiberTable {
     /// `claim_gen` — and only when none is free does the table grow. `None` if a racing allocation
     /// filled the domain quota since [`Self::has_room`]. `charge` is the fiber's
     /// ([`Self::fiber_charge`]), held while the slot is its; a refusal drops it, handing it back.
-    fn create(&self, fiber: Fiber, func: i32, arg0: i64, charge: FiberCharge) -> Option<i64> {
+    fn create(
+        &self,
+        fiber: Fiber,
+        func: i32,
+        arg0: i64,
+        charge: FiberCharge,
+        durable: bool,
+    ) -> Option<i64> {
         let mut t = self.lock();
         let reuse = t.free.peek().map(|&Reverse(s)| s);
         if reuse.is_none() && t.slots.len() + 1 >= self.max_fibers {
             return None;
         }
         let slot = reuse.unwrap_or(t.slots.len());
+        // #2878 — a durable fiber's resume writes its context's words (`slot + 1`) with raw host
+        // stores, so the context must lie inside the arena and below every live vCPU's, exactly as
+        // the oracle refuses ([`ShadowContexts::fiber_fits`]).
+        if durable && !t.contexts.fiber_fits(self.shadow, slot) {
+            return None;
+        }
         // A reused slot keeps its finished occupant's generation (the ABA guard); a fresh slot is 0.
         let generation = if reuse.is_some() {
             t.slots[slot].own.generation()
@@ -1229,10 +1224,15 @@ pub(crate) unsafe extern "C" fn fiber_new(vm: u64, funcref: i32, arg0: u64) -> i
     };
 
     let rt = &*rt;
-    match rt.table.create(fiber, funcref, arg0 as i64, charge) {
+    match rt
+        .table
+        .create(fiber, funcref, arg0 as i64, charge, rt.durable)
+    {
         Some(handle) => handle,
         None => {
-            fault(vm); // a sibling vCPU filled the domain quota since the pre-check
+            // A sibling vCPU filled the domain quota since the pre-check, or (durable) the fiber's
+            // shadow context has no room.
+            fault(vm);
             -1
         }
     }
@@ -2207,8 +2207,8 @@ mod vcpu_ctx_tests {
         TEST_ARENA.ctx_ceiling()
     }
 
-    // The durable vCPU-context allocator (slice 3.3): top-down reservation above the fiber pool, with
-    // free-then-reuse (recycling) and a thaw-seed — the JIT mirror of the interp registry's `vcpu_mask`.
+    // The durable vCPU-context allocator (slice 3.3, the shared `ShadowContexts`): top-down reservation
+    // above the fiber pool, with free-then-reuse (recycling) and a thaw-seed.
     #[test]
     fn reserve_is_top_down_and_recycles() {
         let t = SharedFiberTable::new(MAX_FIBERS, TEST_ARENA, None);
@@ -2221,10 +2221,11 @@ mod vcpu_ctx_tests {
         t.free_vcpu_context(top);
         assert_eq!(t.reserve_vcpu_context(), Some(top));
 
-        // A thaw seed replaces the occupancy wholesale; reserve then avoids the seeded bit.
-        t.seed_vcpu_mask(1 << (top - 1));
-        assert_eq!(t.reserve_vcpu_context(), Some(top));
-        assert_eq!(t.reserve_vcpu_context(), Some(top - 2)); // skips the seeded one
+        // A thaw seed adds the contexts the re-attached children hold — it never drops one already
+        // reserved (#2878: the JIT's seed used to replace the mask; the oracle's always added).
+        t.seed_vcpu_contexts(1 << (top - 4));
+        assert_eq!(t.reserve_vcpu_context(), Some(top - 3));
+        assert_eq!(t.reserve_vcpu_context(), Some(top - 5)); // skips the seeded one
     }
 
     // §12.8 4A.6: a recycled-context freeze re-attaches a **sparse/gappy** vCPU set — a middle context
@@ -2236,7 +2237,7 @@ mod vcpu_ctx_tests {
         let top = top_ctx();
         let (hi, mid, lo) = (top, top - 1, top - 2);
         // Re-attach two live children at `hi` and `lo`; `mid` is the recycled gap between them.
-        t.seed_vcpu_mask((1 << hi) | (1 << lo));
+        t.seed_vcpu_contexts((1 << hi) | (1 << lo));
         // A post-thaw spawn reserves the highest free context — the recycled gap, not a re-attached one.
         assert_eq!(
             t.reserve_vcpu_context(),

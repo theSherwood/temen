@@ -682,6 +682,70 @@ pub mod durable_abi {
             self.size() > 0 && self.base / page <= last && first <= (self.end - 1) / page
         }
     }
+
+    /// The **shadow contexts** a durable domain's spawned vCPUs hold (bit `c` set ⇒ context `c`), and
+    /// the one rule every engine hands contexts out by (#2878; INVARIANTS.md #15). The root is
+    /// context 0. Fibers grow **up** from context 1 (registry slot `s` is context `s + 1`); a spawned
+    /// vCPU takes the **highest free** context above every fiber slot, so the two pools only meet when
+    /// the arena is full. Nothing is handed out past the arena or into the other pool: a refusal is a
+    /// clean `FiberFault` / `ThreadFault`, never a region another context owns or one outside the
+    /// arena (the host writes a context's words with raw stores). A freed context is reused, so the
+    /// bound is *peak concurrent* vCPUs, not the lifetime total.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+    pub struct ShadowContexts(u64);
+
+    impl ShadowContexts {
+        /// The highest context the vCPU pool may use: the arena's ceiling, held to the 64 bits of the
+        /// mask (the verifier already holds a declared arena to [`MAX_SHADOW_CONTEXTS`]).
+        fn ceiling(arena: ShadowArena) -> usize {
+            arena.ctx_ceiling().min(MAX_SHADOW_CONTEXTS - 1)
+        }
+
+        /// The bits a vCPU may hold: contexts `1..=ceiling`.
+        fn pool(arena: ShadowArena) -> u64 {
+            let top = Self::ceiling(arena);
+            if top == 0 {
+                0
+            } else {
+                (u64::MAX >> (63 - top)) & !1
+            }
+        }
+
+        /// Reserve the highest free context above `fiber_slots` fiber slots (they hold contexts
+        /// `1..=fiber_slots`, live or freed). `None` when the vCPU pool growing down would meet them.
+        pub fn reserve(&mut self, arena: ShadowArena, fiber_slots: usize) -> Option<usize> {
+            let mut c = Self::ceiling(arena);
+            while c > fiber_slots {
+                if self.0 & (1 << c) == 0 {
+                    self.0 |= 1 << c;
+                    return Some(c);
+                }
+                c -= 1;
+            }
+            None
+        }
+
+        /// Free a vCPU's context when it genuinely finishes (a freeze-unwound vCPU keeps its region
+        /// for the thaw). A no-op for the root and for a context no vCPU can hold.
+        pub fn free(&mut self, ctx: usize) {
+            if (1..64).contains(&ctx) {
+                self.0 &= !(1 << ctx);
+            }
+        }
+
+        /// Add the contexts a thaw re-establishes: the re-spawned vCPUs reclaim exactly the contexts
+        /// they held at the freeze (with recycling, a sparse set). Bits outside the pool are ignored.
+        pub fn seed(&mut self, arena: ShadowArena, mask: u64) {
+            self.0 |= mask & Self::pool(arena);
+        }
+
+        /// Whether a durable fiber in registry slot `slot` may take its context `slot + 1`: the
+        /// region lies inside the arena and below every live vCPU's.
+        pub fn fiber_fits(self, arena: ShadowArena, slot: usize) -> bool {
+            let ctx = slot.saturating_add(1);
+            ctx <= Self::ceiling(arena) && (self.0.trailing_zeros() as usize) > ctx
+        }
+    }
 }
 
 /// The **op-17 spawn config record** (CONSOLIDATION.md §3/§3c/§3d): the little-endian layout every
@@ -8118,6 +8182,50 @@ mod page0_tests {
             assert!(!d::ShadowArena::EMPTY.fences(0, u64::MAX / page, page));
         }
         assert!(fenced(1 << 16, 1 << 17, 1 << 16) && !fenced(1 << 16, 1 << 16, 1 << 16));
+    }
+
+    /// #2878: fibers take contexts up from 1, vCPUs the highest free one above every fiber slot, and
+    /// neither pool is handed a region past the arena or one the other pool holds.
+    #[test]
+    fn shadow_contexts_keep_the_pools_apart_and_inside_the_arena() {
+        // Eight regions: the root's (0) and contexts 1..=7.
+        let arena = d::ShadowArena::new(1 << 16, (1 << 16) + 8 * d::DEFAULT_SHADOW_STRIDE);
+        assert_eq!(arena.ctx_ceiling(), 7);
+        let mut c = d::ShadowContexts::default();
+        // With no vCPU live, fiber slots 0..=6 (contexts 1..=7) fit and slot 7 (context 8) is past
+        // the arena.
+        assert!((0..7).all(|s| c.fiber_fits(arena, s)));
+        assert!(!c.fiber_fits(arena, 7) && !c.fiber_fits(arena, usize::MAX));
+        // vCPUs grow down, above the fiber slots already handed out.
+        assert_eq!(c.reserve(arena, 2), Some(7));
+        assert_eq!(c.reserve(arena, 2), Some(6));
+        // A fiber must stay below the lowest live vCPU context (6): slots 0..=4 fit, slot 5 does not.
+        assert!(c.fiber_fits(arena, 4) && !c.fiber_fits(arena, 5));
+        // The pools meet: contexts 3..=5 are left above two fiber slots, then none.
+        assert_eq!(c.reserve(arena, 2), Some(5));
+        assert_eq!(c.reserve(arena, 2), Some(4));
+        assert_eq!(c.reserve(arena, 2), Some(3));
+        assert_eq!(c.reserve(arena, 2), None);
+        // Freeing recycles; the root and out-of-pool contexts are no-ops.
+        c.free(6);
+        c.free(0);
+        c.free(63);
+        c.free(usize::MAX);
+        assert_eq!(c.reserve(arena, 2), Some(6));
+        // A seed adds (a thaw's re-attached set) and ignores bits no vCPU can hold.
+        let mut t = d::ShadowContexts::default();
+        t.seed(arena, (1 << 7) | (1 << 3) | 1 | (1 << 9));
+        assert_eq!(t, {
+            let mut want = d::ShadowContexts::default();
+            want.seed(arena, (1 << 7) | (1 << 3));
+            want
+        });
+        assert_eq!(t.reserve(arena, 0), Some(6));
+        assert!(t.fiber_fits(arena, 1) && !t.fiber_fits(arena, 2));
+        // An arena with no regions hands nothing out.
+        let mut e = d::ShadowContexts::default();
+        assert_eq!(e.reserve(d::ShadowArena::EMPTY, 0), None);
+        assert!(!e.fiber_fits(d::ShadowArena::EMPTY, 0));
     }
 }
 

@@ -762,3 +762,82 @@ fn a_consumed_park_frozen_mid_delivery_redelivers_on_the_jit() {
     begin_thaw(&mut jsnap, TEST_ARENA, 0);
     jit_thaw(&jsnap, &jr, "JIT-frozen consumed park thawed on the JIT");
 }
+
+/// #2878 — a durable fiber's context (`slot + 1`) must lie inside the arena and below every live
+/// vCPU's: its resume writes the context's words with raw host stores. The root keeps creating fibers
+/// that suspend (so each holds its slot) and counts them in the window, above the arena. `TEST_ARENA` holds 11 regions —
+/// the root's and contexts 1..=10 — so the 11th fiber (slot 10, context 11) has no region: the
+/// tree-walker traps `FiberFault` there, and the JIT must trap at the same fiber. Before the fix it
+/// handed the slot out and its resumes wrote past the arena, and soon past the window.
+#[test]
+fn jit_durable_fiber_past_the_arena_faults_like_the_oracle() {
+    let src = "memory 17 shadow 16448 65536\n\
+        func () -> (i64) {\n\
+        block 0 () {\n\
+        \x20 v0 = i64.const 0\n\
+        \x20 br 1(v0)\n\
+          }\n\
+        block 1 (v0: i64) {\n\
+        \x20 v1 = ref.func 1\n\
+        \x20 v2 = cont.new v1 v0\n\
+        \x20 v3 = i64.const 0\n\
+        \x20 v4, v5 = cont.resume v2 v3\n\
+        \x20 v6 = i64.const 1\n\
+        \x20 v7 = i64.add v0 v6\n\
+        \x20 v8 = i64.const 65600\n\
+        \x20 i64.store v8 v7\n\
+        \x20 v9 = i64.const 64\n\
+        \x20 v10 = i64.lt_s v7 v9\n\
+        \x20 br_if v10 1(v7) 2(v7)\n\
+          }\n\
+        block 2 (v0: i64) {\n\
+        \x20 return v0\n\
+          }\n\
+        }\n\
+        func (i64, i64) -> (i64) {\n\
+        block 0 (v0: i64, v1: i64) {\n\
+        \x20 v2 = i64.const 1\n\
+        \x20 v3 = suspend v2\n\
+        \x20 return v3\n\
+          }\n\
+        }\n";
+    let m = parse_module(src).expect("parse");
+    verify_module(&m).expect("verify");
+    assert_eq!(
+        TEST_ARENA.ctx_ceiling(),
+        10,
+        "the arena holds contexts 0..=10"
+    );
+    let created = |win: &[u8]| u64::from_le_bytes(win[65600..65608].try_into().expect("8 bytes"));
+
+    let mut ihost = Host::new();
+    ihost.set_durable(true);
+    let iwin = init_durable_window(WINDOW, TEST_ARENA);
+    let mut fuel = 10_000_000u64;
+    let (ires, isnap) =
+        run_capture_reserved_with_host(&m, 0, &[], &mut fuel, &iwin, WINDOW_LOG2, &mut ihost);
+    assert!(
+        matches!(ires, Err(temen_interp::Trap::FiberFault)),
+        "the oracle refuses the fiber with no region: {ires:?}"
+    );
+    assert_eq!(created(&isnap), 10, "the oracle ran ten fibers first");
+
+    let mut jhost = Host::new();
+    let jwin = init_durable_window(WINDOW, TEST_ARENA);
+    let (jout, jsnap, DurableResidue { .. }) = compile_and_run_durable(
+        &m,
+        0,
+        &[],
+        &jwin,
+        WINDOW_LOG2,
+        temen_run::cap_thunk,
+        &mut jhost as *mut Host as *mut c_void,
+        DurableRun::default(),
+    )
+    .expect("JIT compiles + runs the durable fiber module");
+    assert!(
+        matches!(jout, JitOutcome::Trapped(temen_jit::TrapKind::FiberFault)),
+        "the JIT refuses the same fiber: {jout:?}"
+    );
+    assert_eq!(created(&jsnap), 10, "the JIT ran the same ten fibers");
+}

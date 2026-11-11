@@ -3156,7 +3156,7 @@ fn seed_thread(
     live_ids.insert(ff.task as TaskId, cid);
     s.live += 1;
     let ctx = p.arena().ctx_of_sp(ff.shadow_sp);
-    p.domain.registry.seed_vcpu_mask(1 << ctx);
+    p.domain.registry.seed_vcpu_contexts(p.arena(), 1 << ctx);
     // It joins its domain, as its spawn did ([`Domain`]).
     let mut child = Box::new(VCpu::new(
         Arc::clone(&p.domain),
@@ -12022,6 +12022,7 @@ fn freeze_has_landed(mem: Option<&dyn GuestMem>) -> bool {
 /// The shadow arena: where every durable-runtime word sits — the per-context regions, and the
 /// arena's control words in context 0's region header (one definition of placement).
 pub use temen_ir::durable_abi::ShadowArena;
+use temen_ir::durable_abi::ShadowContexts;
 /// The region stride an arena declares unless it names its own: context `i` occupies
 /// `[ShadowArena::region_base(i), +stride)`, 4 KiB by default. The transform's shadow-overflow
 /// guard bounds each push by the arena's stride (#1683), so a context recursed deeper than one
@@ -12649,12 +12650,9 @@ struct RegState {
     /// top-down vCPU pool) and bounding the table to the *peak concurrent* fiber count rather than the
     /// lifetime total. A finished slot's generation is already bumped, so reuse is ABA-safe.
     free: BinaryHeap<Reverse<usize>>,
-    /// **Occupied** durable vCPU shadow contexts (slice 3.2.2 + context recycling): a bitmask over
-    /// contexts `1..=MAX_SHADOW_CTX` (bit `c` set ⇒ context `c` is live). The root spawns children that
-    /// grow **down** from `MAX_SHADOW_CTX` while fibers grow **up** from context 1; a child's context is
-    /// *freed* (its bit cleared) when it genuinely finishes, so the bound is now *peak concurrent* vCPUs
-    /// rather than the lifetime total. `MAX_SHADOW_CTX` is 15, so a `u16` holds every context bit.
-    vcpu_mask: u64,
+    /// The durable shadow contexts the domain's spawned vCPUs hold — the allocator every engine
+    /// shares ([`ShadowContexts`], #2878).
+    contexts: ShadowContexts,
 }
 
 impl FiberRegistry {
@@ -12668,7 +12666,7 @@ impl FiberRegistry {
                 pending: Vec::new(),
                 charges: Vec::new(),
                 free: BinaryHeap::new(),
-                vcpu_mask: 0,
+                contexts: ShadowContexts::default(),
             }),
         }
     }
@@ -12702,43 +12700,25 @@ impl FiberRegistry {
         }
     }
 
-    /// Reserve the next durable vCPU shadow-context (slice 3.2.2): the `thread.spawn` path calls this
-    /// to claim a top-down region (`MAX_SHADOW_CTX`, `−1`, …) for a freshly spawned child. `None` if
-    /// the reserve is full (the vCPU pool growing down would meet the fiber pool growing up) — a clean
-    /// `ThreadFault`, never an overlap. Atomic with the fiber count under the registry lock.
+    /// Reserve a durable vCPU shadow context for a freshly spawned child (`thread.spawn`): the highest
+    /// free one above the fiber pool ([`ShadowContexts::reserve`]). `None` if the reserve is full — a
+    /// clean `ThreadFault`, never an overlap. Atomic with the fiber count under the registry lock.
     fn reserve_vcpu_context(&self, arena: ShadowArena) -> Option<usize> {
         let mut t = self.lock();
-        // Hand out the **highest free** context above the fiber pool (`fibers.len()` occupies contexts
-        // `1..=fibers.len()`). Top-down keeps the vCPU pool clear of the upward-growing fibers; reusing
-        // a freed (cleared) bit is the recycling that lifts the lifetime cap to peak-concurrent.
-        let floor = t.fibers.len();
-        let mut c = arena.ctx_ceiling();
-        while c > floor {
-            if t.vcpu_mask & (1u64 << c) == 0 {
-                t.vcpu_mask |= 1u64 << c;
-                return Some(c);
-            }
-            c -= 1;
-        }
-        None // the reserve is full (the vCPU pool growing down would meet the fibers growing up)
+        let fiber_slots = t.fibers.len();
+        t.contexts.reserve(arena, fiber_slots)
     }
 
-    /// Free a spawned vCPU's shadow context for reuse (context recycling): called when the child
-    /// **genuinely finishes** (not a freeze-unwind, which keeps the region for thaw). A no-op for the
-    /// root / a non-durable child (context 0).
+    /// Free a spawned vCPU's shadow context when the child **genuinely finishes** (not a
+    /// freeze-unwind, which keeps the region for thaw). A no-op for the root / a non-durable child.
     fn free_vcpu_context(&self, ctx: usize) {
-        if (1..64).contains(&ctx) {
-            self.lock().vcpu_mask &= !(1u64 << ctx);
-        }
+        self.lock().contexts.free(ctx);
     }
 
-    /// Seed the durable vCPU-context occupancy a **thaw** re-establishes (context recycling): the
-    /// re-spawned children reclaim *exactly* the contexts they held at freeze (derived from their
-    /// restored shadow-SPs — recycling means these need not be the top `n`), so a post-thaw spawn
-    /// allocates into a genuinely-free context. Each re-spawned child adds its own, before forward
-    /// execution.
-    fn seed_vcpu_mask(&self, mask: u64) {
-        self.lock().vcpu_mask |= mask;
+    /// Seed the vCPU contexts a **thaw** re-establishes (each re-spawned child reclaims the context it
+    /// held at the freeze), so a post-thaw spawn allocates into a genuinely free one.
+    fn seed_vcpu_contexts(&self, arena: ShadowArena, mask: u64) {
+        self.lock().contexts.seed(arena, mask);
     }
 
     /// `cont.new`: allocate a slot — the guest handle — under [`MAX_FIBERS`], which is **per run** now
@@ -12764,20 +12744,10 @@ impl FiberRegistry {
             return Err(Trap::FiberFault);
         }
         let slot = reuse.unwrap_or(t.fibers.len());
-        // A durable fiber needs a distinct shadow region; refuse if the reserve has no room (a
-        // clean `FiberFault`, like reaching the ceiling — never an overflow into another
-        // context's region). The fiber's context index is `slot + 1` (the root is context 0). The
-        // fiber pool grows up from 1 and the spawned-vCPU pool grows down from `MAX_SHADOW_CTX`
-        // (slice 3.2.2), so this fiber must stay strictly below the lowest live vCPU context (which,
-        // with recycling, need not be a simple count from the top).
-        let lowest_vcpu = {
-            if t.vcpu_mask == 0 {
-                arena.ctx_ceiling() + 1
-            } else {
-                t.vcpu_mask.trailing_zeros() as usize
-            }
-        };
-        if durable && (!arena.region_fits(slot + 1) || slot + 1 >= lowest_vcpu) {
+        // A durable fiber needs a distinct shadow region (context `slot + 1`) inside the arena and
+        // below every live vCPU's; refuse if it has none — a clean `FiberFault`, like reaching the
+        // ceiling, never an overflow into another context's region ([`ShadowContexts::fiber_fits`]).
+        if durable && !t.contexts.fiber_fits(arena, slot) {
             return Err(Trap::FiberFault);
         }
         let generation = if reuse.is_some() {
