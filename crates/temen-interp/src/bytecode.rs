@@ -632,18 +632,25 @@ enum Op {
         cap: u32,
         dst: u32,
     },
+    /// `leave` (on this op and the two tail calls): the function takes `setjmp` checkpoints, so its
+    /// exit drops this activation's (#2877, [`Vm::leave_setjmps`]). Static, so no other exit pays.
     Ret {
         srcs: Box<[u32]>,
+        leave: bool,
     },
     /// `return_call`: a direct tail call — reuse the current activation window (no stack growth),
     /// staying in the caller's module; on return the callee returns to *this* activation's caller.
     TailCall {
         callee: u32,
         args: Box<[u32]>,
+        leave: bool,
     },
     /// `return_call.dyn`: an indirect tail call — resolve through the runtime dispatch table
     /// (possibly cross-module), then reuse the current window like [`Op::TailCall`].
-    TailCallIndirect(Box<IndirectCall>),
+    TailCallIndirect {
+        call: Box<IndirectCall>,
+        leave: bool,
+    },
     Unreachable,
     /// A `CapFault` trap: an `Instantiator` call that isn't a live op at its contracted shape
     /// (`temen_ir::served_contract`), which the oracle refuses after the handle resolves (a
@@ -2581,6 +2588,11 @@ fn compile_func(f: &Func, view: &ModuleView<'_>, fuse: bool) -> Option<Program> 
     let discard = nslots;
     nslots += 1;
     let mut block_pc = vec![0u32; f.blocks.len()];
+    // #2877 — a function that takes `setjmp` checkpoints drops them at each exit.
+    let leave = f
+        .blocks
+        .iter()
+        .any(|b| b.insts.iter().any(|i| matches!(i, Inst::SetJmp { .. })));
     // One op per instruction and one per terminator, less any compare a branch fuses: sized once
     // rather than grown (#2586).
     let nops = f.blocks.iter().map(|b| b.insts.len() + 1).sum();
@@ -2762,6 +2774,7 @@ fn compile_func(f: &Func, view: &ModuleView<'_>, fuse: bool) -> Option<Program> 
             }
             Terminator::Return(vs) => ops.push(Op::Ret {
                 srcs: vs.iter().map(|v| g(*v)).collect(),
+                leave,
             }),
             Terminator::Unreachable => ops.push(Op::Unreachable),
             // Tail calls reuse the current activation window (no stack growth): a direct tail call
@@ -2769,15 +2782,17 @@ fn compile_func(f: &Func, view: &ModuleView<'_>, fuse: bool) -> Option<Program> 
             Terminator::ReturnCall { func, args } => ops.push(Op::TailCall {
                 callee: *func,
                 args: args.iter().map(|a| g(*a)).collect(),
+                leave,
             }),
-            Terminator::ReturnCallIndirect { ty, idx, args } => {
-                ops.push(Op::TailCallIndirect(Box::new(IndirectCall {
+            Terminator::ReturnCallIndirect { ty, idx, args } => ops.push(Op::TailCallIndirect {
+                call: Box::new(IndirectCall {
                     idx: g(*idx),
                     args: args.iter().map(|a| g(*a)).collect(),
                     want_params: view.sig(*ty).params.clone().into(),
                     want_results: view.sig(*ty).results.clone().into(),
-                })))
-            }
+                }),
+                leave,
+            }),
         }
         // Exactly one terminator op was pushed above (fused `BrIfCmp` or a plain terminator); pair it
         // with the terminator source entry so `src` stays the same length as `ops`.
@@ -20315,7 +20330,10 @@ impl Vm {
     }
 
     /// #2877 — the activations from stack depth `depth` up are exiting (a return or tail call of the
-    /// current one, or a `longjmp` past them): their `setjmp` checkpoints die with them.
+    /// current one, or a `longjmp` past them): their `setjmp` checkpoints die with them. Out of line:
+    /// only a function that takes checkpoints calls it at its exits.
+    #[cold]
+    #[inline(never)]
     fn leave_setjmps(&mut self, depth: usize) {
         if let Some(r) = self.rare.as_deref_mut() {
             while r.setjmps.last().is_some_and(|p| p.depth >= depth) {
@@ -21317,7 +21335,7 @@ impl Vm {
                     base = nb;
                     pc = 0;
                 }
-                Op::Ret { srcs } => {
+                Op::Ret { srcs, leave } => {
                     // #1146 — if this returns from an injected async signal handler (its guard entry
                     // records the stack depth at injection, which equals the current depth when the
                     // handler's own `Ret` fires), restore the personality's block-during-handler mask
@@ -21330,7 +21348,9 @@ impl Vm {
                             source.handler_returned();
                         }
                     }
-                    self.leave_setjmps(self.stack.len());
+                    if *leave {
+                        self.leave_setjmps(self.stack.len());
+                    }
                     match self.stack.pop() {
                         None => {
                             // The entry's results go to the first slots of its window, gathered
@@ -21365,7 +21385,11 @@ impl Vm {
                 // Tail calls reuse the *current* window (`base` unchanged) instead of pushing a
                 // return entry, so the callee returns to this activation's caller. Args may alias the
                 // destination prefix, so gather into `scratch` then scatter (like edge copies).
-                Op::TailCall { callee, args } => {
+                Op::TailCall {
+                    callee,
+                    args,
+                    leave,
+                } => {
                     safepoint!(); // fuel unification: function-entry safepoint
                     let callee = *callee as usize;
                     #[cfg(feature = "callprof")]
@@ -21374,7 +21398,9 @@ impl Vm {
                     }
                     self.count_call(module, cur);
                     self.entered = self.work;
-                    self.leave_setjmps(self.stack.len());
+                    if *leave {
+                        self.leave_setjmps(self.stack.len());
+                    }
                     self.grow_regs(base + c.prog(callee).nslots as usize)?;
                     self.scratch.clear();
                     for a in args.iter() {
@@ -21387,7 +21413,7 @@ impl Vm {
                     enter!();
                     pc = 0;
                 }
-                Op::TailCallIndirect(call) => {
+                Op::TailCallIndirect { call, leave } => {
                     let IndirectCall {
                         idx,
                         args,
@@ -21408,7 +21434,9 @@ impl Vm {
                     }
                     self.count_call(module, cur);
                     self.entered = self.work;
-                    self.leave_setjmps(self.stack.len());
+                    if *leave {
+                        self.leave_setjmps(self.stack.len());
+                    }
                     self.grow_regs(base + tm.prog(tfunc).nslots as usize)?;
                     self.scratch.clear();
                     for a in args.iter() {
