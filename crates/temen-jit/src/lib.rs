@@ -7284,13 +7284,19 @@ fn define_funcs(
     // r8. `None` for a register-result function. Built from the IR, where the result list is known.
     sret: &(dyn Fn(usize) -> Option<u32> + Sync),
 ) -> Result<usize, JitError> {
+    // The callee contracts a call names, which the validator checks each call against (and, per
+    // function, its stack-pop count — the frame's incoming stack-argument bytes). Built before the
+    // replay branch so a replayed function is validated against the same contracts a fresh compile is
+    // (#2536): replayed `CodeDir` code reaches the validator here, not only fresh compiles.
+    let contracts = callee_contracts(module);
+    let callee = &|id: u32| contracts.get(id as usize).copied().flatten();
     let keep = match code {
-        Codegen::Replay(kept, imports) => return kept.replay(module, ids, imports),
+        Codegen::Replay(kept, imports) => {
+            return kept.replay(module, ids, imports, guest, callee, sret)
+        }
         Codegen::Compile(keep) => keep,
     };
     let isa = jit_isa()?;
-    let contracts = callee_contracts(module);
-    let callee = &|id: u32| contracts.get(id as usize).copied().flatten();
     let workers = std::thread::available_parallelism()
         .map_or(1, |n| n.get())
         .clamp(1, ids.len().max(1));

@@ -149,11 +149,17 @@ impl EmittedCode {
         module: &mut JITModule,
         ids: &[FuncId],
         imports: &Imports,
+        // #2536 — what the validator checks a replayed function against, the same as a fresh compile:
+        // the module's §4 facts (window, fn table, type contracts), the callee a relocation names,
+        // and the function's own stack-pop count and `sret` result-slot count (its frame).
+        guest: &crate::validate::Guest,
+        callee: &dyn Fn(u32) -> Option<crate::validate::Contract>,
+        sret: &dyn Fn(usize) -> Option<u32>,
     ) -> Result<usize, JitError> {
         let backend = |e: cranelift_module::ModuleError| JitError::Backend(e.to_string());
         let cc = module.isa().default_call_conv();
         let mut bytes = 0;
-        for (f, &id) in self.funcs.iter().zip(ids) {
+        for (i, (f, &id)) in self.funcs.iter().zip(ids).enumerate() {
             let mut relocs = Vec::with_capacity(f.relocs.len());
             for r in &f.relocs {
                 let name = match &r.target {
@@ -179,6 +185,23 @@ impl EmittedCode {
                     name,
                     addend: r.addend,
                 });
+            }
+            // #2536 — check the replayed bytes, as a fresh compile is checked. The kept code is an
+            // own (guest) function, so it enters in its module's context contract; its frame is its
+            // own stack-pop count and `sret` result count. Shadow mode: logged, never fatal, until
+            // the flip routes every define site through one gate.
+            if crate::validate::enabled() {
+                let checked = crate::validate::relocs(&relocs, callee, cc);
+                let frame = crate::validate::Frame {
+                    stack_args: callee(id.as_u32()).and_then(|c| c.pops),
+                    sret_results: sret(i),
+                };
+                crate::validate::shadow_check(
+                    &f.bytes,
+                    &checked,
+                    crate::validate::Entry::Guest(guest),
+                    frame,
+                );
             }
             module
                 .define_function_bytes(id, f.align, &f.bytes, &relocs)
