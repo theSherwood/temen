@@ -38437,7 +38437,7 @@ impl Mem {
         if !self.has_regions.load(Ordering::Relaxed) {
             self.back.fill(base, len, val);
         } else {
-            self.write_run(base, &vec![val; len as usize]);
+            self.fill_run(base, len, val);
         }
         self.writes += 1;
         Ok(())
@@ -39144,6 +39144,20 @@ impl Mem {
                 r.copy_in(roff, &bytes[k..k + n]);
             }
             None => self.back.write_from(at, &bytes[k..k + n]),
+        });
+    }
+
+    /// Set `len` bytes at the backing-absolute `off` to `val`, as [`Self::set_byte`] would byte by
+    /// byte, a page at a time, from one page-sized buffer: what the host allocates does not grow with
+    /// a guest-chosen length.
+    fn fill_run(&self, off: u64, len: u64, val: u8) {
+        let space = self.space_read();
+        let page = vec![val; (self.page as usize).min(len as usize)];
+        self.each_page(&space, off, len as usize, |at, _, n, region| match region {
+            Some((r, roff)) => {
+                r.copy_in(roff, &page[..n]);
+            }
+            None => self.back.fill(at, n as u64, val),
         });
     }
 
