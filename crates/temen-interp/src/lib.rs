@@ -5102,9 +5102,26 @@ pub(crate) struct Frame {
     /// Block-local SSA values produced so far (entry = the call arguments), as raw [`Reg`]s, with
     /// the values of the block's ancestors ([`Vals`]).
     vals: Vals,
+    /// #2877 — the `setjmp` checkpoints this activation took, oldest first. They live exactly as long
+    /// as it does: popping, replacing (a tail call) or unwinding past the frame takes them with it,
+    /// so a `longjmp` finds only a live one, on this computation's own stack.
+    setjmps: Vec<SetJmpPoint>,
 }
 
 impl Frame {
+    /// A fresh activation of `func` (in function space `module`), at its entry block with `vals` as
+    /// its arguments.
+    fn new(func: FuncIdx, module: u32, vals: Vals) -> Frame {
+        Frame {
+            func,
+            module,
+            block: 0,
+            inst: 0,
+            vals,
+            setjmps: Vec::new(),
+        }
+    }
+
     /// The function's first param: value 0 of its entry block, which every other block has as an
     /// ancestor, so the frame holds it wherever it is. A §3d frontend passes the data-SP there and
     /// never moves it within the function, so this is the frame's data-SP — whether or not the
@@ -5261,17 +5278,17 @@ impl FromIterator<Reg> for Vals {
     }
 }
 
-/// A `<setjmp.h>` checkpoint: the resume point of a `setjmp` call (see [`VCpu::setjmp_points`]). Since
-/// `Frame::vals` is **replaced per block** (block-param SSA), the value state at the `setjmp` point can
-/// not be reconstructed from the live (later-block) frame, so it is snapshotted here. `longjmp` truncates
-/// the call stack to `depth` (the intervening frames discarded — C has no cleanups), overwrites the
-/// surviving `setjmp` frame with `(block, inst, vals)`, sets `vals[result_idx]` to the long-jump value,
-/// and resumes. The data-stack pointer is among those values ([`Frame::sp`]), so restoring `vals`
-/// restores it.
+/// A `<setjmp.h>` checkpoint: the resume point of a `setjmp` call, kept in the frame that took it
+/// ([`Frame::setjmps`]). Since `Frame::vals` is **replaced per block** (block-param SSA), the value
+/// state at the `setjmp` point can not be reconstructed from the live (later-block) frame, so it is
+/// snapshotted here. `longjmp` truncates the call stack to that frame (the intervening frames discarded
+/// — C has no cleanups), overwrites it with `(block, inst, vals)`, sets `vals[result_idx]` to the
+/// long-jump value, and resumes. The data-stack pointer is among those values ([`Frame::sp`]), so
+/// restoring `vals` restores it.
 #[derive(Clone)]
 struct SetJmpPoint {
-    /// Call-stack length at `setjmp` (the `setjmp` frame is at index `depth - 1`).
-    depth: usize,
+    /// The token the `setjmp` wrote into the guest `jmp_buf` (#1062), which names this checkpoint.
+    token: u64,
     /// The `setjmp` frame's block, and the instruction index just *after* the `setjmp`.
     block: usize,
     inst: usize,
@@ -13522,15 +13539,6 @@ struct VCpu {
     /// seeds a thread's from [`Host::next_vcpu_id`]), guest-overwritable. Read at the op's execution
     /// point — so a fiber that migrated here reads *this* vCPU's word.
     tls: i64,
-    /// `<setjmp.h>` checkpoints — `setjmp` records this vCPU's resume point here, keyed by a
-    /// per-`setjmp` **token** it writes into the guest `jmp_buf`'s opaque first 8 bytes (#1062);
-    /// `longjmp` reads the token back from the (possibly-copied) buffer and looks it up. Per-vCPU
-    /// (a checkpoint references *this* frame stack; cross-thread `longjmp` is UB in C and simply
-    /// misses). Token-keying (vs the old buffer-address key) is what lets a guest *copy* a `jmp_buf`
-    /// — bash's `COPY_PROCENV` memcpy of `top_level`, which address-keying mis-resolved into an
-    /// infinite `longjmp` loop — carry the checkpoint identity with the bytes. Bounded by pruning
-    /// checkpoints whose `setjmp` frame has returned (`SetJmp` arm), so it does not grow without end.
-    setjmp_points: BTreeMap<u64, SetJmpPoint>,
     /// Set when resuming from a park: how to finish the blocked op (see [`Pending`]).
     pending: Option<Pending>,
     /// The executor this vCPU runs under — the real OS-thread [`Scheduler`] or the deterministic
@@ -13704,13 +13712,11 @@ impl VCpu {
             invoked_types: None,
             chain: vec![ROOT_FIBER],
             cur: ROOT_FIBER,
-            frames: vec![Frame {
-                func: entry,
-                module: 0,
-                block: 0,
-                inst: 0,
-                vals: args.iter().map(|&x| Reg::from_value(x)).collect(),
-            }],
+            frames: vec![Frame::new(
+                entry,
+                0,
+                args.iter().map(|&x| Reg::from_value(x)).collect(),
+            )],
             root_parked: None,
             below: Vec::new(),
             parked_frames: 0,
@@ -13731,7 +13737,6 @@ impl VCpu {
             id,
             parent_task: 0,
             tls: 0, // §12 a domain's root; `thread.spawn` seeds a thread's (#1775)
-            setjmp_points: BTreeMap::new(),
             pending: None,
             sched,
             memop: false,
@@ -13806,7 +13811,6 @@ impl VCpu {
             id: new_id,
             parent_task: self.parent_task,
             tls: self.tls,
-            setjmp_points: BTreeMap::new(),
             pending: None, // the caller sets `CapResult(reply_twin)`
             sched: self.sched.clone(),
             memop: false,
@@ -13861,13 +13865,11 @@ impl VCpu {
             invoked_types: Some(unit_types),
             chain: vec![ROOT_FIBER],
             cur: ROOT_FIBER,
-            frames: vec![Frame {
-                func: 0, // the unit's entry
-                module: INVOKE_MODULE,
-                block: 0,
-                inst: 0,
-                vals: args.iter().map(|&x| Reg::from_value(x)).collect(),
-            }],
+            frames: vec![Frame::new(
+                0, // the unit's entry
+                INVOKE_MODULE,
+                args.iter().map(|&x| Reg::from_value(x)).collect(),
+            )],
             root_parked: None,
             below: Vec::new(),
             parked_frames: 0,
@@ -13888,7 +13890,6 @@ impl VCpu {
             id: 0, // unused: driven inline, never via the executor
             parent_task: 0,
             tls: 0, // §12 per-vCPU TLS seed (id 0)
-            setjmp_points: BTreeMap::new(),
             pending: None,
             sched,
             memop: false,
@@ -14922,7 +14923,6 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
         tls,
         memop,
         acc,
-        setjmp_points,
         units,
         invoked,
         invoked_ref_slots,
@@ -15202,13 +15202,11 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                     .zip(args_)
                                     .map(|(ty, &s)| Reg::from_value(slot_to_val(*ty, s)))
                                     .collect();
-                                frames.push(Frame {
-                                    func: f_,
-                                    module: INVOKE_MODULE,
-                                    block: 0,
-                                    inst: 0,
-                                    vals: hvals_.into(),
-                                });
+                                frames.push(Frame::new(
+                                    f_,
+                                    INVOKE_MODULE,
+                                    hvals_.into(),
+                                ));
                                 continue 'frames;
                             }
                             // The admission outcomes, decided under one brief state lock (the busy
@@ -15512,13 +15510,11 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                     }
                                     chain.push(hslot_);
                                     *cur = hslot_;
-                                    *frames = vec![Frame {
-                                        func: f_,
-                                        module: INVOKE_MODULE,
-                                        block: 0,
-                                        inst: 0,
-                                        vals: hvals_.into(),
-                                    }];
+                                    *frames = vec![Frame::new(
+                                        f_,
+                                        INVOKE_MODULE,
+                                        hvals_.into(),
+                                    )];
                                     // CALLS.md 4b.2 — invalidate the `cur_funcs` cache: the handler
                                     // frame is `INVOKE_MODULE` but `invoked` just changed to the
                                     // provider's `entry.funcs`. A *nested* animation switches
@@ -15721,14 +15717,11 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 {
                                     return Err(Trap::StackOverflow);
                                 }
-                                frames.push(Frame {
-                                    func: cfunc,
-                                    module: cmod,
-                                    block: 0,
-                                    inst: 0,
-                                    vals: vec![Reg::from_i64(sp as i64), Reg::from_i32(signum)]
-                                        .into(),
-                                });
+                                frames.push(Frame::new(
+                                    cfunc,
+                                    cmod,
+                                    vec![Reg::from_i64(sp as i64), Reg::from_i32(signum)].into(),
+                                ));
                                 sig_handler_stack.push(frames.len());
                                 continue 'frames;
                             }
@@ -16205,13 +16198,11 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     if depth as usize + *parked_frames + frames.len() > MAX_CALL_DEPTH as usize {
                         return Err(Trap::StackOverflow);
                     }
-                    frames.push(Frame {
-                        func: *func,
-                        module: frames[top].module, // a direct call stays in the caller's module
-                        block: 0,
-                        inst: 0,
-                        vals: argv,
-                    });
+                    frames.push(Frame::new(
+                        *func,
+                        frames[top].module, // a direct call stays in the caller's module
+                        argv,
+                    ));
                     continue 'frames;
                 }
                 Inst::CallIndirect(c) => {
@@ -16231,13 +16222,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     if depth as usize + *parked_frames + frames.len() > MAX_CALL_DEPTH as usize {
                         return Err(Trap::StackOverflow);
                     }
-                    frames.push(Frame {
-                        func: cfunc,
-                        module: cmod,
-                        block: 0,
-                        inst: 0,
-                        vals: argv,
-                    });
+                    frames.push(Frame::new(cfunc, cmod, argv));
                     continue 'frames;
                 }
                 // The arms below serve their ops here, each delivering the results its op's contract
@@ -17005,13 +16990,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                     pslot,
                                     phandle,
                                     pticket,
-                                    vec![Frame {
-                                        func: hfunc as FuncIdx,
-                                        module: 0,
-                                        block: 0,
-                                        inst: 0,
-                                        vals,
-                                    }]
+                                    vec![Frame::new(hfunc as FuncIdx, 0, vals,)]
                                 );
                             }
                             _ => return Err(Trap::FiberFault),
@@ -17063,13 +17042,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             hslot,
                             handle,
                             d.ticket,
-                            vec![Frame {
-                                func: fidx,
-                                module: 0,
-                                block: 0,
-                                inst: 0,
-                                vals: child_vals.into(),
-                            }]
+                            vec![Frame::new(fidx, 0, child_vals.into(),)]
                         );
                     }
                     // Nothing runnable. `svc.wait` with no progress parks, keyed by this
@@ -18113,13 +18086,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             vals.extend([Reg::from_i64(arg0), Reg::from_i64(av)]);
                             let mut f = std::mem::take(&mut spare_frames);
                             f.clear(); // already empty, as a returned fiber's stack is
-                            f.push(Frame {
-                                func: cfunc,
-                                module: cmod,
-                                block: 0,
-                                inst: 0,
-                                vals,
-                            });
+                            f.push(Frame::new(cfunc, cmod, vals));
                             f
                         }
                         Claimed::Live(mut f) => {
@@ -18243,9 +18210,9 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     }
                 }
                 // `setjmp`: snapshot this frame's resume point (the value state is captured because
-                // `vals` is replaced per block) keyed by the guest `jmp_buf` address, and fall through
+                // `vals` is replaced per block) as a checkpoint of this frame, and fall through
                 // returning 0. `frames[top].inst` is already advanced past the `setjmp` (line above), so
-                // it is exactly the re-entry point. A re-`setjmp` to the same buffer overwrites.
+                // it is exactly the re-entry point.
                 Inst::SetJmp { buf } => {
                     let buf_addr = get_i64(&frames[top].vals, *buf)? as u64;
                     // #1062 — mint a fresh token and write it into the guest `jmp_buf`'s opaque
@@ -18262,33 +18229,28 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         StoreOp::I64,
                         Value::I64(token as i64),
                     )?;
-                    // Bound the token map (address-keying was bounded by overwrite; tokens are not):
-                    // drop checkpoints whose `setjmp` frame has already returned — a `longjmp` to one
-                    // would trap regardless. A copied-but-live checkpoint sits at a still-live frame
-                    // (`depth <= live`) and is retained.
-                    let live = frames.len();
-                    setjmp_points.retain(|_, p| p.depth <= live);
+                    // #2877 — the checkpoint lives in this frame, so it dies with the activation
+                    // (a return, a tail call, a longjmp or trap past it) and nothing else can reach
+                    // it: no returned activation, no sibling at the same depth, no other fiber.
                     let result_idx = frames[top].vals.len();
                     let mut snap = frames[top].vals.clone();
                     snap.push(Reg::from_i32(0)); // the result slot (overwritten by longjmp)
-                    setjmp_points.insert(
+                    let point = SetJmpPoint {
                         token,
-                        SetJmpPoint {
-                            depth: frames.len(),
-                            block: frames[top].block,
-                            inst: frames[top].inst,
-                            vals: snap,
-                            result_idx,
-                        },
-                    );
+                        block: frames[top].block,
+                        inst: frames[top].inst,
+                        vals: snap,
+                        result_idx,
+                    };
+                    frames[top].setjmps.push(point);
                     frames[top].vals.push(Reg::from_i32(0)); // the direct call returns 0
                 }
                 // `longjmp`: read the #1062 token back from the (possibly-copied) `jmp_buf`, look up
                 // the checkpoint by token, unwind the call stack to it (the intervening frames
                 // discarded — C has no cleanups), restore the `setjmp` frame's (block, inst, vals)
                 // with the result slot set to `val` (a `0` `val` becomes `1`, per C), and resume
-                // there. A token that names no live checkpoint (never `setjmp`'d, or its frame
-                // already returned — `depth` now exceeds the live stack) traps in-sandbox (§3b).
+                // there. A token that names no checkpoint of a live frame of this computation (never
+                // `setjmp`'d, or its activation already returned) traps in-sandbox (§3b, #2877).
                 Inst::LongJmp { buf, val } => {
                     let buf_addr = get_i64(&frames[top].vals, *buf)? as u64;
                     let v = get_i32(&frames[top].vals, *val)?;
@@ -18302,11 +18264,18 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             Value::I64(t) => t as u64,
                             _ => return Err(Trap::Malformed),
                         };
-                    let point = setjmp_points.get(&token).cloned().ok_or(Trap::Malformed)?;
-                    if point.depth == 0 || point.depth > frames.len() {
-                        return Err(Trap::Malformed); // the setjmp frame has already returned
-                    }
-                    frames.truncate(point.depth);
+                    let (at, point) = frames
+                        .iter()
+                        .enumerate()
+                        .rev()
+                        .find_map(|(k, f)| {
+                            f.setjmps
+                                .iter()
+                                .find(|p| p.token == token)
+                                .map(|p| (k, p.clone()))
+                        })
+                        .ok_or(Trap::Malformed)?;
+                    frames.truncate(at + 1);
                     // #802 — a longjmp that unwinds OUT of an injected signal handler leaves the
                     // handler exactly like a return does: pop each crossed guard entry and fire
                     // `handler_returned()` per crossed handler, so the personality restores its
@@ -18327,7 +18296,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         // handled (POSIX: EINTR is per-interrupted-call).
                         host.lock_unpoisoned().take_sig_interrupt();
                     }
-                    let f = &mut frames[point.depth - 1];
+                    let f = &mut frames[at];
                     f.block = point.block;
                     f.inst = point.inst;
                     f.vals = point.vals;
@@ -19162,13 +19131,11 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 if fs.get(*func as usize).is_none() {
                     return Err(Trap::Malformed);
                 }
-                let callee = Frame {
-                    func: *func,
-                    module: frames[top].module, // a direct tail call stays in the caller's module
-                    block: 0,
-                    inst: 0,
-                    vals: argv,
-                };
+                let callee = Frame::new(
+                    *func,
+                    frames[top].module, // a direct tail call stays in the caller's module
+                    argv,
+                );
                 recycle(&mut spare, std::mem::replace(&mut frames[top], callee).vals);
             }
             Terminator::ReturnCallIndirect { ty, idx, args } => {
@@ -19182,13 +19149,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     call_sig(&cur_types, *ty),
                 )?;
                 let argv = callee_vals(&mut spare, &frames[top].vals, args)?;
-                let callee = Frame {
-                    func: cfunc,
-                    module: cmod,
-                    block: 0,
-                    inst: 0,
-                    vals: argv,
-                };
+                let callee = Frame::new(cfunc, cmod, argv);
                 recycle(&mut spare, std::mem::replace(&mut frames[top], callee).vals);
             }
         }

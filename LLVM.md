@@ -2232,15 +2232,19 @@ Picking a target is really picking the *gap* it drives to completion. Current st
   layout gives each block distinct slots, so the `setjmp` block's values survive a deeper call in place
   — it only restores the `(module, cur, base, pc)` cursor + pops the activation stack). The **JIT** now
   runs it too (**Option B, DONE** — see "JIT `longjmp`" below): libc `_setjmp`/`_longjmp` called **inline
-  from JITted code** with the `jmp_buf` in a host-side per-run table keyed by the guest buffer address
-  (no host SP/return-addr leaks into the window); the in-frame `_setjmp` dodges the "helper-frame-is-gone"
+  from JITted code** with the `jmp_buf` in a host-side table of checkpoints (no host SP/return-addr leaks
+  into the window); the in-frame `_setjmp` dodges the "helper-frame-is-gone"
   problem. Cranelift sees no edge from `_longjmp` back to the `setjmp`, so a spill slot live across the
   call can be reused on the longjmp path: every value the code reads after it, the guest's and the
   lowering's own context values (window base, function table, vmctx, stack limit, return area, a paged
   child's access table) alike, is saved to an explicit stack slot no spill reuses and reloaded from it
-  (#2537, #2652). Gated to the `setjmp_rt` targets (unix among `fiber_rt`); a module mixing `setjmp` with
-  fibers/threads is fail-closed-declined (the interpreters' per-vCPU keying covers it — a documented
-  per-fiber-JIT-keying follow-on). Tests: `setjmp_longjmp_round_trip`, `setjmp_longjmp_loop_and_deep_nesting`,
+  (#2537, #2652). **One rule on every engine (#2877):** a checkpoint is named by the token its `setjmp`
+  writes into the guest `jmp_buf`'s first 8 bytes (#1062 — a memcpy'd buffer carries its identity) and
+  lives exactly as long as the activation that took it; a `longjmp` to anything else — a returned
+  activation, a sibling reusing its depth, another fiber's, an earlier run's — traps `Malformed`. Gated to
+  the `setjmp_rt` targets (unix among `fiber_rt`); a module mixing `setjmp` with fibers/threads is
+  fail-closed-declined (the interpreters keep each checkpoint with its own frame, so they cover it — a
+  table per native stack is the follow-on). Tests: `setjmp_longjmp_round_trip`, `setjmp_longjmp_loop_and_deep_nesting`,
   plus returns-twice stress (`setjmp_value_live_across`, `setjmp_nested_buffers`) — **all three engines ==
   native libc** (the JIT lane now asserts agreement, not a decline). Perf (`examples/onramp_perf.rs`): the
   non-`setjmp` baseline rows are unmoved (gated; byte-identical IR); the JIT runs `setjmp_happy` ~3× and
@@ -2864,18 +2868,23 @@ Cranelift code runs on the real native control stack, so `longjmp` must restore 
 `setjmp` point. **Approach — Option B: call libc `_setjmp`/`_longjmp` from JITted code, with the
 `jmp_buf` in a host-side table.** Rationale + the rejected alternatives are below.
 
-**What landed.** A per-run host `jmp_buf` table (`setjmp_rt::SetjmpRuntime`, owned by the
-`CompiledModule` so its address stays valid for re-runs) keyed by the guest `jmp_buf` window address;
-`Inst::SetJmp` lowers to `rt_setjmp_slot` (alloc/find the host slot) then an **inline** `call _setjmp`,
-and `Inst::LongJmp` to `rt_setjmp_lookup` (find, or write the `SetjmpFault` trap cell on a miss — a
-fail-closed §3b totality check) then an inline `call _longjmp`. The libc `_setjmp`/`_longjmp` addresses
+**What landed.** A per-instance host checkpoint table (`setjmp_rt::SetjmpRuntime`, owned by the
+`CompiledModule`): a flat stack of live checkpoints, each a token, the frame pointer of the activation
+that took it, and its host `jmp_buf`. `Inst::SetJmp` lowers to `rt_setjmp_slot` (write a fresh token into
+the guest buffer through the confined guest-store path, push the checkpoint, return its `jmp_buf`) then
+an **inline** `call _setjmp`; `Inst::LongJmp` to `rt_longjmp` (read the token, find its live checkpoint
+in this frame or one enclosing it, or raise `SetjmpFault` — a fail-closed §3b totality check — and
+`_longjmp` from its own frame). A checkpoint dies with its activation (#2877): every return and tail call
+of a function that takes them calls `rt_setjmp_leave`, a `longjmp` drops the deeper frames', and the one
+guarded-call boundary (`mem::run_guarded_range`) drops the ones a call took when it ends — a fault skips
+every frame's exit — and floors the table so no `longjmp` crosses the host frames of a nested call. The libc `_setjmp`/`_longjmp` addresses
 are baked **directly** as the call targets (not via a Rust thunk, whose frame would be gone by
 `longjmp` time), mirroring the `call.cap`/fiber-thunk "call-to-baked-host-address" template. Gated to
 the `setjmp_rt` cfg (= `fiber_rt && unix`; built in `build.rs`) — Windows `setjmp` is SEH-coupled, a
 follow-on, and there the JIT keeps declining and the interpreters cover it. A §14 JIT child using
 `setjmp`, and any module mixing `setjmp` with fibers/threads, are **fail-closed-declined** (no per-child
-/ per-fiber `setjmp` table yet — the per-run table is keyed only by buffer address, so concurrent
-shared-buffer use across native stacks would corrupt; the interpreters' per-vCPU keying covers it). The
+/ per-stack `setjmp` table yet — the table's frame-pointer order holds only for one native stack; the
+interpreters keep each checkpoint with its own frame, so they cover it). The
 returns-twice hazard held up: clang's `-O2` setjmp-crossing spills + Cranelift's caller-saved spills
 across the `SetJmp` call site mean live values arrive as loads/stores, not long-lived SSA, and the
 guest's data-stack values ride in window memory (preserved across `_longjmp`). Validated by the on-ramp
@@ -2936,9 +2945,9 @@ live across the `setjmp` (`setjmp_value_live_across`), nested buffers (`setjmp_n
 loop / deep-nesting `longjmp` across several frames (`setjmp_longjmp_loop_and_deep_nesting`).
 
 **Reference implementations to mirror (already landed, byte-identical to native):** the tree-walker
-(`crates/temen-interp/src/lib.rs` — `SetJmpPoint`, `setjmp_points`, the `SetJmp`/`LongJmp` arms in
-`run_inner`) and the bytecode engine (`crates/temen-interp/src/bytecode.rs` — `ByteSetJmp`, `Op::SetJmp`/
-`LongJmp`). The on-ramp lowering is `lower_setjmp_call` in `crates/temen-llvm/src/lib.rs`; the JIT path is `setjmp_rt.rs` + the `SetJmp`/`LongJmp` lowering arms in
+(`crates/temen-interp/src/lib.rs` — `SetJmpPoint` in `Frame::setjmps`, the `SetJmp`/`LongJmp` arms in
+`run_inner`) and the bytecode engine (`crates/temen-interp/src/bytecode.rs` — `ByteSetJmp` in
+`VmRare::setjmps`, `Op::SetJmp`/`LongJmp`, dropped at `Ret`/tail calls by `Vm::leave_setjmps`). The on-ramp lowering is `lower_setjmp_call` in `crates/temen-llvm/src/lib.rs`; the JIT path is `setjmp_rt.rs` + the `SetJmp`/`LongJmp` lowering arms in
 `build_clif`. **Current state: all three engines run `setjmp`/`longjmp`** (the JIT via Option B, above),
 byte-identical to native, engines in sync, never divergent.
 

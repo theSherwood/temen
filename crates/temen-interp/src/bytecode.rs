@@ -19909,7 +19909,7 @@ fn teardown_domains(
 /// the cursor back into `self`, and hands this struct to the caller to park / hash / resume — exactly
 /// what `park_suspended(frames)` does for the tree-walker today.
 /// #1062 — the monotonic **`setjmp` token** source for the bytecode engine (its own counter; a run
-/// uses one engine tier, and `setjmp_points` is per-`Vm`, so it never collides with the tree-walk
+/// uses one engine tier, and the checkpoints are per-`Vm`, so it never collides with the tree-walk
 /// counter). Each `setjmp` writes a fresh token into the guest `jmp_buf`'s opaque first 8 bytes and
 /// keys its checkpoint by that token, so a guest that *copies* the `jmp_buf` (bash's `COPY_PROCENV`
 /// memcpy of `top_level`, on every `bash -c`) carries the checkpoint identity with the bytes —
@@ -19918,12 +19918,14 @@ fn teardown_domains(
 /// matters — the exact value and any cross-thread interleaving of this counter cannot affect a run.
 static BYTE_SETJMP_TOKEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
-/// A `<setjmp.h>` checkpoint (see [`Vm::setjmp_points`]): everything needed to re-enter a `setjmp`
+/// A `<setjmp.h>` checkpoint (see [`VmRare::setjmps`]): everything needed to re-enter a `setjmp`
 /// activation. `longjmp` truncates [`Vm::stack`] to `depth` (the intervening activations discarded —
 /// C has no cleanups), restores the `(module, cur, base, pc)` cursor and the activation's register
 /// window, and sets the `dst` register to the long-jump value.
 #[derive(Clone)]
 struct ByteSetJmp {
+    /// The token the `setjmp` wrote into the guest `jmp_buf` (#1062), which names this checkpoint.
+    token: u64,
     /// `Vm::stack` length at `setjmp` (the `setjmp` activation is the current one, not yet pushed).
     depth: usize,
     module: usize,
@@ -20032,14 +20034,16 @@ struct Vm {
 /// stays off it.
 #[derive(Clone, Default)]
 struct VmRare {
-    /// `<setjmp.h>` checkpoints — `setjmp` records its activation's resume point here, keyed by a
+    /// `<setjmp.h>` checkpoints — `setjmp` records its activation's resume point here, named by a
     /// per-`setjmp` **token** it writes into the guest `jmp_buf`'s opaque first 8 bytes (#1062);
     /// `longjmp` reads the token back from the (possibly-copied) buffer and looks it up, and
     /// restores the activation's register window ([`ByteSetJmp::window`]).
     /// Token-keying (vs the old address key) is what lets a guest *copy* a `jmp_buf` — bash's
-    /// `COPY_PROCENV` memcpy of `top_level` — carry the checkpoint identity with the bytes; bounded
-    /// by pruning checkpoints whose `setjmp` activation has returned (`SetJmp` op).
-    setjmp_points: std::collections::BTreeMap<u64, ByteSetJmp>,
+    /// `COPY_PROCENV` memcpy of `top_level` — carry the checkpoint identity with the bytes.
+    /// #2877 — a checkpoint lives exactly as long as its activation: its exit (`Ret`, a tail call) or a
+    /// `longjmp` past it drops it ([`Vm::leave_setjmps`]). Each is taken in the current, deepest live
+    /// activation, so the live ones are a stack ordered by `depth`, outermost first.
+    setjmps: Vec<ByteSetJmp>,
     /// §3.6 serve-loop core, #2742: on a handler fiber, the ticket of the dispatch it answers, which
     /// its return replies to ([`return_from_fiber`]). A serve op inside it refuses (#2160).
     dispatch: Option<u64>,
@@ -20308,6 +20312,16 @@ impl Vm {
     /// [`VmRare`], made on first use.
     fn rare(&mut self) -> &mut VmRare {
         self.rare.get_or_insert_default()
+    }
+
+    /// #2877 — the activations from stack depth `depth` up are exiting (a return or tail call of the
+    /// current one, or a `longjmp` past them): their `setjmp` checkpoints die with them.
+    fn leave_setjmps(&mut self, depth: usize) {
+        if let Some(r) = self.rare.as_deref_mut() {
+            while r.setjmps.last().is_some_and(|p| p.depth >= depth) {
+                r.setjmps.pop();
+            }
+        }
     }
 
     /// #2742 — the ticket of the dispatch this handler fiber answers; `None` off a handler.
@@ -21137,8 +21151,8 @@ impl Vm {
                     pc = *target as usize;
                 }
                 // `<setjmp.h>` `setjmp`: checkpoint the resume point (the op after this, in this
-                // activation) and its register window, keyed by the guest `jmp_buf` address, and
-                // return 0.
+                // activation) and its register window, named by a token written into the guest
+                // `jmp_buf`, and return 0.
                 Op::SetJmp { buf, dst } => {
                     // #1062 — key the checkpoint by a fresh TOKEN written into the guest `jmp_buf`'s
                     // opaque first 8 bytes (not the buffer address), so a guest that memcpy-copies
@@ -21154,26 +21168,20 @@ impl Vm {
                         StoreOp::I64,
                         token,
                     )?;
-                    // Bound the token map (address-keying was bounded by overwrite; tokens are not):
-                    // drop checkpoints whose `setjmp` activation has returned — a `longjmp` to one
-                    // would trap regardless. A copied-but-live checkpoint sits at a still-live
-                    // activation (`depth <= stack.len()`) and is retained.
+                    // #2877 — a checkpoint deeper than this activation is dead (its exit dropped it).
                     let live = self.stack.len();
+                    self.leave_setjmps(live + 1);
                     let window = self.regs[base..base + c.prog(cur).nslots as usize].into();
-                    let points = &mut self.rare().setjmp_points;
-                    points.retain(|_, p| p.depth <= live);
-                    points.insert(
+                    self.rare().setjmps.push(ByteSetJmp {
                         token,
-                        ByteSetJmp {
-                            depth: live,
-                            module,
-                            cur,
-                            base,
-                            pc: pc + 1,
-                            dst: *dst,
-                            window,
-                        },
-                    );
+                        depth: live,
+                        module,
+                        cur,
+                        base,
+                        pc: pc + 1,
+                        dst: *dst,
+                        window,
+                    });
                     r!(*dst) = Reg::from_i32(0);
                     pc += 1;
                 }
@@ -21191,13 +21199,16 @@ impl Vm {
                         .ok_or(Trap::Malformed)?
                         .load_scalar(buf_addr, 0, LoadOp::I64)?
                         .i64() as u64;
+                    // #2877 — only a live activation's checkpoint is in the list, so a token that
+                    // names none (never `setjmp`'d, or its activation already returned) misses.
                     let point = (self.rare.as_ref())
-                        .and_then(|r| r.setjmp_points.get(&token))
+                        .and_then(|r| r.setjmps.iter().rev().find(|p| p.token == token))
                         .ok_or(Trap::Malformed)?
                         .clone();
                     if point.depth > self.stack.len() {
-                        return Err(Trap::Malformed); // the setjmp activation already returned
+                        return Err(Trap::Malformed); // unreachable: its exit dropped it
                     }
+                    self.leave_setjmps(point.depth + 1);
                     if let Some(&(.., entered)) = self.stack.get(point.depth) {
                         self.entered = entered;
                     }
@@ -21319,6 +21330,7 @@ impl Vm {
                             source.handler_returned();
                         }
                     }
+                    self.leave_setjmps(self.stack.len());
                     match self.stack.pop() {
                         None => {
                             // The entry's results go to the first slots of its window, gathered
@@ -21362,6 +21374,7 @@ impl Vm {
                     }
                     self.count_call(module, cur);
                     self.entered = self.work;
+                    self.leave_setjmps(self.stack.len());
                     self.grow_regs(base + c.prog(callee).nslots as usize)?;
                     self.scratch.clear();
                     for a in args.iter() {
@@ -21395,6 +21408,7 @@ impl Vm {
                     }
                     self.count_call(module, cur);
                     self.entered = self.work;
+                    self.leave_setjmps(self.stack.len());
                     self.grow_regs(base + tm.prog(tfunc).nslots as usize)?;
                     self.scratch.clear();
                     for a in args.iter() {

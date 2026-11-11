@@ -830,7 +830,8 @@ pub enum TrapKind {
     /// lowering polls that cell at loop back-edges and function entries and traps here. Matches the
     /// interpreter's `Trap::OutOfFuel` — both report "the host bounded this run".
     OutOfFuel = temen_ir::trap_code::OUT_OF_FUEL as u32,
-    /// A `longjmp` to a `jmp_buf` that was never `setjmp`'d (a stale/forged token) — caught by the
+    /// A `longjmp` to a `jmp_buf` that names no live checkpoint — a forged token, one whose activation
+    /// has returned, an earlier run's, or one an enclosing guarded call took (#2877) — caught by the
     /// host `setjmp` table's lookup before the (skipped) `_longjmp` (§3b totality). Matches the
     /// interpreters' `Trap::Malformed` for the same condition (LLVM.md §"JIT `longjmp`").
     SetjmpFault = temen_ir::trap_code::MALFORMED as u32,
@@ -4039,12 +4040,13 @@ impl CompiledModule {
         // (the `setjmp_rt` cfg); elsewhere `ensure_supported` has already rejected the ops.
         #[cfg(setjmp_rt)]
         let uses_setjmp = module_uses_setjmp(m);
-        // Fail-closed (guard against cross-stack corruption): the per-run `jmp_buf` table is keyed by
-        // the guest buffer address and shared across the run's native stacks, so a module that mixes
-        // `setjmp` with fibers/threads could let one stack's `setjmp` overwrite another's saved native
-        // SP (a `longjmp` would then restore into the wrong stack). The on-ramp never emits that combo,
-        // but a hand-crafted IR module could — so decline the JIT and let the interpreters (which key
-        // `setjmp_points` per-vCPU) cover it. Per-fiber JIT keying is a documented follow-on.
+        // Fail-closed (guard against cross-stack corruption): the instance's checkpoint table is one
+        // stack of checkpoints ordered by frame pointer (#2877), which holds only while every
+        // checkpoint lives on the one native stack the instance's guarded calls run on. A module that
+        // mixes `setjmp` with fibers/threads would take checkpoints on other stacks (a `longjmp` could
+        // then restore into the wrong one). The on-ramp never emits that combo, but a hand-crafted IR
+        // module could — so decline the JIT and let the interpreters (which keep each checkpoint with
+        // its own frame) cover it. A table per native stack is the follow-on.
         #[cfg(setjmp_rt)]
         if uses_setjmp && (uses_fibers || uses_threads) {
             return Err(JitError::Unsupported(
@@ -6545,14 +6547,19 @@ enum HostFn {
     InstSpawn,
     ChildOffer,
     ChildGrant,
+    /// #2877 — `rt_setjmp_slot`: writes a `setjmp`'s token into the guest `jmp_buf`, records the
+    /// checkpoint for this frame and returns its host `jmp_buf`.
     SetjmpSlot,
+    /// #2877 — `rt_setjmp_leave`: the frame is returning or tail-calling, so its checkpoints die.
+    SetjmpLeave,
     /// #2534 — `mem.copy`/`mem.move` and `mem.fill` (D62): the host confines, pages, probes and
     /// writes the spans in the window the context names (`mem::mem_copy`, `mem::mem_fill`).
     MemCopy,
     MemFill,
     /// libc `_setjmp`, called inline in the guest frame (LLVM.md §"JIT `longjmp`").
     Setjmp,
-    /// `rt_longjmp`: looks the host `jmp_buf` up and `_longjmp`s to it (#2534).
+    /// `rt_longjmp`: reads the token, checks its checkpoint is live and `_longjmp`s to it (#2534,
+    /// #2877).
     Longjmp,
     VcpuTlsGet,
     VcpuTlsSet,
@@ -6572,7 +6579,7 @@ enum HostFn {
 
 impl HostFn {
     /// Every host function, for [`new_jit_module`] to bind.
-    const ALL: [HostFn; 32] = [
+    const ALL: [HostFn; 33] = [
         HostFn::CapThunk,
         HostFn::SigTake,
         HostFn::SigReturn,
@@ -6593,6 +6600,7 @@ impl HostFn {
         HostFn::ChildOffer,
         HostFn::ChildGrant,
         HostFn::SetjmpSlot,
+        HostFn::SetjmpLeave,
         HostFn::MemCopy,
         HostFn::MemFill,
         HostFn::Setjmp,
@@ -6645,6 +6653,7 @@ impl HostFn {
             HostFn::ChildOffer => "temen.child_offer",
             HostFn::ChildGrant => "temen.child_grant",
             HostFn::SetjmpSlot => "temen.setjmp_slot",
+            HostFn::SetjmpLeave => "temen.setjmp_leave",
             HostFn::MemCopy => "temen.mem_copy",
             HostFn::MemFill => "temen.mem_fill",
             HostFn::Setjmp => "temen.setjmp",
@@ -6711,10 +6720,10 @@ impl HostFn {
             | HostFn::InstSpawn
             | HostFn::ChildOffer
             | HostFn::ChildGrant
-            | HostFn::SetjmpSlot
-            | HostFn::Longjmp
             | HostFn::MemCopy
             | HostFn::MemFill => &[Vmctx],
+            // vmctx, this frame's pointer (the checkpoint's activation), then guest values
+            HostFn::SetjmpSlot | HostFn::SetjmpLeave | HostFn::Longjmp => &[Vmctx, FramePointer],
             // libc `_setjmp` saves the frame's registers into its argument, so it must be the host
             // `jmp_buf` `SetjmpSlot` returned (`Self::ret`), never a value the code computed.
             HostFn::Setjmp => &[JmpBuf],
@@ -6799,14 +6808,16 @@ impl HostFn {
             InstSpawn => (&[I64, I32, I64], &[I32]),
             // (vmctx, instantiator, child, arg) -> handle or -errno
             ChildOffer | ChildGrant => (&[I64, I32, I32, I64], &[I32]),
-            // (vmctx, buf) -> jmp_buf
-            SetjmpSlot => (&[I64, I64], &[I64]),
+            // (vmctx, fp, buf) -> jmp_buf
+            SetjmpSlot => (&[I64, I64, I64], &[I64]),
+            // (vmctx, fp)
+            SetjmpLeave => (&[I64, I64], &[]),
             // (vmctx, dst, src, len) / (vmctx, dst, byte, len)
             MemCopy | MemFill => (&[I64, I64, I64, I64], &[]),
             // (jmp_buf) -> 0, or the value a `longjmp` to it passes
             Setjmp => (&[I64], &[I32]),
-            // (vmctx, buf, value); returns only when `buf` names no `setjmp`, having raised
-            Longjmp => (&[I64, I64, I32], &[]),
+            // (vmctx, fp, buf, value); returns only when `buf` names no live checkpoint, having raised
+            Longjmp => (&[I64, I64, I64, I32], &[]),
             VcpuTlsGet | DurableShadowBase | StackLimit => (&[], &[I64]),
             // (value)
             VcpuTlsSet => (&[I64], &[]),
@@ -6867,6 +6878,8 @@ impl HostFn {
             HostFn::ChildGrant => instantiator_rt::child_grant as *const (),
             #[cfg(setjmp_rt)]
             HostFn::SetjmpSlot => setjmp_rt::rt_setjmp_slot as *const (),
+            #[cfg(setjmp_rt)]
+            HostFn::SetjmpLeave => setjmp_rt::rt_setjmp_leave as *const (),
             HostFn::MemCopy => mem::mem_copy as *const (),
             HostFn::MemFill => mem::mem_fill as *const (),
             #[cfg(setjmp_rt)]
@@ -7642,6 +7655,7 @@ mod arg_contract_tests {
             ChildOffer,
             ChildGrant,
             SetjmpSlot,
+            SetjmpLeave,
             Longjmp,
             MemCopy,
             MemFill,
@@ -9537,6 +9551,14 @@ struct Lower<'a> {
     page: Option<(PageEnv, FuncRef, Variable)>,
     /// #2488 — the function's shared exits ([`Exits`]).
     exits: Exits,
+    /// #2877 — the function takes `setjmp` checkpoints (it contains a `SetJmp`), so each of its exits
+    /// drops them first ([`emit_setjmp_leave`]).
+    setjmp_leave: bool,
+    /// #2877 — in a function that uses `setjmp`/`longjmp`, the variable holding its frame pointer,
+    /// which names its activation to the `setjmp` runtime. Read once at entry and laundered across
+    /// each `setjmp` with the other context variables ([`context_vars`]), so every use reads a copy
+    /// the validator can follow, never a register the `longjmp` path restored around it.
+    fp_var: Option<Variable>,
     /// #2534 — the function's `call.cap` buffer, [`CAP_BUF_WORDS`] words of its frame that every
     /// `call.cap` in it passes its arguments and results through ([`lower_cap_call`]), made at the
     /// first. One per function, so a function of many calls does not grow a frame per call.
@@ -9721,6 +9743,8 @@ fn open_function<'a>(
         trap_capture,
         page,
         exits: Exits::default(),
+        setjmp_leave: false,
+        fp_var: None,
         cap_buf: std::cell::Cell::new(None),
     };
     // The params follow the three context pointers and the stack limit, then the sret pointer.
@@ -9787,7 +9811,17 @@ fn build_clif(
             }
         }
     }
-    let (lower, params) = open_function(&mut b, plan, &f.params, &f.results, func_idx)?;
+    let (mut lower, params) = open_function(&mut b, plan, &f.params, &f.results, func_idx)?;
+    lower.setjmp_leave = f
+        .blocks
+        .iter()
+        .any(|blk| blk.insts.iter().any(|i| matches!(i, Inst::SetJmp { .. })));
+    if setjmp {
+        let fp_var = b.declare_var(I64);
+        let fp = b.ins().get_frame_pointer(I64);
+        b.def_var(fp_var, fp);
+        lower.fp_var = Some(fp_var);
+    }
 
     // Jump into IR block 0 passing the function parameters. A §5 kill-path check guards the *entry*
     // (caught before any work): this is what stops unbounded recursion and tail-call loops — each
@@ -10591,6 +10625,7 @@ fn context_vars(lower: &Lower) -> Vec<Variable> {
     ];
     vars.extend(lower.sret_var);
     vars.extend(lower.page.as_ref().map(|&(_, _, table)| table));
+    vars.extend(lower.fp_var);
     vars
 }
 
@@ -10929,23 +10964,24 @@ fn lower_block(
             vals.push(b.inst_results(call)[0]);
             continue;
         }
-        // `setjmp` (LLVM.md §"JIT `longjmp`", Option B): two calls. First a host thunk returns the
-        // stable host `jmp_buf` slot for this guest `buf` address (`rt_setjmp_slot`); then
-        // `_setjmp` is called **inline in this guest frame** — the frame a later `longjmp` returns
-        // to — so it saves *this* frame's SP/return-addr. The code calls libc `_setjmp` itself (not
-        // wrapped in a Rust thunk, whose frame would be gone by `longjmp` time — UB). Result is the
-        // `i32` 0 (direct) / long-jump value (re-entry). The slot alloc is infallible, so no
-        // trap-propagate.
+        // `setjmp` (LLVM.md §"JIT `longjmp`", Option B; #2877): two calls. First a host thunk writes a
+        // fresh token into the guest `jmp_buf` (confined as a guest store), records the checkpoint for
+        // this frame (its frame pointer names the activation) and returns the checkpoint's host
+        // `jmp_buf` (`rt_setjmp_slot`); then `_setjmp` is called **inline in this guest frame** — the
+        // frame a later `longjmp` returns to — so it saves *this* frame's SP/return-addr. The code calls
+        // libc `_setjmp` itself (not wrapped in a Rust thunk, whose frame would be gone by `longjmp`
+        // time — UB). Result is the `i32` 0 (direct) / long-jump value (re-entry). The token store's
+        // fault is checked after the reload: the thunk returned a scratch `jmp_buf` and raised.
         if let Inst::SetJmp { buf } = inst {
-            // The guest jmp_buf's window address: the key of its host table entry.
             let bufv = get(&vals, *buf)?;
             // #2537, #2652: save every value live across this setjmp to a reuse-immune explicit
             // stackslot *before* the call, and reload it after, so both returns (direct and via
             // longjmp) read the saved copy, not a spill slot the longjmp path may clobber.
             let laundered = launder_across_setjmp(b, lower, blk, inst_idx, &vals);
-            // slot = rt_setjmp_slot(vmctx, buf) -> *mut jmp_buf, in the instance's table (#2534)
+            // slot = rt_setjmp_slot(vmctx, fp, buf) -> *mut jmp_buf, in the instance's table (#2534)
             let vmctx = b.use_var(lower.vmctx_var);
-            let c1 = call_host(lower.callees, b, HostFn::SetjmpSlot, &[vmctx, bufv])?;
+            let fp = frame_pointer(b, lower)?;
+            let c1 = call_host(lower.callees, b, HostFn::SetjmpSlot, &[vmctx, fp, bufv])?;
             let slot = b.inst_results(c1)[0];
             // r = _setjmp(slot) -> i32 — emitted inline in this JIT frame.
             let c2 = call_host(lower.callees, b, HostFn::Setjmp, &[slot])?;
@@ -10953,19 +10989,24 @@ fn lower_block(
             // No check point's base crosses the call (#2652): a later access tests its own.
             checked.forget();
             laundered.reload(b, &mut vals);
+            // After the reload, so it reads the context as saved, not a register the longjmp path
+            // restored around it.
+            emit_trap_propagate(b, lower, Callee::Host);
             vals.push(r);
             continue;
         }
-        // `longjmp` (LLVM.md §"JIT `longjmp`"): `rt_longjmp(vmctx, buf, val)` looks up the host
-        // `jmp_buf` slot for this `buf` (set by a prior `setjmp`) and `_longjmp`s to it, restoring the
-        // saved frame and never returning; the IR's trailing `unreachable` terminator caps the block.
-        // A miss (forged/stale token) raises instead and returns, and `emit_trap_propagate` bails. The
-        // code never holds the host slot, so it cannot hand `_longjmp` a forged one (#2534). No result.
+        // `longjmp` (LLVM.md §"JIT `longjmp`"; #2877): `rt_longjmp(vmctx, fp, buf, val)` reads the token
+        // from the guest `jmp_buf` (confined as a guest load), checks its checkpoint is live and in this
+        // frame or one enclosing it, and `_longjmp`s to it, never returning; the IR's trailing
+        // `unreachable` terminator caps the block. Anything else (a forged token, a returned frame)
+        // raises and returns, and `emit_trap_propagate` bails. The code never holds the host slot, so
+        // it cannot hand `_longjmp` a forged one (#2534). No result.
         if let Inst::LongJmp { buf, val } = inst {
             let bufv = get(&vals, *buf)?;
             let valv = get(&vals, *val)?; // i32 long-jump value (0 → 1 is applied by libc `_longjmp`)
             let vmctx = b.use_var(lower.vmctx_var);
-            call_host(lower.callees, b, HostFn::Longjmp, &[vmctx, bufv, valv])?;
+            let fp = frame_pointer(b, lower)?;
+            call_host(lower.callees, b, HostFn::Longjmp, &[vmctx, fp, bufv, valv])?;
             emit_trap_propagate(b, lower, Callee::Host);
             continue;
         }
@@ -12165,6 +12206,7 @@ fn lower_block(
                 .iter()
                 .map(|o| get(&vals, *o))
                 .collect::<Result<_, _>>()?;
+            emit_setjmp_leave(b, lower)?;
             if let Some(sret_var) = lower.sret_var {
                 // sret ABI: write each result into the caller-provided return-area (8-byte slots,
                 // `encode_slot`-encoded like the buffer ABI), then return void.
@@ -12182,6 +12224,7 @@ fn lower_block(
         }
         Terminator::ReturnCall { func, args } => {
             // Tail call (§3b): replace this frame with the callee, threading the context.
+            emit_setjmp_leave(b, lower)?;
             let callee = direct_callee(b, lower, *func)?;
             let mut cargs = ctx_args(b, lower);
             // The tail callee shares this function's result type (verifier-enforced), so its sret-ness
@@ -12199,6 +12242,7 @@ fn lower_block(
         }
         Terminator::ReturnCallIndirect { ty, idx, args } => {
             // Indirect tail call: table dispatch (§3c) then a guaranteed tail call.
+            emit_setjmp_leave(b, lower)?;
             let ty = sig_of(lower.type_section, *ty); // #922: resolve interned call type index
             let code = indirect_dispatch(b, lower, get(&vals, *idx)?, ty);
             let sig = b.import_signature(sig_from(&ty.params, &ty.results));
@@ -12220,6 +12264,22 @@ fn lower_block(
     blocks.vals[block_idx] = vals;
     checked.leave(block_idx);
     Ok(())
+}
+
+/// #2877 — before an exit (a return or a tail call) of a function that takes `setjmp` checkpoints,
+/// drop this frame's: once its activation is gone, no `longjmp` may reach them.
+fn emit_setjmp_leave(b: &mut FunctionBuilder, lower: &Lower) -> Result<(), JitError> {
+    if lower.setjmp_leave {
+        let vmctx = b.use_var(lower.vmctx_var);
+        let fp = frame_pointer(b, lower)?;
+        call_host(lower.callees, b, HostFn::SetjmpLeave, &[vmctx, fp])?;
+    }
+    Ok(())
+}
+
+/// #2877 — the frame pointer of a function that uses `setjmp`/`longjmp` ([`Lower::fp_var`]).
+fn frame_pointer(b: &mut FunctionBuilder, lower: &Lower) -> Result<Value, JitError> {
+    Ok(b.use_var(lower.fp_var.ok_or(JitError::Malformed)?))
 }
 
 /// The leading context arguments threaded into every guest call: `(mem_base,

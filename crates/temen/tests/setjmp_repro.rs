@@ -347,3 +347,311 @@ fn jit_setjmp_matches_oracle_with_context_values_after_the_second_return() {
     // Five results return through the return area, whose pointer is a context value too.
     assert_jit_matches_oracle(|n| stress_context(n, 5), &ns, &[7, 1000, -7]);
 }
+
+// ---- #2877: a checkpoint lives exactly as long as the activation that took it ----
+//
+// One rule on every engine: a `longjmp` reaches only a checkpoint of a live activation, named by the
+// token its `setjmp` wrote into the buffer (#1062). Anything else traps `Malformed` — on the JIT
+// before it would `_longjmp` into a dead native frame, which is host UB.
+
+/// How a run ended on one engine: its results, or the wire code it trapped with
+/// (`temen_ir::trap_code`); `None` when the engine declined the module.
+type Ended = Option<Result<Vec<i64>, i64>>;
+
+/// `src`'s entry with argument `x` on the tree-walker, the bytecode engine and the Cranelift JIT.
+fn on_every_engine(src: &str, x: i64) -> [Ended; 3] {
+    let m = parse_module(src).unwrap_or_else(|e| panic!("parse: {e:?}\n{src}"));
+    verify_module(&m).unwrap_or_else(|e| panic!("verify: {e:?}"));
+    let wide = |vs: Vec<Value>| -> Vec<i64> {
+        vs.iter()
+            .map(|v| match v {
+                Value::I64(v) => *v,
+                other => panic!("result shape: {other:?}"),
+            })
+            .collect()
+    };
+    let mut fuel = 1_000_000u64;
+    let tree = Some(
+        run(&m, 0, &[Value::I64(x)], &mut fuel)
+            .map(wide)
+            .map_err(|t| t.code()),
+    );
+    let mut fuel = 1_000_000u64;
+    let byte = temen_interp::bytecode::compile_and_run(&m, 0, &[Value::I64(x)], &mut fuel)
+        .map(|r| r.map(wide).map_err(|t| t.code()));
+    let jit = match compile_and_run(&m, 0, &[x]) {
+        Ok(JitOutcome::Returned(vs)) => Some(Ok(vs)),
+        Ok(JitOutcome::Trapped(k)) => Some(Err(k.code())),
+        other => panic!("jit: {other:?}"),
+    };
+    [tree, byte, jit]
+}
+
+/// Every engine ends `src(x)` as `want`.
+fn assert_every_engine(src: &str, x: i64, want: Result<Vec<i64>, i64>) {
+    let got = on_every_engine(src, x);
+    let names = ["tree-walker", "bytecode", "Cranelift JIT"];
+    for (name, got) in names.iter().zip(&got) {
+        assert_eq!(got.as_ref(), Some(&want), "{name} at x={x}: {got:?}");
+    }
+}
+
+const MALFORMED: i64 = temen_ir::trap_code::MALFORMED;
+
+/// Func 1 takes a checkpoint at the buffer (48000) and returns; func 2 `longjmp`s to it with 7.
+/// `x = 0`: the root runs both, so func 2 reaches a checkpoint whose activation returned, at the
+/// depth that activation had — the depth-only rule let this through and ran func 2's body at
+/// func 1's resume point. `x = 1`: func 1 alone, which returns 0.
+const RETURNED: &str = "memory 16
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  v1 = i64.const 48000
+  v2 = call 1(v1)
+  v3 = i64.const 0
+  v4 = i64.eq v0 v3
+  br_if v4 1(v1) 2(v2)
+  }
+block 1 (v5: i64) {
+  v6 = call 2(v5)
+  return v6
+  }
+block 2 (v7: i64) {
+  return v7
+  }
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  v1 = setjmp v0
+  v2 = i64.extend_i32_u v1
+  return v2
+  }
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  v1 = i32.const 7
+  longjmp v0 v1
+  unreachable
+  }
+}
+";
+
+#[test]
+fn a_longjmp_to_a_returned_activation_traps_on_every_engine() {
+    assert_every_engine(RETURNED, 0, Err(MALFORMED));
+    assert_every_engine(RETURNED, 1, Ok(vec![0]));
+}
+
+/// One call site runs func 1 twice: the first activation takes a checkpoint and returns, the second
+/// `longjmp`s to it before taking its own. Same function, same depth, same return address — only the
+/// activation differs, and the first one has returned.
+const SAME_SITE: &str = "memory 16
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  v1 = i64.const 0
+  br 1(v1)
+  }
+block 1 (v2: i64) {
+  v3 = i64.const 48000
+  v4 = call 1(v3, v2)
+  v5 = i64.const 1
+  v6 = i64.add v2 v5
+  v7 = i64.const 2
+  v8 = i64.lt_s v6 v7
+  br_if v8 1(v6) 2(v4)
+  }
+block 2 (v9: i64) {
+  return v9
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (v0: i64, v1: i64) {
+  v2 = i64.const 0
+  v3 = i64.eq v1 v2
+  br_if v3 1(v0) 2(v0)
+  }
+block 1 (v4: i64) {
+  v5 = setjmp v4
+  v6 = i64.extend_i32_u v5
+  return v6
+  }
+block 2 (v7: i64) {
+  v8 = i32.const 5
+  longjmp v7 v8
+  unreachable
+  }
+}
+";
+
+#[test]
+fn a_longjmp_from_a_later_activation_at_the_same_call_site_traps() {
+    assert_every_engine(SAME_SITE, 0, Err(MALFORMED));
+}
+
+/// The root takes checkpoint A, calls func 1, which takes B and `longjmp`s to A — unwinding func 1 and
+/// B with it — and the root then `longjmp`s to B: B's activation is gone. `x = 1` stops after the
+/// first `longjmp`, which returns 1 through A.
+const UNWOUND: &str = "memory 16
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  v1 = i64.const 48000
+  v2 = setjmp v1
+  v3 = i32.const 0
+  v4 = i32.eq v2 v3
+  br_if v4 1() 2(v2, v0)
+  }
+block 1 () {
+  v5 = i64.const 48000
+  v6 = i64.const 48016
+  v7 = call 1(v5, v6)
+  return v7
+  }
+block 2 (v8: i32, v15: i64) {
+  v9 = i64.const 0
+  v10 = i64.eq v15 v9
+  br_if v10 3() 4(v8)
+  }
+block 3 () {
+  v11 = i64.const 48016
+  v12 = i32.const 9
+  longjmp v11 v12
+  unreachable
+  }
+block 4 (v13: i32) {
+  v14 = i64.extend_i32_u v13
+  return v14
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (v0: i64, v1: i64) {
+  v2 = setjmp v1
+  v3 = i32.const 1
+  longjmp v0 v3
+  unreachable
+  }
+}
+";
+
+#[test]
+fn a_longjmp_to_a_checkpoint_an_earlier_longjmp_unwound_traps() {
+    assert_every_engine(UNWOUND, 0, Err(MALFORMED));
+    assert_every_engine(UNWOUND, 1, Ok(vec![1]));
+}
+
+/// bash's `COPY_PROCENV` shape (#1062): the root takes checkpoint A in the buffer and calls func 1,
+/// which saves the buffer's bytes, takes its own checkpoint in the same buffer and `longjmp`s to it;
+/// the handler restores the saved bytes and `longjmp`s again *while func 1 is still live*. The restored
+/// token names the root's checkpoint, so the run returns 100 + 3 — an address-keyed table resolves the
+/// newest checkpoint at the address instead and loops forever.
+const COPIED: &str = "memory 16
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  v1 = i64.const 48000
+  v2 = setjmp v1
+  v3 = i32.const 0
+  v4 = i32.eq v2 v3
+  br_if v4 1() 2(v2)
+  }
+block 1 () {
+  v5 = i64.const 48000
+  v6 = call 1(v5)
+  return v6
+  }
+block 2 (v7: i32) {
+  v8 = i64.extend_i32_u v7
+  v9 = i64.const 100
+  v10 = i64.add v8 v9
+  return v10
+  }
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  v1 = i64.load v0
+  v2 = i64.const 48016
+  i64.store v2 v1
+  v3 = setjmp v0
+  v4 = i32.const 0
+  v5 = i32.eq v3 v4
+  br_if v5 1(v0) 2(v0)
+  }
+block 1 (v6: i64) {
+  v7 = i32.const 1
+  longjmp v6 v7
+  unreachable
+  }
+block 2 (v8: i64) {
+  v9 = i64.const 48016
+  v10 = i64.load v9
+  i64.store v8 v10
+  v11 = i32.const 3
+  longjmp v8 v11
+  unreachable
+  }
+}
+";
+
+#[test]
+fn a_restored_copy_of_a_jmp_buf_reaches_its_own_checkpoint_on_every_engine() {
+    assert_every_engine(COPIED, 0, Ok(vec![103]));
+}
+
+/// A `jmp_buf` in the NULL guard faults at the `setjmp`'s token store on every engine, as any store
+/// there does.
+#[test]
+fn a_setjmp_into_the_null_guard_faults_on_every_engine() {
+    let src = RETURNED.replace("v1 = i64.const 48000", "v1 = i64.const 64");
+    assert_every_engine(&src, 1, Err(temen_ir::trap_code::MEMORY_FAULT));
+}
+
+/// One compiled module run twice over one window: the first run takes a checkpoint (its token stays
+/// in the buffer) and returns; the second `longjmp`s with that token. The first run's activation is
+/// long gone — the JIT's table outlives runs, so it must drop a run's checkpoints when the run ends.
+#[test]
+fn a_jit_rerun_cannot_reach_an_earlier_runs_checkpoint() {
+    let src = "memory 16
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  v1 = i64.const 48000
+  v2 = i64.const 0
+  v3 = i64.eq v0 v2
+  br_if v3 1(v1) 2(v1)
+  }
+block 1 (v4: i64) {
+  v5 = setjmp v4
+  v6 = i64.extend_i32_u v5
+  return v6
+  }
+block 2 (v7: i64) {
+  v8 = i32.const 7
+  longjmp v7 v8
+  unreachable
+  }
+}
+";
+    let m = parse_module(src).expect("parse");
+    verify_module(&m).expect("verify");
+    let mut host = temen_interp::Host::new();
+    let mut cm = temen_jit::CompiledModule::compile(
+        &m,
+        0,
+        temen_run::cap_thunk,
+        &mut host as *mut temen_interp::Host as *mut core::ffi::c_void,
+        temen_ir::DEFAULT_RESERVED_LOG2,
+        None,
+        None,
+        None,
+        None,
+        None,
+        0,
+    )
+    .expect("compile");
+    let (first, window) = cm.run(&[0], None, None).expect("first run");
+    assert!(
+        matches!(first, JitOutcome::Returned(ref v) if v == &[0]),
+        "{first:?}"
+    );
+    let (second, _) = cm.run(&[1], Some(&window), None).expect("second run");
+    assert!(
+        matches!(second, JitOutcome::Trapped(k) if k.code() == MALFORMED),
+        "the second run reached the first's checkpoint: {second:?}"
+    );
+}

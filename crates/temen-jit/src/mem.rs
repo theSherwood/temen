@@ -398,18 +398,7 @@ pub(crate) unsafe fn run_guarded(
 ) -> bool {
     pal::install_guard();
     let (lo, hi) = window.fault_range();
-    let f: Entry = std::mem::transmute(code);
-    // The entry ABI spells the context pointer as the trap cell it starts with (`VmCtx` field 0).
-    pal::run_guarded(
-        f,
-        args,
-        results,
-        mem_base,
-        fn_table,
-        vmctx as *mut i64,
-        lo,
-        hi,
-    )
+    run_guarded_range(code, args, results, mem_base, fn_table, vmctx, lo, hi)
 }
 
 /// Install the guard on the calling (worker) thread. Idempotent; the handler is process-wide but its
@@ -476,6 +465,11 @@ pub(crate) unsafe fn run_guarded_range(
     hi: usize,
 ) -> bool {
     let f: Entry = std::mem::transmute(code);
+    // #2877 — the `setjmp` checkpoints this call takes die with it, however it ends (a fault skips
+    // every frame's exit), and a `longjmp` inside it cannot reach an enclosing call's.
+    #[cfg(setjmp_rt)]
+    let _checkpoints = crate::setjmp_rt::Scope::enter(vmctx);
+    // The entry ABI spells the context pointer as the trap cell it starts with (`VmCtx` field 0).
     pal::run_guarded(
         f,
         args,
@@ -540,6 +534,28 @@ pub(crate) unsafe extern "C" fn mem_fill(vm: &crate::VmCtx, dst: u64, val: u64, 
     }
     probe(d, len);
     core::ptr::write_bytes(d, val as u8, len as usize);
+}
+
+/// #2877 — the 8 guest bytes at window offset `at` of `vm`'s window, for a host function to read or
+/// (when `write`) write in place of a guest access: confined, paged and probed as [`mem_copy`] does a
+/// span, so they fault exactly where a guest access would. `None` when the guest may not access them,
+/// with the `MemoryFault` raised (or the domain stopped by its pager). The `setjmp` runtime reads and
+/// writes a `jmp_buf`'s token through it.
+///
+/// # Safety
+/// As [`mem_copy`].
+#[cfg(setjmp_rt)]
+pub(crate) unsafe fn guest_word(vm: &crate::VmCtx, at: u64, write: bool) -> Option<*mut u8> {
+    let w = vm.window();
+    let Some(p) = w.span(at, 8) else {
+        fault(vm);
+        return None;
+    };
+    if w.pages != 0 && !pages_admit(vm, at, 8, write) {
+        return None;
+    }
+    probe(p, 8);
+    Some(p)
 }
 
 /// A bulk op's span past the reservation: the `MemoryFault` a guest access there is. Out of line, so
