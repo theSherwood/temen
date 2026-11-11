@@ -38,8 +38,7 @@ fn consumer(argv: &[&str], stdin: &str, report: bool) -> String {
     }
     let payload = argv_len + stdin.len();
     let tail = if report {
-        format!(
-            "  vread = i64.const 1
+        "  vread = i64.const 1
   vcap = i64.const 16
   vn = call.cap 13 0 (i64, i64, i64, i64) -> (i64) vh (vread, vjob, vz, vcap)
   vst = i64.const 3
@@ -50,7 +49,7 @@ fn consumer(argv: &[&str], stdin: &str, report: bool) -> String {
   vsum = i64.add vmul vn
   vcode = i32.wrap_i64 vsum
   call.import 1 (vcode)"
-        )
+            .to_string()
     } else {
         "  vfailed = i64.lt_s vjob vz
   call.import 1 (vfailed)"
