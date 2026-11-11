@@ -23003,6 +23003,8 @@ impl core::ops::DerefMut for HostBuffer {
 pub(crate) struct Fuel {
     left: u64,
     src: Option<NodeRef>,
+    /// #2958 — a native task's ([`Fuel::native`]): it names its node and never draws from it.
+    native: bool,
 }
 
 impl Fuel {
@@ -23011,18 +23013,38 @@ impl Fuel {
         Fuel {
             left: 0,
             src: Some(src),
+            native: false,
+        }
+    }
+
+    /// #2958 — the fuel of a task whose code is a native tier's: it names the node the tier's own
+    /// cell draws from ([`Self::source`]) and draws nothing itself, so no chunk is ever stranded in
+    /// it while the task's code burns elsewhere. A burn charges nothing: the tier's code charged the
+    /// same safepoint (its entry prologue, for the root's entry charge).
+    pub(crate) fn native(src: NodeRef) -> Fuel {
+        Fuel {
+            left: 0,
+            src: Some(src),
+            native: true,
         }
     }
 
     /// A fixed allowance of `n`, never refilled.
     pub(crate) fn fixed(n: u64) -> Fuel {
-        Fuel { left: n, src: None }
+        Fuel {
+            left: n,
+            src: None,
+            native: false,
+        }
     }
 
     /// Burn one unit, at a safepoint.
     #[inline]
     pub(crate) fn burn(&mut self) -> Result<(), Trap> {
         if self.left == 0 {
+            if self.native {
+                return Ok(());
+            }
             self.refill()?;
         }
         self.left -= 1;
@@ -23032,7 +23054,7 @@ impl Fuel {
     /// Whether one unit is there to burn, drawing it if `left` is spent: a charge decided ahead of
     /// work that must not trap half-done (an offer crossing's checkout, CALLS.md 5b).
     pub(crate) fn has_one(&mut self) -> bool {
-        self.left > 0 || self.refill().is_ok()
+        self.left > 0 || self.native || self.refill().is_ok()
     }
 
     /// Refill a spent `left` with a draw; a spent chain (or a spent fixed allowance) is `OutOfFuel`.
@@ -23075,6 +23097,7 @@ impl Fuel {
     /// fixed allowance, starts with a copy of it, as every thread did before (#1944 slice 3).
     pub(crate) fn for_thread(&self) -> Fuel {
         match &self.src {
+            Some(s) if self.native => Fuel::native(s.clone()),
             Some(s) => Fuel::drawn(s.clone()),
             None => Fuel::fixed(self.left),
         }

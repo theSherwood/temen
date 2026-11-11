@@ -295,6 +295,8 @@ block 2 (vr: i64) {
         assert_eq!(oracle.0, Ok(vec![2 * 500_500]));
         assert_eq!(kernel.0, oracle.0, "the kernel route: the oracle's answer");
         assert_eq!(kernel, today, "the kernel route: today's answer and fuel");
+        // Both JIT routes burn one unit per spawned thread more than the oracle (#2977): fixing it
+        // fails this line until the allowance is taken away.
         assert_eq!(oracle.1 - today.1, 2, "one unit per spawned entry (#2977)");
     }
 }
@@ -398,4 +400,86 @@ block 0 (va: i64, vb: i64) {
 ";
     let m = module(src);
     assert_eq!(jit_kernel::run_fresh(&m, 0, &[], None).err(), Some("cap"));
+}
+
+/// Eight threads counting 1,000 each, joined and summed.
+const EIGHT_COUNTERS: &str = "memory 16
+func () -> (i64) {
+block 0 () {
+  vz = i64.const 0
+  br 1(vz, vz)
+}
+block 1 (vi: i64, vacc: i64) {
+  veight = i64.const 8
+  vlt = i64.lt_u vi veight
+  br_if vlt 2(vi, vacc) 3(vacc)
+}
+block 2 (vi2: i64, vacc2: i64) {
+  vn = i64.const 1000
+  vz2 = i64.const 0
+  vh = thread.spawn 1 vn vz2
+  vs, vv = thread.join vh
+  vacc3 = i64.add vacc2 vv
+  vone = i64.const 1
+  vin = i64.add vi2 vone
+  br 1(vin, vacc3)
+}
+block 3 (vr: i64) {
+  return vr
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vn: i64, vacc: i64) {
+  br 1(vn, vacc)
+}
+block 1 (vi: i64, va: i64) {
+  vone = i64.const 1
+  vj = i64.sub vi vone
+  vb = i64.add va vi
+  vz = i64.eqz vj
+  br_if vz 2(vb) 1(vj, vb)
+}
+block 2 (vr: i64) {
+  return vr
+  }
+}
+";
+
+/// The least budget a run completes in, by bisection over `fueled`'s engine `which`.
+fn least_budget(m: &temen_ir::Module, which: usize, hi: u64) -> u64 {
+    let (mut lo, mut hi) = (0u64, hi); // lo runs out, hi completes
+    assert!(fueled(m, hi)[which].0.is_ok());
+    while hi - lo > 1 {
+        let mid = lo + (hi - lo) / 2;
+        match fueled(m, mid)[which].0 {
+            Ok(_) => hi = mid,
+            Err(Trap::OutOfFuel) => lo = mid,
+            Err(t) => panic!("{t:?}"),
+        }
+    }
+    hi
+}
+
+/// No task strands fuel the oracle would not. A run's least budget is set by the chunk rule: each
+/// vCPU's draw takes up to half of the room, and the root holds what it drew while it waits in a
+/// join, so the threads' burns come out of half of what is left. A chunk a native task's
+/// kernel-side fuel drew and never burned would raise the kernel's least budget past the oracle's
+/// (the root's did, before native tasks' fuel stopped drawing: 49,999 stranded of 100,000). A
+/// completed run leaves exactly today's JIT's fuel. Both JIT routes burn one unit per spawned
+/// thread more than the oracle (#2977), which the half-room draw doubles in the least budget: the
+/// allowance is spelled out, so fixing #2977 fails this test until it is taken away.
+#[test]
+fn the_kernel_route_strands_no_fuel_the_oracle_does_not() {
+    const SPAWNS: u64 = 8;
+    let m = module(EIGHT_COUNTERS);
+    let [oracle, today, kernel] = fueled(&m, 1_000_000);
+    assert_eq!(oracle.0, Ok(vec![8 * 500_500]));
+    assert_eq!(kernel, today, "a completed run leaves today's fuel");
+    assert_eq!(oracle.1 - kernel.1, SPAWNS, "#2977's allowance");
+    let least = least_budget(&m, 0, 1_000_000);
+    assert_eq!(
+        least_budget(&m, 2, 1_000_000),
+        least + 2 * SPAWNS,
+        "the kernel route's least budget is the oracle's, but for #2977's allowance"
+    );
 }

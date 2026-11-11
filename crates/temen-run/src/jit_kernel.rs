@@ -246,7 +246,7 @@ pub fn run(
         .zip(start.args)
         .map(|(t, a)| slot_value(*t, *a))
         .collect();
-    let opened = CoopRun::new_parallel(
+    let opened = CoopRun::open_parallel(
         m,
         start.entry,
         &vals,
@@ -259,9 +259,11 @@ pub fn run(
     );
     let mut co = match opened {
         Some(Ok(co)) => co,
-        // A run its activation refused (the process's pools): an ordinary run ends so too. Its host
-        // went with it, as `new_parallel` keeps it.
-        Some(Err(t)) => {
+        // A run its activation refused (the process's pools): an ordinary run ends so too, and the
+        // caller has its host back, as on the JIT's own runtime.
+        Some(Err(refused)) => {
+            let (t, back) = *refused;
+            *host = back;
             host.set_thread_platform(ThreadPlatform::OS);
             host.replace_run_door(embedders);
             return Ok(KernelEnd {
@@ -396,5 +398,54 @@ struct Hook<'c, 'a>(&'c mut EmittedCall<'a>);
 impl KernelPark for Hook<'_, '_> {
     fn park(&mut self, stop: NativeStop) -> Result<[i64; 2], i64> {
         self.0.park(stop).map_err(|t| t.code())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A program whose root does not run whole on the JIT: an import its host does not bind keeps
+    /// the root interpreted (`image_parks`), so its call to a function the tier emits tiers up as an
+    /// interpreted call.
+    const INTERPRETED_ROOT: &str = r#"import 0 "vm_page_size" () -> (i64)
+memory 16
+func () -> (i64) {
+block 0 () {
+  vz = i64.const 0
+  vh = thread.spawn 1 vz vz
+  vst, vv = thread.join vh
+  vr = call 1(vz, vv)
+  return vr
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (va: i64, vb: i64) {
+  vone = i64.const 1
+  vr = i64.add vb vone
+  return vr
+  }
+}
+"#;
+
+    /// The JIT's tier traps an interpreted call (`CallEntry::Call`): what makes every vCPU of an
+    /// admitted program native. `admit` declines this one (`imports`); run past it, it traps.
+    #[test]
+    fn an_interpreted_call_traps_on_the_jits_tier_and_admit_keeps_it_away() {
+        let m = temen_text::parse_module(INTERPRETED_ROOT).expect("parse");
+        temen_verify::verify_module(&m).expect("verify");
+        let mut host = Host::new();
+        assert_eq!(admit(&m, &host, None).err(), Some("imports"));
+        let start = Start {
+            entry: 0,
+            args: &[],
+            init_mem: &[],
+            reserved_log2: temen_ir::DEFAULT_RESERVED_LOG2,
+            fuel: u64::MAX,
+            snapshot_cap: None,
+            kill: None,
+        };
+        let end = run(Admitted(&m), start, &mut host).expect("compiles");
+        assert_eq!(end.result, Err(Trap::Malformed));
     }
 }

@@ -14166,9 +14166,7 @@ impl SchedCore {
         // the JIT's entry-prologue charge, so the tree-walker, bytecode, and JIT engines burn identically.
         // Gated exactly as the tree-walker's `drive` (`super::drive_arc`): a durable **thaw** re-enters to
         // continue an already-charged run (the root re-enters under `REWINDING`), so it must not re-charge.
-        // #2958 — nor a native tier's: its root's entry prologue charges it, from the cell its code
-        // burns, and this fuel never draws (a native task's fuel is its tier's, [`EmittedCall::fuel_node`]).
-        if !thaws(&h, mem.as_ref()) && !parks_natively(&h) {
+        if !thaws(&h, mem.as_ref()) {
             fuel.burn()?;
         }
         let root_vt = VTask::new(&source.primary(), entry as usize, args, Some(h.own_node()))?;
@@ -16787,10 +16785,39 @@ impl CoopRun {
         back: Option<std::sync::Arc<super::Region>>,
         pump: bool,
     ) -> Option<Result<CoopRun, Trap>> {
+        Self::open_parallel(
+            m,
+            entry,
+            args,
+            fuel,
+            host,
+            init_mem,
+            reserved_log2,
+            back,
+            pump,
+        )
+        .map(|r| r.map_err(|refused| refused.0))
+    }
+
+    /// [`Self::new_parallel`], giving the host back with the trap when the run is refused (its
+    /// window, or the process's room for its activation): an embedder whose caller keeps its host
+    /// whatever the run does (#2958, the Cranelift JIT's kernel route).
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_parallel(
+        m: &Module,
+        entry: FuncIdx,
+        args: &[Value],
+        fuel: u64,
+        host: Host,
+        init_mem: &[u8],
+        reserved_log2: u8,
+        back: Option<std::sync::Arc<super::Region>>,
+        pump: bool,
+    ) -> Option<Result<CoopRun, Box<(Trap, Host)>>> {
         let (source, table, mem) =
             match parallel_domain(m, entry, &host, reserved_log2, back, init_mem)? {
                 Ok(start) => start,
-                Err(t) => return Some(Err(t)),
+                Err(t) => return Some(Err(Box::new((t, host)))),
             };
         let leaf = host.thread_platform().tier.and_then(|t| t.leaf);
         let leaf = leaf.and_then(|emit| root_leaf(&emit, m, &source, entry, &host, mem.as_ref()));
@@ -16798,7 +16825,10 @@ impl CoopRun {
             Ok(t) => Some(Ok(CoopRun {
                 exec: CoopExec::Threads(t),
             })),
-            Err(refused) => Some(Err(refused.0)),
+            Err(refused) => {
+                let (t, host, _) = *refused;
+                Some(Err(Box::new((t, host))))
+            }
         }
     }
 
@@ -18572,7 +18602,12 @@ impl ThreadRun {
         let Some(node) = host.begin_activation(fuel, RootWindow::of(mem.as_ref())) else {
             return Err(Box::new((Trap::ThreadFault, host, mem)));
         };
-        let root_fuel = Fuel::drawn(node);
+        // #2958 — on a native tier every task's code burns its tier's own cell, which draws from this
+        // node ([`EmittedCall::fuel_node`]): the run's fuel, and every task's hand of it, only names it.
+        let root_fuel = match parks_natively(&host) {
+            true => Fuel::native(node),
+            false => Fuel::drawn(node),
+        };
         // The run's processes ring its bell, armed by the embedder or the run's own.
         let bell = host.external_wake().unwrap_or_default();
         let root = host.into_cell();
