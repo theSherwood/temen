@@ -244,7 +244,14 @@ pub fn run(
     let _kill = start.kill.map(|k| {
         let door = Arc::clone(&door);
         // A busy run lock answers `false`: the stop is asked again (`RunDoor::stop`).
-        temen_jit::kernel_rt::on_kill(k, Box::new(move || while !door.stop() {}))
+        temen_jit::kernel_rt::on_kill(
+            k,
+            Box::new(move || {
+                while !door.stop() {
+                    std::thread::yield_now();
+                }
+            }),
+        )
     });
     let vals: Vec<Value> = f
         .params
@@ -264,14 +271,18 @@ pub fn run(
         false,
     );
     let mut co = match opened {
-        Some(Ok(co)) => co,
-        // A run its activation refused (the process's pools): an ordinary run ends so too, and the
-        // caller has its host back, as on the JIT's own runtime.
-        Some(Err(refused)) => {
+        Ok(co) => co,
+        // No run started: the caller has its host back, as on the JIT's own runtime. A run its
+        // activation refused (the process's pools) ends as an ordinary run does; one the engine
+        // declines (outside its subset) is the JIT's compile refusing it.
+        Err(refused) => {
             let (t, back) = *refused;
             *host = back;
             host.set_thread_platform(ThreadPlatform::OS);
             host.replace_run_door(embedders);
+            let t = t.ok_or(temen_jit::JitError::Unsupported(
+                "executor 2 declines the module",
+            ))?;
             return Ok(KernelEnd {
                 result: Err(t),
                 snapshot: None,
@@ -279,8 +290,6 @@ pub fn run(
                 vcpus: 0,
             });
         }
-        // `native_scope` admitted the module, so the bytecode compile cannot refuse it.
-        None => unreachable!("native_scope admits only what the bytecode engine compiles"),
     };
     // The kernel seeded the window; nothing has run. A protection the OS refuses ends the run as a
     // window it cannot hold does (`ThreadFault`), with its host given back.

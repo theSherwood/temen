@@ -16785,7 +16785,7 @@ impl CoopRun {
         back: Option<std::sync::Arc<super::Region>>,
         pump: bool,
     ) -> Option<Result<CoopRun, Trap>> {
-        Self::open_parallel(
+        match Self::open_parallel(
             m,
             entry,
             args,
@@ -16795,12 +16795,15 @@ impl CoopRun {
             reserved_log2,
             back,
             pump,
-        )
-        .map(|r| r.map_err(|refused| refused.0))
+        ) {
+            Ok(run) => Some(Ok(run)),
+            Err(refused) => refused.0.map(Err),
+        }
     }
 
-    /// [`Self::new_parallel`], giving the host back with the trap when the run is refused (its
-    /// window, or the process's room for its activation): an embedder whose caller keeps its host
+    /// [`Self::new_parallel`], giving the host back whenever no run starts: with the trap that
+    /// refused it (its window, or the process's room for its activation), or with none when `m` is
+    /// outside the engine's subset or its host is durable. For an embedder whose caller keeps its host
     /// whatever the run does (#2958, the Cranelift JIT's kernel route).
     #[allow(clippy::too_many_arguments)]
     pub fn open_parallel(
@@ -16813,21 +16816,22 @@ impl CoopRun {
         reserved_log2: u8,
         back: Option<std::sync::Arc<super::Region>>,
         pump: bool,
-    ) -> Option<Result<CoopRun, Box<(Trap, Host)>>> {
+    ) -> Result<CoopRun, Box<(Option<Trap>, Host)>> {
         let (source, table, mem) =
-            match parallel_domain(m, entry, &host, reserved_log2, back, init_mem)? {
-                Ok(start) => start,
-                Err(t) => return Some(Err(Box::new((t, host)))),
+            match parallel_domain(m, entry, &host, reserved_log2, back, init_mem) {
+                Some(Ok(start)) => start,
+                Some(Err(t)) => return Err(Box::new((Some(t), host))),
+                None => return Err(Box::new((None, host))),
             };
         let leaf = host.thread_platform().tier.and_then(|t| t.leaf);
         let leaf = leaf.and_then(|emit| root_leaf(&emit, m, &source, entry, &host, mem.as_ref()));
         match ThreadsRun::open(source, table, entry, args, fuel, mem, host, pump, leaf) {
-            Ok(t) => Some(Ok(CoopRun {
+            Ok(t) => Ok(CoopRun {
                 exec: CoopExec::Threads(t),
-            })),
+            }),
             Err(refused) => {
                 let (t, host, _) = *refused;
-                Some(Err(Box::new((t, host))))
+                Err(Box::new((Some(t), host)))
             }
         }
     }
@@ -18223,6 +18227,7 @@ impl EmittedCall<'_> {
     /// over them, run over the task's live window and powerbox, with how many words the emitted
     /// frames beneath it pushed to the thread's spill stack ([`EmittedCall::spill`]). Returns how
     /// many results it wrote.
+    #[inline]
     pub fn bounce(&mut self, target: u32, io: &mut [i64], pushed: usize) -> Result<usize, Trap> {
         self.seam.bounce(target, io, pushed)
     }
@@ -18232,6 +18237,7 @@ impl EmittedCall<'_> {
     /// `(status, value)` for a join, the result in `[0]` otherwise. `Err` when the task or the run
     /// ended meanwhile, or the op traps; the emitted code then unwinds. Only a native tier's code
     /// makes one ([`ThreadTier::native`]).
+    #[inline]
     pub fn park(&mut self, stop: NativeStop) -> Result<[i64; 2], Trap> {
         self.seam.park(stop)
     }

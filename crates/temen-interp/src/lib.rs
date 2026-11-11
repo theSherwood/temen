@@ -23020,7 +23020,8 @@ impl Fuel {
     /// #2958 — the fuel of a task whose code is a native tier's: it names the node the tier's own
     /// cell draws from ([`Self::source`]) and draws nothing itself, so no chunk is ever stranded in
     /// it while the task's code burns elsewhere. A burn charges nothing: the tier's code charged the
-    /// same safepoint (its entry prologue, for the root's entry charge).
+    /// same safepoint (its entry prologue, for the root's entry charge). Its refill grants without a
+    /// draw and hands nothing back, so [`Self::burn`]'s hot path is every fuel's.
     pub(crate) fn native(src: NodeRef) -> Fuel {
         Fuel {
             left: 0,
@@ -23042,9 +23043,6 @@ impl Fuel {
     #[inline]
     pub(crate) fn burn(&mut self) -> Result<(), Trap> {
         if self.left == 0 {
-            if self.native {
-                return Ok(());
-            }
             self.refill()?;
         }
         self.left -= 1;
@@ -23054,12 +23052,17 @@ impl Fuel {
     /// Whether one unit is there to burn, drawing it if `left` is spent: a charge decided ahead of
     /// work that must not trap half-done (an offer crossing's checkout, CALLS.md 5b).
     pub(crate) fn has_one(&mut self) -> bool {
-        self.left > 0 || self.native || self.refill().is_ok()
+        self.left > 0 || self.refill().is_ok()
     }
 
     /// Refill a spent `left` with a draw; a spent chain (or a spent fixed allowance) is `OutOfFuel`.
     #[cold]
     fn refill(&mut self) -> Result<(), Trap> {
+        // #2958 — a native task's fuel draws nothing: what it "burns" its tier's code charged.
+        if self.native {
+            self.left = u64::MAX;
+            return Ok(());
+        }
         let drawn = self.src.as_ref().ok_or(Trap::OutOfFuel)?.draw();
         self.left = match drawn {
             None => {
@@ -23074,11 +23077,13 @@ impl Fuel {
 
     /// What this vCPU can still burn: `left` plus the chain's room, `u64::MAX` when unmetered.
     pub(crate) fn can_burn(&self) -> u64 {
+        // A native task's `left` was drawn from nothing ([`Self::native`]).
+        let left = if self.native { 0 } else { self.left };
         match &self.src {
-            None => self.left,
+            None => left,
             Some(s) => match s.fuel_room() {
                 r if r < 0 => u64::MAX,
-                r => self.left.saturating_add(r as u64),
+                r => left.saturating_add(r as u64),
             },
         }
     }
@@ -23106,7 +23111,7 @@ impl Fuel {
 
 impl Drop for Fuel {
     fn drop(&mut self) {
-        if let Some(s) = &self.src {
+        if let Some(s) = self.src.as_ref().filter(|_| !self.native) {
             s.give_back(self.left);
         }
     }

@@ -254,10 +254,11 @@ fn fueled(m: &temen_ir::Module, budget: u64) -> [(Result<Vec<i64>, Trap>, u64); 
     ]
 }
 
-/// Fuel on the kernel route is today's JIT's: a threaded run that completes leaves exactly what
-/// today's JIT leaves, every vCPU's unburned draw handed back, and the oracle's answer. Both JIT
-/// routes burn one more unit per spawned thread than the oracle, which charges no thread's entry:
-/// #2977, outside this route.
+/// Fuel on the kernel route is exact: a threaded run that completes leaves exactly the oracle's
+/// fuel, every vCPU's unburned draw handed back, but for one unit per spawned thread, which both JIT
+/// routes burn and the oracle does not (#2977): the allowance is spelled out, so fixing #2977 fails
+/// this test until it is taken away. (Today's JIT is no reference here: its threads share one fixed
+/// cell, whose plain decrements race when they run at once.)
 #[test]
 fn a_threaded_run_with_fuel_to_spare_leaves_todays_fuel() {
     let src = "memory 16
@@ -293,11 +294,9 @@ block 2 (vr: i64) {
     for _ in 0..20 {
         let [oracle, today, kernel] = fueled(&m, 1_000_000);
         assert_eq!(oracle.0, Ok(vec![2 * 500_500]));
+        assert_eq!(today.0, oracle.0, "today's JIT: the oracle's answer");
         assert_eq!(kernel.0, oracle.0, "the kernel route: the oracle's answer");
-        assert_eq!(kernel, today, "the kernel route: today's answer and fuel");
-        // Both JIT routes burn one unit per spawned thread more than the oracle (#2977): fixing it
-        // fails this line until the allowance is taken away.
-        assert_eq!(oracle.1 - today.1, 2, "one unit per spawned entry (#2977)");
+        assert_eq!(oracle.1 - kernel.1, 2, "one unit per spawned entry (#2977)");
     }
 }
 
@@ -465,16 +464,16 @@ fn least_budget(m: &temen_ir::Module, which: usize, hi: u64) -> u64 {
 /// join, so the threads' burns come out of half of what is left. A chunk a native task's
 /// kernel-side fuel drew and never burned would raise the kernel's least budget past the oracle's
 /// (the root's did, before native tasks' fuel stopped drawing: 49,999 stranded of 100,000). A
-/// completed run leaves exactly today's JIT's fuel. Both JIT routes burn one unit per spawned
+/// completed run leaves exactly the oracle's fuel, but for #2977. Both JIT routes burn one unit per spawned
 /// thread more than the oracle (#2977), which the half-room draw doubles in the least budget: the
 /// allowance is spelled out, so fixing #2977 fails this test until it is taken away.
 #[test]
 fn the_kernel_route_strands_no_fuel_the_oracle_does_not() {
     const SPAWNS: u64 = 8;
     let m = module(EIGHT_COUNTERS);
-    let [oracle, today, kernel] = fueled(&m, 1_000_000);
+    let [oracle, _, kernel] = fueled(&m, 1_000_000);
     assert_eq!(oracle.0, Ok(vec![8 * 500_500]));
-    assert_eq!(kernel, today, "a completed run leaves today's fuel");
+    assert_eq!(kernel.0, oracle.0, "the oracle's answer");
     assert_eq!(oracle.1 - kernel.1, SPAWNS, "#2977's allowance");
     let least = least_budget(&m, 0, 1_000_000);
     assert_eq!(
