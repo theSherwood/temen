@@ -12263,6 +12263,12 @@ struct Waits {
     /// How many wait in each domain that has had a waiter: a domain whose every other task has
     /// ended is still alive. A domain's count goes with it ([`Tasks::forget_domain`]).
     in_domain: std::collections::BTreeMap<usize, usize>,
+    /// #2963 — the tasks the last [`Tasks::notify`] woke, in the order it woke them. Executor 2 takes
+    /// them under the same lock hold: a futex stop wakes their threads ([`ThreadRun::apply`]), and
+    /// the wake scan after a settle sees them among the rest ([`ThreadRun::wake`]). Each notify
+    /// starts it afresh, so a driver that wakes no threads leaves it be, and it never holds more
+    /// than one notify's waiters.
+    woken: Vec<usize>,
 }
 
 impl std::ops::Deref for Tasks {
@@ -12379,12 +12385,14 @@ impl Tasks {
     /// `memory.notify` on futex `key`: wake up to `count` of its waiting tasks, lowest task index
     /// first (deterministic), and answer how many it woke.
     fn notify(&mut self, key: super::FutexKey, count: u32) -> u32 {
+        self.waits.woken.clear();
         let mut woken = 0;
         while woken < count {
             let Some(&i) = self.waits.on.get(&key).and_then(|q| q.front()) else {
                 break;
             };
             self.end_wait(i, super::WAIT_WOKEN);
+            self.waits.woken.push(i);
             woken += 1;
         }
         woken
@@ -14675,7 +14683,9 @@ impl CoopSched {
                 Ok(VcpuStop::CapPending { id, .. }) => Some(*id),
                 _ => None,
             };
-            if let Some(step) = core.on_stop(emit, source, ti, stop) {
+            // The pump settles every round whatever the stop changed: its round's settle is its only
+            // look at what the world did meanwhile (#2963).
+            if let Applied::Pause(step) = core.on_stop(emit, source, ti, stop) {
                 return Ok(step);
             }
             // #2695 step 2 — an activation that has answered frees its slot, and the embedder's call
@@ -14811,6 +14821,25 @@ impl CoopSched {
     }
 }
 
+/// What applying a stop to the run changed ([`SchedCore::on_stop`]), for its executor to follow up.
+/// Every stop changes anything unless its rule says otherwise.
+enum Applied {
+    /// The pump pauses for its host: a tier-up, a task's entry included, or an emitted `Jit.invoke`,
+    /// recorded in the `EmitTier`.
+    Pause(CoopStep),
+    /// #2963 — a futex stop that moved only futex task state: the stopping task, which runs on or
+    /// waits aside, and the tasks its notify woke, which [`Waits::woken`] holds until the stop's
+    /// executor takes them under the same lock hold ([`ThreadRun::apply`]). No task ended, no fiber
+    /// moved, and no park of any other kind began or ended, so a settle after it would find only
+    /// what the last one found and what the world did since, which wakes its own waiters
+    /// ([`ThreadRun::apply`]). It relies on no task being runnable yet held back by something a
+    /// futex park could release: a dispatch-time lane on the bytecode drivers (#1600) would make a
+    /// lane-freeing park [`Applied::All`].
+    Futex,
+    /// Anything may have changed.
+    All,
+}
+
 impl SchedCore {
     /// The stop half of a pump round (#1414 3e): what a task's step stopped on, applied to the run,
     /// one arm per stop (a park, a spawn, a fork, a live call, a futex op, a JIT op). `Some(step)`
@@ -14827,7 +14856,7 @@ impl SchedCore {
         source: &ModuleSource,
         ti: usize,
         stop: Result<VcpuStop, Trap>,
-    ) -> Option<CoopStep> {
+    ) -> Applied {
         let SchedCore {
             tasks,
             domains,
@@ -14875,7 +14904,7 @@ impl SchedCore {
                 *pending_tierup = Some((ti, dst, results));
                 *pending_call = Some((module, func));
                 let window = domains[tasks[ti].domain].mem.as_ref();
-                return Some(CoopStep::TierUp {
+                return Applied::Pause(CoopStep::TierUp {
                     module,
                     func,
                     argv,
@@ -14928,7 +14957,7 @@ impl SchedCore {
                 // park probe).
                 if callee_env.is_some_and(|k| dead_domains.contains(&k)) {
                     fail_call(tasks, domains, ti, dst, sig.results(), super::CAP_REVOKED);
-                    return None;
+                    return Applied::All;
                 }
                 // #2695 step 2 — a call made in a held run names who pays for it: the activation that
                 // serves it runs on its caller's fuel, whichever thread starts it.
@@ -15000,7 +15029,7 @@ impl SchedCore {
                     paged.filter(|&(p, ..)| !dead_domains.contains(&p))
                 else {
                     complete(tasks, domains, ti, Err(Trap::MemoryFault));
-                    return None;
+                    return Applied::All;
                 };
                 let pager = std::sync::Arc::clone(&domains[pager_env].host);
                 let ticket = pager.lock_unpoisoned().request_page(export, sink);
@@ -15347,7 +15376,7 @@ impl SchedCore {
                 macro_rules! refuse {
                     ($e:expr) => {{
                         tasks[ti].deliver(dst, Reg::from_i32($e as i32));
-                        return None;
+                        return Applied::All;
                     }};
                 }
                 // Admissible from a clean root computation only (no serve handler, root fiber, a
@@ -15451,11 +15480,11 @@ impl SchedCore {
                 // from any other fiber keeps its placeholder.
                 if tasks[ti].vm.vt.active.dispatch().is_some() || tasks[ti].answers.is_some() {
                     tasks[ti].deliver(dst, Reg::from_i64(super::EINVAL));
-                    return None;
+                    return Applied::All;
                 }
                 if tasks[ti].vm.vt.active_id != ROOT_FIBER {
                     tasks[ti].deliver(dst, Reg::from_i64(temen_ir::errno::ENOSYS));
-                    return None;
+                    return Applied::All;
                 }
                 let r = spawn_task(
                     tasks,
@@ -15572,18 +15601,18 @@ impl SchedCore {
                     Ok(vt) => vt,
                     Err(t) => {
                         complete(tasks, domains, ti, Err(t));
-                        return None;
+                        return Applied::All;
                     }
                 };
                 if tasks.live_count() >= super::MAX_VCPUS {
                     complete(tasks, domains, ti, Err(Trap::ThreadFault)); // thread bomb
-                    return None;
+                    return Applied::All;
                 }
                 // #2001 — the thread is one `spawn` of its domain's node while it lives: a full
                 // ceiling refuses it as the live cap does.
                 let Some(live) = LiveVcpu::charge(node) else {
                     complete(tasks, domains, ti, Err(Trap::ThreadFault));
-                    return None;
+                    return Applied::All;
                 };
                 // #926 slice 2, #2248: a `thread.spawn` child tiers up its own eligible calls when
                 // the program it runs has an emit: the run's own, or a granted module's that a
@@ -15647,11 +15676,11 @@ impl SchedCore {
                     Ok(Ok(c)) => c,
                     Ok(Err(refused)) => {
                         tasks[ti].deliver(dst, Reg::from_i32(refused.errno() as i32));
-                        return None;
+                        return Applied::All;
                     }
                     Err(t) => {
                         complete(tasks, domains, ti, Err(t));
-                        return None;
+                        return Applied::All;
                     }
                 };
                 // #816 env-routed tier-up, as for a confined child: the child tiers up its
@@ -15702,6 +15731,15 @@ impl SchedCore {
                     timeout,
                     dst,
                 );
+                // #2963 — a task's own wait answered not-equal, or parked aside: nothing else moved.
+                // A fiber's park, and a fault, are anything's business.
+                let own = matches!(
+                    tasks[ti].state,
+                    TaskState::Runnable | TaskState::BlockedWait { .. }
+                );
+                if own && !fiber {
+                    return Applied::Futex;
+                }
             }
             Ok(VcpuStop::Notify { base, count, dst }) => {
                 // Wake up to `count` waiters, lowest task index first (deterministic). Key on the
@@ -15710,12 +15748,18 @@ impl SchedCore {
                 // same `SharedRegion` byte.
                 let key = futex_key_in(domains[tasks[ti].domain].mem.as_ref(), base);
                 let want = count as u32;
-                let mut woken = tasks.notify(key, want);
+                let tasks_woken = tasks.notify(key, want);
                 // §3.6 slice 5a: then event-parked FIBER waiters, in every domain: the root's
                 // registry, then each child domain's.
                 let regs = domains.iter_mut().flat_map(|e| e.fibers.fibers.iter_mut());
-                woken += wake_fiber_waiters(regs, key, want - woken);
+                let fibers_woken = wake_fiber_waiters(regs, key, want - tasks_woken);
+                let woken = tasks_woken + fibers_woken;
                 tasks[ti].deliver(dst, Reg::from_i32(woken as i32));
+                // #2963 — only the tasks it woke moved ([`Waits::woken`]); a woken fiber's resumer
+                // is anything's business.
+                if fibers_woken == 0 {
+                    return Applied::Futex;
+                }
             }
             // #1936 — a post's signal: its op completed, so the task runs on.
             Ok(VcpuStop::WakeRegion(w)) => wake_region(tasks, domains, &w),
@@ -15737,7 +15781,7 @@ impl SchedCore {
                 let active = &mut tasks[ti].vm.vt.active;
                 if let Err(t) = jit_install(unit, source, table, active, dst, record) {
                     complete(tasks, domains, ti, Err(t));
-                    return None;
+                    return Applied::All;
                 }
             }
             Ok(VcpuStop::JitUninstall { h, slot, dst }) => {
@@ -15750,7 +15794,7 @@ impl SchedCore {
                 let cleared = jit_uninstall(jit_table, source, table, slot, active, dst, forget);
                 if let Err(t) = cleared {
                     complete(tasks, domains, ti, Err(t));
-                    return None;
+                    return Applied::All;
                 }
             }
             Ok(VcpuStop::JitInvoke {
@@ -15805,7 +15849,7 @@ impl SchedCore {
                 };
                 if let Some((wasm, mapped)) = surfaced {
                     *pending_jit = Some((ti, dst as usize, results.clone()));
-                    return Some(CoopStep::JitInvoke {
+                    return Applied::Pause(CoopStep::JitInvoke {
                         code,
                         wasm,
                         argv,
@@ -15852,12 +15896,12 @@ impl SchedCore {
                     }
                     Err(t) => {
                         complete(tasks, domains, ti, Err(t));
-                        return None;
+                        return Applied::All;
                     }
                 }
             }
         }
-        None
+        Applied::All
     }
 }
 
@@ -16539,7 +16583,10 @@ impl HeldThreads {
         };
         // This thread waits on a park of its own while it carries the call, and counts in.
         match g.parks.get_mut(a) {
-            Some(park) => *park = Park::default(),
+            Some(park) => {
+                debug_assert!(!park.thread && !park.asleep, "an activation's slot is free");
+                *park = Park::default();
+            }
             None => g.parks.push(Park::default()),
         }
         g.live += 1;
@@ -17568,6 +17615,17 @@ const PIPE_SPIN_NS: u64 = 20_000;
 /// [`thread_wakes`]' count.
 static THREAD_WAKES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// [`thread_blocks`]' count.
+static THREAD_BLOCKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// #2963 — how many times this process's executor 2 threads have slept on a park and blocked: the
+/// sleep found no wake already waiting for it ([`Signal::wait`]), so the OS put the thread to
+/// sleep. A park whose wake landed first wakes without blocking. A pingpong's cost is mostly its
+/// blocks, so `temen-bench --threads` reads this per hand-off.
+pub fn thread_blocks() -> u64 {
+    THREAD_BLOCKS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// #2757 — how many times this process's executor 2 threads have woken from a sleep: a parked task's
 /// thread ([`ThreadRun::park`]) or a watcher ([`ThreadRun::watching`]). Each wakes only when something
 /// may end a park, never on a timer, so a test reads this before and after an idle window to prove
@@ -17587,6 +17645,17 @@ struct Threads {
     /// The parks to signal once the lock is let go ([`release`]): a thread signalled under the
     /// lock would wake only to wait for it.
     woken: Vec<std::sync::Arc<Signal>>,
+    /// #2963 — how many threads step a task, or are about to look at it, rather than sleep on its
+    /// park: those that will take the lock again with no wake. A park that would leave none settles
+    /// first ([`ThreadRun::park`]). [`Threads::set_park`] alone writes it.
+    awake: usize,
+    /// #2963 — whether a thread watches the run now ([`ThreadRun::watching`]), and so settles it on
+    /// the next ring of its bell: the opener's watch, the run's own watcher, or an embedder's watch
+    /// while it pumps the run. A futex stop skips its settle only then ([`ThreadRun::apply`]). The
+    /// watch counts itself in as it starts and out under the same lock hold as its last settle, so
+    /// a ring the count could miss lands after that settle, while every stop settles in full again.
+    /// At most one thread watches: a run its opener or embedder watches starts no watcher.
+    watching: usize,
     /// The run's result once it is over: its root's, or a deadlock's `ThreadFault`. Every thread
     /// ends at its next look.
     over: Option<Result<Vec<Value>, Trap>>,
@@ -17625,8 +17694,11 @@ struct Park {
     signal: std::sync::Arc<Signal>,
     /// Whether the thread waits on `signal` and nothing has woken it yet. The wake scan wakes it once
     /// its task needs no rule to go on ([`ThreadRun::awake`]), whatever changed its state: a rule, or
-    /// a store outside the lock (a continue).
+    /// a store outside the lock (a continue). Written through [`Threads::set_park`].
     asleep: bool,
+    /// #2963 — whether a thread steps the task or sleeps on this park ([`carry`]). Written through
+    /// [`Threads::set_park`].
+    thread: bool,
     /// #2757 — what the thread's park registered on the pipes it waits on ([`ThreadRun::listen`]),
     /// until the thread wakes.
     listen: Option<Listen>,
@@ -17666,6 +17738,9 @@ impl Signal {
     /// end early: its caller looks again either way. No clock is read, which wasm32 lacks.
     fn wait(&self, timeout: Option<std::time::Duration>) {
         let mut woken = self.woken.lock_unpoisoned();
+        if !*woken {
+            THREAD_BLOCKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         match timeout {
             None => {
                 while !*woken {
@@ -17704,9 +17779,27 @@ impl Threads {
 
     /// Wake task `j`'s thread when the lock is let go ([`release`]).
     fn rouse(&mut self, j: usize) {
+        self.set_park(j, None, Some(false));
+        self.woken
+            .push(std::sync::Arc::clone(&self.parks[j].signal));
+    }
+
+    /// #2963 — set whether a thread is on task `j`'s park, and whether it sleeps there, keeping
+    /// [`Self::awake`]: the only writer of either, and of the count.
+    fn set_park(&mut self, j: usize, thread: Option<bool>, asleep: Option<bool>) {
         let park = &mut self.parks[j];
-        park.asleep = false;
-        self.woken.push(std::sync::Arc::clone(&park.signal));
+        let was = park.thread && !park.asleep;
+        park.thread = thread.unwrap_or(park.thread);
+        park.asleep = asleep.unwrap_or(park.asleep);
+        let now = park.thread && !park.asleep;
+        self.awake = self.awake + usize::from(now) - usize::from(was);
+    }
+
+    /// #2963 — [`Self::awake`] as the parks have it.
+    fn awake_by_parks(&self) -> usize {
+        (self.parks.iter())
+            .filter(|p| p.thread && !p.asleep)
+            .count()
     }
 
     /// What a thread steps a task of domain `env` over: its own view of the domain's window and its
@@ -18207,6 +18300,8 @@ impl ThreadRun {
                 core,
                 parks: vec![Park::default()],
                 woken: Vec::new(),
+                awake: 0,
+                watching: 0,
                 over: None,
                 fault: None,
                 live: 1, // the root's
@@ -18338,6 +18433,7 @@ fn carry<'g>(
 ) -> std::sync::MutexGuard<'g, Threads> {
     let (mut mem, mut fuel) = (mem, fuel);
     let activation = g.core.tasks[ti].answers.is_some();
+    g.set_park(ti, Some(true), None);
     let mut env = g.core.tasks[ti].domain;
     // An exec gives the task's domain the image's window, or moves the task into a domain of its
     // own: its thread steps over the new one.
@@ -18357,9 +18453,12 @@ fn carry<'g>(
         match next {
             Next::Run => {}
             Next::Stop => break,
+            // The thread leaves the task's park while it carries the activation, and comes back.
             Next::Carry(a) => {
                 let (view, _) = g.hand(0);
+                g.set_park(ti, Some(false), None);
                 g = carry(run, g, a, view, Fuel::fixed(0));
+                g.set_park(ti, Some(true), None);
                 continue;
             }
         }
@@ -18408,6 +18507,7 @@ fn carry<'g>(
         invoke = surfaced;
         g = start_tasks(run, g, made);
     }
+    g.set_park(ti, Some(false), None);
     // #2695 step 2 — an activation that has answered goes: its carrier back to its own task, and
     // its slot to the next activation.
     if activation {
@@ -18883,15 +18983,48 @@ impl ThreadRun {
         stop: Result<VcpuStop, Trap>,
         exits: usize,
     ) -> (Vec<NewTask>, Option<SurfacedInvoke>) {
+        debug_assert!(
+            g.core.tasks.waits.woken.is_empty(),
+            "a notify's wakes were taken"
+        );
         let had = g.core.tasks.len();
-        g.core.clock = self.now();
+        // A notify and an untimed wait read no clock (#2963).
+        let untimed = matches!(
+            stop,
+            Ok(VcpuStop::Notify { .. } | VcpuStop::Wait { timeout: None, .. })
+        );
+        if !untimed {
+            g.core.clock = self.now();
+        }
         let Threads { core, emit, .. } = &mut *g;
         // A thread runs its own task's tier-ups ([`ThreadRun::step`]), so no tier-up reaches the
         // rules. An emitted §22 invoke does, and goes back to the task's thread, which runs it
         // ([`ThreadRun::invoke`]).
-        let invoke = match core.on_stop(emit, &self.source, ti, stop) {
-            None => None,
-            Some(CoopStep::JitInvoke {
+        let applied = core.on_stop(emit, &self.source, ti, stop);
+        // #2963 — a futex stop that moved only futex task state wakes the threads of the tasks it
+        // woke, and nothing else: what a settle would find besides is the world's doing since the
+        // last one, and each such store rings the run's bell, which its watcher settles on, or wakes
+        // the thread parked on it ([`Self::park`]). So only a run a thread watches now takes it
+        // ([`Threads::watching`]), and not once it is over or holds a domain, whose gate a park
+        // gives back. If the stop leaves the run idle,
+        // the park that puts its last thread to sleep settles first.
+        let watched = g.watching != 0;
+        if matches!(applied, Applied::Futex) && watched && g.over.is_none() && g.core.held.is_none()
+        {
+            let mut woken = std::mem::take(&mut g.core.tasks.waits.woken);
+            for j in woken.drain(..) {
+                if g.parks.get(j).is_some_and(|p| p.asleep) && self.awake(&g.core, j) {
+                    g.rouse(j);
+                }
+            }
+            // Its buffer goes back, so a notify allocates nothing once warm.
+            g.core.tasks.waits.woken = woken;
+            return (Vec::new(), None);
+        }
+        let Threads { core, emit, .. } = &mut *g;
+        let invoke = match applied {
+            Applied::Futex | Applied::All => None,
+            Applied::Pause(CoopStep::JitInvoke {
                 code,
                 wasm,
                 argv,
@@ -18916,7 +19049,7 @@ impl ThreadRun {
             }
             // Nothing else surfaces from the rules here: every tier-up, a task's entry included, runs
             // on the task's thread.
-            Some(_) => {
+            Applied::Pause(_) => {
                 debug_assert!(false, "executor 2 surfaced a pause it cannot serve");
                 emit.pending_tierup = None;
                 complete(&mut core.tasks, &mut core.domains, ti, Err(Trap::CapFault));
@@ -18959,8 +19092,12 @@ impl ThreadRun {
     /// Then the run's end: its root is done, or the pump's deadlock verdict — nothing can move on
     /// its own ([`Self::idle`]), and no park is one an embedder can wake through the armed
     /// external-wake bell (#1122). Every change to a task's state is followed by this under the same
-    /// lock, so the run cannot go idle unseen.
+    /// lock, or by a thread left awake to look: a futex stop that moved only futex task state skips
+    /// it ([`Applied::Futex`]), and the park that would leave no thread awake settles first
+    /// ([`Self::park`]). So the run cannot go idle unseen.
     fn settle(&self, g: &mut Threads) {
+        debug_assert_eq!(g.awake, g.awake_by_parks(), "the awake count is the parks'");
+        debug_assert!(g.watching <= 1, "one thread watches a run at most");
         let core = &mut g.core;
         let rests = Held::rests(&core.held);
         // #2695 step 2 — a resting held domain ends when any of its members exits or traps.
@@ -19057,6 +19194,9 @@ impl ThreadRun {
     /// A task the rules have just made has no thread yet. Every settle is followed by this scan, so
     /// the tasks that ended have been seen by every rule here, and leave the live list (#2229).
     fn wake(&self, g: &mut Threads) {
+        // #2963 — the tasks a notify woke are the live ones this scan looks at: whatever notified
+        // them, a stop's rule or a settle's post, they are taken here.
+        g.core.tasks.waits.woken.clear();
         let over = g.over.is_some();
         for k in 0..g.core.tasks.live.len() {
             let j = g.core.tasks.live[k];
@@ -19216,8 +19356,10 @@ impl ThreadRun {
         ti: usize,
     ) -> std::sync::MutexGuard<'g, Threads> {
         let mut until = None;
+        let mut looked = false;
         match self.park_for(&g.core, ti) {
-            // Only a rule ends this park, and the rule's holder settled after it.
+            // Only a rule ends this park, and the rule's holder settled after it, or left a thread
+            // awake to look (#2963).
             ParkFor::Wake => {}
             ParkFor::Until(at) => until = Some(at),
             ParkFor::Ring(call) => {
@@ -19232,6 +19374,7 @@ impl ThreadRun {
                 if !listen.only_pipes || listen.pipes.iter().any(|(p, _)| p.ready()) {
                     self.settle(&mut g);
                     self.wake(&mut g);
+                    looked = true;
                     if self.awake(&g.core, ti) || g.over.is_some() || g.carried(ti).is_some() {
                         return g;
                     }
@@ -19248,7 +19391,19 @@ impl ThreadRun {
                 }
             }
         }
-        g.parks[ti].asleep = true;
+        // #2963 — the run cannot go idle unseen: a futex stop does not settle ([`Self::apply`]), so
+        // the park that would leave no thread awake to look settles first, and the verdict is the
+        // one that stop's settle would have reached.
+        if g.awake == 1 && !looked {
+            self.settle(&mut g);
+            self.wake(&mut g);
+            if self.awake(&g.core, ti) || g.over.is_some() || g.carried(ti).is_some() {
+                // A listen this park registered goes with the look.
+                g.parks[ti].listen = None;
+                return g;
+            }
+        }
+        g.set_park(ti, None, Some(true));
         let signal = std::sync::Arc::clone(&g.parks[ti].signal);
         let left = until.map(|at| std::time::Duration::from_nanos(at.saturating_sub(self.now())));
         // A pipe park looks for its store a moment before it sleeps: a stream's next write
@@ -19269,8 +19424,8 @@ impl ThreadRun {
             signal.wait(left);
         }
         let mut g = self.state.lock_unpoisoned();
+        g.set_park(ti, None, Some(false));
         let park = &mut g.parks[ti];
-        park.asleep = false;
         // A store into a pipe it waits on woke it: its settle re-admits the task.
         let fired = park.fired();
         park.listen = None;
@@ -19388,6 +19543,7 @@ impl ThreadRun {
     /// ([`CoopRun::wait`]).
     fn watching(&self) -> (Watched, u64) {
         let _exit = ThreadExit(self);
+        self.state.lock_unpoisoned().watching += 1;
         loop {
             let seen = *self.bell.0.lock_unpoisoned();
             let mut g = self.state.lock_unpoisoned();
@@ -19399,6 +19555,10 @@ impl ThreadRun {
                 Some(_) => Some(Watched::Over),
                 None => self.event(&mut g),
             };
+            // #2963 — it stops watching under the lock hold of its last settle ([`Threads::watching`]).
+            if watched.is_some() {
+                g.watching -= 1;
+            }
             release(g);
             if let Some(w) = watched {
                 return (w, seen);
