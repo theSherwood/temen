@@ -75,7 +75,13 @@ pub fn compile(
     CompiledModule::compile(
         m,
         entry,
-        crate::cap_thunk_locked,
+        // A module with no §12 op runs only its root, which never parks: it keeps the unlocked
+        // thunk, as today's JIT does (`jit_proc::locked`), over the host it holds for its run.
+        if raw_host(m) {
+            crate::cap_thunk
+        } else {
+            crate::cap_thunk_locked
+        },
         std::ptr::null_mut(), // each vCPU's context names its domain's host cell
         reserved_log2,
         None, // no §14 children
@@ -116,6 +122,7 @@ pub fn run_compiled(
     let state: Arc<dyn std::any::Any + Send + Sync> = Arc::new(TierState {
         kr: Arc::clone(&kr),
         vcpus: Arc::clone(&ran),
+        raw: raw_host(m),
     });
     let on_end = {
         let kr = Arc::clone(&kr);
@@ -257,6 +264,8 @@ fn outcome_unchecked(
 /// The tier's run state ([`NativeTier::state`]): the JIT's half of the run, and how many vCPUs ran.
 struct TierState {
     kr: Arc<KernelRun>,
+    /// The module has no §12 op ([`raw_host`]): its one vCPU holds the host for its run.
+    raw: bool,
     vcpus: Arc<std::sync::atomic::AtomicU64>,
 }
 
@@ -303,6 +312,15 @@ pub fn outcome(
     Some(o)
 }
 
+/// Whether `m` makes no §12 op: no thread, fiber or futex op. Its only vCPU is the root, which
+/// never parks into the kernel, so it may hold its domain's host for its whole run and make its
+/// `call.cap`s through the unlocked thunk.
+fn raw_host(m: &Module) -> bool {
+    !m.funcs
+        .iter()
+        .any(|f| f.uses_fibers_or_threads() || f.uses_futex())
+}
+
 /// [`ThreadTier::run`] for the Cranelift JIT: run the task's entry on this thread as a vCPU.
 fn tier_run(call: &mut EmittedCall<'_>) -> Result<(), Trap> {
     VCPUS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -325,13 +343,23 @@ fn tier_run(call: &mut EmittedCall<'_>) -> Result<(), Trap> {
             arg1: argv.get(1).copied().unwrap_or(0),
         }
     };
-    let (tls, host) = (call.tls, call.host_cell());
+    let (tls, host, raw) = (call.tls, call.host_cell(), st.raw);
+    // SAFETY: `host` is the task's domain's live host cell, borrowed by the call.
+    let cell = unsafe { &*host };
+    // A module with no §12 op: its root holds the host for its run (nothing else of the run locks
+    // it meanwhile: no task parks, so no rule runs) and its calls take the unlocked thunk's `*mut`.
+    let mut held = raw.then(|| cell.lock().unwrap_or_else(|e| e.into_inner()));
+    let cap_ctx = match held.as_mut() {
+        Some(h) => &mut **h as *mut Host as *mut core::ffi::c_void,
+        None => host as *mut core::ffi::c_void,
+    };
     let ran = {
         let mut park = Park(call);
-        // SAFETY: `host` is the task's domain's live host cell, which `cap_thunk_locked` takes; the
-        // kernel seeded the window and `run` protected it before any task ran.
-        unsafe { kr.run_vcpu(entry, tls, host as *mut core::ffi::c_void, &mut park) }
+        // SAFETY: `cap_ctx` is what the compile's thunk takes: the held host, or the host cell for
+        // `cap_thunk_locked`; the kernel seeded the window and `run` protected it before any task ran.
+        unsafe { kr.run_vcpu(entry, tls, cap_ctx, &mut park) }
     };
+    drop(held);
     match ran {
         Ok(vals) => {
             call.results = vals;

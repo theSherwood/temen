@@ -269,9 +269,15 @@ pub fn run(reps: usize) {
             );
         }
     }
-    // Off unless asked for: `SPIKE_SECTIONS=pairs`.
+    // Off unless asked for: `SPIKE_SECTIONS=pairs`, `nowake`, `k1000`.
     if on("pairs") && !only.is_empty() {
         run_pairs(reps);
+    }
+    if on("nowake") && !only.is_empty() {
+        run_nowake(reps);
+    }
+    if on("k1000") && !only.is_empty() {
+        run_k1000(reps);
     }
     assert_eq!(
         temen_interp::bytecode::native_interp_stops(),
@@ -316,6 +322,74 @@ pub fn run(reps: usize) {
             "us",
         );
     }
+    assert_eq!(
+        temen_interp::bytecode::native_interp_stops(),
+        0,
+        "all native"
+    );
+}
+
+/// The no-wake probe ([`crate::kernel_spike_ir::NOWAKE_IR`], `SPIKE_SECTIONS=nowake`): ns per
+/// `memory.notify` with no waiter and per `memory.wait` that answers not-equal at once, beside `k`
+/// threads parked for good. No thread wakes, so the OS's wake cost is out of it: what is left is the
+/// runtime's own per-op cost, which a futex-based guest mutex pays on each contended unlock.
+pub fn run_nowake(reps: usize) {
+    println!("\nno wake: a notify with no waiter / a wait that answers not-equal (ns per op):");
+    let m = parse(crate::kernel_spike_ir::NOWAKE_IR);
+    for (mode, what) in [(0i64, "notify, none"), (1, "wait, not-equal")] {
+        for k in [0i64, 100, 1_000] {
+            let label = format!("{what}, K = {k}");
+            let args = move |n| vec![n, k, mode];
+            // A span long enough that each lane's fixed cost (spawning the K threads, about 0.6 s
+            // at K = 1,000 on today's lane) subtracts to a usable range; the spike without the
+            // queue costs ~0.1 us per parked task per op, so it takes a short one.
+            let long = if k >= 1_000 { 20_001_000 } else { 2_001_000 };
+            let mut fast = vec![
+                ("today", today(&m, Host::new(), true)),
+                ("spike+kq", spike(&m, Host::new, true)),
+            ];
+            per_iter(&label, &mut fast, args, (1_000, long), 1.0, reps, 1.0, "ns");
+            let mut slow = vec![("spike", spike(&m, Host::new, false))];
+            per_iter(
+                &label,
+                &mut slow,
+                args,
+                (1_000, 101_000),
+                1.0,
+                reps,
+                1.0,
+                "ns",
+            );
+        }
+    }
+    assert_eq!(
+        temen_interp::bytecode::native_interp_stops(),
+        0,
+        "all native"
+    );
+}
+
+/// K = 1,000 of the pingpong with a span long enough that today's run, whose fixed cost is spawning
+/// the 1,000 threads (about 0.6 s, give or take 0.2 s), still subtracts to a usable range:
+/// `SPIKE_SECTIONS=k1000`. The spike without the queue keeps the short span (its cost is 100x).
+pub fn run_k1000(reps: usize) {
+    println!("\npark and wake, K = 1000, long span (us per hand-off):");
+    let m = parse(crate::kernel_spike_ir::PINGPONG_IR);
+    let mut lanes = vec![
+        ("today", today(&m, Host::new(), true)),
+        ("spike+kq", spike(&m, Host::new, true)),
+    ];
+    let args = |n| vec![n, 1_000];
+    per_iter(
+        "K = 1000",
+        &mut lanes,
+        args,
+        (100, 200_100),
+        2.0,
+        reps,
+        1e3,
+        "us",
+    );
     assert_eq!(
         temen_interp::bytecode::native_interp_stops(),
         0,

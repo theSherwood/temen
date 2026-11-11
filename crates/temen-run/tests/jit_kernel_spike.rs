@@ -194,3 +194,57 @@ block 0 () {
     assert!(r.is_none(), "declined");
     assert_eq!(host.jit_table_log2(), 7, "the host is the caller's still");
 }
+
+/// A module with no §12 op keeps the unlocked `call.cap` thunk under the kernel, over the host its
+/// root holds for its run: its host procedure answers each call, as on today's path.
+#[test]
+fn a_module_that_cannot_spawn_calls_its_host_procedure_through_the_unlocked_thunk() {
+    use temen_interp::{put_results, CapState, HostProcGrant, ProcHandler};
+    let src = "memory 16
+func (i32) -> (i64) {
+block 0 (vh: i32) {
+  vz = i64.const 0
+  br 1(vh, vz, vz)
+}
+block 1 (vh1: i32, vi1: i64, vacc1: i64) {
+  vn1 = i64.const 1000
+  vlt1 = i64.lt_s vi1 vn1
+  br_if vlt1 2(vh1, vi1, vacc1) 3(vacc1)
+}
+block 2 (vh2: i32, vi2: i64, vacc2: i64) {
+  vr2 = call.cap 13 0 (i64) -> (i64) vh2(vi2)
+  vacc22 = i64.add vacc2 vr2
+  vone2 = i64.const 1
+  vin2 = i64.add vi2 vone2
+  br 1(vh2, vin2, vacc22)
+}
+block 3 (vr3: i64) {
+  return vr3
+  }
+}
+";
+    let m = module(src);
+    let mut host = Host::new();
+    let handle = host.grant_host_proc(HostProcGrant::new(
+        ProcHandler::Sync(Box::new(|_op, args, out, _mem, _minter| {
+            put_results(out, &[args.first().copied().unwrap_or(0).wrapping_add(1)])
+        })),
+        CapState::Stateless,
+    ));
+    let r = jit_kernel::run(
+        &m,
+        0,
+        &[handle as i64],
+        temen_ir::DEFAULT_RESERVED_LOG2,
+        &mut host,
+        None,
+    )
+    .expect("in scope");
+    assert_eq!(
+        r,
+        Ok(vec![(1..=1000).sum::<i64>()]),
+        "sum of i + 1 over 1,000 calls"
+    );
+    assert_eq!(jit_kernel::last_vcpus(), 1, "its root ran as a kernel task");
+    assert_eq!(temen_interp::bytecode::native_interp_stops(), 0, "native");
+}
