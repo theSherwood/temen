@@ -401,7 +401,7 @@ fn clone_caller_forks_the_caller_into_a_twin_that_returns_the_second_reply() {
 }
 
 /// Where a fork program runs.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum On {
     /// The tree-walker, the oracle, with direct handoff on or off.
     TreeWalk { handoff: bool },
@@ -1020,10 +1020,10 @@ block 6 (vst: i64) {
     )
 }
 
-/// #2862 — **the bytecode engine reaps as the oracle does**: a named twin (fork then wait), any
-/// child (`wait(-1)`), only its own children (a twin's `wait(-1)` is `-ECHILD`), and `WNOHANG` on
-/// a twin still running. The engine answered `wait(-1)` with `-ECHILD`, and dropped `reap`'s flags,
-/// so its `WNOHANG` waited for a twin that never exits.
+/// #2862 — **the bytecode engine reaps as the oracle does**, on both its drivers: a named twin
+/// (fork then wait), any child (`wait(-1)`), only its own children (a twin's `wait(-1)` is
+/// `-ECHILD`), and `WNOHANG` on a twin still running. The engine answered `wait(-1)` with
+/// `-ECHILD`, and dropped `reap`'s flags, so its `WNOHANG` waited for a twin that never exits.
 #[test]
 fn the_bytecode_engine_reaps_as_the_oracle_does() {
     for (name, src, ret) in [
@@ -1038,11 +1038,9 @@ fn the_bytecode_engine_reaps_as_the_oracle_does() {
             (Ok(vec![Value::I64(ret)]), vec![ret]),
             "{name}, on the oracle"
         );
-        assert_eq!(
-            run_forking(&src, On::Bytecode),
-            oracle,
-            "{name}, on the bytecode engine"
-        );
+        for on in [On::Bytecode, On::Parallel] {
+            assert_eq!(run_forking(&src, on), oracle, "{name}, on {on:?}");
+        }
     }
 }
 
