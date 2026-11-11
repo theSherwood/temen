@@ -311,7 +311,10 @@ struct Pending {
     state: Arc<AtomicU8>,
 }
 
-struct Wgpu {
+/// The [`Backend`] over wgpu, bound to a [`Surface`]. [`webgpu_cap`] grants one to each guest. A
+/// host that runs the protocol in-process, with no guest, such as a native compositor's tests, drives
+/// `temen_gpu::Gpu::new(Wgpu::new(surface))` itself: the same checks, device and surfaces.
+pub struct Wgpu {
     surface: Surface,
     device: Option<Result<Device, String>>,
     objs: Vec<Obj>,
@@ -326,7 +329,7 @@ struct Wgpu {
 }
 
 impl Wgpu {
-    fn new(surface: Surface) -> Self {
+    pub fn new(surface: Surface) -> Self {
         Wgpu {
             surface,
             device: None,

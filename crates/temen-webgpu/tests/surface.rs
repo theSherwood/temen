@@ -189,3 +189,43 @@ fn window_surface_follows_its_size() {
         run(surface, size, backend);
     }
 }
+
+/// A host that runs the protocol in-process, with no guest, as a native compositor's tests do,
+/// drives `temen_gpu::Gpu` over [`temen_webgpu::Wgpu`] itself: the same checks and surfaces.
+#[test]
+fn an_in_process_host_presents() {
+    use temen_gpu::command::{ColorAttachment, Command, Encoder};
+    use temen_gpu::enums::{LoadOp, StoreOp};
+    common::require_adapter();
+    let frames = Frames::default();
+    let surface = Surface::Offscreen {
+        size: Size::new(8, 4),
+        format: temen_gpu::TextureFormat::Rgba8Unorm,
+        frames: frames.clone(),
+    };
+    let mut gpu = temen_gpu::Gpu::new(temen_webgpu::Wgpu::new(surface));
+    let mut e = Encoder::new();
+    e.push(&Command::Acquire {
+        texture: 1,
+        view: 2,
+    });
+    e.push(&Command::BeginRenderPass {
+        colors: vec![ColorAttachment {
+            view: 2,
+            resolve: None,
+            load: LoadOp::Clear,
+            store: StoreOp::Store,
+            clear: [0.0, 1.0, 0.0, 1.0],
+        }],
+    });
+    e.push(&Command::EndPass);
+    e.push(&Command::Present {
+        texture: 1,
+        view: 2,
+    });
+    assert_eq!(gpu.submit(&e.bytes), 0, "the stream runs");
+    let (shown, frame) = frames.last();
+    let frame = frame.expect("a presented frame");
+    assert_eq!((shown, frame.width, frame.height), (1, 8, 4));
+    assert!(frame.texels.chunks(4).all(|t| t == [0, 255, 0, 255]));
+}
