@@ -5634,6 +5634,18 @@ unsafe fn mapped_atomic(
     }
 }
 
+/// #2962 — `[off, off + n)` of a host mapping of a region (`base`, `len` bytes), or `None` when the
+/// range is not inside it: how a host servicer copies a message region in one go. The guest may write
+/// the region meanwhile (it is shared), so the bytes are whatever is there, as a host procedure's read
+/// of a window is.
+///
+/// # Safety
+/// `base` maps `[0, len)` read-write for `'a`.
+unsafe fn mapped_range<'a>(base: *mut u8, len: usize, off: u64, n: usize) -> Option<&'a mut [u8]> {
+    temen_interp::region_range_ok(len as u64, off, n)
+        .then(|| std::slice::from_raw_parts_mut(base.add(off as usize), n))
+}
+
 /// A §13 `SharedRegion` backing over a real OS shared-memory object (`memfd`/`shm`), whose `os_fd` a
 /// window `mmap`s `MAP_SHARED` for true hardware aliasing. The fd is also mapped once into the host
 /// process so `read_byte`/`write_byte` work (e.g. if an interpreter `Mem` uses this backing); in the
@@ -5705,6 +5717,16 @@ impl SharedBacking for ShmBacking {
             // SAFETY: off < len ≤ cap; `ptr` maps `[0, cap)` RW for `self`'s lifetime.
             unsafe { *self.ptr.add(off as usize) = b }
         }
+    }
+    fn copy_out(&self, off: u64, buf: &mut [u8]) -> bool {
+        // SAFETY: `ptr` maps at least `[0, len)` RW for `self`'s lifetime.
+        let r = unsafe { mapped_range(self.ptr, self.len, off, buf.len()) };
+        r.map(|r| buf.copy_from_slice(r)).is_some()
+    }
+    fn copy_in(&self, off: u64, bytes: &[u8]) -> bool {
+        // SAFETY: as `copy_out`.
+        let r = unsafe { mapped_range(self.ptr, self.len, off, bytes.len()) };
+        r.map(|r| r.copy_from_slice(bytes)).is_some()
     }
     fn atomic(&self, off: u64, width: u32, f: &mut dyn FnMut(u64) -> Option<u64>) -> u64 {
         // SAFETY: `ptr` maps `[0, cap)` RW for `self`'s lifetime, page-aligned, and `len ≤ cap`.
@@ -5827,6 +5849,16 @@ impl SharedBacking for FileBacking {
             unsafe { *self.ptr.add(off as usize) = b }
         }
     }
+    fn copy_out(&self, off: u64, buf: &mut [u8]) -> bool {
+        // SAFETY: `ptr` maps at least `[0, len)` RW for `self`'s lifetime.
+        let r = unsafe { mapped_range(self.ptr, self.len, off, buf.len()) };
+        r.map(|r| buf.copy_from_slice(r)).is_some()
+    }
+    fn copy_in(&self, off: u64, bytes: &[u8]) -> bool {
+        // SAFETY: as `copy_out`.
+        let r = unsafe { mapped_range(self.ptr, self.len, off, bytes.len()) };
+        r.map(|r| r.copy_from_slice(bytes)).is_some()
+    }
     fn atomic(&self, off: u64, width: u32, f: &mut dyn FnMut(u64) -> Option<u64>) -> u64 {
         // SAFETY: `ptr` maps `[0, cap)` RW for `self`'s lifetime, page-aligned, and `len ≤ cap`.
         unsafe { mapped_atomic(self.ptr, self.len, off, width, f) }
@@ -5947,6 +5979,16 @@ impl SharedBacking for WinShmBacking {
             // SAFETY: off < len ≤ cap; `ptr` maps `[0, cap)` RW for `self`'s lifetime.
             unsafe { *self.ptr.add(off as usize) = b }
         }
+    }
+    fn copy_out(&self, off: u64, buf: &mut [u8]) -> bool {
+        // SAFETY: `ptr` maps at least `[0, len)` RW for `self`'s lifetime.
+        let r = unsafe { mapped_range(self.ptr, self.len, off, buf.len()) };
+        r.map(|r| buf.copy_from_slice(r)).is_some()
+    }
+    fn copy_in(&self, off: u64, bytes: &[u8]) -> bool {
+        // SAFETY: as `copy_out`.
+        let r = unsafe { mapped_range(self.ptr, self.len, off, bytes.len()) };
+        r.map(|r| r.copy_from_slice(bytes)).is_some()
     }
     fn atomic(&self, off: u64, width: u32, f: &mut dyn FnMut(u64) -> Option<u64>) -> u64 {
         // SAFETY: `ptr` maps `[0, cap)` RW for `self`'s lifetime, page-aligned, and `len ≤ cap`.
