@@ -21844,7 +21844,7 @@ impl Vm {
                     // parks the task until the handler's reply (the tree-walker's caller-parking arm,
                     // task-level).
                     if let Some(target) = live {
-                        let sig = target.sig(*op, argv.len(), results.len())?;
+                        let sig = target.sig(argv.len(), results.len())?;
                         self.module = module;
                         self.cur = cur;
                         self.base = base;
@@ -21852,7 +21852,7 @@ impl Vm {
                         return Ok(Outcome::LiveCall(LiveCall {
                             callee: target.callee,
                             export: target.export,
-                            op: *op,
+                            op: target.op,
                             args: argv.to_vec(),
                             sig,
                             dst: *dst,

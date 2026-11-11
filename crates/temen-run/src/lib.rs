@@ -256,7 +256,6 @@ pub unsafe extern "C" fn cap_thunk(
                 &mut CallerHost::Owned(host),
                 &target,
                 fast,
-                op,
                 call_args,
                 out,
                 vm,
@@ -832,15 +831,7 @@ pub unsafe extern "C" fn cap_thunk_locked(
             let fast = guard.handoff();
             drop(guard);
             let out = result_slots(results, n_results);
-            live_impl_call(
-                &mut CallerHost::Cell(m),
-                &target,
-                fast,
-                op,
-                call_args,
-                out,
-                vm,
-            );
+            live_impl_call(&mut CallerHost::Cell(m), &target, fast, call_args, out, vm);
             return;
         }
         // #2645 — an unlocked host procedure runs with the domain lock released, so the run's other
@@ -3394,12 +3385,12 @@ unsafe fn live_impl_call(
     caller: &mut CallerHost,
     target: &LiveTarget,
     fast: bool,
-    op: u32,
     args: &[i64],
     out: &mut [i64],
     vm: &temen_jit::VmCtx,
 ) {
-    let Ok(sig) = target.sig(op, args.len(), out.len()) else {
+    let op = target.op;
+    let Ok(sig) = target.sig(args.len(), out.len()) else {
         vm.raise(TrapKind::CapFault as i64);
         return;
     };

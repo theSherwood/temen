@@ -743,6 +743,12 @@ pub struct SpawnRec {
     pub child_off: u64,
 }
 
+/// #744 — a grant record's `handle` naming the spawner's **own** impl-export `i` as a live offer
+/// served by the spawner's serve loop: `GRANT_SERVE_LIVE_TAG | i`. Part of the record ABI a guest
+/// writes, so it lives beside [`SpawnRec`]; `temen_interp::GRANT_SERVE_LIVE_TAG` documents how each
+/// engine honors it.
+pub const GRANT_SERVE_LIVE_TAG: u32 = 0x8000_0000;
+
 /// The byte length of a [`SpawnRec`].
 pub const SPAWN_REC_LEN: usize = 64;
 
