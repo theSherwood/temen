@@ -224,7 +224,7 @@ pub unsafe extern "C" fn cap_thunk(
     let host = &*(ctx as *mut Host);
     let pending_face = n_results == 1 && !host.is_durable() && !host.records_caps();
     loop {
-        let (mut pending_id, mut park) = (None, None);
+        let (mut pending_id, mut park, mut live) = (None, None, None);
         cap_thunk_impl(
             ctx,
             mem_base,
@@ -241,7 +241,26 @@ pub unsafe extern "C" fn cap_thunk(
             pending_face.then_some(&mut pending_id),
             None, // one caller at a time: an unlocked procedure runs inline
             &mut park,
+            &mut live,
         );
+        // CALLS.md 5c.1b — the caller side of the JIT parked transport (§10.2 arm 5): a call through
+        // a minted live-impl, which the dispatch handed back, enqueues on the callee child's shared
+        // cell and **thread-blocks** on the reply.
+        if let Some(target) = live {
+            let host = &mut *(ctx as *mut Host);
+            let fast = host.handoff();
+            let out = result_slots(results, n_results);
+            live_impl_call(
+                &mut CallerHost::Owned(host),
+                &target,
+                fast,
+                op,
+                call_args,
+                out,
+                vm,
+            );
+            return;
+        }
         if let Some(id) = pending_id {
             let comps = (*(ctx as *mut Host)).completions();
             let r = cap_wait(&comps, id, temen_jit::fiber_active(), vm);
@@ -458,10 +477,16 @@ pub unsafe extern "C" fn jit_sig_return(vm: &temen_jit::VmCtx) {
 /// wait) under the domain lock — the caller takes the completion id, releases the lock, and
 /// waits on [`Host::completions`]. `unlocked` (#2645) is the same for an unlocked host procedure:
 /// the caller takes the call, releases the lock, and runs it ([`Host::cap_dispatch_slots_deferring`]).
+/// `live` (#2847) is a call through a live-callee offer, which the dispatch hands back: each thunk
+/// makes it as its caller can, the locked one with the domain lock released.
 ///
 /// # Safety
 /// Same contract as [`cap_thunk`].
+///
+/// #2847 — inlined into each thunk, which specializes it to the faces that thunk offers: a call
+/// marshals none of its fifteen arguments, and the two copies come to less code than the one.
 #[allow(clippy::too_many_arguments)]
+#[inline(always)]
 unsafe fn cap_thunk_impl(
     ctx: *mut c_void,
     mem_base: *mut u8,
@@ -478,6 +503,7 @@ unsafe fn cap_thunk_impl(
     pending: Option<&mut Option<u64>>,
     unlocked: Option<&mut Option<UnlockedCall>>,
     park: &mut Option<HostParkReq>,
+    live: &mut Option<LiveTarget>,
 ) {
     let host = &mut *(ctx as *mut Host);
     // PROCESS.md S1b/S1c — the canonical-key futex region recorder, installed on the root thread's first
@@ -550,21 +576,6 @@ unsafe fn cap_thunk_impl(
         );
         return;
     }
-    // CALLS.md 5c.1b — the caller side of the JIT parked transport (§10.2 arm 5): a `call.cap`
-    // whose handle resolves to a minted live-impl enqueues on the callee child's shared cell and
-    // **thread-blocks** on the reply, instead of falling to the generic dispatch (whose LiveImpl
-    // arm answers `-EINVAL`). The `host` borrow above is dead on this path; the target is
-    // re-derived from `ctx` in its own short scope before any callee lock is taken.
-    let target = {
-        let h = &*(ctx as *mut Host);
-        h.live_impl_of(handle, type_id).map(|t| (t, h.handoff()))
-    };
-    if let Some((target, fast)) = target {
-        let out = result_slots(results, n_results);
-        let caller = &mut CallerHost::Owned(&mut *(ctx as *mut Host));
-        live_impl_call(caller, &target, fast, op, arg_slots, out, vm);
-        return;
-    }
     // #1768 — a JIT process's powerbox serves its personality's caller requests (`fork`, `execve`,
     // a blocking `waitpid`) and its pipes' parks here, after the op that raised one
     // ([`jit_proc::serve_request`]).
@@ -593,9 +604,21 @@ unsafe fn cap_thunk_impl(
     // The dispatch writes its results straight into the call's result slots, which the compiled
     // code zeroed (#2361, #2319). A deferred call writes none there, and it raised no park.
     let out = result_slots(results, n_results);
-    let r = host
-        .cap_dispatch_slots_deferring(type_id, op, handle, arg_slots, out, view, pending, unlocked);
+    let r = host.cap_dispatch_slots_deferring(
+        type_id,
+        op,
+        handle,
+        arg_slots,
+        out,
+        view,
+        pending,
+        unlocked,
+        Some(&mut *live),
+    );
     match r {
+        // #2847 — a call through a live-callee offer, handed back: the thunk makes it, and the
+        // dispatch left no transient.
+        Ok(()) if live.is_some() => {}
         Ok(()) => {
             // Every transient the op left is drained, acted on or not: one left set would land on a
             // later call.
@@ -776,32 +799,9 @@ pub unsafe extern "C" fn cap_thunk_locked(
     // A parked op runs again from the top: its dispatch re-takes the lock (#1826).
     loop {
         let mut guard = m.lock().unwrap_or_else(|e| e.into_inner());
-        // CALLS.md 5c.1b — a **locked-domain caller** takes the parked transport too, with this
-        // domain's guard released before it blocks (#2139): blocking on a sibling's reply while
-        // holding it would deadlock (A holds A waiting B; B blocked on A's lock).
-        if let Some(target) = guard.live_impl_of(handle, type_id) {
-            let fast = guard.handoff();
-            drop(guard);
-            let arg_slots = if n_args == 0 {
-                &[][..]
-            } else {
-                std::slice::from_raw_parts(args, n_args as usize)
-            };
-            let out = result_slots(results, n_results);
-            live_impl_call(
-                &mut CallerHost::Cell(m),
-                &target,
-                fast,
-                op,
-                arg_slots,
-                out,
-                vm,
-            );
-            return;
-        }
         let host_ptr = &mut *guard as *mut Host as *mut c_void;
         let mut pending_id = None;
-        let mut unlocked = None;
+        let (mut unlocked, mut live) = (None, None);
         let mut park = None;
         // #2495 — no parking face under a recording host, as in [`cap_thunk`].
         let face = (!guard.records_caps()).then_some(&mut pending_id);
@@ -821,7 +821,26 @@ pub unsafe extern "C" fn cap_thunk_locked(
             face,
             Some(&mut unlocked),
             &mut park,
+            &mut live,
         );
+        // CALLS.md 5c.1b — a **locked-domain caller** takes the parked transport too, with this
+        // domain's guard released before it blocks (#2139): blocking on a sibling's reply while
+        // holding it would deadlock (A holds A waiting B; B blocked on A's lock).
+        if let Some(target) = live {
+            let fast = guard.handoff();
+            drop(guard);
+            let out = result_slots(results, n_results);
+            live_impl_call(
+                &mut CallerHost::Cell(m),
+                &target,
+                fast,
+                op,
+                call_args,
+                out,
+                vm,
+            );
+            return;
+        }
         // #2645 — an unlocked host procedure runs with the domain lock released, so the run's other
         // vCPUs make their host calls meanwhile. Its window copies each take the lock
         // ([`LockedWindow`]). It raised no park.
@@ -4685,7 +4704,10 @@ impl MprotectWindow {
     /// child's carve is smaller than the guard, the interpreter left it unguarded, and this tier
     /// refused its low pages as unmapped — a `CapFault` where the oracle joins cleanly.
     pub fn set_null_guard(&mut self, guard: u64) {
-        if guard == 0 || !guard.is_multiple_of(self.page) || guard > self.mapped {
+        // #2847 — a host page is a power of two, so a mask tests page exactness: a call's fit
+        // divides nothing.
+        debug_assert!(self.page.is_power_of_two());
+        if guard == 0 || guard & (self.page - 1) != 0 || guard > self.mapped {
             return;
         }
         self.null_guard = guard;

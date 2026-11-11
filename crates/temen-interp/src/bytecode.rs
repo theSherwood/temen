@@ -11772,13 +11772,18 @@ fn payer(host: &mut HostCell) -> Option<NodeRef> {
 impl HostCell<'_> {
     /// Run `f` with exclusive access to the powerbox: directly (`Excl`) or under a brief lock
     /// (`Shared`). `f`'s result is owned (no borrow escapes the lock), so the lock is held only across
-    /// the one host call.
+    /// the one host call. `f` is called in one place, so each use inlines one copy of it (#2847).
     #[inline]
     fn with<R>(&mut self, f: impl FnOnce(&mut Host) -> R) -> R {
-        match self {
-            HostCell::Excl(h) => f(h),
-            HostCell::Shared(m) => f(&mut m.lock_unpoisoned()),
-        }
+        let mut held;
+        let host = match self {
+            HostCell::Excl(h) => &mut **h,
+            HostCell::Shared(m) => {
+                held = m.lock_unpoisoned();
+                &mut *held
+            }
+        };
+        f(host)
     }
 }
 
@@ -21466,25 +21471,6 @@ impl Vm {
                             }
                         }
                     }
-                    // §3.6 (I36 slice 2) — caller-side parking: a call through a live-callee
-                    // offer never reaches the generic dispatch. The task stops to make it, and the
-                    // driver enqueues it on the callee's inbound queue and parks the task until the
-                    // handler's reply (the tree-walker's caller-parking arm, task-level).
-                    if let Some(target) = host.with(|p| p.live_impl_of(h, *type_id)) {
-                        let sig = target.sig(*op, argv.len(), results.len())?;
-                        self.module = module;
-                        self.cur = cur;
-                        self.base = base;
-                        self.pc = pc + 1;
-                        return Ok(Outcome::LiveCall(LiveCall {
-                            callee: target.callee,
-                            export: target.export,
-                            op: *op,
-                            args: argv.to_vec(),
-                            sig,
-                            dst: *dst,
-                        }));
-                    }
                     // #2109: the host copies the call's buffers in one go ([`super::SoleMem`]).
                     let mut sole = mem.as_mut().map(super::SoleMem);
                     let gm = sole.as_mut().map(|m| m as &mut dyn GuestMem);
@@ -21499,7 +21485,7 @@ impl Vm {
                     // into its own `dst`. That is the `EINTR(42)` → `0` flake, at ~20% per attempt.
                     // Under one lock the flags are what they always meant to be: extra return values
                     // of this dispatch, unreachable by any other vCPU.
-                    let mut unlocked = None;
+                    let (mut unlocked, mut live) = (None, None);
                     let (r, parks) = host.with(|p| {
                         let r = p.cap_dispatch_slots_deferring(
                             *type_id,
@@ -21510,6 +21496,7 @@ impl Vm {
                             gm,
                             Some(&mut pending_id),
                             Some(&mut unlocked),
+                            Some(&mut live),
                         );
                         // Drain unconditionally (the tree-walker's park site does the same): a flag
                         // only ever means "the op *this* dispatch just ran wants to park", so one
@@ -21521,6 +21508,26 @@ impl Vm {
                     // parallel driver its other tasks make their host calls meanwhile. It raised no
                     // park, so the rest of this arm only delivers its results.
                     r?;
+                    // §3.6 (I36 slice 2) — caller-side parking: a call through a live-callee
+                    // offer does not complete in the dispatch, which hands its target back. The task
+                    // stops to make it, and the driver enqueues it on the callee's inbound queue and
+                    // parks the task until the handler's reply (the tree-walker's caller-parking arm,
+                    // task-level).
+                    if let Some(target) = live {
+                        let sig = target.sig(*op, argv.len(), results.len())?;
+                        self.module = module;
+                        self.cur = cur;
+                        self.base = base;
+                        self.pc = pc + 1;
+                        return Ok(Outcome::LiveCall(LiveCall {
+                            callee: target.callee,
+                            export: target.export,
+                            op: *op,
+                            args: argv.to_vec(),
+                            sig,
+                            dst: *dst,
+                        }));
+                    }
                     if let Some(call) = unlocked {
                         call.run(argv, res, sole.as_mut().map(|m| m as &mut dyn GuestMem))?;
                     }
