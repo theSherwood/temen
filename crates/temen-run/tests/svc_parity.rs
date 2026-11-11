@@ -285,12 +285,6 @@ fn a_forking_server_answers_as_the_oracle_on_all_three_backends() {
     let image = |f| std::sync::Arc::new(temen_ir::child_image_at(&m, f).expect("child image"));
     let (server, caller) = (image(1), image(4));
     let inst = instantiate_with_imports(m, Imports::new()).expect("instantiate");
-    // Queued calls: under direct handoff the tree-walker runs S's handler inline, with no parked
-    // caller to fork, so C's `fork` answers `-EAGAIN` for good (#2854).
-    let config = RunConfig {
-        handoff: false,
-        ..RunConfig::default()
-    };
     for backend in [Backend::TreeWalk, Backend::Bytecode, Backend::Jit] {
         let module = |image: &std::sync::Arc<Module>| {
             let image = std::sync::Arc::clone(image);
@@ -301,7 +295,7 @@ fn a_forking_server_answers_as_the_oracle_on_all_three_backends() {
         let r = inst
             .run_with_caps(
                 backend,
-                &config,
+                &RunConfig::default(),
                 &[
                     ("vm", HostCap::custom(6, 0, |h, _| h.grant_instantiator())),
                     ("budget", HostCap::detached_budget(8 << 20)),
