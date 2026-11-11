@@ -129,6 +129,10 @@ pub struct VmCtx {
     /// ([`Self::thunk_state`]): made by the thunk's first call, dropped with the context. Never read
     /// by compiled code. #2847 — beside it, the type it was made as.
     thunk_state: std::sync::OnceLock<(core::any::TypeId, Box<dyn core::any::Any + Send + Sync>)>,
+    /// #2958 — on a vCPU that runs as a task of executor 2's scheduling core, where its §12 ops go
+    /// ([`crate::kernel_rt`]): set by `KernelRun::run_vcpu` for its guarded call, `None` on every
+    /// other context. Never read by compiled code, so it sits past every field the code loads.
+    pub(crate) kernel: Option<core::ptr::NonNull<dyn crate::kernel_rt::KernelPark>>,
 }
 
 /// The per-instance addresses a [`VmCtx`] is filled from — everything but the trap cell, which each
@@ -250,6 +254,7 @@ impl VmCtx {
             #[cfg(fiber_rt)]
             owned_handlers: Some(owned_handlers),
             thunk_state: std::sync::OnceLock::new(),
+            kernel: None,
         }
     }
 
@@ -282,6 +287,7 @@ impl VmCtx {
             #[cfg(fiber_rt)]
             owned_handlers: None,
             thunk_state: std::sync::OnceLock::new(),
+            kernel: None,
         }
     }
 

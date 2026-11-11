@@ -14,6 +14,7 @@ use core::ffi::c_void;
 use std::time::{Duration, Instant};
 use temen_interp::{run_with_host, Host, Trap};
 use temen_jit::compile_and_run_capture_reserved_with_host_ex;
+use temen_run::jit_kernel::{self, Route};
 
 fn module(text: &str) -> temen_ir::Module {
     let m = temen_text::parse_module(text).expect("parse");
@@ -21,9 +22,21 @@ fn module(text: &str) -> temen_ir::Module {
     m
 }
 
-/// Run `m` on an **unarmed** JIT domain: no kill-path interrupt cell, no durable window, no grant
-/// hooks. Returns `Err` if the run ended abnormally — which is what a detected deadlock looks like.
-fn jit_unarmed(m: &temen_ir::Module) -> Result<temen_jit::JitOutcome, String> {
+/// Run `m` on an **unarmed** JIT domain, on each route its threads run on while both exist
+/// (#2958): today's thread runtime (no kill-path interrupt cell, no durable window, no grant hooks)
+/// and the kernel's, which `m` must be in the scope of. Each is `Err` if the run ended abnormally —
+/// which is what a detected deadlock looks like.
+fn jit_unarmed(m: &temen_ir::Module) -> Vec<Result<temen_jit::JitOutcome, String>> {
+    Route::BOTH
+        .iter()
+        .filter_map(|r| match r {
+            Route::Today => Some(jit_today(m)),
+            Route::Kernel => jit_kernel::expect_kernel(m, 0, &[], None, None).map(Ok),
+        })
+        .collect()
+}
+
+fn jit_today(m: &temen_ir::Module) -> Result<temen_jit::JitOutcome, String> {
     let mut host = Host::new();
     let (jo, _) = compile_and_run_capture_reserved_with_host_ex(
         m,
@@ -78,11 +91,12 @@ block 0 () {
 #[test]
 fn a_lone_infinite_wait_ends_instead_of_hanging_an_unarmed_jit_run() {
     let m = module(LONE_INFINITE_WAIT);
-    let jo = jit_unarmed(&m);
-    assert!(
-        !matches!(jo, Ok(temen_jit::JitOutcome::Returned(_))),
-        "an unsatisfiable wait must not come back as an ordinary result: {jo:?}"
-    );
+    for jo in jit_unarmed(&m) {
+        assert!(
+            !matches!(jo, Ok(temen_jit::JitOutcome::Returned(_))),
+            "an unsatisfiable wait must not come back as an ordinary result: {jo:?}"
+        );
+    }
 }
 
 /// **The oracle agrees, and promptly (#1624).** `thread_wait` has always claimed it surfaces
@@ -147,9 +161,10 @@ block 0 (vsp: i64, varg: i64) {
 #[test]
 fn a_mutual_deadlock_ends_instead_of_hanging_an_unarmed_jit_run() {
     let m = module(MUTUAL_DEADLOCK);
-    let jo = jit_unarmed(&m);
-    assert!(
-        !matches!(jo, Ok(temen_jit::JitOutcome::Returned(_))),
-        "two vCPUs each blocked on the other must not come back as a result: {jo:?}"
-    );
+    for jo in jit_unarmed(&m) {
+        assert!(
+            !matches!(jo, Ok(temen_jit::JitOutcome::Returned(_))),
+            "two vCPUs each blocked on the other must not come back as a result: {jo:?}"
+        );
+    }
 }

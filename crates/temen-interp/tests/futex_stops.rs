@@ -11,7 +11,8 @@
 //!   futex stops. A stop through the run's door, and a kill an embedder's signal source rings for,
 //!   still end the run at once, not at some later settle: in a run its opener watches, and in one
 //!   whose opener runs the root, as a browser's Worker does, which nothing watches until a park
-//!   starts a watcher. Such a run takes no futex stop without a settle.
+//!   starts a watcher (such a run takes no futex stop without a settle), and in one whose opener
+//!   runs the root with the run's watcher started at open, as the Cranelift JIT's does (#2958).
 //! - **Between an embedder's pumps.** A run its embedder pumps goes on between the pumps, and then
 //!   nothing watches it: a kill rung then ends its threads at their next stop, as before #2963, not
 //!   at the next pump. A door stop ends the run itself, pumped or not.
@@ -24,7 +25,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use temen_interp::bytecode::{self, CoopEvent, CoopRun, ThreadPlatform};
+use temen_interp::bytecode::{self, CoopEvent, CoopRun, Opener, ThreadPlatform};
 use temen_interp::{Host, SignalSource, Trap, Value};
 
 /// One test at a time: [`threads_stop`] reads a count every thread of the process adds to.
@@ -151,16 +152,17 @@ block 4 () {
 /// Hand-offs enough that no test run finishes them.
 const FOREVER: i32 = i32::MAX;
 
-/// Whether the opener watches the run (the native platform), or runs its root, as a browser's
-/// Worker does, and nothing watches it.
-const OPENERS: [bool; 2] = [false, true];
+/// Whether the opener watches the run (the native platform), runs its root as a browser's Worker
+/// does, with nothing watching it, or runs its root with the run's own watcher started at open, as
+/// the Cranelift JIT does (#2958).
+const OPENERS: [Opener; 3] = [Opener::Watches, Opener::RunsRoot, Opener::RunsRootWatched];
 
 /// Run `src`'s function 0 with `args` on executor 2, over a host `setup` arms, on a thread of its
 /// own: its result arrives on the receiver.
 fn run(
     src: &str,
     args: Vec<Value>,
-    root_on_opener: bool,
+    opener: Opener,
     setup: impl FnOnce(&mut Host) + Send + 'static,
 ) -> std::sync::mpsc::Receiver<Result<Vec<Value>, Trap>> {
     let m = temen_text::parse_module(src).expect("parse");
@@ -169,7 +171,7 @@ fn run(
     std::thread::spawn(move || {
         let mut host = Host::new();
         host.set_thread_platform(ThreadPlatform {
-            root_on_opener,
+            opener,
             ..ThreadPlatform::OS
         });
         setup(&mut host);
@@ -200,19 +202,11 @@ fn the_last_park_of_two_mutual_waits_is_the_verdict_and_a_timed_one_moves() {
         let r = rx
             .recv_timeout(GIVE_UP)
             .expect("two untimed waits hung the run: no settle saw it go idle");
-        assert_eq!(
-            r,
-            Err(Trap::ThreadFault),
-            "a deadlock (opener runs root: {opener})"
-        );
+        assert_eq!(r, Err(Trap::ThreadFault), "a deadlock (opener: {opener:?})");
 
         let rx = run(&mutual_wait(10_000_000), Vec::new(), opener, |_| {});
         let r = rx.recv_timeout(GIVE_UP).expect("a timed wait hung the run");
-        assert_eq!(
-            r,
-            Ok(vec![Value::I64(2)]),
-            "timed out (opener runs root: {opener})"
-        );
+        assert_eq!(r, Ok(vec![Value::I64(2)]), "timed out (opener: {opener:?})");
     }
 }
 
@@ -235,15 +229,8 @@ fn a_stop_ends_a_futex_pingpong_at_once() {
             .recv_timeout(GIVE_UP)
             .expect("the stopped pingpong ran on");
         let took = asked.elapsed();
-        assert_eq!(
-            r,
-            Err(Trap::OutOfFuel),
-            "stopped (opener runs root: {opener})"
-        );
-        assert!(
-            took < PROMPT,
-            "the stop took {took:?} (opener runs root: {opener})"
-        );
+        assert_eq!(r, Err(Trap::OutOfFuel), "stopped (opener: {opener:?})");
+        assert!(took < PROMPT, "the stop took {took:?} (opener: {opener:?})");
     }
 }
 
@@ -294,15 +281,8 @@ fn a_kill_ends_a_futex_pingpong_at_once() {
             .recv_timeout(GIVE_UP)
             .expect("the killed pingpong ran on");
         let took = asked.elapsed();
-        assert_eq!(
-            r,
-            Err(Trap::ThreadFault),
-            "finalized (opener runs root: {opener})"
-        );
-        assert!(
-            took < PROMPT,
-            "the kill took {took:?} (opener runs root: {opener})"
-        );
+        assert_eq!(r, Err(Trap::ThreadFault), "finalized (opener: {opener:?})");
+        assert!(took < PROMPT, "the kill took {took:?} (opener: {opener:?})");
     }
 }
 

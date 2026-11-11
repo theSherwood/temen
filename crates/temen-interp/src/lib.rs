@@ -34623,6 +34623,15 @@ impl Host {
         self.run_door = Some(door);
     }
 
+    /// #2958 — put `door` in place of the door this host's run has, if any, and hand that one back:
+    /// an embedder that sets a door for one run gives the host its own back after it.
+    pub fn replace_run_door(
+        &mut self,
+        door: Option<Arc<bytecode::RunDoor>>,
+    ) -> Option<Arc<bytecode::RunDoor>> {
+        std::mem::replace(&mut self.run_door, door)
+    }
+
     /// The run's door, if its embedder set one ([`Host::set_run_door`]).
     pub(crate) fn run_door(&self) -> Option<Arc<bytecode::RunDoor>> {
         self.run_door.clone()
