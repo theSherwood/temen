@@ -20872,6 +20872,29 @@ pub trait SharedBacking: Send + Sync {
     /// Write one region-relative byte (out of range ⇒ ignored). Interior-mutable: a region is shared
     /// (`Arc`), so writes go through `&self`.
     fn write_byte(&self, off: u64, b: u8);
+    /// Copy region-relative `[off, off + buf.len())` into `buf`: `false`, copying nothing, when the
+    /// range is not inside the region. How the interpreter copies an aliased page in one go
+    /// (#2962); a backing that holds its bytes flat overrides it with one copy.
+    fn copy_out(&self, off: u64, buf: &mut [u8]) -> bool {
+        if !region_range_ok(self.size(), off, buf.len()) {
+            return false;
+        }
+        for (k, b) in buf.iter_mut().enumerate() {
+            *b = self.read_byte(off + k as u64);
+        }
+        true
+    }
+    /// Copy `bytes` into region-relative `[off, off + bytes.len())`: `false`, writing nothing, when
+    /// the range is not inside the region ([`copy_out`](SharedBacking::copy_out)'s mirror).
+    fn copy_in(&self, off: u64, bytes: &[u8]) -> bool {
+        if !region_range_ok(self.size(), off, bytes.len()) {
+            return false;
+        }
+        for (k, &b) in bytes.iter().enumerate() {
+            self.write_byte(off + k as u64, b);
+        }
+        true
+    }
     /// #2127 — one naturally aligned `width`-byte (1, 2, 4 or 8) atomic access at region-relative
     /// `off`: `f` maps the current value to the one to store (`None` stores nothing), and the old
     /// value (zero-extended) is returned. Atomic, and sequentially consistent with every other
@@ -20899,6 +20922,11 @@ pub trait SharedBacking: Send + Sync {
     fn outside_writers(&self) -> bool {
         false
     }
+}
+
+/// Whether `[off, off + len)` lies inside a region of `size` bytes ([`SharedBacking::copy_out`]).
+pub fn region_range_ok(size: u64, off: u64, len: usize) -> bool {
+    off.checked_add(len as u64).is_some_and(|end| end <= size)
 }
 
 /// A reference to a shared region backing (see [`SharedBacking`]); cloning shares the same object.
@@ -21162,6 +21190,28 @@ impl SharedBacking for VecBacking {
             *s = b;
         }
     }
+    fn copy_out(&self, off: u64, buf: &mut [u8]) -> bool {
+        let src = self.buf();
+        let Some(s) = (off as usize)
+            .checked_add(buf.len())
+            .and_then(|end| src.get(off as usize..end))
+        else {
+            return false;
+        };
+        buf.copy_from_slice(s);
+        true
+    }
+    fn copy_in(&self, off: u64, bytes: &[u8]) -> bool {
+        let mut dst = self.buf();
+        let Some(d) = (off as usize)
+            .checked_add(bytes.len())
+            .and_then(|end| dst.get_mut(off as usize..end))
+        else {
+            return false;
+        };
+        d.copy_from_slice(bytes);
+        true
+    }
     fn atomic(&self, off: u64, width: u32, f: &mut dyn FnMut(u64) -> Option<u64>) -> u64 {
         // One lock for the whole word: every `atomic` on the region is serialized, so each is
         // atomic and all are totally ordered (#2127).
@@ -21214,6 +21264,12 @@ impl SharedBacking for ChargedRegion {
     }
     fn write_byte(&self, off: u64, b: u8) {
         self.backing.write_byte(off, b)
+    }
+    fn copy_out(&self, off: u64, buf: &mut [u8]) -> bool {
+        self.backing.copy_out(off, buf)
+    }
+    fn copy_in(&self, off: u64, bytes: &[u8]) -> bool {
+        self.backing.copy_in(off, bytes)
     }
     fn atomic(&self, off: u64, width: u32, f: &mut dyn FnMut(u64) -> Option<u64>) -> u64 {
         self.backing.atomic(off, width, f)
@@ -38347,7 +38403,10 @@ impl Mem {
         if !self.has_regions.load(Ordering::Relaxed) {
             self.back.copy_within(dbase, sbase, len);
         } else {
-            self.copy_span(dbase, sbase, len);
+            // #2962 — a page at a time, aliased or not; the whole span is read first, so the copy
+            // is overlap-safe. The oracle keeps its scalar `copy_span`.
+            let buf = self.read_run(sbase, len);
+            self.write_run(dbase, &buf);
         }
         self.writes += 1;
         Ok(())
@@ -38364,9 +38423,7 @@ impl Mem {
         if !self.has_regions.load(Ordering::Relaxed) {
             self.back.fill(base, len, val);
         } else {
-            for k in 0..len {
-                self.set_byte(base + k, val);
-            }
+            self.fill_run(base, len, val);
         }
         self.writes += 1;
         Ok(())
@@ -39060,27 +39117,86 @@ impl Mem {
 
     /// Write `bytes` at the backing-absolute `off`, as [`Self::set_byte`] would byte by byte: in one
     /// copy when no §13 region is mapped, since then no page is `Backed` and every byte writes
-    /// through to `back`. The copy is not atomic, so the caller must be the window's only accessor:
-    /// a window being seeded or given an image, or the bytecode engine ([`SoleMem`]).
+    /// through to `back`, and otherwise in one copy per page (#2962), to the page's region or to
+    /// `back`. The copy is not atomic, as a run of `set_byte`s is not.
     fn write_run(&self, off: u64, bytes: &[u8]) {
         if !self.has_regions.load(Ordering::Relaxed) {
             self.back.write_from(off, bytes);
             return;
         }
-        for (k, &b) in bytes.iter().enumerate() {
-            self.set_byte(off + k as u64, b);
-        }
+        let space = self.space_read();
+        self.each_page(&space, off, bytes.len(), |at, k, n, region| match region {
+            Some((r, roff)) => {
+                r.copy_in(roff, &bytes[k..k + n]);
+            }
+            None => self.back.write_from(at, &bytes[k..k + n]),
+        });
+    }
+
+    /// Set `len` bytes at the backing-absolute `off` to `val`, as [`Self::set_byte`] would byte by
+    /// byte, a page at a time, from one page-sized buffer: what the host allocates does not grow with
+    /// a guest-chosen length.
+    fn fill_run(&self, off: u64, len: u64, val: u8) {
+        let space = self.space_read();
+        let page = vec![val; (self.page as usize).min(len as usize)];
+        self.each_page(&space, off, len as usize, |at, _, n, region| match region {
+            Some((r, roff)) => {
+                r.copy_in(roff, &page[..n]);
+            }
+            None => self.back.fill(at, n as u64, val),
+        });
     }
 
     /// Read `len` bytes at the backing-absolute `off`, as [`Self::byte`] would byte by byte; the
-    /// mirror of [`Self::write_run`], under the same only-accessor contract.
+    /// mirror of [`Self::write_run`].
     fn read_run(&self, off: u64, len: u64) -> Vec<u8> {
+        let mut out = vec![0; len as usize];
         if !self.has_regions.load(Ordering::Relaxed) {
-            let mut out = vec![0; len as usize];
             self.back.read_into(off, &mut out);
             return out;
         }
-        (0..len).map(|k| self.byte(off + k)).collect()
+        let space = self.space_read();
+        self.each_page(&space, off, out.len(), |at, k, n, region| match region {
+            Some((r, roff)) => {
+                r.copy_out(roff, &mut out[k..k + n]);
+            }
+            None => self.back.read_into(at, &mut out[k..k + n]),
+        });
+        out
+    }
+
+    /// #2962 — walk `[off, off + len)` a page at a time: `f(at, k, n, region)` for the `n` bytes at
+    /// backing-absolute `at`, the `k`th on of the walk, with `region` the region and offset a
+    /// `Backed` page aliases there (`None` for a page of `back`). What part of a page lies past its
+    /// region's end is left out, as [`Self::byte`] reads it as 0 and [`Self::set_byte`] drops it.
+    fn each_page(
+        &self,
+        space: &AddrSpace,
+        off: u64,
+        len: usize,
+        mut f: impl FnMut(u64, usize, usize, Option<(RegionBacking, u64)>),
+    ) {
+        let mut k = 0;
+        while k < len {
+            let at = off + k as u64;
+            let idx = at % self.page;
+            let n = ((self.page - idx) as usize).min(len - k);
+            match space.prot.get(&(at / self.page)) {
+                Some(PageProt::Backed {
+                    region, region_off, ..
+                }) => {
+                    if let Some(r) = space.regions.get(region).and_then(Weak::upgrade) {
+                        let roff = region_off + idx;
+                        let inside = (r.size().saturating_sub(roff) as usize).min(n);
+                        if inside > 0 {
+                            f(at, k, inside, Some((r, roff)));
+                        }
+                    }
+                }
+                _ => f(at, k, n, None),
+            }
+            k += n;
+        }
     }
 
     fn set_byte(&self, off: u64, b: u8) {
