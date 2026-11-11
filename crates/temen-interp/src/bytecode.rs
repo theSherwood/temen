@@ -12263,9 +12263,11 @@ struct Waits {
     /// How many wait in each domain that has had a waiter: a domain whose every other task has
     /// ended is still alive. A domain's count goes with it ([`Tasks::forget_domain`]).
     in_domain: std::collections::BTreeMap<usize, usize>,
-    /// #2963 — the tasks the last [`Tasks::notify`] woke, in the order it woke them: executor 2
-    /// wakes their threads ([`Tasks::take_woken`]). Each notify starts it afresh, so a driver that
-    /// wakes no threads leaves it be, and it never holds more than one notify's waiters.
+    /// #2963 — the tasks the last [`Tasks::notify`] woke, in the order it woke them. Executor 2 takes
+    /// them under the same lock hold: a futex stop wakes their threads ([`ThreadRun::apply`]), and
+    /// the wake scan after a settle sees them among the rest ([`ThreadRun::wake`]). Each notify
+    /// starts it afresh, so a driver that wakes no threads leaves it be, and it never holds more
+    /// than one notify's waiters.
     woken: Vec<usize>,
 }
 
@@ -18996,7 +18998,6 @@ impl ThreadRun {
             g.core.tasks.waits.woken = woken;
             return (Vec::new(), None);
         }
-        g.core.tasks.waits.woken.clear();
         let Threads { core, emit, .. } = &mut *g;
         let invoke = match applied {
             Applied::Futex | Applied::All => None,
@@ -19169,6 +19170,9 @@ impl ThreadRun {
     /// A task the rules have just made has no thread yet. Every settle is followed by this scan, so
     /// the tasks that ended have been seen by every rule here, and leave the live list (#2229).
     fn wake(&self, g: &mut Threads) {
+        // #2963 — the tasks a notify woke are the live ones this scan looks at: whatever notified
+        // them, a stop's rule or a settle's post, they are taken here.
+        g.core.tasks.waits.woken.clear();
         let over = g.over.is_some();
         for k in 0..g.core.tasks.live.len() {
             let j = g.core.tasks.live[k];
