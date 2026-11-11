@@ -2242,6 +2242,15 @@ pub(crate) unsafe extern "C" fn thread_spawn(
     arg0: u64,
     arg1: u64,
 ) -> i32 {
+    // #2948 spike: a kernel vCPU's spawn is the kernel's.
+    let stop = crate::kernel_rt::KStop::Spawn {
+        func: func_idx,
+        arg0: arg0 as i64,
+        arg1: arg1 as i64,
+    };
+    if let Some([handle, _]) = crate::kernel_rt::routed(vm, stop) {
+        return handle as i32;
+    }
     let dom = current_domain(vm.sched as *const Domain);
     let hub = dom.hub();
     let env = dom.env();
@@ -2869,6 +2878,13 @@ pub(crate) unsafe extern "C" fn thread_join(
     status_out: *mut i64,
 ) -> i64 {
     *status_out = 0;
+    // #2948 spike: a kernel vCPU's join is the kernel's.
+    if let Some([status, value]) =
+        crate::kernel_rt::routed(vm, crate::kernel_rt::KStop::Join { handle })
+    {
+        *status_out = status;
+        return value;
+    }
     let dom = current_domain(vm.sched as *const Domain);
     match dom.children.name(handle) {
         ChildRef::Thread(done) => join_thread(dom, handle, &done, status_out, vm),
@@ -3118,6 +3134,16 @@ pub(crate) unsafe extern "C" fn thread_wait(
     width: u32,
     timeout: i64,
 ) -> i32 {
+    // #2948 spike: a kernel vCPU's wait is the kernel's.
+    let stop = crate::kernel_rt::KStop::Wait {
+        off,
+        expected,
+        wide: width == 8,
+        timeout,
+    };
+    if let Some([status, _]) = crate::kernel_rt::routed(vm, stop) {
+        return status as i32;
+    }
     // #2742 — a serve handler's futex wait gives its window's gate back meanwhile, as an event park
     // does ([`park_host_call`]); one whose domain ended meanwhile unwinds.
     let aside = crate::child_exec::handler_steps_aside(vm, false);
@@ -3564,6 +3590,12 @@ pub(crate) unsafe extern "C" fn fiber_resume_block(
 /// # Safety
 /// `vm` is the running context, whose `sched` is the run's live `Domain`.
 pub(crate) unsafe extern "C" fn thread_notify(vm: &crate::VmCtx, off: u64, count: i32) -> i32 {
+    // #2948 spike: a kernel vCPU's notify is the kernel's.
+    if let Some([woken, _]) =
+        crate::kernel_rt::routed(vm, crate::kernel_rt::KStop::Notify { off, count })
+    {
+        return woken as i32;
+    }
     let Some(phys) = vm.window().span(off, 4) else {
         return 0;
     };

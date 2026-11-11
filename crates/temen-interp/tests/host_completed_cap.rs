@@ -971,6 +971,7 @@ fn run_leaf(
                     modules: t.modules,
                     leaf: t.leaf,
                     run: bounce_leaf,
+                    native: None,
                 }),
                 ..ThreadPlatform::OS
             });

@@ -281,6 +281,7 @@ fn run_tree(exec: Exec, guest_text: &str, command: &str, leaf: bool) -> (Ending,
                     modules: None,
                     leaf: Some(leaf),
                     run: bounce_entry,
+                    native: None,
                 }),
                 ..ThreadPlatform::OS
             });

@@ -54,6 +54,31 @@ use descriptors::Descriptor;
 pub mod exec;
 pub mod fs;
 mod jit_proc;
+// #2948 spike: Cranelift vCPUs as executor 2's tasks, behind `TEMEN_JIT_KERNEL` (scaffolding).
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub mod jit_kernel;
+#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+pub mod jit_kernel {
+    //! #2948 spike: off this target; every caller runs today's path.
+    /// Never on here.
+    pub fn enabled() -> bool {
+        false
+    }
+    /// Never: out of the spike's scope here.
+    pub fn run(
+        _: &temen_ir::Module,
+        _: u32,
+        _: &[i64],
+        _: u8,
+        _: &mut temen_interp::Host,
+    ) -> Option<Result<Vec<i64>, temen_interp::Trap>> {
+        None
+    }
+    /// None ran.
+    pub fn vcpus() -> u64 {
+        0
+    }
+}
 pub use jit_proc::JitCodeCache;
 pub mod posix;
 use temen_jit::{CompiledModule, JitFrameLoc, JitOutcome, Parks, TrapKind};

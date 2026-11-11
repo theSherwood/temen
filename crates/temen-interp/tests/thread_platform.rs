@@ -214,6 +214,7 @@ fn tier(
             leaf: None,
             modules: None,
             run,
+            native: None,
         }),
         ..ThreadPlatform::OS
     }
@@ -333,6 +334,7 @@ fn run_leaf_root(m: &Module, take: Option<bool>) -> (Result<Vec<Value>, Trap>, L
                 take
             })),
             run: recording_leaf_calls,
+            native: None,
         }),
         root_on_opener: true,
         ..ThreadPlatform::OS
@@ -747,6 +749,7 @@ fn invoke_tier(run: fn(&mut EmittedCall<'_>) -> Result<(), Trap>) -> ThreadPlatf
             leaf: None,
             modules: None,
             run,
+            native: None,
         }),
         ..ThreadPlatform::OS
     }
@@ -837,6 +840,7 @@ fn run_paged(
             leaf: None,
             modules: None,
             run,
+            native: None,
         }),
         ..ThreadPlatform::OS
     });
@@ -1039,6 +1043,7 @@ fn a_collector_under_each_threads_emitted_frame_sees_its_spilled_words() {
             leaf: None,
             modules: None,
             run: spill_then_collect,
+            native: None,
         }),
         ..ThreadPlatform::OS
     };
@@ -1397,6 +1402,7 @@ fn a_childs_root_task_tiers_up_over_its_own_memory() {
                 })
             })),
             run: recording_child_calls,
+            native: None,
         }),
         ..ThreadPlatform::OS
     };
@@ -1691,6 +1697,7 @@ fn a_bounce_spawns_and_joins_a_child_whose_entry_spawns_a_thread() {
                 })
             })),
             run: recording_child_bounces,
+            native: None,
         }),
         ..ThreadPlatform::OS
     };

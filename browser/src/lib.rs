@@ -2013,6 +2013,7 @@ pub extern "C" fn temen_x2_open(
             // one that parks (#1414 5c).
             leaf: leaves.map(|p| leaf_emitter(p, true, true)),
             run: x2_run,
+            native: None,
         });
     }
     host.set_thread_platform(platform);

@@ -110,6 +110,10 @@ mod setjmp_rt;
 // loom-verified. Available where `temen_fiber::supported()` (x86-64 unix).
 #[cfg(fiber_rt)]
 mod os_thread_rt;
+// #2948 spike: Cranelift vCPUs as tasks of executor 2's scheduling core (scaffolding, behind
+// `TEMEN_JIT_KERNEL` in temen-run).
+#[cfg(fiber_rt)]
+pub mod kernel_rt;
 // PROCESS.md S1b/S1c: the canonical-key futex region registry — `temen-run` records a §13 `map`'s pages
 // (so the JIT futex thunks canonicalize `Backed` addresses) and purges them at teardown. Real-runtime
 // only; the loom futex model has no regions (`futex_key_of` is `Anon`-only there).

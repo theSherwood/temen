@@ -8348,6 +8348,7 @@ impl ScheduledDebugRun {
                         spare: None,
                     },
                     suspended: None,
+                    native: None,
                 }),
                 domain: ts.domain,
                 state: match (&ts.state, readmit_parks) {
@@ -8822,20 +8823,30 @@ fn image_parks(host: &Host, m: &Module, census: &ImageCensus) -> Parks {
     }
     if m.imports.len() != host.import_bindings.len()
         || parks.contains(&OpParks::Otherwise)
-        || census.concurrency
+        || (census.concurrency && !parks_natively(host))
         || census.parks
     {
         return Parks::Otherwise;
     }
     // #2050: past the check above, a futex op is a wait, which parks the process in its bounce.
-    let suspendable =
-        parks.contains(&OpParks::OnChildren) || parks.contains(&OpParks::OnHost) || census.futex;
+    let suspendable = parks.contains(&OpParks::OnChildren)
+        || parks.contains(&OpParks::OnHost)
+        || census.futex
+        || census.concurrency;
     let inline_streams =
         (census.stream_read && stream_op_parks(0)) || (census.stream_write && stream_op_parks(1));
     match suspendable || import_streams || inline_streams {
         true => Parks::Suspendably,
         false => Parks::Never,
     }
+}
+
+/// #2948 spike — whether `host`'s emitted tier makes the §12 thread ops itself ([`ThreadTier::native`]),
+/// so an image that spawns and joins runs whole on it.
+fn parks_natively(host: &Host) -> bool {
+    host.thread_platform()
+        .tier
+        .is_some_and(|t| t.native.is_some())
 }
 
 /// What an image's code does that decides how it runs whole on the emitted tier: the instruction
@@ -12323,6 +12334,7 @@ impl TaskSlot {
             vm: Box::new(TaskVm {
                 vt,
                 suspended: None,
+                native: None,
             }),
             domain,
             state: TaskState::Runnable,
@@ -12337,6 +12349,13 @@ impl TaskSlot {
     /// ([`TaskVm::parked_frame`]): a woken wait's status, a joined child's result, a call's reply. The
     /// one way the scheduler's rules write a task's registers, its own included.
     fn deliver(&mut self, dst: u32, value: Reg) {
+        // #2948 spike — a native task's parked op has no frame: its results land in its cell.
+        if let Some(cell) = self.vm.native.as_mut() {
+            if let Some(r) = cell.get_mut(dst as usize) {
+                *r = value;
+            }
+            return;
+        }
         self.vm.parked_frame().set(dst, value);
     }
 
@@ -12356,6 +12375,9 @@ struct TaskVm {
     /// #1896 — the rest of a call that parked in a bounce out of this task's emitted leaf, run once
     /// the park clears.
     suspended: Option<Box<Suspended>>,
+    /// #2948 spike — set while a native task's op is parked ([`BounceTask::park_native`]): where the
+    /// rules deliver its results, from register 0.
+    native: Option<[Reg; 2]>,
 }
 
 impl TaskVm {
@@ -17620,6 +17642,46 @@ pub struct ThreadTier {
     /// ([`EmittedCall::over`]) it returns by the emitted code's next fuel check, whatever it
     /// returns: the run waits for its thread.
     pub run: fn(&mut EmittedCall<'_>) -> Result<(), Trap>,
+    /// #2948 spike (scaffolding, INVARIANTS #13/#15) — a tier whose emitted code makes the §12
+    /// thread ops itself and parks its own frames for them ([`EmittedCall::park`]): the Cranelift
+    /// JIT under `TEMEN_JIT_KERNEL`. `None` for every supported tier.
+    pub native: Option<NativeTier>,
+}
+
+/// #2948 spike — what a native tier needs from the run beyond [`ThreadTier`]: a way to stop its
+/// running code when the run ends, since it does not read [`EmittedCall::over`].
+#[derive(Clone)]
+pub struct NativeTier {
+    /// Called once as the run ends ([`ThreadRun::conclude`]): the tier's code still running stops at
+    /// its next safepoint.
+    pub on_end: std::sync::Arc<dyn Fn() + Send + Sync>,
+    /// The tier's own run state, for its [`ThreadTier::run`] to find ([`EmittedCall::native`]).
+    pub state: std::sync::Arc<dyn std::any::Any + Send + Sync>,
+}
+
+/// #2948 spike — a §12 op native emitted code makes, applied by the run's rules as an interpreted
+/// op's stop ([`EmittedCall::park`]). Addresses are window-relative, as the guest wrote them.
+#[derive(Clone, Copy, Debug)]
+pub enum NativeStop {
+    Spawn {
+        func: u32,
+        arg0: i64,
+        arg1: i64,
+    },
+    Join {
+        handle: i32,
+    },
+    /// `timeout` in ns, negative for none; `wide` is a 64-bit wait.
+    Wait {
+        addr: u64,
+        expected: u64,
+        wide: bool,
+        timeout: i64,
+    },
+    Notify {
+        addr: u64,
+        count: i32,
+    },
 }
 
 /// What a call on the emitted tier runs ([`EmittedCall::target`]).
@@ -17666,6 +17728,10 @@ pub struct EmittedCall<'a> {
     pub fault: Option<u64>,
     /// A call out of the emitted code back into the interpreter ([`Bounce`]).
     pub bounce: &'a mut Bounce<'a>,
+    /// #2948 spike — the task's `vcpu.tls` seed, its id in its domain.
+    pub tls: i64,
+    park: &'a mut NativePark<'a>,
+    native: Option<&'a NativeTier>,
     table: &'a SharedSlots,
     host: &'a std::sync::Mutex<super::Host>,
     now: &'a std::cell::Cell<u64>,
@@ -17674,6 +17740,25 @@ pub struct EmittedCall<'a> {
 }
 
 impl EmittedCall<'_> {
+    /// #2948 spike — apply §12 op `stop` for the task this call runs, as its rules apply an
+    /// interpreted op's, parking this thread with the emitted frames on its stack until the task can
+    /// run: `(status, value)` for a join, the result in `[0]` otherwise. `Err` when the task or the
+    /// run ended meanwhile, or the op traps; the emitted code then unwinds.
+    pub fn park(&mut self, stop: NativeStop) -> Result<[i64; 2], Trap> {
+        (self.park)(stop)
+    }
+
+    /// #2948 spike — the powerbox the call runs under: its domain's host cell, which a native tier's
+    /// `call.cap` serializes through.
+    pub fn host_cell(&self) -> *const std::sync::Mutex<super::Host> {
+        self.host
+    }
+
+    /// #2948 spike — the run's native tier ([`ThreadTier::native`]), if its tier is one.
+    pub fn native(&self) -> Option<&NativeTier> {
+        self.native
+    }
+
     /// The generation of the task's dispatch table: it moves with every install and uninstall, so
     /// a host that mirrors the table in emitted code rebuilds only when it changed.
     pub fn table_gen(&self) -> u32 {
@@ -17777,6 +17862,9 @@ type NewTask = (usize, Option<Mem>, Fuel);
 /// them, run over the task's live window and powerbox, with how many words the emitted frames beneath
 /// it pushed to the thread's spill stack ([`EmittedCall::spill`]). Returns how many results it wrote.
 pub type Bounce<'a> = dyn FnMut(u32, &mut [i64], usize) -> Result<usize, Trap> + 'a;
+
+/// #2948 spike — a native tier's §12 op, applied for its task ([`EmittedCall::park`]).
+type NativePark<'a> = dyn FnMut(NativeStop) -> Result<[i64; 2], Trap> + 'a;
 
 /// A thread steps this many tier-ups at most before it looks at the run, as a preemption makes it:
 /// a loop of calls that each tier up never spends a quantum.
@@ -18242,6 +18330,44 @@ impl BounceTask<'_> {
             _ => Err(Trap::ThreadFault),
         }
     }
+
+    /// #2948 spike — [`park`](Self::park) for a native tier's own §12 op: the same rules and the same
+    /// wait, with no continuation. The task's VM goes back to the table with a result cell
+    /// ([`TaskVm::native`]) the rules deliver into, and the thread takes the cell back when the task
+    /// can run. A stop that does not park (a spawn, a notify) returns as soon as it is applied.
+    fn park_native(&mut self, stop: VcpuStop) -> Result<[Reg; 2], Trap> {
+        let (run, ti) = (self.run, self.ti);
+        let mut g = run.state.lock_unpoisoned();
+        if g.over.is_some() || matches!(g.core.tasks[ti].state, TaskState::Done(_)) {
+            return Err(Trap::ThreadFault);
+        }
+        std::mem::swap(&mut *g.core.tasks[ti].vm, self.vm);
+        g.core.tasks[ti].vm.native = Some([Reg::default(); 2]);
+        let (made, _) = run.apply(&mut g, ti, Ok(stop), *self.exits);
+        g = start_tasks(run, g, made);
+        let runs = loop {
+            let next;
+            (g, next) = run.await_runnable(g, ti, false);
+            match next {
+                Next::Run => break true,
+                Next::Stop => break false,
+                Next::Carry(a) => {
+                    let (view, _) = g.hand(0);
+                    g = carry(run, g, a, view, Fuel::fixed(0));
+                }
+            }
+        };
+        std::mem::swap(&mut *g.core.tasks[ti].vm, self.vm);
+        *self.exits = g.core.hooked_twins.len();
+        // A rule that ended the task (a trap, the domain's end) leaves it `Done`: its op does not
+        // return.
+        let ended = matches!(g.core.tasks[ti].state, TaskState::Done(_));
+        release(g);
+        match self.vm.native.take() {
+            Some(cell) if runs && !ended => Ok(cell),
+            _ => Err(Trap::ThreadFault),
+        }
+    }
 }
 
 /// Let go of executor 2's lock, then signal the threads its holder woke ([`ThreadRun::wake`]).
@@ -18417,7 +18543,7 @@ impl ThreadRun {
         &self,
         tier: &ThreadTier,
         fibers: &mut FiberCell,
-        mut task: Option<BounceTask<'_>>,
+        task: Option<BounceTask<'_>>,
         ctx: &mut RunCtx,
         state: &mut TierState,
         target: EmittedTarget<'_>,
@@ -18455,7 +18581,57 @@ impl ThreadRun {
             table, fuel, mem, ..
         } = ctx;
         let table: &SharedSlots = table;
+        // #2948 spike — the bounce and a native tier's park share the task and the window; the two
+        // never run at once (a native tier makes no bounce), so each borrows them for its call.
+        let tls = task.as_ref().map_or(0, |t| t.vm.vt.active.tls);
+        let task = std::cell::RefCell::new(task);
+        let mem = std::cell::RefCell::new(mem);
+        let mut park = |stop: NativeStop| -> Result<[i64; 2], Trap> {
+            let stop = {
+                let mem = mem.borrow();
+                let m = mem.as_ref();
+                match stop {
+                    NativeStop::Spawn { func, arg0, arg1 } => VcpuStop::Spawn {
+                        func,
+                        arg0,
+                        arg1,
+                        dst: 0,
+                        module: 0,
+                    },
+                    NativeStop::Join { handle } => VcpuStop::Join { handle, dst: 0 },
+                    NativeStop::Wait {
+                        addr,
+                        expected,
+                        wide,
+                        timeout,
+                    } => {
+                        let ty = if wide { IntTy::I64 } else { IntTy::I32 };
+                        let width = super::atomic_width(ty);
+                        let m = m.ok_or(Trap::Malformed)?;
+                        VcpuStop::Wait {
+                            base: m.prepare_wait(addr, ty)?,
+                            expected: expected & super::width_mask(width),
+                            width,
+                            timeout: (timeout >= 0).then_some(timeout as u64),
+                            dst: 0,
+                        }
+                    }
+                    NativeStop::Notify { addr, count } => VcpuStop::Notify {
+                        base: m.ok_or(Trap::Malformed)?.confine_for_notify(addr)?,
+                        count,
+                        dst: 0,
+                    },
+                }
+            };
+            let mut task = task.borrow_mut();
+            let cell = task.as_mut().ok_or(Trap::Malformed)?.park_native(stop)?;
+            Ok([cell[0].i64(), cell[1].i64()])
+        };
         let mut bounce = |target: u32, io: &mut [i64], pushed: usize| {
+            let mut task = task.borrow_mut();
+            let task = &mut *task;
+            let mut mem = mem.borrow_mut();
+            let mem: &mut Option<Mem> = &mut mem;
             // A tier that does not spill, or a count past its stack, leaves `gc.roots` refused: a
             // scan that cannot see the emitted frames' words would miss roots.
             let words = (!spill.is_empty()).then(|| spill.get(..pushed)).flatten();
@@ -18525,6 +18701,9 @@ impl ThreadRun {
             work: 0,
             fault: None,
             bounce: &mut bounce,
+            tls,
+            park: &mut park,
+            native: tier.native.as_ref(),
             table,
             host,
             now: &now,
@@ -18533,6 +18712,8 @@ impl ThreadRun {
         };
         let ran = (tier.run)(&mut call);
         let (results, work, fault) = (call.results, call.work, call.fault);
+        drop(bounce);
+        let mem = mem.into_inner();
         if let (Err(Trap::MemoryFault), Some(rel), Some(m)) = (&ran, fault, mem.as_ref()) {
             m.report_fault_rel(rel);
         }
@@ -18556,6 +18737,10 @@ impl ThreadRun {
         if g.over.is_none() {
             g.over = Some(res);
             self.over.store(true, std::sync::atomic::Ordering::SeqCst);
+            // #2948 spike — a native tier's running code does not read `over`.
+            if let Some(n) = self.platform.tier.as_ref().and_then(|t| t.native.as_ref()) {
+                (n.on_end)();
+            }
             // Its watcher has to look in order to leave.
             self.ring();
         }

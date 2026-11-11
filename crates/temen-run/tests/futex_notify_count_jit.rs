@@ -38,6 +38,14 @@ fn both(m: &temen_ir::Module) -> (i64, i64) {
     };
 
     let mut host = Host::new();
+    // #2948 spike: under `TEMEN_JIT_KERNEL=1`, an in-scope program's vCPUs run as executor 2's tasks.
+    if temen_run::jit_kernel::enabled() {
+        let r = temen_run::jit_kernel::run(m, 0, &[], temen_ir::DEFAULT_RESERVED_LOG2, &mut host);
+        if let Some(r) = r {
+            let v = r.unwrap_or_else(|t| panic!("jit (kernel) trapped: {t:?}"));
+            return (interp, v.first().copied().unwrap_or(-1));
+        }
+    }
     let (jo, _) = compile_and_run_capture_reserved_with_host_ex(
         m,
         0,
