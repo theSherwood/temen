@@ -53,9 +53,11 @@ pub use descriptors::raise_descriptor_limit;
 use descriptors::Descriptor;
 pub mod exec;
 pub mod fs;
+mod held;
 mod jit_proc;
 pub use jit_proc::JitCodeCache;
 pub mod posix;
+pub use held::hold;
 use temen_jit::{CompiledModule, JitFrameLoc, JitOutcome, Parks, TrapKind};
 pub use temen_peval::{SpecArg, SpecConfig};
 
@@ -3486,6 +3488,12 @@ unsafe fn live_call(
         // Not a JIT run's shared cell (e.g. an interp-tier callee reached from a JIT run): no
         // serve loop here can ever answer, so keep the pre-5c.1 probeable answer.
         return Some(Reply::Failed(EINVAL));
+    }
+    // #2695 step 2 — a domain the JIT holds takes its calls as activations on their callers'
+    // threads, once it rests.
+    if guard.held_for_engine() {
+        drop(guard);
+        return held::held_call(caller, callee, export, op, args, params, vm);
     }
     // A guest fiber's call takes the queue: it parks the fiber at least once, as the oracle's
     // register-then-recheck does (#1952), and a handoff would answer it before it could.

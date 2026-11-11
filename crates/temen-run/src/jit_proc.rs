@@ -105,6 +105,14 @@ pub(crate) fn drives_jit(calls: &BTreeSet<(u32, u32)>, host: &Host) -> bool {
         .any(|&(t, o)| may_reach(t, o, host, |t, _| t == cap_id::JIT))
 }
 
+/// #2695 — whether a program making `calls` can serve its offers in a serve loop over `host`: reach
+/// `svc.poll` or `svc.wait` ([`temen_ir::durable_abi::is_serve_op`]).
+pub(crate) fn serves(calls: &BTreeSet<(u32, u32)>, host: &Host) -> bool {
+    calls
+        .iter()
+        .any(|&(t, o)| may_reach(t, o, host, temen_ir::durable_abi::is_serve_op))
+}
+
 /// How a program forks on the JIT (FORK.md §9.5): its **fork sites** — the dispatch pairs of the calls
 /// that can dispatch the fork op — and the shadow arena its root unwinds into.
 pub(crate) struct ForkPlan {
@@ -1385,7 +1393,7 @@ fn interp_result(
 }
 
 /// The interpreters' [`Trap`] for a JIT trap kind: the same trap wire code (#1735).
-fn trap_of(kind: TrapKind) -> Trap {
+pub(crate) fn trap_of(kind: TrapKind) -> Trap {
     Trap::from_code(kind.code()).expect("every trap kind is a trap")
 }
 
