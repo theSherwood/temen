@@ -3604,6 +3604,41 @@ A link unit is a library. It may not define `main`, and translation fails closed
 Without the flag nothing changes: a whole translation is byte-identical. `tests/link_unit.rs` links
 two translated units in both orders and runs them on the interpreter and the JIT.
 
+## 8c. Interfaces: serving and importing by name (#2961)
+
+A translated guest can serve an interface its children call by name, and can call one it imports.
+These are the substrate's existing ops reached from source. There is no second mechanism:
+
+| Source | IR |
+|---|---|
+| `__temen_iface__<name>`: a constant string such as `"run(i64, i64) -> (i64); take(i64) -> (i64, cap)"` | the interface: op names, op order, shapes; `cap` marks a handle slot |
+| every `__temen_op__<name>__<op>` **defined** | an impl-export `<name>`, served by `svc.wait` |
+| the ops only **declared** | one grouped import `<name>`; a call of an op is `call.import <name>.<op>` |
+| `long __vm_svc_wait(void)` / `long __vm_svc_poll(void)` | `svc.wait` / `svc.poll` |
+| `int __vm_serve_grant(__temen_iface__<name>)` | the constant `GRANT_SERVE_LIVE_TAG \| export`, for a spawn's grant record |
+
+A `cap` is an `int` / `i32` in the source. A frontend's struct-return coercion may widen it to `i64`,
+as rustc does for `{i64, i32}`; the translator narrows it. Two or more results are a small struct
+returned by value (§3a). Each op's source signature is checked against the descriptor. A module that
+defines some ops of an interface but not others is refused, and so is an op symbol that no
+descriptor names. The child binds its import to the grant by name, at spawn, as it binds any other
+import. Every engine translates the handles in `cap` slots between the two tables (INVARIANTS #8).
+
+**The serve stack.** A translated function takes the data-SP first (§3d), so each served op is a
+trampoline. It calls the op's function on a stack of its own, a 256 KiB reserve above the data stack:
+the serve loop that dispatches the call is suspended mid-frame. One stack is sound only while no two
+handlers are live at once. That fails exactly when a handler parks, because on the oracle the serve
+loop then admits the next call. So a served op that can park is refused at translation. The test is
+`temen_ir::seams::handler_never_parks`, the predicate every engine asks of a serve handler. A served
+op therefore runs to completion. It may not use an import (libc I/O, `malloc`), spawn or join,
+indirect calls, fibers or threads. The same property is why the bytecode engine serves a translated
+parent natively (`bytecode_serves_children`), never declining it.
+
+`tests/serve_iface.rs` builds a C parent and child with clang, and a Rust parent and child with
+rustc. In each pair the parent serves `exec` and the child calls it by name: a handle crosses in a
+result and in an argument, and the parent maps the region it receives back and reads the byte the
+child wrote. All four drivers answer the same.
+
 ---
 
 ## 9. Code map
@@ -3618,6 +3653,9 @@ two translated units in both orders and runs them on the interpreter and the JIT
 - Link units (§8b): `LinkCtx`/`SymImports` (the `call.sym` imports), `const_reloc` (a constant
   that may be an address the linker places), and `globals_layout`'s `LinkData` (data relocations
   and data exports) in `crates/temen-llvm/src/lib.rs`; `crates/temen-llvm/tests/link_unit.rs`.
+- Interfaces (§8c): `crates/temen-llvm/src/serve.rs` (descriptors, trampolines, the handler
+  check) and `lower_iface_call` in `lib.rs`; `crates/temen-llvm/tests/serve_iface.rs`, and the
+  substrate's op routing in `crates/temen/tests/live_import.rs`.
 - Crate config + build prereqs: `crates/temen-llvm/Cargo.toml` (no libLLVM deps since the
   textual-reader flip — the in-house `.ll` reader lives in `crates/temen-llvm/src/ll/`; see §8
   Q1b/Q4); workspace exclusion in the root `Cargo.toml`.

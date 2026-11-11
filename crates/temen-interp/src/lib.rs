@@ -15965,13 +15965,13 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
             // until it lands — a fiber alone, the root with its vCPU. A full queue is the call's
             // failure, `-EAGAIN`: probeable backpressure, never a trap, for an op that can carry it.
             macro_rules! live_call {
-                ($target:expr, $op:expr, $argv:expr, $sig:expr) => {{
+                ($target:expr, $argv:expr, $sig:expr) => {{
                     let target: LiveTarget = $target;
-                    let op: u32 = $op;
+                    let op = target.op;
                     let csig = call_sig(&cur_types, $sig);
                     // INVARIANTS #8: the op's own signature, not the call site's, says which
                     // slots are handles.
-                    let sig = target.sig(op, csig.params.len(), csig.results.len())?;
+                    let sig = target.sig(csig.params.len(), csig.results.len())?;
                     let (ticket, callee_id) = issue_live_call(
                         host,
                         *durable_sp_ctx,
@@ -17447,7 +17447,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     // never a trap.
                     if let Some(target) = live {
                         drop(hg);
-                        live_call!(target, *op, argv.to_vec(), *sig);
+                        live_call!(target, argv.to_vec(), *sig);
                     }
                     // §12 parking-on-blocking: a punted offloadable dispatch — release the host
                     // lock **before** waiting (the §5b serialization fix), then take the scalar
@@ -17675,10 +17675,10 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     // fiber until the reply. Same backpressure and race story as slice 3.
                     let live = {
                         let hg = host.lock_unpoisoned();
-                        hg.import_live_target(*import)
+                        hg.import_live_target(*import | (*op << 16))
                     };
-                    if let Some((target, base_op)) = live {
-                        live_call!(target, base_op + *op, argv.to_vec(), *sig);
+                    if let Some(target) = live {
+                        live_call!(target, argv.to_vec(), *sig);
                     }
                     // CALLS.md increment 3 (slice 1): an instanced offer bound to this slot runs
                     // with the narrowed powerbox lock (see the `call.cap` arm). Probe reproduces the
@@ -17786,8 +17786,8 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         let hg = host.lock_unpoisoned();
                         hg.import_live_target(*import)
                     };
-                    if let Some((target, base_op)) = live {
-                        live_call!(target, base_op, argv.to_vec(), *sig);
+                    if let Some(target) = live {
+                        live_call!(target, argv.to_vec(), *sig);
                     }
                     // CALLS.md increment 3 (slice 1): a symbolic slot bound to an instanced offer
                     // runs with the narrowed powerbox lock. CallSym is "a flat call.import (op 0)",
@@ -25075,7 +25075,7 @@ pub fn read_slice(window: &[u8], off: u64, len: usize) -> Result<Vec<u8>, Trap> 
 /// bytecode driver). `exec_module` and every other admission see a negative handle and refuse it
 /// fail-closed through `can_regrant`, as does a spawner in no cell. Non-durable (`callee_task: None`
 /// — freeze refuses), the deferred durability story.
-pub const GRANT_SERVE_LIVE_TAG: u32 = 0x8000_0000;
+pub use temen_ir::GRANT_SERVE_LIVE_TAG;
 
 /// #2219 — the **empty grant** on a §14 named-grant record's `handle` field: the parent grants
 /// *nothing* under the record's name, and the child's import of that name binds to an empty slot
@@ -25409,6 +25409,11 @@ impl Reply {
 pub struct LiveTarget {
     pub callee: Arc<Mutex<Host>>,
     pub export: u32,
+    /// The op the call reaches in the callee's interface: the call site's own for a direct
+    /// `call.cap`, the bound op behind the slot (its remap applied) for a `call.import`, whose call
+    /// site packs `slot | op << 16`. The dispatch that resolves the target sets it, so no engine
+    /// re-derives it from the call site (#2961).
+    pub op: u32,
     sigs: Arc<[FuncType]>,
 }
 
@@ -25418,8 +25423,8 @@ impl LiveTarget {
     /// never the call site's claim: a caller that declared an integer result a `cap` would otherwise
     /// take the callee's handle of that number. An op the interface lacks, or a call of another
     /// arity, is `CapFault`, as at the instanced boundary.
-    pub fn sig(&self, op: u32, n_params: usize, n_results: usize) -> Result<OpSig, Trap> {
-        let op = op as usize;
+    pub fn sig(&self, n_params: usize, n_results: usize) -> Result<OpSig, Trap> {
+        let op = self.op as usize;
         self.sigs
             .get(op)
             .filter(|s| s.params.len() == n_params && s.results.len() == n_results)
@@ -27859,14 +27864,22 @@ impl Host {
                 }
                 // §3.6 / FORK.md §8.5 — the named grant may be a **live-callee** offer
                 // (`child_offer` / a re-granted `regrant_into_child`, a `Binding::LiveImpl`) rather
-                // than a wired `offer_func`. It is name-less at this layer, so coverage matches its
-                // ops by signature; a match binds the slot to the LiveImpl handle, and `call.import`
+                // than a wired `offer_func`. A grouped import's coverage matches its ops by the
+                // offer interface's op names (#2961: matching name-less bound every same-shaped op
+                // to the first); a flat import is one op under the slot's own name, so it matches
+                // by signature. A match binds the slot to the LiveImpl handle, and `call.import`
                 // then rides `import_live_target` (parks the caller on the child's serve loop). This
                 // is what lets a child's *named* `fork` import route to the fork offer — the binding
                 // half a compiled-C `fork()` needs, where the hand-written guest used self.resolve.
-                if let Some(es) = self.resolve_live_impl(h).map(|e| Arc::clone(&e.sigs)) {
-                    let empty: [String; 0] = [];
-                    match coverage_remap(&req_names, &req_sigs, &empty, &es) {
+                if let Some((en, es)) = self
+                    .resolve_live_impl(h)
+                    .map(|e| (Arc::clone(&e.names), Arc::clone(&e.sigs)))
+                {
+                    let en: &[String] = match im.shape {
+                        temen_ir::ImportShape::Interface(_) => &en,
+                        temen_ir::ImportShape::Func(_) => &[],
+                    };
+                    match coverage_remap(&req_names, &req_sigs, en, &es) {
                         Some(remap) => match self.type_id_of(h) {
                             Some(tid) => {
                                 let b = if rebindable {
@@ -32108,35 +32121,29 @@ impl Host {
         }
     }
 
-    /// §3.6 slice 4 — the live-callee target behind import slot `i`, iff the slot is bound to a
-    /// [`Binding::LiveImpl`] handle: `(callee, export, base_op)`. The `call.import` route's
-    /// pre-dispatch probe (an ordinarily-bound slot answers `None` and flows to the ordinary
-    /// dispatch); the consumer's op offsets from `base_op` (flat/identity mapping this slice —
-    /// coverage-remapped grouped bindings ride a later slice).
-    fn import_live_target(&self, i: u32) -> Option<(LiveTarget, u32)> {
-        let b = self.import_binding(i)?;
-        if !b.bound {
-            return None;
+    /// §3.6 slice 4 — the live-callee target behind a `call.import` (`packed` = `slot | op << 16`,
+    /// as [`Host::import_target`] reads it), iff the slot is bound to a [`Binding::LiveImpl`]
+    /// handle. The op is the bound one, through the slot's remap, as for any other binding. The
+    /// `call.import` route's pre-dispatch probe: an ordinarily-bound slot answers `None` and flows to
+    /// the ordinary dispatch.
+    fn import_live_target(&self, packed: u32) -> Option<LiveTarget> {
+        let (type_id, op, handle) = self.import_target(packed).ok()?;
+        match self.resolve(handle, type_id) {
+            Ok(Binding::LiveImpl(i)) => self.live_target(i, op),
+            _ => None,
         }
-        Some((self.live_impl_of(b.handle, b.type_id)?, b.op))
     }
 
     /// The live-callee target behind `handle` iff it resolves to a [`Binding::LiveImpl`] of the
     /// right `type_id` — the `call.import` routes' pre-dispatch probe (a non-LiveImpl handle answers
     /// `None` and flows to the ordinary dispatch). A direct `call.cap` takes its target from the
     /// dispatch's live face ([`Host::cap_dispatch_slots_deferring`]).
-    pub fn live_impl_of(&self, handle: i32, type_id: u32) -> Option<LiveTarget> {
-        match self.resolve(handle, type_id) {
-            Ok(Binding::LiveImpl(i)) => self.live_target(i),
-            _ => None,
-        }
-    }
-
     /// The live-callee target of live impl `i`.
-    fn live_target(&self, i: u32) -> Option<LiveTarget> {
+    fn live_target(&self, i: u32, op: u32) -> Option<LiveTarget> {
         self.live_impls.get(i as usize).map(|e| LiveTarget {
             callee: Arc::clone(&e.callee),
             export: e.export,
+            op,
             sigs: Arc::clone(&e.sigs),
         })
     }
@@ -35566,7 +35573,7 @@ impl Host {
         // back on the face the caller offers, decided by this one resolve, before any check of the
         // op, which the callee's own signature decides.
         if let (Binding::LiveImpl(i), Some(slot)) = (resolved, live) {
-            if let Some(target) = self.live_target(i) {
+            if let Some(target) = self.live_target(i, op) {
                 *slot = Some(target);
                 return Ok(());
             }
