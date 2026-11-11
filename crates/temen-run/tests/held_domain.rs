@@ -1,11 +1,12 @@
-//! #2695 step 2 — a domain its embedder **holds** ([`HeldDomain`]), on every executor that holds
-//! one: the tree-walker, the oracle, and the bytecode engine's pump. It outlives its entry and takes
+//! #2695 step 2 — a domain its embedder **holds** ([`HeldDomain`]), on every executor
+//! ([`temen_run::hold`]): the tree-walker, the oracle, the bytecode engine's pump and executor 2, and
+//! the Cranelift JIT. It outlives its entry and takes
 //! calls until it ends itself or its embedder ends it. Between calls its threads keep running. Each
 //! call, the embedder's or a domain's of its run, runs as an activation: a new fiber in the domain at
 //! the op's handler, called with exactly the op's arguments, on the caller's thread, which funds it.
 //! The domain's calls run one at a time, each until it parks (`Single`, DESIGN.md §12a).
 
-#[path = "support/rec.rs"]
+#[path = "../../temen-interp/tests/support/rec.rs"]
 mod rec;
 
 use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
@@ -387,7 +388,7 @@ fn hold(
     args: &[Value],
     host: Host,
 ) -> (HeldDomain, Vec<Value>) {
-    let started = HeldDomain::start(on, m, entry, args, u64::MAX, host);
+    let started = temen_run::hold(on, m, entry, args, u64::MAX, host);
     let (d, results) = started.unwrap_or_else(|(t, _)| panic!("the entry ends in {t:?}"));
     assert_eq!(d.executor(), on, "the domain runs where it was started");
     (d, results)
@@ -408,8 +409,7 @@ fn call(d: &HeldDomain, op: u32, args: &[i64]) -> Reply {
     d.call(0, op, args, &mut fuel)
 }
 
-/// Each case runs on every executor that holds domains: the tree-walker, the oracle, the pump and
-/// executor 2.
+/// Each case runs on every executor: the tree-walker, the oracle, the pump, executor 2 and the JIT.
 macro_rules! on_every_executor {
     ($($case:ident),* $(,)?) => {$(
         mod $case {
@@ -426,6 +426,11 @@ macro_rules! on_every_executor {
             #[test]
             fn threads() {
                 super::$case(temen_interp::Executor::Threads);
+            }
+
+            #[test]
+            fn jit() {
+                super::$case(temen_interp::Executor::Jit);
             }
         }
     )*};
@@ -655,7 +660,7 @@ fn a_domain_that_ends_in_its_entry_is_not_held(on: Executor) {
     bounded(move || {
         let m = module(&parent());
         let (host, exit) = host_for(&m);
-        let started = HeldDomain::start(on, m, ENTRY_TRAPS, &[Value::I32(exit)], u64::MAX, host);
+        let started = temen_run::hold(on, m, ENTRY_TRAPS, &[Value::I32(exit)], u64::MAX, host);
         assert!(matches!(started, Err((Trap::Unreachable, _))));
     });
 }
@@ -666,7 +671,7 @@ fn a_durable_domain_is_refused(on: Executor) {
         let m = module(&parent());
         let (mut host, exit) = host_for(&m);
         host.set_durable(true);
-        let started = HeldDomain::start(on, m, ENTRY, &[Value::I32(exit)], u64::MAX, host);
+        let started = temen_run::hold(on, m, ENTRY, &[Value::I32(exit)], u64::MAX, host);
         assert!(matches!(started, Err((Trap::ThreadFault, _))));
     });
 }
@@ -674,6 +679,51 @@ fn a_durable_domain_is_refused(on: Executor) {
 /// Dropping the handle ends the domain, its parked thread included.
 fn dropping_the_handle_ends_the_domain(on: Executor) {
     bounded(move || drop(start(on, ENTRY_WITH_WORKER)));
+}
+
+/// A domain whose entry answers 1 and whose one op, `seven()`, answers 7. Its third func serves in
+/// `svc.wait`, though nothing runs it: what the module can do decides where it is held.
+const SERVING: &str = r#"memory 16
+type 0 func () -> (i64)
+type 1 interface { seven: 0 }
+export 0 interface "svc" 1 { seven: 1 }
+func () -> (i64) {
+block 0 () {
+  vr = i64.const 1
+  return vr
+  }
+}
+func () -> (i64) {
+block 0 () {
+  vr = i64.const 7
+  return vr
+  }
+}
+func () -> (i64) {
+block 0 () {
+  vz = i32.const 0
+  vn = svc.wait vz
+  return vn
+  }
+}
+"#;
+
+/// A domain that can serve its offers in a serve loop (`svc.poll`, `svc.wait`) is held by the
+/// tree-walker when it is asked for on the JIT: a thread of it parked in `svc.wait` takes its calls
+/// first, which the JIT's activations do not reach yet (#2895). An executor declines what it would
+/// run otherwise than the oracle does (INVARIANTS #9).
+#[test]
+fn a_domain_that_serves_is_held_by_the_tree_walker_on_the_jit() {
+    bounded(|| {
+        let m = module(SERVING);
+        let mut host = Host::new();
+        host.set_self_module(&m);
+        let started = temen_run::hold(Executor::Jit, m, 0, &[], u64::MAX, host);
+        let (d, results) = started.unwrap_or_else(|(t, _)| panic!("the entry ends in {t:?}"));
+        assert_eq!(d.executor(), Executor::TreeWalker);
+        assert_eq!(results, vec![Value::I64(1)]);
+        assert_eq!(call(&d, 0, &[]), Reply::Results(vec![7]));
+    });
 }
 
 /// The threads [`COUNTING`] has started, in this test binary.

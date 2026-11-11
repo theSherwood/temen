@@ -2683,7 +2683,7 @@ metering is read-before minus read-after. Deferred, named-consumer-gated: a per-
 (caller-side D19 attenuation) and an admission fuel floor (gate-side refusal when the caller
 can't fund a handler).
 
-### Held domains — a domain at rest takes calls as a library provider does  [BUILT on the tree-walker and the bytecode engine's executors, #2695 step 2]
+### Held domains — a domain at rest takes calls as a library provider does  [BUILT on every executor, #2695 step 2]
 
 A domain its embedder holds (`HeldDomain`) outlives its entry: once the entry returns, it
 **rests**. Its threads keep running, and it ends only when it ends itself (any member's exit or
@@ -2700,7 +2700,9 @@ no running main, so each call into it, from its embedder or from a domain of its
 - **Admitted by the callee's policy**: `Single`, run-to-park, serializes the domain's activations
   against each other, never against its own threads. The tree-walker builds that as a lane of
   width 1 over the activations (D66's mechanism: held across a quantum's end, given back at a
-  park); the bytecode engine, as a gate checked before an activation steps, with the same rules.
+  park); the bytecode engine, as a gate checked before an activation steps, with the same rules;
+  the Cranelift JIT, as its serve windows' gate, which an activation gives back at every park, a
+  join's included (a serve handler's join keeps it: it blocks the serving vCPU).
 - **With the thread-local word the domain's main thread left** (`vcpu.tls`). Under `Single` the
   calls run one at a time, as that thread would run them. The caller's word would name the
   caller's memory.
@@ -2722,9 +2724,18 @@ The executor is the embedder's choice (`Executor`):
   too. A call runs on its caller's thread, which carries the activation until it answers: the
   embedder's thread for the embedder's call, the calling task's thread for a call from inside the
   run. The activation has no thread of its own.
+- **The Cranelift JIT** (`temen_run::hold`, where its host glue is) runs each of the domain's
+  threads on an OS thread of its own, between calls too; its root rests on the thread its entry ran
+  on. A call runs on its caller's thread, as on executor 2, and one that parks is its caller's to
+  carry: the caller resumes it each time it is runnable again, and no worker of the run's pool runs
+  it. An activation is a vCPU context of the domain on a fuel cell its call funds: the embedder's
+  loan, or a draw on the inside caller's budget. So a held run's code always charges fuel, whatever
+  its own budget. A call whose fiber stack the OS refuses answers `-EAGAIN`.
 
 On both bytecode executors an activation is a task of the domain on its caller's fuel, which
-charges no vCPU. A module the bytecode engine declines is held by the tree-walker (INVARIANTS #9).
+charges no vCPU. A module the bytecode engine declines is held by the tree-walker (INVARIANTS #9),
+and so is one asked for on the JIT that can serve its offers in a serve loop (`svc.poll`,
+`svc.wait`): its calls do not reach a thread parked in `svc.wait` there yet (#2895).
 
 ### Invariants this holds
 
