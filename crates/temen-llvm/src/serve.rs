@@ -255,9 +255,7 @@ pub(crate) fn impl_exports(
             ops.push(funcs.len() as u32);
             funcs.push(match heap {
                 None => trampoline(target, sig, storage, serve_sp),
-                Some((malloc, free)) => {
-                    heap_trampoline(target, sig, storage, serve_sp, malloc, free)
-                }
+                Some(heap) => heap_trampoline(target, sig, storage, serve_sp, heap, types),
             });
         }
         out.push(ImplExport {
@@ -299,8 +297,8 @@ fn heap_trampoline(
     sig: &FuncType,
     storage: &FuncType,
     serve_sp: u64,
-    malloc: u32,
-    free: u32,
+    (malloc, free): (u32, u32),
+    types: &RefCell<Vec<TypeEntry>>,
 ) -> Func {
     let n = sig.params.len() as u32;
     // Block 0: v0..n the arguments; vn the serve stack, vn+1 the size, vn+2 the stack, vn+3 null?
@@ -348,7 +346,7 @@ fn heap_trampoline(
         insts: b.insts,
         term: Terminator::Return(results),
     };
-    let fail = exhausted(&sig.results);
+    let fail = exhausted(&sig.results, types);
     Func {
         params: sig.params.clone(),
         results: sig.results.clone(),
@@ -359,40 +357,41 @@ fn heap_trampoline(
 /// The errno a dispatch answers when the heap has no room for its data stack.
 pub(crate) const ENOMEM: i64 = -12;
 
-/// The block a dispatch takes when it gets no data stack. The servicer lives: the call is answered
-/// with [`ENOMEM`] in its first result and zeros in the rest, INVARIANTS 8's transport failure,
-/// when the first result is an integer and no result is a `cap`. A zero in a `cap` slot is the
-/// servicer's handle 0, which the reply would grant the caller, so an op that answers a handle, or
-/// whose first result is not an integer, traps instead (#2964: the owner's choice of how such an op
-/// answers is pending).
-fn exhausted(results: &[ValType]) -> Block {
-    let answerable = matches!(results.first(), Some(ValType::I32 | ValType::I64))
-        && !results.contains(&ValType::Cap);
-    let (insts, term) = if answerable {
-        let insts: Vec<Inst> = results
-            .iter()
-            .enumerate()
-            .map(|(k, t)| {
-                let v = if k == 0 { ENOMEM } else { 0 };
-                match t {
-                    ValType::I32 => Inst::ConstI32(v as i32),
-                    ValType::F32 => Inst::ConstF32(0),
-                    ValType::F64 => Inst::ConstF64(0),
-                    _ => Inst::ConstI64(v),
-                }
-            })
-            .collect();
-        let rets = (0..insts.len() as u32).collect();
-        (insts, Terminator::Return(rets))
-    } else {
-        (Vec::new(), Terminator::Unreachable)
-    };
+/// The block a dispatch takes when it gets no data stack: the servicer lives, and the call is
+/// answered `-ENOMEM` as a transport failure through `svc.fail` (#2964), which lays out INVARIANTS
+/// 8's reply for every result shape. What the block then returns is a placeholder the reply ignores.
+fn exhausted(results: &[ValType], types: &RefCell<Vec<TypeEntry>>) -> Block {
+    let sig = crate::intern_sig(
+        types,
+        FuncType {
+            params: vec![ValType::I64],
+            results: vec![ValType::I64],
+        },
+    );
+    let mut insts = vec![
+        Inst::ConstI32(0), // v0: the self namespace's unused handle
+        Inst::ConstI64(ENOMEM),
+        Inst::CapCall(Box::new(temen_ir::CapCall {
+            type_id: temen_ir::CAP_SELF_TYPE_ID,
+            op: temen_ir::CAP_SELF_SVC_FAIL,
+            sig,
+            handle: 0,
+            args: vec![1].into(),
+        })),
+    ];
+    let placeholders = insts.len() as u32;
+    insts.extend(results.iter().map(|t| match t {
+        ValType::I64 => Inst::ConstI64(0),
+        ValType::F32 => Inst::ConstF32(0),
+        ValType::F64 => Inst::ConstF64(0),
+        _ => Inst::ConstI32(0),
+    }));
     Block {
         parent: 0,
         captures: vec![],
         params: vec![],
         insts,
-        term,
+        term: Terminator::Return((placeholders..placeholders + results.len() as u32).collect()),
     }
 }
 

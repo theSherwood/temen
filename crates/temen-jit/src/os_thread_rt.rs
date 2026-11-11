@@ -2015,7 +2015,7 @@ fn run_child(a: SpawnArgs) {
     set_current_domain(a.dom);
     // §12 seed this vCPU's per-vCPU TLS register to its dense id before any guest code runs.
     crate::vcpu_tls::seed(a.vcpu_id);
-    crate::vcpu_tls::set_serve_handlers(0);
+    crate::vcpu_tls::set_serve_state(Default::default());
     // Every vCPU addresses a region of its domain's arena through its durable shadow-base register: a
     // durable child its own, a child of a run that is not durable (which nothing freezes) the root's,
     // where an instrumented prologue reads the root's thaw word (#2518: it used to keep the register's
@@ -2488,8 +2488,8 @@ impl Domain {
         // restore the caller's afterward — a real OS-thread child gets its own thread-local in `run_child`.
         let prev_tls = crate::vcpu_tls::get();
         crate::vcpu_tls::seed(vcpu_id);
-        let prev_handlers = crate::vcpu_tls::serve_handlers();
-        crate::vcpu_tls::set_serve_handlers(0);
+        let prev_serve = crate::vcpu_tls::serve_state();
+        crate::vcpu_tls::set_serve_state(Default::default());
         // A child that uses `cont.*` gets its own fiber execution context over the domain-shared table
         // (D57 3b-ii), like `run_child`; publish it as the current runtime for the run.
         let mut frt = env.fiber_cfg.map(|(tid, mask)| {
@@ -2551,7 +2551,7 @@ impl Domain {
             fiber_rt::set_current(pr);
         }
         crate::vcpu_tls::seed(prev_tls); // restore the caller (root) vCPU's TLS id
-        crate::vcpu_tls::set_serve_handlers(prev_handlers);
+        crate::vcpu_tls::set_serve_state(prev_serve);
 
         let (result, trap) = if faulted {
             env.ctx().raise(TrapKind::MemoryFault as i64);

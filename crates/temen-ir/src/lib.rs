@@ -40,6 +40,11 @@ pub type FuncIdx = u32;
 /// intrinsic, since reflection is ambient/authority-neutral; `u32::MAX` collides with no interface.)
 pub const CAP_SELF_TYPE_ID: u32 = u32::MAX;
 
+/// #2964 — the self-namespace op `svc.fail(errno)`: a serve handler answers the dispatch it serves
+/// as a transport failure. A frontend emits it (a translated server's trampolines), so it lives here;
+/// `temen_interp::CAP_SELF_SVC_FAIL` documents how every engine serves it.
+pub const CAP_SELF_SVC_FAIL: u32 = 20;
+
 /// Reserved pseudo-`type_id` for **executable named imports** (IMPORTS.md phase 1). A verified
 /// [`Inst::CallImport`] dispatches as a host `call.cap` with this `type_id` and the **import index**
 /// as the `op`; the host translates it through the domain's instantiation-time import-binding table
@@ -259,6 +264,7 @@ pub mod cap_id {
 /// | self | 13 | `fuel.remaining` | | fuel |
 /// | self | 14 | `exec_module` | module, grants ptr and count, entry, size_log2 | `-errno` of a refused exec |
 /// | self | 16 | `pipe` | | `0` or `-errno` |
+/// | self | 20 | `svc.fail` | errno | `0`, or `-EINVAL` outside a handler |
 ///
 /// Args an op reads only when present (`svc.wait`'s timeout, `clone_caller`'s replies, `reap`'s
 /// pid, `pipe`'s fds pointer) are past the prefix.
@@ -273,6 +279,7 @@ pub fn served_contract(type_id: u32, op: u32) -> Option<(&'static [ValType], &'s
         (cap_id::MODULE, 2) => Some((&[I64; 4], &[I64])),
         (CAP_SELF_TYPE_ID, 9..=13 | 16) => Some((&[], &[I64])),
         (CAP_SELF_TYPE_ID, 14) => Some((&[I64; 5], &[I64])),
+        (CAP_SELF_TYPE_ID, CAP_SELF_SVC_FAIL) => Some((&[I64], &[I64])),
         _ => None,
     }
 }

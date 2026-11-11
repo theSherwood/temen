@@ -7268,6 +7268,8 @@ struct Answers {
     to: AnswerTo,
     /// Its domain's own fuel ([`Resting::home`]), which a thread it spawns draws from.
     home: Fuel,
+    /// #2964 — the errno the activation's `svc.fail` answered its call with, if it did.
+    failed: Option<i64>,
 }
 
 /// Where an activation's reply goes.
@@ -9024,7 +9026,7 @@ fn reap(s: &mut Sched, mut v: Box<VCpu>, reason: Trap) -> Vec<u64> {
     let tickets: Vec<u64> = v
         .handler_parks
         .values()
-        .map(|&(_, t)| t)
+        .map(|&(_, t, _)| t)
         .chain(v.serve_run.as_ref().map(|r| r.ticket))
         .chain(v.answers.as_ref().and_then(|a| match a.to {
             AnswerTo::Ticket(t) => Some(t),
@@ -10397,6 +10399,16 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 // exit ends the domain, so its call answers as a dead domain's does.
                 let answer = v.answers.take().map(|a| {
                     let reply = match &result {
+                        // #2964 — the activation answered its call as a transport failure.
+                        Ok(_) if a.failed.is_some() => {
+                            let errno = a.failed.unwrap_or(EINVAL);
+                            Reply::Failed(match &a.to {
+                                AnswerTo::Ticket(t) => {
+                                    v.domain.host.lock_unpoisoned().settle_page(*t, errno, None)
+                                }
+                                AnswerTo::Embedder(_) => errno,
+                            })
+                        }
                         Ok(vals) => {
                             let mut slots: Vec<i64> =
                                 vals.iter().map(|&x| val_to_slot(x)).collect();
@@ -10419,7 +10431,7 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 let own_tickets: Vec<u64> = v
                     .handler_parks
                     .values()
-                    .map(|&(_, t)| t)
+                    .map(|&(_, t, _)| t)
                     .chain(v.serve_run.as_ref().map(|r| r.ticket))
                     .collect();
                 // FORK.md §8.6 — a domain finishing (cleanly or trapping) releases its pipe write ends,
@@ -13681,7 +13693,7 @@ struct VCpu {
     /// completed-but-not-replied dispatch: its caller stays parked in `ticket_waiters`, the
     /// serve loop moves on. Each serve re-execution re-claims these — still-blocked ones are
     /// put back; a woken one is resumed, and its eventual return finally replies.
-    handler_parks: BTreeMap<usize, (i64, u64)>,
+    handler_parks: BTreeMap<usize, (i64, u64, Option<i64>)>,
     /// §3.6 slice 5b — dispatches completed by the current `svc.poll`/`svc.wait` activation
     /// (the op's result). Lives on the vCPU because the activation spans rewind-driven
     /// re-executions (and possibly a `svc.wait` park); reset when the count is delivered.
@@ -13732,6 +13744,9 @@ struct ServeRun {
     /// **skips** its auto-reply, so the servicer's injected value is the one the caller reloads —
     /// not the handler's return clobbering it. (`fork()` replies `pid`/`0` this way in PR 2.)
     replied: bool,
+    /// #2964 — set by the handler's `svc.fail(errno)`: its dispatch answers as a transport failure
+    /// when it returns, whatever it returns. Rides a park in [`VCpu::handler_parks`].
+    failed: Option<i64>,
     /// INVARIANTS #8 — the handler's results as slots, recorded when it returns: its dispatch's
     /// reply. The fiber hand-back to the serve frame carries only the first.
     results: Vec<i64>,
@@ -14146,7 +14161,7 @@ impl VCpu {
     fn freeze_drive(&mut self) -> Result<(), Trap> {
         // #1676 — this vCPU's serve handlers, parked or caught mid-run, ride as fibers like any
         // other; their reply linkage rides the powerbox, for the thaw's serve loop to adopt.
-        for (&slot, &(_, ticket)) in &self.handler_parks {
+        for (&slot, &(_, ticket, _)) in &self.handler_parks {
             self.domain
                 .host
                 .lock_unpoisoned()
@@ -16973,7 +16988,17 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 // dispatch's reply out-of-band (`run.replied`), in which case the
                                 // handler's return must **not** clobber the injected value — the
                                 // dispatch still counts as served.
-                                if !run.replied {
+                                if let (false, Some(errno)) = (run.replied, run.failed) {
+                                    // #2964 — the handler answered its dispatch as a transport
+                                    // failure (`svc.fail`): what it returned is not the reply.
+                                    let errno =
+                                        host.lock_unpoisoned().settle_page(run.ticket, errno, None);
+                                    sched.cap_reply_or_stash(
+                                        run.ticket,
+                                        Reply::Failed(errno),
+                                        host,
+                                    );
+                                } else if !run.replied {
                                     // #1862: a page request's bytes move now, from this serving
                                     // vCPU's window, before the reply can wake the child. Its
                                     // status is the handler's one result.
@@ -16997,7 +17022,8 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             // does (#1835): it is kept like a parked one, and the freeze drive
                             // hands its ticket to the thaw.
                             FIBER_PARKED | FIBER_FROZEN => {
-                                handler_parks.insert(run.slot, (run.handle, run.ticket));
+                                handler_parks
+                                    .insert(run.slot, (run.handle, run.ticket, run.failed));
                             }
                             // A handler `suspend` has no resumer to receive its yield — the
                             // serve loop is not a `cont.resume` site. Same family as the root
@@ -17021,13 +17047,14 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     // Switch into handler-fiber frames: the `cont.resume` tail with the serve
                     // frame rewound, so the handler's every exit re-executes this op.
                     macro_rules! serve_switch {
-                        ($slot:expr, $handle:expr, $ticket:expr, $new_frames:expr) => {{
+                        ($slot:expr, $handle:expr, $ticket:expr, $failed:expr, $new_frames:expr) => {{
                             *serve_run = Some(ServeRun {
                                 slot: $slot,
                                 handle: $handle,
                                 ticket: $ticket,
                                 serve_cur: *cur,
                                 replied: false,
+                                failed: $failed,
                                 results: Vec::new(),
                             });
                             frames[top].inst -= 1;
@@ -17061,18 +17088,18 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     // #1676 — a thaw hands this domain's frozen handlers to its serve loop.
                     for (hslot, ticket) in host.lock_unpoisoned().take_frozen_handlers() {
                         let handle = fiber_handle(hslot, registry.generation(hslot));
-                        handler_parks.insert(hslot, (handle, ticket));
+                        handler_parks.insert(hslot, (handle, ticket, None));
                     }
-                    let parked_now: Vec<(usize, i64, u64)> = handler_parks
+                    let parked_now: Vec<(usize, i64, u64, Option<i64>)> = handler_parks
                         .iter()
-                        .map(|(s_, (h_, t_))| (*s_, *h_, *t_))
+                        .map(|(s_, (h_, t_, f_))| (*s_, *h_, *t_, *f_))
                         .collect();
-                    for (pslot, phandle, pticket) in parked_now {
+                    for (pslot, phandle, pticket, pfailed) in parked_now {
                         match registry.claim(phandle)? {
                             (_, Claimed::StillParked) => {}
                             (_, Claimed::LiveWoken(f)) => {
                                 handler_parks.remove(&pslot);
-                                serve_switch!(pslot, phandle, pticket, f);
+                                serve_switch!(pslot, phandle, pticket, pfailed, f);
                             }
                             // A thawed handler: its entry frame only rewinds (#1676), so its
                             // arguments are placeholders; its spilled frames hold the real ones.
@@ -17088,6 +17115,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                     pslot,
                                     phandle,
                                     pticket,
+                                    pfailed,
                                     vec![Frame {
                                         func: hfunc as FuncIdx,
                                         module: 0,
@@ -17146,6 +17174,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             hslot,
                             handle,
                             d.ticket,
+                            None,
                             vec![Frame {
                                 func: fidx,
                                 module: 0,
@@ -17176,6 +17205,29 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     }
                     frames[top].vals.push(Reg::from_i64(*serve_count));
                     *serve_count = 0;
+                }
+                // #2964 — `svc.fail(errno)` (self-namespace op 20): the running handler's dispatch
+                // answers as a transport failure when the handler returns. The handler is the serve
+                // loop's (`serve_run`, a fiber other than the loop's own) or an activation's
+                // (`answers`). An instanced offer animated inside a handler is no dispatch of its
+                // own, so a call there, like one outside any handler, answers `-EINVAL`.
+                Inst::CapCall(c)
+                    if c.type_id == temen_ir::CAP_SELF_TYPE_ID && c.op == CAP_SELF_SVC_FAIL =>
+                {
+                    let errno = get(&frames[top].vals, c.args[0])?.i64();
+                    let r = match (serve_run.as_mut(), answers.as_mut()) {
+                        _ if errno >= 0 || !offer_anim.is_empty() => EINVAL,
+                        (Some(sr), _) if *cur != sr.serve_cur => {
+                            sr.failed = Some(errno);
+                            0
+                        }
+                        (None, Some(a)) => {
+                            a.failed = Some(errno);
+                            0
+                        }
+                        _ => EINVAL,
+                    };
+                    frames[top].vals.push(Reg::from_i64(r));
                 }
                 // FORK.md PR 1/PR 5 — `clone_caller` (self-namespace op 11): serviced here because it
                 // needs the eval-loop-local `serve_run` (the running handler's dispatch). The **targeted
@@ -24941,6 +24993,15 @@ pub const CAP_SELF_CLONE_CALLER: u32 = 11;
 /// host-side or non-serving dispatch answers a probeable `-EINVAL`. Pinned at 12.
 pub const CAP_SELF_REAP: u32 = 12;
 
+/// #2964 — the reserved self-namespace op for `svc.fail(errno)`: from **within a serve handler**,
+/// answer the dispatch it serves as a **transport failure**. The caller gets the reply a full serve
+/// queue gives (INVARIANTS 8: `errno` in an integer first result, the rest zero and untranslated; a
+/// trap where the first result is not an integer), whatever the handler then returns. It returns `0`,
+/// the handler runs on, and its own results are discarded. `-EINVAL` outside a handler, or for an
+/// `errno` that is not negative. A handler with no data stack to run on answers this way, so a caller
+/// can never make its servicer trap by exhausting its stacks.
+pub use temen_ir::CAP_SELF_SVC_FAIL;
+
 /// FORK.md §8.6 — the reserved self-namespace op for `execve` (**true cross-module image-replace**):
 /// `exec_module(module_handle, grants_ptr, grants_n)` replaces the **calling vCPU's own image** with a
 /// granted command `Module`, in place, keeping the vCPU's `TaskId` and fuel — so a parent's `wait(pid)`
@@ -25609,7 +25670,11 @@ fn activation(
     let made = sched.adopt_locked(s, move |id| {
         let mut v = VCpu::new(domain, f, &vals, mem, fuel, 0, id, sref);
         v.tls = tls;
-        v.answers = Some(Answers { to, home });
+        v.answers = Some(Answers {
+            to,
+            home,
+            failed: None,
+        });
         Box::new(v)
     });
     made.ok_or(EAGAIN)
@@ -35189,6 +35254,7 @@ impl Host {
                 // that reaches this table is a tier that doesn't.
                 CAP_SELF_SVC_POLL
                 | CAP_SELF_SVC_WAIT
+                | CAP_SELF_SVC_FAIL
                 | CAP_SELF_CLONE_CALLER
                 | CAP_SELF_REAP
                 | CAP_SELF_EXEC

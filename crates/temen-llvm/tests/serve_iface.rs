@@ -791,11 +791,13 @@ fn a_rustc_parent_serves_ops_that_park_allocate_and_print() {
 
 /// #2964 — a dispatch that gets no data stack is answered, and the servicer lives. The parent
 /// defines its own `malloc` (a bump arena the translator's trampolines use like any other), which
-/// `deny` turns off; the child's next call, `twice`, then gets INVARIANTS 8's transport failure,
-/// `-ENOMEM` in its integer result. `nap` can park, so every op takes a stack of its own.
+/// `deny` turns off; the child's next calls then get INVARIANTS 8's transport failure through
+/// `svc.fail`: `twice` its `-ENOMEM`, and `grab`, which answers a handle, `(-ENOMEM, 0)` with no
+/// handle of the servicer's granted. `nap` can park, so every op takes a stack of its own.
 #[test]
 fn a_dispatch_without_a_stack_is_answered_enomem() {
-    const MEM: &str = "mem { deny: () -> (i64); twice: (i64) -> (i64); nap: () -> (i64) }";
+    const MEM: &str = "mem { deny: () -> (i64); twice: (i64) -> (i64); nap: () -> (i64); \
+                       grab: () -> (i64, cap) }";
     let parent = format!(
         r#"{JOBS_HEADER}
 int __vm_wait32(int *addr, int expected, long timeout_ns);
@@ -814,6 +816,8 @@ static int never = 1;
 long TEMEN_OP(mem, deny)(void) {{ denied = 1; return 0; }}
 long TEMEN_OP(mem, twice)(long x) {{ return 2 * x; }}
 long TEMEN_OP(mem, nap)(void) {{ return __vm_wait32(&never, 0, 0); }}
+struct grabbed {{ long v; int h; }};
+struct grabbed TEMEN_OP(mem, grab)(void) {{ struct grabbed g = {{ 7, 0 }}; return g; }}
 static unsigned rec[16] __attribute__((aligned(8)));
 static unsigned grant[4];
 int main(void) {{
@@ -841,11 +845,14 @@ TEMEN_INTERFACE(mem, "{MEM}");
 long TEMEN_OP(mem, deny)(void);
 long TEMEN_OP(mem, twice)(long x);
 long TEMEN_OP(mem, nap)(void);
+struct grabbed {{ long v; int h; }};
+struct grabbed TEMEN_OP(mem, grab)(void);
 int main(void) {{
   long a = TEMEN_OP(mem, twice)(21);
   TEMEN_OP(mem, deny)();
   long b = TEMEN_OP(mem, twice)(21);
-  return (int)(a * 1000 + b);
+  struct grabbed g = TEMEN_OP(mem, grab)();
+  return (int)(a * 1000 + b + g.v * 100000 + g.h);
 }}
 "#
     );
@@ -861,6 +868,10 @@ int main(void) {{
     let children = [("child", Arc::new(translate(&c, true)))];
     for b in [Backend::TreeWalk, Backend::Bytecode, Backend::Jit] {
         let r = run(&parent, &children, Some(b)).map(|(x, _)| x);
-        assert_eq!(r, Ok(42 * 1000 - 12), "{b:?}: twice(21), then -ENOMEM");
+        assert_eq!(
+            r,
+            Ok(42 * 1000 - 12 - 12 * 100_000),
+            "{b:?}: twice(21), then -ENOMEM, and grab's (-ENOMEM, 0) though it answers a handle"
+        );
     }
 }

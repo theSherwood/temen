@@ -3641,10 +3641,10 @@ call is suspended mid-frame. Which stack depends on whether an op can park, as
   from the program's `malloc`, and `free`s it when the op returns (#2964). `malloc` and `free` never
   park, so they run on the serve stack. A program with no heap gets dlmalloc linked in, and only a
   parking server pays for it. The stacks are guest heap, charged to the domain's budget like any
-  allocation. When the heap has no room for one, the servicer lives and the call is answered with INVARIANTS
-  8's transport failure: `-ENOMEM` in its first result, zeros in the rest (owner, #2964). That
-  takes an integer first result and no `cap` result, since a zero in a reply's `cap` slot is the
-  servicer's handle 0; any other shape still traps until the owner settles how it answers.
+  allocation. When the heap has no room for one, the servicer lives: the trampoline calls `svc.fail(-ENOMEM)`
+  (PROCESS.md S9) and returns placeholders, and the substrate answers the call as INVARIANTS 8's
+  transport failure, as a full queue's `-EAGAIN` is, for every result shape. A handle slot is never
+  filled from the servicer's table (owner, #2964).
   Such a parent runs where hand-written parking servers do: the bytecode engine declines it to the
   tree-walker.
 

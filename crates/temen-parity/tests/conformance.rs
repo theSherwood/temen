@@ -144,4 +144,5 @@ fn capcall_op_numbers_match_the_interpreter() {
     );
     assert_eq!(capcall::EXEC, temen_interp::CAP_SELF_EXEC);
     assert_eq!(capcall::PARALLELISM, temen_interp::CAP_SELF_PARALLELISM);
+    assert_eq!(capcall::SVC_FAIL, temen_interp::CAP_SELF_SVC_FAIL);
 }

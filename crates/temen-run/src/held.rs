@@ -231,6 +231,8 @@ impl HeldEngine for JitHeld {
 fn reply(ran: Result<Option<HandlerEnd>, ServeRefused>) -> Option<Reply> {
     match ran {
         Ok(Some(HandlerEnd::Returned(results))) => Some(Reply::Results(results)),
+        // #2964 — it answered its call as a transport failure (`svc.fail`).
+        Ok(Some(HandlerEnd::Failed(errno))) => Some(Reply::Failed(errno)),
         // It ended the domain, or found it ended: a call into a dead domain (INVARIANTS #8).
         Ok(Some(HandlerEnd::Trapped(_))) => Some(Reply::Failed(CAP_REVOKED)),
         Ok(None) => None,

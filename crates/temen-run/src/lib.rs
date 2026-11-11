@@ -584,6 +584,21 @@ unsafe fn cap_thunk_impl(
     // FORK.md §8.6 — `pipe(fds)`: a process tree serves the parks its pipes' reads and writes make,
     // so it mints them, through the one mint ([`Host::mint_pipe`]). Any other JIT run leaves the op
     // to the host's `-EINVAL`, as every tier that can't park does.
+    // #2964 — `svc.fail(errno)`: the running serve handler's dispatch answers as a transport
+    // failure when it ends. The handler is this vCPU's ([`temen_jit::fail_dispatch`]); off one, the
+    // host's `-EINVAL`.
+    if type_id == temen_ir::CAP_SELF_TYPE_ID && op == temen_interp::CAP_SELF_SVC_FAIL {
+        let errno = arg_slots.first().copied().unwrap_or(0);
+        let r = if errno < 0 && temen_jit::fail_dispatch(errno) {
+            0
+        } else {
+            EINVAL
+        };
+        if n_results != 0 {
+            *results = r;
+        }
+        return;
+    }
     if serves && type_id == temen_ir::CAP_SELF_TYPE_ID && op == temen_interp::CAP_SELF_PIPE {
         let r = host.mint_pipe(arg_slots.first().copied().unwrap_or(0) as u64, gm);
         if n_results != 0 {
@@ -3218,7 +3233,7 @@ unsafe fn serve_locked(
                     // code — including this serve — has returned); `mem_base` is this domain's live
                     // window, handed to this very thunk call. Served on the domain's own thread,
                     // inside its own run: the thunk's `vm` is its `VmCtx`.
-                    temen_jit::invoke_handler(
+                    let failed = temen_jit::invoke_handler(
                         serve_ctx as *const c_void,
                         code,
                         &args,
@@ -3231,12 +3246,11 @@ unsafe fn serve_locked(
                     if vm.ended().is_some() {
                         break None;
                     }
-                    settle_handler(
-                        &mut guard,
-                        ticket,
-                        temen_jit::HandlerEnd::Returned(res),
-                        window,
-                    );
+                    let end = match failed {
+                        Some(errno) => temen_jit::HandlerEnd::Failed(errno),
+                        None => temen_jit::HandlerEnd::Returned(res),
+                    };
+                    settle_handler(&mut guard, ticket, end, window);
                     ring(&guard);
                     count += 1;
                     continue;
@@ -3349,6 +3363,11 @@ fn settle_handler(
         }
         temen_jit::HandlerEnd::Trapped(_) => {
             let v = g.settle_page(ticket, CAP_REVOKED, None);
+            g.svc_settle(ticket, Reply::Failed(v));
+        }
+        // #2964 — the handler answered its dispatch as a transport failure (`svc.fail`).
+        temen_jit::HandlerEnd::Failed(errno) => {
+            let v = g.settle_page(ticket, errno, None);
             g.svc_settle(ticket, Reply::Failed(v));
         }
     }
@@ -3626,6 +3645,7 @@ unsafe fn leave_site(site: &temen_jit::ServeSite, callee: &Mutex<Host>) {
 fn handoff_reply(end: temen_jit::HandlerEnd) -> Reply {
     match end {
         temen_jit::HandlerEnd::Returned(results) => Reply::Results(results),
+        temen_jit::HandlerEnd::Failed(errno) => Reply::Failed(errno),
         temen_jit::HandlerEnd::Trapped(_) => Reply::Failed(CAP_REVOKED),
     }
 }
