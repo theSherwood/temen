@@ -13,10 +13,16 @@ publish = false
 # heavy `wgpu` dependency never enters the default `cargo build`/`test`. Its tests run on any adapter,
 # lavapipe (Mesa software Vulkan) in CI, and fail on a host with none.
 
+[features]
+# The capability a guest is granted (`webgpu_cap`), which needs temen's VM. A host that runs the
+# protocol in-process, with no guest, turns it off and takes the backend alone (`Wgpu`).
+default = ["cap"]
+cap = ["dep:temen-run", "dep:temen-interp"]
+
 [dependencies]
 temen-gpu = { path = "../temen-gpu" }
-temen-run = { path = "../temen-run" }
-temen-interp = { path = "../temen-interp" }
+temen-run = { path = "../temen-run", optional = true }
+temen-interp = { path = "../temen-interp", optional = true }
 wgpu = "24"
 pollster = "0.4"
 

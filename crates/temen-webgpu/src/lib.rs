@@ -3,7 +3,7 @@
 //! The protocol is `temen-gpu`'s, which the browser's capability shares: a guest submits command
 //! streams that name objects by its own ids, and [`temen_gpu::Gpu`] decodes and checks each one
 //! before any of it runs. This crate is the [`Backend`] that then runs it on a wgpu device, and the
-//! [`HostCap`] that grants it. The host holds the device; the guest only ever passes data
+//! `HostCap` that grants it, [`webgpu_cap`], with the `cap` feature, which is on by default. The host holds the device; the guest only ever passes data
 //! (validation, not raw access, is the boundary, §2a), and wgpu validates what the protocol leaves
 //! to WebGPU.
 //!
@@ -29,8 +29,10 @@ use std::sync::{Arc, Mutex};
 
 use temen_gpu::command::*;
 use temen_gpu::enums::*;
-use temen_gpu::{Backend, Fault, Gpu, Id, Readback, SurfaceInfo};
+use temen_gpu::{Backend, Fault, Id, Readback, SurfaceInfo};
+#[cfg(feature = "cap")]
 use temen_interp::{GuestMem, RegionMinter, Trap};
+#[cfg(feature = "cap")]
 use temen_run::HostCap;
 
 /// What an embedder's window must be for [`Surface::Window`]: wgpu's, so that an embedder names
@@ -137,9 +139,10 @@ impl Frames {
 
 /// The `webgpu` capability: grant it under the name `"webgpu"`. Each host instantiation holds its
 /// own device, made on first use.
+#[cfg(feature = "cap")]
 pub fn webgpu_cap(surface: Surface) -> HostCap {
     HostCap::host_proc(0, move |_, _| {
-        let mut gpu = Gpu::new(Wgpu::new(surface.clone()));
+        let mut gpu = temen_gpu::Gpu::new(Wgpu::new(surface.clone()));
         let h: temen_interp::HostProc = Box::new(
             move |op: u32,
                   args: &[i64],
@@ -165,8 +168,10 @@ pub fn adapter_available() -> bool {
 }
 
 /// The guest's window, as the protocol reaches it.
+#[cfg(feature = "cap")]
 struct Window<'m>(&'m mut dyn GuestMem);
 
+#[cfg(feature = "cap")]
 impl temen_gpu::Window for Window<'_> {
     fn read(&mut self, ptr: u64, len: u64) -> Option<Vec<u8>> {
         self.0.read_bytes(ptr, len)

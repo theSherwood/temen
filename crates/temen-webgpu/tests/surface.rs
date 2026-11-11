@@ -12,11 +12,16 @@ use temen_webgpu::{Frames, Size, Surface};
 
 /// A display for a window test: the one `DISPLAY` names, or else an Xvfb of the test's own, which
 /// stops when this drops. With neither, the test fails, saying what to install, as with no adapter.
-struct Display(Option<std::process::Child>);
+/// `name` is the Xvfb's, which the test connects to by name: it never sets `DISPLAY`, which other
+/// tests' threads may be reading.
+struct Display {
+    name: Option<String>,
+    server: Option<std::process::Child>,
+}
 
 impl Drop for Display {
     fn drop(&mut self) {
-        if let Some(x) = &mut self.0 {
+        if let Some(x) = &mut self.server {
             let _ = x.kill();
             let _ = x.wait();
         }
@@ -27,7 +32,10 @@ fn display() -> Display {
     use std::path::Path;
     use std::time::{Duration, Instant};
     if std::env::var_os("DISPLAY").is_some() {
-        return Display(None);
+        return Display {
+            name: None,
+            server: None,
+        };
     }
     // The first display number no other server holds. One another process takes first exits, and
     // the next is tried.
@@ -49,8 +57,10 @@ fn display() -> Display {
                 break;
             }
             if Path::new(&socket).exists() {
-                std::env::set_var("DISPLAY", format!(":{n}"));
-                return Display(Some(x));
+                return Display {
+                    name: Some(format!(":{n}")),
+                    server: Some(x),
+                };
             }
             assert!(
                 Instant::now() < deadline,
@@ -123,10 +133,13 @@ struct XWindow {
 }
 
 impl XWindow {
-    fn new(width: u16, height: u16) -> XWindow {
+    /// A window on `display`, or on the one `DISPLAY` names.
+    fn new(display: Option<&str>, width: u16, height: u16) -> XWindow {
         use x11rb::connection::Connection;
         use x11rb::protocol::xproto::{ConnectionExt, CreateWindowAux, WindowClass};
-        let (conn, screen) = x11rb::xcb_ffi::XCBConnection::connect(None).expect("an X connection");
+        let display = display.map(|d| std::ffi::CString::new(d).expect("a display name"));
+        let (conn, screen) =
+            x11rb::xcb_ffi::XCBConnection::connect(display.as_deref()).expect("an X connection");
         let root = &conn.setup().roots[screen];
         let (parent, black) = (root.root, root.black_pixel);
         let window = conn.generate_id().expect("a window id");
@@ -178,8 +191,9 @@ impl raw_window_handle::HasDisplayHandle for XWindow {
 #[test]
 fn window_surface_follows_its_size() {
     common::require_adapter();
-    let _display = display();
-    let window: Arc<dyn temen_webgpu::WindowHandle> = Arc::new(XWindow::new(64, 48));
+    let display = display();
+    let window = XWindow::new(display.name.as_deref(), 64, 48);
+    let window: Arc<dyn temen_webgpu::WindowHandle> = Arc::new(window);
     for backend in common::ENGINES {
         let size = Size::new(64, 48);
         let surface = Surface::Window {
