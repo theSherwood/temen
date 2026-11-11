@@ -2959,10 +2959,9 @@ fn nim_shells_out_through_the_posix_sh() {
             None,
             None,
         );
-        // The tree-walker and the JIT record twin traps (#1665); a bytecode crash shows in the output.
         let crashed = temen_interp::last_twin_traps();
         assert!(
-            engine == temen_run::Backend::Bytecode || crashed.is_empty(),
+            crashed.is_empty(),
             "{engine:?}: a command crashed:\n{}",
             crashed
                 .iter()
@@ -3151,7 +3150,7 @@ fn an_execd_nim_programs_heap_grows_past_its_window() {
         );
         let crashed = temen_interp::last_twin_traps();
         assert!(
-            engine == temen_run::Backend::Bytecode || crashed.is_empty(),
+            crashed.is_empty(),
             "{engine:?}: a command crashed:\n{}",
             crashed
                 .iter()
