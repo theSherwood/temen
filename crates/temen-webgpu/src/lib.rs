@@ -3,7 +3,7 @@
 //! The protocol is `temen-gpu`'s, which the browser's capability shares: a guest submits command
 //! streams that name objects by its own ids, and [`temen_gpu::Gpu`] decodes and checks each one
 //! before any of it runs. This crate is the [`Backend`] that then runs it on a wgpu device, and the
-//! [`HostCap`] that grants it. The host holds the device; the guest only ever passes data
+//! `HostCap` that grants it, [`webgpu_cap`], with the `cap` feature, which is on by default. The host holds the device; the guest only ever passes data
 //! (validation, not raw access, is the boundary, §2a), and wgpu validates what the protocol leaves
 //! to WebGPU.
 //!
@@ -12,42 +12,94 @@
 //! - **Errors** never panic the host. wgpu's own validation errors are recorded for the guest's
 //!   `error` op, and a panic inside wgpu, which the protocol's checks exist to rule out, loses the
 //!   device rather than the host.
-//! - **The surface** is what [`Surface`] binds. A guest presents to an offscreen texture of the
-//!   host's, which each present reads back into [`Frames`]: a test sees exactly what was presented.
-//!   A window's surface is the embedder's (#2837).
+//! - **The surface** is what [`Surface`] binds: the embedder's window, which each present shows
+//!   (#2837), or an offscreen texture of the host's, which each present reads back into [`Frames`],
+//!   so a test sees exactly what was presented. Either follows a [`Size`] the embedder keeps current,
+//!   as a page's canvas follows its element: the `surface` op reports the size, and the next acquire
+//!   gives a texture of it. A frame the surface cannot give never fails the guest's stream: a
+//!   stand-in takes its place, present shows nothing, and the `error` op says why.
 //!
 //! Kept in its own workspace-excluded crate (like `temen-llvm`) so the heavy `wgpu` dependency
 //! never enters the default build.
 
 use std::num::NonZeroU64;
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 
 use temen_gpu::command::*;
 use temen_gpu::enums::*;
-use temen_gpu::{Backend, Fault, Gpu, Id, Readback, SurfaceInfo};
+use temen_gpu::{Backend, Fault, Id, Readback, SurfaceInfo};
+#[cfg(feature = "cap")]
 use temen_interp::{GuestMem, RegionMinter, Trap};
+#[cfg(feature = "cap")]
 use temen_run::HostCap;
+
+/// What an embedder's window must be for [`Surface::Window`]: wgpu's, so that an embedder names
+/// it without depending on wgpu itself. A winit window is one, as is anything with raw window and
+/// display handles that is `Send` and `Sync`.
+pub use wgpu::WindowHandle;
 
 /// What a guest's frames are presented to.
 #[derive(Clone)]
 pub enum Surface {
     /// No surface: the `surface` op says `-ENODEV`, and a stream that acquires one is refused.
     None,
-    /// A texture the host owns, of this size and a 4-byte format; each present reads it back into
+    /// A texture the host owns, of `size` and a 4-byte format; each present reads it back into
     /// `frames`.
     Offscreen {
-        width: u32,
-        height: u32,
+        size: Size,
         format: TextureFormat,
         frames: Frames,
     },
+    /// The embedder's window (#2837): each present shows a frame in it. `size` is the window's,
+    /// which the embedder keeps current as it resizes. The format is the window's own, a 4-byte
+    /// one unless the window offers none of those: `Bgra8Unorm` or `Rgba8Unorm` when the window
+    /// offers either, as a browser's canvas prefers.
+    Window {
+        window: Arc<dyn WindowHandle>,
+        size: Size,
+    },
 }
 
-/// The frames a guest has presented to an offscreen surface: the last one, and how many.
+/// A surface's size in texels, which its embedder may change while a guest runs. The `surface` op
+/// reports the size it holds then, and the next `acquire` gives a texture of it. A size with a
+/// zero side, as a minimized window's, gives nothing to draw: `acquire` refuses until it grows.
+#[derive(Clone)]
+pub struct Size(Arc<AtomicU64>);
+
+impl Size {
+    pub fn new(width: u32, height: u32) -> Size {
+        Size(Arc::new(AtomicU64::new(pack(width, height))))
+    }
+    pub fn set(&self, width: u32, height: u32) {
+        self.0.store(pack(width, height), Ordering::Release);
+    }
+    pub fn get(&self) -> (u32, u32) {
+        let s = self.0.load(Ordering::Acquire);
+        ((s >> 32) as u32, s as u32)
+    }
+}
+
+fn pack(width: u32, height: u32) -> u64 {
+    (width as u64) << 32 | height as u64
+}
+
+/// The frames a guest has presented to an offscreen surface: the last one, and how many. An
+/// embedder that needs each in turn, as a capture that stamps and keeps every frame does, gives
+/// [`Frames::each`] a function to hand each to as it is presented.
 #[derive(Clone, Default)]
-pub struct Frames(Arc<Mutex<(u64, Option<Frame>)>>);
+pub struct Frames(Arc<Mutex<Shown>>);
+
+#[derive(Default)]
+struct Shown {
+    count: u64,
+    last: Option<Frame>,
+    each: Option<Each>,
+}
+
+/// What [`Frames::each`] hands every frame to.
+type Each = Box<dyn FnMut(&Frame) + Send>;
 
 /// One presented frame: rows of `width` texels of 4 bytes each, top to bottom, in the surface's
 /// format.
@@ -60,17 +112,37 @@ pub struct Frame {
 }
 
 impl Frames {
+    /// Frames that also hand each frame to `f` as it is presented, on the thread presenting it.
+    pub fn each(f: impl FnMut(&Frame) + Send + 'static) -> Frames {
+        let shown = Shown {
+            each: Some(Box::new(f)),
+            ..Shown::default()
+        };
+        Frames(Arc::new(Mutex::new(shown)))
+    }
+
     /// The number of frames presented, and the last.
     pub fn last(&self) -> (u64, Option<Frame>) {
-        self.0.lock().unwrap().clone()
+        let s = self.0.lock().unwrap();
+        (s.count, s.last.clone())
+    }
+
+    fn present(&self, frame: Frame) {
+        let mut s = self.0.lock().unwrap();
+        s.count += 1;
+        if let Some(each) = &mut s.each {
+            each(&frame);
+        }
+        s.last = Some(frame);
     }
 }
 
 /// The `webgpu` capability: grant it under the name `"webgpu"`. Each host instantiation holds its
 /// own device, made on first use.
+#[cfg(feature = "cap")]
 pub fn webgpu_cap(surface: Surface) -> HostCap {
     HostCap::host_proc(0, move |_, _| {
-        let mut gpu = Gpu::new(Wgpu::new(surface.clone()));
+        let mut gpu = temen_gpu::Gpu::new(Wgpu::new(surface.clone()));
         let h: temen_interp::HostProc = Box::new(
             move |op: u32,
                   args: &[i64],
@@ -92,12 +164,14 @@ pub fn webgpu_cap(surface: Surface) -> HostCap {
 
 /// Whether this host has an adapter, hardware or software.
 pub fn adapter_available() -> bool {
-    Device::open().is_ok()
+    Device::open(None).is_ok()
 }
 
 /// The guest's window, as the protocol reaches it.
+#[cfg(feature = "cap")]
 struct Window<'m>(&'m mut dyn GuestMem);
 
+#[cfg(feature = "cap")]
 impl temen_gpu::Window for Window<'_> {
     fn read(&mut self, ptr: u64, len: u64) -> Option<Vec<u8>> {
         self.0.read_bytes(ptr, len)
@@ -110,20 +184,44 @@ impl temen_gpu::Window for Window<'_> {
 struct Device {
     device: wgpu::Device,
     queue: wgpu::Queue,
+    /// The window's surface, for a [`Surface::Window`].
+    window: Option<WindowSurface>,
+}
+
+/// A window's surface, as the device presents to it.
+struct WindowSurface {
+    surface: wgpu::Surface<'static>,
+    /// The format and usages it is configured with, and the size it was last configured at:
+    /// `(0, 0)` until the first acquire.
+    format: wgpu::TextureFormat,
+    usage: wgpu::TextureUsages,
+    alpha: wgpu::CompositeAlphaMode,
+    configured: (u32, u32),
+    /// The frame acquired and not yet presented.
+    frame: Option<wgpu::SurfaceTexture>,
 }
 
 impl Device {
-    /// A hardware adapter if there is one, else a software one.
-    fn open() -> Result<Device, String> {
+    /// A hardware adapter if there is one, else a software one; for a window, one that can present
+    /// to it.
+    fn open(window: Option<&Arc<dyn WindowHandle>>) -> Result<Device, String> {
         pollster::block_on(async {
             let instance = wgpu::Instance::default();
+            let surface = match window {
+                Some(w) => Some(
+                    instance
+                        .create_surface(wgpu::SurfaceTarget::Window(Box::new(Arc::clone(w))))
+                        .map_err(|e| format!("no surface for the window: {e}"))?,
+                ),
+                None => None,
+            };
             let mut adapter = None;
             for fallback in [false, true] {
                 adapter = instance
                     .request_adapter(&wgpu::RequestAdapterOptions {
                         power_preference: wgpu::PowerPreference::HighPerformance,
                         force_fallback_adapter: fallback,
-                        compatible_surface: None,
+                        compatible_surface: surface.as_ref(),
                     })
                     .await;
                 if adapter.is_some() {
@@ -136,8 +234,94 @@ impl Device {
                 .request_device(&wgpu::DeviceDescriptor::default(), None)
                 .await
                 .map_err(|e| format!("no WebGPU device: {e}"))?;
-            Ok(Device { device, queue })
+            let window = match surface {
+                Some(surface) => Some(WindowSurface::new(surface, &adapter)?),
+                None => None,
+            };
+            Ok(Device {
+                device,
+                queue,
+                window,
+            })
         })
+    }
+}
+
+impl WindowSurface {
+    /// The window's surface, in the format a guest will be told: a 4-byte unorm one where the
+    /// window offers it, else the first the protocol names.
+    fn new(surface: wgpu::Surface<'static>, adapter: &wgpu::Adapter) -> Result<Self, String> {
+        let caps = surface.get_capabilities(adapter);
+        let named = |f: &&wgpu::TextureFormat| protocol_format(**f).is_some();
+        let format = caps
+            .formats
+            .iter()
+            .find(|f| {
+                matches!(
+                    f,
+                    wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Rgba8Unorm
+                )
+            })
+            .or_else(|| caps.formats.iter().find(named))
+            .copied()
+            .ok_or("the window offers no format the protocol names")?;
+        // A guest that reads its frame back copies from it, where the window allows that.
+        let usage =
+            wgpu::TextureUsages::RENDER_ATTACHMENT | (caps.usages & wgpu::TextureUsages::COPY_SRC);
+        let alpha = if caps.alpha_modes.contains(&wgpu::CompositeAlphaMode::Opaque) {
+            wgpu::CompositeAlphaMode::Opaque
+        } else {
+            caps.alpha_modes[0]
+        };
+        Ok(WindowSurface {
+            surface,
+            format,
+            usage,
+            alpha,
+            configured: (0, 0),
+            frame: None,
+        })
+    }
+
+    fn configure(&mut self, device: &wgpu::Device, (width, height): (u32, u32)) {
+        self.surface.configure(
+            device,
+            &wgpu::SurfaceConfiguration {
+                usage: self.usage,
+                format: self.format,
+                width,
+                height,
+                present_mode: wgpu::PresentMode::Fifo,
+                desired_maximum_frame_latency: 2,
+                alpha_mode: self.alpha,
+                view_formats: vec![],
+            },
+        );
+        self.configured = (width, height);
+    }
+
+    /// The window's next frame at `size`, configuring the surface first if the size changed. A
+    /// surface that is outdated or lost is configured again once; a second failure is the guest's
+    /// to read.
+    fn acquire(
+        &mut self,
+        device: &wgpu::Device,
+        size: (u32, u32),
+    ) -> Result<wgpu::Texture, String> {
+        if self.configured != size {
+            self.configure(device, size);
+        }
+        let frame = match self.surface.get_current_texture() {
+            Err(wgpu::SurfaceError::Outdated | wgpu::SurfaceError::Lost) => {
+                self.configure(device, size);
+                self.surface.get_current_texture()
+            }
+            r => r,
+        }
+        .map_err(|e| format!("the window gave no frame: {e}"))?;
+        let texture = frame.texture.clone();
+        self.frame = Some(frame);
+        Ok(texture)
     }
 }
 
@@ -163,33 +347,44 @@ struct Pending {
     state: Arc<AtomicU8>,
 }
 
-struct Wgpu {
+/// The [`Backend`] over wgpu, bound to a [`Surface`]. [`webgpu_cap`] grants one to each guest. A
+/// host that runs the protocol in-process, with no guest, such as a native compositor's tests, drives
+/// `temen_gpu::Gpu::new(Wgpu::new(surface))` itself: the same checks, device and surfaces.
+pub struct Wgpu {
     surface: Surface,
     device: Option<Result<Device, String>>,
     objs: Vec<Obj>,
     pending: Vec<Pending>,
-    /// The offscreen surface's texture, made on the first acquire.
+    /// The offscreen surface's texture, made on the first acquire and again when its size changes.
     offscreen: Option<wgpu::Texture>,
+    /// Whether the texture acquired is the surface's, which present shows, rather than a stand-in
+    /// for a frame the surface could not give.
+    shown: bool,
     /// The first error wgpu reported since the guest last asked.
     error: Arc<Mutex<Option<String>>>,
 }
 
 impl Wgpu {
-    fn new(surface: Surface) -> Self {
+    pub fn new(surface: Surface) -> Self {
         Wgpu {
             surface,
             device: None,
             objs: Vec::new(),
             pending: Vec::new(),
             offscreen: None,
+            shown: false,
             error: Arc::default(),
         }
     }
 
     fn device(&mut self) -> Result<(), Fault> {
         let error = Arc::clone(&self.error);
+        let window = match &self.surface {
+            Surface::Window { window, .. } => Some(window),
+            _ => None,
+        };
         let d = self.device.get_or_insert_with(|| {
-            Device::open().inspect(|d| {
+            Device::open(window).inspect(|d| {
                 // An error wgpu does not hand back is the guest's to read, never a host panic.
                 d.device.on_uncaptured_error(Box::new(move |e| {
                     error.lock().unwrap().get_or_insert_with(|| e.to_string());
@@ -266,19 +461,29 @@ impl Backend for Wgpu {
     }
 
     fn surface(&mut self) -> Option<SurfaceInfo> {
-        match &self.surface {
-            Surface::None => None,
-            Surface::Offscreen {
-                width,
-                height,
-                format,
-                ..
-            } => Some(SurfaceInfo {
-                width: *width,
-                height: *height,
-                format: *format,
-            }),
-        }
+        let ((width, height), format) = match &self.surface {
+            Surface::None => return None,
+            Surface::Offscreen { size, format, .. } => (size.get(), *format),
+            // The window's format is known once its device is open.
+            Surface::Window { size, .. } => {
+                let size = size.get();
+                self.device().ok()?;
+                let w = self
+                    .dev()
+                    .window
+                    .as_ref()
+                    .expect("a window's device has its surface");
+                (
+                    size,
+                    protocol_format(w.format).expect("chosen from the named formats"),
+                )
+            }
+        };
+        Some(SurfaceInfo {
+            width,
+            height,
+            format,
+        })
     }
 
     fn take_error(&mut self) -> Option<String> {
@@ -408,6 +613,7 @@ impl Wgpu {
                     self.flush(&mut enc);
                     self.queue(c);
                 }
+                Command::Acquire { texture, view } => self.acquire(*texture, *view),
                 c => self.create(c),
             }
             i += 1;
@@ -568,19 +774,97 @@ impl Wgpu {
         }
     }
 
-    /// Reads the offscreen surface back into the frames, as the guest presented it.
-    fn present(&mut self) {
-        let Surface::Offscreen {
-            width,
-            height,
-            format,
-            frames,
-        } = &self.surface
-        else {
-            panic!("present with no surface");
+    /// Gives `texture` and `view` the surface's next texture at its current size. A surface with
+    /// no area, or a window that gives no frame, gives a stand-in of the host's instead: the
+    /// guest's stream still runs, present shows nothing, and the `error` op says why.
+    fn acquire(&mut self, texture: Id, view: Id) {
+        let got = match &self.surface {
+            Surface::None => panic!("acquire with no surface"),
+            Surface::Offscreen { size, format, .. } => {
+                let (w, h) = size.get();
+                let format = texture_format(*format);
+                if w == 0 || h == 0 {
+                    Err(("the surface has no area".to_string(), format))
+                } else {
+                    let stale = self
+                        .offscreen
+                        .as_ref()
+                        .is_none_or(|t| (t.width(), t.height()) != (w, h));
+                    if stale {
+                        self.offscreen = Some(self.texture([w, h], format, "offscreen surface"));
+                    }
+                    Ok(self.offscreen.clone().unwrap())
+                }
+            }
+            Surface::Window { size, .. } => {
+                let size = size.get();
+                let Some(Ok(d)) = &mut self.device else {
+                    panic!("no device");
+                };
+                let w = d
+                    .window
+                    .as_mut()
+                    .expect("a window's device has its surface");
+                if size.0 == 0 || size.1 == 0 {
+                    Err(("the window has no area".to_string(), w.format))
+                } else {
+                    w.acquire(&d.device, size).map_err(|why| (why, w.format))
+                }
+            }
         };
-        let (w, h) = (*width, *height);
+        self.shown = got.is_ok();
+        let t = got.unwrap_or_else(|(why, format)| {
+            self.error.lock().unwrap().get_or_insert(why);
+            self.texture([1, 1], format, "stand-in for a frame")
+        });
+        let v = t.create_view(&Default::default());
+        self.set(texture, Obj::Texture(t));
+        self.set(view, Obj::View(v));
+    }
+
+    /// A texture a guest renders to and copies from, as a surface's is.
+    fn texture(&self, [w, h]: [u32; 2], format: wgpu::TextureFormat, label: &str) -> wgpu::Texture {
+        self.dev().device.create_texture(&wgpu::TextureDescriptor {
+            label: Some(label),
+            size: extent([w, h, 1]),
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        })
+    }
+
+    /// Shows the frame the guest acquired: in the window, or read back into the offscreen
+    /// surface's frames. A stand-in shows nothing.
+    fn present(&mut self) {
+        if !std::mem::take(&mut self.shown) {
+            return;
+        }
+        match &self.surface {
+            Surface::Window { .. } => {
+                let Some(Ok(d)) = &mut self.device else {
+                    panic!("no device");
+                };
+                let w = d
+                    .window
+                    .as_mut()
+                    .expect("a window's device has its surface");
+                w.frame.take().expect("acquired before present").present();
+            }
+            Surface::Offscreen { .. } => self.read_back(),
+            Surface::None => panic!("present with no surface"),
+        }
+    }
+
+    /// Reads the offscreen surface back into the frames, as the guest presented it.
+    fn read_back(&mut self) {
+        let Surface::Offscreen { format, frames, .. } = &self.surface else {
+            panic!("read back with no offscreen surface");
+        };
         let texture = self.offscreen.as_ref().expect("acquired before present");
+        let (w, h) = (texture.width(), texture.height());
         let row = w * 4;
         let padded = row.div_ceil(256) * 256;
         let d = self.dev();
@@ -610,9 +894,7 @@ impl Wgpu {
         }
         drop(mapped);
         staging.unmap();
-        let mut f = frames.0.lock().unwrap();
-        f.0 += 1;
-        f.1 = Some(Frame {
+        frames.present(Frame {
             width: w,
             height: h,
             format: *format,
@@ -742,37 +1024,6 @@ impl Wgpu {
                     })),
                 )
             }
-            Command::Acquire { texture, view } => {
-                let Surface::Offscreen {
-                    width,
-                    height,
-                    format,
-                    ..
-                } = &self.surface
-                else {
-                    panic!("acquire with no surface");
-                };
-                let t = self
-                    .offscreen
-                    .get_or_insert_with(|| {
-                        d.device.create_texture(&wgpu::TextureDescriptor {
-                            label: Some("offscreen surface"),
-                            size: extent([*width, *height, 1]),
-                            mip_level_count: 1,
-                            sample_count: 1,
-                            dimension: wgpu::TextureDimension::D2,
-                            format: texture_format(*format),
-                            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-                                | wgpu::TextureUsages::COPY_SRC,
-                            view_formats: &[],
-                        })
-                    })
-                    .clone();
-                let v = t.create_view(&Default::default());
-                self.set(*texture, Obj::Texture(t));
-                self.set(*view, Obj::View(v));
-                return;
-            }
             c => panic!("{} is not a creation", c.name()),
         };
         self.set(id, obj);
@@ -894,6 +1145,13 @@ fn extent(s: [u32; 3]) -> wgpu::Extent3d {
         height: s[1],
         depth_or_array_layers: s[2],
     }
+}
+
+/// The protocol's name for a wgpu format, if it has one.
+fn protocol_format(f: wgpu::TextureFormat) -> Option<TextureFormat> {
+    (1..=u8::MAX as u32)
+        .map_while(TextureFormat::from_code)
+        .find(|p| texture_format(*p) == f)
 }
 
 fn texture_format(f: TextureFormat) -> wgpu::TextureFormat {
