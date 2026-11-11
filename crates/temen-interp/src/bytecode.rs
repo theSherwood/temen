@@ -52,7 +52,7 @@ use super::{
     bin32, bin64, call_slots, cast, cmp32, cmp64, fbin32, fbin64, fcmp32, fcmp64, fto_i, fun32,
     fun64, i_to_f, intun32, intun64, slot_to_val, step, trunc_trap, val_to_slot, Fuel, GuestMem,
     Host, HostCharge, Lease, LentFuel, LiveFiber, LiveVcpu, LockUnpoisoned, Mem, MemLayout,
-    NodeRef, Reg, RootWindow, Trap, Value, VarValue, WindowSpec, CALL_STACK_SLOTS,
+    NodeRef, Reg, RootWindow, SpawnRefusal, Trap, Value, VarValue, WindowSpec, CALL_STACK_SLOTS,
 };
 use crate::moment::{Moment, Refusal};
 
@@ -2062,15 +2062,16 @@ impl FreshWindow {
 
 /// Admit a detached spawn against `host` (the parent powerbox) and build the child, with its window
 /// still to be built over a backing the driver supplies. `pm` is the parent's window (the grant list
-/// and the args payload are read from it). `Ok(None)` is a **probeable refusal** — the driver lands
-/// `-EINVAL` and nothing was charged; `Err` is a trap (a forged handle, an unreadable payload, a
-/// nonzero `quota`). The checks — entry shape, the window = the module's declared memory, the payload
-/// fitting the args area, `premap_admit`, durability — run before the `Budget.mem` take, so a
-/// refusal charges nothing; one after it (the child's imports not binding) hands the take back
+/// and the args payload are read from it). `Ok(Err)` is a **probeable refusal**, its cause the code the
+/// driver lands (#2864), and nothing was charged; `Err` is a trap (a forged handle, an unreadable
+/// payload, a nonzero `quota`). The checks — the record's ([`temen_ir::check_spawn_record`]),
+/// `premap_admit`, durability — run before the `Budget.mem` take, in the order every engine keeps, so
+/// a refusal charges nothing; one after it (the child's imports not binding) hands the take back
 /// (`Host::undo_detached_spawn`, #1975).
 ///
 /// A durable domain's detached spawn refuses: the tree-walker's freeze captures a detached child,
-/// but this engine's drivers cannot (#1893).
+/// but this engine's drivers cannot (#1893). It answers as the admission answers a durable domain
+/// without freeze authority, after the checks the tree-walker also makes.
 ///
 /// `source`: the run's compiled modules, where a granted module's program is found or added
 /// ([`granted_program`]).
@@ -2079,7 +2080,7 @@ fn admit_detached_child(
     pm: Option<&Mem>,
     s: DetachedSpawn,
     source: &ModuleSource,
-) -> Result<Option<(AdmittedChild, FreshWindow)>, Trap> {
+) -> Result<Result<(AdmittedChild, FreshWindow), SpawnRefusal>, Trap> {
     // §2.2 — a record's pager must be a `{ page: (i64) -> (i64) }` export of the spawner's own
     // program, as on the tree-walker (#744, #1862). The record named the pager before anything else
     // was checked, so it fails first (#2164). Only a driver that serves its children pages one: the
@@ -2088,7 +2089,7 @@ fn admit_detached_child(
     if s.pager.is_some_and(|export| !host.has_pager_export(export)) {
         return Err(Trap::CapFault);
     }
-    let (program, cmem_log2, cmodule, cshadow) = {
+    let (program, cmem_log2, cmodule, cshadow, cdurable) = {
         let g = host.resolve_module(s.module)?;
         let program = granted_program(host, source, g)?;
         (
@@ -2096,22 +2097,24 @@ fn admit_detached_child(
             g.memory_log2(),
             std::sync::Arc::clone(&g.module),
             g.shadow(),
+            g.durable,
         )
     };
     let sig = program.1.sigs.first();
     let arity = sig.map_or(0, |(p, _)| p.len());
-    let ok_entry = sig.is_some_and(|(p, r)| child_entry_ok(p, r));
-    let size_log2 = temen_ir::detached_size_log2(s.size_log2, cmem_log2);
-    let child_size = if (0..64).contains(&size_log2) {
-        1u64 << size_log2
-    } else {
-        0
-    };
-    let mod_ok = cmem_log2 == Some(size_log2 as u8);
+    let args_len = s.args.map_or(0, |(_, len)| len);
+    // #2864 — the record against its module, in the order every engine checks: the entry, then the
+    // window (§14: the module's declared memory), then the payload's length.
+    let checked = temen_ir::check_spawn_record(
+        sig.map(|(p, r)| (&p[..], &r[..])),
+        cmem_log2,
+        s.size_log2,
+        args_len,
+    );
+    let size_log2 = checked.map_or(0, i64::from);
+    let child_size = checked.map_or(0, |l| 1u64 << l);
     // An over-long payload refuses before anything is read: its length is the guest's (#2338).
-    let payload_ok = s
-        .args
-        .is_none_or(|(_, len)| len <= temen_ir::module_args_end() - temen_ir::module_args_base());
+    let payload_ok = temen_ir::spawn_args_fit(args_len);
     let payload: Vec<u8> = match s.args {
         Some((ptr, len)) if payload_ok => {
             pm.ok_or(Trap::Malformed)?.read_window(ptr, len as usize)?
@@ -2129,25 +2132,32 @@ fn admit_detached_child(
         }
         None => Vec::new(),
     };
+    host.check_grant_list(&glist)?;
     let cell = host.own_cell();
-    if !host.can_grant_list(&glist, cell.is_some()) {
-        return Err(Trap::CapFault);
-    }
     let premap_ok = match s.premap {
         Some((r, o)) => host.premap_admit(r, o, child_size)?,
         None => true,
     };
-    let durable_ok = !host.is_durable();
-    if !ok_entry || child_size == 0 || !mod_ok || !payload_ok || !premap_ok || !durable_ok {
-        return Ok(None);
-    }
+    let durable = host.is_durable();
     let lease = Lease {
         budget: s.budget,
         bytes: child_size,
         runs: super::window_runs_bound(&cmodule.data, s.premap.is_some()),
     };
-    let Some(lane) = host.admit_detached_spawn(lease) else {
-        return Ok(None);
+    let admitted = checked
+        .and_then(|_| premap_ok.then_some(()).ok_or(SpawnRefusal::Record))
+        // #1501 — a durable domain admits only freezable modules, as on every engine.
+        .and_then(|()| {
+            (!durable || cdurable)
+                .then_some(())
+                .ok_or(SpawnRefusal::Module)
+        })
+        // #1893 — then this engine's own refusal of a durable domain's detached spawn.
+        .and_then(|()| (!durable).then_some(()).ok_or(SpawnRefusal::Authority))
+        .and_then(|()| host.admit_detached_spawn(lease));
+    let lane = match admitted {
+        Ok(lane) => lane,
+        Err(refused) => return Ok(Err(refused)),
     };
     // #1975 — every exit from here that builds no child hands back what the admission took.
     let mut child_host = host.child_host();
@@ -2176,7 +2186,7 @@ fn admit_detached_child(
         .is_err()
     {
         host.undo_detached_spawn(lease, lane);
-        return Ok(None);
+        return Ok(Err(SpawnRefusal::Unbound));
     }
     // D66 — single-spawn lane parity with the tree-walker: this engine's detached children do not yet
     // return a lane at their reap, so the lane is given straight back (#1600). The window's bytes stay
@@ -2200,13 +2210,13 @@ fn admit_detached_child(
         payload,
         paged: s.pager.is_some(),
     };
-    Ok(Some((child, window)))
+    Ok(Ok((child, window)))
 }
 
 /// [`admit_detached_child`] for the in-process drivers, which hold the child's window themselves:
 /// built at once, over a reservation of the engine's own, or over a backing of the embedder's
-/// ([`Host::set_child_window`]). A backing it cannot make refuses the spawn, and hands the window's
-/// bytes back to the budget that paid for them. Returns the child, and the emit of the
+/// ([`Host::set_child_window`]). A backing it cannot make refuses the spawn for want of room, and hands
+/// the window's bytes back to the budget that paid for them. Returns the child, and the emit of the
 /// program it runs, as `emit` answers for it ([`ProgramEmits::for_child`]): `None` on a driver with
 /// no emitted tier. Without a backing, a child with an emit gets its window over a
 /// [`FreshWindow::flat_backing`], so that it can tier up on every target (#2102): the cooperative
@@ -2218,16 +2228,17 @@ fn admit_detached_in_process(
     s: DetachedSpawn,
     source: &ModuleSource,
     emit: impl FnOnce(&AdmittedChild) -> Option<ProgramEmit>,
-) -> Result<Option<(AdmittedChild, Option<ProgramEmit>)>, Trap> {
-    let Some((mut child, window)) = admit_detached_child(host, pm, s, source)? else {
-        return Ok(None);
+) -> Result<Result<(AdmittedChild, Option<ProgramEmit>), SpawnRefusal>, Trap> {
+    let (mut child, window) = match admit_detached_child(host, pm, s, source)? {
+        Ok(admitted) => admitted,
+        Err(refused) => return Ok(Err(refused)),
     };
     let (back, tierup) = match host.child_window() {
         Some(make) => match make(window.size_log2) {
             Some(back) => (Some(back), emit(&child)),
             None => {
                 host.release_detached(child.lease);
-                return Ok(None);
+                return Ok(Err(SpawnRefusal::Room));
             }
         },
         None => {
@@ -2236,7 +2247,7 @@ fn admit_detached_in_process(
         }
     };
     child.mem = Some(window.build(back, &mut child.host)?);
-    Ok(Some((child, tierup)))
+    Ok(Ok((child, tierup)))
 }
 
 /// Compile module `g` that `host` granted, for a child or an exec in the run whose units `source`
@@ -6589,9 +6600,12 @@ fn dbg_instantiate_detached(
         let mut owner = e.host.lock_unpoisoned();
         admit_detached_in_process(&mut owner, e.mem.as_ref(), spawn, source, |_| None)?
     };
-    let Some((child, _)) = admitted else {
-        tasks[ti].deliver(dst, Reg::from_i32(super::EINVAL as i32));
-        return Ok(());
+    let (child, _) = match admitted {
+        Ok(admitted) => admitted,
+        Err(refused) => {
+            tasks[ti].deliver(dst, Reg::from_i32(refused.errno() as i32));
+            return Ok(());
+        }
     };
     dbg_start_child(tasks, ti, domains, child, dst)
 }
@@ -9341,7 +9355,7 @@ enum Outcome {
     },
     /// §5 `Instantiator.instantiate_rec` (op 17, #1286): the driver
     /// admits the separate-module child `spawn` describes, in a fresh window of its own
-    /// ([`admit_detached_child`]), and writes the join handle (or `EINVAL`) to `dst`. The child runs
+    /// ([`admit_detached_child`]), and writes the join handle (or its refusal's code) to `dst`. The child runs
     /// on the scheduler, joinable via the shared thread machinery (`Instantiator.join` compiles to
     /// [`Outcome::ThreadJoin`]).
     InstantiateDetached {
@@ -15259,7 +15273,7 @@ impl SchedCore {
             // tree-walk oracle's spawn (`run_with_host`'s op-17 arm) on the cooperative driver.
             // Admission first (entry shape, the window = the module's declared memory, the args
             // payload, `premap_admit`, no durable domain, then the `Budget.mem` take — a refused
-            // spawn lands `-EINVAL` and charges nothing); then the child powerbox: starter
+            // spawn lands its cause's code and charges nothing); then the child powerbox: starter
             // `Instantiator`/`AddressSpace` over the reservation, the by-name re-grants (the op-11
             // record format, fail-closed), and a pre-mapped `SharedRegion` staged and applied to
             // the window before the child runs an op. `join` is the shared seam below.
@@ -15272,9 +15286,9 @@ impl SchedCore {
                     |c| programs.for_child(&c.program, &c.host, source),
                 );
                 let (child, tierup) = match admitted {
-                    Ok(Some(c)) => c,
-                    Ok(None) => {
-                        tasks[ti].deliver(dst, Reg::from_i32(super::EINVAL as i32));
+                    Ok(Ok(c)) => c,
+                    Ok(Err(refused)) => {
+                        tasks[ti].deliver(dst, Reg::from_i32(refused.errno() as i32));
                         return None;
                     }
                     Err(t) => {

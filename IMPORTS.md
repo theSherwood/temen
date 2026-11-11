@@ -565,7 +565,7 @@ deeper), and `bind_child_manifest` binds, per slot: a **named offer grant** firs
 first signature-matching op — structural, fail-closed, a name match with no signature
 match never silently binds), then the reference policy, then **withhold** — a
 `rebindable` slot starts empty, a `required` slot fails the whole spawn closed
-(probeable `-EINVAL` before any child code runs), on both the interpreter's inline spawn
+(probeable `-ENOENT` before any child code runs, #2864), on both the interpreter's inline spawn
 and the JIT's child builders. Forwarding of platform caps is the existing re-grant
 (zero-marginal-cost aliasing); a forwarded offer keeps its entry and gains a depth hop.*
 
@@ -583,7 +583,7 @@ against). The four policies are one act with different right-hand sides:
 
 **Empty grants (#2219, owner 2026-10-08).** Withholding is strict: a `required` import that no grant
 satisfies refuses the spawn, and the run's notes name the import (`Host::take_notes`; `temen-run`
-prints them), since the guest only sees `-EINVAL`. A parent that means to leave an import out says so
+prints them), since the guest sees only `-ENOENT` (#2864). A parent that means to leave an import out says so
 with an **empty grant**: a grant record whose handle is `GRANT_EMPTY` (`VM_EMPTY` in C's `<temen.h>`).
 The import binds empty and faults on use, as a `rebindable` slot nothing attached does.
 - The record's name is the import's, `*` (every import nothing else satisfies), or a prefix ending in

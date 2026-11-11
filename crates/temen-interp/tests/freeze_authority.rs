@@ -10,7 +10,7 @@
 //! survives freeze/thaw through the value-typed re-grant path, and can be asked. These pin the three
 //! properties that makes true.
 
-use temen_interp::{cap_id, Host, Lease, WINDOW_RUNS};
+use temen_interp::{cap_id, Host, Lease, SpawnRefusal, WINDOW_RUNS};
 
 /// A 64 KiB detached window's lease on `budget`.
 fn window(budget: i32) -> Lease {
@@ -81,7 +81,7 @@ fn freeze_authority_is_handed_down_by_grant() {
         .resolve_cap_name("budget")
         .expect("the child's budget");
     assert!(
-        child.admit_detached_spawn(window(own)).is_some(),
+        child.admit_detached_spawn(window(own)).is_ok(),
         "so the durable child may spawn detached children of its own"
     );
 
@@ -89,8 +89,9 @@ fn freeze_authority_is_handed_down_by_grant() {
         .spawn_detached_child(&[], 1 << 16, window(budget), -1, false)
         .expect("spawn");
     let own = bare.resolve_cap_name("budget").expect("the child's budget");
-    assert!(
-        bare.admit_detached_spawn(window(own)).is_none(),
+    assert_eq!(
+        bare.admit_detached_spawn(window(own)),
+        Err(SpawnRefusal::Authority),
         "without the grant it holds none, and its detached spawn is refused"
     );
 }

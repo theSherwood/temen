@@ -5,8 +5,8 @@
 //! binary: the pool is the process's, and tests in one binary share their process.
 
 use temen_interp::{
-    maps_pool, reserved_pool, Host, Lease, RootWindow, SpawnPlan, MAPS_PER_DOMAIN, MAPS_PER_VCPU,
-    WINDOW_RUNS,
+    maps_pool, reserved_pool, Host, Lease, RootWindow, SpawnPlan, SpawnRefusal, MAPS_PER_DOMAIN,
+    MAPS_PER_VCPU, WINDOW_RUNS,
 };
 
 /// The address space a window of the default reservation holds of the pool.
@@ -48,8 +48,9 @@ fn the_pool_refuses_every_window_past_it_and_takes_back_what_ends() {
     let budget = spawner.grant_budget(-1, -1, -1);
     let mut roots: Vec<Host> = std::iter::from_fn(hold).collect();
     assert_eq!(roots.len() as u64, slots, "the pool holds its windows");
-    assert!(
-        spawner.admit_detached_spawn(lease(budget)).is_none(),
+    assert_eq!(
+        spawner.admit_detached_spawn(lease(budget)),
+        Err(SpawnRefusal::Room),
         "a full pool refuses a detached spawn, though its budget is unbounded"
     );
     assert!(

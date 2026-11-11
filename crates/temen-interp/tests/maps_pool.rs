@@ -6,7 +6,7 @@
 //! their process.
 
 use temen_interp::{
-    maps_pool, Host, Lease, RootWindow, MAPS_PER_DOMAIN, MAPS_PER_VCPU, WINDOW_RUNS,
+    maps_pool, Host, Lease, RootWindow, SpawnRefusal, MAPS_PER_DOMAIN, MAPS_PER_VCPU, WINDOW_RUNS,
 };
 
 /// A detached spawn's lease on `budget` for a 64 KiB window.
@@ -28,7 +28,7 @@ fn the_pool_refuses_what_no_grant_does_and_takes_back_what_ends() {
     let mut spawner = Host::new();
     let budget = spawner.grant_budget(-1, -1, -1);
     assert!(
-        spawner.admit_detached_spawn(lease(budget)).is_some(),
+        spawner.admit_detached_spawn(lease(budget)).is_ok(),
         "an empty pool admits"
     );
     // Runs whose roots hold the rest: an activation's mappings are its embedder's choice, held past
@@ -49,13 +49,14 @@ fn the_pool_refuses_what_no_grant_does_and_takes_back_what_ends() {
         (pool - per_root) / per_root,
         "the pool holds as many roots as fit beside the spawner's child"
     );
-    assert!(
-        spawner.admit_detached_spawn(lease(budget)).is_none(),
+    assert_eq!(
+        spawner.admit_detached_spawn(lease(budget)),
+        Err(SpawnRefusal::Room),
         "a full pool refuses, though the budget is unbounded"
     );
     drop(roots);
     assert!(
-        spawner.admit_detached_spawn(lease(budget)).is_some(),
+        spawner.admit_detached_spawn(lease(budget)).is_ok(),
         "the runs that ended handed their mappings back"
     );
 }

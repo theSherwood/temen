@@ -20,7 +20,7 @@ use temen_interp::{bytecode, run_with_host, Host, Trap, Value};
 use temen_ir::SpawnRec;
 use temen_text::parse_module;
 
-use temen_ir::errno::EINVAL;
+use temen_ir::errno::EBADF;
 
 /// A record spawn (the spawn record [`rec_with_impl_export`] appends at 17536) plus a **pager-shaped
 /// export** (a pager-capable module). The record's pager field is runtime data, so admission is by
@@ -163,7 +163,7 @@ fn a_pager_capable_record_module_runs_where_children_are_served() {
     );
 }
 
-/// A dangling budget handle refuses the detached spawn probeably (`-EINVAL`) on both engines,
+/// A dangling budget handle refuses the detached spawn probeably (`-EBADF`, #2864) on both engines,
 /// natively: a spawn record's `budget` must name a `Budget` (anything else refuses). This test pinned
 /// `CapFault` while its record spawned `module = -1` from a host that registered no program: the
 /// module failed to resolve before the budget was looked at (#2219).
@@ -176,7 +176,7 @@ fn dangling_budget_handle_refuses_the_detached_spawn_on_both_engines() {
     let c_tw = h_tw.grant_module(&image);
     let args_tw = [Value::I32(i_tw), Value::I64(99), Value::I32(c_tw)];
     let r_tw = tw(&src, &args_tw, &mut h_tw);
-    assert_eq!(r_tw, Ok(vec![Value::I64(EINVAL)]), "oracle");
+    assert_eq!(r_tw, Ok(vec![Value::I64(EBADF)]), "oracle");
 
     let mut h_bc = Host::new();
     let i_bc = h_bc.grant_instantiator();

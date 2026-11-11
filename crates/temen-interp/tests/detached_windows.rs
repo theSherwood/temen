@@ -273,7 +273,11 @@ fn a_forged_minter_refuses_probeably() {
         &mut host,
     )
     .expect("run — refusal, not a trap");
-    assert_eq!(r, vec![Value::I64(-22)], "-EINVAL, probeable");
+    assert_eq!(
+        r,
+        vec![Value::I64(temen_ir::errno::EBADF)],
+        "-EBADF, probeable: the record's budget is not a `Budget` (#2864)"
+    );
 }
 
 /// A detached child that parks on an anonymous futex word in **its own** window (offset 32768) with

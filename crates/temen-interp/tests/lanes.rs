@@ -149,7 +149,7 @@ block 0 (v0: i64) {
 /// then: spawn with lane 2 (fits a cap of 2), spawn with lane 1 (Σ 3 > 2: refused, charges nothing),
 /// join the first (its lane returns), spawn with lane 1 (fits). Each spawn reads its own spawn record,
 /// at 17408, 17536 and 17664, paid from its sub-budget. Returns
-/// `100·(c1 ≥ 0) + 10·(c2 == -EINVAL) + (c3 ≥ 0)`, so the expected answer is `111`.
+/// `100·(c1 ≥ 0) + 10·(c2 == -EAGAIN) + (c3 ≥ 0)`, so the expected answer is `111`.
 fn sigma() -> String {
     let child = SpawnRec {
         size_log2: 12,
@@ -188,9 +188,9 @@ block 0 (v0: i32, v1: i32, v2: i32) {{
   vrp3 = i64.const 17664
   vc3 = call.cap 6 17 (i64) -> (i32) v0 (vrp3)
   vzero = i32.const 0
-  veinval = i32.const -22
+  veagain = i32.const -11
   vok1 = i32.ge_s vc1 vzero
-  vref2 = i32.eq vc2 veinval
+  vref2 = i32.eq vc2 veagain
   vok3 = i32.ge_s vc3 vzero
   v100 = i32.const 100
   v10 = i32.const 10
@@ -211,7 +211,7 @@ block 0 (v0: i32, v1: i32, v2: i32) {{
 
 /// **The grant-time Σ and the reap credit**, on the tree-walk oracle: a parent with cap 2 can hold
 /// children whose lanes sum to 2, is refused a third that would make 3, and gets the lane back when a
-/// child is joined. The refusal is a value (`-EINVAL`) and charges nothing — the refused sub-budget's
+/// child is joined. The refusal is a value (`-EAGAIN`, #2864) and charges nothing — the refused sub-budget's
 /// `mem` is intact, so the third spawn can use a fresh one.
 #[test]
 fn a_parents_granted_lanes_may_not_exceed_its_cap_and_a_reaped_child_returns_its_lane() {

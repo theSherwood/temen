@@ -21,7 +21,12 @@ use detached::{
 };
 use std::sync::Mutex;
 use temen_interp::{cap_id, run_with_host, Host, MemLayout, Trap, Value};
-use temen_ir::SpawnRec;
+use temen_ir::{SpawnRec, SpawnRefusal};
+
+/// What a refused spawn answers when its budget cannot pay (#2864).
+const NO_ROOM: i64 = SpawnRefusal::Room.errno();
+/// What a durable spawner's spawn of a module it cannot freeze answers (#2864).
+const NOT_FREEZABLE: i64 = SpawnRefusal::Module.errno();
 use temen_jit::{compile_and_run_capture_reserved_with_host_ex, GrantChild, JitOutcome};
 
 /// "hello-de" as a little-endian i64 — the word the child reads at `args_base + 8`.
@@ -313,12 +318,12 @@ fn a_detached_child_is_one_spawn_of_its_budget_on_the_jit() {
     let refused = module(&parent(false));
     assert_eq!(
         interp_result(&refused, spawn_host(&c, 0)),
-        Ok(vec![Value::I64(-22)]),
+        Ok(vec![Value::I64(NO_ROOM)]),
         "interpreter, a spawn-0 budget"
     );
     assert_eq!(
         jit_outcome(&refused, spawn_host(&c, 0)),
-        JitOutcome::Returned(vec![-22]),
+        JitOutcome::Returned(vec![NO_ROOM]),
         "the JIT, a spawn-0 budget"
     );
     let twice = module(&spawn_join_spawn());
@@ -569,18 +574,21 @@ fn two_interleaved_detached_spawns_each_get_their_own_lane_and_budget() {
         assert_eq!(built, 1, "the build trapped {:?}", vm.ended());
         gc
     };
-    // SAFETY: as above.
-    let lanes = unsafe {
-        [
-            (hooks.budget_mem_take)(ctx, a, WINDOW, temen_ir::WINDOW_RUNS),
-            (hooks.budget_mem_take)(ctx, b, WINDOW, temen_ir::WINDOW_RUNS),
-        ]
+    let take = |budget: i32| -> (i64, i64) {
+        let mut lane = 0i64;
+        // SAFETY: as above; `lane` is writable.
+        let taken = unsafe {
+            (hooks.budget_mem_take)(ctx, budget, WINDOW, temen_ir::WINDOW_RUNS, &mut lane)
+        };
+        (taken, lane)
     };
+    let (ta, tb) = (take(a), take(b));
     assert_eq!(
-        lanes,
-        [1, 2],
+        (ta, tb),
+        ((0, 1), (0, 2)),
         "both admitted, with their lanes, before either is built"
     );
+    let lanes = [ta.1, tb.1];
     let (ca, cb) = (build(a, lanes[0]), build(b, lanes[1]));
     let room = |gc: &GrantChild| -> i64 {
         // SAFETY: `gc.ctx` is the child powerbox cell the build filled, not yet released.
@@ -623,8 +631,8 @@ fn two_interleaved_detached_spawns_each_get_their_own_lane_and_budget() {
 fn an_exhausted_minter_refuses_probeably_on_both_backends() {
     let p = module(&parent(false));
     let c = module(CHILD);
-    assert_eq!(run_interp(&p, &c, (1 << 16) - 1), -22);
-    assert_eq!(run_jit(&p, &c, (1 << 16) - 1), -22);
+    assert_eq!(run_interp(&p, &c, (1 << 16) - 1), NO_ROOM);
+    assert_eq!(run_jit(&p, &c, (1 << 16) - 1), NO_ROOM);
 }
 
 /// #2268 — a detached spawn's admission reserves its child's mappings — its domain's, its first
@@ -669,8 +677,12 @@ block 0 (v0: i32, v1: i32, v2: i32) {{
         ))
     };
     let short = parent(lease - 1);
-    assert_eq!(run_interp(&short, &c, 1 << 16), -22, "interp: one short");
-    assert_eq!(run_jit(&short, &c, 1 << 16), -22, "jit: one short");
+    assert_eq!(
+        run_interp(&short, &c, 1 << 16),
+        NO_ROOM,
+        "interp: one short"
+    );
+    assert_eq!(run_jit(&short, &c, 1 << 16), NO_ROOM, "jit: one short");
     let enough = parent(lease);
     let (i, j) = (
         run_interp(&enough, &c, 1 << 16),
@@ -782,7 +794,7 @@ block 0 (v0: i32, v1: i32, v2: i32) {{
 /// detached children — when it holds freeze authority over its detached progeny (#1440) and the module
 /// is attested freezable (#1501) — and its freeze captures them (`temen`'s `durable_detached_jit.rs`).
 /// This pins the refusal half across the third engine: an **un-attested** module is refused on both,
-/// probeably (`-EINVAL`), charging nothing. (The admission half, on the oracle and the resumable engine,
+/// probeably (`-ENOEXEC`, #2864), charging nothing. (The admission half, on the oracle and the resumable engine,
 /// is `temen-interp`'s `durable_detached_parity.rs`.)
 #[test]
 fn a_durable_detached_spawn_of_an_unattested_module_declines_the_same_way_on_both_backends() {
@@ -790,7 +802,7 @@ fn a_durable_detached_spawn_of_an_unattested_module_declines_the_same_way_on_bot
     let c = module(CHILD);
 
     // Native JIT tier, through the embedder's path (`jit_cap_run`, which installs the grant hooks): the
-    // same `-EINVAL`, from the same rule — `mod_durable_ok` — before the budget is charged.
+    // same `-ENOEXEC`, from the same rule — `mod_durable_ok` — before the budget is charged.
     {
         let (mut host, h) = host(&c, 1 << 16);
         host.set_durable(true);
@@ -810,15 +822,15 @@ fn a_durable_detached_spawn_of_an_unattested_module_declines_the_same_way_on_bot
             JitOutcome::Returned(ref v) => v.first().copied().unwrap_or(-1),
             ref o => panic!("jit ended abnormally: {o:?}"),
         };
-        assert_eq!(r, -22, "native jit: EINVAL, not a trap");
+        assert_eq!(r, NOT_FREEZABLE, "native jit: ENOEXEC, not a trap");
         assert!(
             host.budget_mem_take(h[2], 1 << 16),
             "native jit: the refusal charged the budget nothing"
         );
     }
 
-    // Interpreter tier: the same answer, byte for byte. `-22` is `-EINVAL`, matching the native thunk
-    // above — and it is a *value*, so the run completes and the guest could have handled it.
+    // Interpreter tier: the same answer, byte for byte, matching the native thunk above — and it is a
+    // *value*, so the run completes and the guest could have handled it.
     {
         let (mut host, h) = host(&c, 1 << 16);
         host.set_durable(true);
@@ -836,9 +848,9 @@ fn a_durable_detached_spawn_of_an_unattested_module_declines_the_same_way_on_bot
             other => panic!("unexpected interp result {other:?}"),
         };
         assert_eq!(
-            slot, -22,
+            slot, NOT_FREEZABLE,
             "interp must give the native JIT's answer for the same module (INVARIANTS #9): \
-             -EINVAL, not an admission"
+             -ENOEXEC, not an admission"
         );
         // And, like the native thunk, it charges nothing — the gate sits before the quota take, so the
         // guest keeps the budget for something it *is* allowed to do.
@@ -1530,7 +1542,7 @@ fn an_empty_grant_admits_a_child_on_the_jit_as_on_the_interpreter() {
     let c = module(CHILD_IMPORTS_EXIT);
     let empty = temen_interp::GRANT_EMPTY;
     for (grants, want) in [
-        (vec![], -22),
+        (vec![], temen_ir::SpawnRefusal::Unbound.errno()),
         (vec![("exit", empty)], 42),
         (vec![("*", empty)], 42),
         (vec![("ex*", empty)], 42),

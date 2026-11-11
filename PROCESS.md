@@ -521,8 +521,12 @@ object, and *who holds authority over its backing* is the whole visibility story
   refuses outright (a detached window is outside the subtree snapshot — fail closed;
   multi-window freeze stays O6). **Live offers work detached** — `child_offer` +
   caller parking link through the powerbox Arc, not the window — so private memory and
-  live coordination compose. JIT/bytecode answer the probeable `-EINVAL` refusal (the
-  op-14 precedent). Pinned by `temen-interp/tests/detached_windows.rs`: detached
+  live coordination compose. Every engine answers a refusal with its cause's own code,
+  from one table (`temen_ir::SpawnRefusal`, #2864): `-EINVAL` for a record the module's
+  window cannot hold, `-ENOEXEC` for a module that cannot run as the child, `-EPERM` for a
+  durable spawner without freeze authority, `-EBADF` for a budget that is not a `Budget`,
+  `-EAGAIN` for lanes the spawner cannot grant, `-ENOMEM` for no room, and `-ENOENT` for an
+  import no grant binds. Pinned by `temen-interp/tests/detached_windows.rs`: detached
   serve/park/reply round-trip (142), the side-by-side attest report (nested 257 vs
   detached 1), quota exhaustion, forged-budget refusal. **Folded into `Budget.mem` (R2, done):**
   the standalone `WindowMinter` capability and its side table are **retired** — the spawn's budget is a

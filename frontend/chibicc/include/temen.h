@@ -36,7 +36,12 @@ long __vm_resolve(const char *name, long len);
 //
 // **Spawning a §5 detached child** (`Instantiator` op 17): lay a `struct vm_spawn_rec` in your own
 // memory and pass its address to `__vm_instantiate_rec`, which returns the child handle (join it with
-// `__vm_instantiate_join`) or -errno. Start from `VM_SPAWN_REC_INIT`, every field at its "none" value,
+// `__vm_instantiate_join`) or -errno, a code for each refusal (#2864, `temen_ir::SpawnRefusal`):
+// -EINVAL a window the module does not declare, a payload past the args region, or a `region` the
+// window does not hold; -ENOEXEC a module that cannot run as the child; -EPERM a durable spawner
+// without freeze authority; -EBADF a `budget` that is not a Budget; -EAGAIN lanes the spawner cannot
+// grant; -ENOMEM no room for the window; -ENOENT an import of the child's that no grant binds.
+// A refused spawn charges nothing. Start from `VM_SPAWN_REC_INIT`, every field at its "none" value,
 // and set what you use. `module`, a `Module` the host granted you — another program, built to run as
 // a child — runs from its function 0 in a fresh window of `1 << size_log2` bytes (0: its declared
 // memory) minted from `budget`, which also bounds the child's fuel. `region`, a SharedRegion of
@@ -70,7 +75,7 @@ long __vm_instantiate_rec(int inst, long rec);
 long __vm_instantiate_join(int inst, long child, long *status);
 // A grant record is `{u32 name_off, u32 name_len, i32 handle, u32 flags}`, the name a string in your
 // window. A child binds its imports strictly: one that no record satisfies refuses the spawn
-// (-EINVAL), and the run's notes name it. `VM_EMPTY` as a record's handle grants nothing under the
+// (-ENOENT), and the run's notes name it. `VM_EMPTY` as a record's handle grants nothing under the
 // name, so the child's import of that name binds empty and faults if called: you leave it out on
 // purpose. The name may also be `*`, every import nothing else satisfies, or a prefix ending in `*`
 // (`vm_jit_*`), and only an empty grant may use one (#2219).

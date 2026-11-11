@@ -357,7 +357,12 @@ fn the_instantiator_row_by_route() {
     };
     // (op, the arity that reaches its lowering arm, what the base module answers).
     for (op, argc, base_says) in [
-        (17u32, 1usize, Verdict::Answered(-22)),
+        // A record naming no `Budget` (#2864).
+        (
+            17u32,
+            1usize,
+            Verdict::Answered(temen_ir::SpawnRefusal::Budget.errno()),
+        ),
         (14, 2, Verdict::Answered(-22)),
         (1, 1, Verdict::Trapped("ThreadFault".into())),
     ] {
