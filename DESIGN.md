@@ -2365,6 +2365,19 @@ for its store for 20 µs before it sleeps, the JIT's live-call watch: a stream's
 lands in that time, and on a lone core the yield lets the writer fill the pipe first. Pinned in
 `temen-interp/tests/threads_idle.rs` (an idle run's threads stay asleep) and `pipe_wakers_tests`.
 
+**A round costs what the run runs, not what it has run (#2229, 2026-11-11).** A task's index is its
+handle, and a finished task keeps its slot, where a joiner or a reaper reads its result. The pump's
+and executor 2's rules walked that whole table about a dozen times a round, so a run that spawns a
+task per unit of work was quadratic: a loop that spawns and joins a thread took 372 µs an iteration
+at 16,000 iterations on the pump. The rules walk a live list now (`Tasks`), in index order, so the
+pump's round-robin pick and every scan meet tasks in the order they did. A task that has ended stays
+in the list until a round's rules have seen it, since several look for one (a domain's last, a twin
+to hook, a lease to refund), then leaves it with its frames (`Tasks::prune`). The tasks that ended in
+a trap are listed apart for the teardown. The loop now costs the same at every n: ~1.3 µs an
+iteration on the pump, ~57 µs on executor 2, which starts a thread per task. The debug scheduler
+keeps its full scans: it never prunes, so its inspection still reads where an ended thread stopped.
+Pinned in `tasks_tests`.
+
 Pinned constraints (tests in `temen/tests/host_park.rs`, `temen-run/tests/fast_cap.rs`): a parkable
 registration is **never** `fast_cap_resolver`-claimed; **sync ops never pay for parkable ops'
 existence** — no completion id, no table touch unless a handler already returned `Offload`
