@@ -20873,8 +20873,9 @@ pub trait SharedBacking: Send + Sync {
     /// (`Arc`), so writes go through `&self`.
     fn write_byte(&self, off: u64, b: u8);
     /// Copy region-relative `[off, off + buf.len())` into `buf`: `false`, copying nothing, when the
-    /// range is not inside the region. How the interpreter copies an aliased page in one go
-    /// (#2962); a backing that holds its bytes flat overrides it with one copy.
+    /// range is not inside the region. How the interpreter copies an aliased page, and a host
+    /// servicer a message region, in one go (#2962); a backing that holds its bytes flat overrides
+    /// it with one copy.
     fn copy_out(&self, off: u64, buf: &mut [u8]) -> bool {
         if !region_range_ok(self.size(), off, buf.len()) {
             return false;
@@ -29944,6 +29945,32 @@ impl Host {
         })
     }
 
+    /// #2111 — a fresh, zeroed `len`-byte region this domain makes, charged to its node and every
+    /// ancestor while it lives: its bytes of `channel`, all or nothing (`-ENOMEM` when a level lacks
+    /// the room), or past every ceiling when `granted` — the embedder's grant of a capability's
+    /// message region (#2962), state it chose to hand over, as a [`HostCharge`] payer's is — though
+    /// never past the process's pools. A guest's `create_region` and a host servicer's region at
+    /// grant both make theirs here. #2306 — a backing the host cannot make is the errno, its charge
+    /// handed back.
+    pub fn mint_region(&self, len: usize, granted: bool) -> Result<RegionBacking, i64> {
+        let cost = region_cost(len as u64, len as u64);
+        let fits = if granted { Fits::Pool } else { Fits::All };
+        if !self.budgets.add(self.own_budget, &cost, fits) {
+            return Err(ENOMEM);
+        }
+        match self.new_region(len) {
+            Ok(backing) => Ok(Arc::new(ChargedRegion {
+                backing,
+                node: self.own_node(),
+                bytes: len as u64,
+            })),
+            Err(errno) => {
+                self.budgets.refund_set(self.own_budget, &cost);
+                Err(errno)
+            }
+        }
+    }
+
     /// #2306 — a fresh, zeroed backing of `len` bytes for a §13 region: the embedder's factory (OS
     /// shared memory under the JIT, [`Self::set_region_factory`]), else the heap. `Err`, the errno,
     /// when the one it uses refuses: the OS, the process's descriptor pool, or an allocation the host
@@ -33710,9 +33737,10 @@ impl Host {
     }
 
     /// Resolve a handle as a §13 `SharedRegion` and return its backing (an `Arc` clone — the same
-    /// shared object). Used by the eval loop's cross-domain `grant` (SharedRegion op 4); a forged /
-    /// closed / wrong-type handle is a `CapFault`.
-    fn resolve_region(&self, handle: i32) -> Result<RegionBacking, Trap> {
+    /// shared object). Used by the eval loop's cross-domain `grant` (SharedRegion op 4), and by an
+    /// embedder reaching a region it granted (#2962); a forged / closed / wrong-type handle is a
+    /// `CapFault`.
+    pub fn resolve_region(&self, handle: i32) -> Result<RegionBacking, Trap> {
         match self.resolve(handle, cap_id::SHARED_REGION)? {
             Binding::SharedRegion(id) => self.region(id).cloned().ok_or(Trap::CapFault),
             _ => Err(Trap::CapFault),
@@ -36251,24 +36279,10 @@ impl Host {
                     if len <= 0 || len > MAX_MINTED_REGION {
                         return put_results(out, &[EINVAL]);
                     }
-                    let cost = region_cost(len as u64, len as u64);
-                    if !self.budgets.add(self.own_budget, &cost, Fits::All) {
-                        return put_results(out, &[ENOMEM]);
-                    }
-                    // #2306 — a backing the host cannot make is the guest's errno, its charge
-                    // handed back.
-                    let backing = match self.new_region(len as usize) {
+                    let backing = match self.mint_region(len as usize, false) {
                         Ok(backing) => backing,
-                        Err(errno) => {
-                            self.budgets.refund_set(self.own_budget, &cost);
-                            return put_results(out, &[errno]);
-                        }
+                        Err(errno) => return put_results(out, &[errno]),
                     };
-                    let backing: RegionBacking = Arc::new(ChargedRegion {
-                        backing,
-                        node: self.own_node(),
-                        bytes: len as u64,
-                    });
                     // Guest-minting: a full handle table yields -EMFILE, never a panic (§3c / audit
                     // #1); the region goes with the refusal, and its charge with it.
                     return put_results(

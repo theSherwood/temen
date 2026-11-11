@@ -4,6 +4,9 @@
 //! backend and a `scripted_exec` table seeded with the same entry (the guest cannot tell which
 //! served it). Un-granted, resolve stays negative and the guest's fallback runs; an allowlist
 //! miss is a refused op (negative return), never a trap.
+//!
+//! #2962 — every byte crosses the `"exec.msg"` message region the grant brings: the consumer maps
+//! it, writes its argv and stdin there, and reads the output there.
 
 use std::sync::Arc;
 use temen_run::exec::{domain_exec, host_exec, scripted_exec, DomainProgram, ScriptedEntry};
@@ -12,41 +15,88 @@ use temen_run::{
 };
 use temen_text::parse_module;
 
-/// The consumer: resolves `"exec"`, runs `echo hi` (argv `"echo\0hi"` — the separator byte at
-/// 16396 is fresh-memory zero), reads the output into 16416.., echoes it to the granted `out`
-/// stream (the cross-backend byte observable), and exits with `status * 100 + nread` — 3 iff the
-/// run produced `hi\n` and exit 0. All window addresses sit above the #1094 NULL guard (16384).
-const EXEC_CONSUMER: &str = "\
-memory 16
-data 16384 \"exec\"
-data 16392 \"echo\"
-data 16397 \"hi\"
-import 0 \"out\" (i64, i64) -> (i64)
-import 1 \"exit\" (i32) -> ()
-func 0 () -> () {
-block 0 () {
-  vp = i64.const 16384
-  vl = i64.const 4
-  vh = self.resolve vp vl
-  vap = i64.const 16392
-  val = i64.const 7
-  vz = i64.const 0
-  vjob = call.cap 13 0 (i64, i64, i64, i64) -> (i64) vh (vap, val, vz, vz)
-  vbuf = i64.const 16416
+/// Where the consumer maps the message region: the window's upper half (`memory 17`), page-aligned
+/// for every host's mapping granularity.
+const MSG_AT: u64 = 65536;
+
+/// A consumer: resolves `"exec"` and `"exec.msg"`, maps the region at [`MSG_AT`], copies its
+/// payload there (`argv`, NUL-separated, then `stdin`), and `run`s it. When `report`, it reads up to
+/// 16 bytes of output into the region, echoes them to the granted `out` stream (the cross-backend
+/// byte observable), and exits with `status * 100 + nread`; otherwise it exits 1 iff the `run` came
+/// back negative. The payload is staged in data segments above the #1094 NULL guard (16384), one
+/// per token, the separators fresh-memory zero.
+fn consumer(argv: &[&str], stdin: &str, report: bool) -> String {
+    let mut data = String::new();
+    let mut at = 0usize;
+    for t in argv {
+        data += &format!("data {} \"{t}\"\n", 16416 + at);
+        at += t.len() + 1;
+    }
+    let argv_len = at - 1;
+    if !stdin.is_empty() {
+        data += &format!("data {} \"{stdin}\"\n", 16416 + argv_len);
+    }
+    let payload = argv_len + stdin.len();
+    let tail = if report {
+        format!(
+            "  vread = i64.const 1
   vcap = i64.const 16
-  vn = call.cap 13 1 (i64, i64, i64) -> (i64) vh (vjob, vbuf, vcap)
-  vs = call.cap 13 3 (i64) -> (i64) vh (vjob)
-  vw = call.import 0 (vbuf, vn)
+  vn = call.cap 13 0 (i64, i64, i64, i64) -> (i64) vh (vread, vjob, vz, vcap)
+  vst = i64.const 3
+  vs = call.cap 13 0 (i64, i64, i64, i64) -> (i64) vh (vst, vjob, vz, vz)
+  vw = call.import 0 (vwin, vn)
   vhund = i64.const 100
   vmul = i64.mul vs vhund
   vsum = i64.add vmul vn
   vcode = i32.wrap_i64 vsum
-  call.import 1 (vcode)
+  call.import 1 (vcode)"
+        )
+    } else {
+        "  vfailed = i64.lt_s vjob vz
+  call.import 1 (vfailed)"
+            .to_string()
+    };
+    format!(
+        "memory 17
+data 16384 \"exec\"
+data 16392 \"exec.msg\"
+{data}import 0 \"out\" (i64, i64) -> (i64)
+import 1 \"exit\" (i32) -> ()
+func 0 () -> () {{
+block 0 () {{
+  vp = i64.const 16384
+  vl = i64.const 4
+  vh = self.resolve vp vl
+  vmp = i64.const 16392
+  vml = i64.const 8
+  vmsg = self.resolve vmp vml
+  vwin = i64.const {MSG_AT}
+  vz = i64.const 0
+  vlen = i64.const 65536
+  vprot = i32.const 3
+  vmapped = call.cap 4 0 (i64, i64, i64, i32) -> (i64) vmsg (vwin, vz, vlen, vprot)
+  vsrc = i64.const 16416
+  vpay = i64.const {payload}
+  mem.copy vwin vsrc vpay
+  vrun = i64.const 0
+  val = i64.const {argv_len}
+  vsl = i64.const {stdin_len}
+  vjob = call.cap 13 0 (i64, i64, i64, i64) -> (i64) vh (vrun, vz, val, vsl)
+{tail}
   unreachable
-  }
-}
+  }}
+}}
 export 0 func \"_start\" 0
-";
+",
+        stdin_len = stdin.len(),
+    )
+}
+
+/// The `echo hi` consumer, which exits `status * 100 + nread`: 3 iff the run produced `hi\n` and
+/// exit 0.
+fn echo_consumer() -> String {
+    consumer(&["echo", "hi"], "", true)
+}
 
 fn registry() -> Imports {
     Imports::new()
@@ -67,7 +117,7 @@ fn echo_table() -> Vec<ScriptedEntry> {
 /// embedders grant. `echo hi` → `hi\n` + exit 0, on all three backends.
 #[test]
 fn scripted_exec_runs_echo_identically_on_all_three_backends() {
-    let m = parse_module(EXEC_CONSUMER).expect("parse");
+    let m = parse_module(&echo_consumer()).expect("parse");
     let inst = instantiate_with_imports(m, registry()).expect("instantiate");
     for backend in [Backend::TreeWalk, Backend::Bytecode, Backend::Jit] {
         let r = inst
@@ -88,7 +138,7 @@ fn scripted_exec_runs_echo_identically_on_all_three_backends() {
 #[cfg(unix)]
 #[test]
 fn host_exec_matches_scripted_byte_for_byte() {
-    let m = parse_module(EXEC_CONSUMER).expect("parse");
+    let m = parse_module(&echo_consumer()).expect("parse");
     let inst = instantiate_with_imports(m, registry()).expect("instantiate");
     for backend in [Backend::TreeWalk, Backend::Bytecode, Backend::Jit] {
         let r = inst
@@ -139,7 +189,7 @@ fn echo_domain_registry() -> Vec<DomainProgram> {
 /// no way to tell them apart: the one-interface decision, pinned end to end.
 #[test]
 fn domain_exec_matches_scripted_byte_for_byte() {
-    let m = parse_module(EXEC_CONSUMER).expect("parse");
+    let m = parse_module(&echo_consumer()).expect("parse");
     let inst = instantiate_with_imports(m, registry()).expect("instantiate");
     for backend in [Backend::TreeWalk, Backend::Bytecode, Backend::Jit] {
         let r = inst
@@ -180,42 +230,6 @@ block 0 () {
 export 0 func \"_start\" 0
 ";
 
-/// The consumer for the cat test: runs `cat` with stdin `yo` (argv at 16392, the payload at
-/// 16400), reads the job's output, and echoes it to the granted `out` stream; exits status*100 + n.
-/// All window addresses sit above the #1094 NULL guard (16384).
-const CAT_CONSUMER: &str = "\
-memory 16
-data 16384 \"exec\"
-data 16392 \"cat\"
-data 16400 \"yo\"
-import 0 \"out\" (i64, i64) -> (i64)
-import 1 \"exit\" (i32) -> ()
-func 0 () -> () {
-block 0 () {
-  vp = i64.const 16384
-  vl = i64.const 4
-  vh = self.resolve vp vl
-  vap = i64.const 16392
-  val = i64.const 3
-  vsp = i64.const 16400
-  vsl = i64.const 2
-  vjob = call.cap 13 0 (i64, i64, i64, i64) -> (i64) vh (vap, val, vsp, vsl)
-  vbuf = i64.const 16416
-  vcap = i64.const 16
-  vn = call.cap 13 1 (i64, i64, i64) -> (i64) vh (vjob, vbuf, vcap)
-  vs = call.cap 13 3 (i64) -> (i64) vh (vjob)
-  vw = call.import 0 (vbuf, vn)
-  vhund = i64.const 100
-  vmul = i64.mul vs vhund
-  vsum = i64.add vmul vn
-  vcode = i32.wrap_i64 vsum
-  call.import 1 (vcode)
-  unreachable
-  }
-}
-export 0 func \"_start\" 0
-";
-
 #[test]
 fn stdin_flows_into_the_child_domain() {
     let cat = parse_module(CAT_DOMAIN).expect("parse cat domain");
@@ -224,7 +238,7 @@ fn stdin_flows_into_the_child_domain() {
         instance: Arc::new(instantiate(cat).expect("instantiate cat domain")),
         limits: Limits::default(),
     }];
-    let m = parse_module(CAT_CONSUMER).expect("parse");
+    let m = parse_module(&consumer(&["cat"], "yo", true)).expect("parse");
     let inst = instantiate_with_imports(m, registry()).expect("instantiate");
     for backend in [Backend::TreeWalk, Backend::Bytecode, Backend::Jit] {
         let r = inst
@@ -266,33 +280,9 @@ fn a_trapping_domain_program_is_a_failed_run_not_a_trap() {
         instance: Arc::new(instantiate(boom).expect("instantiate boom")),
         limits: Limits::default(),
     }];
-    // The allowlist-miss consumer runs `cat hi`, which this registry doesn't have — reuse it
-    // with a `boom` entry instead: probe that running `boom`'s trap comes back negative.
-    let m = parse_module(
-        "memory 16\n\
-         data 16384 \"exec\"\n\
-         data 16392 \"boom\"\n\
-         import 0 \"exit\" (i32) -> ()\n\
-         func 0 () -> () {\n\
-         block 0 () {\n\
-           vp = i64.const 16384\n\
-           vl = i64.const 4\n\
-           vh = self.resolve vp vl\n\
-           vap = i64.const 16392\n\
-           val = i64.const 4\n\
-           vz = i64.const 0\n\
-           vjob = call.cap 13 0 (i64, i64, i64, i64) -> (i64) vh (vap, val, vz, vz)\n\
-           vzero = i64.const 0\n\
-           vfailed = i64.lt_s vjob vzero\n\
-           call.import 0 (vfailed)\n\
-           unreachable\n\
-           }\n\
-         }\n\
-         export 0 func \"_start\" 0\n",
-    )
-    .expect("parse");
-    let inst =
-        instantiate_with_imports(m, Imports::new().provide("exit", HostCap::exit())).expect("inst");
+    // Probe that running `boom`'s trap comes back negative.
+    let m = parse_module(&consumer(&["boom"], "", false)).expect("parse");
+    let inst = instantiate_with_imports(m, registry()).expect("inst");
     for backend in [Backend::TreeWalk, Backend::Bytecode, Backend::Jit] {
         let r = inst
             .run_with_caps(
@@ -353,34 +343,8 @@ fn ungranted_exec_resolves_negative_and_the_fallback_runs() {
 /// table with no `cat` entry, so the refusal shape does not reveal the backend either.
 #[test]
 fn a_program_outside_the_allowlist_is_refused_not_trapped() {
-    // argv "cat\0hi": "cat" at 16392..16394, fresh-zero separator at 16395, "hi" at 16396..16397,
-    // len 6 — all above the #1094 NULL guard (16384).
-    let m = parse_module(
-        "memory 16\n\
-         data 16384 \"exec\"\n\
-         data 16392 \"cat\"\n\
-         data 16396 \"hi\"\n\
-         import 0 \"exit\" (i32) -> ()\n\
-         func 0 () -> () {\n\
-         block 0 () {\n\
-           vp = i64.const 16384\n\
-           vl = i64.const 4\n\
-           vh = self.resolve vp vl\n\
-           vap = i64.const 16392\n\
-           val = i64.const 6\n\
-           vz = i64.const 0\n\
-           vjob = call.cap 13 0 (i64, i64, i64, i64) -> (i64) vh (vap, val, vz, vz)\n\
-           vzero = i64.const 0\n\
-           vrefused = i64.lt_s vjob vzero\n\
-           call.import 0 (vrefused)\n\
-           unreachable\n\
-           }\n\
-         }\n\
-         export 0 func \"_start\" 0\n",
-    )
-    .expect("parse");
-    let inst =
-        instantiate_with_imports(m, Imports::new().provide("exit", HostCap::exit())).expect("inst");
+    let m = parse_module(&consumer(&["cat", "hi"], "", false)).expect("parse");
+    let inst = instantiate_with_imports(m, registry()).expect("inst");
     for (name, cap) in [
         ("host_exec", host_exec(&["echo"])),
         ("scripted_exec", scripted_exec(echo_table())),

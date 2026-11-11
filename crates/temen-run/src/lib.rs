@@ -5626,7 +5626,7 @@ unsafe fn mapped_atomic(
 }
 
 /// #2962 — `[off, off + n)` of a host mapping of a region (`base`, `len` bytes), or `None` when the
-/// range is not inside it: how a region is copied a page at a time (#2962). The guest may write
+/// range is not inside it: how a region is copied in one go (#2962). The guest may write
 /// the region meanwhile (it is shared), so the bytes are whatever is there, as a host procedure's read
 /// of a window is.
 ///
