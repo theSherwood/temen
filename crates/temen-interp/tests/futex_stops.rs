@@ -12,6 +12,11 @@
 //!   still end the run at once, not at some later settle: in a run its opener watches, and in one
 //!   whose opener runs the root, as a browser's Worker does, which nothing watches until a park
 //!   starts a watcher. Such a run takes no futex stop without a settle.
+//! - **Between an embedder's pumps.** A run its embedder pumps goes on between the pumps, and then
+//!   nothing watches it: a kill rung then ends its threads at their next stop, as before #2963, not
+//!   at the next pump. A door stop ends the run itself, pumped or not.
+//!
+//! The tests share [`bytecode::thread_wakes`], a process-wide count, so they take turns.
 //!
 //! Each run is on a thread of its own, and a test that waits too long fails instead of hanging.
 
@@ -19,8 +24,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use temen_interp::bytecode::{self, ThreadPlatform};
+use temen_interp::bytecode::{self, CoopEvent, CoopRun, ThreadPlatform};
 use temen_interp::{Host, SignalSource, Trap, Value};
+
+/// One test at a time: [`threads_stop`] reads a count every thread of the process adds to.
+static SERIAL: Mutex<()> = Mutex::new(());
+
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 /// How long a run may take to end before the test gives up on it rather than hang.
 const GIVE_UP: Duration = Duration::from_secs(30);
@@ -182,6 +194,7 @@ fn run(
 /// thread still waiting, and there is no verdict.
 #[test]
 fn the_last_park_of_two_mutual_waits_is_the_verdict_and_a_timed_one_moves() {
+    let _turn = serial();
     for opener in OPENERS {
         let rx = run(&mutual_wait(-1), Vec::new(), opener, |_| {});
         let r = rx
@@ -206,6 +219,7 @@ fn the_last_park_of_two_mutual_waits_is_the_verdict_and_a_timed_one_moves() {
 /// A stop through the run's door ends two threads that make only futex stops at once.
 #[test]
 fn a_stop_ends_a_futex_pingpong_at_once() {
+    let _turn = serial();
     for opener in OPENERS {
         let door = Arc::new(bytecode::RunDoor::default());
         let stop = Arc::clone(&door);
@@ -265,6 +279,7 @@ impl SignalSource for KillOnDemand {
 /// task finalized. Before #2963 the next futex stop's own settle found it.
 #[test]
 fn a_kill_ends_a_futex_pingpong_at_once() {
+    let _turn = serial();
     for opener in OPENERS {
         let source = Arc::new(KillOnDemand::default());
         let src = Arc::clone(&source);
@@ -289,4 +304,112 @@ fn a_kill_ends_a_futex_pingpong_at_once() {
             "the kill took {took:?} (opener runs root: {opener})"
         );
     }
+}
+
+/// Whether the run's threads have stopped waking within [`PROMPT`]: two looks at
+/// [`bytecode::thread_wakes`] [`QUIET`] apart that agree. A pingpong wakes thousands of times in
+/// that span.
+fn threads_stop() -> bool {
+    let until = Instant::now() + PROMPT;
+    let mut last = bytecode::thread_wakes();
+    while Instant::now() < until {
+        std::thread::sleep(QUIET);
+        let now = bytecode::thread_wakes();
+        if now == last {
+            return true;
+        }
+        last = now;
+    }
+    false
+}
+
+/// How long the run's threads must stay asleep for [`threads_stop`] to call them stopped.
+const QUIET: Duration = Duration::from_millis(200);
+
+/// An endless pingpong its embedder pumps (`CoopRun::new_parallel`), over a host `setup` arms, on a
+/// thread of its own. Its first pump returns once the door's wake hands it control back
+/// (`Paused`); it pumps again when the test says so, and sends what that pump returned.
+fn pumped(
+    setup: impl FnOnce(&mut Host) + Send + 'static,
+) -> (
+    Arc<bytecode::RunDoor>,
+    std::sync::mpsc::Sender<()>,
+    std::sync::mpsc::Receiver<CoopEvent>,
+) {
+    let m = temen_text::parse_module(PINGPONG).expect("parse");
+    temen_verify::verify_module(&m).expect("verify");
+    let door = Arc::new(bytecode::RunDoor::default());
+    let (go, pump) = std::sync::mpsc::channel::<()>();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let ours = Arc::clone(&door);
+    std::thread::spawn(move || {
+        let mut host = Host::new();
+        host.set_run_door(ours);
+        setup(&mut host);
+        let reserved = temen_ir::default_reserved_log2();
+        let args = [Value::I32(FOREVER)];
+        let mut run =
+            CoopRun::new_parallel(&m, 0, &args, u64::MAX, host, &[], reserved, None, true)
+                .expect("executor 2 runs it")
+                .expect("the run opens");
+        let _ = tx.send(run.run());
+        if pump.recv().is_ok() {
+            let _ = tx.send(run.run());
+        }
+    });
+    // Let the pingpong start, then hand the pumping thread control back.
+    std::thread::sleep(Duration::from_millis(100));
+    while !door.wake() {
+        std::thread::yield_now();
+    }
+    let first = rx
+        .recv_timeout(GIVE_UP)
+        .expect("the wake handed control back");
+    assert!(
+        matches!(first, CoopEvent::Paused),
+        "the wake handed back control"
+    );
+    (door, go, rx)
+}
+
+/// #2963 — between an embedder's pumps nothing watches the run, so its futex stops settle: a kill
+/// its signal source rings for then ends its threads at once, not at the next pump. Its next pump
+/// hears the end.
+#[test]
+fn a_kill_between_an_embedders_pumps_ends_its_threads_at_once() {
+    let _turn = serial();
+    let source = Arc::new(KillOnDemand::default());
+    let src = Arc::clone(&source);
+    let (_door, go, rx) = pumped(move |h| {
+        h.arm_external_wake();
+        h.set_signal_source(src, Arc::new(AtomicBool::new(false)));
+    });
+    source.kill();
+    assert!(
+        threads_stop(),
+        "the killed pingpong ran on between pumps: nothing settled on the kill's ring"
+    );
+    go.send(()).unwrap();
+    let end = rx.recv_timeout(GIVE_UP).expect("the next pump returned");
+    assert!(
+        matches!(end, CoopEvent::Trapped(Trap::ThreadFault)),
+        "the kill ended the run"
+    );
+}
+
+/// A door stop between an embedder's pumps ends the run itself, as it does pumped or not.
+#[test]
+fn a_stop_between_an_embedders_pumps_ends_its_threads_at_once() {
+    let _turn = serial();
+    let (door, go, rx) = pumped(|_| {});
+    while !door.stop() {
+        std::thread::yield_now();
+    }
+    assert!(threads_stop(), "the stopped pingpong ran on between pumps");
+    go.send(()).unwrap();
+    let end = rx.recv_timeout(GIVE_UP).expect("the next pump returned");
+    assert!(
+        matches!(end, CoopEvent::Trapped(Trap::OutOfFuel)),
+        "the stop ended the run"
+    );
 }
