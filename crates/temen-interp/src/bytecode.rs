@@ -17373,6 +17373,14 @@ struct Threads {
     /// call through the queue, by activation: the caller's, which waits on the answer. An activation
     /// has no thread of its own; one the embedder calls runs on the embedder's thread.
     carriers: std::collections::BTreeMap<usize, usize>,
+    /// #2948 spike, #2868 prototype — the tasks parked in a native task's futex wait, by key, oldest
+    /// first, when the tier asks for it ([`NativeTier::keyed_futex`]). An index over
+    /// `TaskState::BlockedWait`, which stays the state: an entry whose task no longer waits on its
+    /// key (a timeout, a rule's wake, the run's end) is stale and skipped.
+    futex_index: std::collections::HashMap<super::FutexKey, std::collections::VecDeque<usize>>,
+    /// #2868 prototype — how many task threads are asleep in a park ([`Park::asleep`]): a keyed wait
+    /// that leaves every thread asleep settles the run, for its deadlock verdict.
+    asleep_n: usize,
 }
 
 /// Where a task's thread waits while the task is parked ([`ThreadRun::park`]).
@@ -17461,6 +17469,7 @@ impl Threads {
     /// Wake task `j`'s thread when the lock is let go ([`release`]).
     fn rouse(&mut self, j: usize) {
         let park = &mut self.parks[j];
+        self.asleep_n -= usize::from(park.asleep);
         park.asleep = false;
         self.woken.push(std::sync::Arc::clone(&park.signal));
     }
@@ -17657,6 +17666,9 @@ pub struct NativeTier {
     pub on_end: std::sync::Arc<dyn Fn() + Send + Sync>,
     /// The tier's own run state, for its [`ThreadTier::run`] to find ([`EmittedCall::native`]).
     pub state: std::sync::Arc<dyn std::any::Any + Send + Sync>,
+    /// #2868 prototype: a native task's futex wait and notify go through a per-key queue and wake
+    /// only their waiters, with no settle and no wake scan ([`ThreadRun::keyed_futex`]).
+    pub keyed_futex: bool,
 }
 
 /// #2948 spike — a §12 op native emitted code makes, applied by the run's rules as an interpreted
@@ -18043,6 +18055,8 @@ impl ThreadRun {
                 stalled: false,
                 told: Vec::new(),
                 carriers: std::collections::BTreeMap::new(),
+                futex_index: std::collections::HashMap::new(),
+                asleep_n: 0,
             }),
             start: (platform.now_ns)(),
             platform,
@@ -18343,8 +18357,17 @@ impl BounceTask<'_> {
         }
         std::mem::swap(&mut *g.core.tasks[ti].vm, self.vm);
         g.core.tasks[ti].vm.native = Some([Reg::default(); 2]);
-        let (made, _) = run.apply(&mut g, ti, Ok(stop), *self.exits);
-        g = start_tasks(run, g, made);
+        let keyed = (run.platform.tier.as_ref())
+            .and_then(|t| t.native.as_ref())
+            .is_some_and(|n| n.keyed_futex);
+        let stop = match keyed {
+            true => run.keyed_futex(&mut g, ti, stop),
+            false => Some(stop),
+        };
+        if let Some(stop) = stop {
+            let (made, _) = run.apply(&mut g, ti, Ok(stop), *self.exits);
+            g = start_tasks(run, g, made);
+        }
         let runs = loop {
             let next;
             (g, next) = run.await_runnable(g, ti, false);
@@ -18712,12 +18735,94 @@ impl ThreadRun {
         };
         let ran = (tier.run)(&mut call);
         let (results, work, fault) = (call.results, call.work, call.fault);
-        drop(bounce);
         let mem = mem.into_inner();
         if let (Err(Trap::MemoryFault), Some(rel), Some(m)) = (&ran, fault, mem.as_ref()) {
             m.report_fault_rel(rel);
         }
         ran.map(|()| (results, work))
+    }
+
+    /// #2948 spike, #2868 prototype — apply a native task's futex `stop` through the per-key queue
+    /// ([`Threads::futex_index`]): a wait parks the task as the wait rule does and queues it under its
+    /// key; a notify wakes up to `count` of its key's queue, oldest first, and rouses their threads.
+    /// Neither settles the run nor scans its tasks. Hands back any other stop for the rules.
+    fn keyed_futex(&self, g: &mut Threads, ti: usize, stop: VcpuStop) -> Option<VcpuStop> {
+        let env = g.core.tasks[ti].domain;
+        match stop {
+            VcpuStop::Wait {
+                base,
+                expected,
+                width,
+                timeout,
+                dst,
+            } => {
+                let clock = self.now();
+                let mem = g.core.domains[env].mem.as_ref();
+                wait_task(
+                    &mut g.core.tasks,
+                    ti,
+                    mem,
+                    clock,
+                    base,
+                    expected,
+                    width,
+                    timeout,
+                    dst,
+                );
+                if let TaskState::BlockedWait { addr, site, .. } = g.core.tasks[ti].state {
+                    let key = site_key_in(mem, addr, site);
+                    g.futex_index.entry(key).or_default().push_back(ti);
+                    // Every other thread asleep: the run may be deadlocked, which a settle decides.
+                    if g.asleep_n + 1 >= g.live {
+                        self.settle(g);
+                        self.wake(g);
+                    }
+                }
+                None
+            }
+            VcpuStop::Notify { base, count, dst } => {
+                let key = futex_key_in(g.core.domains[env].mem.as_ref(), base);
+                let (mut woken, want) = (0u32, count as u32);
+                let Threads {
+                    core,
+                    futex_index,
+                    parks,
+                    woken: rouse,
+                    asleep_n,
+                    ..
+                } = g;
+                if let Some(q) = futex_index.get_mut(&key) {
+                    while woken < want {
+                        let Some(j) = q.pop_front() else { break };
+                        let t = &mut core.tasks[j];
+                        let TaskState::BlockedWait {
+                            addr, site, dst, ..
+                        } = t.state
+                        else {
+                            continue;
+                        };
+                        let win = core.domains[t.domain].mem.as_ref();
+                        if site_key_in(win, addr, site) != key {
+                            continue;
+                        }
+                        t.deliver(dst, Reg::from_i32(super::WAIT_WOKEN));
+                        t.state = TaskState::Runnable;
+                        woken += 1;
+                        if let Some(p) = parks.get_mut(j).filter(|p| p.asleep) {
+                            p.asleep = false;
+                            *asleep_n -= 1;
+                            rouse.push(std::sync::Arc::clone(&p.signal));
+                        }
+                    }
+                    if q.is_empty() {
+                        futex_index.remove(&key);
+                    }
+                }
+                core.tasks[ti].deliver(dst, Reg::from_i32(woken as i32));
+                None
+            }
+            other => Some(other),
+        }
     }
 
     /// Ring the run's bell: its watcher looks at the run.
@@ -19158,6 +19263,7 @@ impl ThreadRun {
             }
         }
         g.parks[ti].asleep = true;
+        g.asleep_n += 1;
         let signal = std::sync::Arc::clone(&g.parks[ti].signal);
         let left = until.map(|at| std::time::Duration::from_nanos(at.saturating_sub(self.now())));
         // A pipe park looks for its store a moment before it sleeps: a stream's next write
@@ -19179,7 +19285,10 @@ impl ThreadRun {
         }
         let mut g = self.state.lock_unpoisoned();
         let park = &mut g.parks[ti];
+        let roused = !park.asleep;
         park.asleep = false;
+        g.asleep_n -= usize::from(!roused);
+        let park = &mut g.parks[ti];
         // A store into a pipe it waits on woke it: its settle re-admits the task.
         let fired = park.fired();
         park.listen = None;

@@ -81,6 +81,8 @@
 //! `--reps 5` (best-of, to stabilise the comparison); plain/`--csv` use one pass for speed.
 
 mod threads;
+// #2948 spike measurements (`--kernel-spike`).
+mod kernel_spike;
 
 use std::cell::RefCell;
 use std::ffi::c_void;
@@ -2729,6 +2731,10 @@ fn main() {
 
     // `--threads`: the concurrency comparison (Temen native thread.spawn vs Wasmtime+wasi-threads on the
     // same bytes) instead of the per-kernel compute table.
+    if args.iter().any(|a| a == "--kernel-spike") {
+        kernel_spike::run(if reps > 1 { reps as usize } else { 7 });
+        return;
+    }
     if args.iter().any(|a| a == "--threads") {
         threads::run(&engine, if reps > 1 { reps as usize } else { 5 });
         return;

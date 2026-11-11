@@ -236,9 +236,24 @@ fn on_cranelift(
             other => panic!("unexpected argument {other:?}"),
         })
         .collect();
+    let trap = |t: Trap| End::Trap(format!("{t:?}"));
+    // #2948 spike: under `TEMEN_JIT_KERNEL=1`, a program that spawns threads, and is in the spike's
+    // scope, runs its vCPUs as executor 2's tasks.
+    let spawns = m.funcs.iter().any(|f| f.uses_concurrency_besides_wait());
+    if temen_run::jit_kernel::enabled() && spawns {
+        if let Some(r) = temen_run::jit_kernel::run(m, 0, &args, reserved_log2, &mut host, None) {
+            let end = match r {
+                Ok(v) => match v[..] {
+                    [x] => End::Value(x),
+                    _ => End::Stuck(format!("returned {v:?}")),
+                },
+                Err(t) => trap(t),
+            };
+            return (end, None, host);
+        }
+    }
     let table = host.jit_table_log2();
     let run = temen_run::jit_cap_run(m, 0, &args, window, reserved_log2, table, &mut host, None);
-    let trap = |t: Trap| End::Trap(format!("{t:?}"));
     match run {
         Ok((temen_jit::JitOutcome::Returned(v), snap)) => match v[..] {
             [x] => (End::Value(x), Some(snap), host),

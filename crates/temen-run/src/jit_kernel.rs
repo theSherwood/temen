@@ -33,6 +33,15 @@ pub fn vcpus() -> u64 {
     VCPUS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// #2868 prototype, for attribution: whether the runs this process opens next queue their native
+/// futex waits by key ([`set_keyed`]), as `TEMEN_SPIKE_KEYED=1` does.
+static KEYED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// [`KEYED`].
+pub fn set_keyed(on: bool) {
+    KEYED.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Whether the spike path is switched on (`TEMEN_JIT_KERNEL=1`).
 pub fn enabled() -> bool {
     std::env::var_os("TEMEN_JIT_KERNEL").is_some_and(|v| v == "1")
@@ -48,14 +57,24 @@ pub fn run(
     host: &mut Host,
     kill: Option<&Arc<temen_jit::Interrupt>>,
 ) -> Option<Result<Vec<i64>, Trap>> {
-    if host.is_durable() || m.funcs.iter().any(temen_ir::Func::uses_fibers) {
+    if host.is_durable() {
         return None;
     }
-    let f = m.funcs.get(entry as usize)?;
-    if f.params.len() != args.len() {
+    let cm = compile(m, entry, reserved_log2, kill)?;
+    run_compiled(cm, m, entry, args, host, kill)
+}
+
+/// The spike's compile of `m` for [`run_compiled`]: `None` when `m` is outside its scope.
+pub fn compile(
+    m: &Module,
+    entry: u32,
+    reserved_log2: u8,
+    kill: Option<&Arc<temen_jit::Interrupt>>,
+) -> Option<CompiledModule> {
+    if m.funcs.iter().any(temen_ir::Func::uses_fibers) {
         return None;
     }
-    let cm = CompiledModule::compile(
+    CompiledModule::compile(
         m,
         entry,
         crate::cap_thunk_locked,
@@ -68,7 +87,23 @@ pub fn run(
         None,
         0,
     )
-    .ok()?;
+    .ok()
+}
+
+/// [`run`] over `cm`, `m`'s [`compile`] for `entry` with `kill`: one run, which takes the compile
+/// (its window is the run's).
+pub fn run_compiled(
+    cm: CompiledModule,
+    m: &Module,
+    entry: u32,
+    args: &[i64],
+    host: &mut Host,
+    kill: Option<&Arc<temen_jit::Interrupt>>,
+) -> Option<Result<Vec<i64>, Trap>> {
+    let f = m.funcs.get(entry as usize)?;
+    if f.params.len() != args.len() || host.is_durable() {
+        return None;
+    }
     let kr = Arc::new(KernelRun::new(cm)?);
     let (base, reserved) = kr.window();
     // SAFETY: the JIT window outlives the run: `kr` is held by the platform's tier, which the host
@@ -90,7 +125,13 @@ pub fn run(
             modules: None,
             leaf: Some(Arc::new(|offer| offer.module == 0)),
             run: tier_run,
-            native: Some(NativeTier { on_end, state }),
+            native: Some(NativeTier {
+                on_end,
+                state,
+                // #2868 prototype, for attribution only: `TEMEN_SPIKE_KEYED=1`.
+                keyed_futex: KEYED.load(std::sync::atomic::Ordering::Relaxed)
+                    || std::env::var_os("TEMEN_SPIKE_KEYED").is_some_and(|v| v == "1"),
+            }),
         }),
         // The root runs on the caller's thread, as the JIT's does.
         root_on_opener: true,
