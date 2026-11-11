@@ -302,6 +302,8 @@ pub fn run(reps: usize) {
             };
             let mut lanes = [
                 ("today", today(&m, crate::dispatch_host().0, false)),
+                // What today's JIT pays for the same call in a program that spawns.
+                ("today-lock", today(&m, crate::dispatch_host().0, true)),
                 ("spike", spike(&m, || crate::dispatch_host().0, false)),
             ];
             per_iter(
@@ -329,22 +331,28 @@ pub fn run(reps: usize) {
             let m = t.module;
             let mut a: Vec<f64> = Vec::new();
             let mut b: Vec<f64> = Vec::new();
-            let mut cm = CompiledModule::compile(
-                &m,
-                entry,
-                temen_jit::INERT_CAP_THUNK,
-                std::ptr::null_mut(),
-                RESERVED,
-                None,
-                None,
-                None,
-                None,
-                None,
-                0,
-            )
-            .expect("compile");
+            let compile = || {
+                CompiledModule::compile(
+                    &m,
+                    entry,
+                    temen_jit::INERT_CAP_THUNK,
+                    std::ptr::null_mut(),
+                    RESERVED,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    0,
+                )
+                .expect("compile")
+            };
             let want = (nw as i64) * (steps as i64);
             for _ in 0..reps {
+                // A fresh, untimed compile per run, as the spike's: a module run again traps
+                // `ThreadFault` in `thread.spawn` once enough earlier runs spawned on it, on
+                // today's JIT.
+                let mut cm = compile();
                 let t0 = Instant::now();
                 let (out, _) = cm.run(&[], None, None).expect("run");
                 a.push(t0.elapsed().as_secs_f64() * 1e3);
@@ -369,6 +377,10 @@ pub fn run(reps: usize) {
                 sb.0 / sa.0
             );
         }
+    }
+    // Off unless asked for: `SPIKE_SECTIONS=pairs`.
+    if on("pairs") && !only.is_empty() {
+        run_pairs(reps);
     }
     if !on("park") {
         return;
@@ -409,3 +421,161 @@ pub fn run(reps: usize) {
         );
     }
 }
+
+/// The run-lock probe ([`PAIRS_IR`], `SPIKE_SECTIONS=pairs`): `p` independent pingpong pairs, each
+/// on a turn word of its own a cache line apart, so nothing but the runtime's own locks couples
+/// them. Per pair, a hand-off costs what it does alone if the runtime runs unrelated hand-offs in
+/// parallel, and up to `p` times that if one lock serializes them.
+pub fn run_pairs(reps: usize) {
+    println!("\nrun lock: P independent pingpong pairs at once (us per hand-off, per pair):");
+    let m = parse(PAIRS_IR);
+    for p in [1i64, 2, 4] {
+        let mut lanes = vec![
+            ("today", today(&m, Host::new(), true)),
+            ("spike+kq", spike(&m, Host::new, true)),
+        ];
+        let args = move |n| vec![n, p];
+        per_iter(
+            &format!("P = {p}"),
+            &mut lanes,
+            args,
+            (100, 5_100),
+            2.0,
+            reps,
+            1e3,
+            "us",
+        );
+    }
+}
+
+/// [`run_pairs`]'s program: `func 0 (n, p)` spawns `p` pairs (`func 1` and `func 2`, each taking
+/// `n` turns on pair `i`'s word) and joins them.
+const PAIRS_IR: &str = r#"memory 16
+func (i64, i64) -> (i64) {
+block 0 (vn: i64, vp: i64) {
+  vz = i64.const 0
+  br 1(vn, vp, vz)
+}
+block 1 (vn1: i64, vp1: i64, vi1: i64) {
+  vlt1 = i64.lt_u vi1 vp1
+  br_if vlt1 2(vn1, vp1, vi1) 3(vp1)
+}
+block 2 (vn2: i64, vp2: i64, vi2: i64) {
+  va2 = thread.spawn 1 vn2 vi2
+  vb2 = thread.spawn 2 vn2 vi2
+  vbase2 = i64.const 24576
+  vsz2 = i64.const 16
+  voff2 = i64.mul vi2 vsz2
+  vslot2 = i64.add vbase2 voff2
+  i32.store vslot2 va2
+  veight2 = i64.const 8
+  vslotb2 = i64.add vslot2 veight2
+  i32.store vslotb2 vb2
+  vone2 = i64.const 1
+  vin2 = i64.add vi2 vone2
+  br 1(vn2, vp2, vin2)
+}
+block 3 (vp3: i64) {
+  vz3 = i64.const 0
+  br 4(vp3, vz3)
+}
+block 4 (vp4: i64, vj4: i64) {
+  vlt4 = i64.lt_u vj4 vp4
+  br_if vlt4 5(vp4, vj4) 6()
+}
+block 5 (vp5: i64, vj5: i64) {
+  vbase5 = i64.const 24576
+  vsz5 = i64.const 16
+  voff5 = i64.mul vj5 vsz5
+  vslot5 = i64.add vbase5 voff5
+  vha5 = i32.load vslot5
+  vsa5, vra5 = thread.join vha5
+  veight5 = i64.const 8
+  vslotb5 = i64.add vslot5 veight5
+  vhb5 = i32.load vslotb5
+  vsb5, vrb5 = thread.join vhb5
+  vone5 = i64.const 1
+  vjn5 = i64.add vj5 vone5
+  br 4(vp5, vjn5)
+}
+block 6 () {
+  vr6 = i64.const 0
+  return vr6
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vn: i64, vx: i64) {
+  vbase = i64.const 16448
+  vsz = i64.const 64
+  voff = i64.mul vx vsz
+  vt = i64.add vbase voff
+  vz = i64.const 0
+  br 1(vn, vt, vz)
+}
+block 1 (vn1: i64, vt1: i64, vi1: i64) {
+  vlt1 = i64.lt_u vi1 vn1
+  br_if vlt1 2(vn1, vt1, vi1) 4(vi1)
+}
+block 2 (vn2: i64, vt2: i64, vi2: i64) {
+  vcur2 = i32.atomic.load vt2
+  vone2 = i32.const 1
+  veq2 = i32.eq vcur2 vone2
+  br_if veq2 3(vn2, vt2, vi2) 5(vn2, vt2, vi2)
+}
+block 3 (vn3: i64, vt3: i64, vi3: i64) {
+  vone3 = i32.const 1
+  vinf3 = i64.const -1
+  vs3 = i32.atomic.wait vt3 vone3 vinf3
+  br 2(vn3, vt3, vi3)
+}
+block 4 (vr4: i64) {
+  return vr4
+}
+block 5 (vn5: i64, vt5: i64, vi5: i64) {
+  vone5 = i32.const 1
+  i32.atomic.store vt5 vone5
+  vw5 = atomic.notify vt5 vone5
+  vinc5 = i64.const 1
+  vin5 = i64.add vi5 vinc5
+  br 1(vn5, vt5, vin5)
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vn: i64, vx: i64) {
+  vbase = i64.const 16448
+  vsz = i64.const 64
+  voff = i64.mul vx vsz
+  vt = i64.add vbase voff
+  vz = i64.const 0
+  br 1(vn, vt, vz)
+}
+block 1 (vn1: i64, vt1: i64, vi1: i64) {
+  vlt1 = i64.lt_u vi1 vn1
+  br_if vlt1 2(vn1, vt1, vi1) 4(vi1)
+}
+block 2 (vn2: i64, vt2: i64, vi2: i64) {
+  vcur2 = i32.atomic.load vt2
+  vz2 = i32.const 0
+  veq2 = i32.eq vcur2 vz2
+  br_if veq2 3(vn2, vt2, vi2) 5(vn2, vt2, vi2)
+}
+block 3 (vn3: i64, vt3: i64, vi3: i64) {
+  vz3 = i32.const 0
+  vinf3 = i64.const -1
+  vs3 = i32.atomic.wait vt3 vz3 vinf3
+  br 2(vn3, vt3, vi3)
+}
+block 4 (vr4: i64) {
+  return vr4
+}
+block 5 (vn5: i64, vt5: i64, vi5: i64) {
+  vz5 = i32.const 0
+  i32.atomic.store vt5 vz5
+  vone5 = i32.const 1
+  vw5 = atomic.notify vt5 vone5
+  vinc5 = i64.const 1
+  vin5 = i64.add vi5 vinc5
+  br 1(vn5, vt5, vin5)
+  }
+}
+"#;
