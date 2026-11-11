@@ -721,12 +721,6 @@ pub mod durable_abi {
 /// | 48 | `i32` region | pre-mapped `SharedRegion` (−1 = none) |
 /// | 52 | `u32` | padding, must be 0 |
 /// | 56 | `u64` child_off | where the region maps in the child |
-/// #744 — a grant record's `handle` naming the spawner's **own** impl-export `i` as a live offer
-/// served by the spawner's serve loop: `GRANT_SERVE_LIVE_TAG | i`. Part of the record ABI a guest
-/// writes, so it lives beside [`SpawnRec`]; `temen_interp::GRANT_SERVE_LIVE_TAG` documents how each
-/// engine honors it.
-pub const GRANT_SERVE_LIVE_TAG: u32 = 0x8000_0000;
-
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct SpawnRec {
     /// Window size as a power-of-two shift count; the driver validates it against `0..64` (offset 0).
@@ -748,6 +742,12 @@ pub struct SpawnRec {
     /// The region's offset in the child's window (offset 56).
     pub child_off: u64,
 }
+
+/// #744 — a grant record's `handle` naming the spawner's **own** impl-export `i` as a live offer
+/// served by the spawner's serve loop: `GRANT_SERVE_LIVE_TAG | i`. Part of the record ABI a guest
+/// writes, so it lives beside [`SpawnRec`]; `temen_interp::GRANT_SERVE_LIVE_TAG` documents how each
+/// engine honors it.
+pub const GRANT_SERVE_LIVE_TAG: u32 = 0x8000_0000;
 
 /// The byte length of a [`SpawnRec`].
 pub const SPAWN_REC_LEN: usize = 64;
