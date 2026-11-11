@@ -383,38 +383,16 @@ block 4 (vr: i64, vho: i32) {
 
 #[test]
 fn clone_caller_forks_the_caller_into_a_twin_that_returns_the_second_reply() {
-    let m = module(&forking(SRC_TWIN));
-    let mut host = Host::new();
-    let ih = host.grant_instantiator();
-    let hb = host.grant_budget(-1, 8 << 20, -1);
-    let sink = host.shared_stdout(); // promote stdout to a shared sink the twin inherits
-    let out_h = host.grant_stream(StreamRole::Out);
-    let [sm, cm] = images(&mut host, &m, [1, 4]);
-    let mut fuel = 40_000_000u64;
-    let r = run_with_host(
-        &m,
-        0,
-        &[Value::I32(ih), Value::I32(out_h), Value::I32(hb), sm, cm],
-        &mut fuel,
-        &mut host,
-    )
-    .expect("run");
+    let (r, vals) = run_forking(SRC_TWIN, false);
     // The run's result is the ORIGINAL caller's reply (reply_orig = 100), joined back through C.
     assert_eq!(
         r,
-        vec![Value::I64(100)],
+        Ok(vec![Value::I64(100)]),
         "the original caller resumes past the fork call with reply_orig (100)"
     );
     // The shared stdout carries BOTH replies — the twin resumed the same continuation with reply_twin
     // (200) over its own private window and duplicated powerbox. The original reaped the twin before
     // returning (I53), so both writes are on the sink deterministically; order is scheduler-dependent.
-    let bytes = sink.lock().unwrap_or_else(|e| e.into_inner()).to_vec();
-    assert_eq!(bytes.len(), 16, "two i64 writes reached the shared sink");
-    let mut vals: Vec<i64> = bytes
-        .chunks_exact(8)
-        .map(|c| i64::from_le_bytes(c.try_into().unwrap()))
-        .collect();
-    vals.sort();
     assert_eq!(
         vals,
         vec![100, 200],
@@ -429,30 +407,46 @@ fn clone_caller_forks_the_caller_into_a_twin_that_returns_the_second_reply() {
 /// twin's continuation is the caller's `Vm` cloned at its post-call resume point over a private
 /// window (`Mem::fork_private`) + duplicated powerbox (`Host::fork_powerbox`); the parent `wait`s
 /// the twin (`reap`) so its stdout write is observed deterministically before teardown.
-fn run_src_twin_oracle() -> (Vec<Value>, Vec<u8>) {
-    let m = module(&forking(SRC_TWIN));
+/// A fork program's run on the tree-walker, the oracle, with direct handoff on or off: its result,
+/// and the values its copies wrote to the shared stdout, sorted, since the twin and the original
+/// write in either order. Its powerbox is every fork test's: the Instantiator, `stdout` (a shared
+/// sink the twin inherits), a budget, and the child images of the server S (func 1) and the caller
+/// C (func 4).
+fn run_forking(src: &str, handoff: bool) -> (Result<Vec<Value>, temen_interp::Trap>, Vec<i64>) {
+    let m = module(&forking(src));
     let mut host = Host::new();
+    host.set_handoff(handoff);
     let ih = host.grant_instantiator();
     let hb = host.grant_budget(-1, 8 << 20, -1);
     let sink = host.shared_stdout();
     let out_h = host.grant_stream(StreamRole::Out);
     let [sm, cm] = images(&mut host, &m, [1, 4]);
-    let mut fuel = 40_000_000u64;
+    let mut fuel = 60_000_000u64;
     let r = run_with_host(
         &m,
         0,
         &[Value::I32(ih), Value::I32(out_h), Value::I32(hb), sm, cm],
         &mut fuel,
         &mut host,
-    )
-    .expect("oracle run");
-    let bytes = sink.lock().unwrap_or_else(|e| e.into_inner()).to_vec();
-    (r, bytes)
+    );
+    let vals = written(&sink.lock().unwrap_or_else(|e| e.into_inner()));
+    (r, vals)
+}
+
+/// The i64s a shared stdout holds, sorted.
+fn written(bytes: &[u8]) -> Vec<i64> {
+    let mut vals: Vec<i64> = bytes
+        .chunks_exact(8)
+        .map(|c| i64::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    vals.sort();
+    vals
 }
 
 #[test]
 fn bytecode_forks_the_twin_identically_to_the_oracle() {
-    let (oracle_r, oracle_bytes) = run_src_twin_oracle();
+    let (oracle_r, oracle_vals) = run_forking(SRC_TWIN, false);
+    let oracle_r = oracle_r.expect("oracle run");
 
     // The bytecode engine must run the fork module NATIVELY (`Some`) — a fold would return `None`.
     let m = module(&forking(SRC_TWIN));
@@ -472,27 +466,18 @@ fn bytecode_forks_the_twin_identically_to_the_oracle() {
     )
     .expect("the fork module runs natively on the bytecode engine (not folded to the oracle)")
     .expect("bytecode run");
-    let bc_bytes = sink.lock().unwrap_or_else(|e| e.into_inner()).to_vec();
+    let bc_vals = written(&sink.lock().unwrap_or_else(|e| e.into_inner()));
 
     assert_eq!(
         bc_r, oracle_r,
         "bytecode fork returns the oracle's value (reply_orig = 100, joined through C)"
     );
-    let sorted = |b: &[u8]| {
-        let mut v: Vec<i64> = b
-            .chunks_exact(8)
-            .map(|c| i64::from_le_bytes(c.try_into().unwrap()))
-            .collect();
-        v.sort();
-        v
-    };
     assert_eq!(
-        sorted(&bc_bytes),
-        sorted(&oracle_bytes),
+        bc_vals, oracle_vals,
         "bytecode and oracle agree on the shared sink (both replies, order-independent)"
     );
     assert_eq!(
-        sorted(&bc_bytes),
+        bc_vals,
         vec![100, 200],
         "return-twice on bytecode: original (100) + twin (200) both wrote their reply"
     );
@@ -502,7 +487,8 @@ fn bytecode_forks_the_twin_identically_to_the_oracle() {
 /// task on its own OS thread, and the run's value and both replies are the oracle's.
 #[test]
 fn the_parallel_driver_forks_the_twin_identically_to_the_oracle() {
-    let (oracle_r, oracle_bytes) = run_src_twin_oracle();
+    let (oracle_r, oracle_vals) = run_forking(SRC_TWIN, false);
+    let oracle_r = oracle_r.expect("oracle run");
     let m = module(&forking(SRC_TWIN));
     let mut host = Host::new();
     let ih = host.grant_instantiator();
@@ -522,20 +508,9 @@ fn the_parallel_driver_forks_the_twin_identically_to_the_oracle() {
     )
     .expect("the parallel driver runs the fork module");
     assert_eq!(r.expect("parallel run"), oracle_r, "the oracle's value");
-    let mut bytes: Vec<i64> = sink
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .chunks_exact(8)
-        .map(|c| i64::from_le_bytes(c.try_into().unwrap()))
-        .collect();
-    bytes.sort();
-    let mut want: Vec<i64> = oracle_bytes
-        .chunks_exact(8)
-        .map(|c| i64::from_le_bytes(c.try_into().unwrap()))
-        .collect();
-    want.sort();
     assert_eq!(
-        bytes, want,
+        written(&sink.lock().unwrap_or_else(|e| e.into_inner())),
+        oracle_vals,
         "both replies on the shared sink, as on the oracle"
     );
 }
@@ -664,38 +639,16 @@ block 5 (vpid: i64) {
 
 #[test]
 fn pid_mode_replies_the_twins_task_id_to_the_parent_and_zero_to_the_child() {
-    let m = module(&forking(SRC_FORK_PID));
-    let mut host = Host::new();
-    let ih = host.grant_instantiator();
-    let hb = host.grant_budget(-1, 8 << 20, -1);
-    let sink = host.shared_stdout();
-    let out_h = host.grant_stream(StreamRole::Out);
-    let [sm, cm] = images(&mut host, &m, [1, 4]);
-    let mut fuel = 40_000_000u64;
-    let r = run_with_host(
-        &m,
-        0,
-        &[Value::I32(ih), Value::I32(out_h), Value::I32(hb), sm, cm],
-        &mut fuel,
-        &mut host,
-    )
-    .expect("run");
+    let (r, vals) = run_forking(SRC_FORK_PID, false);
     // The original C's fork() returned the twin's TaskId (3) — the POSIX parent-sees-pid — joined
     // back through the root.
     assert_eq!(
         r,
-        vec![Value::I64(3)],
+        Ok(vec![Value::I64(3)]),
         "the original caller's fork() returns the twin's pid (TaskId 3)"
     );
     // Both copies wrote their fork() return (parent 3, child 0). The parent reaped the twin before
     // returning (I53), so the child's write is on the sink deterministically before teardown.
-    let bytes = sink.lock().unwrap_or_else(|e| e.into_inner()).to_vec();
-    assert_eq!(bytes.len(), 16, "both copies wrote their fork() return");
-    let mut vals: Vec<i64> = bytes
-        .chunks_exact(8)
-        .map(|c| i64::from_le_bytes(c.try_into().unwrap()))
-        .collect();
-    vals.sort();
     assert_eq!(
         vals,
         vec![0, 3],
@@ -833,38 +786,48 @@ block 5 () {
 
 #[test]
 fn fork_then_wait_reaps_the_twins_exit_status_through_the_shared_offer() {
-    let m = module(&forking(SRC_FORK_WAIT));
-    let mut host = Host::new();
-    let ih = host.grant_instantiator();
-    let hb = host.grant_budget(-1, 8 << 20, -1);
-    let sink = host.shared_stdout();
-    let out_h = host.grant_stream(StreamRole::Out);
-    let [sm, cm] = images(&mut host, &m, [1, 4]);
-    let mut fuel = 60_000_000u64;
-    let r = run_with_host(
-        &m,
-        0,
-        &[Value::I32(ih), Value::I32(out_h), Value::I32(hb), sm, cm],
-        &mut fuel,
-        &mut host,
-    )
-    .expect("run");
+    let (r, vals) = run_forking(SRC_FORK_WAIT, false);
     // The original C forked (pid 3), waited on it, and returned the reaped status — joined to root.
     assert_eq!(
         r,
-        vec![Value::I64(42)],
+        Ok(vec![Value::I64(42)]),
         "the parent's wait(pid) reaped the twin's exit(42)"
     );
-    // Exactly ONE write reached stdout: the parent's reaped status. The twin took the `else` branch
-    // (exit 42) and never wrote — proving the branch-on-fork-return split parent from child.
-    let bytes = sink.lock().unwrap_or_else(|e| e.into_inner()).to_vec();
+    // Exactly ONE write reached stdout: the parent's reaped status, the twin's exit code. The twin
+    // took the `else` branch (exit 42) and never wrote — proving the branch-on-fork-return split
+    // parent from child.
     assert_eq!(
-        bytes.len(),
-        8,
-        "only the parent wrote — the child exited without writing"
+        vals,
+        vec![42],
+        "only the parent wrote, and the status it reaped is the twin's exit code"
     );
-    let status = i64::from_le_bytes(bytes[..8].try_into().unwrap());
-    assert_eq!(status, 42, "the reaped status is the twin's exit code");
+}
+
+/// #2854 — **fork and wait under direct handoff.** With handoff on (`temen_run::RunConfig`'s
+/// default), a call into a provider parked at `svc.wait` runs its handler on the caller's own
+/// thread, so no caller is parked on the dispatch for `clone_caller` to fork or `reap` to wait for.
+/// A domain that can fork takes the queue instead, so each fork program answers as with handoff
+/// off. Before, the two-reply fork fell back to its single reply and C forked again until the fuel
+/// ran out, and pid mode's `fork` answered `-EAGAIN` until then.
+#[test]
+fn fork_and_wait_answer_the_same_under_direct_handoff() {
+    for (name, src, ret, wrote) in [
+        ("the two-reply fork", SRC_TWIN, 100, &[100, 200][..]),
+        ("pid mode", SRC_FORK_PID, 3, &[0, 3][..]),
+        ("fork then wait", SRC_FORK_WAIT, 42, &[42][..]),
+    ] {
+        let off = run_forking(src, false);
+        assert_eq!(
+            off,
+            (Ok(vec![Value::I64(ret)]), wrote.to_vec()),
+            "{name}, queued"
+        );
+        assert_eq!(
+            run_forking(src, true),
+            off,
+            "{name}: handoff-on ≡ handoff-off"
+        );
+    }
 }
 
 /// FORK.md §8.6 — **`waitpid(pid, WNOHANG)`**: the non-blocking poll. Same fork/wait server as

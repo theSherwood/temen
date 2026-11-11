@@ -17,7 +17,7 @@ pub mod moment;
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicU8, AtomicUsize, Ordering};
-use std::sync::{Arc, Barrier, Condvar, Mutex, RwLock, Weak};
+use std::sync::{Arc, Barrier, Condvar, Mutex, OnceLock, RwLock, Weak};
 use std::time::{Duration, Instant};
 
 use temen_ir::{
@@ -5344,6 +5344,10 @@ struct DomainTable {
     /// "Unit-own funcrefs", #2314): `ref.func N` run in the module yields slot `[N]`. `None` for a
     /// unit that names none of its own functions, whose slots hold only its entry.
     unit_ref_slots: Mutex<Vec<Option<Arc<[u32]>>>>,
+    /// #2854 — whether a unit installed here can fork a served call's caller or reap a twin
+    /// (`clone_caller`, `reap`). Set by [`Self::push_unit`], which every install takes; read by
+    /// [`Domain::forks`].
+    unit_forks: AtomicBool,
 }
 
 impl DomainTable {
@@ -5370,6 +5374,7 @@ impl DomainTable {
             units: Mutex::new(Vec::new()),
             unit_types: Mutex::new(Vec::new()),
             unit_ref_slots: Mutex::new(Vec::new()),
+            unit_forks: AtomicBool::new(false),
         }
     }
 
@@ -5393,6 +5398,7 @@ impl DomainTable {
             units: Mutex::new(self.units.lock_unpoisoned().clone()),
             unit_types: Mutex::new(self.unit_types.lock_unpoisoned().clone()),
             unit_ref_slots: Mutex::new(self.unit_ref_slots.lock_unpoisoned().clone()),
+            unit_forks: AtomicBool::new(self.unit_forks.load(Ordering::Acquire)),
         }
     }
 
@@ -5506,6 +5512,9 @@ impl DomainTable {
         unit_types: Arc<[temen_ir::TypeEntry]>,
         ref_slots: Option<Arc<[u32]>>,
     ) -> u32 {
+        if temen_ir::seams::scan_seams(unit.iter()).has_fork {
+            self.unit_forks.store(true, Ordering::Release);
+        }
         units.push(unit);
         self.unit_types.lock_unpoisoned().push(unit_types); // lockstep (#922)
         self.unit_ref_slots.lock_unpoisoned().push(ref_slots); // lockstep (#2314)
@@ -8055,7 +8064,11 @@ impl Scheduler {
         if serves(&s, callee) {
             return None;
         }
-        let host = Arc::clone(&s.resting.get(&callee)?.domain.host);
+        let resting = s.resting.get(&callee)?;
+        if resting.domain.forks() {
+            return None; // #2854: a fork or reap needs its caller parked.
+        }
+        let host = Arc::clone(&resting.domain.host);
         let d = {
             let mut h = host.lock_unpoisoned();
             let i = h.svc_queue.iter().position(|d| d.ticket == ticket)?;
@@ -8086,13 +8099,17 @@ impl Scheduler {
     /// return it so a caller can serve a just-enqueued dispatch inline by donating its thread
     /// ([`dispatch`]). `None` when no such serve loop is parked — busy mid-handler, running, or only
     /// resumers are filed here (#1815: a same-domain `cont.resume.block` resumer shares the domain
-    /// id, so the domain is no test of a serve loop) — and the caller falls
+    /// id, so the domain is no test of a serve loop), or the domain can fork its caller (#2854,
+    /// [`Domain::forks`]) — and the caller falls
     /// back to the enqueue + `svc_wake` + park transport, byte-identical. Takes exactly one serve-loop
     /// vCPU; a second parked consumer (multi-consumer serve) is left for the wake path.
     fn take_parked_serve_loop(&self, callee_id: usize) -> Option<Box<VCpu>> {
         let mut s = self.lock();
         let q = s.svc_waiters.get_mut(&callee_id)?;
         let pos = q.iter().position(|(k, _)| *k == SvcPark::Consumer)?;
+        if q[pos].1.domain.forks() {
+            return None;
+        }
         let (_, v) = q.remove(pos);
         if q.is_empty() {
             s.svc_waiters.remove(&callee_id);
@@ -13332,6 +13349,9 @@ struct Domain {
     /// (never in the child's powerbox) — the child cannot name or call it; only the fault seam does,
     /// userfaultfd-style.
     pager: Option<PagerRef>,
+    /// #2854 — whether its program can fork a served call's caller or reap a twin, found at the
+    /// first ask ([`Domain::forks`]).
+    forks: OnceLock<bool>,
 }
 
 impl Domain {
@@ -13355,7 +13375,21 @@ impl Domain {
             kill: None,
             lane_chain: Vec::new(),
             pager: None,
+            forks: OnceLock::new(),
         }
+    }
+
+    /// #2854 — whether its code can fork the caller of a call it serves or reap a twin
+    /// (`clone_caller`, `reap`; [`temen_ir::seams::Seams::has_fork`]), in its program or a unit it
+    /// installed. Both need that caller parked on the dispatch, which neither inline path has: a
+    /// handoff runs the handler on the caller's own thread. So neither serves its calls
+    /// ([`Scheduler::take_parked_serve_loop`], [`Scheduler::take_resting`]), and they take the
+    /// queue as with handoff off.
+    fn forks(&self) -> bool {
+        *self
+            .forks
+            .get_or_init(|| temen_ir::seams::scan_seams(self.funcs.iter()).has_fork)
+            || self.dt.unit_forks.load(Ordering::Acquire)
     }
 
     /// A run's root domain over `host`: [`Domain::new`], with D66 a lane chain of just its own
@@ -13386,6 +13420,7 @@ impl Domain {
             kill: None,
             lane_chain: Vec::new(),
             pager: None,
+            forks: self.forks.clone(),
         }
     }
 
@@ -13406,6 +13441,7 @@ impl Domain {
             kill: self.kill.clone(),
             lane_chain: self.lane_chain.clone(),
             pager: self.pager.clone(),
+            forks: self.forks.clone(),
         }
     }
 }

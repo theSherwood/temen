@@ -2587,7 +2587,9 @@ call, replacing "sync vs async" entirely:
 4. **`single` process provider parked at `svc.wait`** → **direct handoff**: the caller takes
    the serve op's gate and starts the handler on its own thread (the Doors / L4
    direct-process-switch shape). Handoff-served dispatches count in the callee's serve
-   accounting; handoff-on ≡ handoff-off on observable results (differentially pinned).
+   accounting; handoff-on ≡ handoff-off on observable results (differentially pinned). A provider
+   whose code can fork its caller or reap a twin (`clone_caller`, `reap`) takes arm 5 instead: both
+   need the caller parked on the dispatch (#2854).
 5. **Otherwise** (mid-handler, between serve points) → enqueue + park. On the JIT a caller whose
    park would block its thread watches the callee's bell for up to 20 µs first, having given back
    what it holds, and giving its core up between looks (#2823): a reply often comes in a few

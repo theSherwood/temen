@@ -22,7 +22,9 @@ pub struct Seams {
     pub has_timed_wait: bool,
     /// FORK.md §9 — `clone_caller` / `reap` (self-ops 11, 12): the fork servicer primitives. A
     /// distinct seam because the **bytecode** engine services them natively (its fork-serving
-    /// escape), while the Cranelift routing still folds them ([`Seams::svc_park_veto`] keeps it).
+    /// escape) while the serve qualification vetoes them ([`Seams::svc_park_veto`] keeps it). The
+    /// tree-walker never serves a call inline into a domain that has them (#2854): both need the
+    /// caller parked on the dispatch.
     pub has_fork: bool,
     /// #744 — a call whose callee is unknown until it runs: an indirect call, a dynamic-mode import,
     /// or a `call.cap` on an interface outside the built-ins that never park (a live offer parks
@@ -39,12 +41,12 @@ impl Seams {
     /// serve natively vs. decline to the tree-walk oracle. Adding a new park-capable seam means
     /// extending this one list. (INVARIANTS.md §9: one veto predicate, one definition.)
     ///
-    /// **Fork rides this veto for Cranelift** (`has_fork` is in the disjunction), so temen-run's JIT
-    /// routing still folds a forking module to the oracle — the Cranelift fork slice is unbuilt
-    /// (FORK.md §9.1). The **bytecode** engine, in contrast, services `clone_caller`/`reap` natively;
-    /// its compile gate takes its fork-serving escape past this veto (a per-backend split, the one
-    /// the two-predicate structure exists to allow — the bytecode gate and the serve qualification
-    /// legitimately diverge on fork until Cranelift catches up).
+    /// `has_fork` is in the disjunction, so a forking server is not serve-qualified. That is not
+    /// what keeps fork off the Cranelift JIT: a forking topology nests, and temen-run's serve fold
+    /// leaves a nesting module on the JIT. The JIT declines fork itself (`temen_jit::admits`,
+    /// #2553). The **bytecode** engine services `clone_caller`/`reap` natively; its compile gate
+    /// takes its fork-serving escape past this veto (a per-backend split, the one the two-predicate
+    /// structure exists to allow).
     pub fn svc_park_veto(&self) -> bool {
         self.has_svc
             && (self.has_park_seam
@@ -115,9 +117,9 @@ pub fn scan_seams<'a>(funcs: impl IntoIterator<Item = &'a Func>) -> Seams {
                         s.has_svc = true
                     }
                     // FORK.md §9 — `clone_caller` (11) / `reap` (12): the fork servicer
-                    // primitives. The bytecode engine services both natively, so they are the
-                    // `has_fork` seam — folded for Cranelift (`svc_park_veto` keeps `has_fork`)
-                    // but run natively on bytecode.
+                    // primitives, the `has_fork` seam. The bytecode engine services both natively,
+                    // the Cranelift JIT declines them, and the tree-walker serves no call inline
+                    // into a domain that has them.
                     Inst::CapCall(c)
                         if c.type_id == CAP_SELF_TYPE_ID && matches!(c.op, 11 | 12) =>
                     {
