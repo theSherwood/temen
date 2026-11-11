@@ -445,14 +445,17 @@ enum Op {
         /// The twin handle (or an errno) lands here.
         dst: u32,
     },
-    /// FORK.md §9.2 — `reap` (self-op 12): the servicer side of `wait(pid)`. From within a serve
-    /// handler, reap a twin `pid` a prior `clone_caller` minted, on behalf of the caller parked on
-    /// this dispatch — delivering the twin's exit status (now, or when it finishes). Surfaces to the
-    /// driver ([`Outcome::Reap`]), which owns the task set + the `forked_twins` allow-set. `-EINVAL`
-    /// outside a handler; `-ECHILD` for a `pid` this servicer did not mint (never a hang).
+    /// FORK.md §9.2 — `reap` (self-op 12): the servicer side of `waitpid(pid, flags)`. From within a
+    /// serve handler, reap a twin a prior `clone_caller` minted for the caller parked on this
+    /// dispatch — twin `pid`, or any for `pid == -1` — delivering its exit status (now, or when it
+    /// finishes; `0` at once under `WNOHANG` if it has not). Surfaces to the driver
+    /// ([`Outcome::Reap`]), which owns the task set + the `forked_twins` allow-set. `-EINVAL` outside a
+    /// handler; `-ECHILD` when the caller has no such twin (never a hang).
     Reap {
-        /// The `pid` arg register (`None` = no arg → an out-of-range pid → `-ECHILD`).
+        /// The `pid` arg register (`None` = no arg, any twin, as on the oracle).
         pid: Option<u32>,
+        /// The `flags` arg register (`None` = no flags).
+        flags: Option<u32>,
         dst: u32,
     },
     /// FORK.md §8.6 — `exec_module` (self-op 14): **`execve` image-replace** (#1080). The running vCPU
@@ -3354,6 +3357,7 @@ fn lower_cap_call(
         },
         (temen_ir::CAP_SELF_TYPE_ID, 12) => Op::Reap {
             pid: args.first().map(|a| g(*a)),
+            flags: args.get(1).map(|a| g(*a)),
             dst,
         },
         // CALLS.md §10.6 — `fuel.remaining` (op 13) reads the vCPU's live fuel counter, which
@@ -4671,6 +4675,7 @@ fn rebuild_detached_domain(
             fibers: FiberTables::default(),
             spawner: es.spawner,
             nested: true,
+            twin_of: None,
             children: es.children.clone(),
         };
     };
@@ -4694,6 +4699,7 @@ fn rebuild_detached_domain(
         host: host.into_cell(),
         spawner: es.spawner,
         nested: true,
+        twin_of: None,
         children: es.children.clone(),
     }
 }
@@ -6560,6 +6566,7 @@ fn dbg_start_child(
         fibers: FiberTables::default(),
         spawner: Some(spawner),
         nested: true,
+        twin_of: None,
         children: temen_ir::handles::Table::new(),
     });
     let cidx = tasks.len();
@@ -8650,6 +8657,7 @@ fn spawn_task(
         fibers: FiberTables::default(),
         spawner: None,
         nested: false,
+        twin_of: None,
         program: vt.active.module as u32,
         children: temen_ir::handles::Table::new(),
     });
@@ -9282,10 +9290,11 @@ enum Outcome {
         reply_twin: i64,
         dst: u32,
     },
-    /// FORK.md §9.2 — `reap`: reap twin `pid` on behalf of the caller parked on this handler's
-    /// dispatch ([`Outcome::Reap`]).
+    /// FORK.md §9.2 — `reap`: reap twin `pid` (any for `-1`) on behalf of the caller parked on this
+    /// handler's dispatch, not waiting for it under `WNOHANG` ([`Outcome::Reap`]).
     Reap {
         pid: i64,
+        nohang: bool,
         dst: u32,
     },
     /// FORK.md §8.6 — `exec_module` (`execve` image-replace, #1080): the running vCPU asks the driver
@@ -11449,10 +11458,11 @@ enum VcpuStop {
         reply_twin: i64,
         dst: u32,
     },
-    /// FORK.md §9.2 — `reap`: reap twin `pid` on behalf of the caller parked on this handler's
-    /// dispatch ([`Outcome::Reap`]).
+    /// FORK.md §9.2 — `reap`: reap twin `pid` (any for `-1`) on behalf of the caller parked on this
+    /// handler's dispatch, not waiting for it under `WNOHANG` ([`Outcome::Reap`]).
     Reap {
         pid: i64,
+        nohang: bool,
         dst: u32,
     },
     /// FORK.md §8.6 — `exec_module` image-replace (#1080): surfaced to the cooperative driver, which
@@ -11630,7 +11640,7 @@ impl Outcome {
                 reply_twin,
                 dst,
             },
-            Outcome::Reap { pid, dst } => VcpuStop::Reap { pid, dst },
+            Outcome::Reap { pid, nohang, dst } => VcpuStop::Reap { pid, nohang, dst },
             Outcome::Exec {
                 cmd,
                 grants_ptr,
@@ -11961,6 +11971,10 @@ struct Domain {
     /// A §14 child's domain, not a fork twin's or an exec image's: its end releases the services
     /// it was a client of (#1217), as the oracle's does for a detached child's.
     nested: bool,
+    /// FORK.md §8.6 — for a `clone_caller` twin, the domain whose caller it was forked from: only
+    /// that domain's servicer-side `reap` reaps it, as on the oracle. `None` for every other domain,
+    /// a personality fork's twin included (the personality reaps it).
+    twin_of: Option<usize>,
     /// The unit of the run's [`ModuleSource`] this env's domain runs, which a fork twin of it runs
     /// too, and over which a debugger checkpoint rebuilds its table. The root domain's is unit 0.
     program: u32,
@@ -11987,6 +12001,7 @@ impl Domain {
             fibers: FiberTables::default(),
             spawner: None,
             nested: false,
+            twin_of: None,
             program: 0,
             children: temen_ir::handles::Table::new(),
         }
@@ -12078,6 +12093,7 @@ fn coop_start_child(
         fibers: FiberTables::default(),
         spawner: Some(spawner),
         nested: true,
+        twin_of: None,
         program: module,
         children: temen_ir::handles::Table::new(),
     });
@@ -12257,11 +12273,12 @@ enum TaskState {
         ticket: u64,
         pager: std::sync::Arc<std::sync::Mutex<Host>>,
     },
-    /// FORK.md §9.2 — parked in `reap` (`wait(pid)`) until fork twin `pid` (a task index) finishes;
-    /// the settle scan delivers its exit status ([`super::reap_status`]) to `dst` and wakes. A
-    /// trapped twin reaps as a nonzero crash status, never a propagated trap (reap ≠ join).
+    /// FORK.md §9.2 — parked in `reap` (`wait(pid)`) until fork twin `pid` (a task index) finishes,
+    /// or with `None` (`wait(-1)`) until any twin of this task's own domain does; the settle scan
+    /// delivers its exit status ([`super::reap_status`]) to `dst` and wakes. A trapped twin reaps as
+    /// a nonzero crash status, never a propagated trap (reap ≠ join).
     BlockedReap {
-        pid: usize,
+        pid: Option<usize>,
         dst: u32,
     },
     /// #799/#1080 — parked in a personality **`waitpid()`** (`ParkEvent::TaskExit`/`TaskExitAny`, the
@@ -13435,17 +13452,28 @@ fn settle_wakes(
         }
     }
     // FORK.md §9.2 — reap wakes: a caller parked in `wait(pid)` wakes when fork twin `pid`
-    // finishes, with the twin's exit status ([`super::reap_status`]; a trapped twin reaps as a
+    // finishes, and one parked in `wait(-1)` when any twin of its own domain does (the lowest, as the
+    // oracle picks), with the twin's exit status ([`super::reap_status`]; a trapped twin reaps as a
     // crash status, never a propagated trap — reap ≠ join). Two-phase (read the twin's outcome,
     // then deliver) so the caller and the twin task are not borrowed at once.
     let reap_wakes: Vec<(usize, u32, i64, usize)> = tasks
         .iter()
         .enumerate()
         .filter_map(|(ci, t)| match &t.state {
-            TaskState::BlockedReap { pid, dst } => match &tasks[*pid].state {
-                TaskState::Done(res) => Some((ci, *dst, super::reap_status(res), *pid)),
-                _ => None,
-            },
+            TaskState::BlockedReap { pid, dst } => {
+                let finished = |j: usize| match &tasks[j].state {
+                    TaskState::Done(res) => Some((ci, *dst, super::reap_status(res), j)),
+                    _ => None,
+                };
+                match pid {
+                    Some(j) => finished(*j),
+                    None => forked_twins
+                        .iter()
+                        .copied()
+                        .filter(|&j| domains[tasks[j].domain].twin_of == Some(t.domain))
+                        .find_map(finished),
+                }
+            }
             _ => None,
         })
         .collect();
@@ -14665,7 +14693,7 @@ impl SchedCore {
                 // `reply_orig` (pid mode: the twin's task id) to the original; both resume past the
                 // same fork `call.cap`. Fail-closed to a single reply on any shape the driver can't
                 // duplicate — never a hang, mirroring the oracle's degrade (temen-interp
-                // `fork_parked_caller`). `reap` (fork+wait) is a later slice — such modules fold.
+                // `fork_parked_caller`).
                 let result: i64 = 'fork: {
                     // The running handler's dispatch ticket names the parked caller; outside a
                     // handler there is none → `-EINVAL`, exactly as the oracle.
@@ -14759,6 +14787,7 @@ impl SchedCore {
                         fibers: FiberTables::default(),
                         spawner: None,
                         nested: false,
+                        twin_of: Some(ck),
                         program,
                         children: temen_ir::handles::Table::new(),
                     });
@@ -14778,11 +14807,14 @@ impl SchedCore {
                 };
                 tasks[ti].deliver(dst, Reg::from_i64(result));
             }
-            Ok(VcpuStop::Reap { pid, dst }) => {
-                // FORK.md §9.2 — the servicer side of `wait(pid)`. Reap fork twin `pid` on behalf of
-                // the caller parked on this handler's dispatch: deliver the twin's exit status now (if
-                // it finished) or park the caller until it does. `-ECHILD` for a pid this run did not
-                // mint (the handler's own reply carries it); `-EINVAL` outside a handler. Never a hang.
+            Ok(VcpuStop::Reap { pid, nohang, dst }) => {
+                // FORK.md §8.6, §9.2 — the servicer side of `waitpid(pid, flags)`, as the oracle's
+                // (`reap_parked_caller`, `reap_group_parked_caller`). Reap, on behalf of the caller
+                // parked on this handler's dispatch, a twin its own domain forked (`Domain::twin_of`):
+                // twin `pid`, or any for `pid == -1`. A finished one delivers its exit status now;
+                // under `WNOHANG` the caller gets `0` at once; else it parks until one finishes.
+                // `-ECHILD` when the caller has no such twin (the handler's own reply carries it);
+                // `-EINVAL` outside a handler. Never a hang.
                 let result: i64 = 'reap: {
                     let Some(ticket) = tasks[ti].vm.vt.active.dispatch() else {
                         break 'reap super::EINVAL;
@@ -14797,13 +14829,20 @@ impl SchedCore {
                         TaskState::BlockedTicket { ticket: tk, callee, .. }
                             if *tk == ticket && std::sync::Arc::ptr_eq(callee, &server_host))
                     });
-                    // The pid must be a twin this run minted; otherwise a genuine `-ECHILD`, which the
-                    // handler's own return delivers to the still-parked caller (the normal serve path).
-                    let Some(pid_us) = usize::try_from(pid)
-                        .ok()
-                        .filter(|p| forked_twins.contains(p))
-                    else {
-                        break 'reap super::ECHILD;
+                    let parent_of = |j: usize| domains[tasks[j].domain].twin_of;
+                    // A named pid must be a twin this servicer minted, and `-1` needs one at all;
+                    // otherwise a genuine `-ECHILD`, which the handler's own return delivers to the
+                    // still-parked caller (the normal serve path).
+                    let named = match pid {
+                        -1 if forked_twins.is_empty() => break 'reap super::ECHILD,
+                        -1 => None,
+                        _ => match usize::try_from(pid)
+                            .ok()
+                            .filter(|&p| forked_twins.contains(&p) && parent_of(p).is_some())
+                        {
+                            Some(p) => Some(p),
+                            None => break 'reap super::ECHILD,
+                        },
                     };
                     // The cooperative driver parks the caller before the handler runs, so a miss is
                     // defensive → `-EAGAIN` (retryable, never a false `-ECHILD` — the twin is real).
@@ -14816,19 +14855,38 @@ impl SchedCore {
                     else {
                         break 'reap super::EINVAL;
                     };
-                    // Twin finished → deliver its status now and retire it; else park the caller on it
-                    // (the settle scan wakes it on twin-exit). Either way the caller's reply is handled
-                    // here — the handler's own return lands on a caller no longer `BlockedTicket`, so
-                    // the settle scan never claims it (harmless, mirroring `clone_caller`).
-                    if let TaskState::Done(res) = &tasks[pid_us].state {
-                        let status = super::reap_status(res);
-                        forked_twins.remove(&pid_us);
+                    // Only a twin's own parent reaps it: a twin of another domain is `-ECHILD`.
+                    let parent = Some(tasks[caller_ti].domain);
+                    let mine: Vec<usize> = forked_twins
+                        .iter()
+                        .copied()
+                        .filter(|&j| named.is_none_or(|p| p == j) && parent_of(j) == parent)
+                        .collect();
+                    if mine.is_empty() {
+                        break 'reap super::ECHILD;
+                    }
+                    // A finished one (the lowest, as the oracle picks) → deliver its status now and
+                    // retire it; else `WNOHANG` → `0` now, the twin left to reap later; else park the
+                    // caller (the settle scan wakes it when one finishes). Either way the caller's
+                    // reply is handled here — the handler's own return lands on a caller no longer
+                    // `BlockedTicket`, so the settle scan never claims it (harmless, mirroring
+                    // `clone_caller`).
+                    let finished = mine.iter().find_map(|&j| match &tasks[j].state {
+                        TaskState::Done(res) => Some((j, super::reap_status(res))),
+                        _ => None,
+                    });
+                    if let Some((j, status)) = finished {
+                        forked_twins.remove(&j);
                         tasks[caller_ti].deliver(caller_dst, Reg::from_i64(status));
                         tasks[caller_ti].state = TaskState::Runnable;
                         status
+                    } else if nohang {
+                        tasks[caller_ti].deliver(caller_dst, Reg::from_i64(0));
+                        tasks[caller_ti].state = TaskState::Runnable;
+                        0
                     } else {
                         tasks[caller_ti].state = TaskState::BlockedReap {
-                            pid: pid_us,
+                            pid: named,
                             dst: caller_dst,
                         };
                         0
@@ -14908,6 +14966,7 @@ impl SchedCore {
                                     fibers: FiberTables::default(),
                                     spawner: None,
                                     nested: false,
+                                    twin_of: None,
                                     program: tasks[ti].vm.vt.active.module as u32,
                                     children,
                                 });
@@ -15038,6 +15097,7 @@ impl SchedCore {
                             fibers: FiberTables::default(),
                             spawner: None,
                             nested: false,
+                            twin_of: None,
                             program,
                             children: temen_ir::handles::Table::new(),
                         });
@@ -16929,6 +16989,7 @@ mod dbg_domain_end_tests {
                 fibers,
                 spawner: Some(0),
                 nested: true,
+                twin_of: None,
                 children: temen_ir::handles::Table::new(),
             },
         ];
@@ -21822,15 +21883,16 @@ impl Vm {
                         dst,
                     });
                 }
-                Op::Reap { pid, dst } => {
-                    // The pid to reap (an out-of-range default → the driver answers -ECHILD).
+                Op::Reap { pid, flags, dst } => {
+                    // The pid to reap, `-1` (any twin) without one, as on the oracle.
                     let pid = pid.map(|p| r!(p).i64()).unwrap_or(-1);
+                    let nohang = flags.is_some_and(|f| r!(f).i64() & super::WNOHANG != 0);
                     let dst = *dst;
                     self.module = module;
                     self.cur = cur;
                     self.base = base;
                     self.pc = pc + 1;
-                    return Ok(Outcome::Reap { pid, dst });
+                    return Ok(Outcome::Reap { pid, nohang, dst });
                 }
                 // FORK.md §8.6 — `exec_module` (#1080): resolve the five register operands and surface
                 // the image-replace to the driver. The cursor is saved (pc+1) so a *refused* exec
