@@ -18,6 +18,11 @@ guard-page-stacks = ["temen-fiber/guard-page-stacks"]
 # (`--features stack-check`) keep working and to gate the guard-specific test suites
 # (`tests/stack_check.rs`, `tests/stack_guard_fuzz.rs`) into the dedicated lanes.
 stack-check = []
+# #2799 — the machine-code validator's accept-direction mutation test (`validator_mutants`): it
+# compiles a module, rewrites each function's machine code where a rewrite must make the validator
+# reject it, and reports the mutants it accepted. Test infrastructure only: the `temen` tests and
+# the `validator_mutants` fuzz target turn it on, and no product build does.
+validator-mutants = []
 
 [dev-dependencies]
 # Parse hand-written text IR in the `stack-check` guard test (temen-text → temen-ir; no dep cycle).

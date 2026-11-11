@@ -361,6 +361,7 @@ jobs:
           [
             decode_verify,
             diff,
+            validator_mutants,
             wasm_diff,
             fork_diff,
             mask,
