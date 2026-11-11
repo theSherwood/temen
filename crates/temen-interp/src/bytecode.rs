@@ -8852,6 +8852,93 @@ fn image_parks(host: &Host, m: &Module, census: &ImageCensus) -> Parks {
     }
 }
 
+/// #2948 spike — **attribution only**: where a hand-off's time goes on executor 2, native task
+/// against interpreted, when [`ON`](spike_attrib::ON) is set (off by default; nothing is read or
+/// timed otherwise). Counters and nanosecond totals, process-wide, read and reset by the probe.
+pub mod spike_attrib {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
+    pub static ON: AtomicBool = AtomicBool::new(false);
+    /// §12 stops raised: by a native task (`EmittedCall::park`), by an interpreted one.
+    pub static NATIVE_STOPS: AtomicU64 = AtomicU64::new(0);
+    pub static INTERP_STOPS: AtomicU64 = AtomicU64::new(0);
+    /// Of those, waits the rules answered not-equal at once (the task stayed runnable).
+    pub static NATIVE_WAIT_NE: AtomicU64 = AtomicU64::new(0);
+    pub static INTERP_WAIT_NE: AtomicU64 = AtomicU64::new(0);
+    /// Sleeps in a park that blocked (the signal's token was not yet set), and how long the waits
+    /// on the signal took, blocking or not.
+    pub static SLEEPS: AtomicU64 = AtomicU64::new(0);
+    pub static SLEEP_NS: AtomicU64 = AtomicU64::new(0);
+    /// From a signal's notify to its sleeper waking: the OS wake.
+    pub static WAKE_NS: AtomicU64 = AtomicU64::new(0);
+    /// Native park phases: the run lock taken, the VM swapped in and out, `apply` (the rule, the
+    /// settle and the wake scan), the new tasks' start, `await_runnable` (with its sleep).
+    pub static N_LOCK_NS: AtomicU64 = AtomicU64::new(0);
+    pub static N_SWAP_NS: AtomicU64 = AtomicU64::new(0);
+    pub static N_APPLY_NS: AtomicU64 = AtomicU64::new(0);
+    pub static N_SETTLE_NS: AtomicU64 = AtomicU64::new(0);
+    pub static N_AWAIT_NS: AtomicU64 = AtomicU64::new(0);
+    /// The interpreted task's: the run lock after its step, `apply`, `await_runnable`.
+    pub static I_LOCK_NS: AtomicU64 = AtomicU64::new(0);
+    pub static I_APPLY_NS: AtomicU64 = AtomicU64::new(0);
+    pub static I_SETTLE_NS: AtomicU64 = AtomicU64::new(0);
+    pub static I_AWAIT_NS: AtomicU64 = AtomicU64::new(0);
+    pub fn on() -> bool {
+        ON.load(Relaxed)
+    }
+    pub(super) fn add(c: &AtomicU64, since: Option<std::time::Instant>) {
+        if let Some(t) = since {
+            c.fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
+        }
+    }
+    pub(super) fn now() -> Option<std::time::Instant> {
+        on().then(std::time::Instant::now)
+    }
+    /// Every counter, in declaration order, as `(name, value)`; `reset` zeroes them.
+    pub fn read() -> Vec<(&'static str, u64)> {
+        let all: [(&str, &AtomicU64); 16] = [
+            ("native_stops", &NATIVE_STOPS),
+            ("interp_stops", &INTERP_STOPS),
+            ("native_wait_ne", &NATIVE_WAIT_NE),
+            ("interp_wait_ne", &INTERP_WAIT_NE),
+            ("sleeps", &SLEEPS),
+            ("sleep_ns", &SLEEP_NS),
+            ("wake_ns", &WAKE_NS),
+            ("n_lock_ns", &N_LOCK_NS),
+            ("n_swap_ns", &N_SWAP_NS),
+            ("n_apply_ns", &N_APPLY_NS),
+            ("n_settle_ns", &N_SETTLE_NS),
+            ("n_await_ns", &N_AWAIT_NS),
+            ("i_lock_ns", &I_LOCK_NS),
+            ("i_apply_ns", &I_APPLY_NS),
+            ("i_settle_ns", &I_SETTLE_NS),
+            ("i_await_ns", &I_AWAIT_NS),
+        ];
+        all.iter().map(|(n, c)| (*n, c.load(Relaxed))).collect()
+    }
+    pub fn reset() {
+        for c in [
+            &NATIVE_STOPS,
+            &INTERP_STOPS,
+            &NATIVE_WAIT_NE,
+            &INTERP_WAIT_NE,
+            &SLEEPS,
+            &SLEEP_NS,
+            &WAKE_NS,
+            &N_LOCK_NS,
+            &N_SWAP_NS,
+            &N_APPLY_NS,
+            &N_SETTLE_NS,
+            &N_AWAIT_NS,
+            &I_LOCK_NS,
+            &I_APPLY_NS,
+            &I_SETTLE_NS,
+            &I_AWAIT_NS,
+        ] {
+            c.store(0, Relaxed);
+        }
+    }
+}
+
 /// #2948 spike — whether `m`'s `entry` can run its vCPUs as native tasks under `host` without the
 /// JIT's own thread runtime: `Err` names the first clause that keeps it on today's path. Decided
 /// before the run takes anything. What each clause guards, which phase 1 still has to carry:
@@ -17732,11 +17819,16 @@ impl Park {
 struct Signal {
     woken: std::sync::Mutex<bool>,
     cv: std::sync::Condvar,
+    /// #2948 attribution: when it was last notified ([`spike_attrib`]).
+    at: std::sync::Mutex<Option<std::time::Instant>>,
 }
 
 impl Signal {
     /// Set the token, and wake the sleeper if it sleeps.
     fn notify(&self) {
+        if spike_attrib::on() {
+            *self.at.lock_unpoisoned() = Some(std::time::Instant::now());
+        }
         *self.woken.lock_unpoisoned() = true;
         self.cv.notify_one();
     }
@@ -17750,6 +17842,10 @@ impl Signal {
     /// end early: its caller looks again either way. No clock is read, which wasm32 lacks.
     fn wait(&self, timeout: Option<std::time::Duration>) {
         let mut woken = self.woken.lock_unpoisoned();
+        // #2948 attribution: a sleep that blocks, not one whose token was already set.
+        if !*woken && spike_attrib::on() {
+            spike_attrib::SLEEPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         match timeout {
             None => {
                 while !*woken {
@@ -17764,6 +17860,11 @@ impl Signal {
             Some(_) => {}
         }
         *woken = false;
+        drop(woken);
+        if spike_attrib::on() {
+            let at = self.at.lock_unpoisoned().take();
+            spike_attrib::add(&spike_attrib::WAKE_NS, at);
+        }
     }
 }
 
@@ -17835,6 +17936,9 @@ struct ThreadRun {
     over: std::sync::atomic::AtomicBool,
     /// The embedder's door into the run from outside it ([`Host::set_run_door`]), if it has one.
     door: Option<std::sync::Arc<RunDoor>>,
+    /// #2948 attribution — native tasks inside a futex wait's park, counted in before the compare
+    /// ([`BounceTask::park_native`]), for a notify fast path to read ([`EmittedCall::futex_waiters`]).
+    waiters: std::sync::atomic::AtomicUsize,
 }
 
 /// The embedder's door into a run on executor 2 from outside it (#1414 S5a, 5b-2): it can
@@ -18062,6 +18166,7 @@ pub struct EmittedCall<'a> {
     pub root: bool,
     park: &'a mut NativePark<'a>,
     native: Option<&'a NativeTier>,
+    waiters: &'a std::sync::atomic::AtomicUsize,
     table: &'a SharedSlots,
     host: &'a std::sync::Mutex<super::Host>,
     now: &'a std::cell::Cell<u64>,
@@ -18082,6 +18187,13 @@ impl EmittedCall<'_> {
     /// `call.cap` serializes through.
     pub fn host_cell(&self) -> *const std::sync::Mutex<super::Host> {
         self.host
+    }
+
+    /// #2948 attribution — native tasks inside a futex wait's park, run-wide: counted in before the
+    /// rules compare the word, out when the park returns. A notify that reads 0 after its guest
+    /// store and a full fence has no waiter to wake.
+    pub fn futex_waiters(&self) -> &std::sync::atomic::AtomicUsize {
+        self.waiters
     }
 
     /// #2948 spike — the run's native tier ([`ThreadTier::native`]), if its tier is one.
@@ -18382,6 +18494,7 @@ impl ThreadRun {
             ended: std::sync::Condvar::new(),
             over: std::sync::atomic::AtomicBool::new(false),
             door,
+            waiters: std::sync::atomic::AtomicUsize::new(0),
         });
         if let Some(door) = &run.door {
             *door.run.lock_unpoisoned() = std::sync::Arc::downgrade(&run);
@@ -18505,7 +18618,9 @@ fn carry<'g>(
     let mut tier = TierState::default();
     loop {
         let next;
+        let t = spike_attrib::now();
         (g, next) = run.await_runnable(g, ti, look);
+        spike_attrib::add(&spike_attrib::I_AWAIT_NS, t);
         match next {
             Next::Run => {}
             Next::Stop => break,
@@ -18543,7 +18658,9 @@ fn carry<'g>(
             Err(Trap::MemoryFault) => ctx.mem.as_ref().and_then(|m| m.peek_fault_rel()),
             _ => None,
         };
+        let t = spike_attrib::now();
         g = run.state.lock_unpoisoned();
+        spike_attrib::add(&spike_attrib::I_LOCK_NS, t);
         lend_fuel(&mut g, ti, &mut fuel);
         // Ended while it stepped (its domain torn down, or the run over): its stop is not applied.
         if g.over.is_some() || matches!(g.core.tasks[ti].state, TaskState::Done(_)) {
@@ -18556,7 +18673,17 @@ fn carry<'g>(
         }
         exec = matches!(stop, Ok(VcpuStop::Exec { .. }));
         look = matches!(stop, Ok(VcpuStop::Preempted));
+        let is_wait = matches!(stop, Ok(VcpuStop::Wait { .. }));
+        if spike_attrib::on() && matches!(stop, Ok(VcpuStop::Wait { .. } | VcpuStop::Notify { .. }))
+        {
+            spike_attrib::INTERP_STOPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        let t = spike_attrib::now();
         let (made, surfaced) = run.apply(&mut g, ti, stop, exits);
+        spike_attrib::add(&spike_attrib::I_APPLY_NS, t);
+        if is_wait && spike_attrib::on() && matches!(g.core.tasks[ti].state, TaskState::Runnable) {
+            spike_attrib::INTERP_WAIT_NE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         invoke = surfaced;
         g = start_tasks(run, g, made);
     }
@@ -18666,15 +18793,37 @@ impl BounceTask<'_> {
     /// ([`TaskVm::native`]) the rules deliver into, and the thread takes the cell back when the task
     /// can run. A stop that does not park (a spawn, a notify) returns as soon as it is applied.
     fn park_native(&mut self, stop: VcpuStop) -> Result<[Reg; 2], Trap> {
+        use spike_attrib as a;
         let (run, ti) = (self.run, self.ti);
+        let is_wait = matches!(stop, VcpuStop::Wait { .. });
+        if is_wait {
+            // Counted in before the rules compare the word: a notify that reads 0 here after its
+            // store (and a full fence) may skip the run (`EmittedCall::futex_waiters`).
+            run.waiters
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        let _out = WaiterOut(is_wait.then_some(&run.waiters));
+        if a::on() {
+            a::NATIVE_STOPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        let t = a::now();
         let mut g = run.state.lock_unpoisoned();
+        a::add(&a::N_LOCK_NS, t);
         if g.over.is_some() || matches!(g.core.tasks[ti].state, TaskState::Done(_)) {
             return Err(Trap::ThreadFault);
         }
+        let t = a::now();
         std::mem::swap(&mut *g.core.tasks[ti].vm, self.vm);
         g.core.tasks[ti].vm.native = Some([Reg::default(); 2]);
+        a::add(&a::N_SWAP_NS, t);
+        let t = a::now();
         let (made, _) = run.apply(&mut g, ti, Ok(stop), *self.exits);
+        a::add(&a::N_APPLY_NS, t);
+        if is_wait && a::on() && matches!(g.core.tasks[ti].state, TaskState::Runnable) {
+            a::NATIVE_WAIT_NE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         g = start_tasks(run, g, made);
+        let t = a::now();
         let runs = loop {
             let next;
             (g, next) = run.await_runnable(g, ti, false);
@@ -18687,7 +18836,10 @@ impl BounceTask<'_> {
                 }
             }
         };
+        a::add(&a::N_AWAIT_NS, t);
+        let t = a::now();
         std::mem::swap(&mut *g.core.tasks[ti].vm, self.vm);
+        a::add(&a::N_SWAP_NS, t);
         *self.exits = g.core.hooked_twins.len();
         // A rule that ended the task (a trap, the domain's end) leaves it `Done`: its op does not
         // return.
@@ -18696,6 +18848,17 @@ impl BounceTask<'_> {
         match self.vm.native.take() {
             Some(cell) if runs && !ended => Ok(cell),
             _ => Err(Trap::ThreadFault),
+        }
+    }
+}
+
+/// #2948 attribution — counts a native waiter out of [`ThreadRun::waiters`] when its park returns.
+struct WaiterOut<'a>(Option<&'a std::sync::atomic::AtomicUsize>);
+
+impl Drop for WaiterOut<'_> {
+    fn drop(&mut self) {
+        if let Some(w) = self.0 {
+            w.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
         }
     }
 }
@@ -19053,6 +19216,7 @@ impl ThreadRun {
             root,
             park: &mut park,
             native: tier.native.as_ref(),
+            waiters: &self.waiters,
             table,
             host,
             now: &now,
@@ -19200,7 +19364,17 @@ impl ThreadRun {
         if let Some(h) = g.core.held.as_mut().filter(|_| gives_back) {
             h.gate = None;
         }
+        let t = spike_attrib::now();
         self.settle(g);
+        let native = g.core.tasks[ti].vm.native.is_some();
+        spike_attrib::add(
+            if native {
+                &spike_attrib::N_SETTLE_NS
+            } else {
+                &spike_attrib::I_SETTLE_NS
+            },
+            t,
+        );
         let mut made = Vec::new();
         for j in had..g.core.tasks.len() {
             if j >= g.parks.len() {
@@ -19533,7 +19707,9 @@ impl ThreadRun {
             }
         }
         if !woke {
+            let t = spike_attrib::now();
             signal.wait(left);
+            spike_attrib::add(&spike_attrib::SLEEP_NS, t);
         }
         let mut g = self.state.lock_unpoisoned();
         let park = &mut g.parks[ti];

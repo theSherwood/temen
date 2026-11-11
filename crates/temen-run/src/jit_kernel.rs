@@ -33,6 +33,29 @@ pub fn vcpus() -> u64 {
     VCPUS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// #2948 attribution — the glue's two fast paths, each on its own ([`set_fast`]): a wait whose word
+/// already differs answers not-equal from a native load, without a stop; a notify when no native
+/// task is inside a wait's park answers 0, without the run lock.
+static FAST_WAIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static FAST_NOTIFY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// [`FAST_WAIT`] and [`FAST_NOTIFY`] from `TEMEN_SPIKE_FAST` (`wait`, `notify`, or both,
+/// comma-separated), as a test run sets them.
+fn fast_from_env() {
+    if let Ok(v) = std::env::var("TEMEN_SPIKE_FAST") {
+        set_fast(
+            v.split(',').any(|x| x == "wait"),
+            v.split(',').any(|x| x == "notify"),
+        );
+    }
+}
+
+/// [`FAST_WAIT`] and [`FAST_NOTIFY`], for the runs this process makes next.
+pub fn set_fast(wait: bool, notify: bool) {
+    FAST_WAIT.store(wait, std::sync::atomic::Ordering::Relaxed);
+    FAST_NOTIFY.store(notify, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Whether the spike path is switched on (`TEMEN_JIT_KERNEL=1`).
 pub fn enabled() -> bool {
     std::env::var_os("TEMEN_JIT_KERNEL").is_some_and(|v| v == "1")
@@ -95,6 +118,7 @@ pub fn run_compiled(
     host: &mut Host,
     kill: Option<&Arc<temen_jit::Interrupt>>,
 ) -> Option<Result<Vec<i64>, Trap>> {
+    fast_from_env();
     // Every refusal is decided here, before anything is taken from `host`.
     let f = m.funcs.get(entry as usize)?;
     if f.params.len() != args.len() {
@@ -339,7 +363,7 @@ fn tier_run(call: &mut EmittedCall<'_>) -> Result<(), Trap> {
         None => host as *mut core::ffi::c_void,
     };
     let ran = {
-        let mut park = Park(call);
+        let mut park = Park(call, &kr);
         // SAFETY: `cap_ctx` is what the compile's thunk takes: the held host, or the host cell for
         // `cap_thunk_locked`; the kernel seeded the window and `run` protected it before any task ran.
         unsafe { kr.run_vcpu(entry, tls, cap_ctx, &mut park) }
@@ -355,10 +379,45 @@ fn tier_run(call: &mut EmittedCall<'_>) -> Result<(), Trap> {
 }
 
 /// A vCPU's §12 ops, applied by its task's rules.
-struct Park<'c, 'a>(&'c mut EmittedCall<'a>);
+struct Park<'c, 'a>(&'c mut EmittedCall<'a>, &'c KernelRun);
 
 impl KernelPark for Park<'_, '_> {
     fn park(&mut self, stop: KStop) -> Result<[i64; 2], i64> {
+        use std::sync::atomic::{
+            fence,
+            Ordering::{Relaxed, SeqCst},
+        };
+        match stop {
+            // A not-equal answer is linearizable at the load: the word differed then. An equal one
+            // goes to the rules, which compare again under the run lock.
+            KStop::Wait {
+                off,
+                expected,
+                wide,
+                ..
+            } if FAST_WAIT.load(Relaxed) => {
+                let mask = if wide { u64::MAX } else { u64::from(u32::MAX) };
+                if self
+                    .1
+                    .load_word(off, wide)
+                    .is_some_and(|v| v != expected & mask)
+                {
+                    return Ok([1, 0]); // WAIT_NOT_EQUAL
+                }
+            }
+            // Store buffering: a waiter counts itself in (a locked RMW) before the rules compare
+            // its word; this notify's guest store came first, then this full fence, then the read.
+            // Under one total order, either the read sees the count, and the rules wake the
+            // waiter, or the count came after the read, so the waiter's compare comes after the
+            // store and answers not-equal. Either way no wake is lost.
+            KStop::Notify { .. } if FAST_NOTIFY.load(Relaxed) => {
+                fence(SeqCst);
+                if self.0.futex_waiters().load(SeqCst) == 0 {
+                    return Ok([0, 0]);
+                }
+            }
+            _ => {}
+        }
         let stop = match stop {
             KStop::Spawn { func, arg0, arg1 } => NativeStop::Spawn { func, arg0, arg1 },
             KStop::Join { handle } => NativeStop::Join { handle },

@@ -133,6 +133,35 @@ impl KernelRun {
         cm.null_guard > cm.win_mapped as u64 || self.window.seed_null_guard(cm.null_guard)
     }
 
+    /// #2948 attribution — the futex word at window offset `off` (8 bytes if `wide`, else 4), read
+    /// with a sequentially consistent load, if it lies where every vCPU may read: aligned, in the
+    /// committed window and past the NULL guard. `None` anywhere else, which the kernel answers
+    /// (a fault, or its own read). No page op is in scope, so the committed extent is fixed.
+    pub fn load_word(&self, off: u64, wide: bool) -> Option<u64> {
+        use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::SeqCst};
+        let cm = &self.cm;
+        let width = if wide { 8 } else { 4 };
+        let guard = if cm.null_guard > cm.win_mapped as u64 {
+            0
+        } else {
+            cm.null_guard
+        };
+        let end = off.checked_add(width)?;
+        if !off.is_multiple_of(width) || off < guard || end > cm.win_mapped as u64 {
+            return None;
+        }
+        // SAFETY: `[off, off + width)` is aligned and inside the committed read-write window (the
+        // read-only data pages are readable too), which outlives every vCPU of the run.
+        unsafe {
+            let p = self.window.base().add(off as usize);
+            Some(if wide {
+                (*(p as *const AtomicU64)).load(SeqCst)
+            } else {
+                u64::from((*(p as *const AtomicU32)).load(SeqCst))
+            })
+        }
+    }
+
     /// End the domain: every vCPU still running stops at its next poll of the domain's end.
     pub fn end(&self) {
         self.root.raise(crate::DOMAIN_DONE_CODE as i64);

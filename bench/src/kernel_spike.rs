@@ -61,8 +61,18 @@ fn today<'a>(m: &'a Module, host: Host, locked: bool) -> Lane<'a> {
 
 /// The spike path, on the kernel's keyed futex wait (#2957). Each run takes a fresh compile (its
 /// window is the run's), made untimed.
-fn spike<'a>(m: &'a Module, mut host: impl FnMut() -> Host + 'a) -> Lane<'a> {
+fn spike<'a>(m: &'a Module, host: impl FnMut() -> Host + 'a) -> Lane<'a> {
+    spike_fast(m, host, (false, false))
+}
+
+/// [`spike`] with the glue's attribution fast paths `(wait, notify)` ([`temen_run::jit_kernel::set_fast`]).
+fn spike_fast<'a>(
+    m: &'a Module,
+    mut host: impl FnMut() -> Host + 'a,
+    (wait, notify): (bool, bool),
+) -> Lane<'a> {
     Box::new(move |args| {
+        temen_run::jit_kernel::set_fast(wait, notify);
         let cm = temen_run::jit_kernel::compile(m, 0, RESERVED, None).expect("in scope");
         let mut h = host();
         let t0 = Instant::now();
@@ -272,6 +282,9 @@ pub fn run(reps: usize) {
     if on("pairs") && !only.is_empty() {
         run_pairs(reps);
     }
+    if on("attrib") && !only.is_empty() {
+        run_attrib(reps);
+    }
     if on("nowake") && !only.is_empty() {
         run_nowake(reps);
     }
@@ -296,6 +309,9 @@ pub fn run(reps: usize) {
         let lanes = vec![
             ("today", today(&m, Host::new(), true)),
             ("spike", spike(&m, Host::new)),
+            ("spike+fw", spike_fast(&m, Host::new, (true, false))),
+            ("spike+fn", spike_fast(&m, Host::new, (false, true))),
+            ("spike+both", spike_fast(&m, Host::new, (true, true))),
             ("x2-interp", x2_interp(&m)),
         ];
         // `SPIKE_LANES=today,spike` picks lanes.
@@ -344,6 +360,9 @@ pub fn run_nowake(reps: usize) {
             let mut lanes = vec![
                 ("today", today(&m, Host::new(), true)),
                 ("spike", spike(&m, Host::new)),
+                ("spike+fw", spike_fast(&m, Host::new, (true, false))),
+                ("spike+fn", spike_fast(&m, Host::new, (false, true))),
+                ("spike+both", spike_fast(&m, Host::new, (true, true))),
             ];
             per_iter(
                 &label,
@@ -373,6 +392,9 @@ pub fn run_k1000(reps: usize) {
     let mut lanes = vec![
         ("today", today(&m, Host::new(), true)),
         ("spike", spike(&m, Host::new)),
+        ("spike+fw", spike_fast(&m, Host::new, (true, false))),
+        ("spike+fn", spike_fast(&m, Host::new, (false, true))),
+        ("spike+both", spike_fast(&m, Host::new, (true, true))),
     ];
     let args = |n| vec![n, 1_000];
     per_iter(
@@ -392,6 +414,63 @@ pub fn run_k1000(reps: usize) {
     );
 }
 
+/// #2948 attribution (`SPIKE_SECTIONS=attrib`): one pingpong of `n` turns at K = 0 per lane, with
+/// executor 2's counters and phase timers on ([`temen_interp::bytecode::spike_attrib`]): per
+/// hand-off, the §12 stops raised, the waits answered not-equal, the sleeps in a park (today's:
+/// its vCPU wakes), and the time in each phase of a park. Medians over the reps.
+pub fn run_attrib(reps: usize) {
+    use temen_interp::bytecode::spike_attrib as a;
+    let n = 20_000i64;
+    let handoffs = (2 * n) as f64;
+    println!("\nattribution: pingpong, K = 0, {n} turns, per hand-off (medians over {reps} reps):");
+    let m = parse(crate::kernel_spike_ir::PINGPONG_IR);
+    let mut lanes = vec![
+        ("today", today(&m, Host::new(), true)),
+        ("spike", spike(&m, Host::new)),
+        ("spike+fw", spike_fast(&m, Host::new, (true, false))),
+        ("spike+fn", spike_fast(&m, Host::new, (false, true))),
+        ("spike+both", spike_fast(&m, Host::new, (true, true))),
+        ("x2-interp", x2_interp(&m)),
+    ];
+    let mut rows: Vec<Vec<Vec<f64>>> = vec![Vec::new(); lanes.len()];
+    for _ in 0..reps {
+        for (i, (_, lane)) in lanes.iter_mut().enumerate() {
+            a::reset();
+            a::ON.store(true, std::sync::atomic::Ordering::Relaxed);
+            let w0 = temen_jit::vcpu_wakes();
+            let (_, dt) = lane(&[n, 0]);
+            a::ON.store(false, std::sync::atomic::Ordering::Relaxed);
+            let wakes = (temen_jit::vcpu_wakes() - w0) as f64;
+            let mut v = vec![dt.as_secs_f64() * 1e9 / handoffs, wakes / handoffs];
+            v.extend(a::read().iter().map(|(_, x)| *x as f64 / handoffs));
+            rows[i].push(v);
+        }
+    }
+    let names: Vec<&str> = ["ns_total", "jit_wakes"]
+        .into_iter()
+        .chain(a::read().iter().map(|(n, _)| *n))
+        .collect();
+    print!("  {:<12}", "lane");
+    for n in &names {
+        print!(" {n:>14}");
+    }
+    println!();
+    for (i, (name, _)) in lanes.iter().enumerate() {
+        print!("  {name:<12}");
+        for c in 0..names.len() {
+            let mut col: Vec<f64> = rows[i].iter().map(|r| r[c]).collect();
+            col.sort_by(|x, y| x.partial_cmp(y).unwrap());
+            print!(" {:>14.2}", col[col.len() / 2]);
+        }
+        println!();
+    }
+    assert_eq!(
+        temen_interp::bytecode::native_interp_stops(),
+        0,
+        "all native"
+    );
+}
+
 /// The run-lock probe ([`crate::kernel_spike_ir::PAIRS_IR`], `SPIKE_SECTIONS=pairs`): `p` independent pingpong pairs, each
 /// on a turn word of its own a cache line apart, so nothing but the runtime's own locks couples
 /// them. Per pair, a hand-off costs what it does alone if the runtime runs unrelated hand-offs in
@@ -403,6 +482,9 @@ pub fn run_pairs(reps: usize) {
         let mut lanes = vec![
             ("today", today(&m, Host::new(), true)),
             ("spike", spike(&m, Host::new)),
+            ("spike+fw", spike_fast(&m, Host::new, (true, false))),
+            ("spike+fn", spike_fast(&m, Host::new, (false, true))),
+            ("spike+both", spike_fast(&m, Host::new, (true, true))),
         ];
         let args = move |n| vec![n, p];
         per_iter(
