@@ -418,14 +418,24 @@ found (#2603):
   taken for a write makes a constant load look like a store to rodata, which would refuse correct
   code once the validator fails closed (#2813). EVEX has its own read table, since EVEX puts stores
   in opcode slots where VEX has loads. A Cranelift upgrade that adds an encoding the decoder does
-  not model fails that test, not a user's compile.
+  not model fails that test, not a user's compile. The oracle checks the **complement** too: a
+  vector-map form Cranelift's encoder emits in no `(map, mandatory-prefix, opcode)` combination must
+  decode as rejected, so the decoder's allowlist of emitted opcodes cannot drift wider than the
+  encoder (#2856).
+- The vector maps (`0F`/`0F38`/`0F3A`, legacy and VEX/EVEX) are **default-deny**: an opcode in no
+  `(map, prefix, opcode)` Cranelift emits is rejected by a hand-written allowlist, not classified by
+  the permissive vector default, so an unmodeled form (a wide store read as a narrow one, a GP-writer
+  read as XMM-only) is never admitted on the decoder's word once the gate fails closed (#2856, hole
+  17). Legacy and VEX share the allowlist — the same key is the same operation, and a cross-encoding
+  key is `#UD` — while EVEX, which remaps the slots, has its own.
 - A form whose address isn't `[base + index·scale + disp]` (fs/gs, `0x67`, `xlat`, `bt* [mem], reg`)
   is rejected, not modeled; so is an EVEX compressed-`disp8` operand, whose scale is a per-form
   property the bytes don't carry (Cranelift's pool/stack operands use `disp0`/`disp32`), a 16-bit
-  push or pop and `pushf`/`popf`, which move rsp where the transfer models no change, and the
+  push or pop and `pushf`/`popf`, which move rsp where the transfer models no change, the
   `fxsave`/`xsave` family (`0F AE` memory forms), which access a span the decoder does not size
-  (Cranelift emits only the register-form fences there). Each is a form Cranelift's lowering never
-  emits, so rejecting it costs real code nothing.
+  (Cranelift emits only the register-form fences there), and the one-byte segment push/pop and BCD
+  opcodes invalid in 64-bit mode. Each is a form Cranelift's lowering never emits, so rejecting it
+  costs real code nothing.
 - The native frame is confined by the overflow check (I5), not the window mask. The check is
   recognized by the facts it compares — a stack pointer `RED_ZONE` below the current `rsp` against
   `stack_limit` — so both the `mov r,rsp; add r,-RED_ZONE` and `lea r,[rsp−RED_ZONE]` forms qualify;
