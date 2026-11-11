@@ -14313,6 +14313,7 @@ fn handle_mem(
 /// historical `0`, a false EOF while a writer still held the pipe open. The bytecode engine parked
 /// there all along, and the JIT cannot tell `call.sym` from `call.import` at all (both reach its
 /// thunk as the import dispatch).
+#[derive(Default)]
 pub struct ParkTransients {
     /// A pipe, by its **global id** (the wake key), whose parked readers should be woken (a write,
     /// or a writer-to-zero close).
@@ -24468,8 +24469,12 @@ pub trait RegionMinter {
 /// tables can no longer desync because there is only one). Indexed by the id a
 /// [`Binding::HostProc`] carries.
 struct HostProcEntry {
-    /// The handler closure ([`ProcHandler`]). A dispatch takes it out, runs it, and restores it.
+    /// The handler closure ([`ProcHandler`]). A dispatch runs it in place, but for a minting one,
+    /// which it takes out for the call and restores, since its minter is the host.
     handler: ProcHandler,
+    /// #2847 — a call is running the handler, or ended without the handler returning (it panicked).
+    /// A call that finds it set faults rather than run the handler over a call it did not finish.
+    running: bool,
     /// The provider-supplied fork factory ([`HostProcGrant::fork`]).
     fork: Option<HostProcFork>,
     /// #801 — the provider's published **op vtable** (`(names, sigs)`, the offer-entry shape for a
@@ -24489,6 +24494,7 @@ impl HostProcEntry {
     fn new(grant: HostProcGrant, vtable: Option<HostFnVtable>) -> Self {
         Self {
             handler: grant.handler,
+            running: false,
             fork: grant.fork,
             vtable,
             state: grant.state,
@@ -27511,16 +27517,17 @@ impl Host {
                 twin.abandon();
                 return None;
             }
-            twin.host_procs.push(HostProcEntry {
+            let grant = HostProcGrant {
                 handler: forked.handler,
                 fork: Some(forked.refork.unwrap_or_else(|| Arc::clone(factory))),
-                // #801 — the vtable rides the fork: a twin can exec a `__px_`-linked
-                // command and have its manifest bind against the twin's own personality.
-                vtable: e.vtable.clone(),
                 // #1455 — not the parent's serializer, which closes over the *parent's* state: the
                 // factory's answer for the handler it minted (#1699).
                 state: forked.state,
-            });
+            };
+            // #801 — the vtable rides the fork: a twin can exec a `__px_`-linked command and have
+            // its manifest bind against the twin's own personality.
+            twin.host_procs
+                .push(HostProcEntry::new(grant, e.vtable.clone()));
         }
         // FORK.md §8.6 — module grants ride along (their `funcs`/`data`/`module` are `Arc`s, so the
         // copy is cheap): a shell that holds command modules must be able to fork *and* have each twin
@@ -28024,9 +28031,23 @@ impl Host {
 
     /// #1826 — every park transient the last dispatch left, drained at once ([`ParkTransients`]):
     /// the one drain the interpreters' call arms use, for an engine that decides outside this crate
-    /// (a JIT process tree, `jit_proc`).
-    pub fn take_park_transients(&mut self) -> ParkTransients {
-        ParkTransients::drain(self)
+    /// (a JIT process tree, `jit_proc`). #2847 — `None` when it left none, as most calls do: a few
+    /// loads that change nothing, where a drain writes every flag back.
+    #[inline]
+    pub fn take_park_transients(&mut self) -> Option<ParkTransients> {
+        let left = self.pipe_wake.is_some()
+            || self.pipe_wake_writers.is_some()
+            || self.region_wake.is_some()
+            || self.pipe_read_parked.is_some()
+            || self.pipe_write_parked.is_some()
+            || self.park_request.load(Ordering::Relaxed) != 0;
+        if !left {
+            // What a drain takes, and nothing else: it takes the interrupt flag and a spawn plan
+            // only beside a park or a request.
+            debug_assert!(ParkTransients::drain(self).is_empty());
+            return None;
+        }
+        Some(ParkTransients::drain(self))
     }
 
     /// FORK.md §8.6 — take the transient "the last pipe read must park" flag (`Some(pipe)`), so the
@@ -33872,12 +33893,12 @@ impl Host {
                     // one parks the child's caller as the parent's parks its own, and a declared
                     // host-answered one stays the embedder's to answer (#2579), as `fork_powerbox`
                     // carries it into a twin.
-                    let h = child.grant_host_proc_entry(HostProcEntry {
+                    let grant = HostProcGrant {
                         handler: forked.handler,
                         fork: Some(forked.refork.unwrap_or_else(|| Arc::clone(&factory))),
-                        vtable: None,
                         state: forked.state,
-                    });
+                    };
+                    let h = child.grant_host_proc_entry(HostProcEntry::new(grant, None));
                     // #801 — the vtable rides the re-grant, and its op names enter the child's
                     // directory: a spawned `__px_`-linked child binds its manifest in-loop, same
                     // as an exec'd one.
@@ -34915,117 +34936,136 @@ impl Host {
         if is_recorded_input(type_id, op)
             && (self.cap_record.is_some() || self.cap_replay.is_some())
         {
-            // Replay: serve the next recorded crossing if it matches this call (a mismatch means the
-            // re-execution diverged before this point — fall through to live as a best effort).
-            let served = if let Some((tape, pos)) = &mut self.cap_replay {
-                match tape.get(*pos) {
-                    Some(rec)
-                        if rec.type_id == type_id
-                            && rec.op == op
-                            && rec.handle == handle
-                            && rec.args == args =>
-                    {
-                        *pos += 1;
-                        Some(rec.clone())
-                    }
-                    _ => None,
-                }
-            } else {
-                None
-            };
-            if let Some(rec) = served {
-                // A capability whose state is its own (`CapState::Captured`, a `vm_fs` store) is
-                // re-run as well, so its state follows the replay: a store rewound with the program
-                // re-applies the writes the replay passes. Its answer is a function of that state
-                // and the guest's inputs, which the replay reproduces, so it matches the tape; the
-                // tape's answer is still the one served.
-                let mut mem = mem;
-                if self.host_proc_captured(handle) {
-                    let rerun: Option<&mut dyn GuestMem> = match &mut mem {
-                        Some(m) => Some(&mut **m),
-                        None => None,
-                    };
-                    // Its results are the tape's, so the rerun's go nowhere.
-                    let mut discard = vec![0; out.len()];
-                    let _ = self.cap_dispatch_slots_inner(
-                        type_id,
-                        op,
-                        handle,
-                        args,
-                        &mut discard,
-                        rerun,
-                        None,
-                        None,
-                    );
-                }
-                // Re-apply any guest-window writes the cap made (a buffer-filling `read`), then
-                // return the recorded result slots — no live host needed.
-                if let Some(m) = mem {
-                    for (ptr, bytes) in &rec.mem_writes {
-                        m.write_bytes(*ptr, bytes);
-                    }
-                }
-                self.cap_consumed += 1;
-                return rec.result.and_then(|r| put_results(out, &r));
-            }
-            // Record: run live through a `RecordingMem` so any guest-window writes are captured,
-            // then log the crossing for a future replay.
-            let mut pending = pending;
-            let (result, mem_writes) = match mem {
-                Some(m) => {
-                    let mut rec_mem = RecordingMem {
-                        inner: m,
-                        writes: Vec::new(),
-                    };
-                    let r = self.cap_dispatch_slots_inner(
-                        type_id,
-                        op,
-                        handle,
-                        args,
-                        out,
-                        Some(&mut rec_mem),
-                        pending.as_deref_mut(),
-                        None,
-                    );
-                    (r, rec_mem.writes)
-                }
-                None => (
-                    self.cap_dispatch_slots_inner(
-                        type_id,
-                        op,
-                        handle,
-                        args,
-                        out,
-                        None,
-                        pending.as_deref_mut(),
-                        None,
-                    ),
-                    Vec::new(),
-                ),
-            };
-            if let Some(rec) = &mut self.cap_record {
-                // A parked blocking-stdin read (W4) is a placeholder the driver discards and
-                // re-issues — taping it would replay as a phantom EOF. Only the re-issued
-                // (completed) read joins the tape. Likewise a **punted** dispatch (#1366 host-
-                // answered, or an offloaded job): its result slots are a placeholder the
-                // completion fills in later — a host-answered call's delivered value is taped
-                // where a driver delivers it instead ([`Completions::take_record`]).
-                let punted = pending.as_deref().is_some_and(|p| p.is_some());
-                if !self.stdin_parked && !punted {
-                    rec.push(CapRecord {
-                        type_id,
-                        op,
-                        handle,
-                        args: args.to_vec(),
-                        result: result.map(|()| out.to_vec()),
-                        mem_writes,
-                    });
-                    self.cap_consumed += 1;
-                }
-            }
-            return result;
+            return self.cap_dispatch_taped(type_id, op, handle, args, out, mem, pending);
         }
         self.cap_dispatch_slots_inner(type_id, op, handle, args, out, mem, pending, unlocked)
+    }
+
+    /// A taped call ([`Host::cap_dispatch_slots_deferring`]'s W1 record/replay): served from the
+    /// replay tape when the tape holds it, else run live and recorded. Under a tape an unlocked
+    /// call runs inline, so this offers no unlocked face. #2847 — out of line, so an untaped call's
+    /// dispatch carries none of its frame: a tape is a debugging run's.
+    #[cold]
+    #[allow(clippy::too_many_arguments)] // the call's own six, and its pending face
+    fn cap_dispatch_taped(
+        &mut self,
+        type_id: u32,
+        op: u32,
+        handle: i32,
+        args: &[i64],
+        out: &mut [i64],
+        mem: Option<&mut dyn GuestMem>,
+        pending: Option<&mut Option<u64>>,
+    ) -> Result<(), Trap> {
+        // Replay: serve the next recorded crossing if it matches this call (a mismatch means the
+        // re-execution diverged before this point — fall through to live as a best effort).
+        let served = if let Some((tape, pos)) = &mut self.cap_replay {
+            match tape.get(*pos) {
+                Some(rec)
+                    if rec.type_id == type_id
+                        && rec.op == op
+                        && rec.handle == handle
+                        && rec.args == args =>
+                {
+                    *pos += 1;
+                    Some(rec.clone())
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+        if let Some(rec) = served {
+            // A capability whose state is its own (`CapState::Captured`, a `vm_fs` store) is
+            // re-run as well, so its state follows the replay: a store rewound with the program
+            // re-applies the writes the replay passes. Its answer is a function of that state
+            // and the guest's inputs, which the replay reproduces, so it matches the tape; the
+            // tape's answer is still the one served.
+            let mut mem = mem;
+            if self.host_proc_captured(handle) {
+                let rerun: Option<&mut dyn GuestMem> = match &mut mem {
+                    Some(m) => Some(&mut **m),
+                    None => None,
+                };
+                // Its results are the tape's, so the rerun's go nowhere.
+                let mut discard = vec![0; out.len()];
+                let _ = self.cap_dispatch_slots_inner(
+                    type_id,
+                    op,
+                    handle,
+                    args,
+                    &mut discard,
+                    rerun,
+                    None,
+                    None,
+                );
+            }
+            // Re-apply any guest-window writes the cap made (a buffer-filling `read`), then
+            // return the recorded result slots — no live host needed.
+            if let Some(m) = mem {
+                for (ptr, bytes) in &rec.mem_writes {
+                    m.write_bytes(*ptr, bytes);
+                }
+            }
+            self.cap_consumed += 1;
+            return rec.result.and_then(|r| put_results(out, &r));
+        }
+        // Record: run live through a `RecordingMem` so any guest-window writes are captured,
+        // then log the crossing for a future replay.
+        let mut pending = pending;
+        let (result, mem_writes) = match mem {
+            Some(m) => {
+                let mut rec_mem = RecordingMem {
+                    inner: m,
+                    writes: Vec::new(),
+                };
+                let r = self.cap_dispatch_slots_inner(
+                    type_id,
+                    op,
+                    handle,
+                    args,
+                    out,
+                    Some(&mut rec_mem),
+                    pending.as_deref_mut(),
+                    None,
+                );
+                (r, rec_mem.writes)
+            }
+            None => (
+                self.cap_dispatch_slots_inner(
+                    type_id,
+                    op,
+                    handle,
+                    args,
+                    out,
+                    None,
+                    pending.as_deref_mut(),
+                    None,
+                ),
+                Vec::new(),
+            ),
+        };
+        if let Some(rec) = &mut self.cap_record {
+            // A parked blocking-stdin read (W4) is a placeholder the driver discards and
+            // re-issues — taping it would replay as a phantom EOF. Only the re-issued
+            // (completed) read joins the tape. Likewise a **punted** dispatch (#1366 host-
+            // answered, or an offloaded job): its result slots are a placeholder the
+            // completion fills in later — a host-answered call's delivered value is taped
+            // where a driver delivers it instead ([`Completions::take_record`]).
+            let punted = pending.as_deref().is_some_and(|p| p.is_some());
+            if !self.stdin_parked && !punted {
+                rec.push(CapRecord {
+                    type_id,
+                    op,
+                    handle,
+                    args: args.to_vec(),
+                    result: result.map(|()| out.to_vec()),
+                    mem_writes,
+                });
+                self.cap_consumed += 1;
+            }
+        }
+        result
     }
 
     /// The live capability dispatch (§3c) — resolve the handle in the host table and run the op. The
@@ -35556,18 +35596,17 @@ impl Host {
                     }
                 }
             }
-            // §7 embedder host-capability: hand `op`/args/window to the registered closure. Take it
-            // out for the call so the closure can't alias `self.host_procs` (it doesn't need `Host`;
-            // taking it out first also makes the §4b `&mut dyn RegionMinter` borrow of `self` sound),
-            // then restore it — a panic would only poison this one slot, never the host. A handler
+            // §7 embedder host-capability: hand `op`/args/window to the registered closure. A handler
             // registered mmap-capable ([`ProcHandler::Minting`]) is handed `self` as the minter; a
             // plain one gets `None` — the registration, not the call, decides the extra authority.
             Binding::HostProc(idx) => {
-                // #2645 — an unlocked handler keeps nothing in the host: it is shared, not taken out,
-                // and on a face that offers it the caller runs it once it has let go of the host.
-                if let Some(ProcHandler::Unlocked(f)) =
-                    self.host_procs.get(idx as usize).map(|e| &e.handler)
-                {
+                let Some(e) = self.host_procs.get_mut(idx as usize) else {
+                    return Err(Trap::CapFault);
+                };
+                // #2645 — an unlocked handler keeps nothing in the host: it is shared, not run in
+                // its slot, and on a face that offers it the caller runs it once it has let go of
+                // the host.
+                if let ProcHandler::Unlocked(f) = &e.handler {
                     let call = UnlockedCall {
                         handler: Arc::clone(f),
                         op,
@@ -35580,23 +35619,30 @@ impl Host {
                         None => call.run(args, out, mem),
                     };
                 }
-                let mut f = match self.host_procs.get_mut(idx as usize) {
-                    Some(e) => std::mem::replace(
-                        &mut e.handler,
-                        ProcHandler::Sync(Box::new(|_, _, _, _, _| Err(Trap::CapFault))),
-                    ),
-                    None => return Err(Trap::CapFault),
-                };
+                // #2847 — the handler runs in its slot, which the call marks running until it
+                // returns. A call that finds the mark faults: a re-entrant one, or any call after
+                // one whose handler panicked, so a handler never runs over a call it did not finish.
+                if e.running {
+                    return Err(Trap::CapFault);
+                }
+                e.running = true;
                 // §12 offloadable: the handler decides per call — `Done` completed inline (the
                 // fast case pays nothing beyond this match); `Offload` punts the self-contained
                 // job (pool + `Pending` on the parking face, inline on the sync face). The
                 // window/minter are deliberately out of reach of an offloadable handler.
                 let mut punted: Option<OffloadWork> = None;
                 let mut hosted: Option<HostCompletion> = None;
-                let r = match &mut f {
+                let r = match &mut e.handler {
                     ProcHandler::Sync(f) => f(op, args, out, mem, None),
-                    ProcHandler::Minting(f) => f(op, args, out, mem, Some(self)),
-                    ProcHandler::Unlocked(f) => f(op, args, out, mem), // run above; never taken out
+                    // Its minter is the host, so a minting handler leaves its slot for the call.
+                    ProcHandler::Minting(f) => {
+                        let placeholder: HostProc = Box::new(|_, _, _, _, _| Err(Trap::CapFault));
+                        let mut f = std::mem::replace(f, placeholder);
+                        let r = f(op, args, out, mem, Some(self));
+                        self.host_procs[idx as usize].handler = ProcHandler::Minting(f);
+                        r
+                    }
+                    ProcHandler::Unlocked(f) => f(op, args, out, mem), // run above, never here
                     ProcHandler::Offloadable(f) | ProcHandler::HostAnswered(f) => {
                         match f(op, args, out) {
                             OffloadOutcome::Done(r) => r,
@@ -35611,7 +35657,7 @@ impl Host {
                         }
                     }
                 };
-                self.host_procs[idx as usize].handler = f;
+                self.host_procs[idx as usize].running = false;
                 match (punted, hosted) {
                     (Some(job), _) => self.punt_or_inline(job, out, pending),
                     (None, Some(submit)) => {
@@ -39976,6 +40022,46 @@ mod region_minter_tests {
             CapState::Stateless,
         ));
         assert!(plain >= 0 && region >= 0 && plain != region);
+    }
+}
+
+#[cfg(test)]
+mod host_proc_slot_tests {
+    //! #2847 — a host procedure's handler runs in its slot, marked running for the call, so a call
+    //! after one whose handler panicked faults: a handler never runs over a call it did not finish.
+    use super::*;
+
+    /// A handler that answers `7`, and panics on op 1.
+    fn panics_on_op_1() -> HostProc {
+        Box::new(|op, _args, out, _mem, _minter| {
+            if op == 1 {
+                panic!("a bug in the handler");
+            }
+            put_results(out, &[7])
+        })
+    }
+
+    #[test]
+    fn a_handler_that_panicked_is_not_run_again() {
+        for minting in [false, true] {
+            let handler = if minting {
+                ProcHandler::Minting(panics_on_op_1())
+            } else {
+                ProcHandler::Sync(panics_on_op_1())
+            };
+            let mut host = Host::new();
+            let h = host.grant_host_proc(HostProcGrant::new(handler, CapState::Stateless));
+            let call = |host: &mut Host, op| host.cap_call(cap_id::HOST_PROC, op, h, &[], 1, None);
+            assert_eq!(call(&mut host, 0), Ok(vec![7]), "minting: {minting}");
+            let panicked =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| call(&mut host, 1)));
+            assert!(panicked.is_err(), "minting: {minting}");
+            assert_eq!(
+                call(&mut host, 0),
+                Err(Trap::CapFault),
+                "minting: {minting}"
+            );
+        }
     }
 }
 
