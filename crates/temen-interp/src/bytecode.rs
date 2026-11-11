@@ -17615,6 +17615,20 @@ const PIPE_SPIN_NS: u64 = 20_000;
 /// [`thread_wakes`]' count.
 static THREAD_WAKES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// [`futex_fast_stops`]' count, kept only in a debug build.
+#[cfg(debug_assertions)]
+static FAST_STOPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// #2982 — in a debug build, how many futex stops this process's executor 2 runs have applied
+/// without a settle ([`Applied::Futex`]), for a test to show the path was taken; `0` in a release
+/// build, which keeps no count.
+pub fn futex_fast_stops() -> u64 {
+    #[cfg(debug_assertions)]
+    return FAST_STOPS.load(std::sync::atomic::Ordering::Relaxed);
+    #[cfg(not(debug_assertions))]
+    0
+}
+
 /// [`thread_blocks`]' count.
 static THREAD_BLOCKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -17649,13 +17663,13 @@ struct Threads {
     /// park: those that will take the lock again with no wake. A park that would leave none settles
     /// first ([`ThreadRun::park`]). [`Threads::set_park`] alone writes it.
     awake: usize,
-    /// #2963 — whether a thread watches the run now ([`ThreadRun::watching`]), and so settles it on
-    /// the next ring of its bell: the opener's watch, the run's own watcher, or an embedder's watch
-    /// while it pumps the run. A futex stop skips its settle only then ([`ThreadRun::apply`]). The
-    /// watch counts itself in as it starts and out under the same lock hold as its last settle, so
-    /// a ring the count could miss lands after that settle, while every stop settles in full again.
-    /// At most one thread watches: a run its opener or embedder watches starts no watcher.
-    watching: usize,
+    /// #2982 — the ring count of the run's bell ([`ThreadRun::bell`]) that its last settle read
+    /// before it ran; `None` until the first, so the run's first stop settles whatever it is, as
+    /// every stop did before #2963. A futex stop skips its settle only while the bell still reads
+    /// this ([`ThreadRun::apply`]): whatever the world does that a settle would find rings the
+    /// bell, or wakes the parked thread it concerns itself. A ring that lands during a settle,
+    /// after its read, is seen by the next stop.
+    seen: Option<u64>,
     /// The run's result once it is over: its root's, or a deadlock's `ThreadFault`. Every thread
     /// ends at its next look.
     over: Option<Result<Vec<Value>, Trap>>,
@@ -18301,7 +18315,7 @@ impl ThreadRun {
                 parks: vec![Park::default()],
                 woken: Vec::new(),
                 awake: 0,
-                watching: 0,
+                seen: None,
                 over: None,
                 fault: None,
                 live: 1, // the root's
@@ -18905,6 +18919,13 @@ impl ThreadRun {
         ran.map(|()| (results, work))
     }
 
+    /// #2982 — how many times the run's bell has rung. A stop reads it under the run's lock: the
+    /// bell's lock is the innermost of the run's (a ring under the run's lock takes it, and nothing
+    /// takes the run's lock, or a powerbox's, while holding it), so the read cannot deadlock.
+    fn rings(&self) -> u64 {
+        *self.bell.0.lock_unpoisoned()
+    }
+
     /// Ring the run's bell: its watcher looks at the run.
     fn ring(&self) {
         super::ring(&self.bell);
@@ -19003,14 +19024,15 @@ impl ThreadRun {
         let applied = core.on_stop(emit, &self.source, ti, stop);
         // #2963 — a futex stop that moved only futex task state wakes the threads of the tasks it
         // woke, and nothing else: what a settle would find besides is the world's doing since the
-        // last one, and each such store rings the run's bell, which its watcher settles on, or wakes
-        // the thread parked on it ([`Self::park`]). So only a run a thread watches now takes it
-        // ([`Threads::watching`]), and not once it is over or holds a domain, whose gate a park
-        // gives back. If the stop leaves the run idle,
-        // the park that puts its last thread to sleep settles first.
-        let watched = g.watching != 0;
-        if matches!(applied, Applied::Futex) && watched && g.over.is_none() && g.core.held.is_none()
-        {
+        // last one, and each such store rings the run's bell or wakes the thread parked on it
+        // ([`Self::park`]). So it skips the settle while the bell has not rung since the last one
+        // (#2982, [`Threads::seen`]), and not once the run is over or holds a domain, whose gate a
+        // park gives back. If the stop leaves the run idle, the park that puts its last thread to
+        // sleep settles first.
+        let quiet = g.seen == Some(self.rings());
+        if matches!(applied, Applied::Futex) && quiet && g.over.is_none() && g.core.held.is_none() {
+            #[cfg(debug_assertions)]
+            FAST_STOPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let mut woken = std::mem::take(&mut g.core.tasks.waits.woken);
             for j in woken.drain(..) {
                 if g.parks.get(j).is_some_and(|p| p.asleep) && self.awake(&g.core, j) {
@@ -19097,7 +19119,8 @@ impl ThreadRun {
     /// ([`Self::park`]). So the run cannot go idle unseen.
     fn settle(&self, g: &mut Threads) {
         debug_assert_eq!(g.awake, g.awake_by_parks(), "the awake count is the parks'");
-        debug_assert!(g.watching <= 1, "one thread watches a run at most");
+        // #2982 — read before anything here looks, so a ring after this is the next stop's to see.
+        g.seen = Some(self.rings());
         let core = &mut g.core;
         let rests = Held::rests(&core.held);
         // #2695 step 2 — a resting held domain ends when any of its members exits or traps.
@@ -19543,7 +19566,6 @@ impl ThreadRun {
     /// ([`CoopRun::wait`]).
     fn watching(&self) -> (Watched, u64) {
         let _exit = ThreadExit(self);
-        self.state.lock_unpoisoned().watching += 1;
         loop {
             let seen = *self.bell.0.lock_unpoisoned();
             let mut g = self.state.lock_unpoisoned();
@@ -19555,10 +19577,6 @@ impl ThreadRun {
                 Some(_) => Some(Watched::Over),
                 None => self.event(&mut g),
             };
-            // #2963 — it stops watching under the lock hold of its last settle ([`Threads::watching`]).
-            if watched.is_some() {
-                g.watching -= 1;
-            }
             release(g);
             if let Some(w) = watched {
                 return (w, seen);
