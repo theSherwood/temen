@@ -34,6 +34,11 @@ fn run_killed(src: &str, delay_ms: u64) -> JitOutcome {
         std::thread::sleep(Duration::from_millis(delay_ms));
         wd.fire(); // request the domain kill
     });
+    // #2948 spike: under `TEMEN_JIT_KERNEL=1`, the spike path's run, killed through the same door.
+    if let Some(o) = temen_run::jit_kernel::outcome(&m, 0, &[0i64], Some(&interrupt)) {
+        watchdog.join().unwrap();
+        return o;
+    }
     // The guest makes no `call.cap`, so the thunk is never invoked (null ctx never read).
     let outcome = compile_and_run_with_host_interruptible(
         &m,

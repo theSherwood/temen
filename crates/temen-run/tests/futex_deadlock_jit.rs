@@ -24,6 +24,10 @@ fn module(text: &str) -> temen_ir::Module {
 /// Run `m` on an **unarmed** JIT domain: no kill-path interrupt cell, no durable window, no grant
 /// hooks. Returns `Err` if the run ended abnormally — which is what a detected deadlock looks like.
 fn jit_unarmed(m: &temen_ir::Module) -> Result<temen_jit::JitOutcome, String> {
+    // #2948 spike: under `TEMEN_JIT_KERNEL=1`, the spike path's run.
+    if let Some(o) = temen_run::jit_kernel::outcome(m, 0, &[], None) {
+        return Ok(o);
+    }
     let mut host = Host::new();
     let (jo, _) = compile_and_run_capture_reserved_with_host_ex(
         m,

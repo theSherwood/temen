@@ -102,6 +102,15 @@ fn to_slot(v: &Value) -> i64 {
     }
 }
 
+/// The Cranelift JIT's run of `m`, or under `TEMEN_JIT_KERNEL=1` (#2948 spike) the spike path's,
+/// when `m` is in its scope.
+fn jit_run(m: &temen_ir::Module) -> Result<JitOutcome, temen_jit::JitError> {
+    match temen_run::jit_kernel::outcome(m, 0, &[], None) {
+        Some(o) => Ok(o),
+        None => compile_and_run(m, 0, &[]),
+    }
+}
+
 fn trap_matches(t: &Trap, k: &TrapKind) -> bool {
     t.code() == k.code() // one wire code for both engines (#1735)
 }
@@ -111,7 +120,7 @@ fn assert_jit_matches_interp(src: &str) {
     verify_module(&m).unwrap_or_else(|e| panic!("verify: {e:?}\n{src}"));
     let mut fuel = 50_000_000u64;
     let interp = run(&m, 0, &[], &mut fuel);
-    let jit = compile_and_run(&m, 0, &[]).expect("jit compile/run");
+    let jit = jit_run(&m).expect("jit compile/run");
     match (&interp, &jit) {
         (Ok(vals), JitOutcome::Returned(slots)) => {
             let want: Vec<i64> = vals.iter().map(to_slot).collect();
@@ -169,7 +178,7 @@ fn thread_parallel_atomic_counter() {
     let m = parse_module(ATOMIC4).expect("parse");
     verify_module(&m).expect("verify");
     for _ in 0..40 {
-        match compile_and_run(&m, 0, &[]).expect("jit") {
+        match jit_run(&m).expect("jit") {
             JitOutcome::Returned(x) => assert_eq!(x, [400], "parallel total wrong"),
             other => panic!("unexpected {other:?}"),
         }
@@ -223,7 +232,7 @@ fn thread_parallel_futex_handoff() {
     let m = parse_module(FUTEX).expect("parse");
     verify_module(&m).expect("verify");
     for _ in 0..40 {
-        match compile_and_run(&m, 0, &[]).expect("jit") {
+        match jit_run(&m).expect("jit") {
             JitOutcome::Returned(x) => assert_eq!(x, [987654], "parallel futex payload wrong"),
             other => panic!("unexpected {other:?}"),
         }
@@ -345,7 +354,7 @@ fn thread_parallel_with_fibers() {
     verify_module(&m).expect("verify");
     // Σ over i in 0..4 of (i*10 + 42) = (0+10+20+30) + 4*42 = 60 + 168 = 228.
     for _ in 0..40 {
-        match compile_and_run(&m, 0, &[]).expect("jit") {
+        match jit_run(&m).expect("jit") {
             JitOutcome::Returned(x) => assert_eq!(x, [228], "parallel fiber+thread sum wrong"),
             other => panic!("unexpected {other:?}"),
         }
@@ -615,7 +624,7 @@ fn concurrent_fiber_steal_stress() {
     // Σ over id in 0..16 of (3·id+1) + (7·id+2) = 10·(0+…+15) + 3·16 = 1200 + 48 = 1248.
     let reps = if cfg!(windows) { 10 } else { 30 };
     for _ in 0..reps {
-        match compile_and_run(&m, 0, &[]).expect("jit") {
+        match jit_run(&m).expect("jit") {
             JitOutcome::Returned(x) => assert_eq!(x, [1248], "steal-stress sum wrong"),
             other => panic!("unexpected {other:?}"),
         }

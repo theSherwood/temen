@@ -71,12 +71,22 @@ pub mod jit_kernel {
         _: &[i64],
         _: u8,
         _: &mut temen_interp::Host,
+        _: Option<&std::sync::Arc<temen_jit::Interrupt>>,
     ) -> Option<Result<Vec<i64>, temen_interp::Trap>> {
         None
     }
     /// None ran.
     pub fn vcpus() -> u64 {
         0
+    }
+    /// Never: today's path runs.
+    pub fn outcome(
+        _: &temen_ir::Module,
+        _: u32,
+        _: &[i64],
+        _: Option<&std::sync::Arc<temen_jit::Interrupt>>,
+    ) -> Option<temen_jit::JitOutcome> {
+        None
     }
 }
 pub use jit_proc::JitCodeCache;

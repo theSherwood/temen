@@ -70,6 +70,12 @@ pub(crate) fn routed(vm: &VmCtx, stop: KStop) -> Option<[i64; 2]> {
     }
 }
 
+/// Call `w` when `door` fires, for as long as the registration lives: how a kernel run hears of the
+/// JIT kill door its code polls, to stop its parked tasks too.
+pub fn on_kill(door: &crate::Interrupt, w: Box<dyn Fn() + Send + Sync>) -> crate::Registration<'_> {
+    door.wakers().register(w)
+}
+
 /// What [`KernelRun::run_vcpu`] runs.
 #[derive(Clone, Copy, Debug)]
 pub enum VcpuEntry<'a> {

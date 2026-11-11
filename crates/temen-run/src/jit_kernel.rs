@@ -46,6 +46,7 @@ pub fn run(
     args: &[i64],
     reserved_log2: u8,
     host: &mut Host,
+    kill: Option<&Arc<temen_jit::Interrupt>>,
 ) -> Option<Result<Vec<i64>, Trap>> {
     if host.is_durable() || m.funcs.iter().any(temen_ir::Func::uses_fibers) {
         return None;
@@ -61,7 +62,7 @@ pub fn run(
         std::ptr::null_mut(), // each vCPU's context names its domain's host cell
         reserved_log2,
         None, // no §14 children
-        None, // no interrupt: the run's end raises the domain's end instead
+        kill, // its running code polls the kill door; the run's end raises the domain's end
         None, // no fuel metering
         None,
         None,
@@ -96,6 +97,15 @@ pub fn run(
         ..ThreadPlatform::OS
     };
     host.set_thread_platform(platform);
+    // The kill door stops the kernel's run too, so its parked tasks unwind: the embedder's stop, as
+    // the JIT's kill is (`OutOfFuel`).
+    let door = Arc::new(temen_interp::bytecode::RunDoor::default());
+    host.set_run_door(Arc::clone(&door));
+    let _kill = kill.map(|k| {
+        let door = Arc::clone(&door);
+        // A busy run lock answers `false`: the stop is asked again (`RunDoor::stop`).
+        temen_jit::kernel_rt::on_kill(k, Box::new(move || while !door.stop() {}))
+    });
     let vals: Vec<Value> = f
         .params
         .iter()
@@ -157,6 +167,38 @@ fn value_slot(v: Value) -> i64 {
         Value::Ref(x) => x as i64,
         Value::V128(_) => 0,
     }
+}
+
+/// #2948 spike, for tests: under [`enabled`], run `m`'s `entry(args)` on the spike path with a fresh
+/// host and answer as the JIT's own entries do; `None` when off, or when `m` is out of scope, and the
+/// caller runs today's path.
+pub fn outcome(
+    m: &Module,
+    entry: u32,
+    args: &[i64],
+    kill: Option<&Arc<temen_jit::Interrupt>>,
+) -> Option<temen_jit::JitOutcome> {
+    use temen_jit::{JitOutcome, TrapKind};
+    if !enabled() {
+        return None;
+    }
+    let mut host = Host::new();
+    Some(
+        match run(
+            m,
+            entry,
+            args,
+            temen_ir::DEFAULT_RESERVED_LOG2,
+            &mut host,
+            kill,
+        )? {
+            Ok(v) => JitOutcome::Returned(v),
+            Err(Trap::Exit(code)) => JitOutcome::Exited(code),
+            Err(t) => JitOutcome::Trapped(
+                TrapKind::from_code(t.code() as u32).unwrap_or(TrapKind::ThreadFault),
+            ),
+        },
+    )
 }
 
 /// [`ThreadTier::run`] for the Cranelift JIT: run the task's entry on this thread as a vCPU.

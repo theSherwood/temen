@@ -48,6 +48,20 @@ const ALL: [Backend; 3] = [Backend::TreeWalk, Backend::Bytecode, Backend::Jit];
 fn run_on(src: &str, backend: Backend) -> (Result<String, String>, Duration) {
     let module = temen_text::parse_module(src).expect("parse");
     temen_verify::verify_module(&module).expect("verify");
+    let t0 = Instant::now();
+    // #2948 spike: under `TEMEN_JIT_KERNEL=1`, the JIT row runs the spike path.
+    if backend == Backend::Jit {
+        if let Some(o) = temen_run::jit_kernel::outcome(&module, 0, &[], None) {
+            let dt = t0.elapsed();
+            return match o {
+                temen_jit::JitOutcome::Returned(v) => {
+                    let vals: Vec<_> = v.iter().map(|x| temen_interp::Value::I64(*x)).collect();
+                    (Ok(format!("{vals:?}")), dt)
+                }
+                _ => (Err(format!("{o:?}")), dt),
+            };
+        }
+    }
     let instance = instantiate(module).expect("instantiate");
     let t0 = Instant::now();
     let r = instance.run(backend, &RunConfig::default());
