@@ -325,22 +325,21 @@ export 0 func \"_start\" 0
 #[test]
 fn a_crashing_twin_reaps_as_128_identically_on_every_engine() {
     for backend in [Backend::TreeWalk, Backend::Bytecode, Backend::Jit] {
+        // A run that publishes nothing leaves this empty slot, not the previous run's record.
+        temen_interp::publish_twin_traps(Vec::new());
         assert_eq!(
             run_on(FORK_CRASH, true, backend, &RunConfig::default()),
             Outcome::Exited(128),
             "{backend:?}"
         );
-        // The bytecode engine keeps no twin-trap record; the other two name the trap.
-        if backend != Backend::Bytecode {
-            let traps = temen_interp::last_twin_traps();
-            assert_eq!(traps.len(), 1, "{backend:?}: {traps:?}");
-            assert_eq!(traps[0].task, 2, "{backend:?}");
-            assert_eq!(
-                traps[0].trap,
-                temen_interp::Trap::Unreachable,
-                "{backend:?}"
-            );
-        }
+        let traps = temen_interp::last_twin_traps();
+        assert_eq!(traps.len(), 1, "{backend:?}: {traps:?}");
+        assert_eq!(traps[0].task, 2, "{backend:?}");
+        assert_eq!(
+            traps[0].trap,
+            temen_interp::Trap::Unreachable,
+            "{backend:?}"
+        );
     }
 }
 
@@ -770,16 +769,14 @@ fn the_runs_fuel_stops_a_spinning_twin_on_every_engine() {
         ..RunConfig::default()
     };
     for backend in [Backend::TreeWalk, Backend::Bytecode, Backend::Jit] {
+        temen_interp::publish_twin_traps(Vec::new());
         assert_eq!(
             run_on(FORK_SPIN, true, backend, &cfg),
             Outcome::Exited(128),
             "{backend:?}"
         );
-        // The bytecode engine keeps no twin-trap record; the other two name the trap.
-        if backend != Backend::Bytecode {
-            let traps = temen_interp::last_twin_traps();
-            assert_eq!(traps.len(), 1, "{backend:?}: {traps:?}");
-            assert_eq!(traps[0].trap, temen_interp::Trap::OutOfFuel, "{backend:?}");
-        }
+        let traps = temen_interp::last_twin_traps();
+        assert_eq!(traps.len(), 1, "{backend:?}: {traps:?}");
+        assert_eq!(traps[0].trap, temen_interp::Trap::OutOfFuel, "{backend:?}");
     }
 }

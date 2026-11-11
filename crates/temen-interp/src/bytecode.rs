@@ -8679,6 +8679,7 @@ fn spawn_task(
         state,
         ..TaskSlot::new(vt, eidx, live)
     });
+    tasks.pids.insert(child_ti, pid);
     forked_twins.insert(child_ti);
     pid as i64
 }
@@ -8946,15 +8947,19 @@ fn fork_bare(tasks: &[TaskSlot], envs: &[Domain], ti: usize) -> bool {
 /// What a fork twin takes from its parent's process (the oracle's `fork_vcpu`): one `spawn` of the
 /// node they share while it lives (#2001), its task ([`twin_task`]: the `parent` frame answered
 /// `reply` at `dst`), a private copy of its window `mem`, and its powerbox `host` duplicated as
-/// process `pid`, which pays the node for the copy (#2106). `None` refuses the fork, with nothing
-/// left charged: a full ceiling, or a window or powerbox that cannot be duplicated. The powerbox
-/// comes last: its providers register the process as they copy it, so nothing after may refuse the
-/// fork (#2373). The window is copied outside the powerbox's lock.
+/// process `pid`, which pays the node for the copy (#2106). The powerbox is wired as the root's is
+/// ([`wire_process`], on the run's `bell`), for every twin, a personality fork's or a
+/// `clone_caller`'s, as the oracle wires each (#2197): the twin's own `fork()` and `waitpid()` park,
+/// and a signal to it while every task is parked re-runs the settle. `None` refuses the fork, with
+/// nothing left charged: a full ceiling, or a window or powerbox that cannot be duplicated. The
+/// powerbox comes last: its providers register the process as they copy it, so nothing after may
+/// refuse the fork (#2373). The window is copied outside the powerbox's lock.
 fn fork_process(
     host: &std::sync::Mutex<Host>,
     mem: Option<&Mem>,
     pid: u64,
     (parent, dst, reply): (&Vm, u32, i64),
+    bell: Option<&super::Bell>,
 ) -> Option<(Option<Mem>, Host, LiveVcpu, VTask)> {
     let payer = host.lock_unpoisoned().own_node();
     let live = LiveVcpu::charge(payer.clone())?;
@@ -8965,6 +8970,7 @@ fn fork_process(
     };
     let window = mem.map_or(0, Mem::mapped_size);
     let twin_host = host.lock_unpoisoned().fork_powerbox(pid, window)?;
+    wire_process(&twin_host, bell);
     Some((twin_mem, twin_host, live, task))
 }
 
@@ -12158,6 +12164,13 @@ struct Tasks {
     /// The tasks that ended in a trap whose domain's teardown has not run yet
     /// ([`teardown_domains`]), as [`complete`] and [`Tasks::push`] record them.
     failed: Vec<usize>,
+    /// #1827 — each process's root task (a personality `fork`'s twin, a `clone_caller` twin, a
+    /// spawned process), with the pid its parent knows it by.
+    pids: std::collections::BTreeMap<usize, u64>,
+    /// #1827 — the processes that trapped, in completion order, as [`complete`] records them: a
+    /// process's trap is its parent's business, reaped as a status, so it does not end the run. The
+    /// run's end publishes them for [`super::last_twin_traps`], as the oracle's does (#1665).
+    twin_traps: Vec<super::TwinTrap>,
 }
 
 impl std::ops::Deref for Tasks {
@@ -13925,6 +13938,11 @@ impl CoopSched {
     /// Not a run that froze: the cut carries them.
     fn pump(&mut self, source: &ModuleSource, budget: u64) -> Result<CoopStep, Trap> {
         let step = self.pump_to_pause(source, budget);
+        // #1827 — the run is over: its processes that trapped are published on the thread that
+        // pumped it, as the oracle publishes its own. A held run's end is its `finish`.
+        if matches!(step, Ok(CoopStep::Done(_)) | Err(_)) && self.core.held.is_none() {
+            super::publish_twin_traps(std::mem::take(&mut self.core.tasks.twin_traps));
+        }
         let ended = match &step {
             Ok(CoopStep::Done(_)) => !root_unwinding(&self.core.domains),
             Ok(_) => false,
@@ -14358,8 +14376,10 @@ impl CoopSched {
             // The step is over: what follows may lock any domain's cell, this task's included.
             drop(guard);
             tasks[ti].answers = lent;
-            // The first fault recorded wins; the run entry clears the slot beforehand.
-            if let Some(a) = fault {
+            // The first fault recorded wins; the run entry clears the slot beforehand. A process's
+            // own is not the run's: its trap is recorded apart ([`complete`], #1827), as the oracle
+            // keeps a twin's out of the run's trap origin (#1665).
+            if let Some(a) = fault.filter(|_| !tasks.pids.contains_key(&ti)) {
                 super::LAST_CAPTURE_FAULT.with(|c| _ = c.borrow_mut().get_or_insert(a));
             }
             // #2224 — logical time moves with work: a quantum that ran out moves the clock by its
@@ -14890,8 +14910,13 @@ impl SchedCore {
                         Some(caller_env).filter(|&ck| ck != 0).and_then(|ck| {
                             let env = &domains[ck];
                             let at = (&tasks[caller_ti].vm.vt.active, caller_dst, reply_twin);
-                            let (twin_mem, twin_host, live, twin_vt) =
-                                fork_process(&env.host, env.mem.as_ref(), twin_pid, at)?;
+                            let (twin_mem, twin_host, live, twin_vt) = fork_process(
+                                &env.host,
+                                env.mem.as_ref(),
+                                twin_pid,
+                                at,
+                                bell.as_ref(),
+                            )?;
                             Some((ck, twin_mem, twin_host, live, twin_vt))
                         })
                     } else {
@@ -14930,6 +14955,7 @@ impl SchedCore {
                     });
                     let twin_ti = tasks.len();
                     tasks.push(TaskSlot::new(twin_vt, twin_eidx, live));
+                    tasks.pids.insert(twin_ti, twin_ti as u64);
                     // Mark the twin reapable so a later servicer-side `wait()` (`reap`) can deliver
                     // its exit status to the parent (FORK.md §8.6); retired when reaped.
                     forked_twins.insert(twin_ti);
@@ -15191,7 +15217,7 @@ impl SchedCore {
                     let win = domains[env].mem.as_ref();
                     // The return-twice `0`; the parent keeps the twin's pid, set below.
                     let at = (&tasks[ti].vm.vt.active, dst, 0);
-                    fork_process(&domains[env].host, win, twin_pid, at)
+                    fork_process(&domains[env].host, win, twin_pid, at, bell.as_ref())
                 } else {
                     None
                 };
@@ -15200,10 +15226,6 @@ impl SchedCore {
                         tasks[ti].deliver(dst, Reg::from_i64(super::EAGAIN));
                     }
                     Some((twin_mem, twin_host, live, mut twin_vt)) => {
-                        // #1080 / #1262 — the twin's own park door, so its own `fork()`/`waitpid()`
-                        // park (a bash pipeline subshell is a twin that forks and waits its
-                        // command), and its signal doors on the run's bell.
-                        wire_process(&twin_host, bell.as_ref());
                         // #1297: the twin's own dispatch table, seeded with the caller's installs.
                         let caller = &domains[env];
                         let (twin_table, twin_fuel, program) = (
@@ -15240,6 +15262,7 @@ impl SchedCore {
                         });
                         debug_assert_eq!(tasks.len(), twin_ti, "twin lands at its pre-read index");
                         tasks.push(TaskSlot::new(twin_vt, twin_eidx, live));
+                        tasks.pids.insert(twin_ti, twin_pid);
                         forked_twins.insert(twin_ti);
                         tasks[ti].deliver(dst, Reg::from_i64(twin_pid as i64));
                     }
@@ -16135,6 +16158,7 @@ impl HeldPump {
         } = r;
         let core = &mut sched.core;
         refund_ended_windows(&mut core.tasks, &mut core.domains, true);
+        super::publish_twin_traps(std::mem::take(&mut core.tasks.twin_traps));
         let root = std::sync::Arc::clone(&core.domains[0].host);
         // The tasks hand their fuel back as they go, before the powerbox does.
         drop(sched);
@@ -17980,6 +18004,8 @@ impl ThreadRun {
         let footprint = Footprint::of(&core.domains, &run.source);
         drop(run);
         refund_ended_windows(&mut core.tasks, &mut core.domains, true);
+        // #1827 — on the caller's thread, as the pump publishes them.
+        super::publish_twin_traps(std::mem::take(&mut core.tasks.twin_traps));
         // The root's window goes back to the caller; the rest of the run, the root's fuel with it,
         // goes now.
         let mem = core.domains[0].mem.take();
@@ -18098,7 +18124,8 @@ fn carry<'g>(
             break;
         }
         std::mem::swap(&mut g.core.tasks[ti].vm, &mut vm);
-        if let Some(a) = fault {
+        // A process's own is not the run's, as on the pump (#1827).
+        if let Some(a) = fault.filter(|_| !g.core.tasks.pids.contains_key(&ti)) {
             g.fault.get_or_insert(a);
         }
         exec = matches!(stop, Ok(VcpuStop::Exec { .. }));
@@ -19177,6 +19204,19 @@ fn complete(tasks: &mut Tasks, envs: &mut [Domain], ti: usize, res: Result<Vec<V
         // #2229 — its domain's teardown finds it here.
         if res.is_err() {
             tasks.failed.push(done);
+        }
+        // #1827 — a process's trap is recorded apart, by its pid, as the oracle records it. Its
+        // `exit`, with any status, is not a trap. Like the JIT's, the record names no frames or
+        // fault address.
+        if let (Some(&pid), Err(trap)) = (tasks.pids.get(&done), &res) {
+            if !matches!(trap, Trap::Exit(_)) {
+                tasks.twin_traps.push(super::TwinTrap {
+                    task: pid,
+                    trap: *trap,
+                    backtrace: Vec::new(),
+                    fault: None,
+                });
+            }
         }
         tasks[done].state = TaskState::Done(res.clone());
         tasks[done].live = LiveVcpu::none(); // #2001: its `spawn` goes back

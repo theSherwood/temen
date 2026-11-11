@@ -23,16 +23,15 @@
 
 #[path = "support/coop.rs"]
 mod coop;
+#[path = "support/proc_doors.rs"]
+mod proc_doors;
 #[path = "support/rec.rs"]
 mod rec;
 
-use std::sync::{Arc, Mutex};
+use proc_doors::grant_proc_doors;
+use std::sync::Arc;
 use temen_interp::bytecode::{ModuleEmitter, ModuleOffer, ProgramEmit, TierUpConfig};
-use temen_interp::put_results;
-use temen_interp::{
-    bytecode, CapState, ForkedProc, Host, HostProc, HostProcFork, HostProcGrant, ParkEvent,
-    ProcHandler, SignalSource, Trap, Value,
-};
+use temen_interp::{bytecode, Host, Trap, Value};
 use temen_text::parse_module;
 
 const FUEL: u64 = 10_000_000;
@@ -1408,61 +1407,6 @@ fn root_fork_run(
     };
     envs.sort_unstable();
     (result, envs)
-}
-
-/// A personality reduced to its process doors: op 0 `fork`s and op 1 `waitpid`s, as temen-posix's
-/// do. Each asks the core through the park door the driver installs on the domain's signal source;
-/// `waitpid` re-runs when the twin ends, and answers the status its exit hook recorded.
-fn grant_proc_doors(host: &mut Host) -> i32 {
-    const ENOSYS: i64 = -38;
-    let door = Arc::new(ParkDoor::default());
-    let exited: Arc<Mutex<Option<i64>>> = Arc::default();
-    let (ask, status) = (Arc::clone(&door), Arc::clone(&exited));
-    let doors: HostProc = Box::new(move |op, args, out, _, _| {
-        let (park, r) = match (op, *status.lock().unwrap()) {
-            (0, _) => (Some(ParkEvent::ForkSelf), ENOSYS),
-            (_, Some(s)) => (None, s),
-            (_, None) => (Some(ParkEvent::TaskExit(args[0] as u64)), ENOSYS),
-        };
-        if let (Some(ev), Some(req)) = (park, ask.0.lock().unwrap().clone()) {
-            req(ev);
-        }
-        put_results(out, &[r])
-    });
-    // The twin's own door, as a per-process personality mints one (its park door is its own), and an
-    // exit hook that records its status.
-    let fork: HostProcFork = Arc::new(move |_pid| {
-        let exited = Arc::clone(&exited);
-        let source: Arc<dyn SignalSource + Send + Sync> = Arc::new(ParkDoor::default());
-        Some(ForkedProc {
-            signal: Some((source, Arc::default())),
-            exit: Some(Arc::new(move |s| *exited.lock().unwrap() = Some(s))),
-            ..ForkedProc::shared(
-                ProcHandler::Sync(Box::new(|_, _, out, _, _| put_results(out, &[ENOSYS]))),
-                CapState::Stateless,
-            )
-        })
-    });
-    host.set_signal_source(door, Arc::default());
-    host.grant_host_proc(
-        HostProcGrant::new(ProcHandler::Sync(doors), CapState::Stateless).forkable(fork),
-    )
-}
-
-/// The park door the driver installs on a domain's signal source.
-type ParkRequest = Arc<dyn Fn(ParkEvent) + Send + Sync>;
-
-/// A signal source that holds only the park door the driver installs.
-#[derive(Default)]
-struct ParkDoor(Mutex<Option<ParkRequest>>);
-
-impl SignalSource for ParkDoor {
-    fn take_deliverable(&self) -> Option<(i32, i32, u64)> {
-        None
-    }
-    fn set_park_request(&self, req: ParkRequest) {
-        *self.0.lock().unwrap() = Some(req);
-    }
 }
 
 // #816 item 4 — `SharedProgram::coop_run_over_grown`, the warm session's cooperative constructor:

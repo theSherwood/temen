@@ -9,6 +9,8 @@
 //!   duplicated powerbox), deliver `reply_orig` to the original and `reply_twin` to the twin. Both
 //!   resume past the same fork `call.cap` — return-twice, one live run.
 
+#[path = "support/proc_doors.rs"]
+mod proc_doors;
 #[path = "support/rec.rs"]
 mod rec;
 
@@ -31,7 +33,12 @@ fn forking(src: &str) -> String {
         grants_n: 2,
         ..SpawnRec::default()
     };
-    format!("{src}{}{}", server(), rec::segment(17664, &c))
+    forking_with(src, &c)
+}
+
+/// `src` with the server's spawn record and the caller C's, `c`.
+fn forking_with(src: &str, c: &SpawnRec) -> String {
+    format!("{src}{}{}", server(), rec::segment(17664, c))
 }
 
 /// `m`'s child images (#2219) of the functions `funcs`, granted in order: the server S is func 1 and
@@ -420,8 +427,19 @@ const ORACLE: On = On::TreeWalk { handoff: false };
 /// Instantiator, `stdout` (a shared sink the twin inherits), a budget, and the child images of the
 /// server S (func 1) and the caller C (func 4).
 fn run_forking(src: &str, on: On) -> (Result<Vec<Value>, temen_interp::Trap>, Vec<i64>) {
-    let m = module(&forking(src));
+    run_forked(&forking(src), on, &|_| {})
+}
+
+/// [`run_forking`] of a module already given its spawn records, `text`, with `setup` granting the
+/// root's powerbox whatever else the program asks for.
+fn run_forked(
+    text: &str,
+    on: On,
+    setup: &dyn Fn(&mut Host),
+) -> (Result<Vec<Value>, temen_interp::Trap>, Vec<i64>) {
+    let m = module(text);
     let mut host = Host::new();
+    setup(&mut host);
     if let On::TreeWalk { handoff } = on {
         host.set_handoff(handoff);
     }
@@ -1041,6 +1059,225 @@ fn the_bytecode_engine_reaps_as_the_oracle_does() {
         for on in [On::Bytecode, On::Parallel] {
             assert_eq!(run_forking(&src, on), oracle, "{name}, on {on:?}");
         }
+    }
+}
+
+/// [`SRC_FORK_WAIT`] with its twin crashing on `crash`, a block body, rather than exiting 42, and C
+/// returning the twin's pid rather than the status it reaps, which it still writes.
+fn a_twin_crashes(crash: &str) -> String {
+    let exit = "block 5 () {\n  v42 = i64.const 42\n  return v42\n  }";
+    let src = SRC_FORK_WAIT
+        .replace(exit, &format!("block 5 () {{\n{crash}  }}"))
+        .replace("4(vstatus)", "4(vpid, vstatus)")
+        .replace(
+            "block 4 (vstatus: i64)",
+            "block 4 (vpid: i64, vstatus: i64)",
+        )
+        .replace("  return vstatus\n", "  return vpid\n");
+    assert!(
+        !src.contains("v42") && src.contains("return vpid"),
+        "the twin must crash, and C return its pid"
+    );
+    src
+}
+
+/// #1827 — **a twin's trap is recorded apart**, under the pid its parent knows, on every engine. C's
+/// twin crashes, C reaps the crash status (`128`) and returns the twin's pid, and `last_twin_traps`
+/// names that pid and the trap. The run itself finished cleanly, so it reports no fault address,
+/// though the twin's crash was a NULL read. The bytecode engine published no record, so the slot
+/// held the previous run's, and it reported the twin's fault address as the run's.
+#[test]
+fn a_crashing_twin_is_recorded_apart_on_every_engine() {
+    use temen_interp::Trap;
+    for (crash, trap) in [
+        ("  unreachable\n", Trap::Unreachable),
+        (
+            "  vnull = i64.const 8\n  vx = i64.load vnull\n  return vx\n",
+            Trap::MemoryFault,
+        ),
+    ] {
+        let src = a_twin_crashes(crash);
+        for on in [ORACLE, On::Bytecode, On::Parallel] {
+            // A run that publishes nothing leaves this empty slot, not the previous run's record.
+            temen_interp::publish_twin_traps(Vec::new());
+            let (r, vals) = run_forking(&src, on);
+            assert_eq!(vals, vec![128], "{trap:?} on {on:?}: C reaped the crash");
+            let Ok([Value::I64(pid)]) = r.as_deref() else {
+                panic!("{trap:?} on {on:?}: C returns its twin's pid, not {r:?}");
+            };
+            let traps = temen_interp::last_twin_traps();
+            assert_eq!(
+                traps.iter().map(|t| (t.task, t.trap)).collect::<Vec<_>>(),
+                [(*pid as u64, trap)],
+                "on {on:?}"
+            );
+            assert_eq!(
+                temen_interp::last_capture_fault_addr(),
+                None,
+                "{trap:?} on {on:?}: the twin's fault is not the run's"
+            );
+        }
+    }
+}
+
+/// #2197 — **a twin forks again through its personality.** [`SRC_FORK_WAIT`]'s topology with C
+/// also granted the POSIX personality, as `"p"`: its grant list moves to 16720 to hold three. The
+/// server forks C; the twin, rather than exiting at once, forks through the personality (op 0) and
+/// exits 42 when that gave it a child, else its fork's error made positive. The grandchild exits
+/// 77. C reaps the twin and returns its status.
+const SRC_FORK_THEN_FORK: &str = r#"
+memory 18
+type 0 func (i64) -> (i64)
+type 1 interface { fork: 0, wait: 0 }
+export 0 interface "svc" 1 { fork: 2, wait: 3 }
+data 16684 "svc"
+data 16694 "o"
+data 16704 "p"
+func (i32, i32, i32, i32, i32) -> (i64) {
+block 0 (v0: i32, vout: i32, vbud: i32, vsm: i32, vcm: i32) {
+  qsm = i64.const 17544
+  i32.store qsm vsm
+  q1b = i64.const 17548
+  i32.store q1b vbud
+  q1p = i64.const 17536
+  vs = call.cap 6 17 (i64) -> (i32) v0 (q1p)
+  vz0 = i64.const 0
+  vcap = call.cap 6 14 (i32, i64) -> (i32) v0 (vs, vz0)
+  vpp = i64.const 16704
+  vpl = i64.const 1
+  vproc = self.resolve vpp vpl
+  va0 = i64.const 16720
+  vn0 = i32.const 16684
+  i32.store va0 vn0
+  vl3 = i32.const 3
+  i32.store va0 vl3 offset=4
+  i32.store va0 vcap offset=8
+  va1 = i64.const 16736
+  vn1 = i32.const 16694
+  i32.store va1 vn1
+  vl1 = i32.const 1
+  i32.store va1 vl1 offset=4
+  i32.store va1 vout offset=8
+  va2 = i64.const 16752
+  vn2 = i32.const 16704
+  i32.store va2 vn2
+  i32.store va2 vl1 offset=4
+  i32.store va2 vproc offset=8
+  qcm = i64.const 17672
+  i32.store qcm vcm
+  q2b = i64.const 17676
+  i32.store q2b vbud
+  q2p = i64.const 17664
+  vc = call.cap 6 17 (i64) -> (i32) v0 (q2p)
+  vjc_st, vjc = call.cap 6 1 (i32) -> (i64, i64) v0 (vc)
+  return vjc
+  }
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  br 1()
+  }
+block 1 () {
+  vz = i32.const 0
+  vn = call.cap 4294967295 10 () -> (i64) vz ()
+  br 1()
+  }
+}
+func (i64) -> (i64) {
+block 0 (vx: i64) {
+  vz = i32.const 0
+  vzero = i64.const 0
+  vt = call.cap 4294967295 11 (i64) -> (i64) vz (vzero)
+  return vt
+  }
+}
+func (i64) -> (i64) {
+block 0 (vpid: i64) {
+  vz = i32.const 0
+  vt = call.cap 4294967295 12 (i64) -> (i64) vz (vpid)
+  return vt
+  }
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  br 1()
+  }
+block 1 () {
+  vp0 = i64.const 16684
+  vl3 = i64.const 3
+  vhsvc = self.resolve vp0 vl3
+  vc0 = i64.const 0
+  vpid = call.cap 268435456 0 (i64) -> (i64) vhsvc (vc0)
+  vea1 = i64.const -11
+  vagain1 = i64.eq vpid vea1
+  br_if vagain1 1() 2(vpid, vhsvc)
+  }
+block 2 (vpid: i64, vhsvc: i32) {
+  vz2 = i64.const 0
+  vistwin = i64.eq vpid vz2
+  br_if vistwin 5() 3(vpid, vhsvc)
+  }
+block 3 (vpid: i64, vhsvc: i32) {
+  vstatus = call.cap 268435456 1 (i64) -> (i64) vhsvc (vpid)
+  vea3 = i64.const -11
+  vagain3 = i64.eq vstatus vea3
+  br_if vagain3 3(vpid, vhsvc) 4(vstatus)
+  }
+block 4 (vstatus: i64) {
+  return vstatus
+  }
+block 5 () {
+  vpp = i64.const 16704
+  vpl = i64.const 1
+  vproc = self.resolve vpp vpl
+  vg = call.cap 13 0 () -> (i64) vproc ()
+  vz5 = i64.const 0
+  vgrand = i64.eq vg vz5
+  br_if vgrand 6() 7(vg)
+  }
+block 6 () {
+  v77 = i64.const 77
+  return v77
+  }
+block 7 (vg: i64) {
+  vz7 = i64.const 0
+  vmade = i64.gt_s vg vz7
+  br_if vmade 8() 9(vg)
+  }
+block 8 () {
+  v42 = i64.const 42
+  return v42
+  }
+block 9 (vg: i64) {
+  vz9 = i64.const 0
+  verr = i64.sub vz9 vg
+  return verr
+  }
+}
+"#;
+
+/// #2197 — a twin `clone_caller` makes is a process like any other, wired as every twin is: its
+/// own `fork()` through the personality forks it, on every engine. The bytecode engine wired only a
+/// personality fork's twin, so a `clone_caller` twin's park door was missing, its `fork()` answered
+/// `-ENOSYS`, and the twin exited 38 rather than 42.
+#[test]
+fn a_clone_caller_twin_forks_again_through_its_personality() {
+    let src = forking_with(
+        SRC_FORK_THEN_FORK,
+        &SpawnRec {
+            grants_ptr: 16720,
+            grants_n: 3,
+            ..SpawnRec::default()
+        },
+    );
+    let setup = |host: &mut Host| {
+        let p = proc_doors::grant_proc_doors(host);
+        host.register_cap_name("p", p);
+    };
+    let oracle = run_forked(&src, ORACLE, &setup);
+    assert_eq!(oracle, (Ok(vec![Value::I64(42)]), vec![]), "on the oracle");
+    for on in [On::Bytecode, On::Parallel] {
+        assert_eq!(run_forked(&src, on, &setup), oracle, "on {on:?}");
     }
 }
 

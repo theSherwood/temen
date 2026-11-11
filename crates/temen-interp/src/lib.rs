@@ -4119,9 +4119,11 @@ pub struct TwinTrap {
     pub task: u64,
     pub trap: Trap,
     /// The trap-time call stack, innermost frame first. Frames name the image the twin was running
-    /// when it trapped — after an `execve`, the *new* image, not the program that forked it.
+    /// when it trapped — after an `execve`, the *new* image, not the program that forked it. The
+    /// tree-walker's only: the bytecode engine and the JIT leave it empty.
     pub backtrace: Vec<IrPc>,
     /// The window-relative faulting address, for a `MemoryFault` (see [`last_capture_fault_addr`]).
+    /// The tree-walker's only, as [`Self::backtrace`] is.
     pub fault: Option<u64>,
 }
 
@@ -4153,14 +4155,16 @@ thread_local! {
 /// Every fork twin that **trapped** in the last run on this thread, in completion order — empty if
 /// none did (a twin that `exit`s, with any status, is not a trap). The run itself can have finished
 /// cleanly: a crashed command is its parent's business, reaped as status `128`, and this is the only
-/// place the crash's kind and frames survive. Tree-walker runs only, the same scope as
-/// [`last_capture_backtrace`].
+/// place the crash's kind and frames survive. Every engine's run publishes it: the tree-walker's,
+/// the bytecode engine's (#1827) and the JIT's process tree (#1768). Only the tree-walker's names
+/// frames and a fault address.
 pub fn last_twin_traps() -> Vec<TwinTrap> {
     LAST_TWIN_TRAPS.with(|c| c.borrow().clone())
 }
 
 /// #1768 — publish the twins that trapped in a run driven by **another engine** (the JIT's process
-/// tree), so [`last_twin_traps`] answers for whichever engine ran last on this thread.
+/// tree, the bytecode engine's drivers), so [`last_twin_traps`] answers for whichever engine ran
+/// last on this thread.
 pub fn publish_twin_traps(traps: Vec<TwinTrap>) {
     LAST_TWIN_TRAPS.with(|c| *c.borrow_mut() = traps);
 }
