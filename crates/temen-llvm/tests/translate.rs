@@ -75,6 +75,15 @@ fn compile_g(name: &str, src: &str, opt: &str) -> Option<PathBuf> {
     }
 }
 
+/// The function a `*_vs_native` differential invokes: the C source's `run`, found by its export —
+/// the translator orders functions by definition, so a helper defined above `run` takes index 0.
+fn entry(t: &temen_llvm::Translated) -> u32 {
+    t.exports
+        .iter()
+        .find(|(name, _)| name == "run")
+        .map_or(0, |&(_, idx)| idx)
+}
+
 fn to_slot(v: &Value) -> i64 {
     match v {
         Value::I32(x) => *x as i64,
@@ -150,6 +159,7 @@ fn check_vs_native_flags(name: &str, src: &str, flags: &[&str], seed: i32) {
     let exe =
         std::env::temp_dir().join(format!("temen_llvm_native_{}_{}", std::process::id(), name));
     let c = std::env::temp_dir().join(format!("temen_llvm_{}_{}.c", std::process::id(), name));
+    std::fs::write(&c, src).expect("write C source");
     // `-lm` so demos that call libm (`sqrt`/`floor`/…) link natively; harmless for the rest.
     match Command::new("cc")
         .args(flags)
@@ -172,13 +182,14 @@ fn check_vs_native_flags(name: &str, src: &str, flags: &[&str], seed: i32) {
         .unwrap() as u8;
 
     let t = temen_llvm::translate_ll_path(&bc).expect("translate bitcode");
+    let func = entry(&t);
     let module = t.module;
     temen_verify::verify_module(&module).expect("verify translated IR");
     let full = vec![Value::I64(t.entry_sp as i64), Value::I32(seed)];
     let mut fuel = 100_000_000u64;
-    let interp = temen_interp::run(&module, 0, &full, &mut fuel).expect("interp run");
+    let interp = temen_interp::run(&module, func, &full, &mut fuel).expect("interp run");
     let slots: Vec<i64> = full.iter().map(to_slot).collect();
-    let jit = match temen_jit::compile_and_run(&module, 0, &slots).expect("jit run") {
+    let jit = match temen_jit::compile_and_run(&module, func, &slots).expect("jit run") {
         JitOutcome::Returned(s) => Value::I32(s[0] as i32),
         other => panic!("{name}: unexpected JIT outcome {other:?}"),
     };
@@ -2955,6 +2966,7 @@ fn check_setjmp_vs_native(name: &str, src: &str, seed: i32) {
     };
     let exe = std::env::temp_dir().join(format!("temen_llvm_sj_{}_{}", std::process::id(), name));
     let c = std::env::temp_dir().join(format!("temen_llvm_{}_{}.c", std::process::id(), name));
+    std::fs::write(&c, src).expect("write C source");
     match Command::new("cc").arg(&c).arg("-o").arg(&exe).status() {
         Ok(s) if s.success() => {}
         _ => {
@@ -2969,11 +2981,12 @@ fn check_setjmp_vs_native(name: &str, src: &str, seed: i32) {
         .unwrap() as u8;
 
     let t = temen_llvm::translate_ll_path(&bc).expect("translate bitcode");
+    let func = entry(&t);
     let module = t.module;
     temen_verify::verify_module(&module).expect("verify translated IR");
     let full = vec![Value::I64(t.entry_sp as i64), Value::I32(seed)];
     let mut fuel = 100_000_000u64;
-    let interp = temen_interp::run(&module, 0, &full, &mut fuel).expect("interp run");
+    let interp = temen_interp::run(&module, func, &full, &mut fuel).expect("interp run");
     let temen = match interp.first() {
         Some(Value::I32(x)) => *x as u8,
         other => panic!("{name}: expected i32 result, got {other:?}"),
@@ -2986,7 +2999,7 @@ fn check_setjmp_vs_native(name: &str, src: &str, seed: i32) {
     // The **bytecode** engine implements setjmp/longjmp too (interpreter-grade) and must agree — it
     // runs the module (does not decline) and matches the tree-walker + native.
     let mut bfuel = 100_000_000u64;
-    let bc_out = temen_interp::bytecode::compile_and_run(&module, 0, &full, &mut bfuel)
+    let bc_out = temen_interp::bytecode::compile_and_run(&module, func, &full, &mut bfuel)
         .expect("bytecode engine should run setjmp/longjmp (not decline)")
         .expect("bytecode run");
     let btemen = match bc_out.first() {
@@ -3004,7 +3017,7 @@ fn check_setjmp_vs_native(name: &str, src: &str, seed: i32) {
     // target without the runtime it declines cleanly (the interpreters above already proved
     // correctness); either way it must never miscompile.
     let slots: Vec<i64> = full.iter().map(to_slot).collect();
-    match temen_jit::compile_and_run(&module, 0, &slots) {
+    match temen_jit::compile_and_run(&module, func, &slots) {
         Ok(JitOutcome::Returned(s)) => {
             let jtemen = s[0] as i32 as u8;
             assert_eq!(jtemen, native, "{name}: JIT={jtemen} vs native cc={native}");
@@ -3030,6 +3043,7 @@ fn check_run_byte_vs_native(name: &str, src: &str, seed: i32) {
     };
     let exe = std::env::temp_dir().join(format!("temen_llvm_va_{}_{}", std::process::id(), name));
     let c = std::env::temp_dir().join(format!("temen_llvm_{}_{}.c", std::process::id(), name));
+    std::fs::write(&c, src).expect("write C source");
     // `-lm` so math-helper tests (`ldexp`, …) link against libc's math on the native side.
     match Command::new("cc")
         .arg(&c)
@@ -3051,12 +3065,13 @@ fn check_run_byte_vs_native(name: &str, src: &str, seed: i32) {
         .unwrap() as u8;
 
     let t = temen_llvm::translate_ll_path(&bc).expect("translate bitcode");
+    let func = entry(&t);
     let module = t.module;
     temen_verify::verify_module(&module).expect("verify translated IR");
     let full = vec![Value::I64(t.entry_sp as i64), Value::I32(seed)];
 
     let mut fuel = 100_000_000u64;
-    let interp = temen_interp::run(&module, 0, &full, &mut fuel).expect("interp run");
+    let interp = temen_interp::run(&module, func, &full, &mut fuel).expect("interp run");
     let temen = match interp.first() {
         Some(Value::I32(x)) => *x as u8,
         other => panic!("{name}: expected i32 result, got {other:?}"),
@@ -3067,7 +3082,7 @@ fn check_run_byte_vs_native(name: &str, src: &str, seed: i32) {
     );
 
     let mut bfuel = 100_000_000u64;
-    let bc_out = temen_interp::bytecode::compile_and_run(&module, 0, &full, &mut bfuel)
+    let bc_out = temen_interp::bytecode::compile_and_run(&module, func, &full, &mut bfuel)
         .expect("bytecode compile")
         .expect("bytecode run");
     let btemen = match bc_out.first() {
@@ -3080,7 +3095,7 @@ fn check_run_byte_vs_native(name: &str, src: &str, seed: i32) {
     );
 
     let slots: Vec<i64> = full.iter().map(to_slot).collect();
-    match temen_jit::compile_and_run(&module, 0, &slots) {
+    match temen_jit::compile_and_run(&module, func, &slots) {
         Ok(JitOutcome::Returned(s)) => {
             let jtemen = s[0] as i32 as u8;
             assert_eq!(jtemen, native, "{name}: JIT={jtemen} vs native cc={native}");
