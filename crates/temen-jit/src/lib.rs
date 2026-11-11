@@ -204,7 +204,7 @@ pub fn in_guest_fiber() -> bool {
         false
     }
 }
-pub use vcpu_tls::serve_handlers;
+pub use vcpu_tls::{fail_dispatch, serve_handlers};
 
 // #1768 — the per-instance context compiled code reaches through its threaded context pointer.
 mod vmctx;
@@ -6419,6 +6419,7 @@ impl CompiledModule {
 /// (`[base, base + round_up(reserved) + guard)`, the range its own run arms), so a handler's fault is
 /// the domain's trap: written to `vmctx`'s trap cell, exactly as a guest trap. Counts the handler in
 /// the running vCPU's [`serve_handlers`] for its span, which is what refuses a nested serve (#2160).
+/// Answers the errno the handler failed its dispatch with ([`fail_dispatch`], #2964), if it did.
 ///
 /// # Safety
 /// `cc` is the live [`CompiledModule`] the serving domain runs (registered as its serve context);
@@ -6435,11 +6436,11 @@ pub unsafe fn invoke_handler(
     mem_base: *mut u8,
     mem_reserved: u64,
     vmctx: *const VmCtx,
-) {
+) -> Option<i64> {
     let cc = cc as *const CompiledModule;
     let fn_table_ptr = (*cc).fn_table.base();
     let (lo, hi) = mem::fault_range_of(mem_base, mem_reserved as usize);
-    vcpu_tls::set_serve_handlers(serve_handlers() + 1);
+    let prev = vcpu_tls::enter_handler();
     let faulted = mem::run_guarded_range(
         code,
         args.as_ptr(),
@@ -6450,10 +6451,11 @@ pub unsafe fn invoke_handler(
         lo,
         hi,
     );
-    vcpu_tls::set_serve_handlers(serve_handlers() - 1);
+    let failed = vcpu_tls::leave_handler(prev);
     if faulted {
         (*vmctx).raise(mem::FAULT_TRAP);
     }
+    failed
 }
 
 /// CALLS.md 5c.1a — resolve handler `func`'s serve trampoline on a raw serve-context

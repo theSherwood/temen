@@ -431,6 +431,12 @@ enum Op {
         /// caller's enqueue re-admits it and the rewound op re-executes the whole drain.
         wait: bool,
     },
+    /// #2964 — `svc.fail(errno)` (self-op 20): on a handler fiber or an activation, its dispatch
+    /// answers as a transport failure when it returns ([`VmRare::failed`]); `0`, else `-EINVAL`.
+    SvcFail {
+        errno: u32,
+        dst: u32,
+    },
     /// FORK.md §9.2 — `clone_caller` (self-op 11): fork-returns-twice, servicer side. Compiled only
     /// in a fork-serving module ([`bytecode_serves_fork`]). From within a serve handler, it
     /// duplicates the caller parked on this dispatch into a live twin and replies differently to each.
@@ -3362,6 +3368,10 @@ fn lower_cap_call(
             wait: op == 10,
         },
         (temen_ir::CAP_SELF_TYPE_ID, 9 | 10) => return None,
+        (temen_ir::CAP_SELF_TYPE_ID, 20) => Op::SvcFail {
+            errno: g(args[0]),
+            dst,
+        },
         // FORK.md §9.2 — `clone_caller` (op 11) / `reap` (op 12): compiled to the native fork
         // ops (the module reached here only via the [`bytecode_serves_fork`] escape).
         // The reply/pid args are register operands, resolved in the driver.
@@ -10121,7 +10131,10 @@ fn return_from_fiber(
     // #2742 — a handler's return answers its dispatch, and its serve loop, back at its serve op,
     // counts it. The serve op's one result is not the resumer's `(status, value)` pair.
     if let Some(ticket) = vt.active.dispatch() {
-        answer_dispatch(host, fibers, mem, ticket, Ok(&vt.active.results(source)));
+        match vt.active.rare.as_ref().and_then(|r| r.failed) {
+            Some(errno) => answer_dispatch(host, fibers, mem, ticket, Err(errno)),
+            None => answer_dispatch(host, fibers, mem, ticket, Ok(&vt.active.results(source))),
+        }
         release_handler(fibers, id);
         let mut handler = std::mem::replace(&mut vt.active, resumer);
         vt.active.tls = handler.tls;
@@ -13452,6 +13465,7 @@ fn activation(
     let mut vt =
         VTask::new(&unit, func, &vals, Some(host.own_node())).map_err(|_| super::EAGAIN)?;
     vt.active.tls = tls;
+    vt.active.rare().activation = true;
     let slot = TaskSlot {
         answers: Some(Box::new(Answers { to, fuel })),
         ..TaskSlot::new(vt, 0, LiveVcpu::none())
@@ -19509,7 +19523,14 @@ fn complete(tasks: &mut Tasks, envs: &mut [Domain], ti: usize, res: Result<Vec<V
         tasks[done].live = LiveVcpu::none(); // #2001: its `spawn` goes back
                                              // #2695 step 2 — an activation answers its call, however it ends.
         if let Some(a) = tasks[done].answers.take() {
-            answer(*a, &res, &envs[tasks[done].domain]);
+            let failed = tasks[done]
+                .vm
+                .vt
+                .active
+                .rare
+                .as_ref()
+                .and_then(|r| r.failed);
+            answer(*a, &res, failed, &envs[tasks[done].domain]);
         }
         let domain = tasks[done].domain;
         revoke_handlers(&mut tasks[done], &mut envs[domain]);
@@ -19568,8 +19589,16 @@ fn revoke_handlers(t: &mut TaskSlot, d: &mut Domain) {
 /// handler returned (INVARIANTS #8), or `CAP_REVOKED` for a trap or an exit, which ends `d`. A reply
 /// to a page request first moves the page's bytes out of `d`'s window (#1862). An embedder hears what
 /// is left of the fuel it lent.
-fn answer(a: Answers, res: &Result<Vec<Value>, Trap>, d: &Domain) {
+fn answer(a: Answers, res: &Result<Vec<Value>, Trap>, failed: Option<i64>, d: &Domain) {
     let reply = match res {
+        // #2964 — the activation answered its call as a transport failure (`svc.fail`).
+        Ok(_) if failed.is_some() => {
+            let errno = failed.unwrap_or(super::EINVAL);
+            super::Reply::Failed(match &a.to {
+                super::AnswerTo::Ticket(t) => d.host.lock_unpoisoned().settle_page(*t, errno, None),
+                super::AnswerTo::Embedder(_) => errno,
+            })
+        }
         Ok(vals) => {
             let mut slots: Vec<i64> = vals.iter().map(|&v| val_to_slot(v)).collect();
             if let (super::AnswerTo::Ticket(t), Some(first)) = (&a.to, slots.first_mut()) {
@@ -20322,6 +20351,11 @@ struct VmRare {
     handlers: Vec<usize>,
     /// The count of dispatches completed by the current `svc.poll` / `svc.wait` activation.
     serve_count: i64,
+    /// #2964 — an activation's root: the call it answers is its dispatch, as a handler fiber's is.
+    activation: bool,
+    /// #2964 — the errno this handler or activation answered its dispatch with (`svc.fail`): its
+    /// return then replies a transport failure, not its results.
+    failed: Option<i64>,
 }
 
 const _: () = assert!(std::mem::size_of::<Vm>() <= 256);
@@ -22094,6 +22128,20 @@ impl Vm {
                             return Ok(Outcome::Suspended);
                         }
                     }
+                }
+                Op::SvcFail { errno, dst } => {
+                    let errno = self.regs[base + *errno as usize].i64();
+                    let answers = self.dispatch().is_some()
+                        || self.rare.as_ref().is_some_and(|r| r.activation);
+                    let r = if errno < 0 && answers {
+                        self.rare().failed = Some(errno);
+                        0
+                    } else {
+                        super::EINVAL
+                    };
+                    self.regs[base + *dst as usize] = Reg::from_i64(r);
+                    pc += 1;
+                    continue;
                 }
                 Op::SvcPoll { dst, wait } => {
                     // §3.6 serve-loop core. #2160, the oracle's rule: a serve op inside a running

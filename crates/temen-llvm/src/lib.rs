@@ -575,7 +575,35 @@ fn translate_impl(
     ba: Option<&blockaddr::BlockAddrs>,
     opts: TranslateOptions,
 ) -> Result<Translated, Error> {
-    let m = &*link_heap(m)?;
+    let m = link_heap(m, false)?;
+    match translate_linked(&m, di, ba, &opts)? {
+        Linked::Done(t) => Ok(*t),
+        // #2964 — a served op that can park takes a data stack from the heap per dispatch, and this
+        // program has none: link the C heap in and translate again. Only such a server pays for it.
+        Linked::NeedsHeap => match translate_linked(&*link_heap(Cow::Borrowed(&*m), true)?, di, ba, &opts)? {
+            Linked::Done(t) => Ok(*t),
+            Linked::NeedsHeap => unsup(
+                "a served op that can park needs the C heap for its data stack, which links into a \
+                 program with a `main` that defines neither `malloc` nor `free` alone",
+            ),
+        },
+    }
+}
+
+/// What [`translate_linked`] produced: the translation, or the finding that it needs the C heap.
+enum Linked {
+    Done(Box<Translated>),
+    NeedsHeap,
+}
+
+/// [`translate_impl`] over a module whose heap is already linked (or not needed).
+fn translate_linked(
+    m: &LModule,
+    di: Option<&di::LlvmDebug>,
+    ba: Option<&blockaddr::BlockAddrs>,
+    opts: &TranslateOptions,
+) -> Result<Linked, Error> {
+    let opts = *opts;
     // The RO/writable page-isolation granularity is a per-target knob (native 16 KiB, wasm 64 KiB).
     // Fail closed on a nonsensical value: it must be a power of two and leave room for the §3e args
     // buffer below the globals base (`globals_base == stack_page` for a powerbox program).
@@ -1493,11 +1521,20 @@ fn translate_impl(
             }
         };
     }
-    // #2961 — each served interface: an impl-export whose ops are trampolines onto the serve stack.
+    // #2961 — each served interface: an impl-export whose ops are trampolines onto the serve stack,
+    // or, #2964, when some op can park, onto a data stack of its own per dispatch, from the heap.
+    let heap = match serve::parks(&ifaces, &name2idx, &funcs) {
+        false => None,
+        true => match (name2idx.get("malloc"), name2idx.get("free")) {
+            (Some(&malloc), Some(&free)) => Some((malloc, free)),
+            _ => return Ok(Linked::NeedsHeap),
+        },
+    };
     let impl_exports = serve::impl_exports(
         &ifaces,
         &name2idx,
         serve_stack.unwrap_or(0),
+        heap,
         &sig_types,
         &mut funcs,
     );
@@ -1599,8 +1636,7 @@ fn translate_impl(
     t.module.raise();
     // A constant an integer op reads is the op's immediate (#2585).
     t.module.fold_immediates();
-    serve::check_handlers(&t.module)?;
-    Ok(t)
+    Ok(Linked::Done(Box::new(t)))
 }
 
 /// The **default** page granularity the data stack is aligned to above the globals (≥ the largest OS
@@ -5941,7 +5977,7 @@ const HEAP_API: [(&str, &str); 7] = [
 /// name to the unit's definition, so its calls (and address-takes) resolve like calls to any defined
 /// function. A name the program defines itself stays its own. Only a program (one defining `main`)
 /// gets a heap: the heap's pages come from the powerbox `Memory` grant, which only `_start` holds.
-fn link_heap(m: Cow<'_, LModule>) -> Result<Cow<'_, LModule>, Error> {
+fn link_heap(m: Cow<'_, LModule>, force: bool) -> Result<Cow<'_, LModule>, Error> {
     let defines = |name: &str| {
         m.functions.iter().any(|f| f.name == name)
             || m.global_aliases
@@ -5951,9 +5987,14 @@ fn link_heap(m: Cow<'_, LModule>) -> Result<Cow<'_, LModule>, Error> {
     if !defines("main") {
         return Ok(m);
     }
+    // `force` (#2964): a server's trampolines need `malloc` and `free` though its source calls neither.
     let wanted: Vec<(&str, &str)> = HEAP_API
         .into_iter()
-        .filter(|(name, _)| !defines(name) && m.func_declarations.iter().any(|d| d.name == *name))
+        .filter(|(name, _)| {
+            !defines(name)
+                && (m.func_declarations.iter().any(|d| d.name == *name)
+                    || (force && matches!(*name, "malloc" | "free")))
+        })
         .collect();
     if wanted.is_empty() {
         return Ok(m);

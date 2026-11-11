@@ -184,6 +184,8 @@ pub mod capcall {
     pub const FUEL_REMAINING: u32 = 13;
     pub const EXEC: u32 = 14;
     pub const PARALLELISM: u32 = 19;
+    /// #2964 — `svc.fail`, a frontend-emitted op, so its number is `temen_ir`'s own.
+    pub const SVC_FAIL: u32 = temen_ir::CAP_SELF_SVC_FAIL;
 }
 
 /// Classify a `call.cap` sub-op `(type_id, op)` across the four backends. The generic host-cap case
@@ -241,6 +243,13 @@ fn parity_capcall(type_id: u32, op: u32) -> [Cell; 4] {
         (t, o) if t == self_ty && o == capcall::EXEC => {
             [F, F, cell(Status::NotYet, EXEC_GAP), leaf]
         }
+
+        // #2964 — `svc.fail` (20): a serve handler answers its dispatch as a transport failure.
+        // Native on all three: the tree-walker's eval loop (`serve_run`, an activation's `answers`),
+        // the bytecode engine's `Op::SvcFail` (`VmRare::failed`), and Cranelift's cap thunk
+        // (`temen_jit::fail_dispatch`, `HandlerEnd::Failed`). It never parks, so a handler that
+        // calls it is still serve-qualified. wasm-JIT leaf-folds every cap op.
+        (t, o) if t == self_ty && o == capcall::SVC_FAIL => [F, F, F, leaf],
 
         // Generic host `call.cap` (Stream / Clock / Memory / host-fn / JIT-compile / …) and every
         // other cap sub-op: native on both interpreters and Cranelift's cap-call thunk; wasm leaf.

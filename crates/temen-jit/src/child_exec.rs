@@ -130,9 +130,9 @@ pub(crate) struct ChildTask {
     chain: Vec<(usize, i64)>,
     /// Saved `vcpu.tls` register between residencies (R2: task-level, not thread-level).
     tls: i64,
-    /// Saved serve-handler count between residencies (R2), so a handler that parks resumes nested
-    /// on whichever worker picks it up ([`vcpu_tls::serve_handlers`]).
-    serve_handlers: u32,
+    /// Saved serve state between residencies (R2), so a handler that parks resumes nested on
+    /// whichever worker picks it up ([`vcpu_tls::serve_handlers`]).
+    serve: vcpu_tls::Serve,
     done: Arc<ChildDone>,
     /// Runs exactly once, after the last resume, while the window is still alive: releases the
     /// child powerbox and returns the child's lane to the parent.
@@ -303,7 +303,7 @@ impl ChildTask {
             _code: code,
             chain,
             tls: 0,
-            serve_handlers: 0,
+            serve: Default::default(),
             done,
             teardown: Some(teardown),
             ended: None,
@@ -541,9 +541,12 @@ struct JobCell(std::cell::UnsafeCell<Option<Job>>);
 /// `cell` is the fiber's live [`JobCell`], its job left by the thread resuming it.
 unsafe fn run_job(cell: *const (), _stack_low: u64) {
     let job = (*(*(cell as *const JobCell)).0.get()).expect("a job before each resume");
-    vcpu_tls::set_serve_handlers(vcpu_tls::serve_handlers() + 1);
+    // #2964 — the handler's failure, if it fails its dispatch, stays in the state its residency
+    // saves into its task, which its end reads ([`HandlerTask::end`]).
+    let prev = vcpu_tls::enter_handler();
     (job.entry)(job.args, job.results, job.mem_base, job.fn_table, job.vm);
-    vcpu_tls::set_serve_handlers(vcpu_tls::serve_handlers() - 1);
+    let failed = vcpu_tls::leave_handler(prev);
+    vcpu_tls::set_serve_state(vcpu_tls::Serve { failed, ..prev });
 }
 
 /// #2742 — a handler fiber with what it runs with: its pool slot, its execution context over the
@@ -892,8 +895,9 @@ pub(crate) struct HandlerTask {
     /// #2695 — the fuel cell its context charges, when it has one of its own: a held domain's
     /// activation's, which its call funds. Kept for the context's life.
     _cell: Option<Box<crate::FuelCell>>,
-    /// The serve-handler nesting count between residencies (#2160).
-    serve_handlers: u32,
+    /// The serve state between residencies: its nesting count (#2160) and, once it ends, its
+    /// dispatch's failure (#2964).
+    serve: vcpu_tls::Serve,
     /// It holds its window's gate: taken for a residency, and kept across a quantum's end and a
     /// whole-vCPU park, which on the oracle hold the serving vCPU.
     holds_lanes: bool,
@@ -917,6 +921,9 @@ unsafe impl Send for HandlerTask {}
 pub enum HandlerEnd {
     /// It returned these results, every one the op declares (INVARIANTS #8).
     Returned(Vec<i64>),
+    /// #2964 — it answered its dispatch as a transport failure, this errno (`svc.fail`): the reply
+    /// is INVARIANTS 8's failure, whatever it returned.
+    Failed(i64),
     /// It trapped or faulted, ending the callee with this code.
     Trapped(i64),
 }
@@ -936,9 +943,10 @@ impl HandlerTask {
 
     /// How it ended, once its fiber has.
     fn end(&mut self) -> HandlerEnd {
-        match self.vm.ended() {
-            Some(code) => HandlerEnd::Trapped(code),
-            None => HandlerEnd::Returned(self.shell.results[..self.n_results].to_vec()),
+        match (self.vm.ended(), self.serve.failed()) {
+            (Some(code), _) => HandlerEnd::Trapped(code),
+            (None, Some(errno)) => HandlerEnd::Failed(errno),
+            (None, None) => HandlerEnd::Returned(self.shell.results[..self.n_results].to_vec()),
         }
     }
 
@@ -950,7 +958,7 @@ impl HandlerTask {
     /// Its window comes back with its end.
     fn conclude(mut self, reusable: bool) -> (Option<HandlerEnd>, Arc<Window>) {
         let end = self.end();
-        let served = matches!(end, HandlerEnd::Returned(_));
+        let served = !matches!(end, HandlerEnd::Trapped(_));
         let end = match self.done.take() {
             Some(done) => {
                 done(end);
@@ -1230,8 +1238,7 @@ impl ServeSite {
         let mut results = vec![0i64; n_results.max(1)];
         let caller_tls = vcpu_tls::get();
         vcpu_tls::seed(tls.unwrap_or_else(|| self.window.tls.load(Ordering::Relaxed)));
-        let caller_handlers = vcpu_tls::serve_handlers();
-        vcpu_tls::set_serve_handlers(caller_handlers + 1);
+        let caller = vcpu_tls::enter_handler();
         let (lo, hi) = mem::fault_range_of(self.mem_base, self.mem_reserved as usize);
         let faulted = mem::run_guarded_range(
             code,
@@ -1243,7 +1250,7 @@ impl ServeSite {
             lo,
             hi,
         );
-        vcpu_tls::set_serve_handlers(caller_handlers);
+        let failed = vcpu_tls::leave_handler(caller);
         if tls.is_none() {
             self.window.tls.store(vcpu_tls::get(), Ordering::Relaxed);
         }
@@ -1251,9 +1258,13 @@ impl ServeSite {
         if faulted {
             vm.raise(mem::FAULT_TRAP);
         }
-        let end = match vm.ended() {
-            Some(code) => HandlerEnd::Trapped(code),
-            None => {
+        let end = match (vm.ended(), failed) {
+            (Some(code), _) => HandlerEnd::Trapped(code),
+            (None, Some(errno)) => {
+                self.window.served.fetch_add(1, Ordering::AcqRel);
+                HandlerEnd::Failed(errno)
+            }
+            (None, None) => {
                 results.truncate(n_results);
                 self.window.served.fetch_add(1, Ordering::AcqRel);
                 HandlerEnd::Returned(results)
@@ -1323,7 +1334,7 @@ impl ServeSite {
             tls: None,
             carrier: None,
             _cell: None,
-            serve_handlers: 0,
+            serve: Default::default(),
             holds_lanes: true,
             domain: self.domain,
             n_results,
@@ -1867,9 +1878,9 @@ struct Residency<'a> {
     rt: &'a mut FiberRuntime,
     fault: (usize, usize),
     vm: &'a Arc<VmCtx>,
-    /// The `vcpu.tls` word and serve-handler count the residency starts with.
+    /// The `vcpu.tls` word and serve state the residency starts with.
     tls: i64,
-    serve_handlers: u32,
+    serve: vcpu_tls::Serve,
     /// The thread domain the task's thread thunks act in (null: the vmctx's).
     domain: *const Domain,
     /// The durable shadow region the task spills into, if it is durable.
@@ -2965,7 +2976,7 @@ impl ChildExec {
                     fault: t.fault,
                     vm: &t.vm,
                     tls: t.tls,
-                    serve_handlers: t.serve_handlers,
+                    serve: t.serve,
                     // #1469 — the child's thread thunks act in its own domain for this residency.
                     domain: t.dom.as_ref().map_or(std::ptr::null(), Arc::as_ptr),
                     // #1361 step 4 — a durable child spills into its own window's context-0 region.
@@ -2982,7 +2993,7 @@ impl ChildExec {
                     Outcome::Finished => t.slot.finish_task(),
                     _ => t.slot.release_to_pool(),
                 }
-                (t.tls, t.serve_handlers) = (tls, handlers);
+                (t.tls, t.serve) = (tls, handlers);
                 outcome
             }
             Task::Handler(h) => self.run_handler(h, pool),
@@ -3002,7 +3013,7 @@ impl ChildExec {
             tls: h
                 .tls
                 .unwrap_or_else(|| h.window.tls.load(Ordering::Relaxed)),
-            serve_handlers: h.serve_handlers,
+            serve: h.serve,
             domain: h.domain,
             shadow: None,
         };
@@ -3015,14 +3026,14 @@ impl ChildExec {
         } else if h.window.held_by(h.id()) {
             h.window.tls.store(tls, Ordering::Relaxed);
         }
-        h.serve_handlers = handlers;
+        h.serve = handlers;
         h.reusable = matches!(outcome, Outcome::Done);
         outcome
     }
 
     /// The residency itself: seed this thread's per-task state, resume the task's fiber under a guard
     /// bracket over its own fault range, classify the yield, reset the thread.
-    fn reside(self: &Arc<Self>, r: Residency<'_>, pool: bool) -> (Outcome, i64, u32) {
+    fn reside(self: &Arc<Self>, r: Residency<'_>, pool: bool) -> (Outcome, i64, vcpu_tls::Serve) {
         // #2722 — a pool worker is about to resume this task's fiber (the cost a cadence sweep used
         // to spend on parked tasks that could not advance). `pool_resumes` observes it.
         if pool {
@@ -3038,8 +3049,8 @@ impl ChildExec {
         });
         let prev_tls = vcpu_tls::get();
         vcpu_tls::seed(r.tls);
-        let prev_handlers = vcpu_tls::serve_handlers();
-        vcpu_tls::set_serve_handlers(r.serve_handlers);
+        let prev_serve = vcpu_tls::serve_state();
+        vcpu_tls::set_serve_state(r.serve);
         let prev_dom = os_thread_rt::set_current_domain(r.domain);
         r.rt.push_active(Arc::clone(r.slot));
         // #1991 — a worker's task's quantum ends against this pool ([`quantum_end`]); a handler on
@@ -3071,8 +3082,8 @@ impl ChildExec {
         os_thread_rt::set_current_domain(prev_dom);
         let tls = vcpu_tls::get();
         vcpu_tls::seed(prev_tls);
-        let handlers = vcpu_tls::serve_handlers();
-        vcpu_tls::set_serve_handlers(prev_handlers);
+        let handlers = vcpu_tls::serve_state();
+        vcpu_tls::set_serve_state(prev_serve);
         if let Some(s) = prev_shadow {
             crate::durable_shadow::seed(s);
         }

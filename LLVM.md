@@ -3628,20 +3628,35 @@ defines some ops of an interface but not others is refused, and so is an op symb
 descriptor names. The child binds its import to the grant by name, at spawn, as it binds any other
 import. Every engine translates the handles in `cap` slots between the two tables (INVARIANTS #8).
 
-**The serve stack.** A translated function takes the data-SP first (§3d), so each served op is a
-trampoline. It calls the op's function on a stack of its own, a 256 KiB reserve above the data stack:
-the serve loop that dispatches the call is suspended mid-frame. One stack is sound only while no two
-handlers are live at once. That fails exactly when a handler parks, because on the oracle the serve
-loop then admits the next call. So a served op that can park is refused at translation. The test is
-`temen_ir::seams::handler_never_parks`, the predicate every engine asks of a serve handler. A served
-op therefore runs to completion. It may not use an import (libc I/O, `malloc`), spawn or join,
-indirect calls, fibers or threads. The same property is why the bytecode engine serves a translated
-parent natively (`bytecode_serves_children`), never declining it.
+**Data stacks.** A translated function takes the data-SP first (§3d), so each served op is a
+trampoline that calls the op's function on a stack of its own: the serve loop that dispatches the
+call is suspended mid-frame. Which stack depends on whether an op can park, as
+`temen_ir::seams::handler_never_parks` decides, the predicate every engine asks of a serve handler:
 
-`tests/serve_iface.rs` builds a C parent and child with clang, and a Rust parent and child with
-rustc, the Rust pair under the dotted name `exec.host`. In each pair the parent serves `exec` and the child calls it by name: a handle crosses in a
-result and in an argument, and the parent maps the region it receives back and reads the byte the
-child wrote. All four drivers answer the same.
+- **No op can park.** Handlers never interleave, so one **serve stack** serves them all: a 256 KiB
+  reserve above the data stack. The bytecode engine serves such a parent natively
+  (`bytecode_serves_children`) and never declines it.
+- **Some op can park** (it does I/O through an import, allocates, blocks, spawns or joins). A parked
+  handler lets the serve loop admit the next call, so each dispatch gets a 256 KiB stack of its own
+  from the program's `malloc`, and `free`s it when the op returns (#2964). `malloc` and `free` never
+  park, so they run on the serve stack. A program with no heap gets dlmalloc linked in, and only a
+  parking server pays for it. The stacks are guest heap, charged to the domain's budget like any
+  allocation. When the heap has no room for one, the servicer lives: the trampoline calls `svc.fail(-ENOMEM)`
+  (PROCESS.md S9) and returns placeholders, and the substrate answers the call as INVARIANTS 8's
+  transport failure, as a full queue's `-EAGAIN` is, for every result shape. A handle slot is never
+  filled from the servicer's table (owner, #2964).
+  Such a parent runs where hand-written parking servers do: the bytecode engine declines it to the
+  tree-walker.
+
+`tests/serve_iface.rs` builds every server and child twice, with clang from C and with rustc from
+Rust (the Rust `exec` pair under the dotted name `exec.host`):
+
+- `exec`: a handle crosses in a result and in an argument; the parent maps the region it receives
+  back and reads the byte the child wrote. All four drivers answer the same.
+- `jobs` (#2964): one op allocates and prints. Another parks on a futex, holding live locals,
+  until a second child's call releases it. With one shared stack those locals come back corrupted.
+  The tree-walker, the bytecode run (declined to it) and the Cranelift JIT answer the same; the
+  parallel driver's entry, which pins the bytecode engine, declines the module.
 
 ---
 
@@ -3657,8 +3672,8 @@ child wrote. All four drivers answer the same.
 - Link units (§8b): `LinkCtx`/`SymImports` (the `call.sym` imports), `const_reloc` (a constant
   that may be an address the linker places), and `globals_layout`'s `LinkData` (data relocations
   and data exports) in `crates/temen-llvm/src/lib.rs`; `crates/temen-llvm/tests/link_unit.rs`.
-- Interfaces (§8c): `crates/temen-llvm/src/serve.rs` (descriptors, trampolines, the handler
-  check) and `lower_iface_call` in `lib.rs`; `crates/temen-llvm/tests/serve_iface.rs`, and the
+- Interfaces (§8c): `crates/temen-llvm/src/serve.rs` (descriptors, trampolines, which data
+  stack an op runs on) and `lower_iface_call` in `lib.rs`; `crates/temen-llvm/tests/serve_iface.rs`, and the
   substrate's op routing in `crates/temen/tests/live_import.rs`.
 - Crate config + build prereqs: `crates/temen-llvm/Cargo.toml` (no libLLVM deps since the
   textual-reader flip — the in-house `.ll` reader lives in `crates/temen-llvm/src/ll/`; see §8

@@ -19,19 +19,18 @@
 //! refused. A `cap` is an `int` / `i32` in the source; two or more results are a small struct
 //! returned by value (the §3a multi-result convention).
 //!
-//! A served op runs on the module's **serve stack**, a data stack of its own: the serve loop that
-//! dispatches it is suspended mid-frame, so the op cannot share the loop's stack. One serve stack is
-//! enough only while no two handlers are live at once, which holds exactly when no handler can park
-//! (a parked handler lets its serve loop admit the next call). So an op that can reach a park seam
-//! is refused at translation, through the seam scan every engine shares ([`temen_ir::seams`]).
+//! A translated function takes a data-SP first (§3d), and the serve loop that dispatches a call is
+//! suspended mid-frame, so a served op runs on a stack of its own, through a trampoline. When no op
+//! can park, handlers never interleave, and one **serve stack** serves them all. When one can, a
+//! parked handler lets its serve loop admit the next call, so each dispatch takes a stack from the
+//! program's heap (#2964): an op may allocate, do I/O and block, like any service. Which applies is
+//! decided by the predicate every engine asks of a serve handler ([`temen_ir::seams`]).
 
 use std::cell::RefCell;
 use std::collections::HashMap;
 
 use temen_ir::seams::handler_never_parks;
-use temen_ir::{
-    Block, Func, FuncType, IfaceOp, ImplExport, Inst, Module, Terminator, TypeEntry, ValType,
-};
+use temen_ir::{Block, Func, FuncType, IfaceOp, ImplExport, Inst, Terminator, TypeEntry, ValType};
 
 use crate::ll::ast::{Module as LModule, Parameter, Type};
 use crate::{param_vtypes, result_types, unsup, Error, Types};
@@ -40,8 +39,8 @@ use crate::{param_vtypes, result_types, unsup, Error, Types};
 pub(crate) const IFACE_PREFIX: &str = "__temen_iface__";
 /// The op symbol prefix: `__temen_op__<tag>__<op>`.
 pub(crate) const OP_PREFIX: &str = "__temen_op__";
-/// The serve stack's size: a [`temen_ir::FIBER_STACK`], what a handler fiber is charged on the
-/// oracle.
+/// A served op's data stack, the serve stack or a dispatch's own: a [`temen_ir::FIBER_STACK`],
+/// what a handler fiber is charged on the oracle.
 pub(crate) const SERVE_STACK_SIZE: u64 = 256 * 1024;
 
 /// One interface a module names.
@@ -223,13 +222,28 @@ pub(crate) fn intern_iface(types: &RefCell<Vec<TypeEntry>>, ops: &[(String, Func
     (t.len() - 1) as u32
 }
 
+/// Whether some served op can park: then a dispatch may start while another's handler is parked,
+/// and each needs a data stack of its own (#2964). Decided by the predicate every engine asks of a
+/// serve handler ([`handler_never_parks`]), over each op's own function.
+pub(crate) fn parks(ifaces: &Ifaces, name2idx: &HashMap<String, u32>, funcs: &[Func]) -> bool {
+    ifaces
+        .list
+        .iter()
+        .filter(|i| i.served)
+        .flat_map(|i| i.ops.iter().map(|(op, _)| name2idx[&op_symbol(&i.tag, op)]))
+        .any(|f| !handler_never_parks(funcs, f))
+}
+
 /// Each served interface's impl-export. Its ops are trampolines appended to `funcs`: each takes the
-/// op's own signature, `cap` slots and all, and calls the op's source function on the serve stack
-/// (`serve_sp`), the data-SP every translated function takes first (§3d).
+/// op's own signature, `cap` slots and all, and calls the op's source function with a data-SP (§3d).
+/// That is the serve stack (`serve_sp`) when no op can park; otherwise (`heap` = the program's
+/// `(malloc, free)`) a [`SERVE_STACK_SIZE`] stack of the dispatch's own, allocated on the serve
+/// stack, which a call that never parks only borrows.
 pub(crate) fn impl_exports(
     ifaces: &Ifaces,
     name2idx: &HashMap<String, u32>,
     serve_sp: u64,
+    heap: Option<(u32, u32)>,
     types: &RefCell<Vec<TypeEntry>>,
     funcs: &mut Vec<Func>,
 ) -> Vec<ImplExport> {
@@ -239,7 +253,10 @@ pub(crate) fn impl_exports(
         for ((op, sig), storage) in iface.ops.iter().zip(&iface.storage) {
             let target = name2idx[&op_symbol(&iface.tag, op)];
             ops.push(funcs.len() as u32);
-            funcs.push(trampoline(target, sig, storage, serve_sp));
+            funcs.push(match heap {
+                None => trampoline(target, sig, storage, serve_sp),
+                Some(heap) => heap_trampoline(target, sig, storage, serve_sp, heap, types),
+            });
         }
         out.push(ImplExport {
             name: iface.name.clone(),
@@ -251,6 +268,7 @@ pub(crate) fn impl_exports(
     out
 }
 
+/// One block: call the op on the serve stack.
 fn trampoline(target: u32, sig: &FuncType, storage: &FuncType, serve_sp: u64) -> Func {
     // v0..n are the op's arguments; `next` is the next value an instruction defines.
     let n = sig.params.len() as u32;
@@ -258,20 +276,7 @@ fn trampoline(target: u32, sig: &FuncType, storage: &FuncType, serve_sp: u64) ->
         insts: vec![Inst::ConstI64(serve_sp as i64)],
         next: n + 1,
     };
-    let mut args = vec![n];
-    for (k, (&want, &have)) in storage.params.iter().zip(&sig.params).enumerate() {
-        args.push(b.convert(k as u32, have, want));
-    }
-    b.insts.push(Inst::Call {
-        func: target,
-        args: args.into(),
-    });
-    let first = b.next;
-    b.next += sig.results.len() as u32;
-    let mut results = Vec::with_capacity(sig.results.len());
-    for (k, (&have, &want)) in storage.results.iter().zip(&sig.results).enumerate() {
-        results.push(b.convert(first + k as u32, have, want));
-    }
+    let results = b.call_op(target, n, 0, sig, storage);
     Func {
         params: sig.params.clone(),
         results: sig.results.clone(),
@@ -285,6 +290,111 @@ fn trampoline(target: u32, sig: &FuncType, storage: &FuncType, serve_sp: u64) ->
     }
 }
 
+/// Three blocks: allocate the dispatch's stack (block 0), call the op on it and free it (block 1),
+/// or answer when the heap has no room for it (block 2, [`exhausted`]).
+fn heap_trampoline(
+    target: u32,
+    sig: &FuncType,
+    storage: &FuncType,
+    serve_sp: u64,
+    (malloc, free): (u32, u32),
+    types: &RefCell<Vec<TypeEntry>>,
+) -> Func {
+    let n = sig.params.len() as u32;
+    // Block 0: v0..n the arguments; vn the serve stack, vn+1 the size, vn+2 the stack, vn+3 null?
+    let entry = Block {
+        parent: 0,
+        captures: vec![],
+        params: sig.params.clone(),
+        insts: vec![
+            Inst::ConstI64(serve_sp as i64),
+            Inst::ConstI64(SERVE_STACK_SIZE as i64),
+            Inst::Call {
+                func: malloc,
+                args: vec![n, n + 1].into(),
+            },
+            Inst::Eqz {
+                ty: temen_ir::IntTy::I64,
+                a: n + 2,
+            },
+        ],
+        term: Terminator::BrIf {
+            cond: n + 3,
+            then_blk: 2,
+            then_args: vec![],
+            else_blk: 1,
+            else_args: std::iter::once(n + 2).chain(0..n).collect(),
+        },
+    };
+    // Block 1: v0 the stack, v1..=n the arguments.
+    let mut params = vec![ValType::I64];
+    params.extend_from_slice(&sig.params);
+    let mut b = Body {
+        insts: Vec::new(),
+        next: n + 1,
+    };
+    let results = b.call_op(target, 0, 1, sig, storage);
+    let sp = b.push(Inst::ConstI64(serve_sp as i64));
+    b.insts.push(Inst::Call {
+        func: free,
+        args: vec![sp, 0].into(),
+    });
+    let body = Block {
+        parent: 0,
+        captures: vec![],
+        params,
+        insts: b.insts,
+        term: Terminator::Return(results),
+    };
+    let fail = exhausted(&sig.results, types);
+    Func {
+        params: sig.params.clone(),
+        results: sig.results.clone(),
+        blocks: vec![entry, body, fail],
+    }
+}
+
+/// The errno a dispatch answers when the heap has no room for its data stack.
+pub(crate) const ENOMEM: i64 = -12;
+
+/// The block a dispatch takes when it gets no data stack: the servicer lives, and the call is
+/// answered `-ENOMEM` as a transport failure through `svc.fail` (#2964), which lays out INVARIANTS
+/// 8's reply for every result shape. What the block then returns is a placeholder the reply ignores.
+fn exhausted(results: &[ValType], types: &RefCell<Vec<TypeEntry>>) -> Block {
+    let sig = crate::intern_sig(
+        types,
+        FuncType {
+            params: vec![ValType::I64],
+            results: vec![ValType::I64],
+        },
+    );
+    let mut insts = vec![
+        Inst::ConstI32(0), // v0: the self namespace's unused handle
+        Inst::ConstI64(ENOMEM),
+        Inst::CapCall(Box::new(temen_ir::CapCall {
+            type_id: temen_ir::CAP_SELF_TYPE_ID,
+            op: temen_ir::CAP_SELF_SVC_FAIL,
+            sig,
+            handle: 0,
+            args: vec![1].into(),
+        })),
+    ];
+    let placeholders = insts.len() as u32;
+    insts.extend(results.iter().map(|t| match t {
+        ValType::I64 => Inst::ConstI64(0),
+        ValType::F32 => Inst::ConstF32(0),
+        ValType::F64 => Inst::ConstF64(0),
+        _ => Inst::ConstI32(0),
+    }));
+    Block {
+        parent: 0,
+        captures: vec![],
+        params: vec![],
+        insts,
+        term: Terminator::Return((placeholders..placeholders + results.len() as u32).collect()),
+    }
+}
+
 /// A one-block body under construction: its instructions and the next value one defines.
 struct Body {
     insts: Vec<Inst>,
@@ -292,14 +402,46 @@ struct Body {
 }
 
 impl Body {
+    /// Append `inst`, which defines one value, and return it.
+    fn push(&mut self, inst: Inst) -> u32 {
+        self.insts.push(inst);
+        self.next += 1;
+        self.next - 1
+    }
+
+    /// Call op function `target` with data-SP `stack` and the op's arguments from value `args`
+    /// on, each converted to its source storage; the op's results, converted back.
+    fn call_op(
+        &mut self,
+        target: u32,
+        stack: u32,
+        args: u32,
+        sig: &FuncType,
+        storage: &FuncType,
+    ) -> Vec<u32> {
+        let mut call = vec![stack];
+        for (k, (&want, &have)) in storage.params.iter().zip(&sig.params).enumerate() {
+            call.push(self.convert(args + k as u32, have, want));
+        }
+        self.insts.push(Inst::Call {
+            func: target,
+            args: call.into(),
+        });
+        let first = self.next;
+        self.next += sig.results.len() as u32;
+        storage
+            .results
+            .iter()
+            .zip(&sig.results)
+            .enumerate()
+            .map(|(k, (&have, &want))| self.convert(first + k as u32, have, want))
+            .collect()
+    }
+
     /// Value `v` of type `have` as a value of type `want` ([`conversion`]).
     fn convert(&mut self, v: u32, have: ValType, want: ValType) -> u32 {
         match conversion(have, want) {
-            Some(op) => {
-                self.insts.push(Inst::Convert { op, a: v });
-                self.next += 1;
-                self.next - 1
-            }
+            Some(op) => self.push(Inst::Convert { op, a: v }),
             None => v,
         }
     }
@@ -314,31 +456,6 @@ pub(crate) fn conversion(have: ValType, want: ValType) -> Option<temen_ir::ConvO
         (ValType::I64, ValType::Cap | ValType::I32) => Some(temen_ir::ConvOp::WrapI64),
         _ => None,
     }
-}
-
-/// Refuse a module whose served op can park ([`SERVE_STACK_SIZE`]'s one stack): decided by the
-/// predicate every engine asks of a serve handler ([`temen_ir::seams::handler_never_parks`]).
-pub(crate) fn check_handlers(m: &Module) -> Result<(), Error> {
-    for e in &m.impl_exports {
-        let Some(k) = e
-            .ops
-            .iter()
-            .position(|&f| !handler_never_parks(&m.funcs, f))
-        else {
-            continue;
-        };
-        let op = match m.types.get(e.interface as usize) {
-            Some(TypeEntry::Interface(ops)) => ops.get(k).map_or("?", |o| o.name.as_str()),
-            _ => "?",
-        };
-        return unsup(format!(
-            "interface `{}`: op `{op}` can park (it reaches a blocking call, an import, a spawn or \
-             join, an indirect call, or a fiber or thread op); a served op must run to completion, \
-             since every op of a module runs on its one serve stack",
-            e.name
-        ));
-    }
-    Ok(())
 }
 
 /// Check that a source function's signature is the op's, a `cap` slot being an `i32`.

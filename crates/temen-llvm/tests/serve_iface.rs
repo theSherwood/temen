@@ -306,23 +306,27 @@ fn translate(ll: &Path, child_entry: bool) -> temen_ir::Module {
 }
 
 /// Run `parent` with `child` granted as `"child"`, on `backend` (`None`: the parallel driver).
+/// Run `parent` with each `children` module granted under its name, on `backend` (`None`: the
+/// parallel driver): its result and its stdout.
 fn run(
     parent: &temen_ir::Module,
-    child: &Arc<temen_ir::Module>,
+    children: &[(&'static str, Arc<temen_ir::Module>)],
     backend: Option<Backend>,
-) -> Result<i32, String> {
+) -> Result<(i32, Vec<u8>), String> {
     let inst = temen_run::instantiate(parent.clone()).map_err(|e| e.to_string())?;
-    let child = Arc::clone(child);
-    let caps = [
+    let mut caps = vec![
         ("vm", HostCap::custom(6, 0, |h, _| h.grant_instantiator())),
         ("budget", HostCap::detached_budget(64 << 20)),
-        (
-            "child",
+    ];
+    for (name, child) in children {
+        let child = Arc::clone(child);
+        caps.push((
+            name,
             HostCap::custom(temen_ir::cap_id::MODULE, 0, move |h, _| {
                 h.grant_module(&child)
             }),
-        ),
-    ];
+        ));
+    }
     let cfg = RunConfig::default();
     let r = match backend {
         Some(b) => inst.run_with_caps(b, &cfg, &caps),
@@ -331,7 +335,7 @@ fn run(
     .map_err(|e| e.to_string())?;
     match r.outcome {
         Outcome::Returned(v) => match v[..] {
-            [Value::I32(x)] => Ok(x),
+            [Value::I32(x)] => Ok((x, r.stdout)),
             _ => Err(format!("result {v:?}")),
         },
         o => Err(format!("outcome {o:?}, notes {:?}", r.notes)),
@@ -369,7 +373,8 @@ fn check(name: &str, parent: temen_ir::Module, child: temen_ir::Module) {
     );
     let child = Arc::new(child);
     for b in DRIVERS {
-        assert_eq!(run(&parent, &child, b), Ok(ANSWER), "{b:?}");
+        let r = run(&parent, &[("child", Arc::clone(&child))], b).map(|(x, _)| x);
+        assert_eq!(r, Ok(ANSWER), "{b:?}");
     }
 }
 
@@ -401,8 +406,8 @@ fn a_rustc_parent_serves_its_rustc_childs_calls() {
 }
 
 /// What the translator refuses, each with the reason in its error: a descriptor's ops half defined,
-/// an op symbol no descriptor names, an op whose source signature is not its interface's, a grant
-/// of an interface the module does not serve, and a served op that can park.
+/// an op symbol no descriptor names, an op whose source signature is not its interface's, and a
+/// grant of an interface the module does not serve.
 #[test]
 fn the_translator_refuses_what_it_cannot_serve_or_import() {
     const DESC: &str = "calc { add: (i64, i64) -> (i64); neg: (i64) -> (i64) }";
@@ -438,13 +443,435 @@ fn the_translator_refuses_what_it_cannot_serve_or_import() {
          define i32 @main() {\n  %g = call i32 @__vm_serve_grant(ptr @__temen_iface__calc)\n  ret i32 %g\n}\n",
         "is not an interface this module serves",
     );
-    refused(
-        &format!(
-            "declare i64 @__vm_join(i32, i64, ptr)\n\
-             define i64 @__temen_op__calc__add(i64 %a, i64 %b) {{\n  %st = alloca i64\n  \
-             %j = call i64 @__vm_join(i32 0, i64 %a, ptr %st)\n  ret i64 %j\n}}\n\
-             define i64 @__temen_op__calc__neg(i64 %a) {{\n  %n = sub i64 0, %a\n  ret i64 %n\n}}\n{main}"
-        ),
-        "op `add` can park",
+}
+
+// ---- #2964: served ops that park, allocate and do I/O ------------------------------------------
+
+/// The `jobs` interface: `log` allocates and prints; `wait` parks until `open` releases it, holding
+/// live locals on its data stack across the park; `ready` says whether a `wait` is parked.
+const JOBS: &str = "jobs { log: (i64) -> (i64); wait: (i64) -> (i64); open: (i64) -> (i64); \
+                    ready: () -> (i64) }";
+
+const JOBS_HEADER: &str = r#"
+#define TEMEN_INTERFACE(name, ops) const char __temen_iface__##name[] = ops
+#define TEMEN_OP(iface, op) __temen_op__##iface##__##op
+#define TEMEN_SERVE_GRANT(name) __vm_serve_grant(__temen_iface__##name)
+long __vm_svc_wait(void);
+int __vm_serve_grant(const char *descriptor);
+int __vm_cap_resolve(const char *name, long len);
+long __vm_instantiate_rec(int inst, long rec);
+long __vm_join(int inst, long child, long *status);
+"#;
+
+fn c_jobs_parent() -> String {
+    format!(
+        r#"{JOBS_HEADER}
+#include <stdio.h>
+#include <stdlib.h>
+int __vm_wait32(int *addr, int expected, long timeout_ns);
+int __vm_notify(int *addr, int count);
+int __vm_atomic_load32(int *addr);
+void __vm_atomic_store32(int *addr, int v);
+TEMEN_INTERFACE(jobs, "{JOBS}");
+
+static int gate, waiting;
+
+long TEMEN_OP(jobs, log)(long x) {{
+  long *cell = malloc(sizeof(long) * 4);
+  if (!cell) return -1;
+  cell[2] = x * 2;
+  printf("log %ld\n", x);
+  long r = cell[2];
+  free(cell);
+  return r;
+}}
+
+/* Fill a frame of locals, park until `open`, then sum them: a handler run meanwhile on the same
+   stack would have overwritten them. */
+long TEMEN_OP(jobs, wait)(long x) {{
+  volatile long a[64];
+  for (int i = 0; i < 64; i++) a[i] = x * 1000 + i;
+  __vm_atomic_store32(&waiting, 1);
+  while (__vm_atomic_load32(&gate) == 0) __vm_wait32(&gate, 0, -1);
+  long sum = 0;
+  for (int i = 0; i < 64; i++) sum += a[i];
+  return sum + __vm_atomic_load32(&gate);
+}}
+
+long TEMEN_OP(jobs, open)(long x) {{
+  volatile long b[64];
+  for (int i = 0; i < 64; i++) b[i] = -1;
+  long s = 0;
+  for (int i = 0; i < 64; i++) s += b[i];
+  __vm_atomic_store32(&gate, (int)x);
+  __vm_notify(&gate, 1);
+  return x + s + 64;
+}}
+
+long TEMEN_OP(jobs, ready)(void) {{ return __vm_atomic_load32(&waiting); }}
+
+static unsigned rec[2][16] __attribute__((aligned(8)));
+static unsigned grant[4];
+
+static long spawn(int inst, int budget, int module, int k) {{
+  unsigned words[16] = {{0, ~0u, (unsigned)module, (unsigned)budget, (unsigned)(long)grant, 0, 1,
+                        0, 0, 0, 0, 0, ~0u, 0, 0, 0}};
+  for (int i = 0; i < 16; i++) rec[k][i] = words[i];
+  return __vm_instantiate_rec(inst, (long)rec[k]);
+}}
+
+int main(void) {{
+  int inst = __vm_cap_resolve("vm", 2);
+  int budget = __vm_cap_resolve("budget", 6);
+  int a = __vm_cap_resolve("waiter", 6);
+  int b = __vm_cap_resolve("opener", 6);
+  if (inst < 0 || budget < 0 || a < 0 || b < 0) return -1;
+  grant[0] = (unsigned)(long)"jobs";
+  grant[1] = 4;
+  grant[2] = (unsigned)TEMEN_SERVE_GRANT(jobs);
+  grant[3] = 0;
+  long ha = spawn(inst, budget, a, 0);
+  long hb = spawn(inst, budget, b, 1);
+  if (ha < 0 || hb < 0) return -2;
+  while (__vm_svc_wait() > 0) {{}}
+  long st = 0;
+  long ra = __vm_join(inst, ha, &st);
+  if (st != 0) return (int)(-1000 - st);
+  long rb = __vm_join(inst, hb, &st);
+  if (st != 0) return (int)(-2000 - st);
+  return (int)(ra * 10000 + rb);
+}}
+"#
+    )
+}
+
+fn c_jobs_child(body: &str) -> String {
+    format!(
+        r#"{JOBS_HEADER}
+TEMEN_INTERFACE(jobs, "{JOBS}");
+long TEMEN_OP(jobs, log)(long x);
+long TEMEN_OP(jobs, wait)(long x);
+long TEMEN_OP(jobs, open)(long x);
+long TEMEN_OP(jobs, ready)(void);
+int main(void) {{ {body} }}
+"#
+    )
+}
+
+/// The waiter's `wait(1)`: its 64 locals `1000 + i` summed, plus the gate `open` set (7).
+const WAITED: i32 = 64 * 1000 + 63 * 64 / 2 + 7;
+/// The opener's `log(21) * 100 + open(7)`: the waiter's answer, then the opener's.
+const OPENED: i32 = 42 * 100 + 7;
+
+#[test]
+fn a_clang_parent_serves_ops_that_park_allocate_and_print() {
+    let dir = work_dir("jobs");
+    let waiter = c_jobs_child("return (int)TEMEN_OP(jobs, wait)(1);");
+    let opener = c_jobs_child(
+        "long l = TEMEN_OP(jobs, log)(21);\n  while (TEMEN_OP(jobs, ready)() == 0) {}\n  \
+         return (int)(l * 100 + TEMEN_OP(jobs, open)(7));",
     );
+    let (Some(p), Some(w), Some(o)) = (
+        clang_ll(&dir, "parent", &c_jobs_parent()),
+        clang_ll(&dir, "waiter", &waiter),
+        clang_ll(&dir, "opener", &opener),
+    ) else {
+        eprintln!("note: skipping (clang unavailable)");
+        return;
+    };
+    let parent = translate(&p, false);
+    // `wait` parks, so every op takes a data stack of its own from the heap.
+    assert!(
+        !temen_interp::bytecode::admits(&parent),
+        "a server whose handlers park runs on the tree-walker, as hand-written IR does"
+    );
+    let children = [
+        ("waiter", Arc::new(translate(&w, true))),
+        ("opener", Arc::new(translate(&o, true))),
+    ];
+    // The parallel driver's entry pins the bytecode engine, so it declines the module outright where
+    // a cooperative bytecode run declines it to the oracle (INVARIANTS 9).
+    let r = run(&parent, &children, None);
+    assert!(
+        matches!(&r, Err(e) if e.contains("outside the parallel engine's subset")),
+        "the parallel driver declines it: {r:?}"
+    );
+    for b in [Backend::TreeWalk, Backend::Bytecode, Backend::Jit] {
+        let r = run(&parent, &children, Some(b));
+        assert_eq!(
+            r,
+            Ok((WAITED * 10_000 + OPENED, b"log 21\n".to_vec())),
+            "{b:?}"
+        );
+    }
+}
+
+/// [`c_jobs_parent`] in Rust: the descriptor, then the same four ops and the same spawn-and-serve.
+fn rust_jobs_parent() -> String {
+    format!(
+        r##"#![no_std]
+#![allow(internal_features, non_upper_case_globals, static_mut_refs)]
+#[panic_handler]
+fn ph(_: &core::panic::PanicInfo) -> ! {{ loop {{}} }}
+#[no_mangle]
+pub extern "C" fn rust_eh_personality() {{}}
+
+#[no_mangle]
+pub static __temen_iface__jobs: [u8; {n}] = *b"{JOBS}";
+
+extern "C" {{
+    fn __vm_svc_wait() -> i64;
+    fn __vm_serve_grant(descriptor: *const u8) -> i32;
+    fn __vm_cap_resolve(name: *const u8, len: i64) -> i32;
+    fn __vm_join(inst: i32, child: i64, status: *mut i64) -> i64;
+    fn __vm_wait32(addr: *mut i32, expected: i32, timeout_ns: i64) -> i32;
+    fn __vm_notify(addr: *mut i32, count: i32) -> i32;
+    fn __vm_atomic_load32(addr: *mut i32) -> i32;
+    fn __vm_atomic_store32(addr: *mut i32, v: i32);
+    fn malloc(n: usize) -> *mut i64;
+    fn free(p: *mut i64);
+    fn printf(fmt: *const u8, ...) -> i32;
+}}
+
+static mut GATE: i32 = 0;
+static mut WAITING: i32 = 0;
+
+#[export_name = "__temen_op__jobs__log"]
+pub extern "C" fn log(x: i64) -> i64 {{
+    unsafe {{
+        let cell = malloc(32);
+        if cell.is_null() {{
+            return -1;
+        }}
+        core::ptr::write_volatile(cell.add(2), x * 2);
+        printf(b"log %ld\n\0".as_ptr(), x);
+        let r = core::ptr::read_volatile(cell.add(2));
+        free(cell);
+        r
+    }}
+}}
+
+#[export_name = "__temen_op__jobs__wait"]
+pub extern "C" fn wait(x: i64) -> i64 {{
+    unsafe {{
+        let mut a = [0i64; 64];
+        for i in 0..64 {{
+            core::ptr::write_volatile(&mut a[i], x * 1000 + i as i64);
+        }}
+        __vm_atomic_store32(core::ptr::addr_of_mut!(WAITING), 1);
+        while __vm_atomic_load32(core::ptr::addr_of_mut!(GATE)) == 0 {{
+            __vm_wait32(core::ptr::addr_of_mut!(GATE), 0, -1);
+        }}
+        let mut sum = 0;
+        for i in 0..64 {{
+            sum += core::ptr::read_volatile(&a[i]);
+        }}
+        sum + __vm_atomic_load32(core::ptr::addr_of_mut!(GATE)) as i64
+    }}
+}}
+
+#[export_name = "__temen_op__jobs__open"]
+pub extern "C" fn open(x: i64) -> i64 {{
+    unsafe {{
+        let mut b = [0i64; 64];
+        for i in 0..64 {{
+            core::ptr::write_volatile(&mut b[i], -1);
+        }}
+        let mut s = 0;
+        for i in 0..64 {{
+            s += core::ptr::read_volatile(&b[i]);
+        }}
+        __vm_atomic_store32(core::ptr::addr_of_mut!(GATE), x as i32);
+        __vm_notify(core::ptr::addr_of_mut!(GATE), 1);
+        x + s + 64
+    }}
+}}
+
+#[export_name = "__temen_op__jobs__ready"]
+pub extern "C" fn ready() -> i64 {{
+    unsafe {{ __vm_atomic_load32(core::ptr::addr_of_mut!(WAITING)) as i64 }}
+}}
+
+#[no_mangle]
+pub extern "C" fn main() -> i32 {{
+    unsafe {{
+        let inst = __vm_cap_resolve(b"vm".as_ptr(), 2);
+        let budget = __vm_cap_resolve(b"budget".as_ptr(), 6);
+        let a = __vm_cap_resolve(b"waiter".as_ptr(), 6);
+        let b = __vm_cap_resolve(b"opener".as_ptr(), 6);
+        if inst < 0 || budget < 0 || a < 0 || b < 0 {{
+            return -1;
+        }}
+        let jobs = __vm_serve_grant(__temen_iface__jobs.as_ptr());
+        let ha = vm_spawn(inst, budget, a, &[(b"jobs", jobs)], &[]);
+        let hb = vm_spawn(inst, budget, b, &[(b"jobs", jobs)], &[]);
+        if ha < 0 || hb < 0 {{
+            return -2;
+        }}
+        while __vm_svc_wait() > 0 {{}}
+        let mut st = 0i64;
+        let ra = __vm_join(inst, ha, &mut st);
+        if st != 0 {{
+            return (-1000 - st) as i32;
+        }}
+        let rb = __vm_join(inst, hb, &mut st);
+        if st != 0 {{
+            return (-2000 - st) as i32;
+        }}
+        (ra * 10000 + rb) as i32
+    }}
+}}
+{VM_SPAWN}
+"##,
+        n = JOBS.len()
+    )
+}
+
+/// A Rust child of [`rust_jobs_parent`] whose `main` runs `body`.
+fn rust_jobs_child(body: &str) -> String {
+    format!(
+        r##"#![no_std]
+#![allow(internal_features)]
+#[panic_handler]
+fn ph(_: &core::panic::PanicInfo) -> ! {{ loop {{}} }}
+#[no_mangle]
+pub extern "C" fn rust_eh_personality() {{}}
+
+#[no_mangle]
+pub static __temen_iface__jobs: [u8; {n}] = *b"{JOBS}";
+
+extern "C" {{
+    #[link_name = "__temen_op__jobs__log"]
+    fn log(x: i64) -> i64;
+    #[link_name = "__temen_op__jobs__wait"]
+    fn wait(x: i64) -> i64;
+    #[link_name = "__temen_op__jobs__open"]
+    fn open(x: i64) -> i64;
+    #[link_name = "__temen_op__jobs__ready"]
+    fn ready() -> i64;
+}}
+
+#[no_mangle]
+pub extern "C" fn main() -> i32 {{
+    unsafe {{ {body} }}
+}}
+"##,
+        n = JOBS.len()
+    )
+}
+
+#[test]
+fn a_rustc_parent_serves_ops_that_park_allocate_and_print() {
+    let dir = work_dir("rust_jobs");
+    let waiter = rust_jobs_child("wait(1) as i32");
+    let opener =
+        rust_jobs_child("let l = log(21); while ready() == 0 {} (l * 100 + open(7)) as i32");
+    let (Some(p), Some(w), Some(o)) = (
+        rustc_ll(&dir, "parent", &rust_jobs_parent()),
+        rustc_ll(&dir, "waiter", &waiter),
+        rustc_ll(&dir, "opener", &opener),
+    ) else {
+        eprintln!("note: skipping (rustc unavailable)");
+        return;
+    };
+    let parent = translate(&p, false);
+    let children = [
+        ("waiter", Arc::new(translate(&w, true))),
+        ("opener", Arc::new(translate(&o, true))),
+    ];
+    for b in [Backend::TreeWalk, Backend::Bytecode, Backend::Jit] {
+        let r = run(&parent, &children, Some(b));
+        assert_eq!(
+            r,
+            Ok((WAITED * 10_000 + OPENED, b"log 21\n".to_vec())),
+            "{b:?}"
+        );
+    }
+}
+
+/// #2964 — a dispatch that gets no data stack is answered, and the servicer lives. The parent
+/// defines its own `malloc` (a bump arena the translator's trampolines use like any other), which
+/// `deny` turns off; the child's next calls then get INVARIANTS 8's transport failure through
+/// `svc.fail`: `twice` its `-ENOMEM`, and `grab`, which answers a handle, `(-ENOMEM, 0)` with no
+/// handle of the servicer's granted. `nap` can park, so every op takes a stack of its own.
+#[test]
+fn a_dispatch_without_a_stack_is_answered_enomem() {
+    const MEM: &str = "mem { deny: () -> (i64); twice: (i64) -> (i64); nap: () -> (i64); \
+                       grab: () -> (i64, cap) }";
+    let parent = format!(
+        r#"{JOBS_HEADER}
+int __vm_wait32(int *addr, int expected, long timeout_ns);
+TEMEN_INTERFACE(mem, "{MEM}");
+static char arena[4 << 20] __attribute__((aligned(16)));
+static long used;
+static int denied;
+void *malloc(unsigned long n) {{
+  if (denied || used + (long)n > (long)sizeof arena) return 0;
+  void *p = arena + used;
+  used += (n + 15) & ~15L;
+  return p;
+}}
+void free(void *p) {{ (void)p; }}
+static int never = 1;
+long TEMEN_OP(mem, deny)(void) {{ denied = 1; return 0; }}
+long TEMEN_OP(mem, twice)(long x) {{ return 2 * x; }}
+long TEMEN_OP(mem, nap)(void) {{ return __vm_wait32(&never, 0, 0); }}
+struct grabbed {{ long v; int h; }};
+struct grabbed TEMEN_OP(mem, grab)(void) {{ struct grabbed g = {{ 7, 0 }}; return g; }}
+static unsigned rec[16] __attribute__((aligned(8)));
+static unsigned grant[4];
+int main(void) {{
+  int inst = __vm_cap_resolve("vm", 2);
+  int budget = __vm_cap_resolve("budget", 6);
+  int child = __vm_cap_resolve("child", 5);
+  grant[0] = (unsigned)(long)"mem";
+  grant[1] = 3;
+  grant[2] = (unsigned)TEMEN_SERVE_GRANT(mem);
+  unsigned words[16] = {{0, ~0u, (unsigned)child, (unsigned)budget, (unsigned)(long)grant, 0, 1, 0,
+                        0, 0, 0, 0, ~0u, 0, 0, 0}};
+  for (int i = 0; i < 16; i++) rec[i] = words[i];
+  long h = __vm_instantiate_rec(inst, (long)rec);
+  if (h < 0) return -1;
+  while (__vm_svc_wait() > 0) {{}}
+  long st = 0;
+  long r = __vm_join(inst, h, &st);
+  return st != 0 ? (int)(-1000 - st) : (int)r;
+}}
+"#
+    );
+    let child = format!(
+        r#"{JOBS_HEADER}
+TEMEN_INTERFACE(mem, "{MEM}");
+long TEMEN_OP(mem, deny)(void);
+long TEMEN_OP(mem, twice)(long x);
+long TEMEN_OP(mem, nap)(void);
+struct grabbed {{ long v; int h; }};
+struct grabbed TEMEN_OP(mem, grab)(void);
+int main(void) {{
+  long a = TEMEN_OP(mem, twice)(21);
+  TEMEN_OP(mem, deny)();
+  long b = TEMEN_OP(mem, twice)(21);
+  struct grabbed g = TEMEN_OP(mem, grab)();
+  return (int)(a * 1000 + b + g.v * 100000 + g.h);
+}}
+"#
+    );
+    let dir = work_dir("enomem");
+    let (Some(p), Some(c)) = (
+        clang_ll(&dir, "parent", &parent),
+        clang_ll(&dir, "child", &child),
+    ) else {
+        eprintln!("note: skipping (clang unavailable)");
+        return;
+    };
+    let parent = translate(&p, false);
+    let children = [("child", Arc::new(translate(&c, true)))];
+    for b in [Backend::TreeWalk, Backend::Bytecode, Backend::Jit] {
+        let r = run(&parent, &children, Some(b)).map(|(x, _)| x);
+        assert_eq!(
+            r,
+            Ok(42 * 1000 - 12 - 12 * 100_000),
+            "{b:?}: twice(21), then -ENOMEM, and grab's (-ENOMEM, 0) though it answers a handle"
+        );
+    }
 }
