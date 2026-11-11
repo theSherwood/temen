@@ -800,14 +800,18 @@ cap op by design. This section is the convergence plan and the as-built record.
   op by design, so fork stays ⛔ there like `call.cap`). `svc.poll`/`svc.wait` are ✅ on the fast
   backends (native serve loop when serve-qualified); the Instantiator spawn/join ops are ✅ too.
 - **Native bytecode fork — DONE.** `clone_caller` + `reap` run natively on the bytecode cooperative
-  serve driver. `clone_caller`/`reap` are a `has_fork` seam that `svc_park_veto` keeps (so temen-run's
-  Cranelift routing still folds fork), while the bytecode compile gate takes a bounded
-  `Seams::bytecode_serves_fork` escape past it — the per-backend split. The twin is the parked
+  serve driver. `clone_caller`/`reap` are a `has_fork` seam that `svc_park_veto` keeps, while the
+  bytecode compile gate takes a bounded `Seams::bytecode_serves_fork` escape past it — the
+  per-backend split. The twin is the parked
   caller's `Vm` cloned at its post-call resume point over a private window (`Mem::fork_private`) +
   duplicated powerbox (`Host::fork_powerbox`), pushed as a fresh env+task; `reap` waits it via a
   `BlockedReap` state + a `forked_twins` allow-set. Pinned bit-for-bit against the oracle by
   `clone_caller.rs::bytecode_forks_the_twin_identically_to_the_oracle` (the `SRC_TWIN` topology).
-  The Cranelift side stays folded, pinned by `serve_qualifies_still_folds_fork_for_cranelift`.
+  The Cranelift JIT declines a module that forks (`temen_jit::admits`), and temen-run's routing
+  folds it down the ladder to the bytecode engine, pinned end to end by `svc_parity.rs`'s
+  `a_forking_server_answers_as_the_oracle_on_all_three_backends` (#2553, 2026-11-10). Until then
+  the JIT compiled both ops to its generic cap thunk, which answered `-EINVAL`: a forking module
+  nests, and the serve fold left nesting modules on the JIT.
 
 ### 9.1 The gating finding (verified 2026-08-07): fork is a *serve-substrate* slice, not a targeted op
 
@@ -923,8 +927,8 @@ durable-suspendable, caller-parking op), so this is a multi-PR capstone touching
 differential-pinned against the interp, one increment per PR. It is **not** a bounded slice with a
 safe independently-testable first primitive: items 3–4 are only exercisable once item 2 gives a
 reified mid-call continuation, and item 2 itself is the from-scratch execution-mode change. Until the
-capstone lands, `serve_qualifies` correctly folds fork for Cranelift — no divergence, a forking module
-runs on a reifiable tier. The first PR is item 2's foundation: a durable guest's live-offer `call.cap`
+capstone lands (#2855), the JIT declines a module that forks and temen-run folds it to the bytecode
+engine — no divergence, a forking module runs on a reifiable tier (#2553). The first PR is item 2's foundation: a durable guest's live-offer `call.cap`
 that unwinds pre-result to a window-resident continuation instead of thread-blocking, pinned by a
 freeze/thaw round-trip that resumes past the call with an injected reply.
 ### 9.4 `execve` on the JIT (#1768, 2026-09-24)

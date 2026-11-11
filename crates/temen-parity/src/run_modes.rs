@@ -496,12 +496,14 @@ pub fn exception(f: Feature, c: Config) -> Option<Cell> {
         // The Cranelift JIT, whatever the run adds.
         (Threads | Fibers | Children, Cranelift) => conditional(FIBER_RT),
         (Fork, Cranelift) => not_yet(
-            "answers clone_caller and reap -EINVAL where the oracle forks (#2553); FORK.md §9.3 \
-             plans them natively. The POSIX personality's own fork runs there (§9.5)",
+            "declines a module with clone_caller or reap, which an Instance run folds to the \
+             bytecode engine; FORK.md §9.3 plans them natively (#2855). The POSIX personality's own \
+             fork runs there (§9.5)",
         ),
         (Exec, Cranelift) => not_yet(
-            "declines exec_module, the op C's execve replaces its image with (#2555); the POSIX \
-             personality's OP_EXECVE runs there (FORK.md §9.4)",
+            "declines exec_module, the op C's execve replaces its image with, and an Instance run \
+             folds the module to the bytecode engine (#2555); the POSIX personality's OP_EXECVE \
+             runs there (FORK.md §9.4)",
         ),
         (SharedRegion, Cranelift) => conditional(
             "for a region over an OS shared-memory object (temen_run::new_shared_region), which \

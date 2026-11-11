@@ -13,6 +13,8 @@ use temen_text::parse_module;
 
 #[path = "../../temen-interp/tests/support/drivers.rs"]
 mod drivers;
+#[path = "../../temen-interp/tests/support/rec.rs"]
+mod rec;
 
 use drivers::{agree_on, Driver, Ran};
 
@@ -110,6 +112,214 @@ fn a_serving_domain_behaves_identically_on_all_three_backends() {
             r.outcome,
             Outcome::Returned(vec![temen_interp::Value::I64(42)]),
             "{backend:?}: spawn → child_offer → park → svc.wait-serve → reply → join → 42"
+        );
+    }
+}
+
+/// #2553 — the run-mode matrix's fork topology (`clone_caller.rs`'s twin), its powerbox resolved by
+/// name. The root spawns a server S (func 1) and a caller C (func 4), handing C a live offer into S.
+/// C's call reaches S's `fork` handler (func 2), whose `clone_caller` forks C the way `fork()` does:
+/// the original resumes with the twin's pid and the twin with 0. The twin writes 200 and returns it.
+/// The original reaps the twin by its pid through S's `wait` handler (func 3, `reap`) and returns
+/// the status, 200, which the root's join of C returns. (The matrix's probe reaps pid 3, the twin's
+/// task id in its runners; a run through `Instance` numbers its tasks differently.) C retries a
+/// `fork` or `wait` that answers `-EAGAIN`, the serve/park race `clone_caller.rs` documents (I53),
+/// and returns any other error, so a backend that can't fork fails the test rather than spinning.
+const FORKING_PROGRAM: &str = r#"
+memory 18
+type 0 func (i64) -> (i64)
+type 1 interface { fork: 0, wait: 0 }
+export 0 interface "svc" 1 { fork: 2, wait: 3 }
+data 16448 "vm"
+data 16464 "budget"
+data 16480 "server"
+data 16496 "caller"
+data 16512 "out"
+data 16684 "svc"
+data 16694 "o"
+func () -> (i64) {
+block 0 () {
+  vpv = i64.const 16448
+  vlv = i64.const 2
+  v0 = self.resolve vpv vlv
+  vpb = i64.const 16464
+  vlb = i64.const 6
+  vbud = self.resolve vpb vlb
+  vps = i64.const 16480
+  vls = i64.const 6
+  vsm = self.resolve vps vls
+  vpc = i64.const 16496
+  vlc = i64.const 6
+  vcm = self.resolve vpc vlc
+  vpo = i64.const 16512
+  vlo = i64.const 3
+  vout = self.resolve vpo vlo
+  qsm = i64.const 17544
+  i32.store qsm vsm
+  q1b = i64.const 17548
+  i32.store q1b vbud
+  q1p = i64.const 17536
+  vs = call.cap 6 17 (i64) -> (i32) v0 (q1p)
+  vz0 = i64.const 0
+  vcap = call.cap 6 14 (i32, i64) -> (i32) v0 (vs, vz0)
+  va0 = i64.const 16640
+  vnp = i32.const 16684
+  i32.store va0 vnp
+  va1 = i64.const 16644
+  vnl = i32.const 3
+  i32.store va1 vnl
+  va2 = i64.const 16648
+  i32.store va2 vcap
+  va3 = i64.const 16656
+  vnp2 = i32.const 16694
+  i32.store va3 vnp2
+  va4 = i64.const 16660
+  vnl2 = i32.const 1
+  i32.store va4 vnl2
+  va5 = i64.const 16664
+  i32.store va5 vout
+  qcm = i64.const 17672
+  i32.store qcm vcm
+  q2b = i64.const 17676
+  i32.store q2b vbud
+  q2p = i64.const 17664
+  vc = call.cap 6 17 (i64) -> (i32) v0 (q2p)
+  vjc_st, vjc = call.cap 6 1 (i32) -> (i64, i64) v0 (vc)
+  return vjc
+  }
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  br 1()
+  }
+block 1 () {
+  vz = i32.const 0
+  vn = call.cap 4294967295 10 () -> (i64) vz ()
+  br 1()
+  }
+}
+func (i64) -> (i64) {
+block 0 (vx: i64) {
+  vz = i32.const 0
+  vrt = i64.const 0
+  vt = call.cap 4294967295 11 (i64) -> (i64) vz (vrt)
+  return vt
+  }
+}
+func (i64) -> (i64) {
+block 0 (vpid: i64) {
+  vz = i32.const 0
+  vt = call.cap 4294967295 12 (i64) -> (i64) vz (vpid)
+  return vt
+  }
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vp0 = i64.const 16684
+  vl3 = i64.const 3
+  vhsvc = self.resolve vp0 vl3
+  vp8 = i64.const 16694
+  vl1 = i64.const 1
+  vho = self.resolve vp8 vl1
+  br 1(vhsvc, vho)
+  }
+block 1 (vhsvc: i32, vho: i32) {
+  varg = i64.const 7
+  vpid = call.cap 268435456 0 (i64) -> (i64) vhsvc (varg)
+  vea1 = i64.const -11
+  vagain1 = i64.eq vpid vea1
+  br_if vagain1 1(vhsvc, vho) 2(vpid, vhsvc, vho)
+  }
+block 2 (vpid: i64, vhsvc: i32, vho: i32) {
+  vz2 = i64.const 0
+  vistwin = i64.eq vpid vz2
+  br_if vistwin 5(vho) 3(vpid, vhsvc)
+  }
+block 3 (vpid: i64, vhsvc: i32) {
+  vz3 = i64.const 0
+  vfailed = i64.lt_s vpid vz3
+  br_if vfailed 6(vpid) 4(vpid, vhsvc)
+  }
+block 4 (vpid: i64, vhsvc: i32) {
+  vstatus = call.cap 268435456 1 (i64) -> (i64) vhsvc (vpid)
+  vea4 = i64.const -11
+  vagain4 = i64.eq vstatus vea4
+  br_if vagain4 4(vpid, vhsvc) 6(vstatus)
+  }
+block 5 (vho: i32) {
+  v200 = i64.const 200
+  vp16 = i64.const 17408
+  i64.store vp16 v200
+  vlen = i64.const 8
+  vw = call.cap 0 1 (i64, i64) -> (i64) vho (vp16, vlen)
+  return v200
+  }
+block 6 (vr: i64) {
+  return vr
+  }
+}
+"#;
+
+/// #2553 — a forking server answers as the oracle does on all three backends, run as an embedder runs
+/// it. The Cranelift JIT does not fork, so it declines the module (`temen_jit::admits`), and the run
+/// folds down the ladder to the bytecode engine, which forks. The JIT used to compile the fork ops
+/// to its generic cap thunk, and C's fork answered `-EINVAL`, so the run returned -22.
+#[test]
+fn a_forking_server_answers_as_the_oracle_on_all_three_backends() {
+    let caller = temen_ir::SpawnRec {
+        grants_ptr: 16640,
+        grants_n: 2,
+        ..temen_ir::SpawnRec::default()
+    };
+    let src = format!(
+        "{FORKING_PROGRAM}{}{}",
+        rec::segment(17536, &temen_ir::SpawnRec::default()),
+        rec::segment(17664, &caller)
+    );
+    let m = parse_module(&src).expect("parse");
+    temen_verify::verify_module(&m).expect("verify");
+    assert!(
+        !temen_jit::admits(&m),
+        "the Cranelift JIT declines a module that forks"
+    );
+    let image = |f| std::sync::Arc::new(temen_ir::child_image_at(&m, f).expect("child image"));
+    let (server, caller) = (image(1), image(4));
+    let inst = instantiate_with_imports(m, Imports::new()).expect("instantiate");
+    // Queued calls: under direct handoff the tree-walker runs S's handler inline, with no parked
+    // caller to fork, so C's `fork` answers `-EAGAIN` for good (#2854).
+    let config = RunConfig {
+        handoff: false,
+        ..RunConfig::default()
+    };
+    for backend in [Backend::TreeWalk, Backend::Bytecode, Backend::Jit] {
+        let module = |image: &std::sync::Arc<Module>| {
+            let image = std::sync::Arc::clone(image);
+            HostCap::custom(temen_ir::cap_id::MODULE, 0, move |h, _| {
+                h.grant_module(&image)
+            })
+        };
+        let r = inst
+            .run_with_caps(
+                backend,
+                &config,
+                &[
+                    ("vm", HostCap::custom(6, 0, |h, _| h.grant_instantiator())),
+                    ("budget", HostCap::detached_budget(8 << 20)),
+                    ("server", module(&server)),
+                    ("caller", module(&caller)),
+                    ("out", HostCap::stdout()),
+                ],
+            )
+            .unwrap_or_else(|e| panic!("{backend:?}: {e}"));
+        assert_eq!(
+            r.outcome,
+            Outcome::Returned(vec![Value::I64(200)]),
+            "{backend:?}: fork → the twin returns 200 → the original reaps it → 200"
+        );
+        assert_eq!(
+            r.stdout,
+            200i64.to_le_bytes(),
+            "{backend:?}: the twin wrote through its copy of the powerbox"
         );
     }
 }
