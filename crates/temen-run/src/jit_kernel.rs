@@ -33,15 +33,6 @@ pub fn vcpus() -> u64 {
     VCPUS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// #2868 prototype, for attribution: whether the runs this process opens next queue their native
-/// futex waits by key ([`set_keyed`]), as `TEMEN_SPIKE_KEYED=1` does.
-static KEYED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-/// [`KEYED`].
-pub fn set_keyed(on: bool) {
-    KEYED.store(on, std::sync::atomic::Ordering::Relaxed);
-}
-
 /// Whether the spike path is switched on (`TEMEN_JIT_KERNEL=1`).
 pub fn enabled() -> bool {
     std::env::var_os("TEMEN_JIT_KERNEL").is_some_and(|v| v == "1")
@@ -139,13 +130,7 @@ pub fn run_compiled(
             modules: None,
             leaf: Some(Arc::new(|offer| offer.module == 0)),
             run: tier_run,
-            native: Some(NativeTier {
-                on_end,
-                state,
-                // #2868 prototype, for attribution only: `TEMEN_SPIKE_KEYED=1`.
-                keyed_futex: KEYED.load(std::sync::atomic::Ordering::Relaxed)
-                    || std::env::var_os("TEMEN_SPIKE_KEYED").is_some_and(|v| v == "1"),
-            }),
+            native: Some(NativeTier { on_end, state }),
         }),
         // The root runs on the caller's thread, as the JIT's does.
         root_on_opener: true,

@@ -59,11 +59,10 @@ fn today<'a>(m: &'a Module, host: Host, locked: bool) -> Lane<'a> {
     })
 }
 
-/// The spike path. Each run takes a fresh compile (its window is the run's), made untimed. `keyed`
-/// runs it with the #2868 keyed-queue prototype.
-fn spike<'a>(m: &'a Module, mut host: impl FnMut() -> Host + 'a, keyed: bool) -> Lane<'a> {
+/// The spike path, on the kernel's keyed futex wait (#2957). Each run takes a fresh compile (its
+/// window is the run's), made untimed.
+fn spike<'a>(m: &'a Module, mut host: impl FnMut() -> Host + 'a) -> Lane<'a> {
     Box::new(move |args| {
-        temen_run::jit_kernel::set_keyed(keyed);
         let cm = temen_run::jit_kernel::compile(m, 0, RESERVED, None).expect("in scope");
         let mut h = host();
         let t0 = Instant::now();
@@ -169,7 +168,7 @@ pub fn run(reps: usize) {
             let m = parse(k.ir);
             let mut lanes = [
                 ("today", today(&m, Host::new(), false)),
-                ("spike", spike(&m, Host::new, false)),
+                ("spike", spike(&m, Host::new)),
             ];
             per_iter(
                 k.name,
@@ -195,7 +194,7 @@ pub fn run(reps: usize) {
                 ("today", today(&m, crate::dispatch_host().0, false)),
                 // What today's JIT pays for the same call in a program that spawns.
                 ("today-lock", today(&m, crate::dispatch_host().0, true)),
-                ("spike", spike(&m, || crate::dispatch_host().0, false)),
+                ("spike", spike(&m, || crate::dispatch_host().0)),
             ];
             per_iter(
                 "hostproc",
@@ -296,8 +295,7 @@ pub fn run(reps: usize) {
     for k in ks {
         let lanes = vec![
             ("today", today(&m, Host::new(), true)),
-            ("spike", spike(&m, Host::new, false)),
-            ("spike+kq", spike(&m, Host::new, true)),
+            ("spike", spike(&m, Host::new)),
             ("x2-interp", x2_interp(&m)),
         ];
         // `SPIKE_LANES=today,spike` picks lanes.
@@ -341,20 +339,17 @@ pub fn run_nowake(reps: usize) {
             let label = format!("{what}, K = {k}");
             let args = move |n| vec![n, k, mode];
             // A span long enough that each lane's fixed cost (spawning the K threads, about 0.6 s
-            // at K = 1,000 on today's lane) subtracts to a usable range; the spike without the
-            // queue costs ~0.1 us per parked task per op, so it takes a short one.
+            // at K = 1,000 on today's lane) subtracts to a usable range.
             let long = if k >= 1_000 { 20_001_000 } else { 2_001_000 };
-            let mut fast = vec![
+            let mut lanes = vec![
                 ("today", today(&m, Host::new(), true)),
-                ("spike+kq", spike(&m, Host::new, true)),
+                ("spike", spike(&m, Host::new)),
             ];
-            per_iter(&label, &mut fast, args, (1_000, long), 1.0, reps, 1.0, "ns");
-            let mut slow = vec![("spike", spike(&m, Host::new, false))];
             per_iter(
                 &label,
-                &mut slow,
+                &mut lanes,
                 args,
-                (1_000, 101_000),
+                (1_000, long),
                 1.0,
                 reps,
                 1.0,
@@ -371,13 +366,13 @@ pub fn run_nowake(reps: usize) {
 
 /// K = 1,000 of the pingpong with a span long enough that today's run, whose fixed cost is spawning
 /// the 1,000 threads (about 0.6 s, give or take 0.2 s), still subtracts to a usable range:
-/// `SPIKE_SECTIONS=k1000`. The spike without the queue keeps the short span (its cost is 100x).
+/// `SPIKE_SECTIONS=k1000`.
 pub fn run_k1000(reps: usize) {
     println!("\npark and wake, K = 1000, long span (us per hand-off):");
     let m = parse(crate::kernel_spike_ir::PINGPONG_IR);
     let mut lanes = vec![
         ("today", today(&m, Host::new(), true)),
-        ("spike+kq", spike(&m, Host::new, true)),
+        ("spike", spike(&m, Host::new)),
     ];
     let args = |n| vec![n, 1_000];
     per_iter(
@@ -407,7 +402,7 @@ pub fn run_pairs(reps: usize) {
     for p in [1i64, 2, 4] {
         let mut lanes = vec![
             ("today", today(&m, Host::new(), true)),
-            ("spike+kq", spike(&m, Host::new, true)),
+            ("spike", spike(&m, Host::new)),
         ];
         let args = move |n| vec![n, p];
         per_iter(
