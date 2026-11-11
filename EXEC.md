@@ -7,8 +7,9 @@ Design record for the subprocess capability (first consumer: **jacl**,
 
 ## The one-interface decision
 
-A guest imports **one** interface, `"exec"`, resolved by name
-(`__vm_cap_resolve("exec")` + `__vm_host_call`, exactly like `"fs"`).
+A guest imports **one** interface, `"exec"`: a flat import of the one
+entry (or `self.resolve("exec")` + `call.cap HOST_PROC 0`, which reaches
+only a host servicer), with its message region `"exec.msg"` beside it.
 *What runs* is the wirer's choice, invisible to the guest — the
 interposition-invisibility property the import model already guarantees:
 
@@ -17,7 +18,7 @@ interposition-invisibility property the import model already guarantees:
 | `host_exec(allowlist)` | a real host OS process, attenuated by an explicit program allowlist (the capability *is* the list, as `host_fs`'s *is* the root) | **BUILT 2026-07-22** (`temen-run/src/exec.rs`) |
 | `scripted_exec(table)` | no process at all: a `(argv-prefix → {stdout, stderr, exit})` table — the `mem_fs` analog; what differential tests and wasm/browser embedders grant | **BUILT 2026-07-22** (wasm-safe `temen-exec` crate) |
 | `domain_exec` | a **child temen domain** (host-served: the embedder implements the same ops over the Instantiator machinery it already has) | **BUILT 2026-07-23** (`temen-run/src/exec.rs`) |
-| guest-served | a parent domain serves its child's `"exec"` with **its own code** — the none-the-wiser nested shell | **BUILT** (#744): a detached spawn's live self-serve grant (`GRANT_SERVE_LIVE_TAG`), served natively by the tree-walker, the Cranelift JIT, the cooperative bytecode driver (`drive`, and the browser's `CoopRun`, whose tier-up regions end before a spawn, `svc.wait` or live call) and the native parallel driver (`drive_threads`, on the pump's rules since #1414 3e); the debug driver declines it until #1414 gives it the cooperative pump. A granted module a child runs is admitted by the same rule as the run's own program, so a child image, which keeps its program's serve loop and spawns, runs where its program does (#2284) |
+| guest-served | a parent domain serves its child's `"exec"` with **its own code** — the none-the-wiser nested shell | **BUILT** (#744; with real argv and output through the message region, #2962 — `crates/temen/tests/exec_region.rs` runs one chibicc-compiled client against `host_exec` and against a guest servicer on every driver): a detached spawn's live self-serve grant (`GRANT_SERVE_LIVE_TAG`), served natively by the tree-walker, the Cranelift JIT, the cooperative bytecode driver (`drive`, and the browser's `CoopRun`, whose tier-up regions end before a spawn, `svc.wait` or live call) and the native parallel driver (`drive_threads`, on the pump's rules since #1414 3e); the debug driver declines it until #1414 gives it the cooperative pump. A granted module a child runs is admitted by the same rule as the run's own program, so a child image, which keeps its program's serve loop and spawns, runs where its program does (#2284) |
 
 This is how "a shell that manages real host processes" and "the same
 shell nested, its parent handling process-like domains, none the wiser"
@@ -36,17 +37,48 @@ emulation.
 
 ## Op protocol (v1 — blocking one-shot)
 
-Ops on the granted handle; errors are negative errno-style returns,
-never traps (§3e D42). `argv` is NUL-separated bytes.
+One entry, the op in its first argument; errors are negative errno-style
+returns, never traps (§3e D42). `argv` is NUL-separated bytes. **Every
+byte crosses the message region** (#2962, universal B): a `SharedRegion`
+the wirer grants beside the slot under the name `exec.msg`
+(`EXEC_MSG_LEN` = 64 KiB), and every offset below is region-relative.
 
 ```
-run(argv_ptr, argv_len, stdin_ptr, stdin_len) -> job | -errno
-read_out(job, buf_ptr, buf_cap)               -> n | 0 = EOF | -errno
-read_err(job, buf_ptr, buf_cap)               -> n | 0 = EOF | -errno
-status(job)                                   -> exit code | -errno
-close(job)                                    -> 0 | -errno
+exec(RUN,      off, argv_len, stdin_len) -> job | -errno          ; argv at msg[off..], its stdin right after
+exec(READ_OUT, job, off, cap)            -> n | 0 = EOF | -errno   ; the next ≤ cap bytes land at msg[off..]
+exec(READ_ERR, job, off, cap)            -> n | 0 = EOF | -errno
+exec(STATUS,   job)                      -> exit code | -errno
+exec(CLOSE,    job)                      -> 0 | -errno
 ```
 
+(`RUN` = 0 … `CLOSE` = 4; the shape is `(i64, i64, i64, i64) -> (i64)`.)
+
+- **Why one entry.** A flat import of this shape binds the same way to a
+  host procedure (op 0) and to a guest's live offer (its one op, matched
+  by signature). A call that names the op in its immediate —
+  `call.cap HOST_PROC op`, what `__vm_host_call` lowers to — never reaches
+  a guest servicer, so no client written that way could be interposed.
+- **Why a region.** A guest servicer cannot read its caller's window
+  (PROCESS.md, wire discipline), and a host servicer that reads the
+  window serves a different data plane than a guest one could. With the
+  region, both read the same bytes, and the host servicer never touches
+  the window at all.
+- **Who makes it, and when.** The wirer, at grant time: each host backend
+  mints it as the capability is granted (charged to the grantee) and
+  registers `exec.msg`; a guest parent mints one, maps it into its own
+  window, and grants it with its live `exec` grant. One region per grant,
+  so a servicer with several callers holds one each.
+- **Concurrent calls.** The servicer touches only the ranges a call names,
+  only between the call and its reply. Keeping in-flight calls on disjoint
+  ranges (per-thread slices, or a lock) is the caller's library's job; a
+  library that splits the region aligns slices to 64 B.
+- **Too big.** A `run` whose argv and stdin together pass the region's end
+  is `-E2BIG`; output drains in chunks, so it never needs more. A range
+  past the region is `-EFAULT`.
+- **The bounce.** A caller's library copies argv and stdin in before `run`
+  and each chunk out after `read_out`. A program that keeps its data in
+  the region pays nothing: a driver can read one job's output straight into
+  the next job's stdin slot (`multibinary.rs`).
 - **v1 `run` is synchronous-to-completion**: the process runs with the
   given stdin, its output captured; `read_out`/`read_err` then drain the
   captured bytes in chunks; `status` reports the exit code. Blocking
@@ -112,10 +144,16 @@ constructors live in `temen-run` (`exec.rs`, mirroring `fs.rs`).
 `domain_exec` lands beside them when built; the guest-served backend is
 §3.6/Endpoint work and is recorded there.
 
+**As built (2026-11-11, #2962).** The protocol moved whole to the one-entry,
+message-region form above. `temen-exec` now holds the one dispatcher every
+host backend serves through (`serve`: the entry, the region, the job table),
+so the backends differ only in how a job is made (`RunJob`); `temen-run`'s
+`exec_cap` mints and grants the region at grant time for all three.
+
 **As built (2026-07-22).** `temen-exec` holds the protocol (op codes, errno,
 NUL-argv parsing) plus the shared `JobTable` — every backend routes its
 non-`run` ops through the one table, so read/status/close semantics are
-backend-identical by construction — and `scripted_exec_handler` (longest
+backend-identical by construction — and the scripted backend (longest
 argv-prefix wins; a miss is `-EPERM`, the *same* refusal an allowlist miss
 produces, so the failure mode doesn't reveal the backend either).
 `temen-run/src/exec.rs` adds `host_exec(allowlist)` (blocking one-shot spawn,
