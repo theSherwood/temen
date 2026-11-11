@@ -18,7 +18,7 @@ use temen_durable::{
 };
 use temen_interp::{run_capture_reserved_with_host, Host, MemLayout, StreamRole, Value};
 use temen_ir::durable_abi::ShadowArena;
-use temen_ir::SpawnRec;
+use temen_ir::{SpawnRec, SpawnRefusal};
 use temen_jit::{JitError, JitOutcome};
 
 const ARENA: ShadowArena = ShadowArena::new(16448, 65536);
@@ -137,8 +137,8 @@ block 0 (v0: i64) {
 ";
 
 /// A durable domain spawns detached only a module the host attested freezable (#1501), and the
-/// `"child"` grant of its own program's image is not attested: the spawn refuses `-EINVAL` on the
-/// oracle and on the JIT alike. The JIT once admitted the domain's own program, which `-1` named
+/// `"child"` grant of its own program's image is not attested: the spawn refuses `-ENOEXEC` (#2864) on
+/// the oracle and on the JIT alike. The JIT once admitted the domain's own program, which `-1` named
 /// before #2219, taking it for durable.
 #[test]
 fn a_durable_domain_refuses_its_own_program_detached() {
@@ -162,7 +162,8 @@ fn a_durable_domain_refuses_its_own_program_detached() {
     let args = h.map(Value::I32);
     let mut fuel = 5_000_000u64;
     let (r, _) = run_capture_reserved_with_host(&m, 0, &args, &mut fuel, &win, 17, &mut host);
-    assert_eq!(r, Ok(vec![Value::I64(-22)]), "oracle");
+    let not_freezable = SpawnRefusal::Module.errno();
+    assert_eq!(r, Ok(vec![Value::I64(not_freezable)]), "oracle");
 
     let (mut host, h) = powerbox();
     let slots = h.map(i64::from);
@@ -177,7 +178,7 @@ fn a_durable_domain_refuses_its_own_program_detached() {
         None,
     );
     match jit {
-        Ok((o, _)) => assert_eq!(returned(o), vec![-22], "jit"),
+        Ok((o, _)) => assert_eq!(returned(o), vec![not_freezable], "jit"),
         Err(JitError::Unsupported(_)) => {} // a target without the child executor
         Err(e) => panic!("JIT run failed: {e:?}"),
     }

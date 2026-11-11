@@ -52,7 +52,7 @@ use super::{
     bin32, bin64, call_slots, cast, cmp32, cmp64, fbin32, fbin64, fcmp32, fcmp64, fto_i, fun32,
     fun64, i_to_f, intun32, intun64, slot_to_val, step, trunc_trap, val_to_slot, Fuel, GuestMem,
     Host, HostCharge, Lease, LentFuel, LiveFiber, LiveVcpu, LockUnpoisoned, Mem, MemLayout,
-    NodeRef, Reg, RootWindow, Trap, Value, VarValue, WindowSpec, CALL_STACK_SLOTS,
+    NodeRef, Reg, RootWindow, SpawnRefusal, Trap, Value, VarValue, WindowSpec, CALL_STACK_SLOTS,
 };
 use crate::moment::{Moment, Refusal};
 
@@ -2065,15 +2065,16 @@ impl FreshWindow {
 
 /// Admit a detached spawn against `host` (the parent powerbox) and build the child, with its window
 /// still to be built over a backing the driver supplies. `pm` is the parent's window (the grant list
-/// and the args payload are read from it). `Ok(None)` is a **probeable refusal** — the driver lands
-/// `-EINVAL` and nothing was charged; `Err` is a trap (a forged handle, an unreadable payload, a
-/// nonzero `quota`). The checks — entry shape, the window = the module's declared memory, the payload
-/// fitting the args area, `premap_admit`, durability — run before the `Budget.mem` take, so a
-/// refusal charges nothing; one after it (the child's imports not binding) hands the take back
+/// and the args payload are read from it). `Ok(Err)` is a **probeable refusal**, its cause the code the
+/// driver lands (#2864), and nothing was charged; `Err` is a trap (a forged handle, an unreadable
+/// payload, a nonzero `quota`). The checks — the record's ([`temen_ir::check_spawn_record`]),
+/// `premap_admit`, durability — run before the `Budget.mem` take, in the order every engine keeps, so
+/// a refusal charges nothing; one after it (the child's imports not binding) hands the take back
 /// (`Host::undo_detached_spawn`, #1975).
 ///
 /// A durable domain's detached spawn refuses: the tree-walker's freeze captures a detached child,
-/// but this engine's drivers cannot (#1893).
+/// but this engine's drivers cannot (#1893). It answers as the admission answers a durable domain
+/// without freeze authority, after the checks the tree-walker also makes.
 ///
 /// `source`: the run's compiled modules, where a granted module's program is found or added
 /// ([`granted_program`]).
@@ -2082,7 +2083,7 @@ fn admit_detached_child(
     pm: Option<&Mem>,
     s: DetachedSpawn,
     source: &ModuleSource,
-) -> Result<Option<(AdmittedChild, FreshWindow)>, Trap> {
+) -> Result<Result<(AdmittedChild, FreshWindow), SpawnRefusal>, Trap> {
     // §2.2 — a record's pager must be a `{ page: (i64) -> (i64) }` export of the spawner's own
     // program, as on the tree-walker (#744, #1862). The record named the pager before anything else
     // was checked, so it fails first (#2164). Only a driver that serves its children pages one: the
@@ -2091,7 +2092,7 @@ fn admit_detached_child(
     if s.pager.is_some_and(|export| !host.has_pager_export(export)) {
         return Err(Trap::CapFault);
     }
-    let (program, cmem_log2, cmodule, cshadow) = {
+    let (program, cmem_log2, cmodule, cshadow, cdurable) = {
         let g = host.resolve_module(s.module)?;
         let program = granted_program(host, source, g)?;
         (
@@ -2099,22 +2100,24 @@ fn admit_detached_child(
             g.memory_log2(),
             std::sync::Arc::clone(&g.module),
             g.shadow(),
+            g.durable,
         )
     };
     let sig = program.1.sigs.first();
     let arity = sig.map_or(0, |(p, _)| p.len());
-    let ok_entry = sig.is_some_and(|(p, r)| child_entry_ok(p, r));
-    let size_log2 = temen_ir::detached_size_log2(s.size_log2, cmem_log2);
-    let child_size = if (0..64).contains(&size_log2) {
-        1u64 << size_log2
-    } else {
-        0
-    };
-    let mod_ok = cmem_log2 == Some(size_log2 as u8);
+    let args_len = s.args.map_or(0, |(_, len)| len);
+    // #2864 — the record against its module, in the order every engine checks: the entry, then the
+    // window (§14: the module's declared memory), then the payload's length.
+    let checked = temen_ir::check_spawn_record(
+        sig.map(|(p, r)| (&p[..], &r[..])),
+        cmem_log2,
+        s.size_log2,
+        args_len,
+    );
+    let size_log2 = checked.map_or(0, i64::from);
+    let child_size = checked.map_or(0, |l| 1u64 << l);
     // An over-long payload refuses before anything is read: its length is the guest's (#2338).
-    let payload_ok = s
-        .args
-        .is_none_or(|(_, len)| len <= temen_ir::module_args_end() - temen_ir::module_args_base());
+    let payload_ok = temen_ir::spawn_args_fit(args_len);
     let payload: Vec<u8> = match s.args {
         Some((ptr, len)) if payload_ok => {
             pm.ok_or(Trap::Malformed)?.read_window(ptr, len as usize)?
@@ -2132,25 +2135,32 @@ fn admit_detached_child(
         }
         None => Vec::new(),
     };
+    host.check_grant_list(&glist)?;
     let cell = host.own_cell();
-    if !host.can_grant_list(&glist, cell.is_some()) {
-        return Err(Trap::CapFault);
-    }
     let premap_ok = match s.premap {
         Some((r, o)) => host.premap_admit(r, o, child_size)?,
         None => true,
     };
-    let durable_ok = !host.is_durable();
-    if !ok_entry || child_size == 0 || !mod_ok || !payload_ok || !premap_ok || !durable_ok {
-        return Ok(None);
-    }
+    let durable = host.is_durable();
     let lease = Lease {
         budget: s.budget,
         bytes: child_size,
         runs: super::window_runs_bound(&cmodule.data, s.premap.is_some()),
     };
-    let Some(lane) = host.admit_detached_spawn(lease) else {
-        return Ok(None);
+    let admitted = checked
+        .and_then(|_| premap_ok.then_some(()).ok_or(SpawnRefusal::Record))
+        // #1501 — a durable domain admits only freezable modules, as on every engine.
+        .and_then(|()| {
+            (!durable || cdurable)
+                .then_some(())
+                .ok_or(SpawnRefusal::Module)
+        })
+        // #1893 — then this engine's own refusal of a durable domain's detached spawn.
+        .and_then(|()| (!durable).then_some(()).ok_or(SpawnRefusal::Authority))
+        .and_then(|()| host.admit_detached_spawn(lease));
+    let lane = match admitted {
+        Ok(lane) => lane,
+        Err(refused) => return Ok(Err(refused)),
     };
     // #1975 — every exit from here that builds no child hands back what the admission took.
     let mut child_host = host.child_host();
@@ -2179,7 +2189,7 @@ fn admit_detached_child(
         .is_err()
     {
         host.undo_detached_spawn(lease, lane);
-        return Ok(None);
+        return Ok(Err(SpawnRefusal::Unbound));
     }
     // D66 — single-spawn lane parity with the tree-walker: this engine's detached children do not yet
     // return a lane at their reap, so the lane is given straight back (#1600). The window's bytes stay
@@ -2203,13 +2213,13 @@ fn admit_detached_child(
         payload,
         paged: s.pager.is_some(),
     };
-    Ok(Some((child, window)))
+    Ok(Ok((child, window)))
 }
 
 /// [`admit_detached_child`] for the in-process drivers, which hold the child's window themselves:
 /// built at once, over a reservation of the engine's own, or over a backing of the embedder's
-/// ([`Host::set_child_window`]). A backing it cannot make refuses the spawn, and hands the window's
-/// bytes back to the budget that paid for them. Returns the child, and the emit of the
+/// ([`Host::set_child_window`]). A backing it cannot make refuses the spawn for want of room, and hands
+/// the window's bytes back to the budget that paid for them. Returns the child, and the emit of the
 /// program it runs, as `emit` answers for it ([`ProgramEmits::for_child`]): `None` on a driver with
 /// no emitted tier. Without a backing, a child with an emit gets its window over a
 /// [`FreshWindow::flat_backing`], so that it can tier up on every target (#2102): the cooperative
@@ -2221,16 +2231,17 @@ fn admit_detached_in_process(
     s: DetachedSpawn,
     source: &ModuleSource,
     emit: impl FnOnce(&AdmittedChild) -> Option<ProgramEmit>,
-) -> Result<Option<(AdmittedChild, Option<ProgramEmit>)>, Trap> {
-    let Some((mut child, window)) = admit_detached_child(host, pm, s, source)? else {
-        return Ok(None);
+) -> Result<Result<(AdmittedChild, Option<ProgramEmit>), SpawnRefusal>, Trap> {
+    let (mut child, window) = match admit_detached_child(host, pm, s, source)? {
+        Ok(admitted) => admitted,
+        Err(refused) => return Ok(Err(refused)),
     };
     let (back, tierup) = match host.child_window() {
         Some(make) => match make(window.size_log2) {
             Some(back) => (Some(back), emit(&child)),
             None => {
                 host.release_detached(child.lease);
-                return Ok(None);
+                return Ok(Err(SpawnRefusal::Room));
             }
         },
         None => {
@@ -2239,7 +2250,7 @@ fn admit_detached_in_process(
         }
     };
     child.mem = Some(window.build(back, &mut child.host)?);
-    Ok(Some((child, tierup)))
+    Ok(Ok((child, tierup)))
 }
 
 /// Compile module `g` that `host` granted, for a child or an exec in the run whose units `source`
@@ -5751,7 +5762,7 @@ pub enum SchedBreak {
 /// (#1909), from the child's own. The debugger's child domains see no other end (it declines fork, spawn
 /// and exec), and it never replaces their powerboxes, so the child's is still here. `run_ended`: the
 /// run is over, which ends every child still live too, as the oracle's teardown reaps it (#2006).
-fn dbg_refund_ended_windows(tasks: &mut [TaskSlot], envs: &mut [Domain], run_ended: bool) {
+fn dbg_refund_ended_windows(tasks: &mut Tasks, envs: &mut [Domain], run_ended: bool) {
     let mut ends = Vec::new();
     for t in tasks.iter_mut() {
         if run_ended || matches!(t.state, TaskState::Done(_)) {
@@ -5918,7 +5929,7 @@ struct DetachedLive {
 /// op outside the subset (→ [`SchedStop::Declined`]) is JIT tier-up (never enabled here).
 pub struct ScheduledDebugRun {
     source: std::sync::Arc<ModuleSource>,
-    tasks: Vec<TaskSlot>,
+    tasks: Tasks,
     /// The run's domains, which a task's [`TaskSlot::env`] indexes: the root's first, then each §14
     /// child's as it spawns. Rebuilt deterministically on a reverse-`seek` replay. Not torn down
     /// mid-run (a finished child's env is inert — revocation semantics deferred). The root's fuel is
@@ -6237,7 +6248,7 @@ fn trace_pick_diff(
 /// the spawner's `dst`. Mirrors the production `drive`'s `Spawn` arm for the debuggable subset.
 #[allow(clippy::too_many_arguments)]
 fn dbg_spawn(
-    tasks: &mut Vec<TaskSlot>,
+    tasks: &mut Tasks,
     envs: &mut [Domain],
     ti: usize,
     func: u32,
@@ -6251,7 +6262,7 @@ fn dbg_spawn(
     let (vt, live) = {
         let mut host = envs[env].host.lock_unpoisoned();
         let mut vt = thread_task(source, module, func, arg0, arg1, Some(host.own_node()))?;
-        if live_tasks(tasks) >= super::MAX_VCPUS {
+        if tasks.live_count() >= super::MAX_VCPUS {
             return Err(Trap::ThreadFault); // thread bomb
         }
         // #2001 — the thread is one `spawn` of its domain's node while it lives: a full ceiling
@@ -6311,7 +6322,7 @@ enum Serviced {
 /// → tick its clock and stop the replay).
 #[allow(clippy::too_many_arguments)]
 fn service_advance(
-    tasks: &mut Vec<TaskSlot>,
+    tasks: &mut Tasks,
     ti: usize,
     domains: &mut Vec<Domain>,
     source: &ModuleSource,
@@ -6520,7 +6531,7 @@ fn service_advance(
 /// its window lease back to its spawner's powerbox, so a spawn refused after its admission charges
 /// nothing ([`coop_start_child`], #2006).
 fn dbg_start_child(
-    tasks: &mut Vec<TaskSlot>,
+    tasks: &mut Tasks,
     ti: usize,
     domains: &mut Vec<Domain>,
     child: AdmittedChild,
@@ -6538,7 +6549,7 @@ fn dbg_start_child(
         tasks[ti].deliver(dst, Reg::from_i32(super::EMFILE as i32));
         return Ok(());
     }
-    let room = live_tasks(tasks) < super::MAX_VCPUS;
+    let room = tasks.live_count() < super::MAX_VCPUS;
     let BuiltChild {
         module,
         vt,
@@ -6583,7 +6594,7 @@ fn dbg_start_child(
 /// a **fresh window** instead of a carve. Admission and the child powerbox are [`admit_detached_child`]
 /// (the executor's); the child is scheduled by [`dbg_start_child`], joined like a confined child.
 fn dbg_instantiate_detached(
-    tasks: &mut Vec<TaskSlot>,
+    tasks: &mut Tasks,
     ti: usize,
     domains: &mut Vec<Domain>,
     source: &ModuleSource,
@@ -6596,9 +6607,12 @@ fn dbg_instantiate_detached(
         let mut owner = e.host.lock_unpoisoned();
         admit_detached_in_process(&mut owner, e.mem.as_ref(), spawn, source, |_| None)?
     };
-    let Some((child, _)) = admitted else {
-        tasks[ti].deliver(dst, Reg::from_i32(super::EINVAL as i32));
-        return Ok(());
+    let (child, _) = match admitted {
+        Ok(admitted) => admitted,
+        Err(refused) => {
+            tasks[ti].deliver(dst, Reg::from_i32(refused.errno() as i32));
+            return Ok(());
+        }
     };
     dbg_start_child(tasks, ti, domains, child, dst)
 }
@@ -6845,7 +6859,7 @@ fn dbg_preview_pick(
 /// here.
 #[allow(clippy::too_many_arguments)] // the pick policy's inputs, plus the parks an idle run wakes
 fn dbg_pick_runnable(
-    tasks: &mut [TaskSlot],
+    tasks: &mut Tasks,
     envs: &mut [Domain],
     takes: &mut Takes,
     replay: bool,
@@ -7123,7 +7137,7 @@ impl ScheduledDebugRun {
         );
         Some(ScheduledDebugRun {
             source,
-            tasks: vec![TaskSlot::new(vt, 0, LiveVcpu::none())],
+            tasks: std::iter::once(TaskSlot::new(vt, 0, LiveVcpu::none())).collect(),
             domains: vec![root],
             root_md,
             funcs,
@@ -8585,7 +8599,7 @@ struct ExecBuilt {
 /// retires it as it retires any process and no later process is handed its pid.
 #[allow(clippy::too_many_arguments)] // the pump's own state, borrowed field by field
 fn spawn_task(
-    tasks: &mut Vec<TaskSlot>,
+    tasks: &mut Tasks,
     domains: &mut Vec<Domain>,
     forked_twins: &mut std::collections::BTreeSet<usize>,
     leaf: Option<&LeafEmitter>,
@@ -8598,7 +8612,7 @@ fn spawn_task(
     let child_ti = tasks.len();
     let pid = child_ti as u64 + 1;
     // The run's live cap first, as the oracle's `spawn_vcpu` checks it (#2006).
-    if live_tasks(tasks) >= super::MAX_VCPUS {
+    if tasks.live_count() >= super::MAX_VCPUS {
         return super::EAGAIN;
     }
     let spawner = &domains[tasks[ti].domain];
@@ -9350,7 +9364,7 @@ enum Outcome {
     },
     /// §5 `Instantiator.instantiate_rec` (op 17, #1286): the driver
     /// admits the separate-module child `spawn` describes, in a fresh window of its own
-    /// ([`admit_detached_child`]), and writes the join handle (or `EINVAL`) to `dst`. The child runs
+    /// ([`admit_detached_child`]), and writes the join handle (or its refusal's code) to `dst`. The child runs
     /// on the scheduler, joinable via the shared thread machinery (`Instantiator.join` compiles to
     /// [`Outcome::ThreadJoin`]).
     InstantiateDetached {
@@ -10389,8 +10403,8 @@ fn drain_cap_parked(fibers: &mut [FiberState], comps: &super::Completions) -> Ve
 /// a parked task, as a resumer polls a parked fiber ([`drain_cap_parked`]). A task is a vCPU of its
 /// own, so between tasks the order is whatever the world's is, as on the oracle. Each task's call is
 /// in its own domain's store, a child's as the root's (#2424).
-fn drain_task_completions(tasks: &mut [TaskSlot], domains: &[Domain]) {
-    for t in tasks.iter_mut() {
+fn drain_task_completions(tasks: &mut Tasks, domains: &[Domain]) {
+    for (_, t) in tasks.live_mut() {
         if let TaskState::BlockedHostCap { id, dst, .. } = t.state {
             let answer = take_answer(&mut domains[t.domain].host.lock_unpoisoned(), id);
             if let Some(r) = answer {
@@ -10427,8 +10441,8 @@ fn drain_fiber_completions(domains: &mut [Domain]) -> bool {
 /// task's own (`BlockedHostCap`), and that of a `CapParked` fiber a task resumes, blocking
 /// (`BlockedOnFiber`), as the parallel driver counts them. A fiber no task resumes is left out, one
 /// of a domain that has finished, say (#2480): its answer wakes no one, so nothing waits for it.
-fn outstanding_calls(tasks: &[TaskSlot], domains: &[Domain]) -> Vec<(usize, u64)> {
-    (tasks.iter())
+fn outstanding_calls(tasks: &Tasks, domains: &[Domain]) -> Vec<(usize, u64)> {
+    (tasks.live().map(|i| &tasks[i]))
         .flat_map(|t| calls_awaited(t, domains).map(|id| (t.domain, id)))
         .collect()
 }
@@ -10474,10 +10488,10 @@ enum Stalled {
 /// executor would not step: once nothing in the run can continue it, only a continue from outside
 /// moves it (#2529), as only the embedder can feed a read. Its stop is not read again here: a
 /// continue that lands after the executor looked is a wake its next round sees, never a deadlock.
-fn stalled(tasks: &[TaskSlot], embedder_pumps: bool, bell: bool) -> Stalled {
-    let fed = tasks.iter().any(|t| {
+fn stalled(tasks: &Tasks, embedder_pumps: bool, bell: bool) -> Stalled {
+    let fed = tasks.live().any(|i| {
         matches!(
-            t.state,
+            tasks[i].state,
             TaskState::Runnable
                 | TaskState::BlockedPipeRead { .. }
                 | TaskState::BlockedPipeWrite { .. }
@@ -10498,9 +10512,9 @@ fn stalled(tasks: &[TaskSlot], embedder_pumps: bool, bell: bool) -> Stalled {
 mod stalled_tests {
     use super::*;
 
-    fn runnable() -> TaskSlot {
-        let m = temen_text::parse_module("func () -> () {\nblock 0 () {\n  return\n  }\n}\n")
-            .expect("parse");
+    pub(super) fn runnable() -> TaskSlot {
+        let src = "func () -> () {\nblock 0 () {\n  vx = i32.const 1\n  return\n  }\n}\n";
+        let m = temen_text::parse_module(src).expect("parse");
         let unit = compile_module(&m.funcs, &m.types, None).expect("compile");
         let vt = VTask::new(&unit, 0, &[], None).expect("task");
         TaskSlot::new(vt, 0, LiveVcpu::none())
@@ -10514,18 +10528,51 @@ mod stalled_tests {
     /// continued.
     #[test]
     fn a_stopped_processs_runnable_task_is_a_wait() {
-        let tasks = [runnable()];
+        let tasks: Tasks = std::iter::once(runnable()).collect();
         assert!(matches!(stalled(&tasks, true, false), Stalled::Idle));
         assert!(matches!(stalled(&tasks, false, true), Stalled::Bell));
         assert!(matches!(stalled(&tasks, false, false), Stalled::Deadlock));
-        let done = [TaskSlot {
+        let done: Tasks = std::iter::once(TaskSlot {
             state: TaskState::Done(Ok(Vec::new())),
             ..runnable()
-        }];
+        })
+        .collect();
         assert!(
             matches!(stalled(&done, false, true), Stalled::Deadlock),
             "a bell with nothing waiting on it wakes nothing"
         );
+    }
+}
+
+#[cfg(test)]
+mod tasks_tests {
+    use super::*;
+
+    /// #2229 — each round walks the live list: in the pump's round-robin order from the task after
+    /// its last pick, with a task that has ended kept until the rules have seen it, and its frames
+    /// freed as it leaves.
+    #[test]
+    fn the_live_list_keeps_the_pick_order_and_drops_an_ended_task_once_seen() {
+        let mut tasks: Tasks = (0..5).map(|_| stalled_tests::runnable()).collect();
+        let order = |t: &Tasks, last| t.live_from(last).collect::<Vec<_>>();
+        assert_eq!(order(&tasks, 2), [3, 4, 0, 1, 2]);
+        tasks[1].state = TaskState::Done(Ok(Vec::new()));
+        tasks[3].state = TaskState::Done(Ok(Vec::new()));
+        assert_eq!(order(&tasks, 2), [3, 4, 0, 1, 2], "ended, not yet seen");
+        assert_eq!(tasks.live_count(), 3);
+        assert!(!tasks[1].vm.vt.active.regs.is_empty());
+        tasks.prune();
+        assert_eq!(order(&tasks, 2), [4, 0, 2]);
+        assert_eq!(order(&tasks, 4), [0, 2, 4]);
+        assert!(
+            tasks[1].vm.vt.active.regs.is_empty(),
+            "its frames went as it left"
+        );
+        assert!(!tasks[0].vm.vt.active.regs.is_empty());
+        // A slot an activation takes again rejoins in index order; `live_mut` hands each out once.
+        tasks.put(3, stalled_tests::runnable());
+        let walked: Vec<usize> = tasks.live_mut().map(|(i, _)| i).collect();
+        assert_eq!(walked, [0, 2, 3, 4]);
     }
 }
 
@@ -12021,21 +12068,12 @@ fn domain_of(envs: &[Domain], cell: &DomainCell) -> Option<usize> {
 
 /// Re-admit every task of domain `env` parked in `svc.wait`: its re-executed drain serves what a
 /// caller queued, or takes the client-gone token ([`Host::take_client_gone`], #1217).
-fn wake_serve_loops(tasks: &mut [TaskSlot], env: usize) {
-    for t in tasks.iter_mut() {
+fn wake_serve_loops(tasks: &mut Tasks, env: usize) {
+    for (_, t) in tasks.live_mut() {
         if t.domain == env && matches!(t.state, TaskState::BlockedSvc) {
             t.state = TaskState::Runnable;
         }
     }
-}
-
-/// The run's live vCPUs: every task not yet done, the root among them — what the `MAX_VCPUS`
-/// anti-bomb gate counts, as the oracle's scheduler counts `live`.
-fn live_tasks(tasks: &[TaskSlot]) -> usize {
-    tasks
-        .iter()
-        .filter(|t| !matches!(t.state, TaskState::Done(_)))
-        .count()
 }
 
 /// Schedule an admitted §14/§5 child as a task of the cooperative executor over its own environment,
@@ -12045,7 +12083,7 @@ fn live_tasks(tasks: &[TaskSlot]) -> usize {
 /// hands its window lease back to its spawner's powerbox, so a spawn refused after its admission
 /// charges nothing (#1975, #2006), as the oracle's undo does.
 fn coop_start_child(
-    tasks: &mut Vec<TaskSlot>,
+    tasks: &mut Tasks,
     domains: &mut Vec<Domain>,
     ti: usize,
     child: AdmittedChild,
@@ -12064,7 +12102,7 @@ fn coop_start_child(
         tasks[ti].deliver(dst, Reg::from_i32(super::EMFILE as i32));
         return Ok(());
     }
-    let room = live_tasks(tasks) < super::MAX_VCPUS;
+    let room = tasks.live_count() < super::MAX_VCPUS;
     let BuiltChild {
         module,
         mut vt,
@@ -12105,6 +12143,118 @@ fn coop_start_child(
     let handle = issue_child(tasks, domains, ti, cidx).ok_or(Trap::Malformed)?; // room checked above
     tasks[ti].deliver(dst, Reg::from_i32(handle));
     Ok(())
+}
+
+/// #2229 — a run's tasks. A task's index is its handle, and a finished task keeps its slot: a joiner
+/// or a reaper reads its result there. So the table only grows, and each round's rules walk the
+/// live tasks instead ([`Tasks::live`]): a run costs what it runs, not what it has run.
+#[derive(Default)]
+struct Tasks {
+    slots: Vec<TaskSlot>,
+    /// The live tasks, in index order, and those done since the last [`Tasks::prune`]: a rule that
+    /// looks for a task that has just ended (a domain's last, a twin to hook, a lease to refund)
+    /// finds it here once. A task enters at [`Tasks::push`] or [`Tasks::put`].
+    live: Vec<usize>,
+    /// The tasks that ended in a trap whose domain's teardown has not run yet
+    /// ([`teardown_domains`]), as [`complete`] and [`Tasks::push`] record them.
+    failed: Vec<usize>,
+}
+
+impl std::ops::Deref for Tasks {
+    type Target = [TaskSlot];
+    fn deref(&self) -> &[TaskSlot] {
+        &self.slots
+    }
+}
+
+impl std::ops::DerefMut for Tasks {
+    fn deref_mut(&mut self) -> &mut [TaskSlot] {
+        &mut self.slots
+    }
+}
+
+impl FromIterator<TaskSlot> for Tasks {
+    fn from_iter<I: IntoIterator<Item = TaskSlot>>(slots: I) -> Tasks {
+        let mut tasks = Tasks::default();
+        for t in slots {
+            tasks.push(t);
+        }
+        tasks
+    }
+}
+
+impl Tasks {
+    /// Start task `t` at the next index.
+    fn push(&mut self, t: TaskSlot) {
+        let i = self.slots.len();
+        self.slots.push(t);
+        self.enter(i);
+    }
+
+    /// Start task `t` in finished task `i`'s slot (#2695 step 2: an activation takes a slot an
+    /// earlier one has left).
+    fn put(&mut self, i: usize, t: TaskSlot) {
+        debug_assert!(matches!(self.slots[i].state, TaskState::Done(_)));
+        self.slots[i] = t;
+        self.enter(i);
+    }
+
+    fn enter(&mut self, i: usize) {
+        if let Err(at) = self.live.binary_search(&i) {
+            self.live.insert(at, i);
+        }
+        if let TaskState::Done(Err(_)) = self.slots[i].state {
+            self.failed.push(i);
+        }
+    }
+
+    /// The live tasks in index order, and those done since the last [`Self::prune`].
+    fn live(&self) -> impl DoubleEndedIterator<Item = usize> + '_ {
+        self.live.iter().copied()
+    }
+
+    /// [`Self::live`] round-robin from the one after `last`, wrapping: the pump's pick order (#1157).
+    fn live_from(&self, last: usize) -> impl Iterator<Item = usize> + '_ {
+        let at = self.live.partition_point(|&i| i <= last);
+        self.live[at..].iter().chain(&self.live[..at]).copied()
+    }
+
+    /// [`Self::live`], each with its slot to change.
+    fn live_mut(&mut self) -> impl Iterator<Item = (usize, &mut TaskSlot)> + '_ {
+        let mut rest: &mut [TaskSlot] = &mut self.slots;
+        let mut base = 0;
+        self.live.iter().map(move |&i| {
+            let (_, tail) = std::mem::take(&mut rest).split_at_mut(i - base);
+            let (t, tail) = tail.split_first_mut().expect("a live task is in the table");
+            (rest, base) = (tail, i + 1);
+            (i, t)
+        })
+    }
+
+    /// How many tasks are live: what the `MAX_VCPUS` anti-bomb gate counts, as the oracle's
+    /// scheduler counts `live`.
+    fn live_count(&self) -> usize {
+        (self.live())
+            .filter(|&i| !matches!(self.slots[i].state, TaskState::Done(_)))
+            .count()
+    }
+
+    /// Drop the tasks that have ended from [`Self::live`], once each executor's rules have seen
+    /// them: the pump's after a round's settle, executor 2's after its wake scan. Their frames go
+    /// with them: what a joiner or a reaper reads of an ended task is its result. The debug
+    /// scheduler never prunes, so its inspection still reads where a thread ended.
+    fn prune(&mut self) {
+        let slots = &mut self.slots;
+        (self.live).retain(|&i| {
+            let t = &mut slots[i];
+            let ended = matches!(t.state, TaskState::Done(_));
+            if ended {
+                t.vm.vt.release();
+                t.vm.suspended = None;
+            }
+            !ended
+        });
+    }
 }
 
 /// A scheduled vCPU and its blocking state. What the scheduler keeps of it is its scheduling state;
@@ -12205,11 +12355,19 @@ impl TaskVm {
 /// again. `run_ended`: the run is over, which ends every child still live too, as the oracle's
 /// teardown reaps it ([`CoopSched::pump`]): its window goes back, and what each child domain's window
 /// and fibers hold ([`Host::release_memory`], #2006, #2112).
-fn refund_ended_windows(tasks: &mut [TaskSlot], envs: &mut [Domain], run_ended: bool) {
-    for t in tasks.iter_mut() {
-        if run_ended || matches!(t.state, TaskState::Done(_)) {
-            if let Some((env, lease)) = t.lease.take() {
-                envs[env].host.lock_unpoisoned().release_detached(lease);
+fn refund_ended_windows(tasks: &mut Tasks, envs: &mut [Domain], run_ended: bool) {
+    // A task that has ended since the last prune is still in the live list ([`Tasks::live`]).
+    let mut refund = |t: &mut TaskSlot| {
+        if let Some((env, lease)) = t.lease.take() {
+            envs[env].host.lock_unpoisoned().release_detached(lease);
+        }
+    };
+    if run_ended {
+        tasks.iter_mut().for_each(&mut refund);
+    } else {
+        for (_, t) in tasks.live_mut() {
+            if matches!(t.state, TaskState::Done(_)) {
+                refund(t);
             }
         }
     }
@@ -12543,7 +12701,7 @@ impl TaskState {
 ///   completion that wakes it. Nothing else could wake a parked task, so without this the freeze
 ///   would hang on it.
 fn freeze_step(
-    tasks: &mut [TaskSlot],
+    tasks: &mut Tasks,
     forked_twins: &std::collections::BTreeSet<usize>,
     root: &mut Domain,
     freeze_on_quiesce: &mut bool,
@@ -12552,8 +12710,8 @@ fn freeze_step(
     let mut host = root.host.lock_unpoisoned();
     if *freeze_on_quiesce && quiesced_parks_only(tasks, &root.fibers.fibers) {
         *freeze_on_quiesce = false;
-        let parked_declined = tasks.iter().enumerate().find_map(|(ti, t)| {
-            let site = t.state.park_site()?;
+        let parked_declined = tasks.live().find_map(|ti| {
+            let site = tasks[ti].state.park_site()?;
             (freeze_rule_here(site) == FreezeRule::Decline).then_some((site, ti, None))
         });
         // #2742 — a fiber parked on a live call waits on a reply as a task does, so it declines
@@ -12562,9 +12720,10 @@ fn freeze_step(
         let parked_declined = parked_declined.or_else(|| {
             let k = (root.fibers.fibers.iter())
                 .position(|f| matches!(f, FiberState::TicketParked { .. }))?;
-            let on =
-                |t: &TaskSlot| matches!(t.state, TaskState::BlockedOnFiber { fiber } if fiber == k);
-            let ti = tasks.iter().position(on).unwrap_or(0);
+            let on = |&i: &usize| {
+                matches!(tasks[i].state, TaskState::BlockedOnFiber { fiber } if fiber == k)
+            };
+            let ti = tasks.live().find(on).unwrap_or(0);
             Some((super::ParkSite::Reply, ti, Some(k)))
         });
         let declined = match (forked_twins.first(), parked_declined) {
@@ -12608,10 +12767,10 @@ fn freeze_rule_here(site: super::ParkSite) -> super::FreezeRule {
 
 /// A freeze in flight: re-admit every task parked at a [`super::FreezeRule::Reissue`] site (see
 /// [`freeze_step`]). `true` when it re-admitted one.
-fn admit_parks(tasks: &mut [TaskSlot]) -> bool {
+fn admit_parks(tasks: &mut Tasks) -> bool {
     use super::FreezeRule;
     let mut admitted = false;
-    for t in tasks.iter_mut() {
+    for (_, t) in tasks.live_mut() {
         let Some(site) = t.state.park_site() else {
             continue;
         };
@@ -12630,10 +12789,10 @@ fn admit_parks(tasks: &mut [TaskSlot]) -> bool {
 
 /// The oracle's `quiesced_parks_only`: something is parked that a freeze could re-admit — a
 /// `svc.wait` (or a resumer idling beside it) or a futex wait — and no futex wait has a deadline.
-fn quiesced_parks_only(tasks: &[TaskSlot], fibers: &[FiberState]) -> bool {
+fn quiesced_parks_only(tasks: &Tasks, fibers: &[FiberState]) -> bool {
     let mut any = false;
-    for t in tasks {
-        match t.state {
+    for i in tasks.live() {
+        match tasks[i].state {
             TaskState::BlockedSvc | TaskState::BlockedOnFiber { .. } => any = true,
             TaskState::BlockedWait { deadline: None, .. } => any = true,
             TaskState::BlockedWait { .. } => return false,
@@ -12816,7 +12975,7 @@ struct SpawnAsk {
 /// by what the op declares ([`super::failed_slots`]) from `dst`, or the trap of an op that cannot
 /// carry the errno, which ends the task. The task is runnable either way.
 fn fail_call(
-    tasks: &mut [TaskSlot],
+    tasks: &mut Tasks,
     domains: &mut [Domain],
     ti: usize,
     dst: u32,
@@ -12918,7 +13077,7 @@ struct Released {
 #[derive(Default)]
 struct SchedCore {
     /// The live vCPUs: the root task (index 0) and its `thread.spawn`/`instantiate` descendants.
-    tasks: Vec<TaskSlot>,
+    tasks: Tasks,
     /// The run's domains, which a task's [`TaskSlot::env`] indexes: the root's first, then each §14
     /// child's, fork twin's and exec'd image's as it starts. Each has its own window, powerbox,
     /// table, fuel and §12 fiber registry, which its vCPUs share, so a fiber created or suspended
@@ -12998,7 +13157,7 @@ impl Held {
 /// that made it, its `carrier` ([`Held::made`]).
 #[allow(clippy::too_many_arguments)]
 fn activation(
-    tasks: &mut Vec<TaskSlot>,
+    tasks: &mut Tasks,
     domains: &[Domain],
     held: &mut Held,
     source: &ModuleSource,
@@ -13031,7 +13190,7 @@ fn activation(
     };
     let at = match held.free.pop() {
         Some(i) => {
-            tasks[i] = slot;
+            tasks.put(i, slot);
             i
         }
         None => {
@@ -13049,14 +13208,9 @@ fn activation(
 /// caller its enqueue named ([`super::Host::svc_payers`]): the calls that waited while its entry ran,
 /// and each call made since. A thread of the domain parked in `svc.wait` takes them instead: the
 /// guest chose to serve them so (INVARIANTS #4). A call the domain cannot take is answered at once.
-fn serve_resting(
-    tasks: &mut Vec<TaskSlot>,
-    domains: &[Domain],
-    held: &mut Held,
-    source: &ModuleSource,
-) {
-    let serves = |t: &TaskSlot| t.domain == 0 && matches!(t.state, TaskState::BlockedSvc);
-    if held.rest.is_none() || tasks.iter().any(serves) {
+fn serve_resting(tasks: &mut Tasks, domains: &[Domain], held: &mut Held, source: &ModuleSource) {
+    let serves = |i: usize| tasks[i].domain == 0 && matches!(tasks[i].state, TaskState::BlockedSvc);
+    if held.rest.is_none() || tasks.live().any(serves) {
         return;
     }
     let host = &domains[0].host;
@@ -13251,7 +13405,7 @@ fn wire_run_bell(
 /// that order. Every wake source feeds the one pass, so a task woken during the previous step is
 /// seen this round.
 fn settle_wakes(
-    tasks: &mut [TaskSlot],
+    tasks: &mut Tasks,
     domains: &mut [Domain],
     forked_twins: &mut std::collections::BTreeSet<usize>,
     hooked_twins: &mut std::collections::BTreeSet<usize>,
@@ -13263,7 +13417,7 @@ fn settle_wakes(
     // parked on a page request claims its reply the same way (#2164): the page is in place and
     // the faulting op re-executes, or the pager refused it and the fault is fatal.
     let mut refused = Vec::new();
-    for (i, t) in tasks.iter_mut().enumerate() {
+    for (i, t) in tasks.live_mut() {
         let (TaskState::BlockedTicket { ticket, callee, .. }
         | TaskState::BlockedPage {
             ticket,
@@ -13342,19 +13496,12 @@ fn settle_wakes(
     // back). It runs before the exit-hook step below, so the twin retires (WIFSIGNALED via
     // `term_sig`) and the signaller's `waitpid` reaps it in the same settle. Domain-scoped
     // (invariant 12).
-    let killed: Vec<usize> = tasks
-        .iter()
-        .enumerate()
-        .filter_map(|(ti2, t)| {
-            if matches!(t.state, TaskState::Done(_)) {
-                return None;
-            }
-            let dead = domains[t.domain]
-                .host
-                .lock_unpoisoned()
-                .signal_poll()
-                .is_some_and(|(_, s)| s.killed());
-            dead.then_some(ti2)
+    let killed: Vec<usize> = (tasks.live())
+        .filter(|&ti2| {
+            let t = &tasks[ti2];
+            !matches!(t.state, TaskState::Done(_))
+                && (domains[t.domain].host.lock_unpoisoned().signal_poll())
+                    .is_some_and(|(_, s)| s.killed())
         })
         .collect();
     for ti2 in killed {
@@ -13365,17 +13512,19 @@ fn settle_wakes(
     // producer that exits lets its consumer see EOF; a consumer that exits (e.g. `head`) wakes a
     // parked producer to `-EPIPE`. What its window grew goes back with them (#1909). The root's end
     // is the run's, which its teardown handles.
-    // Per child domain, `k - 1` for domain `k`: a run with none allocates nothing, every round.
-    let mut live = vec![false; domains.len() - 1];
-    let mut seen = vec![false; domains.len() - 1];
-    for t in tasks.iter().filter(|t| t.domain != 0) {
-        seen[t.domain - 1] = true;
-        live[t.domain - 1] |= !matches!(t.state, TaskState::Done(_));
+    // #2229 — a domain's last task to end is in the live list, done, until the next prune: the
+    // domains to look at are those of the live list's tasks, each with whether one is still live.
+    let mut live = std::collections::BTreeMap::<usize, bool>::new();
+    for i in tasks.live() {
+        let t = &tasks[i];
+        if t.domain != 0 {
+            *live.entry(t.domain).or_default() |= !matches!(t.state, TaskState::Done(_));
+        }
     }
     let mut finished: Vec<usize> = Vec::new();
     let mut ends = Vec::new();
-    for k in 1..domains.len() {
-        if seen[k - 1] && !live[k - 1] && released.domains.insert(k) {
+    for (k, live) in live {
+        if !live && released.domains.insert(k) {
             let mut h = domains[k].host.lock_unpoisoned();
             // #1936 — its end post is signalled, every task of it done, its waiters woken below, in
             // this settle: before the run can be read as deadlocked.
@@ -13413,16 +13562,15 @@ fn settle_wakes(
     // runs BEFORE the reap wakes below so a personality `waitpid` re-execution finds the twin
     // already retired. Gated on the twin registry + a not-yet-hooked marker; a twin is always
     // its own env, so its host is `domains[k]`. Two-phase (gather host + status, then fire).
-    let to_hook: Vec<(usize, i64, usize)> = tasks
-        .iter()
-        .enumerate()
-        .filter_map(|(ti2, t)| match &t.state {
-            // A twin is never in the root domain: the cheap test first, as every round scans every
-            // task the run has had.
+    let to_hook: Vec<(usize, i64, usize)> = (tasks.live())
+        .filter_map(|ti2| match &tasks[ti2].state {
+            // A twin is never in the root domain: the cheap test first.
             TaskState::Done(res)
-                if t.domain != 0 && forked_twins.contains(&ti2) && !hooked_twins.contains(&ti2) =>
+                if tasks[ti2].domain != 0
+                    && forked_twins.contains(&ti2)
+                    && !hooked_twins.contains(&ti2) =>
             {
-                Some((ti2, super::reap_status(res), t.domain))
+                Some((ti2, super::reap_status(res), tasks[ti2].domain))
             }
             _ => None,
         })
@@ -13435,31 +13583,25 @@ fn settle_wakes(
         }
         hooked_twins.insert(ti2);
     }
-    // A finished domain gives back what it held — its window, its powerbox, its frames — now
-    // that its pipe ends are released and its exit hooks have fired. What a reaper reads is its
-    // tasks' `Done` results, which stay. Without this a run holds every process it ever ran: a
-    // build that forks and execs a compiler per module grew by a window per process. The env is
-    // left holding the run's one empty powerbox (#2359): a fresh one apiece grew a run by its
-    // handle table per child.
+    // A finished domain gives back what it held — its window, its powerbox, its fibers — now
+    // that its pipe ends are released and its exit hooks have fired; its tasks' frames go as they
+    // leave the live list ([`Tasks::prune`]). What a reaper reads is its tasks' `Done` results. Without
+    // this a run holds every process it ever ran: a build that forks and execs a compiler per
+    // module grew by a window per process. The env is left holding the run's one empty powerbox
+    // (#2359): a fresh one apiece grew a run by its handle table per child.
     for k in finished {
         let env = &mut domains[k];
         env.mem = None;
         env.host = std::sync::Arc::clone(&released.host);
         env.fibers = FiberTables::default();
-        for t in tasks.iter_mut().filter(|t| t.domain == k) {
-            t.vm.vt.release();
-            t.vm.suspended = None;
-        }
     }
     // FORK.md §9.2 — reap wakes: a caller parked in `wait(pid)` wakes when fork twin `pid`
     // finishes, and one parked in `wait(-1)` when any twin of its own domain does (the lowest, as the
     // oracle picks), with the twin's exit status ([`super::reap_status`]; a trapped twin reaps as a
     // crash status, never a propagated trap — reap ≠ join). Two-phase (read the twin's outcome,
     // then deliver) so the caller and the twin task are not borrowed at once.
-    let reap_wakes: Vec<(usize, u32, i64, usize)> = tasks
-        .iter()
-        .enumerate()
-        .filter_map(|(ci, t)| match &t.state {
+    let reap_wakes: Vec<(usize, u32, i64, usize)> = (tasks.live())
+        .filter_map(|ci| match &tasks[ci].state {
             TaskState::BlockedReap { pid, dst } => {
                 let finished = |j: usize| match &tasks[j].state {
                     TaskState::Done(res) => Some((ci, *dst, super::reap_status(res), j)),
@@ -13470,7 +13612,7 @@ fn settle_wakes(
                     None => forked_twins
                         .iter()
                         .copied()
-                        .filter(|&j| domains[tasks[j].domain].twin_of == Some(t.domain))
+                        .filter(|&j| domains[tasks[j].domain].twin_of == Some(tasks[ci].domain))
                         .find_map(finished),
                 }
             }
@@ -13486,26 +13628,22 @@ fn settle_wakes(
     // re-admits (its rewound `waitpid` re-executes) once the named child completes — `Some(pid)`
     // that specific twin, `None` any forked child. No status is delivered here: the re-executed op
     // asks the personality, which serves the exit of the twin its exit hooks (fired above) retired.
-    let reap_p_wakes: Vec<usize> = tasks
-        .iter()
-        .enumerate()
-        .filter_map(|(ci, t)| match &t.state {
-            TaskState::BlockedReapPersonality { child } => {
-                let done = match child {
-                    // Personality pid → task index is `pid - 1` (the fork convention above).
-                    Some(pid) => matches!(
-                        pid.checked_sub(1)
-                            .and_then(|i| tasks.get(i))
-                            .map(|c| &c.state),
-                        Some(TaskState::Done(_))
-                    ),
-                    None => tasks.iter().enumerate().any(|(j, c)| {
-                        forked_twins.contains(&j) && matches!(c.state, TaskState::Done(_))
-                    }),
-                };
-                done.then_some(ci)
-            }
-            _ => None,
+    let reap_p_wakes: Vec<usize> = (tasks.live())
+        .filter(|&ci| match &tasks[ci].state {
+            TaskState::BlockedReapPersonality { child } => match child {
+                // Personality pid → task index is `pid - 1` (the fork convention above).
+                Some(pid) => matches!(
+                    pid.checked_sub(1)
+                        .and_then(|i| tasks.get(i))
+                        .map(|c| &c.state),
+                    Some(TaskState::Done(_))
+                ),
+                // The twins not yet reaped ([`park_task`] prunes the consumed ones).
+                None => forked_twins
+                    .iter()
+                    .any(|&j| matches!(tasks[j].state, TaskState::Done(_))),
+            },
+            _ => false,
         })
         .collect();
     for ci in reap_p_wakes {
@@ -13515,10 +13653,9 @@ fn settle_wakes(
     // it POLLS each parked reader/writer's shared FIFO here and re-admits (the rewound read/write
     // re-executes) once ready. Each checks its own domain's host: a forked command's, or the
     // root's for a root task (a bash builtin over a pipe).
-    let pipe_wakes: Vec<usize> = tasks
-        .iter()
-        .enumerate()
-        .filter_map(|(ci, t)| {
+    let pipe_wakes: Vec<usize> = (tasks.live())
+        .filter(|&ci| {
+            let t = &tasks[ci];
             // Only a pipe or stdin park polls its host: every other task skips the lock.
             if !matches!(
                 t.state,
@@ -13526,24 +13663,23 @@ fn settle_wakes(
                     | TaskState::BlockedPipeWrite { .. }
                     | TaskState::BlockedStdin
             ) {
-                return None;
+                return false;
             }
             // #1171 — a STOPPED reader/writer is not re-admitted by an input/room wake: a
             // stopped process makes no progress, so a suspended foreground `cat` must not steal
             // the bytes the shell should read (it re-admits at its `SIGCONT`). Domain-scoped.
             let h = domains[t.domain].host.lock_unpoisoned();
             if h.signal_poll().is_some_and(|(_, s)| s.stopped()) {
-                return None;
+                return false;
             }
-            let ready = match &t.state {
+            match &t.state {
                 TaskState::BlockedPipeRead { pipe } => h.pipe_read_ready(*pipe),
                 TaskState::BlockedPipeWrite { pipe } => h.pipe_write_ready(*pipe),
                 // #1146 (deeper) — a blocking stdin park re-admits once its own host's stdin
                 // buffer has bytes (the stdin twin of the pipe poll; domain-scoped like the rest).
                 TaskState::BlockedStdin => h.stdin_ready(),
-                _ => return None,
-            };
-            ready.then_some(ci)
+                _ => false,
+            }
         })
         .collect();
     for ci in pipe_wakes {
@@ -13557,7 +13693,7 @@ fn settle_wakes(
     // wake source feeds it uniformly (no per-site wiring). Runs before the pick so a fiber
     // woken during the previous step is seen this iteration.
     // #2742 — and a `svc.wait` wakes once one of its parked handlers can resume.
-    for t in tasks.iter_mut() {
+    for (_, t) in tasks.live_mut() {
         let e = &domains[t.domain];
         let woken = match t.state {
             TaskState::BlockedOnFiber { fiber } => fiber_woken(e, fiber),
@@ -13638,7 +13774,7 @@ impl SchedCore {
             fuel.burn()?;
         }
         let root_vt = VTask::new(&source.primary(), entry as usize, args, Some(h.own_node()))?;
-        let tasks = vec![TaskSlot::new(root_vt, 0, LiveVcpu::none())];
+        let tasks: Tasks = std::iter::once(TaskSlot::new(root_vt, 0, LiveVcpu::none())).collect();
         wire_kill(&h);
         // #1122/#1146/#1262 — the run's bell ([`SchedCore::bell`]): wire the root's personality
         // doors to ring it (pipe-wake for a `feed_terminal` byte arrival; `set_wake` for an
@@ -13927,6 +14063,8 @@ impl CoopSched {
             }
             drain_task_completions(tasks, domains);
             settle_wakes(tasks, domains, forked_twins, hooked_twins, released);
+            // #2229 — every rule has seen the tasks that ended by now.
+            tasks.prune();
             // #1198 — a Runnable task whose DOMAIN is stopped (SIGTSTP/SIGTTIN/SIGTTOU, before its
             // SIGCONT) must not be stepped: a stopped process makes no progress. The tree-walker won't
             // run a stopped process; the coop pick must skip it too, or a background job whose read
@@ -13936,14 +14074,13 @@ impl CoopSched {
             // its next freeze point, and `Op::CapCall` abandons each host call on the way.
             let see_through = root_unwinding(domains);
             let domain_stopped = |i: usize| !see_through && process_stopped(domains, &tasks[i]);
-            // #1157 — round-robin from `last_pick + 1` (wrapping) rather than lowest-index-first.
-            let n = tasks.len();
             // #2695 step 2 — the held domain's `Single` gate: while one activation holds it, running or
             // preempted, its other activations wait.
             let gated = |i: usize| {
                 tasks[i].answers.is_some() && held.as_ref().is_some_and(|h| !h.admits(tasks, i))
             };
-            let Some(ti) = (1..=n).map(|k| (last_pick + k) % n).find(|&i| {
+            // #1157 — round-robin from `last_pick + 1` (wrapping) rather than lowest-index-first.
+            let Some(ti) = tasks.live_from(last_pick).find(|&i| {
                 matches!(tasks[i].state, TaskState::Runnable) && !domain_stopped(i) && !gated(i)
             }) else {
                 // #1904 — bring the parks through a freeze before any timer fires or the run is
@@ -14071,7 +14208,7 @@ impl CoopSched {
             // never wakes while another spins on it.
             let (quantum, preemptible) = if next_wait_deadline(tasks).is_some() || {
                 let (mut runnable, mut awaits_call) = (0, false);
-                for t in tasks.iter() {
+                for t in tasks.live().map(|i| &tasks[i]) {
                     if matches!(t.state, TaskState::Runnable) {
                         runnable += 1;
                     } else if !awaits_call
@@ -14710,12 +14847,12 @@ impl SchedCore {
                     // Locate the parked caller on `(ticket, this server)`. In the cooperative driver
                     // the caller has already parked (it enqueued + woke us before we ran), so a miss
                     // is defensive → degrade.
-                    let caller_ti = tasks.iter().position(|t| {
-                        matches!(&t.state,
+                    let caller_ti = tasks.live().find(|&i| {
+                        matches!(&tasks[i].state,
                         TaskState::BlockedTicket { ticket: tk, callee, .. }
                             if *tk == ticket && std::sync::Arc::ptr_eq(callee, &server_host))
                     });
-                    let degrade = |tasks: &mut Vec<TaskSlot>, caller_ti: Option<usize>| -> i64 {
+                    let degrade = |tasks: &mut Tasks, caller_ti: Option<usize>| -> i64 {
                         // One reply to the caller, no twin. Explicit mode delivers `reply_orig`; pid
                         // mode delivers `-EAGAIN` (POSIX fork failure). Returns the handler's result.
                         let fallback = reply_orig.unwrap_or(super::EAGAIN);
@@ -14749,7 +14886,7 @@ impl SchedCore {
                     // The run's live cap, as the oracle's `fork_vcpu` checks it (#2006).
                     // The twin's continuation is the caller's, with `reply_twin` injected at the
                     // caller's reply slot.
-                    let forked = if bare && live_tasks(tasks) < super::MAX_VCPUS {
+                    let forked = if bare && tasks.live_count() < super::MAX_VCPUS {
                         Some(caller_env).filter(|&ck| ck != 0).and_then(|ck| {
                             let env = &domains[ck];
                             let at = (&tasks[caller_ti].vm.vt.active, caller_dst, reply_twin);
@@ -14824,8 +14961,8 @@ impl SchedCore {
                         break 'reap super::EINVAL;
                     }
                     let server_host = std::sync::Arc::clone(&domains[server_env].host);
-                    let caller_ti = tasks.iter().position(|t| {
-                        matches!(&t.state,
+                    let caller_ti = tasks.live().find(|&i| {
+                        matches!(&tasks[i].state,
                         TaskState::BlockedTicket { ticket: tk, callee, .. }
                             if *tk == ticket && std::sync::Arc::ptr_eq(callee, &server_host))
                     });
@@ -15049,7 +15186,7 @@ impl SchedCore {
                 // (`fork_powerbox`), so it draws from it as a thread would (#1944 slice 3). The
                 // live cap is checked first, as the oracle's `fork_vcpu` checks it (#2006).
                 let env = tasks[ti].domain;
-                let room = fork_bare(tasks, domains, ti) && live_tasks(tasks) < super::MAX_VCPUS;
+                let room = fork_bare(tasks, domains, ti) && tasks.live_count() < super::MAX_VCPUS;
                 let forked = if room {
                     let win = domains[env].mem.as_ref();
                     // The return-twice `0`; the parent keeps the twin's pid, set below.
@@ -15140,7 +15277,7 @@ impl SchedCore {
                         return None;
                     }
                 };
-                if live_tasks(tasks) >= super::MAX_VCPUS {
+                if tasks.live_count() >= super::MAX_VCPUS {
                     complete(tasks, domains, ti, Err(Trap::ThreadFault)); // thread bomb
                     return None;
                 }
@@ -15196,7 +15333,7 @@ impl SchedCore {
             // tree-walk oracle's spawn (`run_with_host`'s op-17 arm) on the cooperative driver.
             // Admission first (entry shape, the window = the module's declared memory, the args
             // payload, `premap_admit`, no durable domain, then the `Budget.mem` take — a refused
-            // spawn lands `-EINVAL` and charges nothing); then the child powerbox: starter
+            // spawn lands its cause's code and charges nothing); then the child powerbox: starter
             // `Instantiator`/`AddressSpace` over the reservation, the by-name re-grants (the op-11
             // record format, fail-closed), and a pre-mapped `SharedRegion` staged and applied to
             // the window before the child runs an op. `join` is the shared seam below.
@@ -15209,9 +15346,9 @@ impl SchedCore {
                     |c| programs.for_child(&c.program, &c.host, source),
                 );
                 let (child, tierup) = match admitted {
-                    Ok(Some(c)) => c,
-                    Ok(None) => {
-                        tasks[ti].deliver(dst, Reg::from_i32(super::EINVAL as i32));
+                    Ok(Ok(c)) => c,
+                    Ok(Err(refused)) => {
+                        tasks[ti].deliver(dst, Reg::from_i32(refused.errno() as i32));
                         return None;
                     }
                     Err(t) => {
@@ -16999,7 +17136,9 @@ mod dbg_domain_end_tests {
                 .mem
         };
         let done = || TaskState::Done(Ok(Vec::new()));
-        let mut tasks = vec![task(done()), task(TaskState::Runnable)];
+        let mut tasks: Tasks = [task(done()), task(TaskState::Runnable)]
+            .into_iter()
+            .collect();
         tasks[0].lease = Some((0, lease));
         dbg_refund_ended_windows(&mut tasks, &mut envs, false);
         assert_eq!(
@@ -17076,7 +17215,7 @@ mod live_cap_tests {
     }
 
     /// A run at its live cap, every task in the root domain over `host`.
-    fn full_run(host: Host) -> (Vec<TaskSlot>, Vec<Domain>) {
+    fn full_run(host: Host) -> (Tasks, Vec<Domain>) {
         let tasks = (0..crate::MAX_VCPUS)
             .map(|_| TaskSlot::new(vtask(), 0, LiveVcpu::none()))
             .collect();
@@ -18614,13 +18753,17 @@ impl ThreadRun {
 
     /// Wake the thread of every task asleep on its park ([`Park::asleep`]) that now needs no rule to
     /// go on ([`Self::awake`]), once the lock is let go ([`release`]); every one once the run is over.
+    /// A task the rules have just made has no thread yet. Every settle is followed by this scan, so
+    /// the tasks that ended have been seen by every rule here, and leave the live list (#2229).
     fn wake(&self, g: &mut Threads) {
         let over = g.over.is_some();
-        for j in 0..g.parks.len() {
-            if g.parks[j].asleep && (over || self.awake(&g.core, j)) {
+        for k in 0..g.core.tasks.live.len() {
+            let j = g.core.tasks.live[k];
+            if g.parks.get(j).is_some_and(|p| p.asleep) && (over || self.awake(&g.core, j)) {
                 g.rouse(j);
             }
         }
+        g.core.tasks.prune();
     }
 
     /// Whether task `ti` needs nothing from a rule to go on: it can run, or it has ended. A runnable
@@ -18721,7 +18864,7 @@ impl ThreadRun {
     /// still counts, as does a runnable task of a stopped process, which the pump's pick skips: only
     /// another task, or an embedder through the external-wake bell, wakes it.
     fn idle(&self, core: &SchedCore) -> bool {
-        (0..core.tasks.len()).all(|j| match core.tasks[j].state {
+        core.tasks.live().all(|j| match core.tasks[j].state {
             TaskState::Done(_) => true,
             TaskState::Runnable => self.stopped(core, j),
             _ => matches!(self.park_for(core, j), ParkFor::Wake | ParkFor::Ring(None)),
@@ -18730,7 +18873,7 @@ impl ThreadRun {
 
     /// Whether no task can run now: each is done, parked, or a runnable task of a stopped process.
     fn quiet(&self, core: &SchedCore) -> bool {
-        (0..core.tasks.len()).all(|j| match core.tasks[j].state {
+        core.tasks.live().all(|j| match core.tasks[j].state {
             TaskState::Runnable => self.stopped(core, j),
             _ => true,
         })
@@ -19028,9 +19171,13 @@ enum Watched {
 /// the joiner is delivered from its `dst` and it becomes runnable ([`super::join_delivery`]), or a
 /// thread's trap propagates — its joiner completes with the same trap (transitively, via the
 /// worklist).
-fn complete(tasks: &mut [TaskSlot], envs: &mut [Domain], ti: usize, res: Result<Vec<Value>, Trap>) {
+fn complete(tasks: &mut Tasks, envs: &mut [Domain], ti: usize, res: Result<Vec<Value>, Trap>) {
     let mut work = vec![(ti, res)];
     while let Some((done, res)) = work.pop() {
+        // #2229 — its domain's teardown finds it here.
+        if res.is_err() {
+            tasks.failed.push(done);
+        }
         tasks[done].state = TaskState::Done(res.clone());
         tasks[done].live = LiveVcpu::none(); // #2001: its `spawn` goes back
                                              // #2695 step 2 — an activation answers its call, however it ends.
@@ -19039,7 +19186,7 @@ fn complete(tasks: &mut [TaskSlot], envs: &mut [Domain], ti: usize, res: Result<
         }
         let domain = tasks[done].domain;
         revoke_handlers(&mut tasks[done], &mut envs[domain]);
-        let joiners: Vec<(usize, i32, u32)> = (0..tasks.len())
+        let joiners: Vec<(usize, i32, u32)> = (tasks.live())
             .filter_map(|j| match tasks[j].state {
                 TaskState::BlockedJoin { child, handle, dst } if child == done => {
                     Some((j, handle, dst))
@@ -19177,7 +19324,7 @@ fn ends_as_value(tasks: &[TaskSlot], ti: usize, c: usize) -> bool {
 /// the joiner; else the joiner parks on it until [`complete`] wakes it. A spent handle delivers
 /// [`super::join_spent`]; a forged one completes the joiner with its trap. The entry says how the child
 /// ends ([`ends_as_value`]), so `thread.join` and `Instantiator.join` deliver alike.
-fn join_child(tasks: &mut [TaskSlot], envs: &mut [Domain], ti: usize, handle: i32, dst: u32) {
+fn join_child(tasks: &mut Tasks, envs: &mut [Domain], ti: usize, handle: i32, dst: u32) {
     let child = match name_child(tasks, envs, ti, handle) {
         Ok(Some((_, c))) => c,
         Ok(None) => return tasks[ti].deliver_from(dst, super::join_spent()),
@@ -19212,7 +19359,7 @@ fn grant_target(tasks: &[TaskSlot], envs: &[Domain], ti: usize, child: i32) -> O
 /// the child's domain and the subtree it spawned ([`kill_domain`]). A spent handle answers `-EBADF`
 /// (#2667); a forged one completes the caller with its trap.
 fn child_ctl(
-    tasks: &mut [TaskSlot],
+    tasks: &mut Tasks,
     envs: &mut [Domain],
     ti: usize,
     child: i32,
@@ -19252,8 +19399,8 @@ fn child_ctl(
 /// parked ([`complete`] overwrites any blocked state and wakes its joiners), then the domains it
 /// spawned, as the tree-walker's kill ends a child and its subtree. A domain with nothing left alive
 /// is left as it is, its children with it: killing a child that has ended does nothing.
-fn kill_domain(tasks: &mut [TaskSlot], envs: &mut [Domain], k: usize) {
-    let live: Vec<usize> = (0..tasks.len())
+fn kill_domain(tasks: &mut Tasks, envs: &mut [Domain], k: usize) {
+    let live: Vec<usize> = (tasks.live())
         .filter(|&i| tasks[i].domain == k && !matches!(tasks[i].state, TaskState::Done(_)))
         .collect();
     if live.is_empty() {
@@ -19408,7 +19555,7 @@ fn wake_fiber_waiters<'a>(
 /// reaches (`WAIT_TIMED_OUT` at a task's `dst`; a fiber made claimable with it). `false` when no
 /// wait has a deadline, which is the driver's deadlock (#1638: an infinite wait never times out).
 fn fire_next_timeout(
-    tasks: &mut [TaskSlot],
+    tasks: &mut Tasks,
     fibers: &mut [&mut Vec<FiberState>],
     clock: &mut u64,
 ) -> bool {
@@ -19422,10 +19569,7 @@ fn fire_next_timeout(
 
 /// The earliest deadline on the logical clock: a task's futex wait's, or an event-parked fiber's
 /// among `fibers`. `None` when no wait has one.
-fn next_timeout<'a>(
-    tasks: &[TaskSlot],
-    fibers: impl Iterator<Item = &'a FiberState>,
-) -> Option<u64> {
+fn next_timeout<'a>(tasks: &Tasks, fibers: impl Iterator<Item = &'a FiberState>) -> Option<u64> {
     let fiber_deadline = |f: &FiberState| match f {
         FiberState::WaitParked {
             deadline,
@@ -19442,7 +19586,7 @@ fn next_timeout<'a>(
 
 /// The earliest deadline among a run's timed waits: its tasks', and its event-parked fibers' in
 /// every domain.
-fn run_deadline(tasks: &[TaskSlot], envs: &[Domain]) -> Option<u64> {
+fn run_deadline(tasks: &Tasks, envs: &[Domain]) -> Option<u64> {
     next_timeout(tasks, envs.iter().flat_map(|e| e.fibers.fibers.iter()))
 }
 
@@ -19453,7 +19597,7 @@ fn run_deadline(tasks: &[TaskSlot], envs: &[Domain]) -> Option<u64> {
 /// (#2224). Whether something came first: the pump then runs a round, the fibers' answers drained.
 #[cold]
 fn wait_out(
-    tasks: &[TaskSlot],
+    tasks: &Tasks,
     domains: &mut [Domain],
     clock: &mut u64,
     calls: &[(std::sync::Arc<super::Completions>, u64)],
@@ -19506,9 +19650,9 @@ fn idle_wait(
 /// `SIGCHLD` on a child's stop/continue transition wakes its blocked `waitpid`, matching the
 /// tree-walker (whose `Blocked::Stopped` insert drains the reap waiters). Returns whether it
 /// re-admitted any.
-fn interrupt_parks(tasks: &mut [TaskSlot], domains: &[Domain]) -> bool {
+fn interrupt_parks(tasks: &mut Tasks, domains: &[Domain]) -> bool {
     let mut woke = false;
-    for t in tasks.iter_mut() {
+    for (_, t) in tasks.live_mut() {
         // A pipe read/write OR a blocking stdin read (#1146 deeper) — the interruptible
         // blocking-I/O parks whose rewound op completes `-EINTR` on a signal.
         let is_pipe = matches!(
@@ -19548,7 +19692,7 @@ fn interrupt_parks(tasks: &mut [TaskSlot], domains: &[Domain]) -> bool {
 
 /// Time out every futex wait whose deadline `clock` has reached: a task's (`WAIT_TIMED_OUT` at its
 /// `dst`), and an event-parked fiber's in any domain's registry (`fibers`), made claimable with it.
-fn time_out_due(tasks: &mut [TaskSlot], fibers: &mut [&mut Vec<FiberState>], clock: u64) {
+fn time_out_due(tasks: &mut Tasks, fibers: &mut [&mut Vec<FiberState>], clock: u64) {
     time_out_waits(tasks, clock);
     for f in fibers.iter_mut().flat_map(|reg| reg.iter_mut()) {
         if let FiberState::WaitParked {
@@ -19568,13 +19712,13 @@ fn time_out_due(tasks: &mut [TaskSlot], fibers: &mut [&mut Vec<FiberState>], clo
 /// index first (deterministic), each keyed through its own window, `win(env)` ([`site_key_in`]).
 /// Returns how many it woke.
 fn wake_waiters<'a>(
-    tasks: &mut [TaskSlot],
+    tasks: &mut Tasks,
     key: super::FutexKey,
     count: u32,
     win: impl Fn(usize) -> Option<&'a Mem>,
 ) -> u32 {
     let mut woken = 0u32;
-    for t in tasks.iter_mut() {
+    for (_, t) in tasks.live_mut() {
         if woken >= count {
             break;
         }
@@ -19595,7 +19739,7 @@ fn wake_waiters<'a>(
 /// #1936 — wake every task and event-parked fiber waiting on region word `w`, in every domain: a
 /// post's `signal` ([`Outcome::WakeRegion`]), or a child's end post at its end. `memory.notify` with
 /// no count, keyed as the word's waiters keyed their parks, whichever window they map it in.
-fn wake_region(tasks: &mut [TaskSlot], domains: &mut [Domain], w: &super::RegionWake) {
+fn wake_region(tasks: &mut Tasks, domains: &mut [Domain], w: &super::RegionWake) {
     let key = w.key();
     wake_waiters(tasks, key, u32::MAX, |env| domains[env].mem.as_ref());
     let regs = domains.iter_mut().flat_map(|e| e.fibers.fibers.iter_mut());
@@ -19605,9 +19749,8 @@ fn wake_region(tasks: &mut [TaskSlot], domains: &mut [Domain], w: &super::Region
 /// The earliest deadline among the tasks' futex waits — what the logical clock advances to when no
 /// task is runnable. An infinite wait has none, so a run whose every waiter is indefinite reaches
 /// its driver's deadlock exit instead of a `WAIT_TIMED_OUT` the guest never asked for (#1638).
-fn next_wait_deadline(tasks: &[TaskSlot]) -> Option<u64> {
-    tasks
-        .iter()
+fn next_wait_deadline(tasks: &Tasks) -> Option<u64> {
+    (tasks.live().map(|i| &tasks[i]))
         .filter_map(|t| match t.state {
             TaskState::BlockedWait { deadline, .. } => deadline,
             _ => None,
@@ -19617,8 +19760,8 @@ fn next_wait_deadline(tasks: &[TaskSlot]) -> Option<u64> {
 
 /// Wake every task whose futex wait's deadline the logical `clock` has reached, `WAIT_TIMED_OUT` at
 /// its `dst`.
-fn time_out_waits(tasks: &mut [TaskSlot], clock: u64) {
-    for t in tasks.iter_mut() {
+fn time_out_waits(tasks: &mut Tasks, clock: u64) {
+    for (_, t) in tasks.live_mut() {
         if let TaskState::BlockedWait {
             deadline: Some(deadline),
             dst,
@@ -19648,22 +19791,27 @@ fn time_out_waits(tasks: &mut [TaskSlot], clock: u64) {
 /// #2695 step 2 — unless the root domain `rests`, held by its embedder past its entry: it then dies
 /// as a child does, once, its callers answered `CAP_REVOKED`, and the trap that ended it is returned.
 fn teardown_domains(
-    tasks: &mut [TaskSlot],
+    tasks: &mut Tasks,
     domains: &mut [Domain],
     dead_domains: &mut std::collections::BTreeSet<usize>,
     rests: bool,
 ) -> Option<Trap> {
     let mut ended = None;
     loop {
-        let hit = tasks.iter().find_map(|t| {
+        // #2229 — the tasks that ended in a trap, the lowest index first, as a scan of the table
+        // would find them: a domain dies of its first member's trap.
+        tasks.failed.sort_unstable();
+        tasks.failed.dedup();
+        let hit = tasks.failed.iter().find_map(|&i| {
+            let t = &tasks[i];
             if let TaskState::Done(Err(trap)) = &t.state {
                 match t.domain {
                     // The root domain: a live member left means the sweep hasn't run yet (once
                     // every member is Done the caller's root check ends the run).
                     0 if !rests
-                        && tasks
-                            .iter()
-                            .any(|u| u.domain == 0 && !matches!(u.state, TaskState::Done(_))) =>
+                        && tasks.live().any(|u| {
+                            tasks[u].domain == 0 && !matches!(tasks[u].state, TaskState::Done(_))
+                        }) =>
                     {
                         return Some((0, *trap));
                     }
@@ -19680,6 +19828,9 @@ fn teardown_domains(
             None
         });
         let Some((env, trap)) = hit else {
+            // A failed task whose domain is dead is done with: no teardown takes it again.
+            let slots = &tasks.slots;
+            (tasks.failed).retain(|&i| !dead_domains.contains(&slots[i].domain));
             return ended;
         };
         if env != 0 || rests {
@@ -19688,8 +19839,10 @@ fn teardown_domains(
         if env == 0 && rests {
             ended = Some(trap);
         }
-        for i in 0..tasks.len() {
-            if tasks[i].domain == env && !matches!(tasks[i].state, TaskState::Done(_)) {
+        let members: Vec<usize> = (tasks.live()).filter(|&i| tasks[i].domain == env).collect();
+        for i in members {
+            // A kill that reaches a joiner may have ended a later member already.
+            if !matches!(tasks[i].state, TaskState::Done(_)) {
                 complete(tasks, domains, i, Err(trap));
             }
         }
@@ -19701,7 +19854,7 @@ fn teardown_domains(
             let dying = std::sync::Arc::clone(&domains[env].host);
             let mut stranded = Vec::new();
             let mut unanswered = Vec::new();
-            for (i, t) in tasks.iter_mut().enumerate() {
+            for (i, t) in tasks.live_mut() {
                 match &t.state {
                     TaskState::BlockedTicket {
                         callee, dst, sig, ..

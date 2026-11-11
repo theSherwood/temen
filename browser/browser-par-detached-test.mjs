@@ -3,12 +3,12 @@
 // `WindowMinter` (the §14 recipe + `minter`), and issues three §5 detached spawns (op-17 records)
 // back to back — each child lands in its OWN fresh shared `WebAssembly.Memory`, its thread on its OWN
 // Worker (the spawning thread's Worker mints the memory, and the Worker that runs the child's thread
-// is handed it) — then a fourth the exhausted minter must refuse probeably (`-EINVAL`), then joins the
+// is handed it) — then a fourth the exhausted minter must refuse probeably (`-ENOMEM`, #2864), then joins the
 // three. Each child reads the 8-byte payload the root passed at `module_args_base()`, `vm_map`s a page
 // PAST its declared 64 KiB window (the grow reaches the child memory through `Region::Foreign` → its
 // accessor's `grow`), stores/loads the word on the grown page and returns it + 1.
 //
-// The root returns Σ(word_i + 1) + h4 = (1001 + 2001 + 3001) - 22. Non-vacuity: `started === 4` — the
+// The root returns Σ(word_i + 1) + h4 = (1001 + 2001 + 3001) - 12. Non-vacuity: `started === 4` — the
 // root's and three children's Workers were all created (the children are spawned before any join, so
 // all three run at once), and `childMems === 3`, one thread over each child's own memory.
 //
@@ -347,7 +347,8 @@ await browser.close();
 await new Promise((r) => server.close(r));
 console.log('RESULT', JSON.stringify(res));
 if (errors.length) console.log('ERRORS', errors.slice(0, 5));
-const EXPECT = String(1001 + 2001 + 3001 - 22);
+// The fourth spawn's budget has no room left for its window: `-ENOMEM` (#2864).
+const EXPECT = String(1001 + 2001 + 3001 - 12);
 const again = res.second && !res.second.err && res.second.value === EXPECT && res.second.started === 4;
 const em = res.emitted;
 const emittedOk = em && !em.err && em.value === EXPECT && em.started === 4 && em.tierups === 3;

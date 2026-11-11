@@ -1647,6 +1647,28 @@ pub(crate) mod x86 {
         off: i64,
     }
 
+    /// An expression Cranelift rematerializes in more than one register, for the local value
+    /// numbering that gives each one symbolic value so two of them are seen as equal (#2858): a
+    /// two-register sum `a + b` (its operands' symbolic values, ordered canonically) and a masked
+    /// value `r & k` (the input's symbolic value and the mask).
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Vn {
+        Sum(Sym, Sym),
+        Mask(Sym, i64),
+    }
+
+    /// The symbolic id for `key`, assigning a fresh one (from `next_id`) the first time each distinct
+    /// expression is seen in a block, so two instructions computing it get the same value.
+    fn value_number(vn: &mut Vec<(Vn, u32)>, next_id: &mut u32, key: Vn) -> u32 {
+        if let Some(&(_, id)) = vn.iter().find(|(k, _)| *k == key) {
+            return id;
+        }
+        let id = *next_id;
+        *next_id += 1;
+        vn.push((key, id));
+        id
+    }
+
     /// The flags a `cmp lhs, rhs` of width `w` leaves, for a `cmov` that tests them: each side as the
     /// value it compared (a register operand's [`Sym`]) and its constant (`w` bytes wide), when known.
     /// Block-local: a block starts with no compare known, and any instruction that writes the flags —
@@ -1778,6 +1800,12 @@ pub(crate) mod x86 {
         // The symbolic value each 8-byte frame slot holds, by entry-relative offset, while nothing
         // writes it: two reloads of one spill are one value to the `cmov` rule.
         let mut slot_vals: Vec<(i64, Sym)> = Vec::new();
+        // Value numbering for the computations Cranelift rematerializes in two registers for D63's
+        // compared and selected values: a two-register sum `a + b` (`lea r, [a+b]` and `[a+b+c]`),
+        // and a masked value `r & k` (`and rcx, k` for the bound check, `and rax, k` for the index,
+        // both of one source). Each expression gets one id, so two instructions computing it share a
+        // symbolic value and are a known constant apart, which the `cmov` rule then confines (#2858).
+        let mut vn: Vec<(Vn, u32)> = Vec::new();
         // The identity the in-state carries across the edge (`State::copies`): a register tied to a
         // slot holds the slot's value, so the slot starts as that register's value, and registers
         // tied to one slot start as one value.
@@ -1867,21 +1895,45 @@ pub(crate) mod x86 {
             // What a full `lea` computes as one register plus a constant, when its other operand is
             // a constant (`lea r, [b + k]`, `lea r, [b + i]` with `i` holding one): the symbolic
             // value it keeps.
-            let lea_tie = match (d.eff, d.operands.mem) {
+            // The symbolic value a full `lea` computes, when it is one tracked value plus a constant
+            // — so two `lea`s whose symbolic values share an id are a known constant apart, which D63
+            // relies on. `[b + k]`, `[b + i·s + k]` with `i` constant, and `[i + k]` fold to one
+            // register plus a constant; `[a + b + k]` with neither operand constant is a two-register
+            // sum, which [`pairs`] gives one value per operand pair so two such sums are related
+            // (#2858). `None` when no single tracked value plus a constant fits.
+            let lea_tie: Option<Sym> = match (d.eff, d.operands.mem) {
                 (Eff::Lea { full: true, .. }, Some(m)) if !m.rip => {
                     let k = |r: u8| konst(&state, Opnd::Reg(r), 8).map(|v| v as i64);
+                    // `sym_of(r) + o`, when it doesn't overflow.
+                    let tie = |r: u8, o: i64| {
+                        let s = sym_of(r);
+                        s.off.checked_add(o).map(|off| Sym { id: s.id, off })
+                    };
                     match (m.base, m.index) {
-                        (Some(b), None) => Some((b, m.disp)),
+                        (Some(b), None) => tie(b, m.disp),
                         (Some(b), Some(i)) => {
                             match k(i).and_then(|x| x.checked_mul(i64::from(m.scale))) {
-                                Some(x) => x.checked_add(m.disp).map(|o| (b, o)),
-                                None if m.scale == 1 => {
-                                    k(b).and_then(|x| x.checked_add(m.disp)).map(|o| (i, o))
-                                }
+                                Some(x) => x.checked_add(m.disp).and_then(|o| tie(b, o)),
+                                // `[b + i]` (scale 1): a constant operand folds into the other; two
+                                // non-constant operands form the sum `pairs` ties.
+                                None if m.scale == 1 => match k(b) {
+                                    Some(x) => x.checked_add(m.disp).and_then(|o| tie(i, o)),
+                                    None => {
+                                        let (a, c) = (sym_of(b), sym_of(i));
+                                        // `a + b == b + a`, so order the key canonically.
+                                        let key = if (a.id, a.off) <= (c.id, c.off) {
+                                            Vn::Sum(a, c)
+                                        } else {
+                                            Vn::Sum(c, a)
+                                        };
+                                        let id = value_number(&mut vn, &mut next_id, key);
+                                        Some(Sym { id, off: m.disp })
+                                    }
+                                },
                                 None => None,
                             }
                         }
-                        (None, Some(i)) if m.scale == 1 => Some((i, m.disp)),
+                        (None, Some(i)) if m.scale == 1 => tie(i, m.disp),
                         _ => None,
                     }
                 }
@@ -2272,13 +2324,20 @@ pub(crate) mod x86 {
                     Some((dst, Some(s)))
                 }),
                 Eff::MovReg { dst, src } => Some((dst, Some(sym_of(src)))),
-                Eff::Lea { dst, full: true } => lea_tie.map(|(r, o)| (dst, offset(r, Some(o)))),
+                Eff::Lea { dst, full: true } => lea_tie.map(|s| (dst, Some(s))),
                 Eff::Alu { dst, alu, src } => match (alu, alu_k, src, dst_k) {
                     (Alu::Add, Some(k), ..) => Some((dst, offset(dst, Some(k)))),
                     (Alu::Sub, Some(k), ..) => Some((dst, offset(dst, k.checked_neg()))),
                     // A destination holding a constant `c`: `dst + s` is `s + c`. D63 compares
                     // `v = x − k` and selects `x + c'`, computed as `mov r, c'; add r, x` (#2799).
                     (Alu::Add, None, Opnd::Reg(s), Some(c)) => Some((dst, offset(s, Some(c)))),
+                    // `and r, k` masks `r` — a deterministic function of `r`, so two `and`s of one
+                    // value with the same mask are equal (D63 masks both its compared and its index,
+                    // #2858). Value-numbered by the input value and the mask.
+                    (Alu::And, Some(k), ..) => {
+                        let id = value_number(&mut vn, &mut next_id, Vn::Mask(sym_of(dst), k));
+                        Some((dst, Some(Sym { id, off: 0 })))
+                    }
                     _ => None,
                 },
                 _ => None,

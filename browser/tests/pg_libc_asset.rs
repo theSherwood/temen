@@ -888,7 +888,8 @@ fn a_card_child_links_through_the_exports_and_a_refusal_is_noted() {
         (
             0,
             STATUS_OK,
-            "talker\ngranted: 7, refused: -22\n".to_string()
+            // An import no grant binds: `-ENOENT` (#2864).
+            "talker\ngranted: 7, refused: -2\n".to_string()
         ),
         "notes: {notes}"
     );

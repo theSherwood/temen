@@ -267,7 +267,7 @@ block 0 (v0: i64) {
 }
 
 /// The gate's other half: without freeze authority over its detached progeny, a durable parent's
-/// spawn is refused probeably (`-EINVAL`) — it cannot mint a child no freeze of it could capture.
+/// spawn is refused probeably (`-EPERM`, #2864) — it cannot mint a child no freeze of it could capture.
 #[test]
 fn a_durable_parent_without_authority_is_refused_the_spawn() {
     const SPAWN_ONLY: &str = "memory 18 shadow 16448 65536
@@ -306,7 +306,7 @@ block 0 (v0: i32, v1: i32, v2: i32) {
     };
     assert_eq!(
         spawn(false),
-        Ok(vec![Value::I64(EINVAL)]),
+        Ok(vec![Value::I64(SpawnRefusal::Authority.errno())]),
         "refused without authority"
     );
     assert_eq!(

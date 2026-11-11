@@ -1150,22 +1150,42 @@ pub type GrantChildReleaser = unsafe extern "C" fn(ctx: *mut core::ffi::c_void);
 /// with ([`CompiledModule::set_held_tail`]). A plain Rust fn: it hands back a `Vec`.
 pub type HeldTail = unsafe fn(ctx: *mut core::ffi::c_void, base: usize, mapped: u64) -> Vec<u64>;
 
+/// #2864 — check a spawn record's grant list before anything of the spawn is admitted, as the
+/// interpreters check it: each record read from the parent's window `[mem_base, mem_base +
+/// mem_size)` (`MemoryFault` outside it, `CapFault` for a bad name), and each handle one the parent
+/// may grant (`CapFault` otherwise). So a forged grant traps whatever else the record says, on every
+/// engine. Returns `1` if the list holds, or `0` with the trap raised on `vm`. The build that follows
+/// ([`GrantDetachedChildBuilder`]) reads and checks the list again.
+///
+/// # Safety
+/// `ctx` is the run's `cap_ctx` (the parent `Host`), and the window is the parent's mapped window.
+pub type GrantListCheck = unsafe extern "C" fn(
+    ctx: *mut core::ffi::c_void,
+    mem_base: *mut u8,
+    mem_size: u64,
+    grants_ptr: u64,
+    grants_n: u64,
+    vm: &VmCtx,
+) -> i32;
+
 /// PROCESS.md §5 / #1287, D66 — the admission for a detached spawn, the interpreter's
 /// `Host::admit_detached_spawn`: reserve the lane of the budget behind `budget` against the parent's
 /// Σ and charge `bytes` (the child's declared window), the child's first vCPU, and the mappings its
 /// domain and window will hold — `runs` bounds the window's runs of page state
-/// (`temen_ir::window_runs_bound`, #2268) — to that budget, or none of them. Returns the lane it
-/// reserved (`-1` = unbounded), which the build then stamps on the child
-/// ([`GrantDetachedChildBuilder`]), or [`ADMIT_REFUSED`] for a forged/wrong-type handle or no room:
-/// the spawn refuses probeably (`-EINVAL`), charging nothing.
+/// (`temen_ir::window_runs_bound`, #2268) — to that budget, or none of them. Returns `0` and writes
+/// the lane it reserved (`-1` = unbounded) to `lane`, which the build then stamps on the child
+/// ([`GrantDetachedChildBuilder`]). Or it returns the refusal's `-errno`
+/// ([`temen_ir::SpawnRefusal::errno`], #2864) and the spawn answers it, charging nothing.
 ///
 /// # Safety
-/// `ctx` is the run's `cap_ctx` (the parent `Host`).
-pub type BudgetMemTaker =
-    unsafe extern "C" fn(ctx: *mut core::ffi::c_void, budget: i32, bytes: u64, runs: u64) -> i64;
-
-/// A [`BudgetMemTaker`]'s refusal. Never a lane: a lane is `-1` (unbounded) or non-negative.
-pub const ADMIT_REFUSED: i64 = i64::MIN;
+/// `ctx` is the run's `cap_ctx` (the parent `Host`), and `lane` is writable.
+pub type BudgetMemTaker = unsafe extern "C" fn(
+    ctx: *mut core::ffi::c_void,
+    budget: i32,
+    bytes: u64,
+    runs: u64,
+    lane: *mut i64,
+) -> i64;
 
 /// D66 — return a detached child's **lane** to its parent's `granted_lanes` once the child is reaped
 /// (the JIT twin of the interpreter's `credit_child_lane`). Called by the child-domain executor at
@@ -1268,6 +1288,8 @@ pub struct GrantChildHooks {
     /// **reservation** (a root's shape), and the budget that paid for its window its own (see
     /// [`GrantDetachedChildBuilder`]).
     pub build_detached: GrantDetachedChildBuilder,
+    /// #2864 — the grant list's check before the spawn is admitted (see [`GrantListCheck`]).
+    pub check_grants: GrantListCheck,
     /// #1287 — the `Budget` quota take (see [`BudgetMemTaker`]).
     pub budget_mem_take: BudgetMemTaker,
     /// #1587 — its undo for a spawn that fails after the take (see [`BudgetMemGiver`]).
@@ -1380,10 +1402,11 @@ pub type ChildGrant = unsafe extern "C" fn(
 ) -> i32;
 
 /// Bind a child module's import manifest against its built powerbox host — see
-/// [`GrantChildHooks::bind_imports`]. Returns `0` on success, nonzero when a `required` import
-/// had nothing to bind (IMPORTS.md §3.3 withhold) — the spawn then fails closed with `-EINVAL`
-/// before any child code runs, matching the interpreter's inline spawn. `module` names the child's
-/// program, as for a [`ModuleResolver`].
+/// [`GrantChildHooks::bind_imports`]. Returns `0` on success, or the `-errno` the spawn answers when
+/// a `required` import had nothing to bind (IMPORTS.md §3.3 withhold): `-ENOENT`
+/// ([`temen_ir::SpawnRefusal::Unbound`], #2864). The spawn then fails closed before any child code
+/// runs, matching the interpreter's inline spawn. `module` names the child's program, as for a
+/// [`ModuleResolver`].
 pub type ChildManifestBinder = unsafe extern "C" fn(
     parent_ctx: *mut core::ffi::c_void,
     child_ctx: *mut core::ffi::c_void,

@@ -4475,6 +4475,82 @@ pub fn child_entry_handles(arity: usize, inst: i32, space: i32) -> impl Iterator
     [inst, space].into_iter().take(arity).map(i64::from)
 }
 
+/// #2864 — why the Instantiator refused a spawn record (op 17). Each cause answers its own code, the
+/// same on every engine (INVARIANTS #14), so a spawner can say why its child did not start, and a
+/// refused spawn charges nothing. Every engine checks in one order: [`check_spawn_record`], then the
+/// pre-mapped region, then durability, then the admission (`Host::admit_detached_spawn`), then the
+/// child's imports. So a record with two causes answers the first on every engine. A trap (a forged
+/// handle, a record or payload outside the window) comes before them all.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SpawnRefusal {
+    /// `-EINVAL`: a window the module does not declare, a payload longer than the args region, or a
+    /// pre-mapped region the window does not hold.
+    Record,
+    /// `-ENOEXEC`: the module cannot run as this child. Its function 0 is no child entry
+    /// ([`child_entry_ok`]), or the spawner is durable and the module cannot be frozen.
+    Module,
+    /// `-EPERM`: a durable spawner that lacks freeze authority over its detached children (#1440).
+    Authority,
+    /// `-EBADF`: the record's budget is not a `Budget`.
+    Budget,
+    /// `-EAGAIN`: the spawner's lanes cannot cover the budget's lane (D66).
+    Lanes,
+    /// `-ENOMEM`: no room for the window and the child's first vCPU. The budget cannot pay, or the
+    /// engine cannot map the window.
+    Room,
+    /// `-ENOENT`: an import of the module that no grant binds. The spawner holds the module and the
+    /// grants, so it can name the import.
+    Unbound,
+}
+
+impl SpawnRefusal {
+    /// The `-errno` op 17 answers for this refusal.
+    pub const fn errno(self) -> i64 {
+        match self {
+            SpawnRefusal::Record => errno::EINVAL,
+            SpawnRefusal::Module => errno::ENOEXEC,
+            SpawnRefusal::Authority => errno::EPERM,
+            SpawnRefusal::Budget => errno::EBADF,
+            SpawnRefusal::Lanes => errno::EAGAIN,
+            SpawnRefusal::Room => errno::ENOMEM,
+            SpawnRefusal::Unbound => errno::ENOENT,
+        }
+    }
+}
+
+/// Whether a spawn's args payload of `len` bytes fits the args region. The length is the guest's,
+/// so an engine checks it before it reads a byte of the payload (#2338).
+pub fn spawn_args_fit(len: u64) -> bool {
+    len <= module_args_end() - module_args_base()
+}
+
+/// #2864 — what every engine checks first of a spawn record against the module it names, in this
+/// order:
+/// - the entry: `entry` is the module's function 0's params and results ([`child_entry_ok`]);
+/// - the window: the record's `size_log2` must be the module's `declared` memory
+///   ([`detached_size_log2`], §14 transparency);
+/// - the payload: `args_len` must fit the args region ([`spawn_args_fit`]).
+///
+/// `Ok` is the window's `log2`.
+pub fn check_spawn_record(
+    entry: Option<(&[ValType], &[ValType])>,
+    declared: Option<u8>,
+    size_log2: i64,
+    args_len: u64,
+) -> Result<u8, SpawnRefusal> {
+    if !entry.is_some_and(|(p, r)| child_entry_ok(p, r)) {
+        return Err(SpawnRefusal::Module);
+    }
+    let log2 = detached_size_log2(size_log2, declared);
+    if !(0..64).contains(&log2) || declared != Some(log2 as u8) {
+        return Err(SpawnRefusal::Record);
+    }
+    if !spawn_args_fit(args_len) {
+        return Err(SpawnRefusal::Record);
+    }
+    Ok(log2 as u8)
+}
+
 pub fn is_named_powerbox_entry(module: &Module) -> bool {
     module.funcs.first().is_some_and(|f| f.params.is_empty())
         && module

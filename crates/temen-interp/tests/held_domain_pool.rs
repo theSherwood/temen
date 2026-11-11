@@ -61,7 +61,11 @@ fn a_held_domain_holds_its_window_until_it_ends() {
 fn holds_its_window_until_it_ends(on: Executor, slots: u64) {
     // Other runs of the process hold every window but one.
     let mut others: Vec<Host> = std::iter::from_fn(hold).collect();
-    assert_eq!(others.len() as u64, slots, "the pool holds its windows");
+    assert_eq!(
+        others.len() as u64,
+        slots,
+        "the pool holds its windows before the {on:?} run"
+    );
     others.pop();
     let m = temen_text::parse_module(DOMAIN).expect("parse");
     temen_verify::verify_module(&m).expect("verify");
@@ -81,9 +85,14 @@ fn holds_its_window_until_it_ends(on: Executor, slots: u64) {
         );
         let mut fuel = 1_000_000u64;
         assert_eq!(d.call(0, 0, &[21], &mut fuel), Reply::Results(vec![42]));
-        let while_held = hold();
-        let (_host, trap) = d.end();
-        let _ = tx.send((while_held.is_some(), trap, hold().is_some()));
+        let while_held = hold().is_some();
+        let (host, trap) = d.end();
+        // Back at the end, though the embedder still holds the host.
+        let after = hold().is_some();
+        // The probes and the host let go before the report: the next run counts the pool's windows
+        // as soon as it hears, and anything still held would be one of them.
+        drop(host);
+        let _ = tx.send((while_held, trap, after));
     });
     let (while_held, trap, after) = rx
         .recv_timeout(std::time::Duration::from_secs(60))
