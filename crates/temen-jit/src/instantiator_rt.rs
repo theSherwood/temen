@@ -15,9 +15,10 @@ use crate::os_thread_rt::{lock, ChildEntry, ChildRef, ChildTable};
 use crate::{CapThunk, TrapKind};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Condvar, Mutex};
-use temen_ir::{Func, SpawnRec};
+use temen_ir::{Func, SpawnRec, SpawnRefusal};
 
-/// Negative-errno a refused spawn returns (§3e D42) — the one shared table.
+/// Negative-errno a refused op returns (§3e D42) — the one shared table. A refused spawn record
+/// answers its cause's own ([`SpawnRefusal`], #2864).
 use temen_ir::errno::EINVAL;
 
 /// One spawned child's **completion cell** (S1c): `(result, trap)` once the child has finished (`trap`
@@ -587,6 +588,8 @@ pub(crate) struct Nursery {
     /// inert `CapFault`, like the other grant ops without hooks).
     grant_build_detached: std::sync::atomic::AtomicUsize,
     grant_budget_mem_take: std::sync::atomic::AtomicUsize,
+    /// #2864 — [`crate::GrantListCheck`]: a spawn's grant list, checked before it is admitted.
+    grant_check_grants: std::sync::atomic::AtomicUsize,
     /// #1587 — [`crate::BudgetMemGiver`]: returns a taken quota when the OS-thread spawn fails.
     grant_budget_mem_give: std::sync::atomic::AtomicUsize,
     /// #1936 — [`crate::ChildEnded`]: a detached child's domain ended; and [`crate::ChildEndSignal`]
@@ -704,6 +707,7 @@ impl Nursery {
             shadow,
             grant_build_detached: std::sync::atomic::AtomicUsize::new(0),
             grant_budget_mem_take: std::sync::atomic::AtomicUsize::new(0),
+            grant_check_grants: std::sync::atomic::AtomicUsize::new(0),
             grant_budget_mem_give: std::sync::atomic::AtomicUsize::new(0),
             grant_child_ended: std::sync::atomic::AtomicUsize::new(0),
             grant_child_end_signal: std::sync::atomic::AtomicUsize::new(0),
@@ -787,6 +791,10 @@ impl Nursery {
         };
         self.grant_build_detached.store(bd, Ordering::Release);
         self.grant_budget_mem_take.store(mt, Ordering::Release);
+        self.grant_check_grants.store(
+            hooks.map_or(0, |h| h.check_grants as usize),
+            Ordering::Release,
+        );
         self.grant_budget_mem_give.store(mg, Ordering::Release);
         self.grant_lane_give.store(lg, Ordering::Release);
         self.grant_premap_admit.store(pa, Ordering::Release);
@@ -1696,9 +1704,9 @@ unsafe fn spawn_detached_child(
         }
         // The child never ran (a refused window, pre-map alias or task stack) — the one refusal on
         // this path that happens *after* `budget_mem_take` committed. Its teardown already ran, and
-        // that un-spent the window bytes (#1587), so answer `-EINVAL` like every other admission
-        // failure (INVARIANTS #5).
-        Filed::Refused => EINVAL as i32,
+        // that un-spent the window bytes (#1587), so it answers as any admission without room does
+        // (INVARIANTS #5, #2864).
+        Filed::Refused => SpawnRefusal::Room.errno() as i32,
     }
 }
 
@@ -1736,12 +1744,13 @@ fn init_durable_words(rw: &mut [u8], a: temen_ir::durable_abi::ShadowArena, free
     }
 }
 
-/// PROCESS.md §5 / #1287 — the detached spawn a record `sr` names, `-> child | -EINVAL`, on the native
+/// PROCESS.md §5 / #1287 — the detached spawn a record `sr` names, `-> child | -errno`, on the native
 /// JIT: a separate-module child in a **fresh window** — `1 << size_log2` committed inside a
 /// root-sized lazy reservation, no carve, no alias — minted through the record's `Budget`. Admission
-/// is the interpreter's op-17 arm errno-for-errno: child entry shape, the window **equals** the module's declared memory (§14
-/// transparency), the payload fits the args region, and the budget quota covers the window (a forged /
-/// exhausted budget refuses, charging nothing). The child powerbox is the by-name grant list plus
+/// is the interpreter's op-17 arm errno-for-errno ([`SpawnRefusal`], #2864): child entry shape, the
+/// window **equals** the module's declared memory (§14 transparency), the payload fits the args
+/// region, and the budget quota covers the window (a forged / exhausted budget refuses, charging
+/// nothing). The child powerbox is the by-name grant list plus
 /// starter caps spanning the **reservation** (a root's shape, so its `vm_map` grows the window);
 /// it attests `window_exposed = false`, or true when the record names a pager, which pages it
 /// (#2164). Data segments + the payload are seeded into the child's own window before it starts.
@@ -1770,13 +1779,15 @@ unsafe fn spawn_detached(
     let build_addr = rt.grant_build_detached.load(Ordering::Acquire);
     let release_addr = rt.grant_release.load(Ordering::Acquire);
     let take_addr = rt.grant_budget_mem_take.load(Ordering::Acquire);
-    if build_addr == 0 || release_addr == 0 || take_addr == 0 {
+    let check_addr = rt.grant_check_grants.load(Ordering::Acquire);
+    if build_addr == 0 || release_addr == 0 || take_addr == 0 || check_addr == 0 {
         vm.raise(TrapKind::CapFault as i64);
         return 0;
     }
     let build: crate::GrantDetachedChildBuilder = core::mem::transmute(build_addr);
     let release: crate::GrantChildReleaser = core::mem::transmute(release_addr);
     let take: crate::BudgetMemTaker = core::mem::transmute(take_addr);
+    let check_grants: crate::GrantListCheck = core::mem::transmute(check_addr);
     let thunk_addr = rt.grant_thunk.load(Ordering::Acquire);
     let child_thunk: crate::CapThunk = if thunk_addr != 0 {
         core::mem::transmute::<usize, crate::CapThunk>(thunk_addr)
@@ -1805,26 +1816,24 @@ unsafe fn spawn_detached(
         return 0;
     };
     let (child_funcs, child_types, child_data) = (&child.funcs[..], &child.types[..], &child.data);
-    let size_log2 = temen_ir::detached_size_log2(size_log2, mod_mem.map(|m| m as u8));
-    let child_size = if (0..64).contains(&size_log2) {
-        1u64 << size_log2
-    } else {
-        0
-    };
     let arity = child_funcs.first().map_or(0, |f| f.params.len());
-    // The one entry-shape rule every tier shares (#911, #1720): the child-entry ABI or a powerbox
-    // `_start` — never a private copy that could admit what the oracle refuses, or refuse what it runs.
-    let ok_entry = child_funcs
-        .first()
-        .is_some_and(|f| temen_ir::child_entry_ok(&f.params, &f.results));
-    // §14 transparency: the detached window equals the module's declared memory (the interpreter's
-    // op-17 `mod_ok`); it grows into its own reservation, so no superset room is needed.
-    let mod_ok = mod_mem == Some(size_log2 as i32);
+    // #2864 — the record against its module, in the order every engine checks (the shared rules,
+    // never a private copy that could admit what the oracle refuses): the entry, the child-entry ABI
+    // or a powerbox `_start` (#911, #1720); then the window, the module's declared memory (§14
+    // transparency; it grows into its own reservation, so no superset room is needed); then the
+    // payload's length.
+    let checked = temen_ir::check_spawn_record(
+        child_funcs.first().map(|f| (&f.params[..], &f.results[..])),
+        mod_mem.map(|m| m as u8),
+        size_log2,
+        sr.args.1,
+    );
+    let size_log2 = checked.map_or(0, i64::from);
+    let child_size = checked.map_or(0, |l| 1u64 << l);
     // The optional payload, read from THIS window (reserved-bounded — an out-of-window range is a
     // MemoryFault, as any window read). An over-long one refuses probeably, before anything is read:
-    // its length is the guest's, and a negative one is a length past the args region too (#2338).
-    let args_room = temen_ir::module_args_end() - temen_ir::module_args_base();
-    let payload_ok = args_len as u64 <= args_room;
+    // its length is the guest's (#2338).
+    let payload_ok = temen_ir::spawn_args_fit(sr.args.1);
     let payload: Vec<u8> = if args_len > 0 && payload_ok {
         let (p, l) = (args_ptr as u64, args_len as u64);
         match p.checked_add(l) {
@@ -1840,39 +1849,60 @@ unsafe fn spawn_detached(
     } else {
         Vec::new()
     };
+    // #2864 — the grant list, read and checked before any refusal, as the interpreters check it: a
+    // forged grant traps whatever else the record says. The build reads it again below.
+    if check_grants(
+        rt.grant_ctx(),
+        mem_base as *mut u8,
+        mem_size,
+        grants_ptr as u64,
+        grants_n as u64,
+        vm,
+    ) == 0
+    {
+        return 0;
+    }
     let durable_ok = !durable
         || (rt.child_module_durable(module)
             && child_shadow != temen_ir::durable_abi::ShadowArena::EMPTY);
-    if !ok_entry
-        || child_size == 0
-        || !mod_ok
-        || !durable_ok
-        || !payload_ok
-        || size_log2 as u8 > crate::MAX_JIT_WINDOW_LOG2
-    {
-        return EINVAL as i32;
-    }
     // The optional pre-mapped region (`region < 0` ⇒ none): admitted host-side — the interpreter's
-    // `Host::premap_admit`, a forged handle traps, bad geometry refuses — before the take.
+    // `Host::premap_admit`, a forged handle traps, bad geometry refuses — before the take. A forged
+    // region traps whatever else the record says, as on the interpreters.
     let premap = (sr.region >= 0).then_some((sr.region, sr.child_off));
     // #2268 — the child's window-ready hook, which records its read-only pages and applies the
     // pre-map, if any.
     let apply_addr = rt.grant_premap_apply.load(Ordering::Acquire);
     let window_ready =
         (apply_addr != 0).then(|| core::mem::transmute::<usize, crate::WindowReady>(apply_addr));
-    if let Some((r, o)) = premap {
-        let admit_addr = rt.grant_premap_admit.load(Ordering::Acquire);
-        let stage_addr = rt.grant_premap_stage.load(Ordering::Acquire);
-        if admit_addr == 0 || stage_addr == 0 || window_ready.is_none() {
-            vm.raise(TrapKind::CapFault as i64);
-            return 0;
+    let premap_ok = match premap {
+        Some((r, o)) => {
+            let admit_addr = rt.grant_premap_admit.load(Ordering::Acquire);
+            let stage_addr = rt.grant_premap_stage.load(Ordering::Acquire);
+            if admit_addr == 0 || stage_addr == 0 || window_ready.is_none() {
+                vm.raise(TrapKind::CapFault as i64);
+                return 0;
+            }
+            let admit: crate::PremapAdmit = core::mem::transmute(admit_addr);
+            match admit(rt.grant_ctx(), r, o, child_size, vm) {
+                1 => true,
+                0 => false,
+                _ => return 0, // forged: a `CapFault` is raised
+            }
         }
-        let admit: crate::PremapAdmit = core::mem::transmute(admit_addr);
-        match admit(rt.grant_ctx(), r, o, child_size, vm) {
-            1 => {}
-            0 => return EINVAL as i32,
-            _ => return 0, // forged: a `CapFault` is raised
-        }
+        None => true,
+    };
+    // #2864 — each refusal its own code, in the order every engine keeps.
+    let refused = checked
+        .and_then(|_| premap_ok.then_some(()).ok_or(SpawnRefusal::Record))
+        .and_then(|()| durable_ok.then_some(()).ok_or(SpawnRefusal::Module))
+        // This engine backs a window of at most `MAX_JIT_WINDOW_LOG2`: a larger one has no room.
+        .and_then(|()| {
+            (size_log2 as u8 <= crate::MAX_JIT_WINDOW_LOG2)
+                .then_some(())
+                .ok_or(SpawnRefusal::Room)
+        });
+    if let Err(refused) = refused {
+        return refused.errno() as i32;
     }
     // Admission = the lane reserved and the budget's window charge (the commit; every refusal above
     // charged nothing).
@@ -1883,9 +1913,10 @@ unsafe fn spawn_detached(
         child_size,
         temen_ir::window_runs_bound(child_data, premap.is_some()),
     );
-    let lane = take(rt.grant_ctx(), lease.0, lease.1, lease.2);
-    if lane == crate::ADMIT_REFUSED {
-        return EINVAL as i32;
+    let mut lane = 0i64;
+    let taken = take(rt.grant_ctx(), lease.0, lease.1, lease.2, &mut lane);
+    if taken != 0 {
+        return taken as i32;
     }
     // #2517 — the process's default reservation, raised to the window, as on every engine.
     let reserved_log2 = temen_ir::window_reserved_log2(size_log2 as u8);
@@ -1937,11 +1968,12 @@ unsafe fn spawn_detached(
     let bind_addr = rt.grant_bind_imports.load(Ordering::Acquire);
     if bind_addr != 0 {
         let bind: crate::ChildManifestBinder = core::mem::transmute(bind_addr);
-        if bind(rt.grant_ctx(), gc.ctx, module) != 0 {
+        let bound = bind(rt.grant_ctx(), gc.ctx, module);
+        if bound != 0 {
             release(gc.ctx);
             release(gc.retained_ctx);
             undo_admission(rt, lease, lane);
-            return EINVAL as i32;
+            return bound;
         }
     }
     // Stage the pre-mapped region into the built child powerbox (a re-grant, as the grant list); the

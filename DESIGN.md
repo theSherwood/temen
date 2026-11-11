@@ -1332,7 +1332,7 @@ the Phase-1 core loop.
   on a 39-bit one) at its admission, on every engine alike, as
   its mappings are held against the pool of those (#2268). One the pool cannot
   hold is **refused there, never a host panic** (#2305): a run ends with
-  `ThreadFault` before it starts, a detached spawn answers `-EINVAL`, a fork or
+  `ThreadFault` before it starts, a detached spawn answers `-ENOMEM` (#2864), a fork or
   spawn `-EAGAIN`. When other mappings fill the address space first, the JIT
   refuses the window's build the same way, and the interpreter falls back to a
   heap-backed window.

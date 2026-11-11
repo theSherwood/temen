@@ -27,6 +27,8 @@ use temen_ir::{
     VFloatBinOp, VFloatUnOp, VICmpOp, VIntBinOp, VIntUnOp, VNarrowOp, VPMinMaxOp, VSatBinOp,
     VShape, VShiftOp, VWidenOp, ValIdx, ValType, VarInfo, VarLoc,
 };
+// #2864 — a refused spawn record's cause, which `Host::admit_detached_spawn` answers.
+pub use temen_ir::SpawnRefusal;
 use temen_mask::Window;
 use temen_mem::RmwOp;
 // Re-exported so an embedder can build a `Region::shared` over host memory (e.g. the wasm shared
@@ -16427,7 +16429,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             let r = grant_into_running(host, callee.as_ref(), gh)?;
                             frames[top].vals.push(Reg::from_i32(r as i32));
                         }
-                        // CONSOLIDATION.md §3 — `instantiate_rec(record_ptr) -> child | -EINVAL`
+                        // CONSOLIDATION.md §3 — `instantiate_rec(record_ptr) -> child | -errno`
                         // (op 17), the one spawn form (INVARIANTS #13, #1863): the record
                         // ([`SpawnRec`]) names the module the child runs from its function 0 (#2219),
                         // the `Budget` whose `mem` mints its **fresh platform window** (#1289 R2), the
@@ -16441,7 +16443,8 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         // kill/join/fuel authority — detachment severs *read*, not lifecycle. A
                         // malformed record (a bad version, a nonzero reserved word) fails the spawn
                         // closed before any child state exists; a non-`Budget`, bad size, budget miss
-                        // or unbound import refuses probeably, and a refused spawn charges nothing.
+                        // or unbound import refuses probeably, each with its own code
+                        // ([`SpawnRefusal`], #2864), and a refused spawn charges nothing.
                         // No D38 contact: the child's window is an ordinary reservation with its own
                         // guard, exactly a root run's.
                         17 => {
@@ -16474,9 +16477,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             // nothing). An over-long payload refuses probeably, before anything is
                             // read: its length is the guest's (#2338).
                             let payload_at = (rec.args.1 > 0).then_some(rec.args);
-                            let payload_ok = payload_at.is_none_or(|(_, len)| {
-                                len <= temen_ir::module_args_end() - temen_ir::module_args_base()
-                            });
+                            let payload_ok = temen_ir::spawn_args_fit(rec.args.1);
                             // The **pre-mapped region** `(region, child_off)` (`region` −1 = none): a
                             // `SharedRegion` of this domain aliased whole, read-write, into the
                             // child's window at `child_off` before it starts — the same alias the
@@ -16509,19 +16510,19 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             authorize_eval_grants(&host.lock_unpoisoned(), &glist)?;
                             let cfs: &[Func] = &cm.module.funcs;
                             let arity = cfs.first().map_or(0, |f| f.params.len());
-                            let ok_entry = cfs
-                                .first()
-                                .is_some_and(|f| bytecode::child_entry_ok(&f.params, &f.results));
-                            let size_log2 =
-                                temen_ir::detached_size_log2(size_log2, cm.memory_log2());
-                            let child_size = if (0..64).contains(&size_log2) {
-                                1u64 << size_log2
-                            } else {
-                                0
-                            };
-                            // §14 transparency: the detached window equals the module's
-                            // declared memory (a module with no memory can't spawn).
-                            let mod_ok = cm.memory_log2() == Some(size_log2 as u8);
+                            // #2864 — the record against its module, in the order every engine
+                            // checks: the entry, then the window (§14 transparency: the module's
+                            // declared memory), then the payload's length.
+                            let checked = temen_ir::check_spawn_record(
+                                cfs.first().map(|f| (&f.params[..], &f.results[..])),
+                                cm.memory_log2(),
+                                size_log2,
+                                rec.args.1,
+                            );
+                            let size_log2 = checked.map_or(0, i64::from);
+                            let child_size = checked.map_or(0, |l| 1u64 << l);
+                            // A forged region traps whatever else the record says, as on every
+                            // engine; its geometry is checked after the record's.
                             let premap_ok = match premap {
                                 Some((r, o)) => {
                                     host.lock_unpoisoned().premap_admit(r, o, child_size)?
@@ -16549,16 +16550,14 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 bytes: child_size,
                                 runs: window_runs_bound(&cm.module.data, premap.is_some()),
                             };
-                            let admitted = (ok_entry
-                                && child_size != 0
-                                && mod_ok
-                                && mod_durable_ok
-                                && payload_ok
-                                && premap_ok)
-                                .then(|| host.lock_unpoisoned().admit_detached_spawn(lease))
-                                .flatten();
-                            if admitted.is_none() {
-                                frames[top].vals.push(Reg::from_i32(EINVAL as i32));
+                            let admitted = checked
+                                .and_then(|_| premap_ok.then_some(()).ok_or(SpawnRefusal::Record))
+                                .and_then(|()| {
+                                    mod_durable_ok.then_some(()).ok_or(SpawnRefusal::Module)
+                                })
+                                .and_then(|()| host.lock_unpoisoned().admit_detached_spawn(lease));
+                            if let Err(refused) = admitted {
+                                frames[top].vals.push(Reg::from_i32(refused.errno() as i32));
                             } else {
                                 let child_lane_val = admitted.unwrap_or(-1);
                                 // The fresh platform window: its own reservation + guard,
@@ -16631,7 +16630,9 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                     ch.bind_child_manifest(&cm.module.imports, &cm.module.types);
                                 if bound.is_err() {
                                     undo();
-                                    frames[top].vals.push(Reg::from_i32(EINVAL as i32));
+                                    frames[top]
+                                        .vals
+                                        .push(Reg::from_i32(SpawnRefusal::Unbound.errno() as i32));
                                 } else {
                                     ch.set_self_module_opt(Some(Arc::clone(&cm.module)));
                                     // #2268 — its window starts, its pre-map in it.
@@ -30259,26 +30260,28 @@ impl Host {
     /// is spent for the window ([`Host::budget_mem_take`]), and its `spawn` for the child's first vCPU
     /// (#1944 slice 3: the budget that pays for a child's window pays for its vCPUs, so a spawn-0
     /// budget funds no child), as one step — if a later charge refuses the earlier ones are undone, so
-    /// a refused spawn charges nothing. `Some(lane)` = admitted (the lane to stamp on the child and to
-    /// return at its reap); `None` = refused, probeably. The window's lease hands the `mem` and the
-    /// vCPU back when the child ends ([`Host::release_detached`]).
-    pub fn admit_detached_spawn(&mut self, lease: Lease) -> Option<i64> {
+    /// a refused spawn charges nothing. `Ok(lane)` = admitted (the lane to stamp on the child and to
+    /// return at its reap); `Err` = refused, probeably, with its cause (#2864). The window's lease
+    /// hands the `mem` and the vCPU back when the child ends ([`Host::release_detached`]).
+    pub fn admit_detached_spawn(&mut self, lease: Lease) -> Result<i64, SpawnRefusal> {
         // #1361 step 4 — R1's endpoint (#1440): a **durable** domain spawns detached only over children
         // a freeze of it may capture, i.e. while it holds freeze authority over its detached progeny.
         // Checked first, so a refusal charges nothing.
         if self.durable && !self.holds_freeze_authority() {
-            return None;
+            return Err(SpawnRefusal::Authority);
         }
+        let Some(node) = self.budget_node(lease.budget) else {
+            return Err(SpawnRefusal::Budget);
+        };
         let lane = self.peek_budget(lease.budget).map_or(-1, |b| b.lane);
         if !self.try_grant_lane(lane) {
-            return None;
+            return Err(SpawnRefusal::Lanes);
         }
-        let node = self.budget_node(lease.budget);
-        if !node.is_some_and(|n| self.budgets.add(n, &lease.cost(), Fits::All)) {
+        if !self.budgets.add(node, &lease.cost(), Fits::All) {
             self.give_lane(lane);
-            return None;
+            return Err(SpawnRefusal::Room);
         }
-        Some(lane)
+        Ok(lane)
     }
 
     /// #1975 — the undo of [`Host::admit_detached_spawn`], for a spawn that goes no further after its
@@ -33530,6 +33533,19 @@ impl Host {
     /// The spawn's check for its whole grant list, which every engine's spawn asks before it builds
     /// anything: each record passes [`Self::can_grant_entry`], and at most one names the end post
     /// ([`END_GRANT`]).
+    /// #2864 — a spawn record's grant list, checked before anything of the spawn is admitted: every
+    /// handle one this host may grant into a child, a #744 live self-serve grant only from a host in
+    /// a shared cell. A miss is the fail-closed `CapFault`, whatever else the record says. The
+    /// bytecode engine's spawn and the JIT's ([`temen_jit::GrantListCheck`] in `temen-run`) both
+    /// check here, and the child's build checks the same again.
+    pub fn check_grant_list(&self, list: &[(String, i32)]) -> Result<(), Trap> {
+        if self.can_grant_list(list, self.own_cell().is_some()) {
+            Ok(())
+        } else {
+            Err(Trap::CapFault)
+        }
+    }
+
     fn can_grant_list(&self, list: &[(String, i32)], callable: bool) -> bool {
         list.iter().filter(|(n, _)| n == END_GRANT).count() <= 1
             && list

@@ -2546,7 +2546,18 @@ locked_parent_hook!(
 locked_parent_hook!(
     budget_mem_take_locked,
     budget_mem_take,
-    (budget: i32, bytes: u64, runs: u64) -> i64
+    (budget: i32, bytes: u64, runs: u64, lane: *mut i64) -> i64
+);
+locked_parent_hook!(
+    grant_list_check_locked,
+    grant_list_check,
+    (
+        mem_base: *mut u8,
+        mem_size: u64,
+        grants_ptr: u64,
+        grants_n: u64,
+        vm: &temen_jit::VmCtx,
+    ) -> i32
 );
 locked_parent_hook!(
     budget_mem_give_locked,
@@ -2823,6 +2834,11 @@ pub fn production_grant_hooks(ctx: CapCtx) -> temen_jit::GrantChildHooks {
             grant_detached_child_build_locked
         } else {
             grant_detached_child_build
+        },
+        check_grants: if locked {
+            grant_list_check_locked
+        } else {
+            grant_list_check
         },
         budget_mem_take: if locked {
             budget_mem_take_locked
@@ -3838,10 +3854,10 @@ pub unsafe extern "C" fn child_bind_imports(
     // 5c.0 — the child powerbox is a shared cell now (`Arc<Mutex<Host>>` raw): lock to bind.
     let child_cell = &*(child_ctx as *const Mutex<Host>);
     if let Some(m) = parent.spawn_module(module as i32) {
-        // §3.3 withhold: nonzero fails the spawn closed at the JIT call site (-EINVAL).
+        // §3.3 withhold: the spawn fails closed at the JIT call site, answering this code (#2864).
         let mut child = child_cell.lock().unwrap_or_else(|e| e.into_inner());
         if child.bind_child_manifest(&m.imports, &m.types).is_err() {
-            return -22;
+            return temen_ir::SpawnRefusal::Unbound.errno() as i32;
         }
         // The child runs this program: its own self module, as the interpreter's spawn arms stamp it
         // (serve/offer resolution; and what a freeze of a detached child names it by, #1361).
@@ -4115,18 +4131,47 @@ unsafe fn window_aliases(
     }
 }
 
-/// PROCESS.md §5 / #1287 — the admission for a detached spawn on the JIT
-/// ([`temen_jit::BudgetMemTaker`]): the lane it reserved, or [`temen_jit::ADMIT_REFUSED`] for a
-/// forged/wrong-type handle or no room (nothing charged) — the spawn refuses probeably, as the
-/// interpreter's admission does.
+/// #2864 — the [`temen_jit::GrantListCheck`] a detached spawn makes before it is admitted: its grant
+/// records read from the parent's window, as [`grant_detached_child_build`] reads them, and their
+/// handles checked as the interpreters check them ([`Host::check_grant_list`]). `1`, or `0` with the
+/// trap raised.
 ///
 /// # Safety
-/// `ctx` is the live `*mut Host` (the cap thunk's parent host).
+/// `ctx` is the live `*mut Host`; `[mem_base, mem_base + mem_size)` is the parent's mapped window.
+pub unsafe extern "C" fn grant_list_check(
+    ctx: *mut c_void,
+    mem_base: *mut u8,
+    mem_size: u64,
+    grants_ptr: u64,
+    grants_n: u64,
+    vm: &temen_jit::VmCtx,
+) -> i32 {
+    let Some(grants) = read_grant_records(mem_base, mem_size, grants_ptr, grants_n, vm) else {
+        return 0;
+    };
+    let parent = &*(ctx as *mut Host);
+    match parent.check_grant_list(&grants) {
+        Ok(()) => 1,
+        Err(t) => {
+            vm.raise(t.code());
+            0
+        }
+    }
+}
+
+/// PROCESS.md §5 / #1287 — the admission for a detached spawn on the JIT
+/// ([`temen_jit::BudgetMemTaker`]): `0`, with the lane it reserved written to `lane`, or the
+/// refusal's `-errno` (nothing charged) — the spawn refuses probeably, as the interpreter's admission
+/// does, with the same code (#2864).
+///
+/// # Safety
+/// `ctx` is the live `*mut Host` (the cap thunk's parent host), and `lane` is writable.
 pub unsafe extern "C" fn budget_mem_take(
     ctx: *mut c_void,
     budget: i32,
     bytes: u64,
     runs: u64,
+    lane: *mut i64,
 ) -> i64 {
     let parent = &mut *(ctx as *mut Host);
     // D66 — the same one-call admission the interpreter engines use (`Host::admit_detached_spawn`):
@@ -4138,9 +4183,13 @@ pub unsafe extern "C" fn budget_mem_take(
         bytes,
         runs,
     };
-    parent
-        .admit_detached_spawn(lease)
-        .unwrap_or(temen_jit::ADMIT_REFUSED)
+    match parent.admit_detached_spawn(lease) {
+        Ok(reserved) => {
+            *lane = reserved;
+            0
+        }
+        Err(refused) => refused.errno(),
+    }
 }
 
 /// D66 — a reaped detached child returns its lane to the parent ([`temen_jit::LaneGiver`]).

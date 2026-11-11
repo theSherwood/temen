@@ -401,13 +401,18 @@ fn a_detached_child_attests_its_spawners_tier() {
     agree_on_every_driver("a detached spawn, a tier-0 spawner", &m, &setup, &ok(0));
 }
 
-/// An unbound required import refuses the spawn `-EINVAL` (IMPORTS.md §3.3 withhold).
+/// An unbound required import refuses the spawn `-ENOENT` (IMPORTS.md §3.3 withhold, #2864).
 #[test]
 fn a_detached_child_whose_import_is_unbound_is_refused() {
     let m = module(&detached(false));
     let child = module(DETACHED_IMPORTS_EXIT);
     let setup = detached_setup(&child, 1 << 20);
-    agree_on_every_driver("a detached spawn, an unbound import", &m, &setup, &ok(-22));
+    agree_on_every_driver(
+        "a detached spawn, an unbound import",
+        &m,
+        &setup,
+        &ok(temen_ir::errno::ENOENT),
+    );
     // #1975 — and it charged nothing: the import is bound after the admission, whose take the refusal
     // hands back, so the budget still has all its room.
     let m = module(&detached_then(false, ROOM_AFTER_REFUSAL));
@@ -460,7 +465,7 @@ fn a_detached_spawn_beyond_the_budget_is_refused() {
         "a detached spawn, a budget one byte short",
         &m,
         &setup,
-        &ok(-22),
+        &ok(temen_ir::errno::ENOMEM),
     );
 }
 
@@ -504,7 +509,7 @@ fn a_detached_window_is_charged_to_every_level_of_the_chain() {
         "a detached spawn, the root's use caps its node",
         &m,
         &detached_tree_setup(&child, 1 << 16, 1 << 15, 3 << 14, false),
-        &ok(-22),
+        &ok(temen_ir::errno::ENOMEM),
     );
     agree_on_every_driver(
         "a detached spawn, room at every level",
@@ -516,7 +521,7 @@ fn a_detached_window_is_charged_to_every_level_of_the_chain() {
         "a detached spawn, the node one byte short",
         &m,
         &detached_tree_setup(&child, 1 << 20, (1 << 15) - 1, 0, false),
-        &ok(-22),
+        &ok(temen_ir::errno::ENOMEM),
     );
     agree_on_every_driver(
         "a detached spawn, a split reserves nothing",
@@ -1029,7 +1034,7 @@ fn a_childs_ceiling_caps_its_subtree_while_its_parent_has_room() {
         "a child whose 64 KiB ceiling its own window fills",
         &m,
         &generations_setup(&m, &[1, 2]),
-        &ok(-22 + 100),
+        &ok(temen_ir::errno::ENOMEM + 100),
     );
 }
 
@@ -1135,7 +1140,7 @@ fn a_childs_spawn_ceiling_counts_itself_and_its_children() {
         "a child whose one-vCPU ceiling it fills",
         &m,
         &generations_setup(&m, &[1, 2]),
-        &ok(-22 + 100),
+        &ok(temen_ir::errno::ENOMEM + 100),
     );
     let m = module(&three_generations(1 << 17, 2));
     agree_on_every_driver(
@@ -1677,11 +1682,15 @@ fn an_empty_grant_satisfies_an_import_nothing_else_does() {
     let child = module(DETACHED_IMPORTS_EXIT);
     let setup = detached_setup(&child, 1 << 20);
     for (what, grants, want) in [
-        ("no grant", vec![], -22),
+        ("no grant", vec![], temen_ir::errno::ENOENT),
         ("an exact empty grant", vec![("exit", EMPTY)], 42),
         ("`*`", vec![("*", EMPTY)], 42),
         ("a covering prefix", vec![("ex*", EMPTY)], 42),
-        ("a prefix that misses", vec![("vm_*", EMPTY)], -22),
+        (
+            "a prefix that misses",
+            vec![("vm_*", EMPTY)],
+            temen_ir::errno::ENOENT,
+        ),
     ] {
         let m = module(&op17_granting(&grants));
         agree_on_every_driver(what, &m, &setup, &ok(want));
@@ -1741,13 +1750,14 @@ fn a_pattern_is_only_an_empty_grant() {
     }
 }
 
-/// A refused spawn's guest sees `-EINVAL`; the run's notes name the import nothing satisfied, for the
+/// A refused spawn's guest sees `-ENOENT`; the run's notes name the import nothing satisfied, for the
 /// embedder to show, and an admitted spawn leaves none.
 #[test]
 fn a_refusal_notes_the_import_nothing_satisfied() {
     let child = module(DETACHED_IMPORTS_EXIT);
     let setup = detached_setup(&child, 1 << 20);
-    for (grants, want, noted) in [(vec![], -22, true), (vec![("exit", EMPTY)], 42, false)] {
+    let unbound = temen_ir::errno::ENOENT;
+    for (grants, want, noted) in [(vec![], unbound, true), (vec![("exit", EMPTY)], 42, false)] {
         let m = module(&op17_granting(&grants));
         for d in drivers::ALL {
             let Some((ran, notes)) = run_on_then(d, &m, &setup, &|h| h.take_notes()) else {

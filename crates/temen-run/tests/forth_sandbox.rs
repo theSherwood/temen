@@ -76,11 +76,11 @@ fn a_sandboxed_definition_does_not_escape() {
 
 /// A sandbox cannot nest one here: the child's `budget` is the node that paid for its window (#1944)
 /// — the host's one-window budget, which the child's own window fills — so the inner spawn is refused
-/// and the inner `sandbox` returns its `-EINVAL`.
+/// for want of room and the inner `sandbox` returns its `-ENOMEM` (#2864).
 #[test]
 fn a_sandbox_cannot_sandbox() {
     let (out, _) = run(Backend::Bytecode, "s\" 0 0 sandbox . cr\" sandbox drop\n");
-    assert_eq!(out, "-22 \n", "inner sandbox must be refused");
+    assert_eq!(out, "-12 \n", "inner sandbox must be refused");
 }
 
 /// The issue's first gate: the child redefines a word the parent already has, prints with *its*

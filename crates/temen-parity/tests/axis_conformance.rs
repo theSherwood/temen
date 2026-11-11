@@ -391,8 +391,9 @@ fn the_spawn_sweep_reaches_admission() {
     };
     assert_eq!(
         once(Way::OneShot(Executor::Pump), &g, false, None),
-        End::Value(-22),
-        "the op-17 sweep must get past reading its record into admission"
+        End::Value(temen_ir::SpawnRefusal::Budget.errno()),
+        "the op-17 sweep must get past reading its record into admission, where a record naming no \
+         Budget is refused (#2864)"
     );
 }
 

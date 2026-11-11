@@ -1883,13 +1883,17 @@ fn a_detached_childs_region_spends_its_budget_on_every_tier() {
 }
 
 /// #1944 (the owner's A/B/C example): a child's ceiling caps its whole subtree even while its parent
-/// has room. The child's 128 KiB ceiling holds its own window, so its child's spawn is refused
-/// (`-22 + 100`), under a root budget of 1 MiB.
+/// has room. The child's 128 KiB ceiling holds its own window, so its child's spawn is refused for
+/// want of room (`-ENOMEM + 100`, #2864), under a root budget of 1 MiB.
 #[test]
 fn a_childs_ceiling_caps_its_subtree_while_its_parent_has_room() {
     let src = three_generations(1 << 17);
     for b in BACKENDS {
-        assert_eq!(run_detached(b, &src).expect("run"), 78, "{b:?}");
+        assert_eq!(
+            run_detached(b, &src).expect("run"),
+            temen_ir::errno::ENOMEM as i32 + 100,
+            "{b:?}"
+        );
     }
 }
 
