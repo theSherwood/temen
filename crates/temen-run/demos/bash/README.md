@@ -309,8 +309,8 @@ on every driver as well — cooperative, parallel, and the threaded debug engine
 The same bytecode also runs over the **parallel driver** (`BASH_PROBE_BACKEND=parallel`, routed through
 `Instance::run_with_caps_parallel`; executor 2, `drive_threads`, since #1414 3e): every bash `fork()`
 twin is a real OS thread over a private window copy with its own powerbox, and `waitpid`, pipes and
-`execve` take the cooperative pump's rules — a parked thread waits on its condvar, a pipe park is
-polled every 50 µs, and the exec'ing thread steps the new image. Builtin pipelines, command/process
+`execve` take the cooperative pump's rules — a parked thread sleeps until something can end its park
+(a pipe's store wakes the threads parked on it, #2757), and the exec'ing thread steps the new image. Builtin pipelines, command/process
 substitution, subshells, and the exec'd-coreutil pipelines (`seq | head`, `seq 100 | wc -l`,
 `sort | uniq`, redirections) all match the cooperative tier. The bash capstone gate
 (`demo_bash_translates_and_verifies`) pins this as the **three-engine differential**: every script in

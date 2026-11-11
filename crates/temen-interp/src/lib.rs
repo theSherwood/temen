@@ -20924,7 +20924,60 @@ type PipeBacking = (
     u32,                        // global pipe id — THE park/wake key (`Sched::pipe_waiters`)
     Option<Arc<ChannelCharge>>, // #989 — channel-memory charge (minter's counter + refund guard)
     bool, // #1926 — one-shot EOF: the terminal's input, whose read of an EOF restores the writer
+    Arc<PipeWakers>, // #2757 — the wakers the ops parked on it registered ([`PipeProbe::listen`])
 );
+
+/// #2757 — the wakers that ops parked on a pipe registered ([`PipeProbe::listen`]). The next store
+/// that can end such a park takes and fires every one: a write, a read that drains a full pipe, or
+/// the close of its last writer or reader ([`Host::drop_pipe_writer`], [`Host::drop_pipe_reader`]).
+/// A woken op that must park again registers again, so a stream of writes fires once per park, not
+/// once per write, and with nothing registered a store reads one atomic.
+#[derive(Default)]
+pub(crate) struct PipeWakers {
+    count: std::sync::atomic::AtomicUsize,
+    wakers: Mutex<Vec<Arc<dyn Fn() + Send + Sync>>>,
+}
+
+impl PipeWakers {
+    /// A store that can end a park on the pipe: take every registered waker, and fire it.
+    fn fire(&self) {
+        use std::sync::atomic::Ordering::SeqCst;
+        if self.count.load(SeqCst) == 0 {
+            return;
+        }
+        let wakers = {
+            let mut wakers = self.wakers.lock_unpoisoned();
+            self.count.store(0, SeqCst);
+            std::mem::take(&mut *wakers)
+        };
+        for waker in wakers {
+            waker();
+        }
+    }
+}
+
+/// #2757 — a waker registered on a pipe ([`PipeProbe::listen`]), until a store fires it or this is
+/// dropped.
+pub(crate) struct PipeListen {
+    wakers: Arc<PipeWakers>,
+    waker: Arc<dyn Fn() + Send + Sync>,
+}
+
+impl Drop for PipeListen {
+    fn drop(&mut self) {
+        let mut wakers = self.wakers.wakers.lock_unpoisoned();
+        let me = Arc::as_ptr(&self.waker).cast::<()>();
+        if let Some(i) = wakers
+            .iter()
+            .position(|w| Arc::as_ptr(w).cast::<()>() == me)
+        {
+            wakers.swap_remove(i);
+            self.wakers
+                .count
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+}
 
 /// #1826 — one end of a pipe, as a parked op sees it: whether the op can proceed, readable from the
 /// pipe's shared state alone, so a waiter can re-check it without the `Host` (a JIT park waits with
@@ -20937,6 +20990,7 @@ pub struct PipeProbe {
     others: Arc<std::sync::atomic::AtomicUsize>,
     gid: u32,
     write: bool,
+    wakers: Arc<PipeWakers>,
 }
 
 impl PipeProbe {
@@ -20956,6 +21010,22 @@ impl PipeProbe {
     /// The pipe's global id, its park/wake key across domains.
     pub fn gid(&self) -> u32 {
         self.gid
+    }
+
+    /// #2757 — register `waker` for the next store that can end a park on this pipe, until the
+    /// returned listen is dropped. Register before the look that decides to park: a store between
+    /// the two is then either seen by the look or fires the waker.
+    pub(crate) fn listen(&self, waker: &Arc<dyn Fn() + Send + Sync>) -> PipeListen {
+        let mut wakers = self.wakers.wakers.lock_unpoisoned();
+        wakers.push(Arc::clone(waker));
+        self.wakers
+            .count
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        drop(wakers);
+        PipeListen {
+            wakers: Arc::clone(&self.wakers),
+            waker: Arc::clone(waker),
+        }
     }
 }
 
@@ -27395,7 +27465,7 @@ impl Host {
         // forking a stage and that stage installing its own ends.
         for s in &twin.table {
             if let Some(Binding::PipeEnd { pipe, write }) = s.entry {
-                if let Some((_, writers, readers, _, _, _)) = twin.pipes.get(pipe as usize) {
+                if let Some((_, writers, readers, _, _, _, _)) = twin.pipes.get(pipe as usize) {
                     let counter = if write { writers } else { readers };
                     counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 }
@@ -27996,12 +28066,13 @@ impl Host {
     /// #1826 — end `write` of domain-local pipe `pipe`, as a [`PipeProbe`]: its readiness, readable
     /// without this `Host`. `None` for no such pipe.
     pub fn pipe_probe(&self, pipe: u32, write: bool) -> Option<PipeProbe> {
-        let (fifo, writers, readers, gid, _, _) = self.pipes.get(pipe as usize)?;
+        let (fifo, writers, readers, gid, _, _, wakers) = self.pipes.get(pipe as usize)?;
         Some(PipeProbe {
             fifo: Arc::clone(fifo),
             others: Arc::clone(if write { readers } else { writers }),
             gid: *gid,
             write,
+            wakers: Arc::clone(wakers),
         })
     }
 
@@ -28064,6 +28135,14 @@ impl Host {
         self.term_flag.load(Ordering::SeqCst) || self.park_interrupted()
     }
 
+    /// #2757 — a store into pipe `pipe` that can end a park on it: fire what its parked ops
+    /// registered ([`PipeWakers`]).
+    fn fire_pipe_wakers(&self, pipe: u32) {
+        if let Some((.., wakers)) = self.pipes.get(pipe as usize) {
+            wakers.fire();
+        }
+    }
+
     /// FORK.md §8.6 — decrement a pipe's shared **writer** count by one (a write end closed or its
     /// holder exited). Returns `true` if the count reached `0` — the caller must then wake that pipe's
     /// parked readers (they re-issue their read, see writers == 0, and get EOF).
@@ -28071,10 +28150,11 @@ impl Host {
         use std::sync::atomic::Ordering::SeqCst;
         match self.pipes.get(pipe as usize) {
             // `fetch_sub` returns the *previous* value; it hits 0 exactly when the previous was 1.
-            Some((_, writers, _, _, _, _)) if writers.load(SeqCst) > 0 => {
+            Some((_, writers, _, _, _, _, wakers)) if writers.load(SeqCst) > 0 => {
                 let zeroed = writers.fetch_sub(1, SeqCst) == 1;
                 if zeroed {
                     self.refund_if_dead(pipe); // #989 — last writer gone; refund iff readers already 0
+                    wakers.fire();
                 }
                 zeroed
             }
@@ -28088,7 +28168,7 @@ impl Host {
     /// backings) idempotent. `&self`: the counter and guard are atomics, so no `&mut` is needed.
     fn refund_if_dead(&self, pipe: u32) {
         use std::sync::atomic::Ordering::SeqCst;
-        if let Some((_, writers, readers, _, Some(charge), _)) = self.pipes.get(pipe as usize) {
+        if let Some((_, writers, readers, _, Some(charge), _, _)) = self.pipes.get(pipe as usize) {
             if writers.load(SeqCst) == 0
                 && readers.load(SeqCst) == 0
                 && charge
@@ -28110,10 +28190,11 @@ impl Host {
     fn drop_pipe_reader(&self, pipe: u32) -> bool {
         use std::sync::atomic::Ordering::SeqCst;
         match self.pipes.get(pipe as usize) {
-            Some((_, _, readers, _, _, _)) if readers.load(SeqCst) > 0 => {
+            Some((_, _, readers, _, _, _, wakers)) if readers.load(SeqCst) > 0 => {
                 let zeroed = readers.fetch_sub(1, SeqCst) == 1;
                 if zeroed {
                     self.refund_if_dead(pipe); // #989 — last reader gone; refund iff writers already 0
+                    wakers.fire();
                 }
                 zeroed
             }
@@ -29757,7 +29838,7 @@ impl Host {
         use std::sync::atomic::Ordering::SeqCst;
         self.durable_pipe_backings()
             .into_iter()
-            .map(|(key, (fifo, writers, readers, _, _, _))| DurablePipe {
+            .map(|(key, (fifo, writers, readers, _, _, _, _))| DurablePipe {
                 key,
                 bytes: fifo.lock_unpoisoned().iter().copied().collect(),
                 writers: writers.load(SeqCst),
@@ -29806,6 +29887,7 @@ impl Host {
                 gid,
                 self.charge_channel(),
                 false,
+                Arc::default(),
             );
             self.thaw_pipes.insert(gid, b);
             ids.push(gid);
@@ -30742,6 +30824,7 @@ impl Host {
             next_pipe_gid(),
             charge,
             false,
+            Arc::default(),
         ));
         let w = self.grant(cap_id::STREAM, Binding::PipeEnd { pipe, write: true });
         let r = self.grant(cap_id::STREAM, Binding::PipeEnd { pipe, write: false });
@@ -30770,6 +30853,7 @@ impl Host {
             next_pipe_gid(),
             Some(charge),
             false,
+            Arc::default(),
         ));
         let w = self.try_grant(cap_id::STREAM, Binding::PipeEnd { pipe, write: true })?;
         let r = self.try_grant(cap_id::STREAM, Binding::PipeEnd { pipe, write: false })?;
@@ -30838,6 +30922,7 @@ impl Host {
             gid,
             None, // #989 — embedder-owned terminal input, not guest-minted channel memory
             true, // #1926 — a `^D` ends one read, not every read after it
+            Arc::default(),
         ));
         let r = self.grant(cap_id::STREAM, Binding::PipeEnd { pipe, write: false });
         (r, backing, writers, gid)
@@ -30856,6 +30941,7 @@ impl Host {
             next_pipe_gid(),
             None, // #989 — embedder-owned filter input, not guest-minted channel memory
             false,
+            Arc::default(),
         ));
         let r = self.grant(cap_id::STREAM, Binding::PipeEnd { pipe, write: false });
         (r, backing)
@@ -36155,9 +36241,10 @@ impl Host {
         use std::sync::atomic::Ordering::SeqCst;
         let ret = |v: i64| Ok(v);
         // Clone the shared Arcs out so the `&mut self` flag writes below don't alias `self.pipes`.
-        let Some((fifo_arc, writers_arc, readers_arc, gid, _, one_shot_eof)) =
-            self.pipes.get(pipe as usize).cloned()
-        else {
+        let Some((fifo_arc, writers_arc, readers_arc, gid, one_shot_eof)) = (self
+            .pipes
+            .get(pipe as usize))
+        .map(|(f, w, r, g, _, eof, _)| (Arc::clone(f), Arc::clone(w), Arc::clone(r), *g, *eof)) else {
             return ret(EINVAL);
         };
         let mut fifo = fifo_arc.lock_unpoisoned();
@@ -36195,6 +36282,7 @@ impl Host {
                 // never had a parked writer, so the wake would be a no-op scan.
                 if was_full {
                     self.pipe_wake_writers = Some(gid);
+                    self.fire_pipe_wakers(pipe);
                 }
                 let Some(m) = mem else {
                     return ret(EFAULT);
@@ -36238,6 +36326,7 @@ impl Host {
                 fifo.extend(bytes);
                 drop(fifo);
                 self.pipe_wake = Some(gid); // eval loop wakes readers parked on this pipe
+                self.fire_pipe_wakers(pipe);
                 ret(n as i64)
             }
             2 => ret(0), // close: refcount decrement is handled in the dispatch arm (it sees the handle)
@@ -44093,5 +44182,67 @@ mod take_from_cell_tests {
             cell_alive.upgrade().is_none(),
             "and the cell with the child's"
         );
+    }
+}
+
+#[cfg(test)]
+mod pipe_wakers_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+
+    /// #2757 — a store that can end a park on a pipe takes and fires the wakers its parked ops
+    /// registered ([`PipeProbe::listen`]), whichever domain makes it: a write, a read that drains a
+    /// full pipe, and the close of its last writer. A store fires a waker once, and nothing fires one
+    /// whose listen is gone.
+    #[test]
+    fn a_pipe_store_fires_the_wakers_its_parked_ops_registered_once() {
+        let mut h = Host::new();
+        let (w, _r) = h.grant_pipe();
+        // A second domain holds the write end too, as a forked or granted child would.
+        let mut peer = Host::new();
+        let (write, backing) = h.resolve_pipe_end(w).expect("a pipe end");
+        peer.install_pipe_end(write, backing);
+        let fired = Arc::new(AtomicUsize::new(0));
+        let f = Arc::clone(&fired);
+        let waker: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            f.fetch_add(1, SeqCst);
+        });
+        let mut win = vec![0u8; 2 * PIPE_CAP];
+        let mut op = |h: &mut Host, write: bool, op: u32, len: usize| {
+            let mut m = WindowMem::new(&mut win, 2 * PIPE_CAP as u64);
+            h.pipe_op(0, write, op, &[0, len as i64], Some(&mut m))
+                .expect("a pipe op")
+        };
+        let listen = |h: &Host| h.pipe_probe(0, false).expect("the read end").listen(&waker);
+
+        // Nothing registered: a store fires nothing.
+        assert_eq!(op(&mut peer, true, 1, 1), 1);
+        let _a = listen(&h);
+        // The peer's write fills the pipe: it fires the waker, once.
+        assert_eq!(op(&mut peer, true, 1, PIPE_CAP), (PIPE_CAP - 1) as i64);
+        assert_eq!(fired.load(SeqCst), 1, "the peer's write fired the waker");
+        assert_eq!(op(&mut h, false, 0, 1), 1);
+        assert_eq!(fired.load(SeqCst), 1, "a store fires a waker once");
+        // A read from a full pipe makes room for a parked writer.
+        assert_eq!(op(&mut peer, true, 1, 1), 1);
+        let _b = listen(&h);
+        assert_eq!(op(&mut h, false, 0, 1), 1);
+        assert_eq!(fired.load(SeqCst), 2, "the read from a full pipe fired it");
+        let _c = listen(&h);
+        assert_eq!(op(&mut h, false, 0, 1), 1);
+        assert_eq!(
+            fired.load(SeqCst),
+            2,
+            "a read from a pipe with room ends no park"
+        );
+        // The last writer's close fires it: a parked read then sees EOF.
+        assert!(!peer.drop_pipe_writer(0), "one writer is left");
+        assert_eq!(fired.load(SeqCst), 2, "a writer is left");
+        assert!(h.drop_pipe_writer(0), "the last writer is gone");
+        assert_eq!(fired.load(SeqCst), 3, "the last writer's close fired it");
+        // A listen dropped before a store leaves nothing to fire.
+        drop(listen(&h));
+        assert!(h.drop_pipe_reader(0), "the last reader is gone");
+        assert_eq!(fired.load(SeqCst), 3, "nothing is registered any more");
     }
 }
