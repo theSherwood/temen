@@ -17339,18 +17339,6 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     // #2319 — the call's arg and result slots, on this stack when they fit.
                     let (mut arg_stack, mut arg_heap) = ([0; CALL_STACK_SLOTS], Vec::new());
                     let argv = arg_slots(&mut arg_stack, &mut arg_heap, &frames[top].vals, args)?;
-                    // §3.6 slice 3 — caller-side parking: a call through a live-callee offer
-                    // does not dispatch here. It enqueues on the callee's inbound queue, wakes
-                    // the callee's `svc.wait` (if parked), and parks THIS fiber until the
-                    // handler's reply (`Blocked::CapReply`). A full callee queue is probeable
-                    // backpressure (`-EAGAIN` as the call's result), never a trap.
-                    let live = {
-                        let hg = host.lock_unpoisoned();
-                        hg.live_impl_of(h, *type_id)
-                    };
-                    if let Some(target) = live {
-                        live_call!(target, *op, argv.to_vec(), *sig);
-                    }
                     // CALLS.md increment 3 (slice 1): an **instanced** offer runs its sub-run with
                     // the caller powerbox lock narrowed to the two `cap`-slot translation edges —
                     // never held across the provider drive (CALLS.md §1 defect / §4 lock discipline).
@@ -17379,7 +17367,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     // host locking). Threads of a domain serialize their capability calls here.
                     let mut hg = HostCall::lock(host, sched);
                     let mut pending_id = None;
-                    let mut unlocked = None;
+                    let (mut unlocked, mut live) = (None, None);
                     // #2495 — under a recording host this engine offers no parking face: it tapes
                     // no delivered value, so a host-answered call declines before its embedder
                     // sees it. A pool job runs inline under a tape on either face.
@@ -17396,7 +17384,18 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         gm,
                         face,
                         Some(&mut unlocked),
+                        Some(&mut live),
                     )?;
+                    // §3.6 slice 3 — caller-side parking: a call through a live-callee offer
+                    // does not complete in the dispatch, which hands its target back. This fiber
+                    // enqueues on the callee's inbound queue, wakes the callee's `svc.wait` (if
+                    // parked), and parks until the handler's reply (`Blocked::CapReply`). A full
+                    // callee queue is probeable backpressure (`-EAGAIN` as the call's result),
+                    // never a trap.
+                    if let Some(target) = live {
+                        drop(hg);
+                        live_call!(target, *op, argv.to_vec(), *sig);
+                    }
                     // §12 parking-on-blocking: a punted offloadable dispatch — release the host
                     // lock **before** waiting (the §5b serialization fix), then take the scalar
                     // completion. The placeholder `results` is discarded.
@@ -17663,6 +17662,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         gm,
                         None,
                         Some(&mut unlocked),
+                        None,
                     )?;
                     // An import-routed blocking-stdin read doesn't park on this engine (the
                     // `set_stdin_blocking` park is `call.cap`'s); the flag is consumed so it can't
@@ -17769,6 +17769,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         gm,
                         None,
                         Some(&mut unlocked),
+                        None,
                     )?;
                     // FORK.md §8.6 — pipe blocking rides this dispatch (a command's `write`/`read`
                     // are `call.sym` imports bound to pipe ends): a `read` on an empty FIFO with
@@ -17872,6 +17873,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         gm,
                         None,
                         Some(&mut unlocked),
+                        None,
                     )?;
                     let _ = hg.take_stdin_parked(); // no stdin parking here (see call.import)
                                                     // #1621/#1647/#1826 — requests and pipe parks are honored here too. No consumer
@@ -32032,17 +32034,23 @@ impl Host {
     }
 
     /// The live-callee target behind `handle` iff it resolves to a [`Binding::LiveImpl`] of the
-    /// right `type_id` — the eval loop's pre-dispatch probe (a non-LiveImpl handle answers
-    /// `None` and flows to the ordinary dispatch).
+    /// right `type_id` — the `call.import` routes' pre-dispatch probe (a non-LiveImpl handle answers
+    /// `None` and flows to the ordinary dispatch). A direct `call.cap` takes its target from the
+    /// dispatch's live face ([`Host::cap_dispatch_slots_deferring`]).
     pub fn live_impl_of(&self, handle: i32, type_id: u32) -> Option<LiveTarget> {
         match self.resolve(handle, type_id) {
-            Ok(Binding::LiveImpl(i)) => self.live_impls.get(i as usize).map(|e| LiveTarget {
-                callee: Arc::clone(&e.callee),
-                export: e.export,
-                sigs: Arc::clone(&e.sigs),
-            }),
+            Ok(Binding::LiveImpl(i)) => self.live_target(i),
             _ => None,
         }
+    }
+
+    /// The live-callee target of live impl `i`.
+    fn live_target(&self, i: u32) -> Option<LiveTarget> {
+        self.live_impls.get(i as usize).map(|e| LiveTarget {
+            callee: Arc::clone(&e.callee),
+            export: e.export,
+            sigs: Arc::clone(&e.sigs),
+        })
     }
 
     /// CALLS.md increment 3, slice 1 — the eval-loop pre-probe (direct `call.cap` form) mirroring
@@ -34865,7 +34873,7 @@ impl Host {
         out: &mut [i64],
         mem: Option<&mut dyn GuestMem>,
     ) -> Result<(), Trap> {
-        self.cap_dispatch_slots_deferring(type_id, op, handle, args, out, mem, None, None)
+        self.cap_dispatch_slots_deferring(type_id, op, handle, args, out, mem, None, None, None)
     }
 
     /// [`Host::cap_dispatch_slots`] into `n` result slots of its own, for a caller that wants them
@@ -34896,11 +34904,16 @@ impl Host {
     /// - `unlocked` (#2645): a call to an unlocked host procedure ([`ProcHandler::Unlocked`])
     ///   returns at once with `*unlocked = Some(call)` instead of running. Drop the host lock, then
     ///   [`UnlockedCall::run`] with the same arguments, result slots and window.
+    /// - `live` (§3.6 slice 3, #2847): a call through a live-callee offer returns at once with
+    ///   `*live = Some(target)`, decided by the dispatch's one `resolve`. The caller makes the call:
+    ///   it enqueues on the callee's inbound queue and waits for the reply, which host-side dispatch
+    ///   cannot. A call handed back is never taped, since no host answers it.
     ///
     /// A face the caller does not offer gets byte-identical inline semantics
     /// (decline-never-diverge, INVARIANTS.md 9). Under a W1 tape a pool punt and an unlocked call
     /// run inline, so the recorded crossing carries the real result.
     #[allow(clippy::too_many_arguments)] // the call's own six, and the two faces a caller offers
+    #[inline]
     pub fn cap_dispatch_slots_deferring(
         &mut self,
         type_id: u32,
@@ -34911,6 +34924,37 @@ impl Host {
         mem: Option<&mut dyn GuestMem>,
         pending: Option<&mut Option<u64>>,
         unlocked: Option<&mut Option<UnlockedCall>>,
+        live: Option<&mut Option<LiveTarget>>,
+    ) -> Result<(), Trap> {
+        // #2847 — a reserved pseudo-id (an import, a dynamic or self call, an attach) out of line:
+        // a call through a granted handle reaches the live dispatch past two tests, which inline
+        // into each engine's call.
+        if type_id >= temen_ir::CAP_DYN_TYPE_ID {
+            return self
+                .cap_dispatch_pseudo(type_id, op, handle, args, out, mem, pending, unlocked, live);
+        }
+        if self.tapes(type_id, op) {
+            return self.cap_dispatch_taped(type_id, op, handle, args, out, mem, pending, live);
+        }
+        self.cap_dispatch_slots_inner(type_id, op, handle, args, out, mem, pending, unlocked, live)
+    }
+
+    /// [`Host::cap_dispatch_slots_deferring`] for a reserved pseudo-id: an import or a dynamic call
+    /// translates to the call it names, a self extension answers here, and the rest takes the
+    /// ordinary flow, tape first.
+    #[allow(clippy::too_many_arguments)] // as `cap_dispatch_slots_deferring`
+    #[inline(never)]
+    fn cap_dispatch_pseudo(
+        &mut self,
+        type_id: u32,
+        op: u32,
+        handle: i32,
+        args: &[i64],
+        out: &mut [i64],
+        mem: Option<&mut dyn GuestMem>,
+        pending: Option<&mut Option<u64>>,
+        unlocked: Option<&mut Option<UnlockedCall>>,
+        live: Option<&mut Option<LiveTarget>>,
     ) -> Result<(), Trap> {
         // §12: under a W1 tape, force punts inline (`pending = None` downstream) — a `Pending`
         // placeholder on the tape would replay as a phantom result; the inline run records the
@@ -34981,16 +35025,19 @@ impl Host {
                 _ => Err(Trap::CapFault),
             };
         }
-        // W1 record/replay (DEBUGGING.md): only the nondeterministic *input* caps are taped —
-        // deterministic / structural caps re-run faithfully on a fresh powerbox and are left live.
-        // #2645: and only while a tape is active, so an untaped call runs on the faces its caller
-        // offers, and its window writes are not copied for a tape no one keeps.
-        if is_recorded_input(type_id, op)
-            && (self.cap_record.is_some() || self.cap_replay.is_some())
-        {
-            return self.cap_dispatch_taped(type_id, op, handle, args, out, mem, pending);
+        if self.tapes(type_id, op) {
+            return self.cap_dispatch_taped(type_id, op, handle, args, out, mem, pending, live);
         }
-        self.cap_dispatch_slots_inner(type_id, op, handle, args, out, mem, pending, unlocked)
+        self.cap_dispatch_slots_inner(type_id, op, handle, args, out, mem, pending, unlocked, live)
+    }
+
+    /// W1 record/replay (DEBUGGING.md): whether this call is taped. Only the nondeterministic *input*
+    /// caps are — deterministic / structural caps re-run faithfully on a fresh powerbox and are left
+    /// live. #2645: and only while a tape is active, so an untaped call runs on the faces its caller
+    /// offers, and its window writes are not copied for a tape no one keeps.
+    #[inline]
+    fn tapes(&self, type_id: u32, op: u32) -> bool {
+        (self.cap_record.is_some() || self.cap_replay.is_some()) && is_recorded_input(type_id, op)
     }
 
     /// A taped call ([`Host::cap_dispatch_slots_deferring`]'s W1 record/replay): served from the
@@ -35008,6 +35055,7 @@ impl Host {
         out: &mut [i64],
         mem: Option<&mut dyn GuestMem>,
         pending: Option<&mut Option<u64>>,
+        live: Option<&mut Option<LiveTarget>>,
     ) -> Result<(), Trap> {
         // Replay: serve the next recorded crossing if it matches this call (a mismatch means the
         // re-execution diverged before this point — fall through to live as a best effort).
@@ -35050,6 +35098,7 @@ impl Host {
                     rerun,
                     None,
                     None,
+                    None,
                 );
             }
             // Re-apply any guest-window writes the cap made (a buffer-filling `read`), then
@@ -35064,7 +35113,7 @@ impl Host {
         }
         // Record: run live through a `RecordingMem` so any guest-window writes are captured,
         // then log the crossing for a future replay.
-        let mut pending = pending;
+        let (mut pending, mut live) = (pending, live);
         let (result, mem_writes) = match mem {
             Some(m) => {
                 let mut rec_mem = RecordingMem {
@@ -35080,6 +35129,7 @@ impl Host {
                     Some(&mut rec_mem),
                     pending.as_deref_mut(),
                     None,
+                    live.as_deref_mut(),
                 );
                 (r, rec_mem.writes)
             }
@@ -35093,6 +35143,7 @@ impl Host {
                     None,
                     pending.as_deref_mut(),
                     None,
+                    live.as_deref_mut(),
                 ),
                 Vec::new(),
             ),
@@ -35103,8 +35154,10 @@ impl Host {
             // (completed) read joins the tape. Likewise a **punted** dispatch (#1366 host-
             // answered, or an offloaded job): its result slots are a placeholder the
             // completion fills in later — a host-answered call's delivered value is taped
-            // where a driver delivers it instead ([`Completions::take_record`]).
-            let punted = pending.as_deref().is_some_and(|p| p.is_some());
+            // where a driver delivers it instead ([`Completions::take_record`]). And a live call
+            // its caller makes (#2847): no host answers it, so no tape here carries it.
+            let punted = pending.as_deref().is_some_and(|p| p.is_some())
+                || live.as_deref().is_some_and(|l| l.is_some());
             if !self.stdin_parked && !punted {
                 rec.push(CapRecord {
                     type_id,
@@ -35135,6 +35188,7 @@ impl Host {
         mem: Option<&mut dyn GuestMem>,
         pending: Option<&mut Option<u64>>,
         unlocked: Option<&mut Option<UnlockedCall>>,
+        live: Option<&mut Option<LiveTarget>>,
     ) -> Result<(), Trap> {
         // Phase-2 `import.attach` (IMPORTS.md): (re)bind rebindable import slot `op` to the handle
         // in `args[0]`. The new handle must resolve **live under the slot's declared interface
@@ -35340,6 +35394,15 @@ impl Host {
                 }
             }
         };
+        // §3.6 slice 3, #2847 — a call through a live-callee offer is its caller's to make: handed
+        // back on the face the caller offers, decided by this one resolve, before any check of the
+        // op, which the callee's own signature decides.
+        if let (Binding::LiveImpl(i), Some(slot)) = (resolved, live) {
+            if let Some(target) = self.live_target(i) {
+                *slot = Some(target);
+                return Ok(());
+            }
+        }
         // An op the interface does not have, decided by the interface's **shape** where one is
         // seeded ([`builtin_iface_shape`]) rather than restated per binding arm below. A `CapFault`,
         // not an errno: `op` is an immediate in the instruction, so an unknown op is a property of
@@ -35354,9 +35417,9 @@ impl Host {
             }
         }
         match resolved {
-            // §3.6 slice 3: a live-callee offer is serviced by the eval loop (enqueue + park —
-            // host-side dispatch cannot park). Reaching it here means a backend tier without
-            // the servicing arm: answer probeable, never trap.
+            // §3.6 slice 3: a live-callee offer is its caller's to call, handed back above on its
+            // live face (enqueue + park — host-side dispatch cannot park). Reaching it here means a
+            // caller that offers none: answer probeable, never trap.
             Binding::LiveImpl(_) => put_results(out, &[EINVAL]),
             // #1440: freeze authority is pure authority, like `Module` — the freeze path consults it,
             // nothing calls it. An `EINVAL` rather than a trap keeps it probeable (INVARIANTS #5:
@@ -40118,6 +40181,67 @@ mod host_proc_slot_tests {
 }
 
 #[cfg(test)]
+mod live_face_tests {
+    //! #2847 — a call through a live-callee offer is handed back on the dispatch's live face,
+    //! decided by its one resolve. A caller that offers no face gets `-EINVAL`, and a call handed
+    //! back is never taped.
+    use super::*;
+
+    /// A host holding a live impl of an offer shaped as `Stream`, which interns to `Stream`'s id,
+    /// so its `read` is a recorded input; the handle and that id.
+    fn wired() -> (Host, i32, u32) {
+        let mut host = Host::new();
+        let callee = Arc::new(Mutex::new(Host::new()));
+        let rw = FuncType {
+            params: vec![ValType::I64, ValType::I64],
+            results: vec![ValType::I64],
+        };
+        let unit = FuncType {
+            params: vec![],
+            results: vec![],
+        };
+        let names = ["read", "write", "close"].map(String::from);
+        let h = host
+            .wire_live_impl(&callee, 0, &names, &[rw.clone(), rw, unit])
+            .expect("wired");
+        let type_id = host.type_id_of(h).expect("a live handle");
+        (host, h, type_id)
+    }
+
+    #[test]
+    fn a_live_call_is_handed_back_and_never_taped() {
+        let (mut host, h, type_id) = wired();
+        assert_eq!(type_id, cap_id::STREAM, "the shape interns to Stream's id");
+        host.record_caps();
+        let mut live = None;
+        let r = host.cap_dispatch_slots_deferring(
+            type_id,
+            0,
+            h,
+            &[0, 0],
+            &mut [0],
+            None,
+            None,
+            None,
+            Some(&mut live),
+        );
+        assert_eq!(r, Ok(()));
+        assert!(live.is_some(), "the dispatch hands the target back");
+        assert!(
+            host.cap_record.as_ref().is_some_and(|tape| tape.is_empty()),
+            "and no tape carries the call"
+        );
+        // A caller that offers no live face gets the probeable errno.
+        let mut out = [0];
+        assert_eq!(
+            host.cap_dispatch_slots(type_id, 0, h, &[0, 0], &mut out, None),
+            Ok(())
+        );
+        assert_eq!(out, [EINVAL]);
+    }
+}
+
+#[cfg(test)]
 mod growth_tests {
     //! #1909, #2106 — the memory a window holds is charged to the budget that paid for it, wherever
     //! the window goes: a detached window's growth past its declared size, a fork twin's copy of its
@@ -41907,6 +42031,7 @@ mod fork_powerbox_tests {
                 &mut [0],
                 None,
                 Some(&mut id),
+                None,
                 None,
             );
             assert_eq!(r, Ok(()), "a punted call answers later");
@@ -44164,6 +44289,7 @@ mod offload_pool_tests {
             &mut [0],
             None,
             Some(&mut id),
+            None,
             None,
         );
         assert_eq!(r, Ok(()), "the call punts");
