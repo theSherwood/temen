@@ -3611,13 +3611,17 @@ These are the substrate's existing ops reached from source. There is no second m
 
 | Source | IR |
 |---|---|
-| `__temen_iface__<name>`: a constant string such as `"run(i64, i64) -> (i64); take(i64) -> (i64, cap)"` | the interface: op names, op order, shapes; `cap` marks a handle slot |
-| every `__temen_op__<name>__<op>` **defined** | an impl-export `<name>`, served by `svc.wait` |
+| `__temen_iface__<tag>`: a constant string such as `"exec.host { run: (i64, i64) -> (i64); take: (i64) -> (i64, cap) }"` | the interface: its name, op names, op order, shapes; `cap` marks a handle slot |
+| every `__temen_op__<tag>__<op>` **defined** | an impl-export `<name>`, served by `svc.wait` |
 | the ops only **declared** | one grouped import `<name>`; a call of an op is `call.import <name>.<op>` |
 | `long __vm_svc_wait(void)` / `long __vm_svc_poll(void)` | `svc.wait` / `svc.poll` |
-| `int __vm_serve_grant(__temen_iface__<name>)` | the constant `GRANT_SERVE_LIVE_TAG \| export`, for a spawn's grant record |
+| `int __vm_serve_grant(__temen_iface__<tag>)` | the constant `GRANT_SERVE_LIVE_TAG \| export`, for a spawn's grant record |
 
-A `cap` is an `int` / `i32` in the source. A frontend's struct-return coercion may widen it to `i64`,
+The descriptor carries the interface's name, the one the manifest and the spawn's grant use, dots
+included (`exec.host`). The tag is any identifier and only ties the ops to their descriptor. Each
+op's shape is written in the text IR's own function-type syntax and read by its parser
+(`temen_text::parse_func_type`), so the tree has one type grammar. A `cap` is an `int` / `i32` in
+the source. A frontend's struct-return coercion may widen it to `i64`,
 as rustc does for `{i64, i32}`; the translator narrows it. Two or more results are a small struct
 returned by value (§3a). Each op's source signature is checked against the descriptor. A module that
 defines some ops of an interface but not others is refused, and so is an op symbol that no
@@ -3635,7 +3639,7 @@ indirect calls, fibers or threads. The same property is why the bytecode engine 
 parent natively (`bytecode_serves_children`), never declining it.
 
 `tests/serve_iface.rs` builds a C parent and child with clang, and a Rust parent and child with
-rustc. In each pair the parent serves `exec` and the child calls it by name: a handle crosses in a
+rustc, the Rust pair under the dotted name `exec.host`. In each pair the parent serves `exec` and the child calls it by name: a handle crosses in a
 result and in an argument, and the parent maps the region it receives back and reads the byte the
 child wrote. All four drivers answer the same.
 

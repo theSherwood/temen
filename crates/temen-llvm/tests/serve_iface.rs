@@ -23,8 +23,13 @@ use temen_run::{Backend, HostCap, Outcome, RunConfig, Value};
 /// What the parent answers on every driver.
 const ANSWER: i32 = (42 * 10_000 + 7 * 1000 + b'C' as i32) * 10 + 3;
 
-/// The interface, as both sides name it.
-const EXEC: &str = "run(i64, i64) -> (i64); take(i64) -> (i64, cap); give(cap) -> (i64)";
+/// The interface's ops, as both sides declare them.
+const OPS: &str = "run: (i64, i64) -> (i64); take: (i64) -> (i64, cap); give: (cap) -> (i64)";
+
+/// The descriptor naming the interface `name`.
+fn descriptor(name: &str) -> String {
+    format!("{name} {{ {OPS} }}")
+}
 
 /// The source surface (#2961), as a C header would carry it.
 const C_HEADER: &str = r#"
@@ -49,7 +54,7 @@ static long page_of(int i, long g) { return ((long)pages[i] + g - 1) & ~(g - 1);
 fn c_parent() -> String {
     format!(
         r#"{C_HEADER}
-TEMEN_INTERFACE(exec, "{EXEC}");
+TEMEN_INTERFACE(exec, "{desc}");
 static int region;
 
 long TEMEN_OP(exec, run)(long a, long b) {{ return a + b; }}
@@ -94,14 +99,15 @@ int main(void) {{
   if (st != 0) return (int)(-1000 - st);
   return (int)(r * 10 + served);
 }}
-"#
+"#,
+        desc = descriptor("exec")
     )
 }
 
 fn c_child() -> String {
     format!(
         r#"{C_HEADER}
-TEMEN_INTERFACE(exec, "{EXEC}");
+TEMEN_INTERFACE(exec, "{desc}");
 long TEMEN_OP(exec, run)(long a, long b);
 struct took TEMEN_OP(exec, take)(long x);
 long TEMEN_OP(exec, give)(int h);
@@ -116,13 +122,16 @@ int main(void) {{
   long c = TEMEN_OP(exec, give)(t.h);
   return (int)(r * 10000 + t.v * 1000 + c);
 }}
-"#
+"#,
+        desc = descriptor("exec")
     )
 }
 
-/// The Rust guests' shared prelude: `no_std`, the descriptor (`__temen_iface__exec`, the same text
-/// as the C header's), and the builtins both sides call.
+/// The Rust guests' shared prelude: `no_std`, the descriptor under the tag `exec`, naming the
+/// interface `exec.host` (a dotted name, which only the descriptor carries), and the builtins both
+/// sides call.
 fn rust_prelude() -> String {
+    let desc = descriptor(RUST_NAME);
     format!(
         r##"#![no_std]
 #![allow(internal_features, non_upper_case_globals, static_mut_refs)]
@@ -132,7 +141,7 @@ fn ph(_: &core::panic::PanicInfo) -> ! {{ loop {{}} }}
 pub extern "C" fn rust_eh_personality() {{}}
 
 #[no_mangle]
-pub static __temen_iface__exec: [u8; {n}] = *b"{EXEC}";
+pub static __temen_iface__exec: [u8; {n}] = *b"{desc}";
 
 #[repr(C)]
 pub struct Took {{ v: i64, h: i32 }}
@@ -153,7 +162,7 @@ struct Pages([[u8; 1 << 16]; 2]);
 static mut PAGES: Pages = Pages([[0; 1 << 16]; 2]);
 unsafe fn page(i: usize) -> i64 {{ core::ptr::addr_of_mut!(PAGES.0[i]) as i64 }}
 "##,
-        n = EXEC.len()
+        n = desc.len()
     )
 }
 
@@ -191,7 +200,7 @@ pub extern "C" fn main() -> i32 {
             return -1;
         }
         let exec = __vm_serve_grant(__temen_iface__exec.as_ptr());
-        let h = vm_spawn(inst, budget, child, &[(b"exec", exec)], &[]);
+        let h = vm_spawn(inst, budget, child, &[(b"exec.host", exec)], &[]);
         if h < 0 {
             return h as i32;
         }
@@ -336,19 +345,22 @@ const DRIVERS: [Option<Backend>; 4] = [
     None,
 ];
 
-fn check(parent: temen_ir::Module, child: temen_ir::Module) {
+/// The Rust lane's interface name.
+const RUST_NAME: &str = "exec.host";
+
+fn check(name: &str, parent: temen_ir::Module, child: temen_ir::Module) {
     // The parent serves `exec` and imports nothing by it; the child imports it whole.
     assert_eq!(
         parent.impl_exports.len(),
         1,
         "the parent serves one interface"
     );
-    assert_eq!(parent.impl_exports[0].name, "exec");
+    assert_eq!(parent.impl_exports[0].name, name);
     assert!(
         child
             .imports
             .iter()
-            .any(|i| i.name == "exec" && matches!(i.shape, temen_ir::ImportShape::Interface(_))),
+            .any(|i| i.name == name && matches!(i.shape, temen_ir::ImportShape::Interface(_))),
         "the child imports `exec` as one grouped slot"
     );
     assert!(
@@ -371,7 +383,7 @@ fn a_clang_parent_serves_its_clang_childs_calls() {
         eprintln!("note: skipping (clang unavailable)");
         return;
     };
-    check(translate(&p, false), translate(&c, true));
+    check("exec", translate(&p, false), translate(&c, true));
 }
 
 #[test]
@@ -385,7 +397,7 @@ fn a_rustc_parent_serves_its_rustc_childs_calls() {
         eprintln!("note: skipping (rustc unavailable)");
         return;
     };
-    check(translate(&p, false), translate(&c, true));
+    check(RUST_NAME, translate(&p, false), translate(&c, true));
 }
 
 /// What the translator refuses, each with the reason in its error: a descriptor's ops half defined,
@@ -393,10 +405,10 @@ fn a_rustc_parent_serves_its_rustc_childs_calls() {
 /// of an interface the module does not serve, and a served op that can park.
 #[test]
 fn the_translator_refuses_what_it_cannot_serve_or_import() {
-    const OPS: &str = "add(i64, i64) -> (i64); neg(i64) -> (i64)";
+    const DESC: &str = "calc { add: (i64, i64) -> (i64); neg: (i64) -> (i64) }";
     let desc = format!(
-        "@__temen_iface__calc = constant [{} x i8] c\"{OPS}\\00\"",
-        OPS.len() + 1
+        "@__temen_iface__calc = constant [{} x i8] c\"{DESC}\\00\"",
+        DESC.len() + 1
     );
     let refused =
         |body: &str, why: &str| match temen_llvm::translate_ll_str(&format!("{desc}\n{body}")) {

@@ -5,17 +5,19 @@
 //! slot, which every engine translates between the two domains (INVARIANTS #8).
 //!
 //! The source names an interface with a **descriptor**: a constant byte string under the symbol
-//! `__temen_iface__<name>`, holding its ops in order,
+//! `__temen_iface__<tag>`, holding the interface's name and its ops in order,
 //!
 //! ```text
-//! run(i64, i64) -> (i64); pass(cap) -> (cap); ping()
+//! exec.host { run: (i64, i64) -> (i64); pass: (cap) -> (cap); ping: () -> () }
 //! ```
 //!
-//! each op's parameter and result types drawn from `i32 i64 f32 f64 cap`, a missing `-> (…)` meaning
-//! no results. Each op is a function named `__temen_op__<name>__<op>`. A module that **defines** every
-//! op serves the interface; one that only **declares** them imports it, and a call of a declared op
-//! is a `call.import` of that op. A mix is refused. A `cap` is an `int` / `i32` in the source; two or
-//! more results are a small struct returned by value (the §3a multi-result convention).
+//! each op's shape in the text IR's own function-type syntax ([`temen_text::parse_func_type`]), its
+//! slots drawn from `i32 i64 f32 f64 cap`. The name is what the manifest and the grant say, dots and
+//! all; the tag is any identifier, only tying the ops to their descriptor. Each op is a function named
+//! `__temen_op__<tag>__<op>`. A module that **defines** every op serves the interface; one that only
+//! **declares** them imports it, and a call of a declared op is a `call.import` of that op. A mix is
+//! refused. A `cap` is an `int` / `i32` in the source; two or more results are a small struct
+//! returned by value (the §3a multi-result convention).
 //!
 //! A served op runs on the module's **serve stack**, a data stack of its own: the serve loop that
 //! dispatches it is suspended mid-frame, so the op cannot share the loop's stack. One serve stack is
@@ -34,9 +36,9 @@ use temen_ir::{
 use crate::ll::ast::{Module as LModule, Parameter, Type};
 use crate::{param_vtypes, result_types, unsup, Error, Types};
 
-/// The descriptor symbol prefix: `__temen_iface__<name>`.
+/// The descriptor symbol prefix: `__temen_iface__<tag>`.
 pub(crate) const IFACE_PREFIX: &str = "__temen_iface__";
-/// The op symbol prefix: `__temen_op__<iface>__<op>`.
+/// The op symbol prefix: `__temen_op__<tag>__<op>`.
 pub(crate) const OP_PREFIX: &str = "__temen_op__";
 /// The serve stack's size: a [`temen_ir::FIBER_STACK`], what a handler fiber is charged on the
 /// oracle.
@@ -44,7 +46,10 @@ pub(crate) const SERVE_STACK_SIZE: u64 = 256 * 1024;
 
 /// One interface a module names.
 pub(crate) struct Iface {
+    /// The interface's name, as the descriptor states it: the impl-export's or the import's.
     pub name: String,
+    /// The descriptor symbol's tag, which names the op functions ([`op_symbol`]).
+    pub tag: String,
     /// The ops in declaration order: their names and signatures, a handle slot typed `cap`.
     pub ops: Vec<(String, FuncType)>,
     /// Each op's signature in the source, where a `cap` slot is the `i32` (or, widened by the
@@ -55,7 +60,7 @@ pub(crate) struct Iface {
     pub served: bool,
 }
 
-/// Every interface a module names, sorted by name, so a served interface's export index (the
+/// Every interface a module names, sorted by descriptor symbol, so a served interface's export index (the
 /// handle a grant names it by) does not depend on symbol order.
 #[derive(Default)]
 pub(crate) struct Ifaces {
@@ -71,8 +76,8 @@ impl Ifaces {
 }
 
 /// The op function's symbol.
-pub(crate) fn op_symbol(iface: &str, op: &str) -> String {
-    format!("{OP_PREFIX}{iface}__{op}")
+pub(crate) fn op_symbol(tag: &str, op: &str) -> String {
+    format!("{OP_PREFIX}{tag}__{op}")
 }
 
 /// Collect the module's interfaces from its descriptors (`gbytes`: each constant global's bytes).
@@ -88,21 +93,24 @@ pub(crate) fn collect(
         .collect();
     names.sort();
     for (sym, bytes) in names {
-        let name = &sym[IFACE_PREFIX.len()..];
-        if !is_ident(name) {
+        let tag = &sym[IFACE_PREFIX.len()..];
+        if !is_ident(tag) {
             return unsup(format!(
-                "interface descriptor `{sym}`: `{name}` is not a name"
+                "interface descriptor `{sym}`: `{tag}` is not a tag"
             ));
         }
         let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
         let text = std::str::from_utf8(&bytes[..end]).map_err(|_| {
-            Error::Unsupported(format!("interface `{name}`: descriptor is not UTF-8"))
+            Error::Unsupported(format!("interface descriptor `{sym}` is not UTF-8"))
         })?;
-        let ops = parse_descriptor(text)
-            .map_err(|e| Error::Unsupported(format!("interface `{name}`: {e}")))?;
+        let (name, ops) = parse_descriptor(text)
+            .map_err(|e| Error::Unsupported(format!("interface descriptor `{sym}`: {e}")))?;
+        if list.iter().any(|i: &Iface| i.name == name) {
+            return unsup(format!("interface `{name}` has two descriptors"));
+        }
         let defs = ops
             .iter()
-            .filter(|(op, _)| defined.contains_key(&op_symbol(name, op)))
+            .filter(|(op, _)| defined.contains_key(&op_symbol(tag, op)))
             .count();
         if defs != 0 && defs != ops.len() {
             return unsup(format!(
@@ -113,7 +121,7 @@ pub(crate) fn collect(
         }
         let mut storage = Vec::with_capacity(ops.len());
         for (op, sig) in &ops {
-            let sym = op_symbol(name, op);
+            let sym = op_symbol(tag, op);
             let src = match m.functions.iter().find(|f| f.name == sym) {
                 Some(f) => Some((&f.parameters, f.return_type.as_ref())),
                 None => m
@@ -131,7 +139,8 @@ pub(crate) fn collect(
             });
         }
         list.push(Iface {
-            name: name.to_string(),
+            name,
+            tag: tag.to_string(),
             ops,
             storage,
             served: defs != 0,
@@ -141,7 +150,7 @@ pub(crate) fn collect(
     let mut known: HashMap<String, (usize, u32)> = HashMap::new();
     for (i, iface) in list.iter().enumerate() {
         for (k, (op, _)) in iface.ops.iter().enumerate() {
-            known.insert(op_symbol(&iface.name, op), (i, k as u32));
+            known.insert(op_symbol(&iface.tag, op), (i, k as u32));
         }
     }
     let fn_names = m
@@ -177,7 +186,7 @@ impl Lowering {
             .iter()
             .filter(|i| i.served)
             .enumerate()
-            .map(|(k, i)| (format!("{IFACE_PREFIX}{}", i.name), k as u32))
+            .map(|(k, i)| (format!("{IFACE_PREFIX}{}", i.tag), k as u32))
             .collect();
         let ops = ifaces
             .imported_ops
@@ -228,7 +237,7 @@ pub(crate) fn impl_exports(
     for iface in ifaces.list.iter().filter(|i| i.served) {
         let mut ops = Vec::with_capacity(iface.ops.len());
         for ((op, sig), storage) in iface.ops.iter().zip(&iface.storage) {
-            let target = name2idx[&op_symbol(&iface.name, op)];
+            let target = name2idx[&op_symbol(&iface.tag, op)];
             ops.push(funcs.len() as u32);
             funcs.push(trampoline(target, sig, storage, serve_sp));
         }
@@ -378,58 +387,46 @@ fn is_ident(s: &str) -> bool {
         && !s.starts_with(|c: char| c.is_ascii_digit())
 }
 
-/// Parse `op(t, …) -> (t, …); …`.
-pub(crate) fn parse_descriptor(text: &str) -> Result<Vec<(String, FuncType)>, String> {
+/// Parse `name { op: (t, …) -> (t, …); … }`: the interface's name, and its ops in order.
+pub(crate) fn parse_descriptor(text: &str) -> Result<(String, Vec<(String, FuncType)>), String> {
+    let (name, rest) = text
+        .split_once('{')
+        .ok_or("expected `name { op: type; … }`")?;
+    let name = name.trim();
+    let body = rest
+        .trim_end()
+        .strip_suffix('}')
+        .ok_or("expected `}` closing the op list")?;
+    if name.is_empty() || name.contains(|c: char| c.is_whitespace() || "{};:".contains(c)) {
+        return Err(format!("`{name}` is not an interface name"));
+    }
     let mut ops: Vec<(String, FuncType)> = Vec::new();
-    for item in text.split(';').map(str::trim).filter(|s| !s.is_empty()) {
-        let open = item
-            .find('(')
-            .ok_or(format!("`{item}`: expected `op(…)`"))?;
-        let name = item[..open].trim();
-        if !is_ident(name) {
-            return Err(format!("`{name}` is not an op name"));
+    for item in body.split(';').map(str::trim).filter(|s| !s.is_empty()) {
+        let (op, ty) = item
+            .split_once(':')
+            .ok_or(format!("`{item}`: expected `op: type`"))?;
+        let op = op.trim();
+        if !is_ident(op) {
+            return Err(format!("`{op}` is not an op name"));
         }
-        if ops.iter().any(|(n, _)| n == name) {
-            return Err(format!("op `{name}` is declared twice"));
+        if ops.iter().any(|(n, _)| n == op) {
+            return Err(format!("op `{op}` is declared twice"));
         }
-        let rest = &item[open..];
-        let close = rest.find(')').ok_or(format!("`{item}`: unclosed `(`"))?;
-        let params = types_of(&rest[1..close])?;
-        let tail = rest[close + 1..].trim();
-        let results = if tail.is_empty() {
-            Vec::new()
-        } else {
-            let r = tail
-                .strip_prefix("->")
-                .map(str::trim)
-                .and_then(|r| r.strip_prefix('('))
-                .and_then(|r| r.strip_suffix(')'))
-                .ok_or(format!("`{item}`: expected `-> (…)` after the parameters"))?;
-            types_of(r)?
-        };
-        ops.push((name.to_string(), FuncType { params, results }));
+        let sig = temen_text::parse_func_type(ty).map_err(|e| format!("op `{op}`: {}", e.0))?;
+        if let Some(t) = sig.params.iter().chain(&sig.results).find(|t| {
+            !matches!(
+                t,
+                ValType::I32 | ValType::I64 | ValType::F32 | ValType::F64 | ValType::Cap
+            )
+        }) {
+            return Err(format!("op `{op}`: a `{t:?}` slot (i32 i64 f32 f64 cap)"));
+        }
+        ops.push((op.to_string(), sig));
     }
     if ops.is_empty() {
         return Err("an interface has at least one op".into());
     }
-    Ok(ops)
-}
-
-fn types_of(list: &str) -> Result<Vec<ValType>, String> {
-    list.split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(|t| match t {
-            "i32" => Ok(ValType::I32),
-            "i64" => Ok(ValType::I64),
-            "f32" => Ok(ValType::F32),
-            "f64" => Ok(ValType::F64),
-            "cap" => Ok(ValType::Cap),
-            other => Err(format!(
-                "`{other}` is not a slot type (i32 i64 f32 f64 cap)"
-            )),
-        })
-        .collect()
+    Ok((name.to_string(), ops))
 }
 
 #[cfg(test)]
@@ -437,8 +434,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_descriptor_parses_in_order_with_caps_and_no_results() {
-        let ops = parse_descriptor(" run(i64, i64) -> (i64); pass(cap)->(cap) ;ping() ").unwrap();
+    fn a_descriptor_parses_its_name_and_its_ops_in_order() {
+        let (name, ops) = parse_descriptor(
+            " exec.host { run: (i64, i64) -> (i64); pass: (cap)->(cap) ;ping: () -> () } ",
+        )
+        .unwrap();
+        assert_eq!(name, "exec.host");
         let names: Vec<&str> = ops.iter().map(|(n, _)| n.as_str()).collect();
         assert_eq!(names, ["run", "pass", "ping"]);
         assert_eq!(ops[1].1.params, [ValType::Cap]);
@@ -450,12 +451,16 @@ mod tests {
     fn a_malformed_descriptor_is_refused() {
         for bad in [
             "",
-            "run",
-            "run(i8)",
-            "run() -> i64",
-            "a(); a()",
-            "x__y()",
-            "run() junk",
+            "x { }",
+            "{ run: () -> () }",
+            "x { run }",
+            "x { run: (i8) -> () }",
+            "x { run: () -> i64 }",
+            "x { run: (v128) -> () }",
+            "x { a: () -> (); a: () -> () }",
+            "x { y__z: () -> () }",
+            "x { run: () -> () junk }",
+            "a b { run: () -> () }",
         ] {
             assert!(parse_descriptor(bad).is_err(), "{bad:?}");
         }
