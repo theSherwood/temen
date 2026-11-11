@@ -38,19 +38,18 @@ fn consumer(argv: &[&str], stdin: &str, report: bool) -> String {
     }
     let payload = argv_len + stdin.len();
     let tail = if report {
-        format!(
-            "  vread = i64.const 1
+        "  vread = i64.const 1
   vcap = i64.const 16
-  vn = call.cap 13 0 (i64, i64, i64, i64) -> (i64) vh (vread, vjob, vz, vcap)
+  vn = call.cap 13 1 (i64, i64, i64) -> (i64) vh (vjob, vz, vcap)
   vst = i64.const 3
-  vs = call.cap 13 0 (i64, i64, i64, i64) -> (i64) vh (vst, vjob, vz, vz)
+  vs = call.cap 13 3 (i64) -> (i64) vh (vjob)
   vw = call.import 0 (vwin, vn)
   vhund = i64.const 100
   vmul = i64.mul vs vhund
   vsum = i64.add vmul vn
   vcode = i32.wrap_i64 vsum
   call.import 1 (vcode)"
-        )
+            .to_string()
     } else {
         "  vfailed = i64.lt_s vjob vz
   call.import 1 (vfailed)"
@@ -81,7 +80,7 @@ block 0 () {{
   vrun = i64.const 0
   val = i64.const {argv_len}
   vsl = i64.const {stdin_len}
-  vjob = call.cap 13 0 (i64, i64, i64, i64) -> (i64) vh (vrun, vz, val, vsl)
+  vjob = call.cap 13 0 (i64, i64, i64) -> (i64) vh (vz, val, vsl)
 {tail}
   unreachable
   }}
@@ -359,5 +358,63 @@ fn a_program_outside_the_allowlist_is_refused_not_trapped() {
                 "{name}/{backend:?}: the miss is a probeable negative, not a trap"
             );
         }
+    }
+}
+
+/// #2962 — a **grouped import** of `exec` in the root binds the host backend by op name, and its
+/// grant brings the slot's message region as `<slot>.msg`: here the slot is `"exec"`, so the
+/// region is `"exec.msg"`. `echo hi` through `call.import 0.run` / `0.read_out` / `0.status`, on
+/// all three backends: exit `status * 100 + nread` = 3.
+#[test]
+fn a_grouped_import_binds_the_host_backend_by_op_name() {
+    let src = "memory 17
+data 16384 \"exec.msg\"
+data 16416 \"echo\"
+data 16421 \"hi\"
+type 0 func (i64, i64, i64) -> (i64)
+type 1 func (i64) -> (i64)
+type 2 interface { run: 0, read_out: 0, read_err: 0, status: 1, close: 1 }
+type 3 func (i64, i64) -> (i64)
+type 4 func (i32) -> ()
+import 0 interface \"exec\" 2
+import 1 func \"out\" 3
+import 2 func \"exit\" 4
+func 0 () -> () {
+block 0 () {
+  vp = i64.const 16384
+  vml = i64.const 8
+  vmsg = self.resolve vp vml
+  vwin = i64.const 65536
+  vz = i64.const 0
+  vlen = i64.const 65536
+  vprot = i32.const 3
+  vmapped = call.cap 4 0 (i64, i64, i64, i32) -> (i64) vmsg (vwin, vz, vlen, vprot)
+  vsrc = i64.const 16416
+  val = i64.const 7
+  mem.copy vwin vsrc val
+  vjob = call.import 0.run (vz, val, vz)
+  vcap = i64.const 16
+  vn = call.import 0.read_out (vjob, vz, vcap)
+  vs = call.import 0.status (vjob)
+  vw = call.import 1 (vwin, vn)
+  vhund = i64.const 100
+  vmul = i64.mul vs vhund
+  vsum = i64.add vmul vn
+  vcode = i32.wrap_i64 vsum
+  call.import 2 (vcode)
+  unreachable
+  }
+}
+export 0 func \"_start\" 0
+";
+    let m = parse_module(src).expect("parse");
+    let imports = registry().provide("exec", scripted_exec(echo_table()));
+    let inst = instantiate_with_imports(m, imports).expect("the grouped import binds by op name");
+    for backend in [Backend::TreeWalk, Backend::Bytecode, Backend::Jit] {
+        let r = inst
+            .run_with_caps(backend, &RunConfig::default(), &[])
+            .unwrap_or_else(|e| panic!("{backend:?}: {e}"));
+        assert_eq!(r.stdout, b"hi\n", "{backend:?}: the captured output");
+        assert_eq!(r.outcome, Outcome::Exited(3), "{backend:?}: status*100 + n");
     }
 }

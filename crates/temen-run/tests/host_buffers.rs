@@ -7,7 +7,7 @@
 use temen_fs::{FS_CLOSEDIR, FS_OPENDIR, FS_READDIR};
 use temen_interp::{cap_id, Host, WindowMem};
 use temen_ir::errno::{ENOMEM, ENOSPC};
-use temen_run::exec::{EXEC_CLOSE, EXEC_MSG, EXEC_RUN};
+use temen_run::exec::{msg_name, EXEC_CLOSE, EXEC_RUN};
 
 /// A host whose own node's `channel` ceiling is `ceiling`.
 fn host(ceiling: i64) -> Host {
@@ -21,17 +21,17 @@ fn host(ceiling: i64) -> Host {
 #[test]
 fn an_exec_whose_output_does_not_fit_is_refused() {
     let mut h = host(1 << 20);
-    let exec = temen_run::exec::host_exec(&["yes", "echo"]).install(&mut h, 0);
+    let exec = temen_run::exec::host_exec(&["yes", "echo"]).grant_as(&mut h, 0, "exec");
     // #2962 — the grant brings its message region, charged to the grantee like the jobs are.
     let msg = h
-        .resolve_cap_name(EXEC_MSG)
+        .resolve_cap_name(&msg_name("exec"))
         .expect("the grant names its region");
     let msg = h.resolve_region(msg).expect("a region");
     let granted = h.channel_used();
     let run = |h: &mut Host, argv: &[u8]| {
         assert!(msg.copy_in(0, argv));
-        let args = [EXEC_RUN, 0, argv.len() as i64, 0];
-        h.cap_call(cap_id::HOST_PROC, 0, exec, &args, 1, None)
+        let args = [0, argv.len() as i64, 0];
+        h.cap_call(cap_id::HOST_PROC, EXEC_RUN, exec, &args, 1, None)
             .expect("dispatch")[0]
     };
     assert_eq!(run(&mut h, b"yes"), ENOMEM, "`yes` writes forever");
@@ -39,7 +39,7 @@ fn an_exec_whose_output_does_not_fit_is_refused() {
     let job = run(&mut h, b"echo\0hi");
     assert!(job >= 0, "a run whose output fits goes through: {job}");
     assert!(h.channel_used() > granted, "its output is held");
-    let close = h.cap_call(cap_id::HOST_PROC, 0, exec, &[EXEC_CLOSE, job], 1, None);
+    let close = h.cap_call(cap_id::HOST_PROC, EXEC_CLOSE, exec, &[job], 1, None);
     assert_eq!(close.expect("dispatch")[0], 0);
     assert_eq!(h.channel_used(), granted, "closed, the job holds nothing");
 }

@@ -63,9 +63,9 @@ export 0 func \"_start\" 0
 ";
 
 /// #2962 — every driver maps the `"exec.msg"` region the `exec` grant brings at window 65536 (the
-/// upper half of a `memory 17` window) and passes the protocol region-relative offsets: `exec`'s one
-/// entry is `call.cap 13 0 (op, a, b, c)` — op 0 `run(off, argv_len, stdin_len)` (argv at `off`, its
-/// stdin right after), 1 `read_out(job, off, cap)`, 3 `status(job)`. The phase names sit in data
+/// upper half of a `memory 17` window) and passes the protocol region-relative offsets: op 0
+/// `run(off, argv_len, stdin_len)` (argv at `off`, its stdin right after), 1 `read_out(job, off,
+/// cap)`, 3 `status(job)`. The phase names sit in data
 /// segments and are copied into the region; output lands in the region. `"exec.msg"` is the data at
 /// 16384 (above the #1094 NULL guard), whose first four bytes spell `"exec"`.
 ///
@@ -103,15 +103,15 @@ block 0 () {
   vs2 = i64.const 16396
   mem.copy vd2 vs2 vtwo
   vrun = i64.const 0
-  vjob1 = call.cap 13 0 (i64, i64, i64, i64) -> (i64) vh (vrun, vz, vtwo, vone)
+  vjob1 = call.cap 13 0 (i64, i64, i64) -> (i64) vh (vz, vtwo, vone)
   vread = i64.const 1
   vin2 = i64.const 258
   vcap = i64.const 16
-  vn1 = call.cap 13 0 (i64, i64, i64, i64) -> (i64) vh (vread, vjob1, vin2, vcap)
+  vn1 = call.cap 13 1 (i64, i64, i64) -> (i64) vh (vjob1, vin2, vcap)
   vo2 = i64.const 256
-  vjob2 = call.cap 13 0 (i64, i64, i64, i64) -> (i64) vh (vrun, vo2, vtwo, vn1)
+  vjob2 = call.cap 13 0 (i64, i64, i64) -> (i64) vh (vo2, vtwo, vn1)
   vout = i64.const 512
-  vn2 = call.cap 13 0 (i64, i64, i64, i64) -> (i64) vh (vread, vjob2, vout, vcap)
+  vn2 = call.cap 13 1 (i64, i64, i64) -> (i64) vh (vjob2, vout, vcap)
   vwout = i64.const 66048
   vw = call.import 0 (vwout, vn2)
   vcode = i32.wrap_i64 vn2
@@ -284,13 +284,13 @@ block 1 (q0: i64) {
   vrun0 = i64.const 0
   vo0 = i64.const 0
   vln0 = i64.const 2
-  vj0 = call.cap 13 0 (i64, i64, i64, i64) -> (i64) vh0 (vrun0, vo0, vln0, q0)
+  vj0 = call.cap 13 0 (i64, i64, i64) -> (i64) vh0 (vo0, vln0, q0)
   vread0 = i64.const 1
   vb0 = i64.const 258
   vc0 = i64.const 32
-  vr0 = call.cap 13 0 (i64, i64, i64, i64) -> (i64) vh0 (vread0, vj0, vb0, vc0)
+  vr0 = call.cap 13 1 (i64, i64, i64) -> (i64) vh0 (vj0, vb0, vc0)
   vst0 = i64.const 3
-  vs0 = call.cap 13 0 (i64, i64, i64, i64) -> (i64) vh0 (vst0, vj0, vb0, vc0)
+  vs0 = call.cap 13 3 (i64) -> (i64) vh0 (vj0)
   vs0w = i32.wrap_i64 vs0
   br_if vs0w 6(vs0) 2(vr0)
 }
@@ -301,13 +301,13 @@ block 2 (q1: i64) {
   vrun1 = i64.const 0
   vo1 = i64.const 256
   vln1 = i64.const 2
-  vj1 = call.cap 13 0 (i64, i64, i64, i64) -> (i64) vh1 (vrun1, vo1, vln1, q1)
+  vj1 = call.cap 13 0 (i64, i64, i64) -> (i64) vh1 (vo1, vln1, q1)
   vread1 = i64.const 1
   vb1 = i64.const 514
   vc1 = i64.const 32
-  vr1 = call.cap 13 0 (i64, i64, i64, i64) -> (i64) vh1 (vread1, vj1, vb1, vc1)
+  vr1 = call.cap 13 1 (i64, i64, i64) -> (i64) vh1 (vj1, vb1, vc1)
   vst1 = i64.const 3
-  vs1 = call.cap 13 0 (i64, i64, i64, i64) -> (i64) vh1 (vst1, vj1, vb1, vc1)
+  vs1 = call.cap 13 3 (i64) -> (i64) vh1 (vj1)
   vs1w = i32.wrap_i64 vs1
   br_if vs1w 6(vs1) 3(vr1)
 }
@@ -318,13 +318,13 @@ block 3 (q2: i64) {
   vrun2 = i64.const 0
   vo2 = i64.const 512
   vln2 = i64.const 2
-  vj2 = call.cap 13 0 (i64, i64, i64, i64) -> (i64) vh2 (vrun2, vo2, vln2, q2)
+  vj2 = call.cap 13 0 (i64, i64, i64) -> (i64) vh2 (vo2, vln2, q2)
   vread2 = i64.const 1
   vb2 = i64.const 770
   vc2 = i64.const 32
-  vr2 = call.cap 13 0 (i64, i64, i64, i64) -> (i64) vh2 (vread2, vj2, vb2, vc2)
+  vr2 = call.cap 13 1 (i64, i64, i64) -> (i64) vh2 (vj2, vb2, vc2)
   vst2 = i64.const 3
-  vs2 = call.cap 13 0 (i64, i64, i64, i64) -> (i64) vh2 (vst2, vj2, vb2, vc2)
+  vs2 = call.cap 13 3 (i64) -> (i64) vh2 (vj2)
   vs2w = i32.wrap_i64 vs2
   br_if vs2w 6(vs2) 4(vr2)
 }
@@ -335,13 +335,13 @@ block 4 (q3: i64) {
   vrun3 = i64.const 0
   vo3 = i64.const 768
   vln3 = i64.const 2
-  vj3 = call.cap 13 0 (i64, i64, i64, i64) -> (i64) vh3 (vrun3, vo3, vln3, q3)
+  vj3 = call.cap 13 0 (i64, i64, i64) -> (i64) vh3 (vo3, vln3, q3)
   vread3 = i64.const 1
   vb3 = i64.const 1026
   vc3 = i64.const 32
-  vr3 = call.cap 13 0 (i64, i64, i64, i64) -> (i64) vh3 (vread3, vj3, vb3, vc3)
+  vr3 = call.cap 13 1 (i64, i64, i64) -> (i64) vh3 (vj3, vb3, vc3)
   vst3 = i64.const 3
-  vs3 = call.cap 13 0 (i64, i64, i64, i64) -> (i64) vh3 (vst3, vj3, vb3, vc3)
+  vs3 = call.cap 13 3 (i64) -> (i64) vh3 (vj3)
   vs3w = i32.wrap_i64 vs3
   br_if vs3w 6(vs3) 5(vr3)
 }
@@ -486,9 +486,9 @@ block 0 () {
   vnamel = i64.const 7
   mem.copy vwin vname vnamel
   vrun = i64.const 0
-  vjob = call.cap 13 0 (i64, i64, i64, i64) -> (i64) vh (vrun, vz, vnamel, vz)
+  vjob = call.cap 13 0 (i64, i64, i64) -> (i64) vh (vz, vnamel, vz)
   vst = i64.const 3
-  vstatus = call.cap 13 0 (i64, i64, i64, i64) -> (i64) vh (vst, vjob, vz, vz)
+  vstatus = call.cap 13 3 (i64) -> (i64) vh (vjob)
   vcode = i32.wrap_i64 vstatus
   call.import 0 (vcode)
   unreachable
@@ -624,18 +624,18 @@ block 0 () {
   vuse = i64.const 16396
   mem.copy vd2 vuse vthree
   vrun = i64.const 0
-  vjg = call.cap 13 0 (i64, i64, i64, i64) -> (i64) vh (vrun, vz, vthree, vz)
+  vjg = call.cap 13 0 (i64, i64, i64) -> (i64) vh (vz, vthree, vz)
   vst = i64.const 3
-  vsg = call.cap 13 0 (i64, i64, i64, i64) -> (i64) vh (vst, vjg, vz, vz)
+  vsg = call.cap 13 3 (i64) -> (i64) vh (vjg)
   vo2 = i64.const 256
-  vju = call.cap 13 0 (i64, i64, i64, i64) -> (i64) vh (vrun, vo2, vthree, vz)
+  vju = call.cap 13 0 (i64, i64, i64) -> (i64) vh (vo2, vthree, vz)
   vread = i64.const 1
   vout = i64.const 512
   vcap = i64.const 32
-  vnu = call.cap 13 0 (i64, i64, i64, i64) -> (i64) vh (vread, vju, vout, vcap)
+  vnu = call.cap 13 1 (i64, i64, i64) -> (i64) vh (vju, vout, vcap)
   vwout = i64.const 66048
   vw = call.import 0 (vwout, vnu)
-  vsu = call.cap 13 0 (i64, i64, i64, i64) -> (i64) vh (vst, vju, vz, vz)
+  vsu = call.cap 13 3 (i64) -> (i64) vh (vju)
   vcode = i32.wrap_i64 vsu
   call.import 1 (vcode)
   unreachable
@@ -718,9 +718,9 @@ block 0 () {
   vnamel = i64.const 5
   mem.copy vwin vname vnamel
   vrun = i64.const 0
-  vj = call.cap 13 0 (i64, i64, i64, i64) -> (i64) vh (vrun, vz, vnamel, vz)
+  vj = call.cap 13 0 (i64, i64, i64) -> (i64) vh (vz, vnamel, vz)
   vst = i64.const 3
-  vs = call.cap 13 0 (i64, i64, i64, i64) -> (i64) vh (vst, vj, vz, vz)
+  vs = call.cap 13 3 (i64) -> (i64) vh (vj)
   vcode = i32.wrap_i64 vs
   call.import 0 (vcode)
   unreachable

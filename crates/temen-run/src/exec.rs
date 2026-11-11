@@ -15,30 +15,46 @@ pub use temen_exec::*;
 use temen_ir::errno::*; // the one shared negative-errno table (#905)
 
 use crate::Descriptor;
-use crate::{Backend, HostCap, Instance, Limits, Outcome, RunConfig};
+use crate::{Backend, HostCap, IfaceShape, Instance, Limits, Outcome, RunConfig};
 use std::io::{Read, Write};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use temen_interp::{
-    cap_id, CapState, ForkedProc, HostBuffer, HostProcFork, HostProcGrant, ProcHandler, Value,
+    CapState, ForkedProc, HostBuffer, HostProcFork, HostProcGrant, ProcHandler, Value,
 };
 
-/// An `exec` [`HostCap`] whose jobs `runner` makes (one [`RunJob`] per handler it mints). Its grant
-/// is the wirer's whole act (#2962): it mints the [`EXEC_MSG`] message region, charged to the
-/// grantee as the embedder's grant, grants it under that name, and grants the handler, which serves
-/// every byte from the region ([`serve`]) and never touches the guest's window. A `fork()` twin
-/// re-mints the handler over a fresh job table and the same region, which the twin shares. A region
-/// the host cannot make leaves the slot unbound: its handle is the errno, so a resolve of `exec`
-/// is negative and the guest's fallback runs.
+/// The `exec` interface's [`IfaceShape`], [`EXEC_IFACE`] parsed.
+fn exec_shape() -> IfaceShape {
+    EXEC_IFACE
+        .iter()
+        .fold(IfaceShape::new(), |shape, (name, sig)| {
+            shape.op(
+                *name,
+                temen_text::parse_func_type(sig).expect("EXEC_IFACE parses"),
+            )
+        })
+}
+
+/// An `exec` [`HostCap`] whose jobs `runner` makes (one [`RunJob`] per handler it mints): a grouped
+/// provider of [`EXEC_IFACE`], published on the handler as its vtable, so a guest's grouped import
+/// binds it by op name, in a child as in the root. Its grant is the wirer's whole act (#2962): for
+/// the slot `name` it mints the message region, charged to the grantee as the embedder's grant,
+/// grants it as `<name>.msg`, and grants the handler, which serves every byte from the region
+/// ([`serve`]) and never touches the guest's window. A `fork()` twin re-mints the handler over a
+/// fresh job table and the same region (#2970). A region the host cannot make leaves the slot
+/// unbound: its handle is the errno, so a resolve of the slot is negative and the guest's fallback
+/// runs.
 fn exec_cap(runner: impl Fn() -> RunJob + Send + Sync + 'static) -> HostCap {
     let runner = Arc::new(runner);
-    HostCap::custom(cap_id::HOST_PROC, 0, move |h, _| {
+    let shape = exec_shape();
+    let vtable: (Vec<String>, Vec<temen_ir::FuncType>) = shape.ops.iter().cloned().unzip();
+    HostCap::iface_named(&shape, "exec", move |h, _, name| {
         let msg = match h.mint_region(EXEC_MSG_LEN, true) {
             Ok(msg) => msg,
             Err(errno) => return errno as i32,
         };
         let region = h.grant_shared_region_backed(Arc::clone(&msg));
-        h.register_cap_name(EXEC_MSG, region);
+        h.register_cap_name(&msg_name(name), region);
         let payer = h.own_node();
         let fork: HostProcFork = Arc::new({
             let (runner, msg, payer) = (Arc::clone(&runner), Arc::clone(&msg), payer.clone());
@@ -52,9 +68,11 @@ fn exec_cap(runner: impl Fn() -> RunJob + Send + Sync + 'static) -> HostCap {
             }
         });
         let handler = serve(msg, &payer, runner());
-        h.grant_host_proc(
+        let h_exec = h.grant_host_proc(
             HostProcGrant::new(ProcHandler::Sync(handler), CapState::Uncaptured).forkable(fork),
-        )
+        );
+        h.set_host_proc_vtable(h_exec, vtable.0.clone(), vtable.1.clone());
+        h_exec
     })
 }
 

@@ -11,14 +11,15 @@
 //! One interface, wirer-chosen backend (EXEC.md): a guest cannot tell which backend serves it,
 //! a host one or a guest one. Two things make that true (#2962):
 //!
-//! - **One call form.** `exec` is a single entry, `exec(op, a, b, c) -> i64`, with the op in the
-//!   first argument. A flat import of that shape binds the same way to a host procedure and to a
-//!   guest's live offer, which a call naming the op in its immediate cannot (`call.cap HOST_PROC op`
-//!   never reaches a guest servicer).
+//! - **One call form: a grouped import bound by op name.** `exec` is the interface [`EXEC_IFACE`],
+//!   five named ops. A guest's grouped import of it binds by op name to a host backend (which
+//!   publishes the shape as its vtable) and to a guest's live offer of the same names alike.
 //! - **One data plane: the message region.** Every byte the protocol moves crosses a `SharedRegion`
-//!   the wirer grants beside the slot, named [`EXEC_MSG`]. Offsets are region-relative, so a guest
-//!   servicer, which cannot read its caller's window, reads the same bytes a host servicer does.
-//!   A host servicer never touches the caller's window at all.
+//!   the wirer grants beside the slot, named `<slot>.msg` ([`msg_name`]). Offsets are
+//!   region-relative, so a guest servicer, which cannot read its caller's window, reads the same
+//!   bytes a host servicer does. A host servicer never touches the caller's window at all, and,
+//!   like every servicer, copies a range once and parses its copy: the caller may still write the
+//!   region during the call.
 //!
 //! v1 is **blocking one-shot**: `run` executes to completion with the given stdin;
 //! `read_out`/`read_err` drain the captured output in chunks; `status` reports the exit code.
@@ -30,25 +31,38 @@ use temen_interp::{
 };
 use temen_ir::errno::*;
 
-/// `exec(RUN, off, argv_len, stdin_len) -> job | -errno` — spawn with the argv at `msg[off..]`
+/// `run(off, argv_len, stdin_len) -> job | -errno` — spawn with the argv at `msg[off..]`
 /// (NUL-separated, `argv[0]` the program) and the stdin right after it; v1 runs the job to
 /// completion before returning. A program the capability does not permit (allowlist miss / no
 /// table entry) is `-EPERM`, a refused op, never a trap.
-pub const EXEC_RUN: i64 = 0;
-/// `exec(READ_OUT, job, off, cap) -> n | 0 = EOF | -errno` — copy the next chunk of the job's
-/// stdout, at most `cap` bytes, to `msg[off..]`.
-pub const EXEC_READ_OUT: i64 = 1;
-/// `exec(READ_ERR, job, off, cap) -> n | 0 = EOF | -errno` — the same for stderr.
-pub const EXEC_READ_ERR: i64 = 2;
-/// `exec(STATUS, job) -> exit code | -errno` — the job's exit code (POSIX-shell collapse on the
-/// host backend: 0-255, signal death as 128+signo; verbatim on scripted/domain backends).
-pub const EXEC_STATUS: i64 = 3;
-/// `exec(CLOSE, job) -> 0 | -errno` — release the job handle.
-pub const EXEC_CLOSE: i64 = 4;
+pub const EXEC_RUN: u32 = 0;
+/// `read_out(job, off, cap) -> n | 0 = EOF | -errno` — copy the next chunk of the job's stdout, at
+/// most `cap` bytes, to `msg[off..]`.
+pub const EXEC_READ_OUT: u32 = 1;
+/// `read_err(job, off, cap) -> n | 0 = EOF | -errno` — the same for stderr.
+pub const EXEC_READ_ERR: u32 = 2;
+/// `status(job) -> exit code | -errno` — the job's exit code (POSIX-shell collapse on the host
+/// backend: 0-255, signal death as 128+signo; verbatim on scripted/domain backends).
+pub const EXEC_STATUS: u32 = 3;
+/// `close(job) -> 0 | -errno` — release the job handle.
+pub const EXEC_CLOSE: u32 = 4;
 
-/// The name the message region is granted under, beside the `exec` slot (#2962): the wirer grants
-/// both, at the same time.
-pub const EXEC_MSG: &str = "exec.msg";
+/// The `exec` interface as text, in op order (op `i` is the host handler's op `i`): what a host
+/// backend publishes and what a guest servicer exports, so both bind a grouped import by the same
+/// names. Its shapes are read by `temen_text::parse_func_type`.
+pub const EXEC_IFACE: [(&str, &str); 5] = [
+    ("run", "(i64, i64, i64) -> (i64)"),
+    ("read_out", "(i64, i64, i64) -> (i64)"),
+    ("read_err", "(i64, i64, i64) -> (i64)"),
+    ("status", "(i64) -> (i64)"),
+    ("close", "(i64) -> (i64)"),
+];
+
+/// The name the message region of the slot named `slot` is granted under, beside it (#2962): the
+/// wirer grants both, at the same time.
+pub fn msg_name(slot: &str) -> String {
+    format!("{slot}.msg")
+}
 /// The message region's size: a `run` whose argv and stdin together exceed it is `-E2BIG`; output
 /// drains through it in chunks, so it never limits a job's output.
 pub const EXEC_MSG_LEN: usize = 64 << 10;
@@ -80,11 +94,12 @@ pub fn parse_argv(bytes: &[u8]) -> Result<Vec<String>, i64> {
     Ok(argv)
 }
 
-/// Decode `run`'s `(off, argv_len, stdin_len)` into `(argv, stdin)`, read from the message region.
-/// A payload past the region's end is `-E2BIG`: the region is the bound on what one `run` carries.
+/// Decode `run`'s `(off, argv_len, stdin_len)` into `(argv, stdin)`, each range copied out of the
+/// message region once and parsed from the copy. A payload past the region's end is `-E2BIG`: the
+/// region is the bound on what one `run` carries.
 pub fn run_args(args: &[i64], msg: &RegionBacking) -> Result<(Vec<String>, Vec<u8>), i64> {
     let a = |i: usize| args.get(i).copied().unwrap_or(0);
-    let (off, argv_len, stdin_len) = (a(1), a(2), a(3));
+    let (off, argv_len, stdin_len) = (a(0), a(1), a(2));
     if off < 0 || argv_len < 1 || stdin_len < 0 {
         return Err(EINVAL);
     }
@@ -174,19 +189,19 @@ impl JobTable {
         }
     }
 
-    /// A non-`run` op (`read_out`/`read_err`/`status`/`close`), `args` the entry's `[op, job, …]`.
-    fn handle(&mut self, args: &[i64], msg: &RegionBacking) -> i64 {
+    /// A non-`run` op (`read_out`/`read_err`/`status`/`close`), `args` its `[job, …]`.
+    fn handle(&mut self, op: u32, args: &[i64], msg: &RegionBacking) -> i64 {
         let a = |i: usize| args.get(i).copied().unwrap_or(0);
-        let job_idx = match a(1) {
+        let job_idx = match a(0) {
             j if j >= 0 && (j as usize) < self.jobs.len() => j as usize,
             _ => return EBADF,
         };
         let Some(job) = self.jobs[job_idx].as_mut() else {
             return EBADF;
         };
-        match a(0) {
-            op @ (EXEC_READ_OUT | EXEC_READ_ERR) => {
-                let (off, cap) = (a(2), a(3));
+        match op {
+            EXEC_READ_OUT | EXEC_READ_ERR => {
+                let (off, cap) = (a(1), a(2));
                 if off < 0 || cap < 0 {
                     return EINVAL;
                 }
@@ -220,9 +235,9 @@ impl JobTable {
 /// The table is the grant's, for charging the job's output to its payer.
 pub type RunJob = Box<dyn FnMut(Vec<String>, Vec<u8>, &JobTable) -> Result<Job, i64> + Send>;
 
-/// The `exec` handler every host backend serves through: one entry (the call's own op must be 0;
-/// the protocol's op is `args[0]`), every byte through `msg`, every non-`run` op through one
-/// [`JobTable`] whose jobs `payer` pays for. Only `run_job` is the backend's.
+/// The `exec` handler every host backend serves through: the five ops of [`EXEC_IFACE`], every
+/// byte through `msg`, every non-`run` op through one [`JobTable`] whose jobs `payer` pays for.
+/// Only `run_job` is the backend's.
 pub fn serve(msg: RegionBacking, payer: &NodeRef, mut run_job: RunJob) -> HostProc {
     let mut jobs = JobTable::new(payer);
     Box::new(
@@ -231,18 +246,15 @@ pub fn serve(msg: RegionBacking, payer: &NodeRef, mut run_job: RunJob) -> HostPr
               out: &mut [i64],
               _mem: Option<&mut dyn GuestMem>,
               _minter: Option<&mut dyn RegionMinter>| {
-            let r = if op != 0 {
-                EINVAL
-            } else if args.first() == Some(&EXEC_RUN) {
-                match run_args(args, &msg) {
+            let r = match op {
+                EXEC_RUN => match run_args(args, &msg) {
                     Ok((argv, stdin)) => match run_job(argv, stdin, &jobs) {
                         Ok(job) => jobs.push(job),
                         Err(e) => e,
                     },
                     Err(e) => e,
-                }
-            } else {
-                jobs.handle(args, &msg)
+                },
+                _ => jobs.handle(op, args, &msg),
             };
             temen_interp::put_results(out, &[r])
         },
