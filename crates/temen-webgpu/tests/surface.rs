@@ -191,13 +191,16 @@ fn window_surface_follows_its_size() {
 }
 
 /// A host that runs the protocol in-process, with no guest, as a native compositor's tests do,
-/// drives `temen_gpu::Gpu` over [`temen_webgpu::Wgpu`] itself: the same checks and surfaces.
+/// drives `temen_gpu::Gpu` over [`temen_webgpu::Wgpu`] itself: the same checks and surfaces. Its
+/// frames hand each one presented to the function it gave them, as a capture keeps every frame.
 #[test]
 fn an_in_process_host_presents() {
     use temen_gpu::command::{ColorAttachment, Command, Encoder};
     use temen_gpu::enums::{LoadOp, StoreOp};
     common::require_adapter();
-    let frames = Frames::default();
+    let each = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let kept = Arc::clone(&each);
+    let frames = Frames::each(move |f| kept.lock().unwrap().push(f.clone()));
     let surface = Surface::Offscreen {
         size: Size::new(8, 4),
         format: temen_gpu::TextureFormat::Rgba8Unorm,
@@ -228,4 +231,9 @@ fn an_in_process_host_presents() {
     let frame = frame.expect("a presented frame");
     assert_eq!((shown, frame.width, frame.height), (1, 8, 4));
     assert!(frame.texels.chunks(4).all(|t| t == [0, 255, 0, 255]));
+    assert_eq!(
+        *each.lock().unwrap(),
+        [frame],
+        "each frame was handed on as it was presented"
+    );
 }

@@ -83,9 +83,21 @@ fn pack(width: u32, height: u32) -> u64 {
     (width as u64) << 32 | height as u64
 }
 
-/// The frames a guest has presented to an offscreen surface: the last one, and how many.
+/// The frames a guest has presented to an offscreen surface: the last one, and how many. An
+/// embedder that needs each in turn, as a capture that stamps and keeps every frame does, gives
+/// [`Frames::each`] a function to hand each to as it is presented.
 #[derive(Clone, Default)]
-pub struct Frames(Arc<Mutex<(u64, Option<Frame>)>>);
+pub struct Frames(Arc<Mutex<Shown>>);
+
+#[derive(Default)]
+struct Shown {
+    count: u64,
+    last: Option<Frame>,
+    each: Option<Each>,
+}
+
+/// What [`Frames::each`] hands every frame to.
+type Each = Box<dyn FnMut(&Frame) + Send>;
 
 /// One presented frame: rows of `width` texels of 4 bytes each, top to bottom, in the surface's
 /// format.
@@ -98,9 +110,28 @@ pub struct Frame {
 }
 
 impl Frames {
+    /// Frames that also hand each frame to `f` as it is presented, on the thread presenting it.
+    pub fn each(f: impl FnMut(&Frame) + Send + 'static) -> Frames {
+        let shown = Shown {
+            each: Some(Box::new(f)),
+            ..Shown::default()
+        };
+        Frames(Arc::new(Mutex::new(shown)))
+    }
+
     /// The number of frames presented, and the last.
     pub fn last(&self) -> (u64, Option<Frame>) {
-        self.0.lock().unwrap().clone()
+        let s = self.0.lock().unwrap();
+        (s.count, s.last.clone())
+    }
+
+    fn present(&self, frame: Frame) {
+        let mut s = self.0.lock().unwrap();
+        s.count += 1;
+        if let Some(each) = &mut s.each {
+            each(&frame);
+        }
+        s.last = Some(frame);
     }
 }
 
@@ -858,9 +889,7 @@ impl Wgpu {
         }
         drop(mapped);
         staging.unmap();
-        let mut f = frames.0.lock().unwrap();
-        f.0 += 1;
-        f.1 = Some(Frame {
+        frames.present(Frame {
             width: w,
             height: h,
             format: *format,
