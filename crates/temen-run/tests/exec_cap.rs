@@ -19,7 +19,19 @@ use temen_text::parse_module;
 /// for every host's mapping granularity.
 const MSG_AT: u64 = 65536;
 
-/// A consumer: resolves `"exec"` and `"exec.msg"`, maps the region at [`MSG_AT`], copies its
+/// The types and imports every consumer declares: `exec` as one grouped slot bound by op name
+/// (import 0), and the `out` stream and `exit` (imports 1 and 2).
+const HEAD: &str = "type 0 func (i64, i64, i64) -> (i64)
+type 1 func (i64) -> (i64)
+type 2 interface { run: 0, read_out: 0, read_err: 0, status: 1, close: 1 }
+type 3 func (i64, i64) -> (i64)
+type 4 func (i32) -> ()
+import 0 interface \"exec\" 2
+import 1 func \"out\" 3
+import 2 func \"exit\" 4
+";
+
+/// A consumer: imports `exec` (its grant brings `"exec.msg"`), maps the region at [`MSG_AT`], copies its
 /// payload there (`argv`, NUL-separated, then `stdin`), and `run`s it. When `report`, it reads up to
 /// 16 bytes of output into the region, echoes them to the granted `out` stream (the cross-backend
 /// byte observable), and exits with `status * 100 + nread`; otherwise it exits 1 iff the `run` came
@@ -38,34 +50,26 @@ fn consumer(argv: &[&str], stdin: &str, report: bool) -> String {
     }
     let payload = argv_len + stdin.len();
     let tail = if report {
-        "  vread = i64.const 1
-  vcap = i64.const 16
-  vn = call.cap 13 1 (i64, i64, i64) -> (i64) vh (vjob, vz, vcap)
-  vst = i64.const 3
-  vs = call.cap 13 3 (i64) -> (i64) vh (vjob)
-  vw = call.import 0 (vwin, vn)
+        "  vcap = i64.const 16
+  vn = call.import 0.read_out (vjob, vz, vcap)
+  vs = call.import 0.status (vjob)
+  vw = call.import 1 (vwin, vn)
   vhund = i64.const 100
   vmul = i64.mul vs vhund
   vsum = i64.add vmul vn
   vcode = i32.wrap_i64 vsum
-  call.import 1 (vcode)"
+  call.import 2 (vcode)"
             .to_string()
     } else {
         "  vfailed = i64.lt_s vjob vz
-  call.import 1 (vfailed)"
+  call.import 2 (vfailed)"
             .to_string()
     };
     format!(
         "memory 17
-data 16384 \"exec\"
 data 16392 \"exec.msg\"
-{data}import 0 \"out\" (i64, i64) -> (i64)
-import 1 \"exit\" (i32) -> ()
-func 0 () -> () {{
+{data}{HEAD}func 0 () -> () {{
 block 0 () {{
-  vp = i64.const 16384
-  vl = i64.const 4
-  vh = self.resolve vp vl
   vmp = i64.const 16392
   vml = i64.const 8
   vmsg = self.resolve vmp vml
@@ -77,10 +81,9 @@ block 0 () {{
   vsrc = i64.const 16416
   vpay = i64.const {payload}
   mem.copy vwin vsrc vpay
-  vrun = i64.const 0
   val = i64.const {argv_len}
   vsl = i64.const {stdin_len}
-  vjob = call.cap 13 0 (i64, i64, i64) -> (i64) vh (vz, val, vsl)
+  vjob = call.import 0.run (vz, val, vsl)
 {tail}
   unreachable
   }}
@@ -117,14 +120,11 @@ fn echo_table() -> Vec<ScriptedEntry> {
 #[test]
 fn scripted_exec_runs_echo_identically_on_all_three_backends() {
     let m = parse_module(&echo_consumer()).expect("parse");
-    let inst = instantiate_with_imports(m, registry()).expect("instantiate");
+    let inst = instantiate_with_imports(m, registry().provide("exec", scripted_exec(echo_table())))
+        .expect("instantiate");
     for backend in [Backend::TreeWalk, Backend::Bytecode, Backend::Jit] {
         let r = inst
-            .run_with_caps(
-                backend,
-                &RunConfig::default(),
-                &[("exec", scripted_exec(echo_table()))],
-            )
+            .run_with_caps(backend, &RunConfig::default(), &[])
             .unwrap_or_else(|e| panic!("{backend:?}: {e}"));
         assert_eq!(r.stdout, b"hi\n", "{backend:?}: the captured output");
         assert_eq!(r.outcome, Outcome::Exited(3), "{backend:?}: status*100 + n");
@@ -138,14 +138,11 @@ fn scripted_exec_runs_echo_identically_on_all_three_backends() {
 #[test]
 fn host_exec_matches_scripted_byte_for_byte() {
     let m = parse_module(&echo_consumer()).expect("parse");
-    let inst = instantiate_with_imports(m, registry()).expect("instantiate");
+    let inst = instantiate_with_imports(m, registry().provide("exec", host_exec(&["echo"])))
+        .expect("instantiate");
     for backend in [Backend::TreeWalk, Backend::Bytecode, Backend::Jit] {
         let r = inst
-            .run_with_caps(
-                backend,
-                &RunConfig::default(),
-                &[("exec", host_exec(&["echo"]))],
-            )
+            .run_with_caps(backend, &RunConfig::default(), &[])
             .unwrap_or_else(|e| panic!("{backend:?}: {e}"));
         assert_eq!(r.stdout, b"hi\n", "{backend:?}: a real echo's output");
         assert_eq!(
@@ -189,14 +186,14 @@ fn echo_domain_registry() -> Vec<DomainProgram> {
 #[test]
 fn domain_exec_matches_scripted_byte_for_byte() {
     let m = parse_module(&echo_consumer()).expect("parse");
-    let inst = instantiate_with_imports(m, registry()).expect("instantiate");
+    let inst = instantiate_with_imports(
+        m,
+        registry().provide("exec", domain_exec(echo_domain_registry())),
+    )
+    .expect("instantiate");
     for backend in [Backend::TreeWalk, Backend::Bytecode, Backend::Jit] {
         let r = inst
-            .run_with_caps(
-                backend,
-                &RunConfig::default(),
-                &[("exec", domain_exec(echo_domain_registry()))],
-            )
+            .run_with_caps(backend, &RunConfig::default(), &[])
             .unwrap_or_else(|e| panic!("{backend:?}: {e}"));
         assert_eq!(
             r.stdout, b"hi\n",
@@ -238,14 +235,12 @@ fn stdin_flows_into_the_child_domain() {
         limits: Limits::default(),
     }];
     let m = parse_module(&consumer(&["cat"], "yo", true)).expect("parse");
-    let inst = instantiate_with_imports(m, registry()).expect("instantiate");
+    let inst =
+        instantiate_with_imports(m, registry().provide("exec", domain_exec(programs.clone())))
+            .expect("instantiate");
     for backend in [Backend::TreeWalk, Backend::Bytecode, Backend::Jit] {
         let r = inst
-            .run_with_caps(
-                backend,
-                &RunConfig::default(),
-                &[("exec", domain_exec(programs.clone()))],
-            )
+            .run_with_caps(backend, &RunConfig::default(), &[])
             .unwrap_or_else(|e| panic!("{backend:?}: {e}"));
         assert_eq!(
             r.stdout, b"yo",
@@ -281,14 +276,12 @@ fn a_trapping_domain_program_is_a_failed_run_not_a_trap() {
     }];
     // Probe that running `boom`'s trap comes back negative.
     let m = parse_module(&consumer(&["boom"], "", false)).expect("parse");
-    let inst = instantiate_with_imports(m, registry()).expect("inst");
+    let inst =
+        instantiate_with_imports(m, registry().provide("exec", domain_exec(programs.clone())))
+            .expect("instantiate");
     for backend in [Backend::TreeWalk, Backend::Bytecode, Backend::Jit] {
         let r = inst
-            .run_with_caps(
-                backend,
-                &RunConfig::default(),
-                &[("exec", domain_exec(programs.clone()))],
-            )
+            .run_with_caps(backend, &RunConfig::default(), &[])
             .unwrap_or_else(|e| panic!("{backend:?}: {e}"));
         assert_eq!(
             r.outcome,
@@ -343,14 +336,15 @@ fn ungranted_exec_resolves_negative_and_the_fallback_runs() {
 #[test]
 fn a_program_outside_the_allowlist_is_refused_not_trapped() {
     let m = parse_module(&consumer(&["cat", "hi"], "", false)).expect("parse");
-    let inst = instantiate_with_imports(m, registry()).expect("inst");
     for (name, cap) in [
         ("host_exec", host_exec(&["echo"])),
         ("scripted_exec", scripted_exec(echo_table())),
     ] {
+        let inst = instantiate_with_imports(m.clone(), registry().provide("exec", cap))
+            .expect("instantiate");
         for backend in [Backend::TreeWalk, Backend::Bytecode, Backend::Jit] {
             let r = inst
-                .run_with_caps(backend, &RunConfig::default(), &[("exec", cap.clone())])
+                .run_with_caps(backend, &RunConfig::default(), &[])
                 .unwrap_or_else(|e| panic!("{name}/{backend:?}: {e}"));
             assert_eq!(
                 r.outcome,
@@ -358,63 +352,5 @@ fn a_program_outside_the_allowlist_is_refused_not_trapped() {
                 "{name}/{backend:?}: the miss is a probeable negative, not a trap"
             );
         }
-    }
-}
-
-/// #2962 — a **grouped import** of `exec` in the root binds the host backend by op name, and its
-/// grant brings the slot's message region as `<slot>.msg`: here the slot is `"exec"`, so the
-/// region is `"exec.msg"`. `echo hi` through `call.import 0.run` / `0.read_out` / `0.status`, on
-/// all three backends: exit `status * 100 + nread` = 3.
-#[test]
-fn a_grouped_import_binds_the_host_backend_by_op_name() {
-    let src = "memory 17
-data 16384 \"exec.msg\"
-data 16416 \"echo\"
-data 16421 \"hi\"
-type 0 func (i64, i64, i64) -> (i64)
-type 1 func (i64) -> (i64)
-type 2 interface { run: 0, read_out: 0, read_err: 0, status: 1, close: 1 }
-type 3 func (i64, i64) -> (i64)
-type 4 func (i32) -> ()
-import 0 interface \"exec\" 2
-import 1 func \"out\" 3
-import 2 func \"exit\" 4
-func 0 () -> () {
-block 0 () {
-  vp = i64.const 16384
-  vml = i64.const 8
-  vmsg = self.resolve vp vml
-  vwin = i64.const 65536
-  vz = i64.const 0
-  vlen = i64.const 65536
-  vprot = i32.const 3
-  vmapped = call.cap 4 0 (i64, i64, i64, i32) -> (i64) vmsg (vwin, vz, vlen, vprot)
-  vsrc = i64.const 16416
-  val = i64.const 7
-  mem.copy vwin vsrc val
-  vjob = call.import 0.run (vz, val, vz)
-  vcap = i64.const 16
-  vn = call.import 0.read_out (vjob, vz, vcap)
-  vs = call.import 0.status (vjob)
-  vw = call.import 1 (vwin, vn)
-  vhund = i64.const 100
-  vmul = i64.mul vs vhund
-  vsum = i64.add vmul vn
-  vcode = i32.wrap_i64 vsum
-  call.import 2 (vcode)
-  unreachable
-  }
-}
-export 0 func \"_start\" 0
-";
-    let m = parse_module(src).expect("parse");
-    let imports = registry().provide("exec", scripted_exec(echo_table()));
-    let inst = instantiate_with_imports(m, imports).expect("the grouped import binds by op name");
-    for backend in [Backend::TreeWalk, Backend::Bytecode, Backend::Jit] {
-        let r = inst
-            .run_with_caps(backend, &RunConfig::default(), &[])
-            .unwrap_or_else(|e| panic!("{backend:?}: {e}"));
-        assert_eq!(r.stdout, b"hi\n", "{backend:?}: the captured output");
-        assert_eq!(r.outcome, Outcome::Exited(3), "{backend:?}: status*100 + n");
     }
 }
