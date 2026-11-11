@@ -207,9 +207,15 @@ fn one_call(
 fn every_engine_defines_the_results_a_call_declares() {
     use temen_ir::{cap_id, trap_code::CAP_FAULT, CAP_SELF_TYPE_ID as SELF};
     // Each op with the args its contract reads.
-    let served: [Call; 11] = [
+    let served: [Call; 12] = [
         (cap_id::JIT, 3, 14, &[("i64", 5)]),
         (cap_id::JIT, 4, 14, &[("i64", 999)]),
+        (
+            cap_id::MODULE,
+            2,
+            6,
+            &[("i64", 0), ("i64", 0), ("i64", 4096), ("i64", 64)],
+        ),
         (cap_id::INSTANTIATOR, 1, 3, &[("i32", 7)]),
         (cap_id::INSTANTIATOR, 9, 3, &[("i32", 7)]),
         (cap_id::INSTANTIATOR, 14, 3, &[("i32", 7), ("i64", 0)]),

@@ -583,7 +583,9 @@ against). The four policies are one act with different right-hand sides:
 
 **Empty grants (#2219, owner 2026-10-08).** Withholding is strict: a `required` import that no grant
 satisfies refuses the spawn, and the run's notes name the import (`Host::take_notes`; `temen-run`
-prints them), since the guest sees only `-ENOENT` (#2864). A parent that means to leave an import out says so
+prints them). The guest sees `-ENOENT` (#2864), and asks the module which import it was:
+`Module.unbound` binds a child from the same list as the spawn does and names the first import
+nothing binds (#2874). A parent that means to leave an import out says so
 with an **empty grant**: a grant record whose handle is `GRANT_EMPTY` (`VM_EMPTY` in C's `<temen.h>`).
 The import binds empty and faults on use, as a `rebindable` slot nothing attached does.
 - The record's name is the import's, `*` (every import nothing else satisfies), or a prefix ending in

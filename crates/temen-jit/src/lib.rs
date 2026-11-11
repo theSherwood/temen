@@ -1018,8 +1018,8 @@ pub struct ResolvedModule {
 /// granted module's code/data (so a guest can only instantiate modules it was given). Returns
 /// nonzero and fills `out` on success, `0` for a forged/closed/wrong handle. Deliberately a
 /// *separate* callback from [`CapThunk`]: module resolution yields host pointers, which must never
-/// be reachable from a guest-issued `call.cap` (the generic dispatch on a Module handle is an inert
-/// `CapFault`) — only the host-side nesting runtime calls this.
+/// be reachable from a guest-issued `call.cap` (the generic dispatch on a Module handle answers only
+/// its declared window and the name of an import) — only the host-side nesting runtime calls this.
 ///
 /// # Safety
 /// `ctx` is the same host pointer as the run's `cap_ctx`; `out` points at a writable

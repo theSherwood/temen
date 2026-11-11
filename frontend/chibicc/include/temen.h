@@ -89,6 +89,17 @@ long __vm_budget_read(int budget, long field);
 // node stays, so a child you spawned from it is still capped by it: close a node you split for a
 // child once the child is spawned, or a parent that spawns many fills its handle table (#2384).
 long __vm_budget_close(int budget);
+// `__vm_module_window(module)` — the window a spawn of `module` gets, as its size_log2: the memory it
+// declares, which the spawn's budget pays `1L << size_log2` bytes of memory for. -EINVAL for a module
+// that declares none, which no spawn admits (#1908).
+long __vm_module_window(int module);
+// `__vm_module_unbound(module, grants, n, buf, cap)` — the import of `module` that the `n` grant
+// records at `grants` leave unbound, which a spawn with them refuses with -ENOENT: its name's length,
+// the name copied into the first `cap` bytes of `buf` (not NUL-terminated), or 0 when every import
+// binds. The child is built and bound as a spawn builds and binds it, then discarded, so the answer is
+// the spawn's own. A record the spawn would trap on traps here too; a `buf` outside your window is
+// -EFAULT. Ask again with a `VM_EMPTY` record for each name it answers to list them all (#2874).
+long __vm_module_unbound(int module, const void *grants, long n, char *buf, long cap);
 //
 // **Reflection** (§7): discover what the host actually granted *this* domain — read-only and
 // authority-neutral (it only re-surfaces handles you already hold). `__vm_cap_count()` is how many

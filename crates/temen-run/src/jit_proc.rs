@@ -982,12 +982,13 @@ pub(crate) enum Entry<'a> {
 /// threads or runs fibers (§12; waiting and notifying alone make no second caller, so a program
 /// that only sleeps on a futex — nim's `nanosleep` — is single-threaded, and can fork). Or it has
 /// a service point: the JIT's one serve loop runs over the locked cell, root or child (#2166). Or
-/// its detached children can call it back (#744): it declares an impl-export and spawns detached
-/// (op 17), so a spawn may grant the child a live offer into the root's cell.
+/// its detached children can call it back (#744): it declares an impl-export and builds a detached
+/// child's powerbox (a spawn, op 17, or `Module.unbound`, #2874), which may grant the child a live
+/// offer into the root's cell.
 pub(crate) fn locked(m: &Module) -> bool {
     m.funcs.iter().any(|f| f.uses_fibers_or_threads())
         || crate::has_service_point(m)
-        || (!m.impl_exports.is_empty() && crate::spawns_detached(m))
+        || (!m.impl_exports.is_empty() && crate::builds_detached_children(m))
 }
 
 /// Run `f` over `host` in the shape a program's `call.cap`s need ([`CapCtx`]): a [`locked`]

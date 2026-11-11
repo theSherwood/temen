@@ -239,10 +239,11 @@ borrowed from the caller's window, fail-closed (`-EFAULT` out of bounds, `-EINVA
 only the funcidx crosses back, never a host pointer.
 
 *Retired (#2219).* A child now starts at its module's function 0, its child bootstrap, so there is
-no entry to look up: `Module` op 0 traps `CapFault` on every engine (`self_spawn_refused.rs`), and a
-`Module` handle has no callable op. A host that wants a child to start at a named export grants that
-export's child image (`temen_ir::child_image_at`). `Module::resolve_export`, the host-side lookup,
-stays for embedders.
+no entry to look up: `Module` op 0 traps `CapFault` on every engine (`self_spawn_refused.rs`). A host
+that wants a child to start at a named export grants that export's child image
+(`temen_ir::child_image_at`). `Module::resolve_export`, the host-side lookup, stays for embedders.
+A `Module`'s ops now only answer what a spawner asks of it: op 1 its declared window (#1908), and op 2
+the first import a grant list leaves unbound (#2874).
 
 **Resolved (F1).** The run paths are converged onto one core:
 - `run_powerbox_inner` no longer carries its own grant/compile/watchdog: it builds an `Instance` (fixed

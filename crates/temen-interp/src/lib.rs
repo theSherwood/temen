@@ -16644,7 +16644,8 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                     );
                                 }
                                 // #1975 — every exit from here that spawns nothing hands back what
-                                // the admission took, so the spawn charges nothing.
+                                // the admission took, so the spawn charges nothing, and discards the
+                                // child, so its grants take nothing from this domain (`Host::discard`).
                                 let undo = || {
                                     host.lock_unpoisoned()
                                         .undo_detached_spawn(lease, child_lane_val)
@@ -16657,6 +16658,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                     let staged = host.lock_unpoisoned().stage_premap(r, o, &mut ch);
                                     if !(staged && ch.apply_premap(&mut fm) >= 0) {
                                         undo();
+                                        ch.discard();
                                         return Err(Trap::Malformed);
                                     }
                                 }
@@ -16664,6 +16666,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                     ch.bind_child_manifest(&cm.module.imports, &cm.module.types);
                                 if bound.is_err() {
                                     undo();
+                                    ch.discard();
                                     frames[top]
                                         .vals
                                         .push(Reg::from_i32(SpawnRefusal::Unbound.errno() as i32));
@@ -16867,6 +16870,21 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     } = &**c;
                     let h = get_i32(&frames[top].vals, *handle)?;
                     jit_invoke_body!(h, args, call_sig(&cur_types, *sig))
+                }
+                // `Module.unbound` (op 2): served here so that its child grants a #744 live
+                // self-serve grant through this powerbox's cell, as this engine's spawns do
+                // (`authorize_eval_grants`). Every other engine serves it on the shared dispatch,
+                // through `Host::own_cell`; the answer is `Host::module_unbound`'s on each.
+                Inst::CapCall(c) if c.type_id == cap_id::MODULE && c.op == 2 => {
+                    let temen_ir::CapCall { handle, args, .. } = &**c;
+                    let h = get_i32(&frames[top].vals, *handle)?;
+                    let (mut arg_stack, mut arg_heap) = ([0; CALL_STACK_SLOTS], Vec::new());
+                    let argv = arg_slots(&mut arg_stack, &mut arg_heap, &frames[top].vals, args)?;
+                    let gm = mem.as_mut().map(|m| m as &mut dyn GuestMem);
+                    let r = host
+                        .lock_unpoisoned()
+                        .module_unbound(h, argv, gm, Some(host))?;
+                    frames[top].vals.push(Reg::from_i64(r));
                 }
                 // §3.6 slices 2+3+5b — the service points. `svc.poll` (op 9) serves everything
                 // currently runnable and returns the count of *completed* dispatches;
@@ -30510,9 +30528,15 @@ impl Host {
             child.budgets = Arc::clone(&self.budgets);
             child.own_budget = node;
             (child.paid_runs, child.leased) = (lease.runs, lease.bytes);
-            if let Some(h) = child.try_grant(cap_id::BUDGET, Binding::Budget(node)) {
-                child.cap_names.insert(0, ("budget".to_string(), h));
-            }
+            child.name_budget(node);
+        }
+    }
+
+    /// Hold budget node `node` under the name `"budget"`, first in this host's directory, so a
+    /// grant of that name never shadows it.
+    fn name_budget(&mut self, node: u32) {
+        if let Some(h) = self.try_grant(cap_id::BUDGET, Binding::Budget(node)) {
+            self.cap_names.insert(0, ("budget".to_string(), h));
         }
     }
 
@@ -32590,8 +32614,8 @@ impl Host {
     /// borrows [`Host::modules`] (append-only), so views into it stay valid for as long as this
     /// `Host` lives — which outlives the run, the same lifetime contract as the `call.cap` ctx
     /// itself. Host-side callers only; never reachable from a guest `call.cap` (the generic
-    /// dispatch on a `Module` handle is an inert `CapFault`), so no host address ever leaks into a
-    /// guest-readable value.
+    /// dispatch on a `Module` handle answers only the module's declared window and the name of an
+    /// import), so no host address ever leaks into a guest-readable value.
     pub fn resolve_module_parts(
         &self,
         handle: i32,
@@ -32605,6 +32629,69 @@ impl Host {
             // temen#2168: what names its code to the JIT's cache of compiled children.
             g.digest,
         ))
+    }
+
+    /// `Module` op 2 ([`cap_id::MODULE`]): the name of the first import of the module behind
+    /// `handle` that a child granted the list at `args[0]` (`args[1]` records) would leave unbound,
+    /// copied into `[args[2], args[2] + min(len, args[3]))`. Answers its length, or `0` when every
+    /// import binds. The child's powerbox is built as every spawn builds it
+    /// ([`Self::spawn_child_powerbox`]), its imports bound as every spawn binds them
+    /// ([`Self::bind_manifest_slots`]), and then it is discarded ([`Self::discard`]), so the answer
+    /// is the spawn's own. Only the admission is left out, and the one thing it grants is the
+    /// child's budget, which no import can bind; the child holds this host's node in its place, under
+    /// the name the spawn's holds its own by.
+    ///
+    /// `cell` is the cell a #744 live self-serve grant calls back through, as at this engine's
+    /// spawn: the tree-walker's own, else [`Self::own_cell`]. A list the spawn would trap on traps
+    /// here too, before anything is built: a record outside the window is a `MemoryFault`, and a
+    /// grant the spawn may not make a `CapFault`. A name that the window cannot take is `-EFAULT`.
+    pub(crate) fn module_unbound(
+        &mut self,
+        handle: i32,
+        args: &[i64],
+        mem: Option<&mut dyn GuestMem>,
+        cell: Option<&Arc<Mutex<Host>>>,
+    ) -> Result<i64, Trap> {
+        let g = self.resolve_module(handle)?.clone();
+        let arg = |i: usize| args.get(i).map_or(0, |&a| a as u64);
+        let list = match arg(1) {
+            0 => Vec::new(),
+            n => {
+                let m = mem.as_deref().ok_or(Trap::MemoryFault)?;
+                read_grant_records(arg(0), n, |o, l| {
+                    m.read_bytes(o, l as u64).ok_or(Trap::MemoryFault)
+                })?
+            }
+        };
+        if !self.can_grant_list(&list, cell.is_some()) {
+            return Err(Trap::CapFault);
+        }
+        let reservation = g
+            .memory_log2()
+            .map_or(0, |l| 1u64 << window_reserved_log2(l));
+        let (mut child, _, _) = self
+            .spawn_child_powerbox(&list, reservation, self.attestation, None, cell)
+            .ok_or(Trap::CapFault)?;
+        child.name_budget(self.own_budget);
+        let refused = child
+            .bind_manifest_slots(&g.module.imports, &g.module.types)
+            .err();
+        child.discard();
+        let Some(i) = refused else {
+            return Ok(0);
+        };
+        let name = g.module.imports[i as usize].name.as_bytes();
+        let n = name
+            .len()
+            .min(usize::try_from(arg(3)).unwrap_or(usize::MAX));
+        if n > 0
+            && mem
+                .and_then(|m| m.write_bytes(arg(2), &name[..n]))
+                .is_none()
+        {
+            return Ok(EFAULT);
+        }
+        Ok(name.len() as i64)
     }
 
     /// Grant a §13 `SharedRegion` capability backed by a fresh `len`-byte zero-filled host buffer,
@@ -34259,7 +34346,7 @@ impl Host {
                 .grant_entry_into_child(cell, name, *handle, &mut ch)
                 .is_none()
             {
-                ch.abandon();
+                ch.discard();
                 return None;
             }
         }
@@ -34366,6 +34453,23 @@ impl Host {
         std::mem::take(&mut self.abandon_hooks)
             .into_iter()
             .for_each(|undo| undo());
+    }
+
+    /// Give back what building this child's powerbox took from its granter, for a child that will
+    /// never run: a spawn refused after its grants were made, or the scratch child of
+    /// `Module.unbound`. Its providers' state goes ([`Self::abandon`]), and so do the counts its
+    /// re-granted pipe ends added, which no end of a run will now release: kept, they would keep a
+    /// reader from seeing EOF and the pipe's channel charge from coming back.
+    ///
+    /// The pipes whose last end this releases are not returned to wake: the granter still holds
+    /// each end it granted, so only its own close, on another vCPU meanwhile, could leave this one
+    /// last, and then the pipe's wakers fire ([`Self::drop_pipe_writer`]).
+    ///
+    /// Every engine's spawn discards a child it refuses after the build, the JIT's through its binder
+    /// hook (`temen_run::child_bind_imports`).
+    pub fn discard(mut self) {
+        self.abandon();
+        let _ = self.release_pipe_ends();
     }
 
     /// A spawned process whose image could not be built in its powerbox (this, from
@@ -36130,10 +36234,24 @@ impl Host {
                 }
                 _ => put_results(out, &[EINVAL]),
             },
-            // A §14 `Module` handle confers instantiation authority (a spawn names it) and has no
-            // callable op. Its op 0 looked an export up by name, to pick a child's entry; a child
-            // starts at its module's function 0 now (#2219), so it went.
-            Binding::Module(_) => Err(Trap::CapFault),
+            // A §14 `Module` handle confers instantiation authority (a spawn names it), and its ops
+            // answer what a spawner asks of it ([`cap_id::MODULE`]): op 1 its declared window
+            // (#1908), op 2 the first import a grant list leaves unbound, through a child the
+            // spawn's own code builds and binds. The tree-walker serves op 2 in its eval loop, with
+            // the cell its spawns grant through; every other engine reaches it here, with this
+            // host's own. Op 0 is retired (#2219).
+            Binding::Module(id) => match op {
+                1 => {
+                    let declared = self.modules.get(id as usize).and_then(|g| g.memory_log2());
+                    put_results(out, &[declared.map_or(EINVAL, i64::from)])
+                }
+                2 => {
+                    let cell = self.own_cell();
+                    let r = self.module_unbound(handle, args, mem, cell.as_ref())?;
+                    put_results(out, &[r])
+                }
+                _ => Err(Trap::CapFault),
+            },
             // Guest-driven `Jit` (iface 11, DESIGN.md §22). This generic arm is the **reference**
             // path (an interpreter run, or a wiring-bug fallback): op 0 `compile` validates +
             // stores the unit and mints its handle; op 2 `release` revokes one. op 1 `invoke` can
@@ -36212,8 +36330,8 @@ impl Host {
                 }
                 _ => put_results(out, &[EINVAL]),
             },
-            // A `CompiledCode` handle has no directly callable ops (like `Module`): it is only
-            // *named* in `Jit.invoke`/`release`.
+            // A `CompiledCode` handle has no directly callable ops: it is only *named* in
+            // `Jit.invoke`/`release`.
             Binding::JitCode { .. } => Err(Trap::CapFault),
             // §12 Blocking: `op 0 work(arg) -> mix(arg)`. As a *direct* call.cap it runs inline and
             // blocks the caller (the degenerate single path); a batched `submit` instead overlaps it

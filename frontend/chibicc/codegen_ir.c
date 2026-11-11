@@ -1629,6 +1629,9 @@ static int gen_builtin_instantiator(Node *node, int op, const char *who) {
 // form `gen_builtin_instantiator` is the 1-arg case of. `__vm_budget_read(budget, field)` is
 // `Budget` op 1 (iface 14): how much of a quota field remains (0 fuel, 1 mem, 2 spawn);
 // `__vm_budget_close(budget)` is its op 3, which gives the handle up (#2384).
+// `__vm_module_window(module)` is `Module` op 1 (iface 8): the window a spawn of it gets (#1908);
+// `__vm_module_unbound(module, grants, n, buf, cap)` is its op 2: the import a spawn with those
+// grants would refuse as unbound (#2874).
 // Every operation arg widens to the host-ABI i64; the result is the `long` the prototype declares.
 static int gen_builtin_cap_call(Node *node, int iface, int op, int n, const char *who) {
   Node *a = node->args;
@@ -2271,6 +2274,10 @@ static int gen_expr(Node *node) {
           return gen_builtin_cap_call(node, 14, 1, 1, "__vm_budget_read");
         if (!strcmp(fname, "__vm_budget_close"))
           return gen_builtin_cap_call(node, 14, 3, 0, "__vm_budget_close");
+        if (!strcmp(fname, "__vm_module_window"))
+          return gen_builtin_cap_call(node, 8, 1, 0, "__vm_module_window");
+        if (!strcmp(fname, "__vm_module_unbound"))
+          return gen_builtin_cap_call(node, 8, 2, 4, "__vm_module_unbound");
         if (!strcmp(fname, "__vm_pipe"))
           return gen_builtin_pipe(node);
         if (!strcmp(fname, "__vm_close"))
