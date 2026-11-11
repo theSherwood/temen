@@ -57,9 +57,7 @@ pub fn run(
     host: &mut Host,
     kill: Option<&Arc<temen_jit::Interrupt>>,
 ) -> Option<Result<Vec<i64>, Trap>> {
-    if host.is_durable() {
-        return None;
-    }
+    temen_interp::bytecode::native_scope(m, host).ok()?;
     let cm = compile(m, entry, reserved_log2, kill)?;
     run_compiled(cm, m, entry, args, host, kill)
 }
@@ -100,16 +98,25 @@ pub fn run_compiled(
     host: &mut Host,
     kill: Option<&Arc<temen_jit::Interrupt>>,
 ) -> Option<Result<Vec<i64>, Trap>> {
+    // Every refusal is decided here, before anything is taken from `host`.
     let f = m.funcs.get(entry as usize)?;
-    if f.params.len() != args.len() || host.is_durable() {
+    if f.params.len() != args.len() {
         return None;
     }
+    temen_interp::bytecode::native_scope(m, host).ok()?;
     let kr = Arc::new(KernelRun::new(cm)?);
     let (base, reserved) = kr.window();
-    // SAFETY: the JIT window outlives the run: `kr` is held by the platform's tier, which the host
-    // holds until the run has ended and every thread has gone.
+    // SAFETY: `kr` owns the reservation and is dropped at the end of this function, after the run
+    // (whose threads have all gone by then, `ThreadRun::finish`) and its host's tier are dropped;
+    // `back`'s strong count is checked to be 1 before then, and the window is kept mapped if it is
+    // not, so no clone of the region outlives its memory.
     let back = Arc::new(unsafe { temen_interp::Region::shared(base, reserved) });
-    let state: Arc<dyn std::any::Any + Send + Sync> = Arc::new(Arc::clone(&kr));
+    let back_held = Arc::clone(&back);
+    let ran = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let state: Arc<dyn std::any::Any + Send + Sync> = Arc::new(TierState {
+        kr: Arc::clone(&kr),
+        vcpus: Arc::clone(&ran),
+    });
     let on_end = {
         let kr = Arc::clone(&kr);
         Arc::new(move || kr.end())
@@ -167,22 +174,32 @@ pub fn run_compiled(
     );
     let mut run = match opened {
         Some(Ok(run)) => run,
-        // `new_parallel` consumed the host: an out-of-subset module is not one this spike can give
-        // back, so it is refused as a run, never silently re-run.
+        // A run its activation refused (the process's pools): an ordinary run ends so too. Its host
+        // went with it, as `new_parallel` keeps it.
         Some(Err(t)) => return Some(Err(t)),
-        None => return Some(Err(Trap::Malformed)),
+        // `native_scope` admitted the module, so the bytecode compile cannot refuse it.
+        None => unreachable!("native_scope admits only what the bytecode engine compiles"),
     };
-    if !kr.protect() {
-        return Some(Err(Trap::ThreadFault));
-    }
-    let end = match run.run() {
-        CoopEvent::Done(vals) => Ok(vals.iter().map(|v| value_slot(*v)).collect()),
-        CoopEvent::Trapped(t) => Err(t),
-        _ => Err(Trap::Malformed),
+    // The kernel seeded the window; nothing has run. A protection the OS refuses ends the run as a
+    // window it cannot hold does (`ThreadFault`), with its host given back.
+    let end = if kr.protect() {
+        match run.run() {
+            CoopEvent::Done(vals) => Ok(vals.iter().map(|v| value_slot(*v)).collect()),
+            CoopEvent::Trapped(t) => Err(t),
+            _ => Err(Trap::Malformed),
+        }
+    } else {
+        Err(Trap::ThreadFault)
     };
     *host = std::mem::take(&mut *run.host_mut());
-    // The tier holds the run's window: it goes with the run.
     host.set_thread_platform(ThreadPlatform::OS);
+    drop(run);
+    LAST_VCPUS.with(|c| c.set(ran.load(std::sync::atomic::Ordering::Relaxed)));
+    // Nothing the run handed back may still reach the window, which `kr` unmaps as it drops.
+    if Arc::strong_count(&back_held) != 1 {
+        debug_assert!(false, "a clone of the JIT window outlived its run");
+        std::mem::forget(kr); // keep it mapped
+    }
     Some(end)
 }
 
@@ -210,19 +227,14 @@ fn value_slot(v: Value) -> i64 {
     }
 }
 
-/// #2948 spike, for tests: under [`enabled`], run `m`'s `entry(args)` on the spike path with a fresh
-/// host and answer as the JIT's own entries do; `None` when off, or when `m` is out of scope, and the
-/// caller runs today's path.
-pub fn outcome(
+/// [`outcome`]'s run, with a fresh host: `None` when [`run`] declines.
+fn outcome_unchecked(
     m: &Module,
     entry: u32,
     args: &[i64],
     kill: Option<&Arc<temen_jit::Interrupt>>,
 ) -> Option<temen_jit::JitOutcome> {
     use temen_jit::{JitOutcome, TrapKind};
-    if !enabled() {
-        return None;
-    }
     let mut host = Host::new();
     Some(
         match run(
@@ -242,20 +254,69 @@ pub fn outcome(
     )
 }
 
+/// The tier's run state ([`NativeTier::state`]): the JIT's half of the run, and how many vCPUs ran.
+struct TierState {
+    kr: Arc<KernelRun>,
+    vcpus: Arc<std::sync::atomic::AtomicU64>,
+}
+
+thread_local! {
+    /// How many vCPUs the last run this thread made ran as kernel tasks ([`last_vcpus`]).
+    static LAST_VCPUS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// How many vCPUs the last [`run`] this thread made ran as kernel tasks.
+pub fn last_vcpus() -> u64 {
+    LAST_VCPUS.with(std::cell::Cell::get)
+}
+
+/// #2948 spike, for tests: under [`enabled`], run `m`'s `entry(args)` on the spike path with a fresh
+/// host and answer as the JIT's own entries do. `None` when off, or when `m` is outside the scope
+/// ([`temen_interp::bytecode::native_scope`], whose clause it names on stderr): the caller runs
+/// today's path. An in-scope program is checked to have run on the kernel path, every vCPU native:
+/// it never falls back silently.
+pub fn outcome(
+    m: &Module,
+    entry: u32,
+    args: &[i64],
+    kill: Option<&Arc<temen_jit::Interrupt>>,
+) -> Option<temen_jit::JitOutcome> {
+    if !enabled() {
+        return None;
+    }
+    if let Err(clause) = temen_interp::bytecode::native_scope(m, &Host::new()) {
+        eprintln!("#2948 spike: today's path ({clause})");
+        return None;
+    }
+    let o =
+        outcome_unchecked(m, entry, args, kill).expect("an in-scope program runs as kernel tasks");
+    assert!(last_vcpus() >= 1, "the run's vCPUs ran as kernel tasks");
+    assert_eq!(
+        temen_interp::bytecode::native_interp_stops(),
+        0,
+        "no interpreted op on the spike path"
+    );
+    eprintln!(
+        "#2948 spike: kernel path ({} vCPUs, all native)",
+        last_vcpus()
+    );
+    Some(o)
+}
+
 /// [`ThreadTier::run`] for the Cranelift JIT: run the task's entry on this thread as a vCPU.
 fn tier_run(call: &mut EmittedCall<'_>) -> Result<(), Trap> {
     VCPUS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let kr = call
+    let st = call
         .native()
-        .and_then(|n| n.state.downcast_ref::<Arc<KernelRun>>())
-        .ok_or(Trap::Malformed)?
-        .clone();
+        .and_then(|n| n.state.downcast_ref::<TierState>())
+        .ok_or(Trap::Malformed)?;
+    st.vcpus.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let kr = Arc::clone(&st.kr);
     let EmittedTarget::Region { module: 0, func } = call.target else {
         return Err(Trap::Malformed);
     };
     let argv: Vec<i64> = call.argv.to_vec();
-    // The root is the kernel's task 0, whose `vcpu.tls` is 0; a thread's starts at 1 (#1775).
-    let entry = if call.tls == 0 {
+    let entry = if call.root {
         VcpuEntry::Root(&argv)
     } else {
         VcpuEntry::Thread {

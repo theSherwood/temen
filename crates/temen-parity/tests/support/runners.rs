@@ -240,8 +240,14 @@ fn on_cranelift(
     // #2948 spike: under `TEMEN_JIT_KERNEL=1`, a program that spawns threads, and is in the spike's
     // scope, runs its vCPUs as executor 2's tasks.
     let spawns = m.funcs.iter().any(|f| f.uses_concurrency_besides_wait());
-    if temen_run::jit_kernel::enabled() && spawns {
-        if let Some(r) = temen_run::jit_kernel::run(m, 0, &args, reserved_log2, &mut host, None) {
+    let scope = temen_interp::bytecode::native_scope(m, &host);
+    if temen_run::jit_kernel::enabled() && spawns && scope.is_ok() {
+        let r = temen_run::jit_kernel::run(m, 0, &args, reserved_log2, &mut host, None);
+        assert!(
+            temen_run::jit_kernel::last_vcpus() >= 1,
+            "in scope, so it ran as kernel tasks"
+        );
+        if let Some(r) = r {
             let end = match r {
                 Ok(v) => match v[..] {
                     [x] => End::Value(x),

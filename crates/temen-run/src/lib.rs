@@ -80,6 +80,10 @@ pub mod jit_kernel {
     pub fn vcpus() -> u64 {
         0
     }
+    /// None ran.
+    pub fn last_vcpus() -> u64 {
+        0
+    }
     /// Never: today's path runs.
     pub fn outcome(
         _: &temen_ir::Module,

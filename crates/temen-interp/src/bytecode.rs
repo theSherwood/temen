@@ -8841,6 +8841,67 @@ fn image_parks(host: &Host, m: &Module, census: &ImageCensus) -> Parks {
     }
 }
 
+/// #2948 spike — whether `m`'s `entry` can run its vCPUs as native tasks under `host` without the
+/// JIT's own thread runtime: `Err` names the first clause that keeps it on today's path. Decided
+/// before the run takes anything. What each clause guards, which phase 1 still has to carry:
+/// - **durable**: executor 2 has no freeze driver (#2533);
+/// - **bytecode**: the kernel's rules need the module's bytecode compile (`admits_for`);
+/// - **no window**: a thread of a module with no memory interprets ([`tierup_servable`]);
+/// - **fibers**: a fiber's park needs the JIT's fiber runtime (`fiber_rt`), not stood up here;
+/// - **imports**: an import may bind anything, a parking or page op included;
+/// - **cap**: a `call.cap` other than a host procedure (a stream, a page op on the window, a
+///   region, a child, a serve point): a park in one needs the JIT's own domain (`host_park`,
+///   `cap_wait`, `wait_outside`), and a page op would move the JIT's page map past the kernel's;
+/// - **host-proc parks**: a host procedure that may park, for the same reason.
+pub fn native_scope(m: &Module, host: &Host) -> Result<(), &'static str> {
+    use temen_ir::cap_id::HOST_PROC;
+    if host.is_durable() {
+        return Err("durable");
+    }
+    if !admits_for(m, true) {
+        return Err("bytecode");
+    }
+    // A thread tiers up at its entry only over a window ([`tierup_servable`]): without one, its
+    // threads would interpret.
+    let spawns = m.funcs.iter().any(|f| f.uses_concurrency_besides_wait());
+    if m.memory.is_none() && spawns {
+        return Err("no window");
+    }
+    if m.funcs.iter().any(temen_ir::Func::uses_fibers) {
+        return Err("fibers");
+    }
+    if !m.imports.is_empty() {
+        return Err("imports");
+    }
+    let mut host_call = false;
+    for i in m
+        .funcs
+        .iter()
+        .flat_map(|f| &f.blocks)
+        .flat_map(|b| &b.insts)
+    {
+        if let Inst::CapCall(c) = i {
+            if c.type_id != HOST_PROC {
+                return Err("cap");
+            }
+            host_call = true;
+        }
+    }
+    if host_call && host.host_procs_park() != super::OpParks::Never {
+        return Err("host-proc parks");
+    }
+    Ok(())
+}
+
+/// #2948 spike — stops of a native task's thread that ran interpreted code: a step that returned
+/// anything but its entry's tier-up, or a bounce out of emitted code. The spike pins it at zero.
+static NATIVE_INTERP_STOPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// [`NATIVE_INTERP_STOPS`].
+pub fn native_interp_stops() -> u64 {
+    NATIVE_INTERP_STOPS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// #2948 spike — whether `host`'s emitted tier makes the §12 thread ops itself ([`ThreadTier::native`]),
 /// so an image that spawns and joins runs whole on it.
 fn parks_natively(host: &Host) -> bool {
@@ -12351,6 +12412,7 @@ impl TaskSlot {
     fn deliver(&mut self, dst: u32, value: Reg) {
         // #2948 spike — a native task's parked op has no frame: its results land in its cell.
         if let Some(cell) = self.vm.native.as_mut() {
+            debug_assert!((dst as usize) < cell.len(), "a native result past its cell");
             if let Some(r) = cell.get_mut(dst as usize) {
                 *r = value;
             }
@@ -17742,6 +17804,8 @@ pub struct EmittedCall<'a> {
     pub bounce: &'a mut Bounce<'a>,
     /// #2948 spike — the task's `vcpu.tls` seed, its id in its domain.
     pub tls: i64,
+    /// #2948 spike — the call is the run's root task's: its entry, not a spawned thread's.
+    pub root: bool,
     park: &'a mut NativePark<'a>,
     native: Option<&'a NativeTier>,
     table: &'a SharedSlots,
@@ -18463,6 +18527,10 @@ impl ThreadRun {
                     }
                     match dst {
                         TierUpDst::Frame(dst) => {
+                            if tier.native.is_some() {
+                                NATIVE_INTERP_STOPS
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
                             set_slot_results(&mut vm.vt.active, dst as u32, &results, vals);
                             let f = func as usize;
                             vm.vt.active.emitted_returned(module as usize, f, work);
@@ -18474,7 +18542,17 @@ impl ThreadRun {
                         }
                     }
                 }
-                stop => return stop,
+                stop => {
+                    if self
+                        .platform
+                        .tier
+                        .as_ref()
+                        .is_some_and(|t| t.native.is_some())
+                    {
+                        NATIVE_INTERP_STOPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    return stop;
+                }
             }
         }
         Ok(VcpuStop::Preempted)
@@ -18607,6 +18685,7 @@ impl ThreadRun {
         // #2948 spike — the bounce and a native tier's park share the task and the window; the two
         // never run at once (a native tier makes no bounce), so each borrows them for its call.
         let tls = task.as_ref().map_or(0, |t| t.vm.vt.active.tls);
+        let root = task.as_ref().is_some_and(|t| t.ti == 0);
         let task = std::cell::RefCell::new(task);
         let mem = std::cell::RefCell::new(mem);
         let mut park = |stop: NativeStop| -> Result<[i64; 2], Trap> {
@@ -18651,6 +18730,9 @@ impl ThreadRun {
             Ok([cell[0].i64(), cell[1].i64()])
         };
         let mut bounce = |target: u32, io: &mut [i64], pushed: usize| {
+            if tier.native.is_some() {
+                NATIVE_INTERP_STOPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             let mut task = task.borrow_mut();
             let task = &mut *task;
             let mut mem = mem.borrow_mut();
@@ -18725,6 +18807,7 @@ impl ThreadRun {
             fault: None,
             bounce: &mut bounce,
             tls,
+            root,
             park: &mut park,
             native: tier.native.as_ref(),
             table,

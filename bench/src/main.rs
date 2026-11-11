@@ -83,6 +83,7 @@
 mod threads;
 // #2948 spike measurements (`--kernel-spike`).
 mod kernel_spike;
+mod kernel_spike_ir;
 
 use std::cell::RefCell;
 use std::ffi::c_void;
