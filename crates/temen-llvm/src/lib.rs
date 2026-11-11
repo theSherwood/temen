@@ -13908,13 +13908,24 @@ fn lower_vm_builtin(
         // budget, long field)` → `call.cap BUDGET 1` answers the room left along its chain;
         // `long __vm_budget_close(int budget)` → `call.cap BUDGET 3` gives the handle up (#2384).
         // The split is how a spawner bounds what one child may spend, by handing it the node.
-        "__vm_budget_split" | "__vm_budget_read" | "__vm_budget_close" => {
-            let (op, n) = match name {
-                "__vm_budget_split" => (0, 3),
-                "__vm_budget_read" => (1, 1),
-                _ => (3, 0),
+        // `Module` (`temen_ir::cap_id::MODULE`): `long __vm_module_window(int module)` → op 1, the
+        // window a spawn of it gets (#1908); `long __vm_module_unbound(int module, const void
+        // *grants, long n, char *buf, long cap)` → op 2, the first import a child granted that list
+        // leaves unbound, which a spawn refuses with `-ENOENT` (#2874).
+        "__vm_budget_split"
+        | "__vm_budget_read"
+        | "__vm_budget_close"
+        | "__vm_module_window"
+        | "__vm_module_unbound" => {
+            use temen_ir::cap_id::{BUDGET, MODULE};
+            let (type_id, op, n) = match name {
+                "__vm_budget_split" => (BUDGET, 0, 3),
+                "__vm_budget_read" => (BUDGET, 1, 1),
+                "__vm_budget_close" => (BUDGET, 3, 0),
+                "__vm_module_window" => (MODULE, 1, 0),
+                _ => (MODULE, 2, 4),
             };
-            let handle = ctx.operand_i32(vm_arg(c, 0)?)?; // the Budget handle
+            let handle = ctx.operand_i32(vm_arg(c, 0)?)?; // the Budget or Module handle
             let args = (1..=n)
                 .map(|i| ctx.operand_i64(vm_arg(c, i)?))
                 .collect::<Result<Vec<_>, _>>()?;
@@ -13924,7 +13935,7 @@ fn lower_vm_builtin(
             };
             let sig = ctx.intern_sig(sig); // #922
             let r = ctx.push(Inst::CapCall(Box::new(temen_ir::CapCall {
-                type_id: temen_ir::cap_id::BUDGET,
+                type_id,
                 op,
                 sig,
                 handle,

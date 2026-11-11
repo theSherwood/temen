@@ -3856,8 +3856,10 @@ pub unsafe extern "C" fn child_bind_imports(
     let child_cell = &*(child_ctx as *const Mutex<Host>);
     if let Some(m) = parent.spawn_module(module as i32) {
         // §3.3 withhold: the spawn fails closed at the JIT call site, answering this code (#2864).
+        // The child never runs, so it is discarded here, which gives back what its grants took.
         let mut child = child_cell.lock().unwrap_or_else(|e| e.into_inner());
         if child.bind_child_manifest(&m.imports, &m.types).is_err() {
+            std::mem::take(&mut *child).discard();
             return temen_ir::SpawnRefusal::Unbound.errno() as i32;
         }
         // The child runs this program: its own self module, as the interpreter's spawn arms stamp it
@@ -6669,15 +6671,19 @@ fn module_nests(m: &temen_ir::Module) -> bool {
     })
 }
 
-/// Whether `m` spawns a **detached** child (`Instantiator` op 17, the record): a spawn
-/// that may grant the child a live offer back into its spawner (#744, [`jit_proc::locked`]).
-fn spawns_detached(m: &Module) -> bool {
+/// Whether `m` builds a **detached** child's powerbox from a grant list, which may grant the child a
+/// live offer back into `m`'s cell (#744, [`jit_proc::locked`]): it spawns one (`Instantiator` op
+/// 17, the record), or asks `Module.unbound` (op 2, #2874), which builds the child a spawn with that
+/// list would get and so admits the grants that spawn would.
+fn builds_detached_children(m: &Module) -> bool {
+    use temen_ir::cap_id::{INSTANTIATOR, MODULE};
     m.funcs.iter().any(|f| {
         f.blocks.iter().any(|b| {
             b.insts.iter().any(|i| {
                 matches!(
                     i,
-                    temen_ir::Inst::CapCall(c) if c.type_id == 6 && c.op == 17
+                    temen_ir::Inst::CapCall(c)
+                        if (c.type_id, c.op) == (INSTANTIATOR, 17) || (c.type_id, c.op) == (MODULE, 2)
                 )
             })
         })

@@ -10,6 +10,13 @@
 //! does. The module resolves first on every engine, so a forged module faults the same way beside a
 //! bad payload.
 //!
+//! A refusal gives back what the spawn took: its budget's room, and the counts of the pipe ends it
+//! granted, so a refused child leaves no phantom reader or writer behind.
+//!
+//! After an `-ENOENT`, `Module.unbound` names the import: it builds and binds the child as the spawn
+//! does, then discards it, so its answer is the spawn's own. `Module.window` answers the window a
+//! spawn of the module gets (#1908).
+//!
 //! A durable spawner's refusals are pinned beside its freezes (`durable_detached_jit.rs`), and a
 //! pre-mapped region's in `crates/temen-interp/tests/detached_premap.rs`.
 
@@ -172,16 +179,20 @@ struct Powerbox {
     child: &'static str,
     mem: i64,
     lanes: Option<(i64, i64)>,
+    /// A pipe, whose write and read ends follow the three handles.
+    pipe: bool,
 }
 
 const PLAIN: Powerbox = Powerbox {
     child: CHILD,
     mem: 1 << 20,
     lanes: None,
+    pipe: false,
 };
 
-/// The parent's powerbox: an `Instantiator`, the child module, and a `Budget` its window spends.
-fn powerbox(p: Powerbox) -> (Host, [i32; 3]) {
+/// The parent's powerbox: an `Instantiator`, the child module, and a `Budget` its window spends,
+/// then a pipe's write and read ends if `p` has one.
+fn powerbox(p: Powerbox) -> (Host, Vec<i32>) {
     let mut host = Host::new();
     let inst = host.grant_instantiator();
     let child = host.grant_module(&module(p.child));
@@ -199,16 +210,23 @@ fn powerbox(p: Powerbox) -> (Host, [i32; 3]) {
         budget = split.expect("the split")[0] as i32;
         host.set_lane_cap(cap);
     }
-    (host, [inst, child, budget])
+    let mut handles = vec![inst, child, budget];
+    if p.pipe {
+        let (w, r) = host.grant_pipe();
+        handles.extend([w, r]);
+    }
+    (host, handles)
 }
 
 /// `m` on the Cranelift JIT, as an embedder drives it (`temen_run::jit_cap_run`).
 fn cranelift(m: &Module, p: Powerbox) -> Result<i64, Trap> {
     let (mut host, h) = powerbox(p);
+    host.set_self_module(&std::sync::Arc::new(m.clone()));
+    let args: Vec<i64> = h.into_iter().map(i64::from).collect();
     let out = temen_run::jit_cap_run(
         m,
         0,
-        &h.map(i64::from),
+        &args,
         &MemLayout::image(Vec::new()),
         temen_ir::DEFAULT_RESERVED_LOG2,
         0,
@@ -224,11 +242,15 @@ fn cranelift(m: &Module, p: Powerbox) -> Result<i64, Trap> {
     }
 }
 
-/// `m` ends as `want` on every interpreter driver and the Cranelift JIT, over powerbox `p`.
+/// `m` ends as `want` on every interpreter driver and the Cranelift JIT, over powerbox `p`. The
+/// powerbox runs `m` as its program, as an embedder's `Instance` sets it, so a live self-serve grant
+/// of one of `m`'s impl-exports names a shape.
 fn each_engine_over(what: &str, m: &Module, p: Powerbox, want: Result<i64, Trap>) {
+    let program = std::sync::Arc::new(m.clone());
     let setup = || {
-        let (host, h) = powerbox(p);
-        (host, h.map(Value::I32).to_vec())
+        let (mut host, h) = powerbox(p);
+        host.set_self_module(&program);
+        (host, h.into_iter().map(Value::I32).collect())
     };
     for driver in drivers::ALL {
         let ran = drivers::run_on(driver, m, &setup)
@@ -340,7 +362,7 @@ fn a_record_with_two_causes_answers_the_first_on_every_engine() {
         Powerbox {
             child: CHILD_IMPORTS_EXIT,
             mem: WINDOW - 1,
-            lanes: None,
+            ..PLAIN
         },
         refused(SpawnRefusal::Room),
     );
@@ -356,7 +378,7 @@ fn a_refusal_after_the_budget_paid_charges_nothing_on_every_engine() {
         Powerbox {
             child: CHILD_IMPORTS_EXIT,
             mem: WINDOW,
-            lanes: None,
+            ..PLAIN
         },
         Ok(WINDOW),
     );
@@ -453,6 +475,337 @@ fn a_forged_grant_traps_before_any_refusal_on_every_engine() {
             mem: WINDOW - 1,
             ..PLAIN
         },
+        Err(Trap::CapFault),
+    );
+}
+
+/// Where a parent lays one grant record, the name it grants under, and the buffer `Module.unbound`
+/// answers in.
+const GRANT: u64 = 18432;
+const NAME: u64 = 18560;
+const BUF: u64 = 18816;
+
+/// The text of a spawn of the child module by `REC`, its answer widened to `i64` in `vh64`.
+fn spawn_call() -> String {
+    format!(
+        "  vma = i64.const {}
+  i32.store vma vmod
+  vba = i64.const {}
+  i32.store vba vb
+  vh = call.cap 6 17 (i64) -> (i32) vi (vp)
+  vh64 = i64.extend_i32_s vh",
+        REC + SpawnRec::MODULE_AT,
+        REC + SpawnRec::BUDGET_AT,
+    )
+}
+
+/// The text of `Module.unbound` asked of the child module over the `grants_n` records at `GRANT`,
+/// answering in the `cap` bytes at `buf`, its answer in `vh64`.
+fn unbound_call(grants_n: u64, buf: u64, cap: u64) -> String {
+    format!(
+        "  vgp = i64.const {GRANT}
+  vgn = i64.const {grants_n}
+  vqb = i64.const {buf}
+  vqc = i64.const {cap}
+  vh64 = call.cap 8 2 (i64, i64, i64, i64) -> (i64) vmod (vgp, vgn, vqb, vqc)"
+    )
+}
+
+/// The record `REC` holds: the one-byte payload, and the one grant record at `GRANT`.
+fn granting_one() -> String {
+    rec::segment(
+        REC,
+        &SpawnRec {
+            args: (PAYLOAD, 1),
+            grants_ptr: GRANT,
+            grants_n: 1,
+            ..SpawnRec::default()
+        },
+    )
+}
+
+/// A parent `(inst, module, budget, write end, read end) -> i64` that grants its pipe's read end as
+/// `in` to `call`, which answers in `vh64`. Then it closes its own read end and writes a byte, and
+/// answers `vh64 * 1000` plus what the write answered: `-EPIPE` once no read end of the pipe is left
+/// anywhere.
+fn granting_a_pipe_reader(call: &str) -> Module {
+    module(&format!(
+        "memory 17
+func (i32, i32, i32, i32, i32) -> (i64) {{
+block 0 (vi: i32, vmod: i32, vb: i32, vwr: i32, vrd: i32) {{
+  vp = i64.const {REC}
+{}{call}
+  vcl = call.cap 0 2 () -> (i64) vrd ()
+  vone = i64.const 1
+  vbuf = i64.const {PAYLOAD}
+  vwrote = call.cap 0 1 (i64, i64) -> (i64) vwr (vbuf, vone)
+  vk = i64.const 1000
+  vt = i64.mul vh64 vk
+  vr = i64.add vt vwrote
+  return vr
+  }}
+}}
+data {PAYLOAD} \"*\"
+data {NAME} \"in\"
+{}",
+        rec::grant("g", GRANT, NAME, 2, "vrd"),
+        granting_one(),
+    ))
+}
+
+const EPIPE: i64 = temen_ir::errno::EPIPE;
+
+/// A spawn refused after its grants were made gives back the pipe ends it granted, on every engine.
+/// The child's copy of the read end counted as a reader, and a child that never runs has no end of
+/// run to release it, so the write after the parent closed its own end went into a pipe no one
+/// could ever read.
+#[test]
+fn a_refused_spawn_gives_back_the_pipe_ends_it_granted_on_every_engine() {
+    each_engine_over(
+        "a pipe's read end granted to a child with an unbound import",
+        &granting_a_pipe_reader(&spawn_call()),
+        Powerbox {
+            child: CHILD_IMPORTS_EXIT,
+            pipe: true,
+            ..PLAIN
+        },
+        Ok(SpawnRefusal::Unbound.errno() * 1000 + EPIPE),
+    );
+}
+
+/// `Module.unbound`'s child is discarded as a refused spawn's is: the read end it was granted leaves
+/// no reader behind.
+#[test]
+fn unbound_gives_back_the_pipe_ends_it_granted_on_every_engine() {
+    each_engine_over(
+        "a pipe's read end granted to the child unbound builds",
+        &granting_a_pipe_reader(&unbound_call(1, BUF, 64)),
+        Powerbox {
+            child: CHILD_IMPORTS_EXIT,
+            pipe: true,
+            ..PLAIN
+        },
+        Ok(4 * 1000 + EPIPE),
+    );
+}
+
+/// A parent asking `Module.unbound` over `grants_n` records at `GRANT` (laid by `data`), answering
+/// `len << 32` or'd with the first four bytes at `BUF`.
+fn asking_unbound(grants_n: u64, buf: u64, cap: u64, data: &str) -> Module {
+    parent(
+        &format!(
+            "{}
+  vbb = i64.const {BUF}
+  vw = i32.load vbb
+  vw64 = i64.extend_i32_u vw
+  v32 = i64.const 32
+  vhi = i64.shl vh64 v32
+  vr = i64.or vhi vw64
+  return vr
+  }}
+}}
+",
+            unbound_call(grants_n, buf, cap)
+        ),
+        "",
+        data,
+    )
+}
+
+/// `len << 32` or'd with the four bytes `bytes` read as a little-endian `u32`.
+fn named(len: i64, bytes: [u8; 4]) -> Result<i64, Trap> {
+    Ok(len << 32 | i64::from(u32::from_le_bytes(bytes)))
+}
+
+#[test]
+fn unbound_names_the_first_import_nothing_binds_on_every_engine() {
+    let over = |child| Powerbox { child, ..PLAIN };
+    each_engine_over(
+        "a child importing exit, granted nothing",
+        &asking_unbound(0, BUF, 64, ""),
+        over(CHILD_IMPORTS_EXIT),
+        named(4, *b"exit"),
+    );
+    each_engine_over(
+        "a child importing nothing",
+        &asking_unbound(0, BUF, 64, ""),
+        over(CHILD),
+        Ok(0),
+    );
+    each_engine_over(
+        "a child importing exit, granted it empty",
+        &asking_unbound(1, BUF, 64, &rec::empty_grant(GRANT, NAME, "exit")),
+        over(CHILD_IMPORTS_EXIT),
+        Ok(0),
+    );
+    each_engine_over(
+        "a buffer two bytes long takes two, and the length is the name's",
+        &asking_unbound(0, BUF, 2, ""),
+        over(CHILD_IMPORTS_EXIT),
+        named(4, [b'e', b'x', 0, 0]),
+    );
+    each_engine_over(
+        "a buffer outside the window",
+        &asking_unbound(0, OUTSIDE, 64, ""),
+        over(CHILD_IMPORTS_EXIT),
+        Ok(temen_ir::errno::EFAULT << 32),
+    );
+}
+
+/// What `Module.unbound` answers is what the spawn does with the same list: it names an import
+/// exactly when the spawn refuses with `-ENOENT`.
+#[test]
+fn unbound_answers_as_the_spawn_does_on_every_engine() {
+    let p = Powerbox {
+        child: CHILD_IMPORTS_EXIT,
+        ..PLAIN
+    };
+    let empty = rec::empty_grant(GRANT, NAME, "exit");
+    for (what, n, data, unbound, spawned) in [
+        (
+            "granted nothing",
+            0,
+            "",
+            named(4, *b"exit"),
+            refused(SpawnRefusal::Unbound),
+        ),
+        ("granted exit empty", 1, &empty[..], Ok(0), Ok(42)),
+    ] {
+        each_engine_over(what, &asking_unbound(n, BUF, 64, data), p, unbound);
+        let rec = SpawnRec {
+            args: (PAYLOAD, 1),
+            grants_ptr: GRANT,
+            grants_n: n,
+            ..SpawnRec::default()
+        };
+        let spawn = parent(
+            &spawn_call(),
+            JOIN_OR_ERRNO,
+            &format!("{}{data}", rec::segment(REC, &rec)),
+        );
+        each_engine_over(what, &spawn, p, spawned);
+    }
+}
+
+/// A grant the spawn would trap on traps `Module.unbound` too.
+#[test]
+fn unbound_traps_on_a_grant_the_spawn_traps_on_every_engine() {
+    let grant = [NAME as u32, 6, 999, 0].map(u32::to_le_bytes).concat();
+    let grant: String = grant.iter().map(|b| format!("\\x{b:02x}")).collect();
+    let data = format!("data {NAME} \"stdout\"\ndata {GRANT} \"{grant}\"\n");
+    each_engine_over(
+        "a forged grant",
+        &asking_unbound(1, BUF, 64, &data),
+        Powerbox {
+            child: CHILD_IMPORTS_EXIT,
+            ..PLAIN
+        },
+        Err(Trap::CapFault),
+    );
+}
+
+/// A child with no declared memory, which no spawn admits.
+const CHILD_NO_MEMORY: &str = "func (i64) -> (i64) {
+block 0 (v0: i64) {
+  return v0
+  }
+}
+";
+
+/// A parent answering what op `op` of its child module answers, called with no arguments.
+fn asking_module(op: u32) -> Module {
+    parent(
+        &format!("  vr = call.cap 8 {op} () -> (i64) vmod ()\n  return vr\n  }}\n}}\n"),
+        "",
+        "",
+    )
+}
+
+/// #1908 — `Module.window` answers the window a spawn of the module gets: its declared memory.
+#[test]
+fn window_answers_the_declared_window_on_every_engine() {
+    each_engine("a module declaring 2^16 bytes", &asking_module(1), Ok(16));
+    each_engine_over(
+        "a module declaring no memory",
+        &asking_module(1),
+        Powerbox {
+            child: CHILD_NO_MEMORY,
+            ..PLAIN
+        },
+        Ok(temen_ir::errno::EINVAL),
+    );
+}
+
+/// `Module` has two ops, 1 and 2; any other is a `CapFault`, as an op an interface lacks is. Op 0
+/// is retired (`self_spawn_refused.rs`).
+#[test]
+fn a_module_op_past_its_two_is_a_cap_fault_on_every_engine() {
+    each_engine("Module op 3", &asking_module(3), Err(Trap::CapFault));
+}
+
+/// A child importing `exec`, an interface of one op, `run: (i64, i64) -> (i64)`.
+const CHILD_IMPORTS_EXEC: &str = "memory 16
+type 0 func (i64, i64) -> (i64)
+type 1 interface { run: 0 }
+import 0 interface \"exec\" 1
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vr = i64.const 42
+  return vr
+  }
+}
+";
+
+/// A parent that serves `exec` with its own code (impl-export 0, its func 1) and asks
+/// `Module.unbound` of the child over one record granting `exec` the `handle` it is given: a #744
+/// live self-serve grant, `GRANT_SERVE_LIVE_TAG` over an impl-export.
+fn asking_over_a_live_grant(handle: i32) -> Module {
+    module(&format!(
+        "memory 17
+type 0 func (i64, i64) -> (i64)
+type 1 interface {{ run: 0 }}
+export 0 interface \"exec\" 1 {{ run: 1 }}
+func 0 (i32, i32, i32) -> (i64) {{
+block 0 (vi: i32, vmod: i32, vb: i32) {{
+  vgh = i32.const {handle}
+{}{}
+  return vh64
+  }}
+}}
+func 1 (i64, i64) -> (i64) {{
+block 0 (va: i64, vb: i64) {{
+  s = i64.add va vb
+  return s
+  }}
+}}
+data {NAME} \"exec\"
+",
+        rec::grant("g", GRANT, NAME, 4, "vgh"),
+        unbound_call(1, BUF, 64),
+    ))
+}
+
+/// A live self-serve grant is admitted as the spawn admits it, on every engine. The child's
+/// `exec` binds to the parent's impl-export by its shape, so nothing is unbound. The JIT builds
+/// such a child only from a powerbox in a cell, which a root that only asked this, and never
+/// spawned, did not run in.
+#[test]
+fn unbound_admits_a_live_self_serve_grant_as_the_spawn_does_on_every_engine() {
+    let tag = temen_interp::GRANT_SERVE_LIVE_TAG as i32;
+    let p = Powerbox {
+        child: CHILD_IMPORTS_EXEC,
+        ..PLAIN
+    };
+    each_engine_over(
+        "exec granted the parent's own impl-export",
+        &asking_over_a_live_grant(tag),
+        p,
+        Ok(0),
+    );
+    each_engine_over(
+        "exec granted an impl-export the parent does not have",
+        &asking_over_a_live_grant(tag | 5),
+        p,
         Err(Trap::CapFault),
     );
 }

@@ -137,10 +137,23 @@ pub mod cap_id {
     /// Host-granted (non-ambient), like `exec`/`fs`.
     pub const MODULE_LOADER: u32 = 7;
     /// `Module` — a host-granted, host-**verified** module a guest may instantiate (§14). The handle
-    /// confers only the authority to name it in an `Instantiator` spawn (op 17's record), which runs
+    /// confers the authority to name it in an `Instantiator` spawn (op 17's record), which runs
     /// *that* module's code as a child domain in a window of its own — the "plugin-in-plugin" story:
-    /// a guest can only instantiate modules it was given (no ambient authority). It has no directly
-    /// callable ops (`call.cap` on it is an inert `CapFault`).
+    /// a guest can only instantiate modules it was given (no ambient authority). Its two ops answer
+    /// what a spawner needs to know before or after a spawn, and confer nothing:
+    ///
+    /// - op 1 `window() -> size_log2 | -EINVAL` — the module's declared window, which a spawn of
+    ///   it gets and its budget pays `1 << size_log2` bytes of `mem` for (#1908). `-EINVAL` when it
+    ///   declares no memory, which no spawn admits.
+    /// - op 2 `unbound(grants_ptr, grants_n, buf, cap) -> len` — the name of the first import a
+    ///   child granted that list would leave unbound, which a spawn refuses with `-ENOENT`
+    ///   ([`super::SpawnRefusal::Unbound`]). It is copied into `[buf, buf + min(len, cap))`, and
+    ///   `0` means every import binds. The child's powerbox is built and bound as a spawn's is,
+    ///   then discarded, so the answer is the spawn's own. A grant the spawn would trap on traps
+    ///   here too; a buffer outside the window is `-EFAULT`.
+    ///
+    /// Any other op is `CapFault`. Op 0, which looked an export up by name, is retired (#2219), so
+    /// no stale call of it reaches another op.
     pub const MODULE: u32 = 8;
     // id 9 was `IoRing` (the submit/complete ring), retired 2026-08-07 by the §12
     // parking-on-blocking re-measure: batching measured 13× negative, overlap subsumed by
@@ -240,6 +253,7 @@ pub mod cap_id {
 /// | Instantiator | 14, 19 | `child_offer`, `grant` | child, export or handle | the child's handle or `-errno` |
 /// | Instantiator | 17 | `instantiate_rec` | record pointer ([`SpawnRec`]) | child or `-errno` |
 /// | Jit | 3, 4 | `install`, `uninstall` | code handle, or slot | slot or `-errno`, or `0` or `-EINVAL` |
+/// | Module | 2 | `unbound` | grants ptr and count, buf, cap | the name's length, `0`, or `-EFAULT` |
 /// | self | 9, 10 | `svc.poll`, `svc.wait` | | dispatches served |
 /// | self | 11, 12 | `clone_caller`, `reap` | | the served caller or `-errno`, or the twin's exit status |
 /// | self | 13 | `fuel.remaining` | | fuel |
@@ -256,6 +270,7 @@ pub fn served_contract(type_id: u32, op: u32) -> Option<(&'static [ValType], &'s
         (cap_id::INSTANTIATOR, 14 | 19) => Some((&[I32, I64], &[I32])),
         (cap_id::INSTANTIATOR, 17) => Some((&[I64], &[I32])),
         (cap_id::JIT, 3 | 4) => Some((&[I64], &[I64])),
+        (cap_id::MODULE, 2) => Some((&[I64; 4], &[I64])),
         (CAP_SELF_TYPE_ID, 9..=13 | 16) => Some((&[], &[I64])),
         (CAP_SELF_TYPE_ID, 14) => Some((&[I64; 5], &[I64])),
         _ => None,

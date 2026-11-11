@@ -2162,7 +2162,8 @@ fn admit_detached_child(
         Ok(lane) => lane,
         Err(refused) => return Ok(Err(refused)),
     };
-    // #1975 — every exit from here that builds no child hands back what the admission took.
+    // #1975 — every exit from here that builds no child hands back what the admission took, and
+    // discards the child, so its grants take nothing from this domain (`Host::discard`).
     let mut child_host = host.child_host();
     child_host.set_attestation(host.detached_child_attestation(s.pager.is_some()));
     child_host.pager = s.pager;
@@ -2180,6 +2181,7 @@ fn admit_detached_child(
     if let Some((r, o)) = s.premap {
         if !host.stage_premap(r, o, &mut child_host) {
             host.undo_detached_spawn(lease, lane);
+            child_host.discard();
             return Err(Trap::Malformed);
         }
     }
@@ -2189,6 +2191,7 @@ fn admit_detached_child(
         .is_err()
     {
         host.undo_detached_spawn(lease, lane);
+        child_host.discard();
         return Ok(Err(SpawnRefusal::Unbound));
     }
     // D66 — single-spawn lane parity with the tree-walker: this engine's detached children do not yet

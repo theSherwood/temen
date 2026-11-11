@@ -185,3 +185,45 @@ fn grant_lowers_to_op_19_with_the_child_then_the_handle() {
         "inst, then (child, handle)"
     );
 }
+
+const LL_MODULE: &str = r#"
+declare i64 @__vm_module_window(i32)
+declare i64 @__vm_module_unbound(i32, ptr, i64, ptr, i64)
+
+define i64 @ask(i32 %module, ptr %grants, ptr %buf) {
+  %w = call i64 @__vm_module_window(i32 %module)
+  %u = call i64 @__vm_module_unbound(i32 %module, ptr %grants, i64 2, ptr %buf, i64 64)
+  %s = add i64 %w, %u
+  ret i64 %s
+}
+"#;
+
+/// #1908, #2874 — what a spawner asks of a `Module`: `__vm_module_window` lowers to `call.cap
+/// MODULE 1` with no arguments, and `__vm_module_unbound` to `call.cap MODULE 2` with the grant
+/// list, its length, the buffer and its size, as chibicc's builtins of those names.
+#[test]
+fn module_window_and_unbound_lower_to_their_ops() {
+    let t = temen_llvm::translate_ll_str(LL_MODULE).expect("translate");
+    temen_verify::verify_module(&t.module).expect("verify");
+    let caps: Vec<(u32, u32, usize)> = t
+        .module
+        .funcs
+        .iter()
+        .flat_map(|f| f.blocks.iter().flat_map(|b| b.insts.iter()))
+        .filter_map(|i| match i {
+            Inst::CapCall(c) => {
+                let temen_ir::CapCall {
+                    type_id, op, args, ..
+                } = &**c;
+                Some((*type_id, *op, args.len()))
+            }
+            _ => None,
+        })
+        .collect();
+    let module = temen_ir::cap_id::MODULE;
+    assert_eq!(
+        caps,
+        vec![(module, 1, 0), (module, 2, 4)],
+        "window, then unbound"
+    );
+}

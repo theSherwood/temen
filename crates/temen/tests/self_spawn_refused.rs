@@ -1,8 +1,9 @@
 //! #2219 — **a child runs a module the spawner holds, from its function 0, on every engine.** A spawn
 //! that names `-1`, which once named the spawner's own program, faults: `-1` is a forged `Module`
 //! handle like any other. A child starts at its module's child bootstrap, so the record names no
-//! entry (#2091). And `Module` op 0, which looked an export up by name to pick an entry, is gone: a
-//! `Module` handle has no callable op. #2067 — so is op 15, the positional spawn: the op-17 record
+//! entry (#2091). And `Module` op 0, which looked an export up by name to pick an entry, is gone; its
+//! number stays retired, so no stale call of it reaches the ops a `Module` has now (#1908, #2874).
+//! #2067 — so is op 15, the positional spawn: the op-17 record
 //! is the one spawn form. Each traps `CapFault` on the tree-walker, each bytecode driver and the
 //! Cranelift JIT alike, so no engine runs a spawn another refuses (INVARIANTS #9).
 //!

@@ -3694,8 +3694,9 @@ own window and attenuated handles), not `Jit`. **`Jit` adds speed to a guest; it
 domain.**
 
 **Door held open — one inert code-handle kind (CONSOLIDATION §6, deferred).** `Module` and
-`JitCode` are both "code as a capability with no callable ops, named by another capability's
-verbs"; the unit-vs-domain difference is a property of the *verb* (`invoke`/`install` run in the
+`JitCode` are both "code as a capability that no op of its own runs, named by another capability's
+verbs" (a `Module`'s two ops only describe it: its window and an unbound import, #1908, #2874); the
+unit-vs-domain difference is a property of the *verb* (`invoke`/`install` run in the
 caller's world; `instantiate` spawns a child), not of the handle — even the §22 preconditions are
 verb-time checks. Unifying would delete a cap kind and unlock **compile-then-sandbox** (JIT a
 plugin, then instantiate it as a confined child), which today has no bridge. Unlike the landed
