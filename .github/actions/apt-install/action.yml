@@ -1,0 +1,28 @@
+# Apt packages (and `.deb` files) from a cache of their debs, restored from the Actions cache, so a
+# job talks to Ubuntu's archive only when its cache is empty: a new runner image, a new request or a
+# change to `scripts/ci/apt-prep.sh`, which says why (#2947). Every apt install in CI goes through
+# this one step, so the cache key and the install cannot drift apart (INVARIANTS #15).
+name: apt install
+description: Install apt packages and .deb files from a cache of their debs.
+inputs:
+  packages:
+    description: Apt packages and .deb paths (globs expand), space-separated.
+    required: true
+runs:
+  using: composite
+  steps:
+    - id: cache
+      shell: bash
+      env:
+        PACKAGES: ${{ inputs.packages }}
+      # Unquoted on purpose here and below: one package or deb per word, and globs expand.
+      run: bash scripts/ci/apt-prep.sh --key $PACKAGES >> "$GITHUB_OUTPUT"
+    - uses: actions/cache@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4
+      with:
+        path: ${{ steps.cache.outputs.dir }}
+        key: ${{ steps.cache.outputs.key }}
+    - shell: bash
+      env:
+        PACKAGES: ${{ inputs.packages }}
+        TEMEN_APT_CACHE: ${{ steps.cache.outputs.dir }}
+      run: bash scripts/ci/apt-prep.sh $PACKAGES

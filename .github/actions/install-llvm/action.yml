@@ -1,7 +1,8 @@
 # The pinned LLVM/clang toolchain (`scripts/ci/install-llvm.sh`), with its packages restored from
 # the Actions cache so a job reaches apt.llvm.org only when the cache is empty; the script says why.
-# Every job that needs LLVM uses this one step, so the cache and the install cannot drift apart
-# across the nine jobs that run them (INVARIANTS #15).
+# What the packages need from Ubuntu's archive, and the extra packages a job asks for, install through
+# `apt-install`, from a cache of their own (#2947). Every job that needs LLVM uses this one step, so
+# the caches and the install cannot drift apart across the jobs that run them (INVARIANTS #15).
 name: install LLVM
 description: Install the pinned LLVM/clang toolchain, plus any extra apt packages the job needs.
 inputs:
@@ -12,12 +13,18 @@ inputs:
 runs:
   using: composite
   steps:
+    # The codename keys the cache: the runner images differ (`ubuntu-latest`, `ubuntu-24.04`), and
+    # each needs its own build of the packages.
+    - id: os
+      shell: bash
+      run: echo "codename=$(. /etc/os-release && echo "$VERSION_CODENAME")" >> "$GITHUB_OUTPUT"
     - uses: actions/cache@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4
       with:
-        path: ~/.cache/temen-ci/llvm
-        key: llvm-${{ runner.os }}-${{ hashFiles('scripts/ci/install-llvm.sh') }}
-    - shell: bash
-      env:
-        PACKAGES: ${{ inputs.packages }}
-      # Unquoted on purpose: one apt package per word.
-      run: bash scripts/ci/install-llvm.sh $PACKAGES
+        path: ~/.cache/temen-ci/llvm/${{ steps.os.outputs.codename }}
+        key: llvm-${{ steps.os.outputs.codename }}-${{ hashFiles('scripts/ci/install-llvm.sh') }}
+    - id: llvm
+      shell: bash
+      run: bash scripts/ci/install-llvm.sh --fetch
+    - uses: ./.github/actions/apt-install
+      with:
+        packages: ${{ steps.llvm.outputs.debs }}/*.deb ${{ inputs.packages }}
