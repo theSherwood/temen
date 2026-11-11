@@ -383,7 +383,7 @@ block 4 (vr: i64, vho: i32) {
 
 #[test]
 fn clone_caller_forks_the_caller_into_a_twin_that_returns_the_second_reply() {
-    let (r, vals) = run_forking(SRC_TWIN, false);
+    let (r, vals) = run_forking(SRC_TWIN, ORACLE);
     // The run's result is the ORIGINAL caller's reply (reply_orig = 100), joined back through C.
     assert_eq!(
         r,
@@ -400,35 +400,58 @@ fn clone_caller_forks_the_caller_into_a_twin_that_returns_the_second_reply() {
     );
 }
 
-/// FORK.md §9 — **native bytecode fork**: the `SRC_TWIN` fork topology now runs on the *bytecode*
-/// engine (not folded to the tree-walk oracle), producing the identical observable result — the run
-/// value plus both replies on the shared stdout sink. This is the differential pin the parity
-/// matrix's bytecode `clone_caller`/`reap` cells rest on (INVARIANTS.md #9; OPS_PARITY.md). The
-/// twin's continuation is the caller's `Vm` cloned at its post-call resume point over a private
-/// window (`Mem::fork_private`) + duplicated powerbox (`Host::fork_powerbox`); the parent `wait`s
-/// the twin (`reap`) so its stdout write is observed deterministically before teardown.
-/// A fork program's run on the tree-walker, the oracle, with direct handoff on or off: its result,
-/// and the values its copies wrote to the shared stdout, sorted, since the twin and the original
-/// write in either order. Its powerbox is every fork test's: the Instantiator, `stdout` (a shared
-/// sink the twin inherits), a budget, and the child images of the server S (func 1) and the caller
-/// C (func 4).
-fn run_forking(src: &str, handoff: bool) -> (Result<Vec<Value>, temen_interp::Trap>, Vec<i64>) {
+/// Where a fork program runs.
+#[derive(Clone, Copy, Debug)]
+enum On {
+    /// The tree-walker, the oracle, with direct handoff on or off.
+    TreeWalk { handoff: bool },
+    /// The bytecode engine's cooperative driver, which must run the module itself, not fold it to
+    /// the oracle.
+    Bytecode,
+    /// The bytecode engine's parallel driver (#1414 3e), each task on an OS thread of its own.
+    Parallel,
+}
+
+/// The oracle with its calls queued, as every fork test but the handoff pin runs it.
+const ORACLE: On = On::TreeWalk { handoff: false };
+
+/// A fork program's run: its result, and the values its copies wrote to the shared stdout, sorted,
+/// since the twin and the original write in either order. Its powerbox is every fork test's: the
+/// Instantiator, `stdout` (a shared sink the twin inherits), a budget, and the child images of the
+/// server S (func 1) and the caller C (func 4).
+fn run_forking(src: &str, on: On) -> (Result<Vec<Value>, temen_interp::Trap>, Vec<i64>) {
     let m = module(&forking(src));
     let mut host = Host::new();
-    host.set_handoff(handoff);
+    if let On::TreeWalk { handoff } = on {
+        host.set_handoff(handoff);
+    }
     let ih = host.grant_instantiator();
     let hb = host.grant_budget(-1, 8 << 20, -1);
     let sink = host.shared_stdout();
     let out_h = host.grant_stream(StreamRole::Out);
     let [sm, cm] = images(&mut host, &m, [1, 4]);
+    let args = [Value::I32(ih), Value::I32(out_h), Value::I32(hb), sm, cm];
     let mut fuel = 60_000_000u64;
-    let r = run_with_host(
-        &m,
-        0,
-        &[Value::I32(ih), Value::I32(out_h), Value::I32(hb), sm, cm],
-        &mut fuel,
-        &mut host,
-    );
+    let r = match on {
+        On::TreeWalk { .. } => run_with_host(&m, 0, &args, &mut fuel, &mut host),
+        On::Bytecode => {
+            temen_interp::bytecode::compile_and_run_with_host(&m, 0, &args, &mut fuel, &mut host)
+                .expect("the bytecode engine runs the fork module itself, not folded to the oracle")
+        }
+        On::Parallel => {
+            temen_interp::bytecode::compile_and_run_capture_over_parallel_with_host(
+                &m,
+                0,
+                &args,
+                &mut fuel,
+                &[],
+                None,
+                &mut host,
+            )
+            .expect("the parallel driver runs the fork module")
+            .0
+        }
+    };
     let vals = written(&sink.lock().unwrap_or_else(|e| e.into_inner()));
     (r, vals)
 }
@@ -443,43 +466,26 @@ fn written(bytes: &[u8]) -> Vec<i64> {
     vals
 }
 
+/// FORK.md §9 — **native bytecode fork**: the `SRC_TWIN` fork topology runs on the *bytecode*
+/// engine (not folded to the tree-walk oracle), producing the identical observable result — the run
+/// value plus both replies on the shared stdout sink. This is the differential pin the parity
+/// matrix's bytecode `clone_caller`/`reap` cells rest on (INVARIANTS.md #9; OPS_PARITY.md). The
+/// twin's continuation is the caller's `Vm` cloned at its post-call resume point over a private
+/// window (`Mem::fork_private`) + duplicated powerbox (`Host::fork_powerbox`); the parent `wait`s
+/// the twin (`reap`) so its stdout write is observed deterministically before teardown.
 #[test]
 fn bytecode_forks_the_twin_identically_to_the_oracle() {
-    let (oracle_r, oracle_vals) = run_forking(SRC_TWIN, false);
-    let oracle_r = oracle_r.expect("oracle run");
-
-    // The bytecode engine must run the fork module NATIVELY (`Some`) — a fold would return `None`.
-    let m = module(&forking(SRC_TWIN));
-    let mut host = Host::new();
-    let ih = host.grant_instantiator();
-    let hb = host.grant_budget(-1, 8 << 20, -1);
-    let sink = host.shared_stdout();
-    let out_h = host.grant_stream(StreamRole::Out);
-    let [sm, cm] = images(&mut host, &m, [1, 4]);
-    let mut fuel = 40_000_000u64;
-    let bc_r = temen_interp::bytecode::compile_and_run_with_host(
-        &m,
-        0,
-        &[Value::I32(ih), Value::I32(out_h), Value::I32(hb), sm, cm],
-        &mut fuel,
-        &mut host,
-    )
-    .expect("the fork module runs natively on the bytecode engine (not folded to the oracle)")
-    .expect("bytecode run");
-    let bc_vals = written(&sink.lock().unwrap_or_else(|e| e.into_inner()));
-
+    let oracle = run_forking(SRC_TWIN, ORACLE);
     assert_eq!(
-        bc_r, oracle_r,
-        "bytecode fork returns the oracle's value (reply_orig = 100, joined through C)"
+        run_forking(SRC_TWIN, On::Bytecode),
+        oracle,
+        "bytecode fork returns the oracle's value (reply_orig = 100, joined through C) and the \
+         oracle's writes (both replies, order-independent)"
     );
     assert_eq!(
-        bc_vals, oracle_vals,
-        "bytecode and oracle agree on the shared sink (both replies, order-independent)"
-    );
-    assert_eq!(
-        bc_vals,
-        vec![100, 200],
-        "return-twice on bytecode: original (100) + twin (200) both wrote their reply"
+        oracle,
+        (Ok(vec![Value::I64(100)]), vec![100, 200]),
+        "return-twice: original (100) + twin (200) both wrote their reply"
     );
 }
 
@@ -487,31 +493,10 @@ fn bytecode_forks_the_twin_identically_to_the_oracle() {
 /// task on its own OS thread, and the run's value and both replies are the oracle's.
 #[test]
 fn the_parallel_driver_forks_the_twin_identically_to_the_oracle() {
-    let (oracle_r, oracle_vals) = run_forking(SRC_TWIN, false);
-    let oracle_r = oracle_r.expect("oracle run");
-    let m = module(&forking(SRC_TWIN));
-    let mut host = Host::new();
-    let ih = host.grant_instantiator();
-    let hb = host.grant_budget(-1, 8 << 20, -1);
-    let sink = host.shared_stdout();
-    let out_h = host.grant_stream(StreamRole::Out);
-    let [sm, cm] = images(&mut host, &m, [1, 4]);
-    let mut fuel = 40_000_000u64;
-    let (r, _image) = temen_interp::bytecode::compile_and_run_capture_over_parallel_with_host(
-        &m,
-        0,
-        &[Value::I32(ih), Value::I32(out_h), Value::I32(hb), sm, cm],
-        &mut fuel,
-        &[],
-        None,
-        &mut host,
-    )
-    .expect("the parallel driver runs the fork module");
-    assert_eq!(r.expect("parallel run"), oracle_r, "the oracle's value");
     assert_eq!(
-        written(&sink.lock().unwrap_or_else(|e| e.into_inner())),
-        oracle_vals,
-        "both replies on the shared sink, as on the oracle"
+        run_forking(SRC_TWIN, On::Parallel),
+        run_forking(SRC_TWIN, ORACLE),
+        "the oracle's value, and both replies on the shared sink, as on the oracle"
     );
 }
 
@@ -639,7 +624,7 @@ block 5 (vpid: i64) {
 
 #[test]
 fn pid_mode_replies_the_twins_task_id_to_the_parent_and_zero_to_the_child() {
-    let (r, vals) = run_forking(SRC_FORK_PID, false);
+    let (r, vals) = run_forking(SRC_FORK_PID, ORACLE);
     // The original C's fork() returned the twin's TaskId (3) — the POSIX parent-sees-pid — joined
     // back through the root.
     assert_eq!(
@@ -786,7 +771,7 @@ block 5 () {
 
 #[test]
 fn fork_then_wait_reaps_the_twins_exit_status_through_the_shared_offer() {
-    let (r, vals) = run_forking(SRC_FORK_WAIT, false);
+    let (r, vals) = run_forking(SRC_FORK_WAIT, ORACLE);
     // The original C forked (pid 3), waited on it, and returned the reaped status — joined to root.
     assert_eq!(
         r,
@@ -816,14 +801,14 @@ fn fork_and_wait_answer_the_same_under_direct_handoff() {
         ("pid mode", SRC_FORK_PID, 3, &[0, 3][..]),
         ("fork then wait", SRC_FORK_WAIT, 42, &[42][..]),
     ] {
-        let off = run_forking(src, false);
+        let off = run_forking(src, ORACLE);
         assert_eq!(
             off,
             (Ok(vec![Value::I64(ret)]), wrote.to_vec()),
             "{name}, queued"
         );
         assert_eq!(
-            run_forking(src, true),
+            run_forking(src, On::TreeWalk { handoff: true }),
             off,
             "{name}: handoff-on ≡ handoff-off"
         );
@@ -960,32 +945,103 @@ block 5 () {
 
 #[test]
 fn waitpid_wnohang_returns_zero_for_a_still_running_twin_without_blocking() {
-    let m = module(&forking(SRC_FORK_WAITPID));
-    let mut host = Host::new();
-    let ih = host.grant_instantiator();
-    let hb = host.grant_budget(-1, 8 << 20, -1);
-    let sink = host.shared_stdout();
-    let out_h = host.grant_stream(StreamRole::Out);
-    let [sm, cm] = images(&mut host, &m, [1, 4]);
-    let mut fuel = 60_000_000u64;
-    let r = run_with_host(
-        &m,
-        0,
-        &[Value::I32(ih), Value::I32(out_h), Value::I32(hb), sm, cm],
-        &mut fuel,
-        &mut host,
-    )
-    .expect("run");
-    // The twin parks forever, so `waitpid(pid, WNOHANG)` returned 0 — non-blocking, no hang.
+    // The twin parks forever, so `waitpid(pid, WNOHANG)` returned 0 — non-blocking, no hang — and
+    // the parent wrote that 0 once.
     assert_eq!(
-        r,
-        vec![Value::I64(0)],
+        run_forking(SRC_FORK_WAITPID, ORACLE),
+        (Ok(vec![Value::I64(0)]), vec![0]),
         "WNOHANG returned 0 for a still-running (never-exiting) twin"
     );
-    let bytes = sink.lock().unwrap_or_else(|e| e.into_inner()).to_vec();
-    assert_eq!(bytes.len(), 8, "the parent wrote its WNOHANG result once");
-    let status = i64::from_le_bytes(bytes[..8].try_into().unwrap());
-    assert_eq!(status, 0, "WNOHANG on a running child is 0");
+}
+
+/// [`SRC_FORK_WAIT`] with the parent waiting for any child, `wait(-1)`, rather than for its twin's
+/// pid. It retries only `-EAGAIN`, the serve/park race: any other error is its answer.
+fn wait_any() -> String {
+    let src = SRC_FORK_WAIT
+        .replace(
+            "vstatus = call.cap 268435456 1 (i64) -> (i64) vhsvc2 (vpid)",
+            "vany = i64.const -1\n  vstatus = call.cap 268435456 1 (i64) -> (i64) vhsvc2 (vany)",
+        )
+        .replace(
+            "vz3 = i64.const 0\n  vwaitfail = i64.lt_s vstatus vz3",
+            "vz3 = i64.const -11\n  vwaitfail = i64.eq vstatus vz3",
+        );
+    assert!(
+        src.contains("(vany)") && src.contains("vz3 = i64.const -11"),
+        "the parent's wait must be rewired"
+    );
+    src
+}
+
+/// [`SRC_FORK_WAITPID`] with its twin parked on its own empty queue (`svc.wait`) rather than on a
+/// futex, which is a thread seam the bytecode engine's fork escape declines. The twin still never
+/// exits.
+fn wnohang_on_a_parked_twin() -> String {
+    let futex = "  vfa = i64.const 17344
+  vval = i32.const 7
+  i32.store vfa vval
+  vexp = i32.const 7
+  vto = i64.const -1
+  vst = i32.atomic.wait vfa vexp vto
+";
+    assert!(SRC_FORK_WAITPID.contains(futex), "the twin's park");
+    SRC_FORK_WAITPID.replace(
+        futex,
+        "  vz5 = i32.const 0\n  vn5 = call.cap 4294967295 10 () -> (i64) vz5 ()\n",
+    )
+}
+
+/// [`SRC_FORK_WAIT`] with the twin, not exiting at once, first waiting for any child of its own.
+/// It has none, the parent's twin being itself, so it gets `-ECHILD` and exits `42 + -10`, the
+/// status its parent reaps: only a twin's own parent reaps it.
+fn a_twin_waits_for_any_child() -> String {
+    let exit = "block 5 () {
+  v42 = i64.const 42
+  return v42
+  }";
+    assert!(SRC_FORK_WAIT.contains(exit), "the twin's exit");
+    SRC_FORK_WAIT.replace(
+        exit,
+        "block 5 () {
+  vp0c = i64.const 16684
+  vl3c = i64.const 3
+  vhsvc3 = self.resolve vp0c vl3c
+  vany = i64.const -1
+  vst = call.cap 268435456 1 (i64) -> (i64) vhsvc3 (vany)
+  vea = i64.const -11
+  vagain = i64.eq vst vea
+  br_if vagain 5() 6(vst)
+  }
+block 6 (vst: i64) {
+  v42 = i64.const 42
+  vr = i64.add v42 vst
+  return vr
+  }",
+    )
+}
+
+/// #2862 — **the bytecode engine reaps as the oracle does**, on both its drivers: a named twin
+/// (fork then wait), any child (`wait(-1)`), only its own children (a twin's `wait(-1)` is
+/// `-ECHILD`), and `WNOHANG` on a twin still running. The engine answered `wait(-1)` with
+/// `-ECHILD`, and dropped `reap`'s flags, so its `WNOHANG` waited for a twin that never exits.
+#[test]
+fn the_bytecode_engine_reaps_as_the_oracle_does() {
+    for (name, src, ret) in [
+        ("fork then wait", SRC_FORK_WAIT.to_string(), 42),
+        ("wait(-1)", wait_any(), 42),
+        ("a twin's wait(-1)", a_twin_waits_for_any_child(), 32),
+        ("WNOHANG", wnohang_on_a_parked_twin(), 0),
+    ] {
+        let oracle = run_forking(&src, ORACLE);
+        assert_eq!(
+            oracle,
+            (Ok(vec![Value::I64(ret)]), vec![ret]),
+            "{name}, on the oracle"
+        );
+        for on in [On::Bytecode, On::Parallel] {
+            assert_eq!(run_forking(&src, on), oracle, "{name}, on {on:?}");
+        }
+    }
 }
 
 /// #1816 — **two waiters on one twin.** [`SRC_FORK_WAIT`]'s parent, but it also spawns a thread that
