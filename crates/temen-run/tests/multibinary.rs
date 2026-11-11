@@ -62,39 +62,66 @@ block 0 () {
 export 0 func \"_start\" 0
 ";
 
-/// The driver — the `nifmake` analog. Resolve `"exec"`; run `p1` with stdin `a`; read `p1`'s output
-/// into 16416.. (above the #1094 NULL guard); run `p2` with **that** buffer as stdin; read `p2`'s
-/// output into 16448..; emit it and exit with its length. `exec` ops (iface 13): 0 = run(argv,stdin),
-/// 1 = read_out(job,buf,cap).
+/// #2962 — every driver maps the `"exec.msg"` region the `exec` grant brings at window 65536 (the
+/// upper half of a `memory 17` window) and passes the protocol region-relative offsets: op 0
+/// `run(off, argv_len, stdin_len)` (argv at `off`, its stdin right after), 1 `read_out(job, off,
+/// cap)`, 3 `status(job)`. The phase names sit in data
+/// segments and are copied into the region; output lands in the region. `"exec.msg"` is the data at
+/// 16384 (above the #1094 NULL guard), whose first four bytes spell `"exec"`.
+///
+/// The driver — the `nifmake` analog. Run `p1` (region 0) with stdin `a`; read `p1`'s output
+/// **straight into `p2`'s stdin slot** (region 258, after `p2`'s name at 256), so the hand-off copies
+/// nothing; run `p2`; read its output to region 512; emit it and exit with its length.
 const DRIVER: &str = "\
-memory 16
-data 16384 \"exec\"
+memory 17
+data 16384 \"exec.msg\"
 data 16392 \"p1\"
 data 16396 \"p2\"
 data 16400 \"a\"
-import 0 \"out\" (i64, i64) -> (i64)
-import 1 \"exit\" (i32) -> ()
+type 0 func (i64, i64, i64) -> (i64)
+type 1 func (i64) -> (i64)
+type 2 interface { run: 0, read_out: 0, read_err: 0, status: 1, close: 1 }
+type 3 func (i64, i64) -> (i64)
+type 4 func (i32) -> ()
+import 0 interface \"exec\" 2
+import 1 func \"out\" 3
+import 2 func \"exit\" 4
 func 0 () -> () {
 block 0 () {
   vp = i64.const 16384
   vl = i64.const 4
   vh = self.resolve vp vl
-  vp1 = i64.const 16392
-  vp1l = i64.const 2
-  vsp = i64.const 16400
-  vsl = i64.const 1
-  vjob1 = call.cap 13 0 (i64, i64, i64, i64) -> (i64) vh (vp1, vp1l, vsp, vsl)
-  vbuf1 = i64.const 16416
+  vml = i64.const 8
+  vmsg = self.resolve vp vml
+  vwin = i64.const 65536
+  vz = i64.const 0
+  vlen = i64.const 65536
+  vprot = i32.const 3
+  vmapped = call.cap 4 0 (i64, i64, i64, i32) -> (i64) vmsg (vwin, vz, vlen, vprot)
+  vs1 = i64.const 16392
+  vtwo = i64.const 2
+  mem.copy vwin vs1 vtwo
+  vd1 = i64.const 65538
+  vsa = i64.const 16400
+  vone = i64.const 1
+  mem.copy vd1 vsa vone
+  vd2 = i64.const 65792
+  vs2 = i64.const 16396
+  mem.copy vd2 vs2 vtwo
+  vrun = i64.const 0
+  vjob1 = call.import 0.run (vz, vtwo, vone)
+  vread = i64.const 1
+  vin2 = i64.const 258
   vcap = i64.const 16
-  vn1 = call.cap 13 1 (i64, i64, i64) -> (i64) vh (vjob1, vbuf1, vcap)
-  vp2 = i64.const 16396
-  vp2l = i64.const 2
-  vjob2 = call.cap 13 0 (i64, i64, i64, i64) -> (i64) vh (vp2, vp2l, vbuf1, vn1)
-  vbuf2 = i64.const 16448
-  vn2 = call.cap 13 1 (i64, i64, i64) -> (i64) vh (vjob2, vbuf2, vcap)
-  vw = call.import 0 (vbuf2, vn2)
+  vn1 = call.import 0.read_out (vjob1, vin2, vcap)
+  vo2 = i64.const 256
+  vjob2 = call.import 0.run (vo2, vtwo, vn1)
+  vout = i64.const 512
+  vn2 = call.import 0.read_out (vjob2, vout, vcap)
+  vwout = i64.const 66048
+  vw = call.import 1 (vwout, vn2)
   vcode = i32.wrap_i64 vn2
-  call.import 1 (vcode)
+  call.import 2 (vcode)
   unreachable
   }
 }
@@ -127,15 +154,12 @@ fn phases() -> Vec<DomainProgram> {
 #[test]
 fn driver_chains_two_phases_passing_output_to_input() {
     let m = parse_module(DRIVER).expect("parse driver");
-    let inst = instantiate_with_imports(m, registry()).expect("instantiate driver");
     for backend in [Backend::TreeWalk, Backend::Bytecode, Backend::Jit] {
-        let r = inst
-            .run_with_caps(
-                backend,
-                &RunConfig::default(),
-                &[("exec", domain_exec(phases()))],
-            )
-            .unwrap_or_else(|e| panic!("{backend:?}: {e}"));
+        let r =
+            instantiate_with_imports(m.clone(), registry().provide("exec", domain_exec(phases())))
+                .expect("instantiate")
+                .run_with_caps(backend, &RunConfig::default(), &[])
+                .unwrap_or_else(|e| panic!("{backend:?}: {e}"));
         assert_eq!(
             r.stdout, b"aa!",
             "{backend:?}: p2 consumed p1's doubled output (a -> aa -> aa!)"
@@ -205,94 +229,128 @@ export 0 func \"_start\" 0
 ";
 
 /// The four-phase driver — the `nifmake` analog with abort-on-failure. Data (above the #1094 NULL
-/// guard): `exec`@16384; phase names `p1`@16392 `p2`@16396 `p3`@16400 `p4`@16404; seed `a`@16408.
-/// Per phase: run it, read its output into a fresh buffer (out1@16448, out2@16512, out3@16576,
-/// out4@16640), read its status, and `br_if status` to the abort block (5) or the next phase.
-/// Block 4 emits the final output + exit 0; block 5 emits nothing and exits with the failed phase's
-/// status. The `exec` handle is re-resolved per block (idempotent by name), so only the inter-phase
-/// length is threaded.
+/// guard): phase names `p1`@16392 `p2`@16396 `p3`@16400 `p4`@16404; seed `a`@16408. Block 0 maps the
+/// message region and lays out one 256-byte slot per phase: its name at `256k`, its stdin after it.
+/// Phase `k` (block `k + 1`) runs slot `k`, reads its output straight into slot `k + 1`'s stdin, reads
+/// its status, and `br_if status` to the abort block (6) or the next phase. Block 5 emits the final
+/// output (slot 4's stdin) + exit 0; block 6 emits nothing and exits with the failed phase's status.
+/// Only the inter-phase length is threaded.
 const DRIVER4: &str = "\
-memory 16
-data 16384 \"exec\"
+memory 17
+data 16384 \"exec.msg\"
 data 16392 \"p1\"
 data 16396 \"p2\"
 data 16400 \"p3\"
 data 16404 \"p4\"
 data 16408 \"a\"
-import 0 \"out\" (i64, i64) -> (i64)
-import 1 \"exit\" (i32) -> ()
+type 0 func (i64, i64, i64) -> (i64)
+type 1 func (i64) -> (i64)
+type 2 interface { run: 0, read_out: 0, read_err: 0, status: 1, close: 1 }
+type 3 func (i64, i64) -> (i64)
+type 4 func (i32) -> ()
+import 0 interface \"exec\" 2
+import 1 func \"out\" 3
+import 2 func \"exit\" 4
 func 0 () -> () {
 block 0 () {
-  vp0 = i64.const 16384
-  vl0 = i64.const 4
-  vh0 = self.resolve vp0 vl0
-  va0 = i64.const 16392
+  vp = i64.const 16384
+  vl = i64.const 4
+  vh = self.resolve vp vl
+  vml = i64.const 8
+  vmsg = self.resolve vp vml
+  vwin = i64.const 65536
+  vz = i64.const 0
+  vlen = i64.const 65536
+  vprot = i32.const 3
+  vmapped = call.cap 4 0 (i64, i64, i64, i32) -> (i64) vmsg (vwin, vz, vlen, vprot)
+  vn0 = i64.const 16392
+  vd0 = i64.const 65536
+  vtwo0 = i64.const 2
+  mem.copy vd0 vn0 vtwo0
+  vn1 = i64.const 16396
+  vd1 = i64.const 65792
+  vtwo1 = i64.const 2
+  mem.copy vd1 vn1 vtwo1
+  vn2 = i64.const 16400
+  vd2 = i64.const 66048
+  vtwo2 = i64.const 2
+  mem.copy vd2 vn2 vtwo2
+  vn3 = i64.const 16404
+  vd3 = i64.const 66304
+  vtwo3 = i64.const 2
+  mem.copy vd3 vn3 vtwo3
+  vsa = i64.const 16408
+  vda = i64.const 65538
+  vone = i64.const 1
+  mem.copy vda vsa vone
+  br 1(vone)
+}
+block 1 (q0: i64) {
+  vrun0 = i64.const 0
+  vo0 = i64.const 0
   vln0 = i64.const 2
-  vsp0 = i64.const 16408
-  vsl0 = i64.const 1
-  vj0 = call.cap 13 0 (i64, i64, i64, i64) -> (i64) vh0 (va0, vln0, vsp0, vsl0)
-  vb0 = i64.const 16448
+  vj0 = call.import 0.run (vo0, vln0, q0)
+  vread0 = i64.const 1
+  vb0 = i64.const 258
   vc0 = i64.const 32
-  vn0 = call.cap 13 1 (i64, i64, i64) -> (i64) vh0 (vj0, vb0, vc0)
-  vs0 = call.cap 13 3 (i64) -> (i64) vh0 (vj0)
+  vr0 = call.import 0.read_out (vj0, vb0, vc0)
+  vst0 = i64.const 3
+  vs0 = call.import 0.status (vj0)
   vs0w = i32.wrap_i64 vs0
-  br_if vs0w 5(vs0) 1(vn0)
+  br_if vs0w 6(vs0) 2(vr0)
 }
-block 1 (q1: i64) {
-  vp1 = i64.const 16384
-  vl1 = i64.const 4
-  vh1 = self.resolve vp1 vl1
-  va1 = i64.const 16396
+block 2 (q1: i64) {
+  vrun1 = i64.const 0
+  vo1 = i64.const 256
   vln1 = i64.const 2
-  vsp1 = i64.const 16448
-  vj1 = call.cap 13 0 (i64, i64, i64, i64) -> (i64) vh1 (va1, vln1, vsp1, q1)
-  vb1 = i64.const 16512
+  vj1 = call.import 0.run (vo1, vln1, q1)
+  vread1 = i64.const 1
+  vb1 = i64.const 514
   vc1 = i64.const 32
-  vn1 = call.cap 13 1 (i64, i64, i64) -> (i64) vh1 (vj1, vb1, vc1)
-  vs1 = call.cap 13 3 (i64) -> (i64) vh1 (vj1)
+  vr1 = call.import 0.read_out (vj1, vb1, vc1)
+  vst1 = i64.const 3
+  vs1 = call.import 0.status (vj1)
   vs1w = i32.wrap_i64 vs1
-  br_if vs1w 5(vs1) 2(vn1)
+  br_if vs1w 6(vs1) 3(vr1)
 }
-block 2 (q2: i64) {
-  vp2 = i64.const 16384
-  vl2 = i64.const 4
-  vh2 = self.resolve vp2 vl2
-  va2 = i64.const 16400
+block 3 (q2: i64) {
+  vrun2 = i64.const 0
+  vo2 = i64.const 512
   vln2 = i64.const 2
-  vsp2 = i64.const 16512
-  vj2 = call.cap 13 0 (i64, i64, i64, i64) -> (i64) vh2 (va2, vln2, vsp2, q2)
-  vb2 = i64.const 16576
+  vj2 = call.import 0.run (vo2, vln2, q2)
+  vread2 = i64.const 1
+  vb2 = i64.const 770
   vc2 = i64.const 32
-  vn2 = call.cap 13 1 (i64, i64, i64) -> (i64) vh2 (vj2, vb2, vc2)
-  vs2 = call.cap 13 3 (i64) -> (i64) vh2 (vj2)
+  vr2 = call.import 0.read_out (vj2, vb2, vc2)
+  vst2 = i64.const 3
+  vs2 = call.import 0.status (vj2)
   vs2w = i32.wrap_i64 vs2
-  br_if vs2w 5(vs2) 3(vn2)
+  br_if vs2w 6(vs2) 4(vr2)
 }
-block 3 (q3: i64) {
-  vp3 = i64.const 16384
-  vl3 = i64.const 4
-  vh3 = self.resolve vp3 vl3
-  va3 = i64.const 16404
+block 4 (q3: i64) {
+  vrun3 = i64.const 0
+  vo3 = i64.const 768
   vln3 = i64.const 2
-  vsp3 = i64.const 16576
-  vj3 = call.cap 13 0 (i64, i64, i64, i64) -> (i64) vh3 (va3, vln3, vsp3, q3)
-  vb3 = i64.const 16640
+  vj3 = call.import 0.run (vo3, vln3, q3)
+  vread3 = i64.const 1
+  vb3 = i64.const 1026
   vc3 = i64.const 32
-  vn3 = call.cap 13 1 (i64, i64, i64) -> (i64) vh3 (vj3, vb3, vc3)
-  vs3 = call.cap 13 3 (i64) -> (i64) vh3 (vj3)
+  vr3 = call.import 0.read_out (vj3, vb3, vc3)
+  vst3 = i64.const 3
+  vs3 = call.import 0.status (vj3)
   vs3w = i32.wrap_i64 vs3
-  br_if vs3w 5(vs3) 4(vn3)
+  br_if vs3w 6(vs3) 5(vr3)
 }
-block 4 (q4: i64) {
-  vb4 = i64.const 16640
-  vw4 = call.import 0 (vb4, q4)
+block 5 (q4: i64) {
+  vb4 = i64.const 66562
+  vw4 = call.import 1 (vb4, q4)
   vz4 = i32.const 0
-  call.import 1 (vz4)
+  call.import 2 (vz4)
   unreachable
 }
-block 5 (code: i64) {
+block 6 (code: i64) {
   vcw = i32.wrap_i64 code
-  call.import 1 (vcw)
+  call.import 2 (vcw)
   unreachable
 }
 }
@@ -325,15 +383,14 @@ fn phases4(fail_at_p3: bool) -> Vec<DomainProgram> {
 #[test]
 fn four_phase_pipeline_composes_when_every_phase_succeeds() {
     let m = parse_module(DRIVER4).expect("parse driver4");
-    let inst = instantiate_with_imports(m, registry()).expect("instantiate driver4");
     for backend in [Backend::TreeWalk, Backend::Bytecode, Backend::Jit] {
-        let r = inst
-            .run_with_caps(
-                backend,
-                &RunConfig::default(),
-                &[("exec", domain_exec(phases4(false)))],
-            )
-            .unwrap_or_else(|e| panic!("{backend:?}: {e}"));
+        let r = instantiate_with_imports(
+            m.clone(),
+            registry().provide("exec", domain_exec(phases4(false))),
+        )
+        .expect("instantiate")
+        .run_with_caps(backend, &RunConfig::default(), &[])
+        .unwrap_or_else(|e| panic!("{backend:?}: {e}"));
         assert_eq!(
             r.stdout, b"abcde",
             "{backend:?}: 4-deep hand-off a -> ab -> abc -> abcd -> abcde"
@@ -345,15 +402,14 @@ fn four_phase_pipeline_composes_when_every_phase_succeeds() {
 #[test]
 fn pipeline_aborts_with_the_failed_phase_status_and_skips_later_phases() {
     let m = parse_module(DRIVER4).expect("parse driver4");
-    let inst = instantiate_with_imports(m, registry()).expect("instantiate driver4");
     for backend in [Backend::TreeWalk, Backend::Bytecode, Backend::Jit] {
-        let r = inst
-            .run_with_caps(
-                backend,
-                &RunConfig::default(),
-                &[("exec", domain_exec(phases4(true)))],
-            )
-            .unwrap_or_else(|e| panic!("{backend:?}: {e}"));
+        let r = instantiate_with_imports(
+            m.clone(),
+            registry().provide("exec", domain_exec(phases4(true))),
+        )
+        .expect("instantiate")
+        .run_with_caps(backend, &RunConfig::default(), &[])
+        .unwrap_or_else(|e| panic!("{backend:?}: {e}"));
         assert_eq!(
             r.stdout, b"",
             "{backend:?}: aborted before the success emit — p4 never ran"
@@ -402,24 +458,38 @@ const SUM_1_TO_10_LENG: &str = "\
    (ret s.0))))";
 
 /// The nifmake-shaped driver for one real phase: resolve `exec`, run `compute` with no stdin, read
-/// its exit status (op 13/3), and re-exit with it.
+/// its exit status (op 3), and re-exit with it.
 const DRIVER_REAL: &str = "\
-memory 16
-data 16384 \"exec\"
+memory 17
+data 16384 \"exec.msg\"
 data 16392 \"compute\"
-import 0 \"exit\" (i32) -> ()
+type 0 func (i64, i64, i64) -> (i64)
+type 1 func (i64) -> (i64)
+type 2 interface { run: 0, read_out: 0, read_err: 0, status: 1, close: 1 }
+type 3 func (i32) -> ()
+import 0 interface \"exec\" 2
+import 1 func \"exit\" 3
 func 0 () -> () {
 block 0 () {
-  vep = i64.const 16384
-  vel = i64.const 4
-  vh = self.resolve vep vel
+  vp = i64.const 16384
+  vl = i64.const 4
+  vh = self.resolve vp vl
+  vml = i64.const 8
+  vmsg = self.resolve vp vml
+  vwin = i64.const 65536
+  vz = i64.const 0
+  vlen = i64.const 65536
+  vprot = i32.const 3
+  vmapped = call.cap 4 0 (i64, i64, i64, i32) -> (i64) vmsg (vwin, vz, vlen, vprot)
   vname = i64.const 16392
-  vnamelen = i64.const 7
-  vzero = i64.const 0
-  vjob = call.cap 13 0 (i64, i64, i64, i64) -> (i64) vh (vname, vnamelen, vzero, vzero)
-  vstatus = call.cap 13 3 (i64) -> (i64) vh (vjob)
+  vnamel = i64.const 7
+  mem.copy vwin vname vnamel
+  vrun = i64.const 0
+  vjob = call.import 0.run (vz, vnamel, vz)
+  vst = i64.const 3
+  vstatus = call.import 0.status (vjob)
   vcode = i32.wrap_i64 vstatus
-  call.import 0 (vcode)
+  call.import 1 (vcode)
   unreachable
   }
 }
@@ -441,15 +511,14 @@ fn compiled_compute_phase() -> DomainProgram {
 #[test]
 fn driver_runs_a_real_temen_leng_compiled_program_as_an_exec_child() {
     let m = parse_module(DRIVER_REAL).expect("parse real driver");
-    let inst = instantiate_with_imports(m, registry()).expect("instantiate driver");
     for backend in [Backend::TreeWalk, Backend::Bytecode, Backend::Jit] {
-        let r = inst
-            .run_with_caps(
-                backend,
-                &RunConfig::default(),
-                &[("exec", domain_exec(vec![compiled_compute_phase()]))],
-            )
-            .unwrap_or_else(|e| panic!("{backend:?}: {e}"));
+        let r = instantiate_with_imports(
+            m.clone(),
+            registry().provide("exec", domain_exec(vec![compiled_compute_phase()])),
+        )
+        .expect("instantiate")
+        .run_with_caps(backend, &RunConfig::default(), &[])
+        .unwrap_or_else(|e| panic!("{backend:?}: {e}"));
         assert_eq!(
             r.outcome,
             Outcome::Exited(55),
@@ -528,32 +597,51 @@ export 0 func \"_start\" 0
 
 /// The driver: run `gen` (writes `mid`), then `use` (reads `mid`), drain `use`'s output and emit it.
 const DRIVER_FS: &str = "\
-memory 16
-data 16384 \"exec\"
+memory 17
+data 16384 \"exec.msg\"
 data 16392 \"gen\"
 data 16396 \"use\"
-import 0 \"out\" (i64, i64) -> (i64)
-import 1 \"exit\" (i32) -> ()
+type 0 func (i64, i64, i64) -> (i64)
+type 1 func (i64) -> (i64)
+type 2 interface { run: 0, read_out: 0, read_err: 0, status: 1, close: 1 }
+type 3 func (i64, i64) -> (i64)
+type 4 func (i32) -> ()
+import 0 interface \"exec\" 2
+import 1 func \"out\" 3
+import 2 func \"exit\" 4
 func 0 () -> () {
 block 0 () {
-  vep = i64.const 16384
-  vel = i64.const 4
-  vh = self.resolve vep vel
+  vp = i64.const 16384
+  vl = i64.const 4
+  vh = self.resolve vp vl
+  vml = i64.const 8
+  vmsg = self.resolve vp vml
+  vwin = i64.const 65536
+  vz = i64.const 0
+  vlen = i64.const 65536
+  vprot = i32.const 3
+  vmapped = call.cap 4 0 (i64, i64, i64, i32) -> (i64) vmsg (vwin, vz, vlen, vprot)
   vgen = i64.const 16392
-  vgenl = i64.const 3
-  vzero = i64.const 0
-  vjg = call.cap 13 0 (i64, i64, i64, i64) -> (i64) vh (vgen, vgenl, vzero, vzero)
-  vsg = call.cap 13 3 (i64) -> (i64) vh (vjg)
+  vthree = i64.const 3
+  mem.copy vwin vgen vthree
+  vd2 = i64.const 65792
   vuse = i64.const 16396
-  vusel = i64.const 3
-  vju = call.cap 13 0 (i64, i64, i64, i64) -> (i64) vh (vuse, vusel, vzero, vzero)
-  vbuf = i64.const 16448
+  mem.copy vd2 vuse vthree
+  vrun = i64.const 0
+  vjg = call.import 0.run (vz, vthree, vz)
+  vst = i64.const 3
+  vsg = call.import 0.status (vjg)
+  vo2 = i64.const 256
+  vju = call.import 0.run (vo2, vthree, vz)
+  vread = i64.const 1
+  vout = i64.const 512
   vcap = i64.const 32
-  vnu = call.cap 13 1 (i64, i64, i64) -> (i64) vh (vju, vbuf, vcap)
-  vw = call.import 0 (vbuf, vnu)
-  vsu = call.cap 13 3 (i64) -> (i64) vh (vju)
+  vnu = call.import 0.read_out (vju, vout, vcap)
+  vwout = i64.const 66048
+  vw = call.import 1 (vwout, vnu)
+  vsu = call.import 0.status (vju)
   vcode = i32.wrap_i64 vsu
-  call.import 1 (vcode)
+  call.import 2 (vcode)
   unreachable
   }
 }
@@ -573,20 +661,19 @@ fn fs_phase(name: &str, src: &str) -> DomainProgram {
 #[test]
 fn driver_hands_off_a_file_between_phases_through_a_shared_memfs() {
     let m = parse_module(DRIVER_FS).expect("parse fs driver");
-    let inst = instantiate_with_imports(m, registry()).expect("instantiate driver");
     for backend in [Backend::TreeWalk, Backend::Bytecode, Backend::Jit] {
         // A fresh shared store per run: both phase children are granted one grant each from the same
         // factory, so `gen`'s write and `use`'s read hit the same filesystem.
         let (factory, _handle) = temen_run::fs::mem_fs_shared_factory(vec![], vec![]);
         let child_fs = HostCap::host_proc(0, move |_, _| Some(factory()));
         let phases = vec![fs_phase("gen", GEN_PHASE), fs_phase("use", USE_PHASE)];
-        let r = inst
-            .run_with_caps(
-                backend,
-                &RunConfig::default(),
-                &[("exec", domain_exec_with_fs(phases, child_fs))],
-            )
-            .unwrap_or_else(|e| panic!("{backend:?}: {e}"));
+        let r = instantiate_with_imports(
+            m.clone(),
+            registry().provide("exec", domain_exec_with_fs(phases, child_fs)),
+        )
+        .expect("instantiate")
+        .run_with_caps(backend, &RunConfig::default(), &[])
+        .unwrap_or_else(|e| panic!("{backend:?}: {e}"));
         assert_eq!(
             r.stdout, b"OK",
             "{backend:?}: 'use' read the file 'gen' wrote to the shared memfs (file hand-off)"
@@ -614,22 +701,36 @@ export 0 func \"_start\" 0
 
 /// A driver that runs `probe` and exits with its status (1 = it got `fs`, 0 = it didn't).
 const DRIVER_PROBE: &str = "\
-memory 16
-data 16384 \"exec\"
+memory 17
+data 16384 \"exec.msg\"
 data 16392 \"probe\"
-import 0 \"exit\" (i32) -> ()
+type 0 func (i64, i64, i64) -> (i64)
+type 1 func (i64) -> (i64)
+type 2 interface { run: 0, read_out: 0, read_err: 0, status: 1, close: 1 }
+type 3 func (i32) -> ()
+import 0 interface \"exec\" 2
+import 1 func \"exit\" 3
 func 0 () -> () {
 block 0 () {
-  vep = i64.const 16384
-  vel = i64.const 4
-  vh = self.resolve vep vel
+  vp = i64.const 16384
+  vl = i64.const 4
+  vh = self.resolve vp vl
+  vml = i64.const 8
+  vmsg = self.resolve vp vml
+  vwin = i64.const 65536
+  vz = i64.const 0
+  vlen = i64.const 65536
+  vprot = i32.const 3
+  vmapped = call.cap 4 0 (i64, i64, i64, i32) -> (i64) vmsg (vwin, vz, vlen, vprot)
   vname = i64.const 16392
   vnamel = i64.const 5
-  vzero = i64.const 0
-  vj = call.cap 13 0 (i64, i64, i64, i64) -> (i64) vh (vname, vnamel, vzero, vzero)
-  vs = call.cap 13 3 (i64) -> (i64) vh (vj)
+  mem.copy vwin vname vnamel
+  vrun = i64.const 0
+  vj = call.import 0.run (vz, vnamel, vz)
+  vst = i64.const 3
+  vs = call.import 0.status (vj)
   vcode = i32.wrap_i64 vs
-  call.import 0 (vcode)
+  call.import 1 (vcode)
   unreachable
   }
 }
@@ -642,35 +743,34 @@ fn a_child_gets_fs_only_when_the_parent_grants_it() {
     // explicit `domain_exec_with_fs` grant. A child under plain `domain_exec` cannot resolve `fs` — no
     // ambient authority, and a child cannot widen its own grant.
     let m = parse_module(DRIVER_PROBE).expect("parse probe driver");
-    let inst = instantiate_with_imports(m, registry()).expect("instantiate driver");
     for backend in [Backend::TreeWalk, Backend::Bytecode, Backend::Jit] {
         let (factory, _h) = temen_run::fs::mem_fs_shared_factory(vec![], vec![]);
-        let granted = inst
-            .run_with_caps(
-                backend,
-                &RunConfig::default(),
-                &[(
-                    "exec",
-                    domain_exec_with_fs(
-                        vec![fs_phase("probe", PROBE_PHASE)],
-                        HostCap::host_proc(0, move |_, _| Some(factory())),
-                    ),
-                )],
-            )
-            .unwrap_or_else(|e| panic!("{backend:?}: {e}"));
+        let granted = instantiate_with_imports(
+            m.clone(),
+            registry().provide(
+                "exec",
+                domain_exec_with_fs(
+                    vec![fs_phase("probe", PROBE_PHASE)],
+                    HostCap::host_proc(0, move |_, _| Some(factory())),
+                ),
+            ),
+        )
+        .expect("instantiate")
+        .run_with_caps(backend, &RunConfig::default(), &[])
+        .unwrap_or_else(|e| panic!("{backend:?}: {e}"));
         assert_eq!(
             granted.outcome,
             Outcome::Exited(1),
             "{backend:?}: an explicitly-granted child resolves fs"
         );
 
-        let default = inst
-            .run_with_caps(
-                backend,
-                &RunConfig::default(),
-                &[("exec", domain_exec(vec![fs_phase("probe", PROBE_PHASE)]))],
-            )
-            .unwrap_or_else(|e| panic!("{backend:?}: {e}"));
+        let default = instantiate_with_imports(
+            m.clone(),
+            registry().provide("exec", domain_exec(vec![fs_phase("probe", PROBE_PHASE)])),
+        )
+        .expect("instantiate")
+        .run_with_caps(backend, &RunConfig::default(), &[])
+        .unwrap_or_else(|e| panic!("{backend:?}: {e}"));
         assert_eq!(
             default.outcome,
             Outcome::Exited(0),
