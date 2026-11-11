@@ -2991,8 +2991,11 @@ Because a stream is plain data, a GPU broker in another process (§17) takes the
 
 - **Natively,** `crates/temen-webgpu` is the backend over **`wgpu`**: a hardware adapter if there is
   one, else a software one (lavapipe). wgpu's errors go to the guest through a non-panicking handler,
-  and a panic inside wgpu loses the device, never the host (#2330 A). Its `Surface` is an offscreen
-  texture each present reads back into `Frames` for the embedder; a window's surface is #2837.
+  and a panic inside wgpu loses the device, never the host (#2330 A). Its `Surface` is the embedder's
+  window, which each present shows, or an offscreen texture each present reads back into `Frames`
+  (#2837). Either follows a `Size` the embedder keeps current: the `surface` op reports it, and the
+  next acquire is a texture of it. A frame the window cannot give, or a surface with no area, gets a
+  stand-in that present does not show, and the `error` op says why.
 - **In the browser,** the engine runs the same decoder and checks, and hands `web/webgpu.js` the WebGPU
   calls a checked stream stands for, as JSON steps it makes by name against `navigator.gpu`. The JS
   holds no knowledge of WebGPU's API of its own. Each capability handler is its own session there, so a
@@ -3018,7 +3021,12 @@ three engines**; a host with no adapter fails them, saying what to install, rath
 4. **Errors are values** — `errors.c`: each case that once reached wgpu's panicking default handler (a
    buffer over the limit, a misaligned write, a bind group short of a binding, a dispatch over the
    limit) comes back from `error`, and the device stays usable.
-5. **On-screen presentation** — in the playground, **"GPU: Mandelbrot zoom (WebGPU shader)"**
+5. **A surface follows its size** — `surface.c`: frames at each size the embedder gives, 64x48, 96x80,
+   no area, then 40x30, which the guest asks for through the test's `resize` cap. Each frame is cleared
+   to its own colour and read back pixel for pixel; a size with no area gives a stand-in, and `error`
+   says why. It runs on an offscreen surface, whose frames the host checks, and on an X11 window's
+   (#2837), under the test's own Xvfb when `DISPLAY` is unset.
+6. **On-screen presentation** — in the playground, **"GPU: Mandelbrot zoom (WebGPU shader)"**
    (`demos/display/gpu_shader.c`) builds one render pipeline and draws a frame to the page's canvas
    each `tick`; only a short command stream crosses the boundary per frame. Headless Chromium presents a
    WebGPU canvas only through ANGLE on Vulkan (lavapipe), so the browser test runs with those flags.
