@@ -64,11 +64,15 @@ fn sweep(seeds: impl Iterator<Item = u64>, mix: u64) -> Sweep {
 /// mutation tables in the PR) and explored by the libFuzzer twin. The gate is the two invariants.
 #[test]
 fn every_mutant_is_rejected() {
-    let n: u64 = std::env::var("MUT_SEEDS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(2000);
-    let s = sweep(0..n, 0x2799_2799);
+    let env = |k: &str, d: u64| {
+        std::env::var(k)
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(d)
+    };
+    // `MUT_FROM`/`MUT_SEEDS` bound the seed range (default `0..2000`), so a single residual seed can
+    // be re-checked cheaply without sweeping from zero.
+    let s = sweep(env("MUT_FROM", 0)..env("MUT_SEEDS", 2000), 0x2799_2799);
     for (op, made) in &s.made {
         eprintln!("made {op}: {made}");
     }
@@ -88,10 +92,7 @@ fn every_mutant_is_rejected() {
     // branches, so the frame/call/jump operators always fire). A total of zero would mean the engine
     // or the capture broke, not a host difference.
     let total: usize = s.made.values().sum();
-    assert!(
-        total > 0,
-        "the mutation engine made no mutants at all over {n} seeds"
-    );
+    assert!(total > 0, "the mutation engine made no mutants at all");
 }
 
 /// The jit_fuzz seed corpus too (a different generator mix, the one the interp↔JIT differential
