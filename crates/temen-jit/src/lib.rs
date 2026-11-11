@@ -191,8 +191,8 @@ pub unsafe fn fiber_park_outside() {
 mod vcpu_tls;
 #[cfg(fiber_rt)]
 pub use child_exec::{
-    handler_steps_aside, handler_steps_back, GateAside, HandlerDone, HandlerEnd, Ran, ServeRefused,
-    ServeSite,
+    handler_steps_aside, handler_steps_back, GateAside, HandlerDone, HandlerEnd, HeldCaller,
+    HeldSite, Ran, ServeRefused, ServeSite,
 };
 
 /// #1952, #2742 — whether the running code is in a guest fiber (`cont.*`): a park there yields
@@ -2280,6 +2280,14 @@ pub struct CapturedSeed {
 /// The run injects that reply, rewinds the root in place, and carries on past the fork call.
 pub type ForkHook = Box<dyn FnMut(&ForkPoint<'_>) -> i64 + Send>;
 
+/// #2695 step 2 — what a **held** run does once its root's entry returns ([`CompiledModule::set_rest`]):
+/// it is handed the domain's [`HeldSite`], where its calls run as activations, and the entry's
+/// results, for its embedder. The domain then rests on the root's thread, its threads running on,
+/// until its embedder ends it or it ends itself ([`HeldSite::end`]); only then does its teardown
+/// begin.
+#[cfg(fiber_rt)]
+pub type Rest = Box<dyn FnOnce(&Arc<HeldSite>, &[i64]) + Send>;
+
 /// #1768 — a run frozen at a fork, as its [`ForkHook`] sees it: the live window, unwound into its
 /// root's shadow stack, and what a private duplicate of it needs.
 pub struct ForkPoint<'a> {
@@ -3371,6 +3379,9 @@ pub struct CompiledModule {
     /// #1768 — the embedder's fork hook ([`Self::set_fork_hook`]): set on a run armed to fork, whose
     /// root unwinds at a fork call for the hook to duplicate. `None` for every other run.
     fork_hook: Option<ForkHook>,
+    /// #2695 step 2 — a held run's rest ([`Self::set_rest`]); `None` for every other run.
+    #[cfg(fiber_rt)]
+    rest: Option<Rest>,
     // --- §12/§14 runtimes this instance's code runs on, which its vmctx names or an entry publishes;
     // --- they must live exactly as long as the instance can run. Each instance has its own
     // --- ([`Self::instance`], temen#2389).
@@ -4526,6 +4537,8 @@ impl CompiledModule {
             window_ready: None,
             fork_hook: None,
             #[cfg(fiber_rt)]
+            rest: None,
+            #[cfg(fiber_rt)]
             fiber_rt,
             #[cfg(fiber_rt)]
             domain,
@@ -4832,6 +4845,8 @@ impl CompiledModule {
             window_ready: None,
             fork_hook: None,
             #[cfg(fiber_rt)]
+            rest: None,
+            #[cfg(fiber_rt)]
             fiber_rt,
             #[cfg(fiber_rt)]
             domain,
@@ -4872,6 +4887,16 @@ impl CompiledModule {
     /// single-threaded, non-durable root — the embedder's contract; `None` disarms.
     pub fn set_fork_hook(&mut self, hook: Option<ForkHook>) {
         self.fork_hook = hook;
+    }
+
+    /// #2695 step 2 — hold this module's next run: once its root's entry returns, the domain rests
+    /// instead of ending, and `rest` is handed its [`HeldSite`] and the entry's results ([`Rest`]).
+    /// Its calls then run as activations on their callers' threads until it ends. Only for a
+    /// non-durable run with a thread domain ([`Self::enable_thread_hosting`]), whose code charges fuel:
+    /// each call lends its own. A run that ends in its entry rests not at all.
+    #[cfg(fiber_rt)]
+    pub fn set_rest(&mut self, rest: Option<Rest>) {
+        self.rest = rest;
     }
 
     /// Make the next run **durable** (DURABILITY.md §12.8) on a caller-built module — the
@@ -5593,6 +5618,29 @@ impl CompiledModule {
             }
             #[cfg(not(fiber_rt))]
             let _ = landed;
+        }
+
+        // #2695 step 2 — a held domain rests here: its entry returned, and its threads run on. Its calls
+        // run as activations on their callers' threads ([`HeldSite`]) until it ends, and only then
+        // does its teardown below begin. The site holds the module, the window and the root's
+        // context raw: no Rust reference into `*this` is live while the activations run.
+        #[cfg(fiber_rt)]
+        if !faulted && vm.ended().is_none() && !(*this).durable {
+            if let (Some(rest), Some(d)) = ((*this).rest.take(), (*this).domain.as_deref()) {
+                let d = d as *const os_thread_rt::Domain;
+                let table = (*this).fiber_table.clone().unwrap_or_else(|| {
+                    Arc::new(fiber_rt::SharedFiberTable::new(
+                        1,
+                        temen_ir::durable_abi::ShadowArena::EMPTY,
+                        None,
+                    ))
+                });
+                let reserved = (*this).win_reserved as u64;
+                let site =
+                    HeldSite::new(&vm, &*this, mem_base, reserved, table, &*d, vcpu_tls::get());
+                rest(&site, &results[..n_results]);
+                site.rest();
+            }
         }
 
         // §5 W3 — the **root vCPU's** trap-time backtrace capture (this run thread's thread-local): a
@@ -8766,6 +8814,8 @@ fn compile_child_windowed(
         held_tail: None,
         window_ready: None,
         fork_hook: None,
+        #[cfg(fiber_rt)]
+        rest: None,
         fiber_rt: None,
         domain: None,
         _nursery: None,

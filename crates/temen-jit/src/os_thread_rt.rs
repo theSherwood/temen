@@ -84,7 +84,7 @@ pub(crate) fn woke() {
 
 /// True iff the kill-path is armed (`addr != 0`) **and** the host has set the interrupt cell — i.e.
 /// a parked vCPU should stop waiting and unwind (its next epoch poll in guest code traps `OutOfFuel`).
-fn epoch_fired(addr: usize) -> bool {
+pub(crate) fn epoch_fired(addr: usize) -> bool {
     // SAFETY: a non-zero `addr` is the run's live interrupt cell (an `AtomicU64`); it outlives every
     // vCPU (joined before `run_inner` frees it). A relaxed load suffices — we only need eventual
     // visibility of the host's store, and the kill is idempotent.

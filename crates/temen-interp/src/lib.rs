@@ -2320,6 +2320,22 @@ pub enum Executor {
     /// calls too, and a call on its caller's. It holds the modules the bytecode engine admits; the
     /// tree-walker holds the others.
     Threads,
+    /// The Cranelift JIT: the domain's threads on threads of their own, and a call on its caller's.
+    /// It lives outside this crate: `temen_run::hold` starts a domain on it ([`HeldEngine`]). Here,
+    /// with no JIT to reach, the tree-walker holds it.
+    Jit,
+}
+
+/// #2695 step 2 — a held domain on an engine outside this crate, which holds it for a
+/// [`HeldDomain`] ([`HeldDomain::of`]): the Cranelift JIT, held by `temen_run::hold`. Its methods
+/// are [`HeldDomain`]'s.
+pub trait HeldEngine: Send + Sync {
+    /// [`HeldDomain::call`].
+    fn call(&self, export: u32, op: u32, args: &[i64], fuel: &mut u64) -> Reply;
+    /// [`HeldDomain::end`], unless it has ended already.
+    fn finish(&mut self) -> Option<(Host, Option<Trap>)>;
+    /// [`HeldDomain::executor`].
+    fn executor(&self) -> Executor;
 }
 
 /// Where a [`HeldDomain`] runs.
@@ -2331,16 +2347,20 @@ enum HeldOn {
     },
     Pump(Box<bytecode::HeldPump>),
     Threads(Box<bytecode::HeldThreads>),
+    Engine(Box<dyn HeldEngine>),
 }
 
 /// The thread a held domain's run is on, which answers the run and hands the powerbox back.
 type HeldRun = std::thread::JoinHandle<(Result<Vec<Value>, Trap>, Host)>;
 
-/// #2695 step 2 — who holds a domain ([`Host::held`]): the tree-walker's run, through its link, or
-/// the bytecode engine's ([`bytecode::HeldPump`], [`bytecode::HeldThreads`]).
+/// #2695 step 2 — who holds a domain ([`Host::held`]): the tree-walker's run, through its link, the
+/// bytecode engine's ([`bytecode::HeldPump`], [`bytecode::HeldThreads`]), or an engine outside this
+/// crate ([`HeldEngine`]), with the site its calls enter once the domain rests
+/// ([`Host::held_site`]).
 pub(crate) enum Holder {
     Tree(Arc<HeldLink>),
     Bytecode,
+    Engine(Option<Arc<dyn std::any::Any + Send + Sync>>),
 }
 
 impl HeldDomain {
@@ -2375,7 +2395,7 @@ impl HeldDomain {
                 Ok(Err(refused)) => return Err(refused),
                 Err(host) => *host,
             },
-            Executor::TreeWalker => host,
+            Executor::TreeWalker | Executor::Jit => host,
         };
         if host.is_durable() {
             return Err((Trap::ThreadFault, Box::new(host)));
@@ -2415,6 +2435,7 @@ impl HeldDomain {
             HeldOn::Tree { link, .. } => link,
             HeldOn::Pump(p) => return p.call(export, op, args, fuel),
             HeldOn::Threads(t) => return t.call(export, op, args, fuel),
+            HeldOn::Engine(e) => return e.call(export, op, args, fuel),
         };
         let Some(sched) = link.scheduler() else {
             return Reply::Failed(CAP_REVOKED);
@@ -2454,10 +2475,19 @@ impl HeldDomain {
     /// The executor the domain runs on: the one it was started on, or the tree-walker if the pump
     /// declined its module.
     pub fn executor(&self) -> Executor {
-        match self.on {
+        match &self.on {
             HeldOn::Tree { .. } => Executor::TreeWalker,
             HeldOn::Pump(_) => Executor::Pump,
             HeldOn::Threads(_) => Executor::Threads,
+            HeldOn::Engine(e) => e.executor(),
+        }
+    }
+
+    /// A domain an engine outside this crate holds ([`HeldEngine`]), as `temen_run::hold` holds one
+    /// on the Cranelift JIT.
+    pub fn of(engine: Box<dyn HeldEngine>) -> HeldDomain {
+        HeldDomain {
+            on: HeldOn::Engine(engine),
         }
     }
 
@@ -2473,6 +2503,7 @@ impl HeldDomain {
             HeldOn::Tree { link, run } => (link, run.take()?),
             HeldOn::Pump(p) => return p.finish(),
             HeldOn::Threads(t) => return t.finish(),
+            HeldOn::Engine(e) => return e.finish(),
         };
         if let Some(sched) = link.scheduler() {
             let mut s = sched.lock();
@@ -28939,6 +28970,35 @@ impl Host {
         match &self.held {
             Some(Holder::Tree(link)) => Some(Arc::clone(link)),
             _ => None,
+        }
+    }
+
+    /// #2695 step 2 — an engine outside this crate holds this domain (`true`), as `temen_run::hold`
+    /// holds one on the Cranelift JIT, or has let it go (`false`). A call from inside its run waits
+    /// for it to rest ([`Host::held_site`]) rather than queue for a serve loop.
+    pub fn hold_for_engine(&mut self, held: bool) {
+        self.held = held.then_some(Holder::Engine(None));
+    }
+
+    /// Whether an engine outside this crate holds this domain ([`Host::hold_for_engine`]).
+    pub fn held_for_engine(&self) -> bool {
+        matches!(self.held, Some(Holder::Engine(_)))
+    }
+
+    /// The site a held domain's calls enter once it rests, as its engine published it
+    /// ([`Host::set_held_site`]); `None` while its entry runs, and once it has ended.
+    pub fn held_site(&self) -> Option<Arc<dyn std::any::Any + Send + Sync>> {
+        match &self.held {
+            Some(Holder::Engine(site)) => site.clone(),
+            _ => None,
+        }
+    }
+
+    /// Publish (`Some`) or withdraw (`None`) the site a domain held by an engine outside this crate
+    /// takes its calls at ([`Host::held_site`]).
+    pub fn set_held_site(&mut self, site: Option<Arc<dyn std::any::Any + Send + Sync>>) {
+        if let Some(Holder::Engine(at)) = &mut self.held {
+            *at = site;
         }
     }
 

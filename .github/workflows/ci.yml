@@ -103,7 +103,8 @@ jobs:
       # re-run instead of eating the whole job budget (a 29 min apt stall burned one 2026-07-23).
       - name: install mingw cross toolchain
         timeout-minutes: 15
-        run: bash scripts/ci/apt-prep.sh gcc-mingw-w64-x86-64
+        uses: ./.github/actions/apt-install
+        with: { packages: gcc-mingw-w64-x86-64 }
       - run: cargo check --workspace --all-targets --target x86_64-pc-windows-gnu
       - run: cargo clippy --workspace --all-targets --target x86_64-pc-windows-gnu -- -D warnings
   # Two parts on two runners, one definition. The self-hosted lane is ~11 min (release build, then
@@ -653,7 +654,8 @@ jobs:
         # be — the test uses plain `clang` (any version the on-ramp's textual reader accepts).
         # ISSUES.md I34: bound the fetch so a wedged mirror fails fast into a re-run.
         timeout-minutes: 15
-        run: bash scripts/ci/apt-prep.sh clang
+        uses: ./.github/actions/apt-install
+        with: { packages: clang }
       # The heavy self-compile gate is #[ignore]d — too slow (~2 min) for the inner
       # `cargo test --workspace` loop: it `make`s chibicc, compiles ~10 TUs `--emit-object`, links +
       # verifies a ~300-function module, runs it on the tree-walk interpreter AND the JIT, and
@@ -689,7 +691,8 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: install clang (native reference compiler)
         timeout-minutes: 15
-        run: bash scripts/ci/apt-prep.sh clang
+        uses: ./.github/actions/apt-install
+        with: { packages: clang }
       - run: cargo test -p temen --test c_link -j 2 -- --ignored whole_cc1_compiles_giant_tus
 
   # The #[ignore]d full-depth CORRECTNESS gates (not benches) were one 90-min job (`full-depth-gates`)
@@ -1538,7 +1541,8 @@ jobs:
       # bound it so an apt-mirror wedge fails fast into a re-run.
       - name: install mingw cross toolchain
         timeout-minutes: 15
-        run: bash scripts/ci/apt-prep.sh gcc-mingw-w64-x86-64
+        uses: ./.github/actions/apt-install
+        with: { packages: gcc-mingw-w64-x86-64 }
       - run: cargo clippy -p temen-jit --features stack-check --all-targets --target x86_64-pc-windows-gnu -- -D warnings
 
   stack-guard-cross-os:
