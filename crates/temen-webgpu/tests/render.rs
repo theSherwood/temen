@@ -7,7 +7,7 @@
 
 mod common;
 
-use temen_webgpu::{Frames, Surface};
+use temen_webgpu::{Frames, Size, Surface};
 
 fn fnv(bytes: &[u8]) -> u32 {
     bytes
@@ -24,8 +24,7 @@ fn demo_webgpu_render() {
         for backend in common::ENGINES {
             let frames = Frames::default();
             let surface = Surface::Offscreen {
-                width: 64,
-                height: 64,
+                size: Size::new(64, 64),
                 format,
                 frames: frames.clone(),
             };
