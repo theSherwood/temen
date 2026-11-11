@@ -788,3 +788,79 @@ fn a_rustc_parent_serves_ops_that_park_allocate_and_print() {
         );
     }
 }
+
+/// #2964 — a dispatch that gets no data stack is answered, and the servicer lives. The parent
+/// defines its own `malloc` (a bump arena the translator's trampolines use like any other), which
+/// `deny` turns off; the child's next call, `twice`, then gets INVARIANTS 8's transport failure,
+/// `-ENOMEM` in its integer result. `nap` can park, so every op takes a stack of its own.
+#[test]
+fn a_dispatch_without_a_stack_is_answered_enomem() {
+    const MEM: &str = "mem { deny: () -> (i64); twice: (i64) -> (i64); nap: () -> (i64) }";
+    let parent = format!(
+        r#"{JOBS_HEADER}
+int __vm_wait32(int *addr, int expected, long timeout_ns);
+TEMEN_INTERFACE(mem, "{MEM}");
+static char arena[4 << 20] __attribute__((aligned(16)));
+static long used;
+static int denied;
+void *malloc(unsigned long n) {{
+  if (denied || used + (long)n > (long)sizeof arena) return 0;
+  void *p = arena + used;
+  used += (n + 15) & ~15L;
+  return p;
+}}
+void free(void *p) {{ (void)p; }}
+static int never = 1;
+long TEMEN_OP(mem, deny)(void) {{ denied = 1; return 0; }}
+long TEMEN_OP(mem, twice)(long x) {{ return 2 * x; }}
+long TEMEN_OP(mem, nap)(void) {{ return __vm_wait32(&never, 0, 0); }}
+static unsigned rec[16] __attribute__((aligned(8)));
+static unsigned grant[4];
+int main(void) {{
+  int inst = __vm_cap_resolve("vm", 2);
+  int budget = __vm_cap_resolve("budget", 6);
+  int child = __vm_cap_resolve("child", 5);
+  grant[0] = (unsigned)(long)"mem";
+  grant[1] = 3;
+  grant[2] = (unsigned)TEMEN_SERVE_GRANT(mem);
+  unsigned words[16] = {{0, ~0u, (unsigned)child, (unsigned)budget, (unsigned)(long)grant, 0, 1, 0,
+                        0, 0, 0, 0, ~0u, 0, 0, 0}};
+  for (int i = 0; i < 16; i++) rec[i] = words[i];
+  long h = __vm_instantiate_rec(inst, (long)rec);
+  if (h < 0) return -1;
+  while (__vm_svc_wait() > 0) {{}}
+  long st = 0;
+  long r = __vm_join(inst, h, &st);
+  return st != 0 ? (int)(-1000 - st) : (int)r;
+}}
+"#
+    );
+    let child = format!(
+        r#"{JOBS_HEADER}
+TEMEN_INTERFACE(mem, "{MEM}");
+long TEMEN_OP(mem, deny)(void);
+long TEMEN_OP(mem, twice)(long x);
+long TEMEN_OP(mem, nap)(void);
+int main(void) {{
+  long a = TEMEN_OP(mem, twice)(21);
+  TEMEN_OP(mem, deny)();
+  long b = TEMEN_OP(mem, twice)(21);
+  return (int)(a * 1000 + b);
+}}
+"#
+    );
+    let dir = work_dir("enomem");
+    let (Some(p), Some(c)) = (
+        clang_ll(&dir, "parent", &parent),
+        clang_ll(&dir, "child", &child),
+    ) else {
+        eprintln!("note: skipping (clang unavailable)");
+        return;
+    };
+    let parent = translate(&p, false);
+    let children = [("child", Arc::new(translate(&c, true)))];
+    for b in [Backend::TreeWalk, Backend::Bytecode, Backend::Jit] {
+        let r = run(&parent, &children, Some(b)).map(|(x, _)| x);
+        assert_eq!(r, Ok(42 * 1000 - 12), "{b:?}: twice(21), then -ENOMEM");
+    }
+}

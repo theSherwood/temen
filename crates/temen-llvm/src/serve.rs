@@ -293,7 +293,7 @@ fn trampoline(target: u32, sig: &FuncType, storage: &FuncType, serve_sp: u64) ->
 }
 
 /// Three blocks: allocate the dispatch's stack (block 0), call the op on it and free it (block 1),
-/// or trap when the heap has no room for it (block 2), as a fiber past its budget does.
+/// or answer when the heap has no room for it (block 2, [`exhausted`]).
 fn heap_trampoline(
     target: u32,
     sig: &FuncType,
@@ -348,17 +348,51 @@ fn heap_trampoline(
         insts: b.insts,
         term: Terminator::Return(results),
     };
-    let fail = Block {
-        parent: 0,
-        captures: vec![],
-        params: vec![],
-        insts: vec![],
-        term: Terminator::Unreachable,
-    };
+    let fail = exhausted(&sig.results);
     Func {
         params: sig.params.clone(),
         results: sig.results.clone(),
         blocks: vec![entry, body, fail],
+    }
+}
+
+/// The errno a dispatch answers when the heap has no room for its data stack.
+pub(crate) const ENOMEM: i64 = -12;
+
+/// The block a dispatch takes when it gets no data stack. The servicer lives: the call is answered
+/// with [`ENOMEM`] in its first result and zeros in the rest, INVARIANTS 8's transport failure,
+/// when the first result is an integer and no result is a `cap`. A zero in a `cap` slot is the
+/// servicer's handle 0, which the reply would grant the caller, so an op that answers a handle, or
+/// whose first result is not an integer, traps instead (#2964: the owner's choice of how such an op
+/// answers is pending).
+fn exhausted(results: &[ValType]) -> Block {
+    let answerable = matches!(results.first(), Some(ValType::I32 | ValType::I64))
+        && !results.contains(&ValType::Cap);
+    let (insts, term) = if answerable {
+        let insts: Vec<Inst> = results
+            .iter()
+            .enumerate()
+            .map(|(k, t)| {
+                let v = if k == 0 { ENOMEM } else { 0 };
+                match t {
+                    ValType::I32 => Inst::ConstI32(v as i32),
+                    ValType::F32 => Inst::ConstF32(0),
+                    ValType::F64 => Inst::ConstF64(0),
+                    _ => Inst::ConstI64(v),
+                }
+            })
+            .collect();
+        let rets = (0..insts.len() as u32).collect();
+        (insts, Terminator::Return(rets))
+    } else {
+        (Vec::new(), Terminator::Unreachable)
+    };
+    Block {
+        parent: 0,
+        captures: vec![],
+        params: vec![],
+        insts,
+        term,
     }
 }
 
