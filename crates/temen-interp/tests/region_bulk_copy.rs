@@ -4,9 +4,10 @@
 //! byte of such a copy, aliased or not, took the address-space lock and a page lookup. The tree-walk
 //! oracle keeps its byte loop, so the drivers are compared against it.
 //!
-//! The root maps an 8 KiB region at 65536 and, across the plain pages on either side, fills, fills
-//! again and copies spans that cross both boundaries, then returns a weighted checksum of
-//! `[56000, 80000)`.
+//! The root maps a 64 KiB region at 65536 (whole pages on every host, 16 KiB macOS pages and
+//! Windows' 64 KiB granularity included) and, across the plain pages on either side, fills, fills
+//! again and copies spans that cross both of its boundaries, then returns a weighted checksum of
+//! `[56000, 150000)`.
 
 #[path = "support/drivers.rs"]
 mod drivers;
@@ -16,9 +17,9 @@ use temen_interp::{Host, Value};
 use temen_ir::Module;
 
 /// The spans the root writes: `(dst, val, len)` fills, then a `(dst, src, len)` copy.
-const FILLS: [(usize, u8, usize); 2] = [(60000, 7, 20000), (64000, 9, 2000)];
-const COPY: (usize, usize, usize) = (72000, 63000, 4000);
-const SUM: (usize, usize) = (56000, 80000);
+const FILLS: [(usize, u8, usize); 2] = [(60000, 7, 80000), (64000, 9, 4000)];
+const COPY: (usize, usize, usize) = (128000, 63000, 8000);
+const SUM: (usize, usize) = (56000, 150000);
 
 fn src() -> String {
     let fills: String = FILLS
@@ -33,10 +34,10 @@ fn src() -> String {
     let (cd, cs, cn) = COPY;
     let (lo, hi) = SUM;
     format!(
-        "memory 17
+        "memory 18
 func (i32) -> (i64) {{
 block 0 (vas: i32) {{
-  vlen = i64.const 8192
+  vlen = i64.const 65536
   vrh = call.cap 5 5 (i64) -> (i64) vas (vlen)
   vr = i32.wrap_i64 vrh
   vwin = i64.const 65536
@@ -77,7 +78,7 @@ block 3 (sum: i64, vm: i64) {{
 
 /// The checksum a correct run returns (the map answering 0).
 fn want() -> i64 {
-    let mut mem = vec![0u8; 1 << 17];
+    let mut mem = vec![0u8; 1 << 18];
     for (d, v, n) in FILLS {
         mem[d..d + n].fill(v);
     }
@@ -92,7 +93,7 @@ fn bulk_copies_across_an_aliased_page_agree_on_every_driver() {
     temen_verify::verify_module(&m).expect("verify");
     let setup = || {
         let mut h = Host::new();
-        let a = h.grant_address_space(0, 1 << 17);
+        let a = h.grant_address_space(0, 1 << 18);
         (h, vec![Value::I32(a)])
     };
     let want = Ran {
