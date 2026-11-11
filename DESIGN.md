@@ -2333,6 +2333,22 @@ already counted, so a fiber no one resumes holds no wait and no deadlock verdict
 drops a domain's fiber waiters when the domain ends, as its teardown does a dying one's. Pinned in
 `bytecode_pump_kill.rs` and `cap_park.rs`.
 
+**Executor 2's parks wait on what ends them (#2757, 2026-11-11).** A task parked on a pipe, on stdin,
+in a stopped process, on a fiber or handler parked on the host, or on a punted call in a run nobody
+watched slept 50 µs at a time and settled the run again (`THREADS_POLL`), because the store that
+could end its park rang nothing. Now nothing polls. A park registers what can end it, looks once
+more, then sleeps on a token of its own (`Signal`), so a wake that lands first is kept and a waker
+takes no lock of the run's. A pipe's shared backing carries the wakers its parked ops registered
+(`PipeWakers`): the next write, read of a full pipe or last close takes and fires them, from any
+domain or engine, so a stream costs one atomic load per write. Everything else rings the run's bell
+— its processes' personality doors, wired on every run to the embedder's armed bell or the run's own,
+and a punted call's answer — and the opener's or the embedder's watch settles on each ring, as does a
+watcher the run starts itself when nobody watches it. The wake scan wakes every sleeping thread whose
+task can now run, which sees a continue that landed outside the lock. A pipe park yields and looks
+for its store for 20 µs before it sleeps, the JIT's live-call watch: a stream's next write usually
+lands in that time, and on a lone core the yield lets the writer fill the pipe first. Pinned in
+`temen-interp/tests/threads_idle.rs` (an idle run's threads stay asleep) and `pipe_wakers_tests`.
+
 Pinned constraints (tests in `temen/tests/host_park.rs`, `temen-run/tests/fast_cap.rs`): a parkable
 registration is **never** `fast_cap_resolver`-claimed; **sync ops never pay for parkable ops'
 existence** — no completion id, no table touch unless a handler already returned `Offload`

@@ -8582,6 +8582,7 @@ fn spawn_task(
     domains: &mut Vec<Domain>,
     forked_twins: &mut std::collections::BTreeSet<usize>,
     leaf: Option<&LeafEmitter>,
+    bell: Option<&super::Bell>,
     source: &ModuleSource,
     ti: usize,
     cmd: super::ExecCmd,
@@ -8625,8 +8626,8 @@ fn spawn_task(
     );
     let (child_mem, child_host, table, vt, state, live) = match built {
         Ok(built) => {
-            // Its own park door and pump bell, as the fork arm wires a twin's.
-            wire_process(&built.host, &domains[0].host);
+            // Its own park door and the run's bell, as the fork arm wires a twin's.
+            wire_process(&built.host, bell);
             let state = TaskState::Runnable;
             let (m, h) = (Some(built.mem), built.host);
             (m, h, built.table, built.vt, state, live)
@@ -8947,17 +8948,14 @@ fn fork_process(
 
 /// Wire a new process's powerbox as the root's is: its own park door, which its personality's
 /// `fork()`/`waitpid()` park through (`fork_powerbox` and `spawn_powerbox` mint it with none), its
-/// terminate ([`wire_kill`]), and its signal doors on the run's external-wake bell, so an embedder
+/// terminate ([`wire_kill`]), and its signal doors on the run's bell ([`SchedCore::bell`]), so a
 /// signal to it while every task is parked re-runs the settle (#1262: an interactive `^C` of a
 /// parked `cat`).
-fn wire_process(host: &Host, root: &DomainCell) {
+fn wire_process(host: &Host, bell: Option<&super::Bell>) {
     host.wire_park_door();
     wire_kill(host);
-    let bell = root.lock_unpoisoned().external_wake();
-    if let Some(bell) = bell {
-        if let Some((_, source)) = host.signal_poll() {
-            wire_run_bell(&source, &bell);
-        }
+    if let (Some(bell), Some((_, source))) = (bell, host.signal_poll()) {
+        wire_run_bell(&source, bell);
     }
 }
 
@@ -9140,8 +9138,10 @@ impl DispatchParks {
             sig_interrupt: p.take_sig_interrupt(),
             region: p.take_region_wake(),
         };
-        // The wake flags a peer's write/close raised need no action at a dispatch site — both drivers
-        // poll pipe readiness at their settle — but they are per-op too, so they drain here as well.
+        // The wake flags a peer's write/close raised need no action at a dispatch site — the pump
+        // looks at pipe readiness at each round's settle, and the store itself fired the wakers
+        // executor 2's parked tasks registered on the pipe (#2757, [`super::PipeProbe::listen`]) —
+        // but they are per-op too, so they drain here as well.
         let _ = (p.take_pipe_wake(), p.take_pipe_wake_writers());
         parks
     }
@@ -12922,6 +12922,11 @@ struct SchedCore {
     clock: u64,
     /// #2695 step 2 — `Some` while the run's embedder holds its root domain ([`HeldPump`]).
     held: Option<Held>,
+    /// #1262, #2757 — the bell each process's personality doors ring ([`wire_run_bell`]): the
+    /// external-wake bell its embedder armed (#1122), or executor 2's own, whose watcher settles on
+    /// each ring ([`ThreadRun::bell`]). `None` on a pump nothing armed: its one thread settles every
+    /// round.
+    bell: Option<super::Bell>,
 }
 
 /// #2695 step 2 — a run whose root domain its embedder holds past its entry ([`HeldPump`]). Once
@@ -13583,6 +13588,7 @@ impl SchedCore {
     /// ([`reapply_installs`]). The root domain is `mem`, the powerbox in `host`, `dom`'s table and
     /// `fuel`; the window is taken only once nothing can refuse the run, so a refusal leaves it with
     /// the caller. Both executors start a run here ([`CoopSched::new`], [`ThreadRun::open`]).
+    #[allow(clippy::too_many_arguments)]
     fn new(
         source: &ModuleSource,
         table: std::sync::Arc<SharedSlots>,
@@ -13591,6 +13597,7 @@ impl SchedCore {
         mut fuel: Fuel,
         mem: &mut Option<Mem>,
         host: DomainCell,
+        bell: Option<super::Bell>,
     ) -> Result<SchedCore, Trap> {
         let mut h = host.lock_unpoisoned();
         reapply_installs(&h, source, &table)?;
@@ -13605,18 +13612,15 @@ impl SchedCore {
         let root_vt = VTask::new(&source.primary(), entry as usize, args, Some(h.own_node()))?;
         let tasks = vec![TaskSlot::new(root_vt, 0, LiveVcpu::none())];
         wire_kill(&h);
-        // #1122/#1146/#1262 — an armed external-wake doorbell: wire the root's personality doors to
-        // ring it (pipe-wake for a `feed_terminal` byte arrival; `set_wake` for an EINTR-bearing
-        // deliverable signal; `set_chld_wake` for a child stop/continue re-scan; `set_kill` for a
-        // default-action TERMINATE; `set_stop` for its own stop or continue, #2529), the
-        // cooperative twin of the tree-walker's scheduler doors. An embedder (another OS thread,
-        // or another wasm-thread instantiation) is the source; each ring re-runs the settle, which
-        // does the work (pipe poll, `reap_pending`, the #1215 kill sweep), so a ring only says
-        // "something changed". See [`wire_run_bell`].
-        if let Some(bell) = h.external_wake() {
-            if let Some((_, source)) = h.signal_poll() {
-                wire_run_bell(&source, &bell);
-            }
+        // #1122/#1146/#1262 — the run's bell ([`SchedCore::bell`]): wire the root's personality
+        // doors to ring it (pipe-wake for a `feed_terminal` byte arrival; `set_wake` for an
+        // EINTR-bearing deliverable signal; `set_chld_wake` for a child stop/continue re-scan;
+        // `set_kill` for a default-action TERMINATE; `set_stop` for its own stop or continue,
+        // #2529), the cooperative twin of the tree-walker's scheduler doors. Each ring re-runs the
+        // settle, which does the work (pipe poll, `reap_pending`, the #1215 kill sweep), so a ring
+        // only says "something changed". See [`wire_run_bell`].
+        if let (Some(bell), Some((_, source))) = (&bell, h.signal_poll()) {
+            wire_run_bell(&source, bell);
         }
         // Thaw seeding (DURABILITY.md §12.8 slice 3.1.5): a `REWINDING` run re-creates the fibers a
         // freeze flattened *before* the root re-enters, so the root's re-issued `cont.resume` names
@@ -13679,6 +13683,7 @@ impl SchedCore {
             released: Released::default(),
             clock: 0,
             held: None,
+            bell,
         })
     }
 }
@@ -13711,7 +13716,8 @@ impl CoopSched {
             ),
             None => (ProgramEmits::default(), None),
         };
-        let mut core = SchedCore::new(source, table, entry, args, fuel, mem, host)?;
+        let bell = host.lock_unpoisoned().external_wake();
+        let mut core = SchedCore::new(source, table, entry, args, fuel, mem, host, bell)?;
         if let Some(e) = &programs.root {
             core.arm_tierup(e);
         }
@@ -13800,6 +13806,7 @@ impl CoopSched {
                 released,
                 clock,
                 held,
+                bell,
             } = &mut *core;
             let EmitTier {
                 leaf,
@@ -14011,6 +14018,7 @@ impl CoopSched {
                     domains,
                     forked_twins,
                     leaf.as_ref(),
+                    bell.as_ref(),
                     source,
                     ti,
                     cmd,
@@ -14368,6 +14376,7 @@ impl SchedCore {
             hooked_twins,
             clock,
             held,
+            bell,
             ..
         } = self;
         let EmitTier {
@@ -14956,6 +14965,7 @@ impl SchedCore {
                     domains,
                     forked_twins,
                     leaf.as_ref(),
+                    bell.as_ref(),
                     source,
                     ti,
                     cmd,
@@ -14997,7 +15007,7 @@ impl SchedCore {
                         // #1080 / #1262 — the twin's own park door, so its own `fork()`/`waitpid()`
                         // park (a bash pipeline subshell is a twin that forks and waits its
                         // command), and its signal doors on the run's bell.
-                        wire_process(&twin_host, &domains[0].host);
+                        wire_process(&twin_host, bell.as_ref());
                         // #1297: the twin's own dispatch table, seeded with the caller's installs.
                         let caller = &domains[env];
                         let (twin_table, twin_fuel, program) = (
@@ -16034,8 +16044,8 @@ impl HeldThreads {
         };
         // This thread waits on a park of its own while it carries the call, and counts in.
         match g.parks.get_mut(a) {
-            Some(park) => *park = std::sync::Arc::default(),
-            None => g.parks.push(std::sync::Arc::default()),
+            Some(park) => *park = Park::default(),
+            None => g.parks.push(Park::default()),
         }
         g.live += 1;
         let (view, _) = g.hand(0);
@@ -17052,9 +17062,21 @@ fn thaws(host: &Host, mem: Option<&Mem>) -> bool {
 
 // === #1414 3e — executor 2: one OS thread per task over the run's scheduling core ===============
 
-/// How long the thread of a task parked on what no rule wakes (a pipe, stdin, a fiber parked on the
-/// host, or a punted call on a run nothing watches) sleeps before it looks again.
-const THREADS_POLL: std::time::Duration = std::time::Duration::from_micros(50);
+/// #2757 — how long a pipe park looks for the store it registered before it sleeps, in ns of the
+/// platform's clock ([`ThreadRun::park`]), giving its core up between looks: the JIT's live-call
+/// watch, for a stream.
+const PIPE_SPIN_NS: u64 = 20_000;
+
+/// [`thread_wakes`]' count.
+static THREAD_WAKES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// #2757 — how many times this process's executor 2 threads have woken from a sleep: a parked task's
+/// thread ([`ThreadRun::park`]) or a watcher ([`ThreadRun::watching`]). Each wakes only when something
+/// may end a park, never on a timer, so a test reads this before and after an idle window to prove
+/// a run's parked threads stay asleep.
+pub fn thread_wakes() -> u64 {
+    THREAD_WAKES.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 /// Executor 2's shared state (#1414 3e): the run's scheduling core and what its threads keep beside
 /// it, under the one lock every rule runs under ([`drive_threads`]).
@@ -17063,10 +17085,10 @@ struct Threads {
     /// rules see them. Each thread steps over its own view and hand of its domain's.
     core: SchedCore,
     /// `parks[ti]`: where task `ti`'s thread waits while the task is parked.
-    parks: Vec<std::sync::Arc<std::sync::Condvar>>,
+    parks: Vec<Park>,
     /// The parks to signal once the lock is let go ([`release`]): a thread signalled under the
     /// lock would wake only to wait for it.
-    woken: Vec<std::sync::Arc<std::sync::Condvar>>,
+    woken: Vec<std::sync::Arc<Signal>>,
     /// The run's result once it is over: its root's, or a deadlock's `ThreadFault`. Every thread
     /// ends at its next look.
     over: Option<Result<Vec<Value>, Trap>>,
@@ -17076,6 +17098,9 @@ struct Threads {
     /// returns once it is zero ([`ThreadRun::ended`]), so no thread outlives it holding a hand of
     /// its fuel.
     live: usize,
+    /// #2757 — whether the run has started a watcher of its own ([`ThreadRun::start_watcher`]): one
+    /// its opener does not watch starts one the first time a task parks on what only a ring ends.
+    watcher: bool,
     /// Whether one of them panicked: the run then ends, and its caller panics.
     panicked: bool,
     /// The emitted tier's state the rules read ([`SchedCore::on_stop`]): the eligibility the
@@ -17096,6 +17121,80 @@ struct Threads {
     carriers: std::collections::BTreeMap<usize, usize>,
 }
 
+/// Where a task's thread waits while the task is parked ([`ThreadRun::park`]).
+#[derive(Default)]
+struct Park {
+    signal: std::sync::Arc<Signal>,
+    /// Whether the thread waits on `signal` and nothing has woken it yet. The wake scan wakes it once
+    /// its task needs no rule to go on ([`ThreadRun::awake`]), whatever changed its state: a rule, or
+    /// a store outside the lock (a continue).
+    asleep: bool,
+    /// #2757 — what the thread's park registered on the pipes it waits on ([`ThreadRun::listen`]),
+    /// until the thread wakes.
+    listen: Option<Listen>,
+}
+
+impl Park {
+    /// Whether a store fired the waker this park registered on a pipe, which woke the thread.
+    fn fired(&self) -> bool {
+        self.listen.as_ref().is_some_and(|l| {
+            (l.fired.as_ref()).is_some_and(|f| f.load(std::sync::atomic::Ordering::SeqCst))
+        })
+    }
+}
+
+/// #2757 — where a parked task's thread sleeps ([`Park::signal`]): a token a waker sets and the sleep
+/// takes. A wake that lands before the sleep is not lost, and a waker takes no lock of the run's, so a
+/// store into a pipe wakes its parked reader directly, under the pipe's host ([`ThreadRun::listen`]).
+#[derive(Default)]
+struct Signal {
+    woken: std::sync::Mutex<bool>,
+    cv: std::sync::Condvar,
+}
+
+impl Signal {
+    /// Set the token, and wake the sleeper if it sleeps.
+    fn notify(&self) {
+        *self.woken.lock_unpoisoned() = true;
+        self.cv.notify_one();
+    }
+
+    /// Take the token, if it is set.
+    fn take(&self) -> bool {
+        std::mem::take(&mut *self.woken.lock_unpoisoned())
+    }
+
+    /// Sleep until the token is set, or for about `timeout`, and take the token. A timed sleep may
+    /// end early: its caller looks again either way. No clock is read, which wasm32 lacks.
+    fn wait(&self, timeout: Option<std::time::Duration>) {
+        let mut woken = self.woken.lock_unpoisoned();
+        match timeout {
+            None => {
+                while !*woken {
+                    woken = self.cv.wait(woken).unwrap_or_else(|e| e.into_inner());
+                }
+            }
+            Some(t) if !*woken => {
+                woken = (self.cv.wait_timeout(woken, t))
+                    .unwrap_or_else(|e| e.into_inner())
+                    .0;
+            }
+            Some(_) => {}
+        }
+        *woken = false;
+    }
+}
+
+/// #2757 — what a park registered ([`ThreadRun::listen`]): the next store into each pipe it waits on
+/// sets `fired` and wakes the thread, until this is dropped.
+struct Listen {
+    /// Each pipe, with the park's waker registered on it.
+    pipes: Vec<(super::PipeProbe, super::PipeListen)>,
+    /// Whether those pipes are all the park waits on, so a look at them is a look at the park.
+    only_pipes: bool,
+    fired: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+}
+
 impl Threads {
     /// The activation task `ti`'s thread carries, if one answers a call `ti` waits on.
     fn carried(&self, ti: usize) -> Option<usize> {
@@ -17103,6 +17202,13 @@ impl Threads {
             .iter()
             .find(|&(_, &c)| c == ti)
             .map(|(&a, _)| a)
+    }
+
+    /// Wake task `j`'s thread when the lock is let go ([`release`]).
+    fn rouse(&mut self, j: usize) {
+        let park = &mut self.parks[j];
+        park.asleep = false;
+        self.woken.push(std::sync::Arc::clone(&park.signal));
     }
 
     /// What a thread steps a task of domain `env` over: its own view of the domain's window and its
@@ -17130,10 +17236,16 @@ struct ThreadRun {
     platform: ThreadPlatform,
     start: u64,
     /// What its watcher waits on ([`Self::watch`]): the external-wake bell the embedder armed
-    /// (#1122), or one of the run's own. An embedder's input or signal rings it, as does an answer
-    /// to a punted call (#2423) and the run's end.
+    /// (#1122), or one of the run's own. Whatever can end a park outside the rules, but a pipe's
+    /// store, rings it (#2757): its processes' personality doors, for an input byte, a signal or a
+    /// continue ([`wire_run_bell`]); an answer to a punted call (#2423); and the run's end. A store
+    /// into a pipe wakes the threads parked on it itself ([`Self::listen`]).
     bell: super::Bell,
-    /// Whether the thread that opened the run watches it ([`ThreadPlatform::root_on_opener`]).
+    /// The hook a punted call's store calls as its answer posts: ring [`Self::bell`].
+    on_answer: std::sync::Arc<dyn Fn() + Send + Sync>,
+    /// Whether the thread that opened the run watches it ([`ThreadPlatform::root_on_opener`]), or
+    /// its embedder, while it pumps it. A run nobody watches starts a watcher of its own
+    /// ([`Self::start_watcher`]).
     watched: bool,
     ended: std::sync::Condvar,
     /// Whether the run is over ([`Threads::over`]), for emitted code to read without the lock
@@ -17226,7 +17338,8 @@ pub struct ThreadPlatform {
     /// thread of its own, like every other task, and the opener watches the run: it settles the run
     /// on each ring of the run's bell. A browser opens a run on the Worker the page started for its
     /// root, since another Worker costs a run about 11 ms to start, and its page cannot wait to
-    /// watch. Nothing watches such a run, so a task waiting on a punted call polls for its answer.
+    /// watch. Such a run starts a watcher of its own only once a task parks on what only a ring of
+    /// its bell ends (#2757).
     pub root_on_opener: bool,
 }
 
@@ -17454,32 +17567,22 @@ impl Drop for ThreadExit<'_> {
         if g.live == 0 {
             self.0.ended.notify_all();
         }
-        let over = g.over.is_some();
         release(g);
-        // Once the run is over, its bell's watcher has to look in order to leave.
-        if over {
-            self.0.ring();
-        }
     }
-}
-
-/// Whether task `t` needs nothing from a rule to go on: it can run, or it has ended.
-fn awake(t: &TaskSlot) -> bool {
-    matches!(t.state, TaskState::Runnable | TaskState::Done(_))
 }
 
 /// What a parked task's thread waits for, besides a rule's wake.
 enum ParkFor {
     /// Nothing else: only a rule wakes it.
     Wake,
-    /// The answer to punted call `id`, its own or the call of a fiber it resumes. The answer
-    /// rings the run's bell, and the watcher's settle wakes the task (#2423).
-    Answer(u64),
     /// Its wait's deadline, on the run's clock ([`ThreadRun::now`]).
     Until(u64),
-    /// The next poll, for what no rule wakes: a pipe, stdin or the host, which another task or an
-    /// embedder fills.
-    Poll,
+    /// #2757 — what a store outside the rules ends: a pipe or stdin another task or the embedder
+    /// fills, a fiber parked on the host, a continue, or the answer to punted call `Some(id)`, its
+    /// own or the call of a fiber it resumes (#2423). A pipe's store wakes the thread itself
+    /// ([`ThreadRun::listen`]); any other rings the run's bell ([`ThreadRun::bell`]), and the
+    /// watcher's settle on the ring wakes it.
+    Ring(Option<u64>),
 }
 
 /// Executor 2, the parallel driver (#1414 3e): a run's tasks, each on its own OS thread (D56), over
@@ -17493,11 +17596,13 @@ enum ParkFor {
 /// on the wall clock (the core's `clock` reads nanoseconds since the run started, so the rules'
 /// deadline arithmetic is the pump's); a fiber op takes the core's lock ([`FiberCell::Core`]); the
 /// root runs on a thread of its own while this one watches the run, settling it on each ring of its
-/// bell ([`ThreadRun::watch`]), unless this thread runs the root ([`ThreadPlatform::root_on_opener`]);
-/// and the run ends when its root does, the other tasks stopping at their next look, or with the
-/// pump's deadlock verdict ([`ThreadRun::settle`]). It returns once every thread has gone
-/// ([`ThreadExit`]). A thread starts and the clock is read through the host's [`ThreadPlatform`],
-/// and with the platform's emitted tier each thread runs its own task's tier-ups ([`ThreadRun::step`]).
+/// bell ([`ThreadRun::watch`]), unless this thread runs the root ([`ThreadPlatform::root_on_opener`]),
+/// when the run starts a watcher of its own once it needs one ([`ThreadRun::start_watcher`]); no
+/// parked thread polls (#2757); and the run ends when its root does, the other tasks stopping at
+/// their next look, or with the pump's deadlock verdict ([`ThreadRun::settle`]). It returns once
+/// every thread has gone ([`ThreadExit`]). A thread starts and the clock is read through the host's
+/// [`ThreadPlatform`], and with the platform's emitted tier each thread runs its own task's tier-ups
+/// ([`ThreadRun::step`]).
 fn drive_threads(
     source: std::sync::Arc<ModuleSource>,
     table: std::sync::Arc<SharedSlots>,
@@ -17562,18 +17667,20 @@ impl ThreadRun {
             return Err(Box::new((Trap::ThreadFault, host, mem)));
         };
         let root_fuel = Fuel::drawn(node);
+        // The run's processes ring its bell, armed by the embedder or the run's own.
+        let bell = host.external_wake().unwrap_or_default();
         let root = host.into_cell();
         let mut mem = mem;
         let cell = std::sync::Arc::clone(&root);
-        let mut core = match SchedCore::new(&source, table, entry, args, root_fuel, &mut mem, cell)
-        {
-            Ok(core) => core,
-            Err(t) => return Err(Box::new((t, Host::from_cell(root), mem))),
-        };
-        let (bell, door, platform) = {
+        let rung = Some(std::sync::Arc::clone(&bell));
+        let mut core =
+            match SchedCore::new(&source, table, entry, args, root_fuel, &mut mem, cell, rung) {
+                Ok(core) => core,
+                Err(t) => return Err(Box::new((t, Host::from_cell(root), mem))),
+            };
+        let (door, platform) = {
             let host = root.lock_unpoisoned();
-            let bell = host.external_wake().unwrap_or_default();
-            (bell, host.run_door(), host.thread_platform())
+            (host.run_door(), host.thread_platform())
         };
         let watched = match driver {
             Driver::Platform => !platform.root_on_opener,
@@ -17600,11 +17707,12 @@ impl ThreadRun {
             root,
             state: std::sync::Mutex::new(Threads {
                 core,
-                parks: vec![std::sync::Arc::default()],
+                parks: vec![Park::default()],
                 woken: Vec::new(),
                 over: None,
                 fault: None,
                 live: 1, // the root's
+                watcher: false,
                 panicked: false,
                 emit: EmitTier {
                     programs,
@@ -17618,6 +17726,7 @@ impl ThreadRun {
             }),
             start: (platform.now_ns)(),
             platform,
+            on_answer: super::ring_on_answer(&bell),
             bell,
             watched,
             ended: std::sync::Condvar::new(),
@@ -17728,7 +17837,6 @@ fn carry<'g>(
     fuel: Fuel,
 ) -> std::sync::MutexGuard<'g, Threads> {
     let (mut mem, mut fuel) = (mem, fuel);
-    let park = std::sync::Arc::clone(&g.parks[ti]);
     let activation = g.core.tasks[ti].answers.is_some();
     let mut env = g.core.tasks[ti].domain;
     // An exec gives the task's domain the image's window, or moves the task into a domain of its
@@ -17745,7 +17853,7 @@ fn carry<'g>(
     let mut tier = TierState::default();
     loop {
         let next;
-        (g, next) = run.await_runnable(g, ti, &park, look);
+        (g, next) = run.await_runnable(g, ti, look);
         match next {
             Next::Run => {}
             Next::Stop => break,
@@ -17879,10 +17987,9 @@ impl BounceTask<'_> {
         // A §22 invoke in the call is served in the bounce (`drive_nested`): none surfaces here.
         let (made, _) = run.apply(&mut g, ti, Ok(stop), *self.exits);
         g = start_tasks(run, g, made);
-        let park = std::sync::Arc::clone(&g.parks[ti]);
         let runs = loop {
             let next;
-            (g, next) = run.await_runnable(g, ti, &park, false);
+            (g, next) = run.await_runnable(g, ti, false);
             match next {
                 Next::Run => break true,
                 Next::Stop => break false,
@@ -17907,7 +18014,7 @@ fn release(mut g: std::sync::MutexGuard<'_, Threads>) {
     let woken = std::mem::take(&mut g.woken);
     drop(g);
     for park in woken {
-        park.notify_one();
+        park.notify();
     }
 }
 
@@ -17993,10 +18100,9 @@ impl ThreadRun {
     /// ([`Self::park`]); returns whether it runs. `look`: whether its process may have stopped since
     /// its thread last looked (#1198), after a park or a preemption.
     fn await_runnable<'g>(
-        &self,
+        self: &'g std::sync::Arc<Self>,
         mut g: std::sync::MutexGuard<'g, Threads>,
         ti: usize,
-        park: &std::sync::Condvar,
         mut look: bool,
     ) -> (std::sync::MutexGuard<'g, Threads>, Next) {
         loop {
@@ -18024,7 +18130,7 @@ impl ThreadRun {
                 }
                 TaskState::Done(_) => return (g, Next::Stop),
                 _ => {
-                    g = self.park(g, ti, park);
+                    g = self.park(g, ti);
                     look = true;
                 }
             }
@@ -18215,13 +18321,19 @@ impl ThreadRun {
         if g.over.is_none() {
             g.over = Some(res);
             self.over.store(true, std::sync::atomic::Ordering::SeqCst);
+            // Its watcher has to look in order to leave.
+            self.ring();
         }
     }
 
     /// End the run with `res` (if it is not over already) and wake every thread to see it.
     fn end(&self, g: &mut Threads, res: Result<Vec<Value>, Trap>) {
         self.conclude(g, res);
-        g.woken = g.parks.clone();
+        g.woken = g
+            .parks
+            .iter()
+            .map(|p| std::sync::Arc::clone(&p.signal))
+            .collect();
     }
 
     /// [`RunDoor::wake`]'s half: ring the run's bell, unless its lock is busy (`false`, and the
@@ -18255,7 +18367,6 @@ impl ThreadRun {
             g.live -= 1;
             self.end(&mut g, Err(Trap::ThreadFault));
             release(g);
-            self.ring();
         }
     }
 
@@ -18271,7 +18382,6 @@ impl ThreadRun {
         stop: Result<VcpuStop, Trap>,
         exits: usize,
     ) -> (Vec<NewTask>, Option<SurfacedInvoke>) {
-        let was_awake: Vec<bool> = g.core.tasks.iter().map(awake).collect();
         let had = g.core.tasks.len();
         g.core.clock = self.now();
         let Threads { core, emit, .. } = &mut *g;
@@ -18316,27 +18426,17 @@ impl ThreadRun {
             g.core.tasks[ti].state = TaskState::Runnable;
         }
         // #2695 step 2 — an activation that parked or answered gives the `Single` gate back, and
-        // each activation that waits on it may run: their threads look again.
+        // each activation that waits on it may run: the wake scan below wakes their threads.
         let gives_back = g.core.held.as_ref().is_some_and(|h| h.gate == Some(ti))
             && !matches!(g.core.tasks[ti].state, TaskState::Runnable);
-        if gives_back {
-            if let Some(h) = g.core.held.as_mut() {
-                h.gate = None;
-            }
-            for j in 0..g.core.tasks.len() {
-                let waits = g.core.tasks[j].answers.is_some()
-                    && matches!(g.core.tasks[j].state, TaskState::Runnable);
-                if waits && j < g.parks.len() {
-                    let park = std::sync::Arc::clone(&g.parks[j]);
-                    g.woken.push(park);
-                }
-            }
+        if let Some(h) = g.core.held.as_mut().filter(|_| gives_back) {
+            h.gate = None;
         }
         self.settle(g);
         let mut made = Vec::new();
         for j in had..g.core.tasks.len() {
             if j >= g.parks.len() {
-                g.parks.push(std::sync::Arc::default());
+                g.parks.push(Park::default());
             }
             // #2695 step 2 — an activation has no thread of its own: its caller's carries it.
             if g.core.tasks[j].answers.is_some() {
@@ -18347,7 +18447,7 @@ impl ThreadRun {
         }
         // Each new task's thread counts in now, before it starts, so the run cannot end unseen.
         g.live += made.len();
-        self.wake(g, &was_awake, Some(ti));
+        self.wake(g);
         (made, invoke)
     }
 
@@ -18411,8 +18511,7 @@ impl ThreadRun {
         let made = core.held.as_mut().map(|h| std::mem::take(&mut h.made));
         for (a, c) in made.into_iter().flatten() {
             g.carriers.insert(a, c);
-            let park = std::sync::Arc::clone(&g.parks[c]);
-            g.woken.push(park);
+            g.rouse(c);
         }
         if let Some(trap) = g.core.held.as_ref().and_then(|h| h.ended) {
             self.conclude(g, Err(trap));
@@ -18452,16 +18551,33 @@ impl ThreadRun {
         }
     }
 
-    /// Queue the thread of every task `was_awake` shows parked that is now awake, but `own`'s (the
-    /// caller's, if it is a task's thread), to be signalled when the lock is let go ([`release`]);
-    /// every thread once the run is over.
-    fn wake(&self, g: &mut Threads, was_awake: &[bool], own: Option<usize>) {
+    /// Wake the thread of every task asleep on its park ([`Park::asleep`]) that now needs no rule to
+    /// go on ([`Self::awake`]), once the lock is let go ([`release`]); every one once the run is over.
+    fn wake(&self, g: &mut Threads) {
+        let over = g.over.is_some();
         for j in 0..g.parks.len() {
-            let woke = !was_awake.get(j).copied().unwrap_or(true) && awake(&g.core.tasks[j]);
-            if Some(j) != own && (woke || g.over.is_some()) {
-                let park = std::sync::Arc::clone(&g.parks[j]);
-                g.woken.push(park);
+            if g.parks[j].asleep && (over || self.awake(&g.core, j)) {
+                g.rouse(j);
             }
+        }
+    }
+
+    /// Whether task `ti` needs nothing from a rule to go on: it can run, or it has ended. A runnable
+    /// task can run once its process is not stopped (#1198), and an activation once its domain's
+    /// `Single` gate admits it (#2695 step 2), as [`Self::await_runnable`] has it.
+    fn awake(&self, core: &SchedCore, ti: usize) -> bool {
+        let t = &core.tasks[ti];
+        match t.state {
+            TaskState::Runnable => {
+                let admitted = t.answers.is_none()
+                    || core
+                        .held
+                        .as_ref()
+                        .is_some_and(|h| h.admits(&core.tasks, ti));
+                admitted && !self.stopped(core, ti)
+            }
+            TaskState::Done(_) => true,
+            _ => false,
         }
     }
 
@@ -18496,17 +18612,17 @@ impl ThreadRun {
             // #2695 step 2 — an activation that waits on its domain's `Single` gate: the holder's
             // park or answer gives it back, and wakes it ([`ThreadRun::apply`]).
             TaskState::Runnable if t.answers.is_some() && !self.stopped(core, ti) => ParkFor::Wake,
-            // Its SIGCONT comes from another task's call or an embedder, with no rule to wake it.
-            TaskState::Runnable => ParkFor::Poll,
+            // Its SIGCONT comes from another task's call or an embedder, through its stop door.
+            TaskState::Runnable => ParkFor::Ring(None),
             TaskState::BlockedWait {
                 deadline: Some(d), ..
             } => ParkFor::Until(d),
             TaskState::BlockedPipeRead { .. }
             | TaskState::BlockedPipeWrite { .. }
-            | TaskState::BlockedStdin => ParkFor::Poll,
-            TaskState::BlockedHostCap { id, .. } => ParkFor::Answer(id),
-            // #2742 — a `svc.wait` whose parked handler waits on the host polls for it; one woken
-            // by a reply or a call is woken at the settle that brings it.
+            | TaskState::BlockedStdin => ParkFor::Ring(None),
+            TaskState::BlockedHostCap { id, .. } => ParkFor::Ring(Some(id)),
+            // #2742 — a `svc.wait` whose parked handler waits on the host waits for its ring; one
+            // woken by a reply or a call is woken at the settle that brings it.
             TaskState::BlockedSvc => {
                 let fibers = &core.domains[t.domain].fibers.fibers;
                 let polls = t.vm.vt.active.handlers().iter().any(|&k| {
@@ -18516,7 +18632,7 @@ impl ThreadRun {
                     )
                 });
                 if polls {
-                    ParkFor::Poll
+                    ParkFor::Ring(None)
                 } else {
                     ParkFor::Wake
                 }
@@ -18528,10 +18644,10 @@ impl ThreadRun {
                         woken: None,
                         ..
                     }) => ParkFor::Until(*d),
-                    Some(FiberState::HostParked { .. }) => ParkFor::Poll,
+                    Some(FiberState::HostParked { .. }) => ParkFor::Ring(None),
                     Some(FiberState::CapParked {
                         id, woken: None, ..
-                    }) => ParkFor::Answer(*id),
+                    }) => ParkFor::Ring(Some(*id)),
                     _ => ParkFor::Wake,
                 }
             }
@@ -18547,7 +18663,7 @@ impl ThreadRun {
         (0..core.tasks.len()).all(|j| match core.tasks[j].state {
             TaskState::Done(_) => true,
             TaskState::Runnable => self.stopped(core, j),
-            _ => matches!(self.park_for(core, j), ParkFor::Wake | ParkFor::Poll),
+            _ => matches!(self.park_for(core, j), ParkFor::Wake | ParkFor::Ring(None)),
         })
     }
 
@@ -18569,81 +18685,200 @@ impl ThreadRun {
             })
     }
 
-    /// Wait out task `ti`'s park on `park`. A park a deadline or a poll ends settles after it, as
-    /// a pump round does: the wall clock moved, or what it polls may be ready.
+    /// Wait out task `ti`'s park, asleep until something wakes it ([`Park::asleep`]): a rule's
+    /// settle, its deadline, or what it registered ([`ParkFor`]). A park a deadline ends settles after
+    /// it, as a pump round does: the wall clock moved.
+    ///
+    /// #2757 — a park a store outside the rules ends ([`ParkFor::Ring`]) registers what it waits on
+    /// first ([`Self::listen`]), then looks once more, then sleeps: a store that lands before the
+    /// registration is seen by the look, and one after it wakes this thread, which settles, or rings
+    /// the bell, which a watcher hears. A pipe park looks for its store for [`PIPE_SPIN_NS`] before
+    /// it sleeps. A run nobody watches starts a watcher of its own ([`Self::start_watcher`]); this thread
+    /// then looks again. Nothing polls.
     fn park<'g>(
-        &self,
+        self: &'g std::sync::Arc<Self>,
         mut g: std::sync::MutexGuard<'g, Threads>,
         ti: usize,
-        park: &std::sync::Condvar,
     ) -> std::sync::MutexGuard<'g, Threads> {
-        // What this thread woke is signalled before it sleeps.
-        for p in std::mem::take(&mut g.woken) {
-            p.notify_one();
-        }
-        g = match self.park_for(&g.core, ti) {
+        let mut until = None;
+        match self.park_for(&g.core, ti) {
             // Only a rule ends this park, and the rule's holder settled after it.
-            ParkFor::Wake => return park.wait(g).unwrap_or_else(|e| e.into_inner()),
-            // The answer rings the run's bell once the call's store has the run's hook, and the
-            // watcher's settle wakes the task. One that posted before the hook rang nothing, so
-            // look once more first. An embedder that pumps the run hears of a call it answers
-            // as soon as the call is filed (#1414 D4), while the run's other tasks go on.
-            ParkFor::Answer(id) if self.watched => {
-                let env = g.core.tasks[ti].domain;
-                let comps = g.core.domains[env].host.lock_unpoisoned().completions();
-                comps.set_notify(Some(super::ring_on_answer(&self.bell)));
-                let was_awake: Vec<bool> = g.core.tasks.iter().map(awake).collect();
-                self.settle(&mut g);
-                self.wake(&mut g, &was_awake, Some(ti));
-                if awake(&g.core.tasks[ti]) || g.over.is_some() {
-                    return g;
+            ParkFor::Wake => {}
+            ParkFor::Until(at) => until = Some(at),
+            ParkFor::Ring(call) => {
+                if !self.watched && !g.watcher {
+                    return self.start_watcher(g);
                 }
-                if g.embedder_pumps && !g.told.contains(&id) && comps.is_host_owned(id) {
-                    self.ring();
+                // Register, then look again: a store since the settle that parked the task is
+                // either seen now or fires what it registered. A park on nothing but live pipes
+                // looks at them; any other looks at the run.
+                let signal = std::sync::Arc::clone(&g.parks[ti].signal);
+                let listen = self.listen(&g.core, ti, &signal);
+                if !listen.only_pipes || listen.pipes.iter().any(|(p, _)| p.ready()) {
+                    self.settle(&mut g);
+                    self.wake(&mut g);
+                    if self.awake(&g.core, ti) || g.over.is_some() || g.carried(ti).is_some() {
+                        return g;
+                    }
                 }
-                for p in std::mem::take(&mut g.woken) {
-                    p.notify_one();
+                g.parks[ti].listen = Some(listen);
+                // An embedder that pumps the run hears of a call it answers as soon as the call is
+                // filed (#1414 D4), while the run's other tasks go on.
+                if let Some(id) = call.filter(|id| g.embedder_pumps && !g.told.contains(id)) {
+                    let env = g.core.tasks[ti].domain;
+                    let comps = g.core.domains[env].host.lock_unpoisoned().completions();
+                    if comps.is_host_owned(id) {
+                        self.ring();
+                    }
                 }
-                return park.wait(g).unwrap_or_else(|e| e.into_inner());
             }
-            ParkFor::Until(at) => {
-                let left = std::time::Duration::from_nanos(at.saturating_sub(self.now()));
-                park.wait_timeout(g, left)
-                    .unwrap_or_else(|e| e.into_inner())
-                    .0
+        }
+        g.parks[ti].asleep = true;
+        let signal = std::sync::Arc::clone(&g.parks[ti].signal);
+        let left = until.map(|at| std::time::Duration::from_nanos(at.saturating_sub(self.now())));
+        // A pipe park looks for its store a moment before it sleeps: a stream's next write
+        // usually lands within it, and on a lone core the yield lets the writer go first.
+        let spin = (g.parks[ti].listen.as_ref())
+            .filter(|l| !l.pipes.is_empty())
+            .map(|_| (self.platform.now_ns)() + PIPE_SPIN_NS);
+        // What this thread woke is signalled as it lets go of the lock.
+        release(g);
+        let mut woke = false;
+        if let Some(until) = spin {
+            while !woke && (self.platform.now_ns)() < until {
+                woke = signal.take();
+                std::thread::yield_now();
             }
-            ParkFor::Answer(_) | ParkFor::Poll => {
-                park.wait_timeout(g, THREADS_POLL)
-                    .unwrap_or_else(|e| e.into_inner())
-                    .0
-            }
-        };
-        let was_awake: Vec<bool> = g.core.tasks.iter().map(awake).collect();
-        self.settle(&mut g);
-        self.wake(&mut g, &was_awake, Some(ti));
+        }
+        if !woke {
+            signal.wait(left);
+        }
+        let mut g = self.state.lock_unpoisoned();
+        let park = &mut g.parks[ti];
+        park.asleep = false;
+        // A store into a pipe it waits on woke it: its settle re-admits the task.
+        let fired = park.fired();
+        park.listen = None;
+        THREAD_WAKES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if until.is_some() || fired {
+            self.settle(&mut g);
+            self.wake(&mut g);
+        }
         g
     }
 
+    /// #2757 — register what can end task `ti`'s park: an answer to a punted call in its domain rings
+    /// the run's bell ([`super::Completions::set_notify`]), as its doors do already
+    /// ([`wire_run_bell`]), and the next store into each pipe it, or a fiber its park waits on, reads
+    /// or writes sets the returned listen's flag ([`Park::fired`]) and wakes its thread on `signal`
+    /// ([`super::PipeProbe::listen`]), for as long as the listen lives.
+    fn listen(&self, core: &SchedCore, ti: usize, signal: &std::sync::Arc<Signal>) -> Listen {
+        let t = &core.tasks[ti];
+        let d = &core.domains[t.domain];
+        let fiber_pipe = |k: usize| match d.fibers.fibers.get(k) {
+            Some(FiberState::HostParked {
+                on: HostWait::Pipe(p),
+                ..
+            }) => Some(p.clone()),
+            _ => None,
+        };
+        // A vanished pipe reads ready to the settle (its re-run fails closed), so a park on one
+        // looks at the run, as one that waits on anything but a pipe does.
+        let (comps, probes): (_, Vec<super::PipeProbe>) = {
+            let host = d.host.lock_unpoisoned();
+            let probes = match t.state {
+                TaskState::BlockedPipeRead { pipe } => {
+                    host.pipe_probe(pipe, false).into_iter().collect()
+                }
+                TaskState::BlockedPipeWrite { pipe } => {
+                    host.pipe_probe(pipe, true).into_iter().collect()
+                }
+                TaskState::BlockedOnFiber { fiber } => fiber_pipe(fiber).into_iter().collect(),
+                TaskState::BlockedSvc => (t.vm.vt.active.handlers().iter())
+                    .filter_map(|&k| fiber_pipe(k))
+                    .collect(),
+                _ => Vec::new(),
+            };
+            (host.completions(), probes)
+        };
+        let only_pipes = !probes.is_empty()
+            && matches!(
+                t.state,
+                TaskState::BlockedPipeRead { .. }
+                    | TaskState::BlockedPipeWrite { .. }
+                    | TaskState::BlockedOnFiber { .. }
+            );
+        comps.set_notify(Some(std::sync::Arc::clone(&self.on_answer)));
+        if probes.is_empty() {
+            return Listen {
+                pipes: Vec::new(),
+                only_pipes,
+                fired: None,
+            };
+        }
+        let fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (flag, signal) = (std::sync::Arc::clone(&fired), std::sync::Arc::clone(signal));
+        let waker: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(move || {
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            signal.notify();
+        });
+        Listen {
+            pipes: (probes.into_iter())
+                .map(|p| {
+                    let listen = p.listen(&waker);
+                    (p, listen)
+                })
+                .collect(),
+            only_pipes,
+            fired: Some(fired),
+        }
+    }
+
+    /// #2757 — start the watcher of a run nobody watches ([`Self::watched`]): a thread of the run's
+    /// own that settles it on each ring until it is over ([`Self::watching`]), as the opener's watch
+    /// does. It counts in now, before it starts, so the run cannot end unseen; the lock is let go
+    /// while it starts.
+    fn start_watcher<'g>(
+        self: &'g std::sync::Arc<Self>,
+        mut g: std::sync::MutexGuard<'g, Threads>,
+    ) -> std::sync::MutexGuard<'g, Threads> {
+        g.watcher = true;
+        g.live += 1;
+        release(g);
+        let run = std::sync::Arc::clone(self);
+        self.start_thread(
+            move || {
+                run.watching();
+            },
+            None,
+        );
+        self.state.lock_unpoisoned()
+    }
+
     /// #1122/#1262 — the watch of the thread that opened the run, or of the `run` of an embedder
-    /// that pumps it ([`ThreadsRun`]): settle the run, and again on each ring of its bell, until the
-    /// run is over or has something for its embedder to hear ([`Self::event`]). An embedder's input
-    /// or signal rings the bell (a terminal `^C` while every task waits on a rule or a deadline), and
-    /// so does an answer to a punted call a task waits on (#2423): the parks it ends wake now, not at
-    /// the next stop. The ring count is read before each settle, so a ring after it is not missed,
-    /// and the bell's lock is let go before the run's is taken, so a ring from under the run's lock
-    /// cannot deadlock with it. The watcher counts as one of the run's threads while it watches, so
-    /// a panic in a settle ends the run, as it does on any other. With what it ended on comes the
-    /// ring count its last look began at ([`CoopRun::wait`]).
+    /// that pumps it ([`ThreadsRun`]), counted as one of the run's threads while it watches
+    /// ([`Self::watching`]).
     fn watch(&self) -> (Watched, u64) {
         self.state.lock_unpoisoned().live += 1;
+        self.watching()
+    }
+
+    /// [`Self::watch`] on a thread the run counted in: settle the run, and again on each ring of its
+    /// bell, until the run is over or has something for its embedder to hear ([`Self::event`]).
+    /// Whatever but a pipe's store can end a park outside the rules rings the bell ([`Self::bell`]),
+    /// so the parks it ends wake now, not at the next stop. The ring count is read before each settle, so a ring
+    /// after it is not missed, and the bell's lock is let go before the run's is taken, so a ring
+    /// from under the run's lock cannot deadlock with it. A panic in a settle ends the run, as it does
+    /// on any other thread. With what it ended on comes the ring count its last look began at
+    /// ([`CoopRun::wait`]).
+    fn watching(&self) -> (Watched, u64) {
         let _exit = ThreadExit(self);
         loop {
             let seen = *self.bell.0.lock_unpoisoned();
             let mut g = self.state.lock_unpoisoned();
             if g.over.is_none() {
-                let was_awake: Vec<bool> = g.core.tasks.iter().map(awake).collect();
                 self.settle(&mut g);
-                self.wake(&mut g, &was_awake, None);
+                self.wake(&mut g);
             }
             let watched = match g.over {
                 Some(_) => Some(Watched::Over),
@@ -18654,6 +18889,7 @@ impl ThreadRun {
                 return (w, seen);
             }
             super::wait_for_ring(&self.bell, seen, None);
+            THREAD_WAKES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
     }
 
@@ -21125,7 +21361,7 @@ impl Vm {
                         // Drain unconditionally (the tree-walker's park site does the same): a flag
                         // only ever means "the op *this* dispatch just ran wants to park", so one
                         // left set would misfire on a later, unrelated op. The wake flags need no
-                        // action here — the drivers poll readiness at their settle.
+                        // action here: see [`DispatchParks::take`].
                         (r, DispatchParks::take(p))
                     });
                     // #2645 — an unlocked host procedure runs now, the domain's host let go: on the

@@ -2706,13 +2706,10 @@ fn drive_arc(
         handoff,
         jit_reapply,
     );
-    // Every vCPU (which held an Arc clone) is finished and dropped now, so the shared host is
-    // uniquely owned — unwrap it back into the caller so it observes the run's effects (stdout,
-    // grants, clock…).
-    *host = Arc::try_unwrap(host_shared)
-        .unwrap_or_else(|_| unreachable!("all vCPUs dropped before host readback"))
-        .into_inner()
-        .unwrap_or_else(|e| e.into_inner());
+    // Every vCPU (which held an Arc clone) is finished and dropped now: take the shared host back
+    // into the caller so it observes the run's effects (stdout, grants, clock…). A child's live offer
+    // back into the cell may still hold it (#2830), which keeps an empty host.
+    *host = Host::take_from_cell(host_shared);
     r
 }
 
@@ -20927,7 +20924,60 @@ type PipeBacking = (
     u32,                        // global pipe id — THE park/wake key (`Sched::pipe_waiters`)
     Option<Arc<ChannelCharge>>, // #989 — channel-memory charge (minter's counter + refund guard)
     bool, // #1926 — one-shot EOF: the terminal's input, whose read of an EOF restores the writer
+    Arc<PipeWakers>, // #2757 — the wakers the ops parked on it registered ([`PipeProbe::listen`])
 );
+
+/// #2757 — the wakers that ops parked on a pipe registered ([`PipeProbe::listen`]). The next store
+/// that can end such a park takes and fires every one: a write, a read that drains a full pipe, or
+/// the close of its last writer or reader ([`Host::drop_pipe_writer`], [`Host::drop_pipe_reader`]).
+/// A woken op that must park again registers again, so a stream of writes fires once per park, not
+/// once per write, and with nothing registered a store reads one atomic.
+#[derive(Default)]
+pub(crate) struct PipeWakers {
+    count: std::sync::atomic::AtomicUsize,
+    wakers: Mutex<Vec<Arc<dyn Fn() + Send + Sync>>>,
+}
+
+impl PipeWakers {
+    /// A store that can end a park on the pipe: take every registered waker, and fire it.
+    fn fire(&self) {
+        use std::sync::atomic::Ordering::SeqCst;
+        if self.count.load(SeqCst) == 0 {
+            return;
+        }
+        let wakers = {
+            let mut wakers = self.wakers.lock_unpoisoned();
+            self.count.store(0, SeqCst);
+            std::mem::take(&mut *wakers)
+        };
+        for waker in wakers {
+            waker();
+        }
+    }
+}
+
+/// #2757 — a waker registered on a pipe ([`PipeProbe::listen`]), until a store fires it or this is
+/// dropped.
+pub(crate) struct PipeListen {
+    wakers: Arc<PipeWakers>,
+    waker: Arc<dyn Fn() + Send + Sync>,
+}
+
+impl Drop for PipeListen {
+    fn drop(&mut self) {
+        let mut wakers = self.wakers.wakers.lock_unpoisoned();
+        let me = Arc::as_ptr(&self.waker).cast::<()>();
+        if let Some(i) = wakers
+            .iter()
+            .position(|w| Arc::as_ptr(w).cast::<()>() == me)
+        {
+            wakers.swap_remove(i);
+            self.wakers
+                .count
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+}
 
 /// #1826 — one end of a pipe, as a parked op sees it: whether the op can proceed, readable from the
 /// pipe's shared state alone, so a waiter can re-check it without the `Host` (a JIT park waits with
@@ -20940,6 +20990,7 @@ pub struct PipeProbe {
     others: Arc<std::sync::atomic::AtomicUsize>,
     gid: u32,
     write: bool,
+    wakers: Arc<PipeWakers>,
 }
 
 impl PipeProbe {
@@ -20959,6 +21010,22 @@ impl PipeProbe {
     /// The pipe's global id, its park/wake key across domains.
     pub fn gid(&self) -> u32 {
         self.gid
+    }
+
+    /// #2757 — register `waker` for the next store that can end a park on this pipe, until the
+    /// returned listen is dropped. Register before the look that decides to park: a store between
+    /// the two is then either seen by the look or fires the waker.
+    pub(crate) fn listen(&self, waker: &Arc<dyn Fn() + Send + Sync>) -> PipeListen {
+        let mut wakers = self.wakers.wakers.lock_unpoisoned();
+        wakers.push(Arc::clone(waker));
+        self.wakers
+            .count
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        drop(wakers);
+        PipeListen {
+            wakers: Arc::clone(&self.wakers),
+            waker: Arc::clone(waker),
+        }
     }
 }
 
@@ -24892,8 +24959,10 @@ pub fn read_slice(window: &[u8], off: u64, len: usize) -> Result<Vec<u8>, Trap> 
 /// until its `svc.wait` serve loop replies: a parent serving its child's `"exec"` with **its own
 /// code** (the none-the-wiser nested shell). Mediation-consistent by construction (PROCESS.md §4 S9):
 /// the offer exists only in the grantee's table, handed *down* the granter's own grant graph — the
-/// granter never holds a self-referential cap (no reference cycle, nothing for it to mis-call), and no
-/// new peer arrow appears.
+/// granter never holds a self-referential cap (nothing for it to mis-call), and no new peer arrow
+/// appears. A granter that also holds an offer over the grantee does hold the grantee's powerbox,
+/// which holds the granter's cell: a cycle, which the end of the run breaks by taking the granter's
+/// host out of its cell ([`Host::take_from_cell`], #2830).
 ///
 /// Why a tagged handle and not the record's reserved `flags` word: `flags` is documented
 /// reserved-and-**ignored**, and real callers (the C shims' unwritten `pad`, hand-built manager
@@ -27396,7 +27465,7 @@ impl Host {
         // forking a stage and that stage installing its own ends.
         for s in &twin.table {
             if let Some(Binding::PipeEnd { pipe, write }) = s.entry {
-                if let Some((_, writers, readers, _, _, _)) = twin.pipes.get(pipe as usize) {
+                if let Some((_, writers, readers, _, _, _, _)) = twin.pipes.get(pipe as usize) {
                     let counter = if write { writers } else { readers };
                     counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 }
@@ -27997,12 +28066,13 @@ impl Host {
     /// #1826 — end `write` of domain-local pipe `pipe`, as a [`PipeProbe`]: its readiness, readable
     /// without this `Host`. `None` for no such pipe.
     pub fn pipe_probe(&self, pipe: u32, write: bool) -> Option<PipeProbe> {
-        let (fifo, writers, readers, gid, _, _) = self.pipes.get(pipe as usize)?;
+        let (fifo, writers, readers, gid, _, _, wakers) = self.pipes.get(pipe as usize)?;
         Some(PipeProbe {
             fifo: Arc::clone(fifo),
             others: Arc::clone(if write { readers } else { writers }),
             gid: *gid,
             write,
+            wakers: Arc::clone(wakers),
         })
     }
 
@@ -28065,6 +28135,14 @@ impl Host {
         self.term_flag.load(Ordering::SeqCst) || self.park_interrupted()
     }
 
+    /// #2757 — a store into pipe `pipe` that can end a park on it: fire what its parked ops
+    /// registered ([`PipeWakers`]).
+    fn fire_pipe_wakers(&self, pipe: u32) {
+        if let Some((.., wakers)) = self.pipes.get(pipe as usize) {
+            wakers.fire();
+        }
+    }
+
     /// FORK.md §8.6 — decrement a pipe's shared **writer** count by one (a write end closed or its
     /// holder exited). Returns `true` if the count reached `0` — the caller must then wake that pipe's
     /// parked readers (they re-issue their read, see writers == 0, and get EOF).
@@ -28072,10 +28150,11 @@ impl Host {
         use std::sync::atomic::Ordering::SeqCst;
         match self.pipes.get(pipe as usize) {
             // `fetch_sub` returns the *previous* value; it hits 0 exactly when the previous was 1.
-            Some((_, writers, _, _, _, _)) if writers.load(SeqCst) > 0 => {
+            Some((_, writers, _, _, _, _, wakers)) if writers.load(SeqCst) > 0 => {
                 let zeroed = writers.fetch_sub(1, SeqCst) == 1;
                 if zeroed {
                     self.refund_if_dead(pipe); // #989 — last writer gone; refund iff readers already 0
+                    wakers.fire();
                 }
                 zeroed
             }
@@ -28089,7 +28168,7 @@ impl Host {
     /// backings) idempotent. `&self`: the counter and guard are atomics, so no `&mut` is needed.
     fn refund_if_dead(&self, pipe: u32) {
         use std::sync::atomic::Ordering::SeqCst;
-        if let Some((_, writers, readers, _, Some(charge), _)) = self.pipes.get(pipe as usize) {
+        if let Some((_, writers, readers, _, Some(charge), _, _)) = self.pipes.get(pipe as usize) {
             if writers.load(SeqCst) == 0
                 && readers.load(SeqCst) == 0
                 && charge
@@ -28111,10 +28190,11 @@ impl Host {
     fn drop_pipe_reader(&self, pipe: u32) -> bool {
         use std::sync::atomic::Ordering::SeqCst;
         match self.pipes.get(pipe as usize) {
-            Some((_, _, readers, _, _, _)) if readers.load(SeqCst) > 0 => {
+            Some((_, _, readers, _, _, _, wakers)) if readers.load(SeqCst) > 0 => {
                 let zeroed = readers.fetch_sub(1, SeqCst) == 1;
                 if zeroed {
                     self.refund_if_dead(pipe); // #989 — last reader gone; refund iff writers already 0
+                    wakers.fire();
                 }
                 zeroed
             }
@@ -29758,7 +29838,7 @@ impl Host {
         use std::sync::atomic::Ordering::SeqCst;
         self.durable_pipe_backings()
             .into_iter()
-            .map(|(key, (fifo, writers, readers, _, _, _))| DurablePipe {
+            .map(|(key, (fifo, writers, readers, _, _, _, _))| DurablePipe {
                 key,
                 bytes: fifo.lock_unpoisoned().iter().copied().collect(),
                 writers: writers.load(SeqCst),
@@ -29807,6 +29887,7 @@ impl Host {
                 gid,
                 self.charge_channel(),
                 false,
+                Arc::default(),
             );
             self.thaw_pipes.insert(gid, b);
             ids.push(gid);
@@ -30743,6 +30824,7 @@ impl Host {
             next_pipe_gid(),
             charge,
             false,
+            Arc::default(),
         ));
         let w = self.grant(cap_id::STREAM, Binding::PipeEnd { pipe, write: true });
         let r = self.grant(cap_id::STREAM, Binding::PipeEnd { pipe, write: false });
@@ -30771,6 +30853,7 @@ impl Host {
             next_pipe_gid(),
             Some(charge),
             false,
+            Arc::default(),
         ));
         let w = self.try_grant(cap_id::STREAM, Binding::PipeEnd { pipe, write: true })?;
         let r = self.try_grant(cap_id::STREAM, Binding::PipeEnd { pipe, write: false })?;
@@ -30839,6 +30922,7 @@ impl Host {
             gid,
             None, // #989 — embedder-owned terminal input, not guest-minted channel memory
             true, // #1926 — a `^D` ends one read, not every read after it
+            Arc::default(),
         ));
         let r = self.grant(cap_id::STREAM, Binding::PipeEnd { pipe, write: false });
         (r, backing, writers, gid)
@@ -30857,6 +30941,7 @@ impl Host {
             next_pipe_gid(),
             None, // #989 — embedder-owned filter input, not guest-minted channel memory
             false,
+            Arc::default(),
         ));
         let r = self.grant(cap_id::STREAM, Binding::PipeEnd { pipe, write: false });
         (r, backing)
@@ -31734,16 +31819,24 @@ impl Host {
     }
 
     /// Take a host back out of the cell [`Host::into_cell`] made, once its run is over: no longer a
-    /// shared cell. A clone of the cell some straggler still holds (a child's live offer to it)
-    /// keeps an empty host.
+    /// shared cell ([`Host::take_from_cell`]).
     pub fn from_cell(cell: Arc<Mutex<Host>>) -> Host {
-        let mut host = match Arc::try_unwrap(cell) {
-            Ok(m) => m.into_inner().unwrap_or_else(|e| e.into_inner()),
-            Err(cell) => std::mem::take(&mut *cell.lock_unpoisoned()),
-        };
+        let mut host = Host::take_from_cell(cell);
         host.self_cell = None;
         host.svc_bell = None;
         host
+    }
+
+    /// Take a host out of a shared cell once its run is over: the cell's own host when nothing else
+    /// holds the cell, else its contents, leaving an empty host to the straggler that does. One is a
+    /// child's live offer back into the cell (#744), which holds it in a cycle with this host's own
+    /// offer over that child: taking the host out of the cell breaks the cycle, so both go once the
+    /// caller drops what it takes (#2830). Every engine's end of run reads its host back so.
+    pub(crate) fn take_from_cell(cell: Arc<Mutex<Host>>) -> Host {
+        match Arc::try_unwrap(cell) {
+            Ok(m) => m.into_inner().unwrap_or_else(|e| e.into_inner()),
+            Err(cell) => std::mem::take(&mut *cell.lock_unpoisoned()),
+        }
     }
 
     /// #2742 — publish a serve op of this domain parked at an empty queue; see
@@ -33568,8 +33661,10 @@ impl Host {
     /// callee is this domain's own running cell `cell`, over its impl-export. The child's calls
     /// enqueue on this domain's inbound queue and park until its `svc.wait` serve loop replies. Only
     /// the child's table holds the entry (granter → grantee, down the grant graph), so the granter
-    /// never holds a self-referential `Arc`: no cycle, nothing for it to mis-call. `callee_task:
-    /// None` — non-durable (freeze refuses), the deferred durability story (#1681).
+    /// never holds a self-referential `Arc`: nothing for it to mis-call. One that holds an offer over
+    /// the child too sits in a cycle with it, broken at the run's end ([`Host::take_from_cell`],
+    /// #2830). `callee_task: None` — non-durable (freeze refuses), the deferred durability story
+    /// (#1681).
     fn grant_into_child(
         &mut self,
         cell: Option<&Arc<Mutex<Host>>>,
@@ -36146,9 +36241,10 @@ impl Host {
         use std::sync::atomic::Ordering::SeqCst;
         let ret = |v: i64| Ok(v);
         // Clone the shared Arcs out so the `&mut self` flag writes below don't alias `self.pipes`.
-        let Some((fifo_arc, writers_arc, readers_arc, gid, _, one_shot_eof)) =
-            self.pipes.get(pipe as usize).cloned()
-        else {
+        let Some((fifo_arc, writers_arc, readers_arc, gid, one_shot_eof)) = (self
+            .pipes
+            .get(pipe as usize))
+        .map(|(f, w, r, g, _, eof, _)| (Arc::clone(f), Arc::clone(w), Arc::clone(r), *g, *eof)) else {
             return ret(EINVAL);
         };
         let mut fifo = fifo_arc.lock_unpoisoned();
@@ -36186,6 +36282,7 @@ impl Host {
                 // never had a parked writer, so the wake would be a no-op scan.
                 if was_full {
                     self.pipe_wake_writers = Some(gid);
+                    self.fire_pipe_wakers(pipe);
                 }
                 let Some(m) = mem else {
                     return ret(EFAULT);
@@ -36229,6 +36326,7 @@ impl Host {
                 fifo.extend(bytes);
                 drop(fifo);
                 self.pipe_wake = Some(gid); // eval loop wakes readers parked on this pipe
+                self.fire_pipe_wakers(pipe);
                 ret(n as i64)
             }
             2 => ret(0), // close: refcount decrement is handled in the dispatch arm (it sees the handle)
@@ -44043,3 +44141,108 @@ mod detached_freeze_tests;
 
 #[cfg(test)]
 mod freeze_census_tests;
+
+#[cfg(test)]
+mod take_from_cell_tests {
+    use super::*;
+
+    /// #2830 — a parent's offer over a child holding a live offer back into the parent's cell is a
+    /// cycle. Taking the parent's host out of its cell at its run's end breaks it: once the caller
+    /// drops the host it took, the child's powerbox goes, and the emptied cell with it.
+    #[test]
+    fn taking_a_host_out_of_its_cell_frees_the_cycle_through_a_child_s_grant() {
+        let no_ops = || {
+            (
+                Arc::from(Vec::<String>::new()),
+                Arc::from(Vec::<FuncType>::new()),
+            )
+        };
+        let cell = Arc::new(Mutex::new(Host::new()));
+        let child = Arc::new(Mutex::new(Host::new()));
+        let (names, sigs) = no_ops();
+        child
+            .lock_unpoisoned()
+            .install_live_impl(Arc::clone(&cell), 0, names, sigs, None);
+        let (names, sigs) = no_ops();
+        cell.lock_unpoisoned()
+            .install_live_impl(Arc::clone(&child), 0, names, sigs, None);
+        let (cell_alive, child_alive) = (Arc::downgrade(&cell), Arc::downgrade(&child));
+        drop(child);
+        let host = Host::take_from_cell(cell);
+        assert!(
+            cell_alive.upgrade().is_some(),
+            "the child's offer still holds the emptied cell"
+        );
+        drop(host);
+        assert!(
+            child_alive.upgrade().is_none(),
+            "the child's powerbox goes with the parent's offer"
+        );
+        assert!(
+            cell_alive.upgrade().is_none(),
+            "and the cell with the child's"
+        );
+    }
+}
+
+#[cfg(test)]
+mod pipe_wakers_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+
+    /// #2757 — a store that can end a park on a pipe takes and fires the wakers its parked ops
+    /// registered ([`PipeProbe::listen`]), whichever domain makes it: a write, a read that drains a
+    /// full pipe, and the close of its last writer. A store fires a waker once, and nothing fires one
+    /// whose listen is gone.
+    #[test]
+    fn a_pipe_store_fires_the_wakers_its_parked_ops_registered_once() {
+        let mut h = Host::new();
+        let (w, _r) = h.grant_pipe();
+        // A second domain holds the write end too, as a forked or granted child would.
+        let mut peer = Host::new();
+        let (write, backing) = h.resolve_pipe_end(w).expect("a pipe end");
+        peer.install_pipe_end(write, backing);
+        let fired = Arc::new(AtomicUsize::new(0));
+        let f = Arc::clone(&fired);
+        let waker: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            f.fetch_add(1, SeqCst);
+        });
+        let mut win = vec![0u8; 2 * PIPE_CAP];
+        let mut op = |h: &mut Host, write: bool, op: u32, len: usize| {
+            let mut m = WindowMem::new(&mut win, 2 * PIPE_CAP as u64);
+            h.pipe_op(0, write, op, &[0, len as i64], Some(&mut m))
+                .expect("a pipe op")
+        };
+        let listen = |h: &Host| h.pipe_probe(0, false).expect("the read end").listen(&waker);
+
+        // Nothing registered: a store fires nothing.
+        assert_eq!(op(&mut peer, true, 1, 1), 1);
+        let _a = listen(&h);
+        // The peer's write fills the pipe: it fires the waker, once.
+        assert_eq!(op(&mut peer, true, 1, PIPE_CAP), (PIPE_CAP - 1) as i64);
+        assert_eq!(fired.load(SeqCst), 1, "the peer's write fired the waker");
+        assert_eq!(op(&mut h, false, 0, 1), 1);
+        assert_eq!(fired.load(SeqCst), 1, "a store fires a waker once");
+        // A read from a full pipe makes room for a parked writer.
+        assert_eq!(op(&mut peer, true, 1, 1), 1);
+        let _b = listen(&h);
+        assert_eq!(op(&mut h, false, 0, 1), 1);
+        assert_eq!(fired.load(SeqCst), 2, "the read from a full pipe fired it");
+        let _c = listen(&h);
+        assert_eq!(op(&mut h, false, 0, 1), 1);
+        assert_eq!(
+            fired.load(SeqCst),
+            2,
+            "a read from a pipe with room ends no park"
+        );
+        // The last writer's close fires it: a parked read then sees EOF.
+        assert!(!peer.drop_pipe_writer(0), "one writer is left");
+        assert_eq!(fired.load(SeqCst), 2, "a writer is left");
+        assert!(h.drop_pipe_writer(0), "the last writer is gone");
+        assert_eq!(fired.load(SeqCst), 3, "the last writer's close fired it");
+        // A listen dropped before a store leaves nothing to fire.
+        drop(listen(&h));
+        assert!(h.drop_pipe_reader(0), "the last reader is gone");
+        assert_eq!(fired.load(SeqCst), 3, "nothing is registered any more");
+    }
+}
