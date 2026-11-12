@@ -11,11 +11,14 @@
 //!   futex stops. A stop through the run's door, and a kill an embedder's signal source rings for,
 //!   still end the run at once, not at some later settle: in a run its opener watches, and in one
 //!   whose opener runs the root, as a browser's Worker does, which nothing watches until a park
-//!   starts a watcher (such a run takes no futex stop without a settle), and in one whose opener
-//!   runs the root with the run's watcher started at open, as the Cranelift JIT's does (#2958).
+//!   starts a watcher. #2982 — a futex stop skips its settle only while the run's bell has not rung
+//!   since the last one, so the kill's ring makes the next stop settle, watched or not, and the
+//!   unwatched run takes the fast path until then.
 //! - **Between an embedder's pumps.** A run its embedder pumps goes on between the pumps, and then
-//!   nothing watches it: a kill rung then ends its threads at their next stop, as before #2963, not
-//!   at the next pump. A door stop ends the run itself, pumped or not.
+//!   nothing watches it: a kill rung then ends its threads at their next stop, not at the next
+//!   pump. A door stop ends the run itself, pumped or not.
+//! - **A door stop asked before the run starts** ends a run whose every stop is a futex stop at
+//!   once: the run's open reads it.
 //!
 //! The tests share [`bytecode::thread_wakes`], a process-wide count, so they take turns.
 //!
@@ -152,10 +155,9 @@ block 4 () {
 /// Hand-offs enough that no test run finishes them.
 const FOREVER: i32 = i32::MAX;
 
-/// Whether the opener watches the run (the native platform), runs its root as a browser's Worker
-/// does, with nothing watching it, or runs its root with the run's own watcher started at open, as
-/// the Cranelift JIT does (#2958).
-const OPENERS: [Opener; 3] = [Opener::Watches, Opener::RunsRoot, Opener::RunsRootWatched];
+/// Whether the opener watches the run (the native platform), or runs its root, as a browser's Worker
+/// and the Cranelift JIT (#2958) do, with nothing watching it until a park starts a watcher.
+const OPENERS: [Opener; 2] = [Opener::Watches, Opener::RunsRoot];
 
 /// Run `src`'s function 0 with `args` on executor 2, over a host `setup` arms, on a thread of its
 /// own: its result arrives on the receiver.
@@ -392,4 +394,112 @@ fn a_stop_between_an_embedders_pumps_ends_its_threads_at_once() {
         matches!(end, CoopEvent::Trapped(Trap::OutOfFuel)),
         "the stop ended the run"
     );
+}
+
+/// #2982 — a run whose opener runs the root, as a browser's Worker does, has no watcher until a ring
+/// park starts one, and a futex pingpong never parks on a ring. Its futex stops still skip their
+/// settles, and the kill's ring makes the next one settle: the kill ends the run at once.
+#[test]
+fn an_unwatched_pingpong_takes_the_fast_path_and_a_kill_still_ends_it() {
+    let _turn = serial();
+    let source = Arc::new(KillOnDemand::default());
+    let src = Arc::clone(&source);
+    let before = bytecode::futex_fast_stops();
+    let rx = run(
+        PINGPONG,
+        vec![Value::I32(FOREVER)],
+        Opener::RunsRoot,
+        move |h| {
+            h.arm_external_wake();
+            h.set_signal_source(src, Arc::new(AtomicBool::new(false)));
+        },
+    );
+    // A release build keeps no count of its fast stops.
+    if cfg!(debug_assertions) {
+        let until = Instant::now() + GIVE_UP;
+        let mut fast = 0;
+        while fast <= 100 && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(10));
+            fast = bytecode::futex_fast_stops() - before;
+        }
+        assert!(
+            fast > 100,
+            "the unwatched pingpong settled its futex stops: {fast} skipped in {GIVE_UP:?}"
+        );
+    } else {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let asked = Instant::now();
+    source.kill();
+    let r = rx
+        .recv_timeout(GIVE_UP)
+        .expect("the killed pingpong ran on");
+    let took = asked.elapsed();
+    assert_eq!(r, Err(Trap::ThreadFault), "the killed root is finalized");
+    assert!(took < PROMPT, "the kill took {took:?}");
+}
+
+/// The root waits on word 16384 for 1 while it holds 0, for ever: every stop it makes is a futex
+/// stop, the first one included, and none parks.
+const NOT_EQUAL_FOREVER: &str = r#"memory 16
+func () -> (i64) {
+block 0 () {
+  br 1()
+  }
+block 1 () {
+  vw = i64.const 16384
+  vexp = i32.const 1
+  vto = i64.const -1
+  vst = i32.atomic.wait vw vexp vto
+  br 1()
+  }
+}
+"#;
+
+/// #2982 — a door stop asked before the run starts ends a run whose every stop is a futex stop at
+/// once: the run's open reads it, and its first stop settles besides.
+#[test]
+fn a_stop_asked_before_the_run_starts_ends_a_run_of_futex_stops_at_once() {
+    let _turn = serial();
+    for opener in OPENERS {
+        let door = Arc::new(bytecode::RunDoor::default());
+        while !door.stop() {
+            std::thread::yield_now();
+        }
+        let asked = Instant::now();
+        let stop = Arc::clone(&door);
+        let rx = run(NOT_EQUAL_FOREVER, Vec::new(), opener, move |h| {
+            h.set_run_door(stop)
+        });
+        let r = rx
+            .recv_timeout(GIVE_UP)
+            .expect("the waits ran on past an early stop");
+        let took = asked.elapsed();
+        assert_eq!(r, Err(Trap::OutOfFuel), "stopped ({opener:?})");
+        assert!(took < PROMPT, "the stop took {took:?} ({opener:?})");
+    }
+}
+
+/// #2982 — a kill asked of a run's signal source before the run starts rings nothing: its hook is
+/// not wired yet. A run whose every stop is a futex stop still sees it, at its first stop's
+/// settle, which `None` in `Threads::seen` owes it, and ends at once.
+#[test]
+fn a_kill_asked_before_the_run_starts_ends_a_run_of_futex_stops_at_once() {
+    let _turn = serial();
+    for opener in OPENERS {
+        let source = Arc::new(KillOnDemand::default());
+        source.dead.store(true, Ordering::SeqCst);
+        let src = Arc::clone(&source);
+        let asked = Instant::now();
+        let rx = run(NOT_EQUAL_FOREVER, Vec::new(), opener, move |h| {
+            h.arm_external_wake();
+            h.set_signal_source(src, Arc::new(AtomicBool::new(false)));
+        });
+        let r = rx
+            .recv_timeout(GIVE_UP)
+            .expect("the waits ran on past an early kill");
+        let took = asked.elapsed();
+        assert_eq!(r, Err(Trap::ThreadFault), "killed ({opener:?})");
+        assert!(took < PROMPT, "the kill took {took:?} ({opener:?})");
+    }
 }
