@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 use fake_foreign::{fake_child_window, fake_word};
 use temen_interp::bytecode::{
     self, ChildBacking, CoopEvent, EmittedCall, EmittedTarget, Hotness, LeafOffer, ModuleOffer,
-    ProgramEmit, ThreadPlatform, ThreadStart, ThreadTier, TierUpConfig,
+    Opener, ProgramEmit, ThreadPlatform, ThreadStart, ThreadTier, TierUpConfig,
 };
 use temen_interp::{Host, JitValidated, Region, Trap, Value};
 use temen_ir::{Module, SpawnRec, ValType};
@@ -194,7 +194,7 @@ fn bounce_whole_call(call: &mut EmittedCall<'_>) -> Result<(), Trap> {
     };
     let mut io = [0i64; 8];
     io[..call.argv.len()].copy_from_slice(call.argv);
-    let n = (call.bounce)(func, &mut io, 0)?;
+    let n = call.bounce(func, &mut io, 0)?;
     call.results = io[..n].to_vec();
     Ok(())
 }
@@ -214,6 +214,7 @@ fn tier(
             leaf: None,
             modules: None,
             run,
+            native: None,
         }),
         ..ThreadPlatform::OS
     }
@@ -333,8 +334,9 @@ fn run_leaf_root(m: &Module, take: Option<bool>) -> (Result<Vec<Value>, Trap>, L
                 take
             })),
             run: recording_leaf_calls,
+            native: None,
         }),
-        root_on_opener: true,
+        opener: Opener::RunsRoot,
         ..ThreadPlatform::OS
     });
     let declared = m.memory.expect("a window").size_log2;
@@ -747,6 +749,7 @@ fn invoke_tier(run: fn(&mut EmittedCall<'_>) -> Result<(), Trap>) -> ThreadPlatf
             leaf: None,
             modules: None,
             run,
+            native: None,
         }),
         ..ThreadPlatform::OS
     }
@@ -837,6 +840,7 @@ fn run_paged(
             leaf: None,
             modules: None,
             run,
+            native: None,
         }),
         ..ThreadPlatform::OS
     });
@@ -973,7 +977,7 @@ fn protect_in_a_bounce(call: &mut EmittedCall<'_>) -> Result<(), Trap> {
     let before = pagestate_now(call);
     let mut io = [0i64; 8];
     io[0] = call.argv[0];
-    (call.bounce)(3, &mut io, 0)?;
+    call.bounce(3, &mut io, 0)?;
     let after = pagestate_now(call);
     AROUND_THE_BOUNCE.lock().unwrap().extend([before, after]);
     bounce_whole_call(call)
@@ -1014,7 +1018,7 @@ fn spill_then_collect(call: &mut EmittedCall<'_>) -> Result<(), Trap> {
         base.add(1).write(v0 as u64 + 8);
     }
     let mut io = [0i64; 8];
-    (call.bounce)(2, &mut io, 2)?;
+    call.bounce(2, &mut io, 2)?;
     call.results = vec![io[0] + 8];
     Ok(())
 }
@@ -1039,6 +1043,7 @@ fn a_collector_under_each_threads_emitted_frame_sees_its_spilled_words() {
             leaf: None,
             modules: None,
             run: spill_then_collect,
+            native: None,
         }),
         ..ThreadPlatform::OS
     };
@@ -1397,6 +1402,7 @@ fn a_childs_root_task_tiers_up_over_its_own_memory() {
                 })
             })),
             run: recording_child_calls,
+            native: None,
         }),
         ..ThreadPlatform::OS
     };
@@ -1691,6 +1697,7 @@ fn a_bounce_spawns_and_joins_a_child_whose_entry_spawns_a_thread() {
                 })
             })),
             run: recording_child_bounces,
+            native: None,
         }),
         ..ThreadPlatform::OS
     };

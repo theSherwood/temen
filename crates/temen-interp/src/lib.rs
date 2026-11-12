@@ -23003,6 +23003,8 @@ impl core::ops::DerefMut for HostBuffer {
 pub(crate) struct Fuel {
     left: u64,
     src: Option<NodeRef>,
+    /// #2958 — a native task's ([`Fuel::native`]): it names its node and never draws from it.
+    native: bool,
 }
 
 impl Fuel {
@@ -23011,12 +23013,30 @@ impl Fuel {
         Fuel {
             left: 0,
             src: Some(src),
+            native: false,
+        }
+    }
+
+    /// #2958 — the fuel of a task whose code is a native tier's: it names the node the tier's own
+    /// cell draws from ([`Self::source`]) and draws nothing itself, so no chunk is ever stranded in
+    /// it while the task's code burns elsewhere. A burn charges nothing: the tier's code charged the
+    /// same safepoint (its entry prologue, for the root's entry charge). Its refill grants without a
+    /// draw and hands nothing back, so [`Self::burn`]'s hot path is every fuel's.
+    pub(crate) fn native(src: NodeRef) -> Fuel {
+        Fuel {
+            left: 0,
+            src: Some(src),
+            native: true,
         }
     }
 
     /// A fixed allowance of `n`, never refilled.
     pub(crate) fn fixed(n: u64) -> Fuel {
-        Fuel { left: n, src: None }
+        Fuel {
+            left: n,
+            src: None,
+            native: false,
+        }
     }
 
     /// Burn one unit, at a safepoint.
@@ -23038,6 +23058,11 @@ impl Fuel {
     /// Refill a spent `left` with a draw; a spent chain (or a spent fixed allowance) is `OutOfFuel`.
     #[cold]
     fn refill(&mut self) -> Result<(), Trap> {
+        // #2958 — a native task's fuel draws nothing: what it "burns" its tier's code charged.
+        if self.native {
+            self.left = u64::MAX;
+            return Ok(());
+        }
         let drawn = self.src.as_ref().ok_or(Trap::OutOfFuel)?.draw();
         self.left = match drawn {
             None => {
@@ -23052,11 +23077,13 @@ impl Fuel {
 
     /// What this vCPU can still burn: `left` plus the chain's room, `u64::MAX` when unmetered.
     pub(crate) fn can_burn(&self) -> u64 {
+        // A native task's `left` was drawn from nothing ([`Self::native`]).
+        let left = if self.native { 0 } else { self.left };
         match &self.src {
-            None => self.left,
+            None => left,
             Some(s) => match s.fuel_room() {
                 r if r < 0 => u64::MAX,
-                r => self.left.saturating_add(r as u64),
+                r => left.saturating_add(r as u64),
             },
         }
     }
@@ -23075,6 +23102,7 @@ impl Fuel {
     /// fixed allowance, starts with a copy of it, as every thread did before (#1944 slice 3).
     pub(crate) fn for_thread(&self) -> Fuel {
         match &self.src {
+            Some(s) if self.native => Fuel::native(s.clone()),
             Some(s) => Fuel::drawn(s.clone()),
             None => Fuel::fixed(self.left),
         }
@@ -23083,7 +23111,7 @@ impl Fuel {
 
 impl Drop for Fuel {
     fn drop(&mut self) {
-        if let Some(s) = &self.src {
+        if let Some(s) = self.src.as_ref().filter(|_| !self.native) {
             s.give_back(self.left);
         }
     }
@@ -34621,6 +34649,15 @@ impl Host {
     /// ([`bytecode::RunDoor`]).
     pub fn set_run_door(&mut self, door: Arc<bytecode::RunDoor>) {
         self.run_door = Some(door);
+    }
+
+    /// #2958 — put `door` in place of the door this host's run has, if any, and hand that one back:
+    /// an embedder that sets a door for one run gives the host its own back after it.
+    pub fn replace_run_door(
+        &mut self,
+        door: Option<Arc<bytecode::RunDoor>>,
+    ) -> Option<Arc<bytecode::RunDoor>> {
+        std::mem::replace(&mut self.run_door, door)
     }
 
     /// The run's door, if its embedder set one ([`Host::set_run_door`]).

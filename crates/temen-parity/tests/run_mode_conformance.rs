@@ -291,3 +291,27 @@ fn audited_coverage_does_not_regress() {
          landed, and 124 once the reactor runners did (#2545)"
     );
 }
+
+/// **The Cranelift runner's threaded probe takes the kernel route (#2958).** The runner runs it
+/// through `jit_cap_run`, whose route is `temen_run::jit_kernel::admit`'s answer for the module, the
+/// host and the start: the probe's setup is a bare host and its start a fresh seed, so this asks
+/// the same question the run does. If a clause comes to decline the probe, the matrix's Cranelift
+/// cell is today's route, and this fails until the manifest or the clause says so.
+#[test]
+fn the_cranelift_runner_runs_the_threaded_probe_on_the_kernel_route() {
+    let probe = probes()
+        .into_iter()
+        .find(|p| p.feature == Feature::Threads)
+        .expect("a threaded probe");
+    let m = module(&(probe.src)());
+    let host = temen_interp::Host::new();
+    let seed = temen_interp::MemLayout::image(Vec::new());
+    assert_eq!(
+        temen_run::jit_kernel::admit(&m, &host, Some(&seed), false).err(),
+        None,
+        "the threaded probe runs on the kernel route"
+    );
+    let (o, vcpus) = temen_run::jit_kernel::run_fresh(&m, 0, &[], None).expect("in scope");
+    assert_eq!(o, temen_jit::JitOutcome::Returned(vec![probe.want]));
+    assert_eq!(vcpus, 3, "its root and two threads ran as kernel tasks");
+}
