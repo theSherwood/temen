@@ -1428,7 +1428,10 @@ impl Carrier {
 pub struct HeldSite {
     site: ServeSite,
     /// The resting root's context, which each activation's is a vCPU context of. Live until the rest
-    /// ends; not read once [`Self::closed`] is set.
+    /// returns, and read only by an activation that counted itself in flight and then found the site
+    /// open ([`Self::activate`], [`InFlight`]): the rest closes the site before it waits for the
+    /// count, so such an activation is one it waits for. The site itself outlives the run (its
+    /// embedder holds the `Arc`), and so may this pointer, dead (#2990).
     root: *const VmCtx,
     /// The main thread's `vcpu.tls` word at rest.
     tls: i64,
@@ -1443,7 +1446,8 @@ pub struct HeldSite {
 }
 
 // SAFETY: as `ServeSite`'s; `root` is the resting root's context, live while the rest runs, and
-// read by an activation only after it counted itself in flight and found the site open.
+// read by an activation only after it counted itself in flight and found the site open, which the
+// rest waits for. A closed site touches only what it owns (#2990).
 unsafe impl Send for HeldSite {}
 unsafe impl Sync for HeldSite {}
 
@@ -1458,7 +1462,7 @@ impl Drop for InFlight<'_> {
         // root's context is live; the rest's look at the count, under the lock this wake takes,
         // sees this one gone or this one sees the domain closed.
         //
-        // #2991 — but only while the site is open. A call that counted itself in after the rest
+        // #2990 — but only while the site is open. A call that counted itself in after the rest
         // had seen the count reach 0 and returned finds the site closed and leaves at once, and by
         // then the root's context may be gone: it must not be read. The rest sets `closed` before
         // it waits on the count, so an activation that sees the site open is one the rest waits
@@ -1601,9 +1605,13 @@ impl HeldSite {
     /// caller's own domain ended while it waited (its trap cell set to unwind it). `Err` when the
     /// module has no such handler, or the OS refused its stack.
     ///
+    /// May be called at any time, before or after the domain's run returned: its embedder holds the
+    /// `Arc<HeldSite>` past the run. A closed site answers `Trapped` at once and touches only what
+    /// the site owns; an open one is read only while this call counts in flight, which the rest waits
+    /// for before the run's context, window and module go (#2990).
+    ///
     /// # Safety
-    /// The site's domain is live (its rest has not returned), and `Inside`'s context is the
-    /// caller's live one.
+    /// `Inside`'s context is the caller's live one.
     pub unsafe fn activate(
         &self,
         func: u32,

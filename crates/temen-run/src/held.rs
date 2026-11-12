@@ -205,7 +205,8 @@ impl HeldEngine for JitHeld {
                 EINVAL
             });
         };
-        // SAFETY: the site's domain lives until its rest returns, which waits for this call.
+        // SAFETY: an outside call has no caller context; `activate` may be called whether or not the
+        // run has returned, and a closed site refuses it touching nothing of the run (#2990).
         reply(unsafe { self.site.activate(func, args, HeldCaller::Outside(fuel)) })
             .unwrap_or(Reply::Failed(CAP_REVOKED))
     }
@@ -300,4 +301,50 @@ pub(crate) unsafe fn held_call(
         args
     };
     reply(site.activate(func, args, HeldCaller::Inside(vm)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// #2990 — an embedder keeps the `Arc<HeldSite>` past the run, so it may call `activate` after
+    /// the run returned and its root's context, window and module are gone. The call is refused, and
+    /// reads nothing the run owned: before the fix, the activation's guard read the dead root's end
+    /// word as it left.
+    #[test]
+    fn a_call_through_the_site_after_the_run_returned_reads_nothing_of_the_run() {
+        let m = temen_text::parse_module(
+            "memory 16
+func () -> (i64) {
+block 0 () {
+  vr = i64.const 1
+  return vr
+  }
+}
+",
+        )
+        .expect("parse");
+        temen_verify::verify_module(&m).expect("verify");
+        let mut host = Host::new();
+        host.hold_for_engine(true);
+        let (rested, rests) = std::sync::mpsc::channel();
+        let main = std::thread::spawn(move || run_held(&m, 0, &[], u64::MAX, &mut host, rested));
+        let site = rests
+            .recv()
+            .expect("the entry returned and the domain rests")
+            .site;
+        site.end();
+        let ran = main.join().expect("the run's thread");
+        assert!(matches!(ran, Ok(JitOutcome::Returned(_))), "{ran:?}");
+        assert!(site.closed());
+        let mut fuel = u64::MAX;
+        for _ in 0..8 {
+            // SAFETY: the corrected contract: a closed site touches only what it owns.
+            let end = unsafe { site.activate(0, &[], HeldCaller::Outside(&mut fuel)) };
+            assert!(
+                matches!(end, Ok(Some(HandlerEnd::Trapped(_)))),
+                "a call into a dead domain is refused"
+            );
+        }
+    }
 }
