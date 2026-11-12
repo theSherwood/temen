@@ -537,7 +537,8 @@ jobs:
         with: { toolchain: "${{ env.RUST_STABLE }}" }
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: loom model check
-        run: cargo test -p temen-jit --lib loom
+        # temen-interp's: the futex count protocol (#2958 slice 2, `src/futex_count.rs`).
+        run: cargo test -p temen-jit -p temen-interp --lib loom
         env:
           RUSTFLAGS: "--cfg loom"
 

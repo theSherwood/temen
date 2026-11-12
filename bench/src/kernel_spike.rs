@@ -324,9 +324,12 @@ fn run_nowake(reps: usize) {
             // A span long enough that each lane's fixed cost (spawning the K threads, about 0.6 s
             // at K = 1,000 on today's lane) subtracts to a usable range.
             let long = if k >= 1_000 { 20_001_000 } else { 2_001_000 };
+            // Executor 2 interpreting the program too: its interpreted futex ops take the same
+            // fast paths as the kernel's native ones (#2958 slice 2).
             let mut lanes = [
                 ("today", today(&m, 0, Host::new(), true)),
                 ("kernel", kernel(&m, 0)),
+                ("x2-interp", x2_interp(&m)),
             ];
             let label = format!("{what}, K = {k}");
             per_iter(

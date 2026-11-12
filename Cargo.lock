@@ -852,6 +852,7 @@ name = "temen-interp"
 version = "0.0.0"
 dependencies = [
  "libm",
+ "loom",
  "page_size",
  "temen-durable",
  "temen-encode",

@@ -1853,3 +1853,129 @@ fn a_fork_join_runs_with_its_spawner_and_threads_emitted() {
         "the root's call to the spawner and the four threads' entries ran emitted"
     );
 }
+
+// ----- #2958 slice 2: the futex fast paths on the interpreted and bounce entries ---------------
+
+/// A spawned thread (function 1) runs `op` at `addr` in a `memory 16` window, nothing waiting or
+/// notifying beside it; the root joins it and returns what the op answered, or ends with its trap.
+/// A wait expects 1 of a word that holds 0 (a not-equal answer), with a 1 ms timeout.
+fn op_in_thread(op: &str, addr: u64) -> Module {
+    let body = match op {
+        "wait" => format!(
+            "  va = i64.const {addr}\n  vx = i32.const 1\n  vt = i64.const 1000000\n  vs = i32.atomic.wait va vx vt\n"
+        ),
+        _ => format!("  va = i64.const {addr}\n  vc = i32.const 1\n  vs = atomic.notify va vc\n"),
+    };
+    module(&format!(
+        "memory 16
+func () -> (i64) {{
+block 0 () {{
+  vz = i64.const 0
+  vh = thread.spawn 1 vz vz
+  vst, vv = thread.join vh
+  return vv
+  }}
+}}
+func (i64, i64) -> (i64) {{
+block 0 (va0: i64, vb0: i64) {{
+{body}  vr = i64.extend_i32_u vs
+  return vr
+  }}
+}}
+"
+    ))
+}
+
+/// The oracle's answer for `m`.
+fn oracle(m: &Module) -> Result<Vec<Value>, Trap> {
+    let mut fuel = 50_000_000;
+    temen_interp::run(m, 0, &[], &mut fuel)
+}
+
+/// The rows of [`a_futex_op_with_no_waiter_answers_as_the_oracle_on_both_entries`]: the NULL guard,
+/// a mapped word, a misaligned one, past the declared window, and past the reservation.
+const BAD_AND_GOOD: [u64; 6] = [0, 4096, 16_384, 16_386, 65_536, 1 << 30];
+
+/// #2958 slice 2 — a notify or a wait with no waiter, at every kind of address, answers as the
+/// oracle does on executor 2's interpreted entry and on its bounce entry (the thread's code served
+/// whole through a bounce, as the browser tier's outlined futex ops are): the op's own checks trap a
+/// bad address before any fast answer, and a good one answers 0 woken or not-equal.
+#[test]
+fn a_futex_op_with_no_waiter_answers_as_the_oracle_on_both_entries() {
+    let before = bytecode::futex_no_wakes();
+    for op in ["wait", "notify"] {
+        for addr in BAD_AND_GOOD {
+            let m = op_in_thread(op, addr);
+            let want = oracle(&m);
+            let interpreted = run_over(&m, ThreadPlatform::OS, None);
+            assert_eq!(interpreted, want, "{op} at {addr}, interpreted");
+            let bounced = run_over(
+                &m,
+                tier(Arc::from([false, true]), bounce_whole_call),
+                flat_window(),
+            );
+            assert_eq!(bounced, want, "{op} at {addr}, bounced");
+        }
+    }
+    if cfg!(debug_assertions) {
+        assert!(bytecode::futex_no_wakes() > before, "the fast paths ran");
+    }
+}
+
+/// The root spawns function 1, which sets the cell at 16392 and then notifies word 16400, which
+/// nothing waits on, forever. The root waits for the cell and returns 42 without joining it.
+fn root_leaves_a_notify_loop() -> Module {
+    let op = "va = i64.const 16400\n  vc = i32.const 1\n  vk = atomic.notify va vc";
+    module(&format!(
+        "memory 16
+func () -> (i64) {{
+block 0 () {{
+  vz = i64.const 0
+  vh = thread.spawn 1 vz vz
+  br 1()
+  }}
+block 1 () {{
+  vc = i64.const 16392
+  vs = i32.atomic.load vc
+  vzero = i32.const 0
+  vwait = i32.eq vs vzero
+  br_if vwait 1() 2()
+  }}
+block 2 () {{
+  vr = i64.const 42
+  return vr
+  }}
+}}
+func (i64, i64) -> (i64) {{
+block 0 (va0: i64, vb0: i64) {{
+  vc = i64.const 16392
+  vone = i32.const 1
+  i32.atomic.store vc vone
+  br 1()
+  }}
+block 1 () {{
+  {op}
+  br 1()
+  }}
+}}
+"
+    ))
+}
+
+/// #2958 slice 2 — a loop of notifies answered without the rules, inside a bounce, whose interpreter
+/// polls neither the run's end nor fuel: the run's end still reaches it, because every
+/// `TIERUP_LOOK`th op goes to the rules, which tell the thread the run is over. (A bounce answers a
+/// not-equal wait itself, before any stop, so a bounced loop of those is told nothing, on main as
+/// here: #2988.)
+#[test]
+fn the_runs_end_stops_a_bounced_loop_of_fast_notifies() {
+    let t0 = std::time::Instant::now();
+    let ran = run_over(
+        &root_leaves_a_notify_loop(),
+        tier(Arc::from([false, true]), bounce_whole_call),
+        flat_window(),
+    );
+    assert_eq!(ran, Ok(vec![Value::I64(42)]));
+    let took = t0.elapsed();
+    assert!(took < std::time::Duration::from_secs(5), "{took:?}");
+}

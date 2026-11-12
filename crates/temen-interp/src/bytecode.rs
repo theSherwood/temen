@@ -12357,6 +12357,24 @@ struct Waits {
     /// starts it afresh, so a driver that wakes no threads leaves it be, and it never holds more
     /// than one notify's waiters.
     woken: Vec<usize>,
+    /// #2958 slice 2 — how many wait on each key, for a notify to read without the run lock
+    /// ([`super::futex_count`]): a task counts in as it joins [`Self::on`] ([`Tasks::park_wait`])
+    /// and out as it leaves ([`Tasks::unpark_wait`]), so the count is the queue's size, per stripe.
+    /// Executor 2's run holds the other handle ([`ThreadRun::count`]).
+    count: std::sync::Arc<super::futex_count::FutexCount>,
+    /// How many fiber waits have counted in, never to count out ([`futex_wait`]): what the stripes
+    /// hold beyond [`Self::n`].
+    sticky: u64,
+}
+
+impl Drop for Waits {
+    fn drop(&mut self) {
+        debug_assert_eq!(
+            self.count.total(),
+            self.n as u64 + self.sticky,
+            "every futex wait counted in once and out once"
+        );
+    }
 }
 
 impl std::ops::Deref for Tasks {
@@ -12430,6 +12448,8 @@ impl Tasks {
         }
         w.n += 1;
         *w.in_domain.entry(self.slots[i].domain).or_default() += 1;
+        // #2958 slice 2 — counted in before the wait rule compares its word ([`wait_task`]).
+        w.count.enter(&key);
         self.slots[i].waits_on = Some(key);
     }
 
@@ -12440,6 +12460,7 @@ impl Tasks {
             return;
         };
         let w = &mut self.waits;
+        w.count.leave(&key);
         if let Some(q) = w.on.get_mut(&key) {
             if let Ok(at) = q.binary_search(&i) {
                 q.remove(at);
@@ -12540,6 +12561,11 @@ impl Tasks {
     /// #2868 — file every futex wait under the key its site has in the windows `win` names now: after
     /// a debug restore or undo rebuilt the tasks or their windows, under the same sites
     /// ([`super::FutexSite`]).
+    ///
+    /// #2958 slice 2 — each waiter counts out of its old key's stripe and into its new one, so a
+    /// notify reading the stripes without the run lock would see neither in between. None does: a
+    /// restore or an undo runs on the cooperative debugger's core ([`SchedCore`]), whose run has no
+    /// thread but the one doing this, and only executor 2's threads read a count without the lock.
     fn file_waits<'a>(&mut self, win: impl Fn(usize) -> Option<&'a Mem>) {
         let waiting: Vec<usize> = (self.members().into_iter())
             .filter(|&i| matches!(self.slots[i].state, TaskState::BlockedWait { .. }))
@@ -17765,6 +17791,20 @@ pub fn futex_fast_stops() -> u64 {
     0
 }
 
+/// [`futex_no_wakes`]' count, kept only in a debug build.
+#[cfg(debug_assertions)]
+static NO_WAKES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// #2958 slice 2 — in a debug build, how many futex ops this process's executor 2 runs have answered
+/// without the run lock ([`ThreadRun::no_wake`]): a notify with no waiter, a wait whose word already
+/// differed. For a test to show the path was taken; `0` in a release build, which keeps no count.
+pub fn futex_no_wakes() -> u64 {
+    #[cfg(debug_assertions)]
+    return NO_WAKES.load(std::sync::atomic::Ordering::Relaxed);
+    #[cfg(not(debug_assertions))]
+    0
+}
+
 /// [`thread_blocks`]' count.
 static THREAD_BLOCKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -17996,6 +18036,10 @@ struct ThreadRun {
     end: std::sync::atomic::AtomicI64,
     /// The embedder's door into the run from outside it ([`Host::set_run_door`]), if it has one.
     door: Option<std::sync::Arc<RunDoor>>,
+    /// #2958 slice 2 — the run's futex wait counts, the same table as its tasks' [`Waits::count`]
+    /// (taken at open; only the cooperative debugger's restore rebuilds a core's tasks), for a notify
+    /// to read without the lock ([`Self::no_wake`]).
+    count: std::sync::Arc<super::futex_count::FutexCount>,
 }
 
 /// The embedder's door into a run on executor 2 from outside it (#1414 S5a, 5b-2): it can
@@ -18382,6 +18426,8 @@ struct CallSeam<'s, 'f, 't> {
     paged: bool,
     now: &'s std::cell::Cell<u64>,
     pagestate: &'s std::cell::Cell<(*const u8, usize)>,
+    /// How many futex ops in a row the call has answered without the rules ([`ThreadRun::no_wake`]).
+    answered: u32,
 }
 
 impl TaskSeam for CallSeam<'_, '_, '_> {
@@ -18411,12 +18457,19 @@ impl TaskSeam for CallSeam<'_, '_, '_> {
         drop(first);
         // #2443 — the call stopped for its task's scheduler: the task stops with it, and the call
         // runs on once the task can, until it returns.
-        while let Some((cont, stop)) = parked.take() {
-            let cont = self
-                .task
-                .as_mut()
-                .ok_or(Trap::Malformed)?
-                .park(cont, stop)?;
+        while let Some((mut cont, stop)) = parked.take() {
+            let task = self.task.as_mut().ok_or(Trap::Malformed)?;
+            let mem = self.mem.as_ref();
+            let cont = match self
+                .run
+                .no_wake(&mut self.answered, &task.vm.vt, mem, &stop)
+            {
+                Some((dst, v)) => {
+                    cont.set(dst, v);
+                    cont
+                }
+                None => task.park(cont, stop)?,
+            };
             let under = self.task.as_ref().zip(words).map(|(t, w)| t.beneath(w));
             ran = drive_nested(
                 &self.run.source,
@@ -18488,11 +18541,11 @@ impl TaskSeam for CallSeam<'_, '_, '_> {
                 dst: 0,
             },
         };
-        let cell = self
-            .task
-            .as_mut()
-            .ok_or(Trap::Malformed)?
-            .park_native(stop)?;
+        let task = self.task.as_mut().ok_or(Trap::Malformed)?;
+        if let Some((_, v)) = self.run.no_wake(&mut self.answered, &task.vm.vt, m, &stop) {
+            return Ok([v.i64(), 0]);
+        }
+        let cell = task.park_native(stop)?;
         Ok([cell[0].i64(), cell[1].i64()])
     }
 }
@@ -18658,9 +18711,11 @@ impl ThreadRun {
         if let Some(leaf) = leaf {
             core.arm_leaf(leaf);
         }
+        let count = std::sync::Arc::clone(&core.tasks.waits.count);
         let run = std::sync::Arc::new(ThreadRun {
             source,
             root,
+            count,
             state: std::sync::Mutex::new(Threads {
                 core,
                 parks: vec![Park::default()],
@@ -19039,16 +19094,29 @@ impl ThreadRun {
         state: &mut TierState,
     ) -> Result<VcpuStop, Trap> {
         let mut fibers = FiberCell::Core(&self.state, env);
+        // #2958 slice 2 — a futex op answered without the lock ([`Self::no_wake`]) is no stop, and
+        // `step_vcpu` cannot hand back what is left of its quantum (it starts each `resume` afresh),
+        // so a step after one runs a share of a quantum: a loop of such ops looks at the run within
+        // two quanta, as a loop that only computes does within one.
+        let (mut quantum, mut answered) = (COOP_QUANTUM, 0);
         for _ in 0..TIERUP_LOOK {
             match step_vcpu(
                 &mut vm.vt,
                 &mut fibers,
                 &self.source,
                 ctx,
-                COOP_QUANTUM,
+                quantum,
                 true, // a blocking `cont.resume` idles the task on the fiber (I48)
                 true, // the quantum is the thread's look at the run: a kill, or the run's end
             ) {
+                Ok(stop @ (VcpuStop::Wait { .. } | VcpuStop::Notify { .. })) => {
+                    let mem = ctx.mem.as_ref();
+                    let Some((dst, v)) = self.no_wake(&mut answered, &vm.vt, mem, &stop) else {
+                        return Ok(stop);
+                    };
+                    vm.vt.active.set(dst, v);
+                    quantum = COOP_QUANTUM / TIERUP_LOOK as u64;
+                }
                 Ok(VcpuStop::TierUp {
                     module,
                     func,
@@ -19246,6 +19314,7 @@ impl ThreadRun {
             paged,
             now: &now,
             pagestate: &pagestate,
+            answered: 0,
         };
         let mut call = EmittedCall {
             target,
@@ -19330,6 +19399,81 @@ impl ThreadRun {
     /// [`RunDoor::stop`]'s half: end the run as stopped and wake its threads, unless its lock is
     /// busy (`false`, and the caller asks again). It never waits. The run's watcher leaves once a
     /// woken thread does ([`ThreadExit`]).
+    /// #2958 slice 2 — answer futex op `stop` of a task whose active VM is `vt`, over the thread's
+    /// view `mem` of its window, without the run lock, when the rules would only answer it and move
+    /// nothing: a `memory.notify` that no task can be waiting on answers 0 woken, a `memory.wait`
+    /// whose word already differs answers `WAIT_NOT_EQUAL`: the answer and the register it lands in.
+    /// `None` sends the stop to the rules.
+    ///
+    /// The one place each engine on executor 2 takes it, before the lock: an interpreted task's
+    /// step ([`Self::step`]), a bounce out of emitted code ([`CallSeam::bounce`], the browser tier's
+    /// outlined futex ops among them) and a native tier's own op ([`CallSeam::park`]).
+    ///
+    /// - **The checks come first, and are the rules' own.** `stop` carries a `base` its op made with
+    ///   [`Mem::prepare_wait`] (bounded to the reservation through temen-mask, naturally aligned,
+    ///   every page readable in the window's page map: the NULL guard and the unmapped tail refuse)
+    ///   or [`Mem::confine_for_notify`]; a refused address trapped there, before this, as on the
+    ///   slow path. The wait's read is the rules' compare ([`Mem::atomic_value`]) on the same view,
+    ///   which needs no run lock: the lock orders a compare against a park, and a not-equal answer
+    ///   parks nothing.
+    /// - **Why the read is safe without the lock.** On the kernel route the window's protection is
+    ///   fixed once `KernelRun::protect` ran (page ops are declined until #2958 slice 3), so a word
+    ///   `prepare_wait` admitted stays readable. An interpreted window never loses host access: an
+    ///   unmap is a page-map change and a zero fill, so a racing unmap reads zero or the old value,
+    ///   as the compare under the lock could, since page ops take the host's lock, not this one.
+    ///   *Slice 3 must revisit this:* once page ops reach the JIT's window a page can go
+    ///   `PROT_NONE` between the check and the load, and this read and [`wait_task`]'s both go
+    ///   through the window's guarded read (`GuestMem`), one reader with one fix.
+    /// - **The notify** reads its key's count after a fence ([`super::futex_count`], the
+    ///   store-buffering argument). Its key is the rules' ([`futex_key_in`]) on the same backing.
+    /// - **A fiber's wait** goes to the rules: its not-equal answer parks the fiber once
+    ///   (`FIBER_PARKED`), as the oracle's does.
+    /// - **Nothing else is skipped.** Neither op charges fuel or reads the clock on its slow path, and
+    ///   neither parks, so no gate is given back (a held run) and no wake is missed.
+    /// - **A thread still meets the rules.** What the run asks of its threads (its end, a kill, a
+    ///   stop at the door, a ring) a thread sees at a stop, at an emitted safepoint (the run's end
+    ///   word, fuel) or at its quantum. A futex op is the only stop a loop of them makes, and a
+    ///   bounce's interpreter and a killed task's emitted code poll neither, so `answered` counts
+    ///   the thread's answers in a row and the [`TIERUP_LOOK`]th op goes to the rules anyway: a
+    ///   loop of these ops is told within that many of them, where on the slow path it was told at
+    ///   the next.
+    fn no_wake(
+        &self,
+        answered: &mut u32,
+        vt: &VTask,
+        mem: Option<&Mem>,
+        stop: &VcpuStop,
+    ) -> Option<(u32, Reg)> {
+        if *answered >= TIERUP_LOOK {
+            *answered = 0;
+            return None;
+        }
+        let m = mem?;
+        let answer = match *stop {
+            VcpuStop::Wait {
+                base,
+                expected,
+                width,
+                dst,
+                ..
+            } => (vt.active_id == ROOT_FIBER && m.atomic_value(base, width) != expected)
+                .then_some((dst, super::WAIT_NOT_EQUAL)),
+            VcpuStop::Notify { base, dst, .. } => {
+                self.count.quiet(&m.futex_key(base)).then_some((dst, 0))
+            }
+            _ => None,
+        };
+        match answer {
+            Some(_) => {
+                *answered += 1;
+                #[cfg(debug_assertions)]
+                NO_WAKES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            None => *answered = 0,
+        }
+        answer.map(|(dst, v)| (dst, Reg::from_i32(v)))
+    }
+
     fn try_stop(&self) -> bool {
         use std::sync::TryLockError;
         let mut g = match self.state.try_lock() {
@@ -19370,6 +19514,10 @@ impl ThreadRun {
         debug_assert!(
             g.core.tasks.waits.woken.is_empty(),
             "a notify's wakes were taken"
+        );
+        debug_assert!(
+            std::sync::Arc::ptr_eq(&self.count, &g.core.tasks.waits.count),
+            "a notify reads the counts its run's waiters write"
         );
         let had = g.core.tasks.len();
         // A notify and an untimed wait read no clock (#2963).
@@ -20324,16 +20472,19 @@ fn wait_task(
     dst: u32,
 ) {
     let site = mem.map_or(super::FutexSite::Anon(base), |m| m.futex_site(base));
+    // #2958 slice 2 — park first, which counts the waiter in on its key ([`Tasks::park_wait`]),
+    // then compare: a notify that reads the count without the run lock either sees the waiter, or
+    // made its store before this read ([`super::futex_count`]). A word that already changed ends
+    // the wait at once, as if it had not parked.
+    tasks[ti].state = TaskState::BlockedWait {
+        addr: base,
+        site,
+        deadline: timeout.map(|t| clock.saturating_add(t)),
+        dst,
+    };
+    tasks.park_wait(ti, site_key_in(mem, base, site));
     if mem.map_or(0, |m| m.atomic_value(base, width)) != expected {
-        tasks[ti].deliver(dst, Reg::from_i32(super::WAIT_NOT_EQUAL));
-    } else {
-        tasks[ti].state = TaskState::BlockedWait {
-            addr: base,
-            site,
-            deadline: timeout.map(|t| clock.saturating_add(t)),
-            dst,
-        };
-        tasks.park_wait(ti, site_key_in(mem, base, site));
+        tasks.end_wait(ti, super::WAIT_NOT_EQUAL);
     }
 }
 
@@ -20365,11 +20516,16 @@ fn futex_wait(
         return wait_task(tasks, ti, mem, clock, base, expected, width, timeout, dst);
     }
     // The key before the read, as [`wait_task`] takes its site.
-    let (key, cur) = mem
+    let key = mem
         .as_ref()
-        .map_or((super::FutexKey::Anon(0, base), 0), |m| {
-            (m.futex_key(base), m.atomic_value(base, width))
-        });
+        .map_or(super::FutexKey::Anon(0, base), |m| m.futex_key(base));
+    // #2958 slice 2 — a fiber's wait counts in on its key before its read, as a task's does, and
+    // never out: its wait ends in the fiber machinery, not in [`Waits`]. The key's stripe stays on
+    // the slow path for the rest of the run. Phase 2 of #2958 puts fiber waits in the kernel's wait
+    // index, where they count out as a task's do.
+    tasks.waits.count.enter(&key);
+    tasks.waits.sticky += 1;
+    let cur = mem.as_ref().map_or(0, |m| m.atomic_value(base, width));
     // The park-time recheck closes the park-vs-store race: a store that already landed wakes the
     // fiber with `WAIT_NOT_EQUAL`, after the one transient `FIBER_PARKED`, like the oracle.
     let woken = (cur != expected).then_some(super::WAIT_NOT_EQUAL);
