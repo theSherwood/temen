@@ -503,3 +503,122 @@ fn a_kill_asked_before_the_run_starts_ends_a_run_of_futex_stops_at_once() {
         assert!(took < PROMPT, "the kill took {took:?} ({opener:?})");
     }
 }
+
+/// #2958 slice 2 — the root and the thread it spawns each run `op` forever: a notify of word 16400,
+/// which nothing waits on, a wait on it for a 1 it never holds, or (to compare) nothing but the
+/// loop's own add. The futex ops are answered without the run lock (`ThreadRun::no_wake`), so they
+/// are not stops: only the world ends the run.
+fn forever(op: &str) -> String {
+    let op = match op {
+        "notify" => "va = i64.const 16400\n  vc = i32.const 1\n  vk = atomic.notify va vc",
+        "wait" => {
+            "va = i64.const 16400\n  vx = i32.const 1\n  vto = i64.const -1\n  vk = i32.atomic.wait va vx vto"
+        }
+        _ => "vk = i32.const 0",
+    };
+    format!(
+        "memory 16
+func () -> (i64) {{
+block 0 () {{
+  vz = i64.const 0
+  vt = thread.spawn 1 vz vz
+  br 1(vz)
+  }}
+block 1 (vi: i64) {{
+  {op}
+  vone = i64.const 1
+  vn = i64.add vi vone
+  br 1(vn)
+  }}
+}}
+func (i64, i64) -> (i64) {{
+block 0 (vsp: i64, varg: i64) {{
+  vz = i64.const 0
+  br 1(vz)
+  }}
+block 1 (vi: i64) {{
+  {op}
+  vone = i64.const 1
+  vn = i64.add vi vone
+  br 1(vn)
+  }}
+}}
+"
+    )
+}
+
+/// The loops [`forever`] makes, the futex ones first.
+const LOOPS: [&str; 3] = ["notify", "wait", "compute"];
+
+/// Wait until a run of [`forever`]`(op)` is in its loop: in a debug build, until its fast paths have
+/// answered an op since `before` ([`bytecode::futex_no_wakes`], which only a debug build counts),
+/// which also shows they ran; otherwise, and for the compute loop, a while.
+fn reach_the_loop(op: &str, before: u64) {
+    if !cfg!(debug_assertions) || op == "compute" {
+        std::thread::sleep(Duration::from_millis(100));
+        return;
+    }
+    let until = Instant::now() + GIVE_UP;
+    while bytecode::futex_no_wakes() <= before {
+        assert!(
+            Instant::now() < until,
+            "no {op} was answered without the lock in {GIVE_UP:?}"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// #2958 slice 2 — threads that only notify a word nothing waits on, or only wait on a word that
+/// already differs, take no stop: a door stop still ends them promptly, as it ends threads that only
+/// compute (each thread's quantum, or the [`bytecode::futex_no_wakes`]-counted run of answers that
+/// sends the next op to the rules). The time each took is printed beside the compute loop's.
+#[test]
+fn a_stop_ends_threads_that_only_take_the_futex_fast_paths() {
+    let _turn = serial();
+    for op in LOOPS {
+        for opener in OPENERS {
+            let before = bytecode::futex_no_wakes();
+            let door = Arc::new(bytecode::RunDoor::default());
+            let stop = Arc::clone(&door);
+            let rx = run(&forever(op), Vec::new(), opener, move |h| {
+                h.set_run_door(stop)
+            });
+            reach_the_loop(op, before);
+            let asked = Instant::now();
+            while !door.stop() {
+                std::thread::yield_now();
+            }
+            let r = rx.recv_timeout(GIVE_UP).expect("the stopped loop ran on");
+            let took = asked.elapsed();
+            eprintln!("door stop of a {op} loop ({opener:?}): {took:?}");
+            assert_eq!(r, Err(Trap::OutOfFuel), "stopped ({op}, {opener:?})");
+            assert!(took < PROMPT, "the stop took {took:?} ({op}, {opener:?})");
+        }
+    }
+}
+
+/// #2958 slice 2 — as [`a_stop_ends_threads_that_only_take_the_futex_fast_paths`], for a kill an
+/// embedder's signal source rings: each thread's task is finalized at its next look at the run.
+#[test]
+fn a_kill_ends_threads_that_only_take_the_futex_fast_paths() {
+    let _turn = serial();
+    for op in LOOPS {
+        for opener in OPENERS {
+            let before = bytecode::futex_no_wakes();
+            let source = Arc::new(KillOnDemand::default());
+            let src = Arc::clone(&source);
+            let rx = run(&forever(op), Vec::new(), opener, move |h| {
+                h.arm_external_wake();
+                h.set_signal_source(src, Arc::new(AtomicBool::new(false)));
+            });
+            reach_the_loop(op, before);
+            let asked = Instant::now();
+            source.kill();
+            let r = rx.recv_timeout(GIVE_UP).expect("the killed loop ran on");
+            let took = asked.elapsed();
+            eprintln!("kill of a {op} loop ({opener:?}): {took:?}");
+            assert_eq!(r, Err(Trap::ThreadFault), "finalized ({op}, {opener:?})");
+            assert!(took < PROMPT, "the kill took {took:?} ({op}, {opener:?})");
+        }
+    }
+}

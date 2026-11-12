@@ -11,6 +11,7 @@
 /// Phase-1b bytecode-dispatch engine (see `INTERP_PERF.md`) — a flat, operand-resolved execution
 /// path, not yet the default; gated by the equality harness against this interpreter.
 pub mod bytecode;
+mod futex_count;
 pub mod journal;
 pub mod moment;
 

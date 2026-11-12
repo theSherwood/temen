@@ -50,3 +50,13 @@ temen-durable.workspace = true
 # IR types (no platform surface), so it keeps the test crate Miri-buildable.
 temen-ir.workspace = true
 temen-encode.workspace = true
+
+# #2958 slice 2 — the futex count's model (`src/futex_count.rs`, `loom_tests`), run as
+# `RUSTFLAGS="--cfg loom" cargo test -p temen-interp --lib loom`. Its atomics are loom's only in this
+# crate's own test build, so a `--cfg loom` build of a dependent (temen-jit's loom lane) is unchanged.
+[target.'cfg(loom)'.dev-dependencies]
+loom = "0.7"
+
+[lints.rust]
+# `--cfg loom` is set manually for loom model-checking runs; tell rustc it's expected.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }

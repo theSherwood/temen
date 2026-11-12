@@ -482,3 +482,128 @@ fn the_kernel_route_strands_no_fuel_the_oracle_does_not() {
         "the kernel route's least budget is the oracle's, but for #2977's allowance"
     );
 }
+
+// ----- #2958 slice 2: the futex fast paths on a native vCPU -------------------------------------
+
+/// The oracle's answer for `m`, as the JIT's are spelled.
+fn oracle(m: &temen_ir::Module) -> Result<Vec<i64>, Trap> {
+    let mut left = temen_interp::DEFAULT_FUEL;
+    temen_interp::run(m, 0, &[], &mut left).map(|v| {
+        v.iter()
+            .map(|x| match x {
+                temen_interp::Value::I64(n) => *n,
+                other => panic!("{other:?}"),
+            })
+            .collect()
+    })
+}
+
+/// #2958 slice 2 — a notify or a wait with no waiter at every kind of address answers as the oracle
+/// does on both routes: the op's own checks (`prepare_wait`, `confine_for_notify`) trap a bad address
+/// before any fast answer, a wait in range times out (its word is the 0 it expects), and a notify in
+/// range answers 0 woken without the run lock.
+#[test]
+fn a_futex_op_with_no_waiter_answers_as_the_oracle_on_both_lanes() {
+    for op in ["wait", "notify"] {
+        for addr in [0, 4096, 16_384, 16_386, 65_536, 1 << 30] {
+            let m = module(&op_in_thread(op, addr));
+            let want = oracle(&m);
+            assert_eq!(today(&m), want, "{op} at {addr}, today's JIT");
+            assert_eq!(kernel(&m), want, "{op} at {addr}, the kernel route");
+        }
+    }
+}
+
+/// The root spawns a vCPU, and both run `op` forever: a notify of word 16400, which nothing waits
+/// on, a wait on it for a 1 it never holds, or (to compare) nothing but the loop's add. With
+/// `returns`, the root instead returns 7 once the vCPU has started its loop.
+fn forever(op: &str, returns: bool) -> String {
+    let op = match op {
+        "notify" => "va = i64.const 16400\n  vc = i32.const 1\n  vk = atomic.notify va vc",
+        "wait" => {
+            "va = i64.const 16400\n  vx = i32.const 1\n  vto = i64.const -1\n  vk = i32.atomic.wait va vx vto"
+        }
+        _ => "vk = i32.const 0",
+    };
+    let root = if returns {
+        "block 1 () {
+  vc = i64.const 16392
+  vs = i32.atomic.load vc
+  vzero = i32.const 0
+  vwait = i32.eq vs vzero
+  br_if vwait 1() 2()
+  }
+block 2 () {
+  vr = i64.const 7
+  return vr
+  }"
+        .to_string()
+    } else {
+        format!("block 1 () {{\n  {op}\n  br 1()\n  }}")
+    };
+    format!(
+        "memory 16
+func () -> (i64) {{
+block 0 () {{
+  vz = i64.const 0
+  vh = thread.spawn 1 vz vz
+  br 1()
+  }}
+{root}
+}}
+func (i64, i64) -> (i64) {{
+block 0 (va0: i64, vb0: i64) {{
+  vc = i64.const 16392
+  vone = i32.const 1
+  i32.atomic.store vc vone
+  br 1()
+  }}
+block 1 () {{
+  {op}
+  br 1()
+  }}
+}}
+"
+    )
+}
+
+/// #2958 slice 2 — a vCPU that only notifies a word nothing waits on, or only waits on a word that
+/// already differs, takes no stop: the root's return still ends it at its loop's back-edge poll of
+/// the run's end word, as it ends a vCPU that only computes, and the run returns the root's value.
+#[test]
+fn the_roots_return_ends_a_vcpu_that_only_takes_the_futex_fast_paths() {
+    for op in ["notify", "wait", "compute"] {
+        let before = temen_interp::bytecode::futex_no_wakes();
+        assert_eq!(kernel(&module(&forever(op, true))), Ok(vec![7]), "{op}");
+        if cfg!(debug_assertions) && op != "compute" {
+            let taken = temen_interp::bytecode::futex_no_wakes() > before;
+            assert!(taken, "the fast path ran ({op})");
+        }
+    }
+}
+
+/// #2958 slice 2 — the JIT's kill door ends two vCPUs that only take the fast paths promptly, as it
+/// ends two that only compute: the kill stops the kernel's run, whose end word their back-edges
+/// poll. The time each took is printed beside the compute loop's.
+#[test]
+fn the_kill_door_ends_vcpus_that_only_take_the_futex_fast_paths() {
+    for op in ["notify", "wait", "compute"] {
+        let m = module(&forever(op, false));
+        let kill = temen_jit::Interrupt::new();
+        let k = std::sync::Arc::clone(&kill);
+        let fired = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let at = std::sync::Arc::clone(&fired);
+        let watchdog = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            *at.lock().unwrap() = Some(Instant::now());
+            k.fire();
+        });
+        let (o, vcpus) = jit_kernel::run_fresh(&m, 0, &[], Some(&kill)).expect("in scope");
+        let took = fired.lock().unwrap().expect("the kill fired").elapsed();
+        watchdog.join().unwrap();
+        eprintln!("kill of a {op} loop on the kernel route: {took:?}");
+        assert!(vcpus >= 1, "it ran as kernel tasks");
+        assert_eq!(result(o), Err(Trap::OutOfFuel), "{op}");
+        assert!(took < PROMPT, "{op}: the kill took {took:?}");
+    }
+}
