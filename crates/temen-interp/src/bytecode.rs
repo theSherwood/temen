@@ -10733,6 +10733,9 @@ mod tasks_tests {
         assert_eq!(tasks.next_deadline(), None);
         tasks.prune();
         assert_eq!(tasks.live().collect::<Vec<_>>(), [0, 1, 2, 3]);
+        // #2975 — the emptied queues left the map; the spare kept the storage, holding no waiter.
+        assert!(tasks.waits.on.is_empty());
+        assert!(tasks.waits.spare.is_empty() && tasks.waits.spare.capacity() > 0);
     }
 }
 
@@ -12365,9 +12368,21 @@ struct Waits {
     /// How many fiber waits have counted in, never to count out ([`futex_wait`]): what the stripes
     /// hold beyond [`Self::n`].
     sticky: u64,
+    /// #2975 — the storage of the last queue a wait emptied, always empty, for the next key a wait
+    /// files under: a wait allocates no queue and a notify frees none, once warm. Storage only:
+    /// what waits is in [`Self::on`].
+    spare: std::collections::VecDeque<usize>,
 }
 
 impl Waits {
+    /// Key `key`'s queue, emptied: it leaves the map and its storage becomes the spare.
+    fn drop_queue(&mut self, key: &super::FutexKey) {
+        if let Some(q) = self.on.remove(key) {
+            debug_assert!(q.is_empty(), "only an empty queue is dropped");
+            self.spare = q;
+        }
+    }
+
     /// Whether the stripes hold exactly the waiters and the fiber waits that never count out: what
     /// every count in and out leaves them as, outside [`wait_task`]'s one hold of the lock.
     fn counted(&self) -> bool {
@@ -12457,7 +12472,8 @@ impl Tasks {
             self.live.remove(at);
         }
         let w = &mut self.waits;
-        let q = w.on.entry(key).or_default();
+        debug_assert!(w.spare.is_empty(), "the spare queue holds no waiter");
+        let q = (w.on.entry(key)).or_insert_with(|| std::mem::take(&mut w.spare));
         if let Err(at) = q.binary_search(&i) {
             q.insert(at, i);
         }
@@ -12472,19 +12488,29 @@ impl Tasks {
     /// #2868 — task `i` no longer waits aside, however its wait ended: it is back in the live list.
     /// One that does not wait aside is left as it is.
     fn unpark_wait(&mut self, i: usize) {
-        let Some(key) = self.slots[i].waits_on.take() else {
+        let Some(key) = self.slots[i].waits_on else {
             return;
         };
         let w = &mut self.waits;
-        w.count.leave(&key);
         if let Some(q) = w.on.get_mut(&key) {
             if let Ok(at) = q.binary_search(&i) {
                 q.remove(at);
             }
             if q.is_empty() {
-                w.on.remove(&key);
+                w.drop_queue(&key);
             }
         }
+        self.leave_wait(i);
+    }
+
+    /// [`Self::unpark_wait`] for a task already taken out of its key's queue ([`Self::notify`]): it
+    /// counts out, leaves the deadline index and the counts, and is back in the live list.
+    fn leave_wait(&mut self, i: usize) {
+        let Some(key) = self.slots[i].waits_on.take() else {
+            unreachable!("only a waiter leaves its wait");
+        };
+        let w = &mut self.waits;
+        w.count.leave(&key);
         if let TaskState::BlockedWait {
             deadline: Some(d), ..
         } = self.slots[i].state
@@ -12501,6 +12527,11 @@ impl Tasks {
     /// #2868 — end task `i`'s futex wait with `status` at its `dst`: it runs on.
     fn end_wait(&mut self, i: usize, status: i32) {
         self.unpark_wait(i);
+        self.answer_wait(i, status);
+    }
+
+    /// Hand task `i`, out of its wait, `status` at its `dst`: it runs on.
+    fn answer_wait(&mut self, i: usize, status: i32) {
         if let TaskState::BlockedWait { dst, .. } = self.slots[i].state {
             self.slots[i].deliver(dst, Reg::from_i32(status));
             self.slots[i].state = TaskState::Runnable;
@@ -12513,10 +12544,19 @@ impl Tasks {
         self.waits.woken.clear();
         let mut woken = 0;
         while woken < count {
-            let Some(&i) = self.waits.on.get(&key).and_then(|q| q.front()) else {
+            // #2975 — it takes its waiter from the queue it found, which it drops once empty.
+            let w = &mut self.waits;
+            let Some(q) = w.on.get_mut(&key) else {
                 break;
             };
-            self.end_wait(i, super::WAIT_WOKEN);
+            let Some(i) = q.pop_front() else {
+                unreachable!("an empty queue leaves the map");
+            };
+            if q.is_empty() {
+                w.drop_queue(&key);
+            }
+            self.leave_wait(i);
+            self.answer_wait(i, super::WAIT_WOKEN);
             self.waits.woken.push(i);
             woken += 1;
         }
