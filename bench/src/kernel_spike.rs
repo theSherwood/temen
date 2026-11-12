@@ -122,17 +122,21 @@ struct Sw {
 }
 
 impl Sw {
-    /// The counts now. `getrusage(RUSAGE_SELF)` keeps the counts of threads that have exited.
+    /// The counts now. `getrusage(RUSAGE_SELF)` keeps the counts of threads that have exited. Off
+    /// unix the switch counts read 0.
     fn now() -> Sw {
+        #[cfg(unix)]
         // SAFETY: `getrusage` writes the struct it is handed and reads nothing else.
-        let ru = unsafe {
+        let (vol, invol) = unsafe {
             let mut ru = std::mem::zeroed::<libc::rusage>();
             libc::getrusage(libc::RUSAGE_SELF, &mut ru);
-            ru
+            (ru.ru_nvcsw as f64, ru.ru_nivcsw as f64)
         };
+        #[cfg(not(unix))]
+        let (vol, invol) = (0.0, 0.0);
         Sw {
-            vol: ru.ru_nvcsw as f64,
-            invol: ru.ru_nivcsw as f64,
+            vol,
+            invol,
             blocks: temen_interp::bytecode::thread_blocks() as f64,
         }
     }
@@ -240,7 +244,10 @@ fn per_iter(
             let sw = s1.minus(s0).per(ops);
             if raw() {
                 let v = d * 1e9 / ops / unit_ns;
-                println!("    raw {label} {name} {v:.3} vol {:.3} blocks {:.3}", sw.vol, sw.blocks);
+                println!(
+                    "    raw {label} {name} {v:.3} vol {:.3} blocks {:.3}",
+                    sw.vol, sw.blocks
+                );
             }
             sws[i].push(sw);
         }
@@ -357,11 +364,17 @@ pub fn run(reps: usize) {
 /// on that lane, and the work alone ([`crate::kernel_spike_ir::always_work_ir`]) is measured again
 /// in every rep, interleaved with the pingpong, and taken out.
 fn run_always(reps: usize) {
-    println!("\nalways block: the pingpong with a turn of work before each notify (us per hand-off):");
+    println!(
+        "\nalways block: the pingpong with a turn of work before each notify (us per hand-off):"
+    );
     let pp = parse(&crate::kernel_spike_ir::always_ir());
     let alone = parse(&crate::kernel_spike_ir::always_work_ir());
     let targets: Vec<f64> = std::env::var("SPIKE_WORK_US")
-        .map(|v| v.split(',').map(|x| x.parse().expect("SPIKE_WORK_US")).collect())
+        .map(|v| {
+            v.split(',')
+                .map(|x| x.parse().expect("SPIKE_WORK_US"))
+                .collect()
+        })
         .unwrap_or_else(|_| vec![20.0, 100.0]);
     let pick = std::env::var("SPIKE_LANES").unwrap_or_default();
     let lanes = |m| {
@@ -393,11 +406,14 @@ fn run_always(reps: usize) {
     for target in targets {
         // Both native lanes run the same Cranelift code for the work, so they take the same count
         // (today's), and their hand-offs compare rep by rep with no work taken out.
-        let native = (pps.iter().position(|(n, _)| *n == "today"))
-            .map(|t| steps[t]);
+        let native = (pps.iter().position(|(n, _)| *n == "today")).map(|t| steps[t]);
         let ws: Vec<i64> = (pps.iter().zip(&steps))
             .map(|((n, _), s)| {
-                let s = if *n == "x2-interp" { *s } else { native.unwrap_or(*s) };
+                let s = if *n == "x2-interp" {
+                    *s
+                } else {
+                    native.unwrap_or(*s)
+                };
                 ((target * 1e3 / s) as i64).max(1)
             })
             .collect();
@@ -422,7 +438,10 @@ fn run_always(reps: usize) {
                 let sw = s1.minus(s0).per(2.0 * turns);
                 if raw() {
                     let name = pps[i].0;
-                    println!("    raw always{target} {name} {h:.3} work {wk:.3} vol {:.3}", sw.vol);
+                    println!(
+                        "    raw always{target} {name} {h:.3} work {wk:.3} vol {:.3}",
+                        sw.vol
+                    );
                 }
                 sws[i].push(sw);
             }
