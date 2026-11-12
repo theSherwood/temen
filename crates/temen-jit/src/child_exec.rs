@@ -1457,8 +1457,15 @@ impl Drop for InFlight<'_> {
         // ending, for the last activation. The end is read while this one still counts, so the
         // root's context is live; the rest's look at the count, under the lock this wake takes,
         // sees this one gone or this one sees the domain closed.
-        // SAFETY: the rest does not return while an activation counts in flight.
-        let ended = unsafe { (*site.root).ended().is_some() };
+        //
+        // #2991 — but only while the site is open. A call that counted itself in after the rest
+        // had seen the count reach 0 and returned finds the site closed and leaves at once, and by
+        // then the root's context may be gone: it must not be read. The rest sets `closed` before
+        // it waits on the count, so an activation that sees the site open is one the rest waits
+        // for, and one that sees it closed notifies below anyway.
+        // SAFETY: the rest does not return while an activation counts in flight and the site is
+        // open.
+        let ended = !site.closed() && unsafe { (*site.root).ended().is_some() };
         site.inflight.fetch_sub(1, Ordering::SeqCst);
         if ended || site.closed() {
             let _g = lock(&site.end_asked);
