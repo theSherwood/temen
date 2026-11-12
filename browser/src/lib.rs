@@ -1352,8 +1352,8 @@ fn emitted_trap(code: i32) -> Trap {
 // - `x2_tierup(module, func, argv, argc, win, mapped, over, out, mem)`: run `f{func}(win, env,
 //   ...argv)` of program `module`'s emit on this Worker's emitted tier, with `"mapped"` set, and write
 //   its results at `out`. Returns how many, or `-(1 + code)` when it trapped with `code`. The emitted
-//   code's fuel checks look at the byte at `over`, and once it is set the next one ends the call
-//   ([`bytecode::EmittedCall::over`]). With `mem` -1 the program is the run's own
+//   code's fuel checks look at the end word at `over`, and once it is set the next one ends the call
+//   ([`bytecode::EmittedCall::end`]). With `mem` -1 the program is the run's own
 //   ([`temen_x2_wasm_ptr`]), over the engine's memory at `win`. Otherwise `mem` is a detached child's
 //   memory, which the Worker registered, and the program a granted module ([`temen_x2_program_len`]):
 //   the window starts past the child's header and the call's context is in it (#1414 ED-2).
@@ -1493,7 +1493,7 @@ fn x2_run(call: &mut bytecode::EmittedCall<'_>) -> Result<(), Trap> {
     let mut out = [0i64; temen_wasm_jit::XCALL_MAX_SLOTS];
     let (argv, argc) = (call.argv.as_ptr(), call.argv.len() as u32);
     let (win, mapped) = (call.win as usize as u32, call.mapped);
-    let over = call.over.as_ptr() as usize as u32;
+    let over = call.end.as_ptr() as usize as u32;
     let mem = call.memory.map_or(-1, |id| id as i32);
     let unit = match call.target {
         bytecode::EmittedTarget::Region { module, func } => Err((module, func)),

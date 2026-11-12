@@ -214,10 +214,6 @@ pub fn run(
         kr: Arc::clone(&kr),
         vcpus: Arc::clone(&vcpus),
     });
-    let on_end = {
-        let kr = Arc::clone(&kr);
-        Arc::new(move || kr.end())
-    };
     let n = m.funcs.len();
     let platform = ThreadPlatform {
         tier: Some(ThreadTier {
@@ -229,7 +225,7 @@ pub fn run(
             modules: None,
             leaf: Some(Arc::new(|offer| offer.module == 0)),
             run: tier_run,
-            native: Some(NativeTier { on_end, state }),
+            native: Some(NativeTier { state }),
         }),
         // The root runs on the caller's thread, as the JIT's own runtime runs it, and the run is
         // watched from its start (#2958 condition 7).
@@ -383,7 +379,7 @@ fn tier_run(call: &mut EmittedCall<'_>) -> Result<(), Trap> {
         Some(node) => FuelCell::drawing(Arc::new(crate::HostNode(node))),
         None => FuelCell::fixed(u64::MAX),
     };
-    let (tls, host) = (call.tls, call.host_cell());
+    let (tls, host, end) = (call.tls, call.host_cell(), call.end);
     let ran = {
         let mut hook = Hook(call);
         // SAFETY: `host` is the task's domain's live host cell, what `cap_thunk_locked` takes; the
@@ -392,6 +388,7 @@ fn tier_run(call: &mut EmittedCall<'_>) -> Result<(), Trap> {
             kr.run_vcpu(
                 entry,
                 tls,
+                end,
                 &mut hook,
                 host as *mut core::ffi::c_void,
                 &mut fuel,

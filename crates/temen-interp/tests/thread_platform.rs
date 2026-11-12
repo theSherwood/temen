@@ -616,7 +616,7 @@ fn spin_until_stopped(call: &mut EmittedCall<'_>) -> Result<(), Trap> {
     SPUN.fetch_add(1, Ordering::SeqCst);
     signal_root(call);
     let since = std::time::Instant::now();
-    while !call.over.load(Ordering::SeqCst) {
+    while call.end.load(Ordering::SeqCst) == 0 {
         // Far past the root's end: the run never stopped this code, and would wait for it forever.
         assert!(
             since.elapsed() < std::time::Duration::from_secs(60),
