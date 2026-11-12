@@ -431,14 +431,20 @@ fn an_unwatched_pingpong_takes_the_fast_path_and_a_kill_still_ends_it() {
         h.arm_external_wake();
         h.set_signal_source(src, Arc::new(AtomicBool::new(false)));
     });
-    std::thread::sleep(Duration::from_millis(100));
-    let fast = bytecode::futex_fast_stops() - before;
     // A release build keeps no count of its fast stops.
     if cfg!(debug_assertions) {
+        let until = Instant::now() + GIVE_UP;
+        let mut fast = 0;
+        while fast <= 100 && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(10));
+            fast = bytecode::futex_fast_stops() - before;
+        }
         assert!(
             fast > 100,
-            "the unwatched pingpong settled its futex stops: {fast} skipped"
+            "the unwatched pingpong settled its futex stops: {fast} skipped in {GIVE_UP:?}"
         );
+    } else {
+        std::thread::sleep(Duration::from_millis(100));
     }
     let asked = Instant::now();
     source.kill();
@@ -494,6 +500,37 @@ fn a_stop_asked_before_the_run_starts_ends_a_run_of_futex_stops_at_once() {
         assert!(
             took < PROMPT,
             "the stop took {took:?} (opener runs root: {opener})"
+        );
+    }
+}
+
+/// #2982 — a kill asked of a run's signal source before the run starts rings nothing: its hook is
+/// not wired yet. A run whose every stop is a futex stop still sees it, at its first stop's
+/// settle, which `None` in `Threads::seen` owes it, and ends at once.
+#[test]
+fn a_kill_asked_before_the_run_starts_ends_a_run_of_futex_stops_at_once() {
+    let _turn = serial();
+    for opener in OPENERS {
+        let source = Arc::new(KillOnDemand::default());
+        source.dead.store(true, Ordering::SeqCst);
+        let src = Arc::clone(&source);
+        let asked = Instant::now();
+        let rx = run(NOT_EQUAL_FOREVER, Vec::new(), opener, move |h| {
+            h.arm_external_wake();
+            h.set_signal_source(src, Arc::new(AtomicBool::new(false)));
+        });
+        let r = rx
+            .recv_timeout(GIVE_UP)
+            .expect("the waits ran on past an early kill");
+        let took = asked.elapsed();
+        assert_eq!(
+            r,
+            Err(Trap::ThreadFault),
+            "killed (opener runs root: {opener})"
+        );
+        assert!(
+            took < PROMPT,
+            "the kill took {took:?} (opener runs root: {opener})"
         );
     }
 }

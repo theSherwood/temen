@@ -17664,8 +17664,9 @@ struct Threads {
     /// first ([`ThreadRun::park`]). [`Threads::set_park`] alone writes it.
     awake: usize,
     /// #2982 — the ring count of the run's bell ([`ThreadRun::bell`]) that its last settle read
-    /// before it ran; `None` until the first, so the run's first stop settles whatever it is, as
-    /// every stop did before #2963. A futex stop skips its settle only while the bell still reads
+    /// before it ran; `None` until the first, so the run's first stop settles whatever it is: what
+    /// the world did before the run wired its doors to the bell rang nothing (a kill asked of its
+    /// signal source before it started, say). A futex stop skips its settle only while the bell still reads
     /// this ([`ThreadRun::apply`]): whatever the world does that a settle would find rings the
     /// bell, or wakes the parked thread it concerns itself. A ring that lands during a settle,
     /// after its read, is seen by the next stop.
@@ -19029,8 +19030,12 @@ impl ThreadRun {
         // (#2982, [`Threads::seen`]), and not once the run is over or holds a domain, whose gate a
         // park gives back. If the stop leaves the run idle, the park that puts its last thread to
         // sleep settles first.
-        let quiet = g.seen == Some(self.rings());
-        if matches!(applied, Applied::Futex) && quiet && g.over.is_none() && g.core.held.is_none() {
+        // The bell's lock last: only a futex stop of a live run that holds no domain pays for it.
+        if matches!(applied, Applied::Futex)
+            && g.over.is_none()
+            && g.core.held.is_none()
+            && g.seen == Some(self.rings())
+        {
             #[cfg(debug_assertions)]
             FAST_STOPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let mut woken = std::mem::take(&mut g.core.tasks.waits.woken);
