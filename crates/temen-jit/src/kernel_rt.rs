@@ -130,22 +130,34 @@ impl KernelRun {
     }
 
     /// Once the kernel has seeded the window: map the read-only data segments read-only, and the NULL
-    /// guard, as a fresh run's window is (`CompiledModule::seed_window`). `false` if the OS refused
-    /// one. (Its seeding is the kernel's while the kernel keeps a `Mem` of its own over the window:
-    /// one page map, #2958 slice 3, leaves the JIT's seeding the only one.)
-    pub fn protect(&self) -> bool {
+    /// guard, as a fresh run's window is (`CompiledModule::seed_window`). Returns the byte ranges it
+    /// made read-only, for the host's page map (#2995), or `None` if the OS refused one. (Its seeding
+    /// is the kernel's while the kernel keeps a `Mem` of its own over the window: one page map, #2958
+    /// slice 3, leaves the JIT's seeding the only one.)
+    pub fn protect(&self) -> Option<Vec<[u64; 2]>> {
         let cm = &self.cm;
+        let mut ro = Vec::new();
         if let Some(size_log2) = cm.mem_size_log2 {
             let size = 1u64 << size_log2;
             for d in cm.data.iter().filter(|d| d.readonly) {
                 let lo = d.offset.min(size);
                 let hi = d.offset.saturating_add(d.bytes.len() as u64).min(size);
-                if hi > lo && !self.window.protect(lo, hi - lo, mem::Prot::Ro) {
-                    return false;
+                if hi > lo {
+                    if !self.window.protect(lo, hi - lo, mem::Prot::Ro) {
+                        return None;
+                    }
+                    ro.push([lo, hi]);
                 }
             }
         }
-        cm.null_guard > cm.win_mapped as u64 || self.window.seed_null_guard(cm.null_guard)
+        let guarded =
+            cm.null_guard > cm.win_mapped as u64 || self.window.seed_null_guard(cm.null_guard);
+        guarded.then_some(ro)
+    }
+
+    /// The window's backed size, its declared memory.
+    pub fn mapped(&self) -> u64 {
+        self.cm.win_mapped as u64
     }
 
     /// Whether `cm`'s code carries fuel checks, so each vCPU's own cell must be handed to it

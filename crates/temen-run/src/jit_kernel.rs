@@ -287,8 +287,15 @@ pub fn run(
         }
     };
     // The kernel seeded the window; nothing has run. A protection the OS refuses ends the run as a
-    // window it cannot hold does (`ThreadFault`), with its host given back.
-    let result = if kr.protect() {
+    // window it cannot hold does (`ThreadFault`), with its host given back. #2995 — the host's page
+    // map learns the read-only pages the protection made, as the JIT's own window start teaches it
+    // (`window_aliases`), so a capability's borrow of one is refused (`-EFAULT`) rather than written
+    // through into a page the hardware protects.
+    let protected = kr.protect().is_some_and(|ro| {
+        // SAFETY: `[base, base + reserved)` is the window `kr` owns, live for the run.
+        unsafe { crate::seed_kernel_window(&mut co.host_mut(), base, kr.mapped(), reserved, &ro) }
+    });
+    let result = if protected {
         match co.run() {
             CoopEvent::Done(vals) => Ok(vals.iter().map(|v| value_slot(*v)).collect()),
             CoopEvent::Trapped(t) => Err(t),
