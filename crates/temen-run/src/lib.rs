@@ -55,6 +55,8 @@ pub mod exec;
 pub mod fs;
 mod held;
 mod jit_proc;
+// #2958: a JIT program's vCPUs as executor 2's tasks.
+pub mod jit_kernel;
 pub use jit_proc::JitCodeCache;
 pub mod posix;
 pub use held::hold;
@@ -1442,6 +1444,21 @@ pub fn jit_cap_run(
 ) -> Result<(JitOutcome, temen_interp::MemLayout), temen_jit::JitError> {
     // A fresh window: its page map is `init`'s, none from an earlier run (see `reset_cap_pages`).
     host.reset_cap_pages(init.page_map());
+    // #2958 — a program `jit_kernel::admit` admits runs its vCPUs as executor 2's tasks.
+    if let Ok(admitted) = jit_kernel::admit(m, host, Some(init), false) {
+        let start = jit_kernel::Start {
+            entry,
+            args,
+            init_mem: init.bytes(),
+            reserved_log2,
+            fuel: temen_interp::DEFAULT_FUEL,
+            snapshot_cap: Some(1 << 18),
+            kill: None,
+        };
+        let end = jit_kernel::run(admitted, start, host)?;
+        let (outcome, bytes) = end.outcome();
+        return Ok((outcome, jit_layout(m, host, bytes, Vec::new())));
+    }
     // #1944 slice 3, #2113 — an activation of the run `host` roots, as `jit_run`'s: the default fuel,
     // and its window (with what `init` grew) and main vCPU charged to its node.
     // #2268 — and what its window will hold of the process's mappings, reserved before the window is
@@ -7603,6 +7620,27 @@ fn jit_run(
     // which pays for its window and main vCPU as an interpreter's does. A chain unbounded at every
     // level meters nothing, and the run's code compiles without fuel checks.
     limits.grant(host);
+    // #2958 — a program `jit_kernel::admit` admits runs its vCPUs as executor 2's tasks.
+    if let Ok(admitted) = jit_kernel::admit(m, host, None, code.is_some()) {
+        let end = with_deadline(limits.deadline, |kill| {
+            let start = jit_kernel::Start {
+                entry: func,
+                args: slots,
+                init_mem: init_mem.unwrap_or(&[]),
+                reserved_log2: temen_ir::default_reserved_log2(),
+                fuel: limits.fuel(),
+                snapshot_cap,
+                kill,
+            };
+            jit_kernel::run(admitted, start, host)
+        })
+        .map_err(|e| format!("JIT compile failed: {e:?}"))?;
+        let (outcome, snapshot) = end.outcome();
+        if let JitOutcome::Trapped(kind) = outcome {
+            return Err(format!("guest trapped ({kind:?}) — detect-and-kill (§5)"));
+        }
+        return Ok((outcome, snapshot, m.funcs[func as usize].results.clone()));
+    }
     let window = RootWindow::fresh(m, temen_ir::default_reserved_log2());
     let Some(node) = host.begin_activation(limits.fuel(), window) else {
         return Err(no_room_for_run());

@@ -18,6 +18,7 @@
 use core::ffi::c_void;
 use temen_interp::{run_with_host, Host, Value};
 use temen_jit::{compile_and_run_capture_reserved_with_host_ex, JitOutcome};
+use temen_run::jit_kernel::{self, Route};
 
 fn module(text: &str) -> temen_ir::Module {
     let m = temen_text::parse_module(text).expect("parse");
@@ -25,8 +26,10 @@ fn module(text: &str) -> temen_ir::Module {
     m
 }
 
-/// Run `m` on both engines and return `(interp, jit)`.
-fn both(m: &temen_ir::Module) -> (i64, i64) {
+/// Run `m` on both engines and return `(interp, jit)`: the JIT on each route its threads run on
+/// while both exist (#2958), today's thread runtime and the kernel's, unless `declined` names the
+/// clause that keeps it off the kernel's. The routes must agree.
+fn both(m: &temen_ir::Module, declined: Option<&'static str>) -> (i64, i64) {
     let mut host = Host::new();
     let mut fuel = u64::MAX;
     let interp = match run_with_host(m, 0, &[], &mut fuel, &mut host)
@@ -36,24 +39,33 @@ fn both(m: &temen_ir::Module) -> (i64, i64) {
         Some(Value::I64(x)) => *x,
         other => panic!("unexpected interp result {other:?}"),
     };
-
-    let mut host = Host::new();
-    let (jo, _) = compile_and_run_capture_reserved_with_host_ex(
-        m,
-        0,
-        &[],
-        &[],
-        temen_ir::DEFAULT_RESERVED_LOG2,
-        temen_run::cap_thunk,
-        &mut host as *mut Host as *mut c_void,
-        Some(temen_run::module_resolver),
-        None,
-    )
-    .expect("jit run");
-    let jit = match jo {
+    let first = |jo: JitOutcome| match jo {
         JitOutcome::Returned(ref v) => v.first().copied().unwrap_or(-1),
         ref o => panic!("jit ended abnormally: {o:?}"),
     };
+    let mut jits = Route::BOTH.iter().filter_map(|r| match r {
+        Route::Today => {
+            let mut host = Host::new();
+            let (jo, _) = compile_and_run_capture_reserved_with_host_ex(
+                m,
+                0,
+                &[],
+                &[],
+                temen_ir::DEFAULT_RESERVED_LOG2,
+                temen_run::cap_thunk,
+                &mut host as *mut Host as *mut c_void,
+                Some(temen_run::module_resolver),
+                None,
+            )
+            .expect("jit run");
+            Some(first(jo))
+        }
+        Route::Kernel => jit_kernel::expect_kernel(m, 0, &[], None, declined).map(first),
+    });
+    let jit = jits.next().expect("today's route");
+    for other in jits {
+        assert_eq!(other, jit, "the kernel route agrees with today's");
+    }
     (interp, jit)
 }
 
@@ -186,7 +198,7 @@ block 2 () {
 #[test]
 fn a_notify_of_one_wakes_exactly_one_of_three_waiters_on_both_engines() {
     let m = module(NOTIFY_ONE_OF_THREE);
-    let (interp, jit) = both(&m);
+    let (interp, jit) = both(&m, None);
     assert_eq!(
         interp, 101,
         "the oracle: notify claimed 1 and exactly 1 waiter reported woken"
@@ -325,7 +337,7 @@ block 2 () {
 #[test]
 fn a_notify_of_one_wakes_the_oldest_of_a_fiber_and_a_vcpu_on_both_engines() {
     let m = module(NOTIFY_ONE_OF_A_FIBER_AND_A_VCPU);
-    let (interp, jit) = both(&m);
+    let (interp, jit) = both(&m, Some("fibers"));
     assert_eq!(
         interp, 110,
         "the oracle: one claimed, and it is the older waiter — the fiber"
@@ -481,7 +493,7 @@ block 2 () {
 #[test]
 fn a_notify_of_zero_wakes_none_and_a_notify_past_the_end_wakes_all_on_both_engines() {
     let m = module(NOTIFY_ZERO_THEN_ALL);
-    let (interp, jit) = both(&m);
+    let (interp, jit) = both(&m, None);
     assert_eq!(
         interp, 202,
         "the oracle: 0 claimed by the zero budget, then both claimed and both woken"

@@ -37,28 +37,57 @@
 //! never does exhausts its budget at the identical safepoint.
 
 use std::time::{Duration, Instant};
+use temen_jit::JitOutcome;
+use temen_run::jit_kernel::{self, Route};
 use temen_run::{instantiate, Backend, RunConfig};
 
-/// Every backend this contract binds. Named once so a future engine is added here, not
-/// forgotten — the omission #1638 is about.
-const ALL: [Backend; 3] = [Backend::TreeWalk, Backend::Bytecode, Backend::Jit];
+/// Where a case runs: a backend through the embedder's entry (`Instance::run`, whose JIT picks its
+/// threads' route itself, #2958), or the JIT on one route its threads run on while both exist.
+#[derive(Clone, Copy, Debug)]
+enum Lane {
+    Engine(Backend),
+    Jit(Route),
+}
 
-/// Run `src` on `backend`, returning `Ok(description)` if it produced an ordinary result and
-/// `Err(description)` if it ended abnormally, plus how long it took.
-fn run_on(src: &str, backend: Backend) -> (Result<String, String>, Duration) {
+/// Every backend this contract binds, and both of the JIT's thread routes. Named once so a future
+/// engine is added here, not forgotten — the omission #1638 is about.
+const ALL: [Lane; 5] = [
+    Lane::Engine(Backend::TreeWalk),
+    Lane::Engine(Backend::Bytecode),
+    Lane::Engine(Backend::Jit),
+    Lane::Jit(Route::Today),
+    Lane::Jit(Route::Kernel),
+];
+
+/// Run `src` on `lane`, returning `Ok(description)` if it produced an ordinary result and
+/// `Err(description)` if it ended abnormally, plus how long it took. `None` for the kernel route
+/// when `declined` names the clause that keeps `src` off it, as it must.
+fn run_on(
+    src: &str,
+    lane: Lane,
+    declined: Option<&'static str>,
+) -> Option<(Result<String, String>, Duration)> {
     let module = temen_text::parse_module(src).expect("parse");
     temen_verify::verify_module(&module).expect("verify");
-    let instance = instantiate(module).expect("instantiate");
     let t0 = Instant::now();
-    let r = instance.run(backend, &RunConfig::default());
-    let dt = t0.elapsed();
-    (
-        match r {
-            Ok(run) => Ok(format!("{:?}", run.outcome)),
-            Err(e) => Err(e),
-        },
-        dt,
-    )
+    let jit = |o: JitOutcome| match o {
+        JitOutcome::Returned(v) => Ok(v.iter().map(|x| format!("I64({x})")).collect()),
+        o => Err(format!("{o:?}")),
+    };
+    let r = match lane {
+        Lane::Engine(backend) => {
+            let instance = instantiate(module).expect("instantiate");
+            match instance.run(backend, &RunConfig::default()) {
+                Ok(run) => Ok(format!("{:?}", run.outcome)),
+                Err(e) => Err(e),
+            }
+        }
+        Lane::Jit(Route::Today) => jit(temen_jit::compile_and_run(&module, 0, &[]).expect("jit")),
+        Lane::Jit(Route::Kernel) => {
+            jit(jit_kernel::expect_kernel(&module, 0, &[], None, declined)?)
+        }
+    };
+    Some((r, t0.elapsed()))
 }
 
 /// The deadlock verdict must come from the predicate, not from a 10 s `MAX_WAIT` backstop —
@@ -67,9 +96,11 @@ fn run_on(src: &str, backend: Backend) -> (Result<String, String>, Duration) {
 const PROMPT: Duration = Duration::from_secs(4);
 
 /// Assert every backend ends `src` abnormally — a `ThreadFault` — and promptly.
-fn pin_all_fault(src: &str, what: &str) {
+fn pin_all_fault(src: &str, what: &str, declined: Option<&'static str>) {
     for backend in ALL {
-        let (r, dt) = run_on(src, backend);
+        let Some((r, dt)) = run_on(src, backend, declined) else {
+            continue;
+        };
         let e = match r {
             Ok(out) => panic!(
                 "{backend:?}: {what} must not come back as an ordinary result, got {out} in {dt:?}"
@@ -106,7 +137,11 @@ block 0 () {
 
 #[test]
 fn a_lone_infinite_wait_faults_on_every_backend() {
-    pin_all_fault(LONE_INFINITE_WAIT, "a lone unsatisfiable infinite wait");
+    pin_all_fault(
+        LONE_INFINITE_WAIT,
+        "a lone unsatisfiable infinite wait",
+        None,
+    );
 }
 
 /// **Shape 2 — the fiber case**, which #1638 calls out separately because it reaches a
@@ -158,6 +193,7 @@ fn an_infinite_wait_inside_a_fiber_faults_on_every_backend() {
     pin_all_fault(
         FIBER_INFINITE_WAIT,
         "an unsatisfiable infinite wait inside a fiber",
+        Some("fibers"),
     );
 }
 
@@ -181,7 +217,7 @@ block 0 () {
 #[test]
 fn a_finite_wait_with_no_notifier_still_times_out_on_every_backend() {
     for backend in ALL {
-        let (r, dt) = run_on(LONE_TIMED_WAIT, backend);
+        let (r, dt) = run_on(LONE_TIMED_WAIT, backend, None).expect("in the kernel's scope");
         let out = r.unwrap_or_else(|e| {
             panic!("{backend:?}: a finite wait is a timeout, not a deadlock: {e} in {dt:?}")
         });
@@ -193,9 +229,11 @@ fn a_finite_wait_with_no_notifier_still_times_out_on_every_backend() {
 }
 
 /// Assert every backend runs `src` to an ordinary result containing `want`.
-fn pin_all_completes(src: &str, want: &str, what: &str) {
+fn pin_all_completes(src: &str, want: &str, what: &str, declined: Option<&'static str>) {
     for backend in ALL {
-        let (r, dt) = run_on(src, backend);
+        let Some((r, dt)) = run_on(src, backend, declined) else {
+            continue;
+        };
         let out = r.unwrap_or_else(|e| panic!("{backend:?}: {what} must complete: {e} in {dt:?}"));
         assert!(
             out.contains(want),
@@ -266,6 +304,7 @@ fn a_joiner_whose_child_finished_is_not_counted_blocked() {
         JOIN_THEN_NOTIFY,
         "I64(300)",
         "join, then notify a waiting sibling",
+        None,
     );
 }
 
@@ -358,5 +397,6 @@ fn a_vcpu_driving_a_just_notified_fiber_is_not_counted_blocked() {
         NOTIFY_A_BLOCK_DRIVEN_FIBER_THEN_WAIT,
         "I64(300)",
         "notify a block-driven fiber, then wait for its reply",
+        Some("fibers"),
     );
 }

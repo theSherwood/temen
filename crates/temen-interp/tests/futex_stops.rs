@@ -28,7 +28,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use temen_interp::bytecode::{self, CoopEvent, CoopRun, ThreadPlatform};
+use temen_interp::bytecode::{self, CoopEvent, CoopRun, Opener, ThreadPlatform};
 use temen_interp::{Host, SignalSource, Trap, Value};
 
 /// One test at a time: [`threads_stop`] reads a count every thread of the process adds to.
@@ -155,16 +155,16 @@ block 4 () {
 /// Hand-offs enough that no test run finishes them.
 const FOREVER: i32 = i32::MAX;
 
-/// Whether the opener watches the run (the native platform), or runs its root, as a browser's
-/// Worker does, and nothing watches it.
-const OPENERS: [bool; 2] = [false, true];
+/// Whether the opener watches the run (the native platform), or runs its root, as a browser's Worker
+/// and the Cranelift JIT (#2958) do, with nothing watching it until a park starts a watcher.
+const OPENERS: [Opener; 2] = [Opener::Watches, Opener::RunsRoot];
 
 /// Run `src`'s function 0 with `args` on executor 2, over a host `setup` arms, on a thread of its
 /// own: its result arrives on the receiver.
 fn run(
     src: &str,
     args: Vec<Value>,
-    root_on_opener: bool,
+    opener: Opener,
     setup: impl FnOnce(&mut Host) + Send + 'static,
 ) -> std::sync::mpsc::Receiver<Result<Vec<Value>, Trap>> {
     let m = temen_text::parse_module(src).expect("parse");
@@ -173,7 +173,7 @@ fn run(
     std::thread::spawn(move || {
         let mut host = Host::new();
         host.set_thread_platform(ThreadPlatform {
-            root_on_opener,
+            opener,
             ..ThreadPlatform::OS
         });
         setup(&mut host);
@@ -204,19 +204,11 @@ fn the_last_park_of_two_mutual_waits_is_the_verdict_and_a_timed_one_moves() {
         let r = rx
             .recv_timeout(GIVE_UP)
             .expect("two untimed waits hung the run: no settle saw it go idle");
-        assert_eq!(
-            r,
-            Err(Trap::ThreadFault),
-            "a deadlock (opener runs root: {opener})"
-        );
+        assert_eq!(r, Err(Trap::ThreadFault), "a deadlock (opener: {opener:?})");
 
         let rx = run(&mutual_wait(10_000_000), Vec::new(), opener, |_| {});
         let r = rx.recv_timeout(GIVE_UP).expect("a timed wait hung the run");
-        assert_eq!(
-            r,
-            Ok(vec![Value::I64(2)]),
-            "timed out (opener runs root: {opener})"
-        );
+        assert_eq!(r, Ok(vec![Value::I64(2)]), "timed out (opener: {opener:?})");
     }
 }
 
@@ -239,15 +231,8 @@ fn a_stop_ends_a_futex_pingpong_at_once() {
             .recv_timeout(GIVE_UP)
             .expect("the stopped pingpong ran on");
         let took = asked.elapsed();
-        assert_eq!(
-            r,
-            Err(Trap::OutOfFuel),
-            "stopped (opener runs root: {opener})"
-        );
-        assert!(
-            took < PROMPT,
-            "the stop took {took:?} (opener runs root: {opener})"
-        );
+        assert_eq!(r, Err(Trap::OutOfFuel), "stopped (opener: {opener:?})");
+        assert!(took < PROMPT, "the stop took {took:?} (opener: {opener:?})");
     }
 }
 
@@ -298,15 +283,8 @@ fn a_kill_ends_a_futex_pingpong_at_once() {
             .recv_timeout(GIVE_UP)
             .expect("the killed pingpong ran on");
         let took = asked.elapsed();
-        assert_eq!(
-            r,
-            Err(Trap::ThreadFault),
-            "finalized (opener runs root: {opener})"
-        );
-        assert!(
-            took < PROMPT,
-            "the kill took {took:?} (opener runs root: {opener})"
-        );
+        assert_eq!(r, Err(Trap::ThreadFault), "finalized (opener: {opener:?})");
+        assert!(took < PROMPT, "the kill took {took:?} (opener: {opener:?})");
     }
 }
 
@@ -427,10 +405,15 @@ fn an_unwatched_pingpong_takes_the_fast_path_and_a_kill_still_ends_it() {
     let source = Arc::new(KillOnDemand::default());
     let src = Arc::clone(&source);
     let before = bytecode::futex_fast_stops();
-    let rx = run(PINGPONG, vec![Value::I32(FOREVER)], true, move |h| {
-        h.arm_external_wake();
-        h.set_signal_source(src, Arc::new(AtomicBool::new(false)));
-    });
+    let rx = run(
+        PINGPONG,
+        vec![Value::I32(FOREVER)],
+        Opener::RunsRoot,
+        move |h| {
+            h.arm_external_wake();
+            h.set_signal_source(src, Arc::new(AtomicBool::new(false)));
+        },
+    );
     // A release build keeps no count of its fast stops.
     if cfg!(debug_assertions) {
         let until = Instant::now() + GIVE_UP;
@@ -492,15 +475,8 @@ fn a_stop_asked_before_the_run_starts_ends_a_run_of_futex_stops_at_once() {
             .recv_timeout(GIVE_UP)
             .expect("the waits ran on past an early stop");
         let took = asked.elapsed();
-        assert_eq!(
-            r,
-            Err(Trap::OutOfFuel),
-            "stopped (opener runs root: {opener})"
-        );
-        assert!(
-            took < PROMPT,
-            "the stop took {took:?} (opener runs root: {opener})"
-        );
+        assert_eq!(r, Err(Trap::OutOfFuel), "stopped ({opener:?})");
+        assert!(took < PROMPT, "the stop took {took:?} ({opener:?})");
     }
 }
 
@@ -523,14 +499,7 @@ fn a_kill_asked_before_the_run_starts_ends_a_run_of_futex_stops_at_once() {
             .recv_timeout(GIVE_UP)
             .expect("the waits ran on past an early kill");
         let took = asked.elapsed();
-        assert_eq!(
-            r,
-            Err(Trap::ThreadFault),
-            "killed (opener runs root: {opener})"
-        );
-        assert!(
-            took < PROMPT,
-            "the kill took {took:?} (opener runs root: {opener})"
-        );
+        assert_eq!(r, Err(Trap::ThreadFault), "killed ({opener:?})");
+        assert!(took < PROMPT, "the kill took {took:?} ({opener:?})");
     }
 }

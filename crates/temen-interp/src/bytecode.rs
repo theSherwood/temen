@@ -8350,6 +8350,7 @@ impl ScheduledDebugRun {
                         spare: None,
                     },
                     suspended: None,
+                    native: None,
                 }),
                 domain: ts.domain,
                 state: match (&ts.state, readmit_parks) {
@@ -8833,20 +8834,107 @@ fn image_parks(host: &Host, m: &Module, census: &ImageCensus) -> Parks {
     }
     if m.imports.len() != host.import_bindings.len()
         || parks.contains(&OpParks::Otherwise)
-        || census.concurrency
+        || (census.concurrency && !parks_natively(host))
         || census.parks
     {
         return Parks::Otherwise;
     }
-    // #2050: past the check above, a futex op is a wait, which parks the process in its bounce.
-    let suspendable =
-        parks.contains(&OpParks::OnChildren) || parks.contains(&OpParks::OnHost) || census.futex;
+    // #2050: past the check above, a futex op is a wait, which parks the process in its bounce; on
+    // a native tier (#2958) a thread or notify op parks its task in place too.
+    let suspendable = parks.contains(&OpParks::OnChildren)
+        || parks.contains(&OpParks::OnHost)
+        || census.futex
+        || census.concurrency;
     let inline_streams =
         (census.stream_read && stream_op_parks(0)) || (census.stream_write && stream_op_parks(1));
     match suspendable || import_streams || inline_streams {
         true => Parks::Suspendably,
         false => Parks::Never,
     }
+}
+
+/// #2958 — whether `m`'s vCPUs can run as native tasks under `host`: emitted code that makes its §12
+/// ops itself ([`ThreadTier::native`]), on this run's rules. `Err` names the first clause that keeps
+/// the program on its engine's own thread runtime, decided before the run takes anything. This is
+/// the one place the two routes are chosen (INVARIANTS #13, #15): each clause is migration
+/// scaffolding, and names what removes it (#2958's plan, section B).
+///
+/// - **`no §12 op`**: a module with no thread, fiber or futex op keeps its single-threaded path,
+///   with no kernel (the phase that runs every JIT program on the kernel, after phase 2);
+/// - **`durable`**: executor 2 has no freeze driver (#2533; the phase that ports freeze);
+/// - **`bytecode`**: the rules need the module's bytecode compile ([`admits_for`]; slice 7);
+/// - **`no window`**: a thread of a module with no memory interprets ([`tierup_servable`]; slice 6);
+/// - **`fibers`**: a fiber's park runs on the engine's fiber runtime, whose futex core its vCPU
+///   waits share (phase 2);
+/// - **`gc.roots`**: the rules scan an interpreted task's frames, not native ones (a later phase,
+///   or for good if no consumer needs it);
+/// - **`signals`**: delivery into native code is the engine's safepoint redirect, not executor 2's
+///   interrupt (a later phase);
+/// - **`imports`**: an import may bind anything, a parking op or a page op included (slice 4);
+/// - **`cap`**: a `call.cap` other than a host procedure: a stream, a page op (the second page map,
+///   slice 3), a region, a child or a serve point (#2791, #2792), a §22 `Jit` op (one dispatch
+///   table, a later phase);
+/// - **`host-proc parks`**: a host procedure that may park, which needs the engine's own park
+///   (slice 5).
+///
+/// A held run never reaches this: its embedder runs it on the engine's own runtime (#2935).
+pub fn native_scope(m: &Module, host: &Host) -> Result<(), &'static str> {
+    use temen_ir::cap_id::HOST_PROC;
+    if !m
+        .funcs
+        .iter()
+        .any(|f| f.uses_fibers_or_threads() || f.uses_futex())
+    {
+        return Err("no §12 op");
+    }
+    if host.is_durable() {
+        return Err("durable");
+    }
+    if !admits_for(m, true) {
+        return Err("bytecode");
+    }
+    let spawns = m.funcs.iter().any(|f| f.uses_concurrency_besides_wait());
+    if m.memory.is_none() && spawns {
+        return Err("no window");
+    }
+    if m.funcs.iter().any(temen_ir::Func::uses_fibers) {
+        return Err("fibers");
+    }
+    if m.funcs.iter().any(temen_ir::Func::uses_gc_roots) {
+        return Err("gc.roots");
+    }
+    if host.signal_arm_pair().is_some() {
+        return Err("signals");
+    }
+    if !m.imports.is_empty() {
+        return Err("imports");
+    }
+    let mut host_call = false;
+    for i in m
+        .funcs
+        .iter()
+        .flat_map(|f| &f.blocks)
+        .flat_map(|b| &b.insts)
+    {
+        if let Inst::CapCall(c) = i {
+            if c.type_id != HOST_PROC {
+                return Err("cap");
+            }
+            host_call = true;
+        }
+    }
+    if host_call && host.host_procs_park() != super::OpParks::Never {
+        return Err("host-proc parks");
+    }
+    Ok(())
+}
+
+/// #2958 — whether `host`'s emitted tier makes the §12 thread ops itself ([`ThreadTier::native`]),
+/// so an image that spawns and joins runs whole on it.
+fn parks_natively(host: &Host) -> bool {
+    host.thread_platform()
+        .tier
+        .is_some_and(|t| t.native.is_some())
 }
 
 /// What an image's code does that decides how it runs whole on the emitted tier: the instruction
@@ -12571,6 +12659,7 @@ impl TaskSlot {
             vm: Box::new(TaskVm {
                 vt,
                 suspended: None,
+                native: None,
             }),
             domain,
             state: TaskState::Runnable,
@@ -12586,6 +12675,14 @@ impl TaskSlot {
     /// ([`TaskVm::parked_frame`]): a woken wait's status, a joined child's result, a call's reply. The
     /// one way the scheduler's rules write a task's registers, its own included.
     fn deliver(&mut self, dst: u32, value: Reg) {
+        // #2958 — a native task's parked op has no frame: its results land in its cell.
+        if let Some(cell) = self.vm.native.as_mut() {
+            debug_assert!((dst as usize) < cell.len(), "a native result past its cell");
+            if let Some(r) = cell.get_mut(dst as usize) {
+                *r = value;
+            }
+            return;
+        }
         self.vm.parked_frame().set(dst, value);
     }
 
@@ -12605,6 +12702,9 @@ struct TaskVm {
     /// #1896 — the rest of a call that parked in a bounce out of this task's emitted leaf, run once
     /// the park clears.
     suspended: Option<Box<Suspended>>,
+    /// #2958 — set while a native task's §12 op is parked ([`BounceTask::park_native`]): where the
+    /// rules deliver its results, from register 0.
+    native: Option<[Reg; 2]>,
 }
 
 impl TaskVm {
@@ -16663,7 +16763,7 @@ impl CoopRun {
     /// wake from another of the embedder's threads ([`RunDoor::wake`], [`CoopEvent::Paused`]); or its
     /// end. After an idle, the pumping thread may [`wait`](Self::wait) for the run to change.
     /// Otherwise the run tells of nothing, and its first `run` returns at its end, with the root on
-    /// this thread where the platform says so ([`ThreadPlatform::root_on_opener`]). A browser's Worker
+    /// this thread where the platform says so ([`ThreadPlatform::opener`]). A browser's Worker
     /// runs a program that declares no host-answered call and is fed no input so.
     ///
     /// Its emitted tier is the platform's, so it surfaces no tier-up and no §22 invoke, and a
@@ -16681,18 +16781,54 @@ impl CoopRun {
         back: Option<std::sync::Arc<super::Region>>,
         pump: bool,
     ) -> Option<Result<CoopRun, Trap>> {
+        match Self::open_parallel(
+            m,
+            entry,
+            args,
+            fuel,
+            host,
+            init_mem,
+            reserved_log2,
+            back,
+            pump,
+        ) {
+            Ok(run) => Some(Ok(run)),
+            Err(refused) => refused.0.map(Err),
+        }
+    }
+
+    /// [`Self::new_parallel`], giving the host back whenever no run starts: with the trap that
+    /// refused it (its window, or the process's room for its activation), or with none when `m` is
+    /// outside the engine's subset or its host is durable. For an embedder whose caller keeps its host
+    /// whatever the run does (#2958, the Cranelift JIT's kernel route).
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_parallel(
+        m: &Module,
+        entry: FuncIdx,
+        args: &[Value],
+        fuel: u64,
+        host: Host,
+        init_mem: &[u8],
+        reserved_log2: u8,
+        back: Option<std::sync::Arc<super::Region>>,
+        pump: bool,
+    ) -> Result<CoopRun, Box<(Option<Trap>, Host)>> {
         let (source, table, mem) =
-            match parallel_domain(m, entry, &host, reserved_log2, back, init_mem)? {
-                Ok(start) => start,
-                Err(t) => return Some(Err(t)),
+            match parallel_domain(m, entry, &host, reserved_log2, back, init_mem) {
+                Some(Ok(start)) => start,
+                Some(Err(t)) => return Err(Box::new((Some(t), host))),
+                None => return Err(Box::new((None, host))),
             };
         let leaf = host.thread_platform().tier.and_then(|t| t.leaf);
         let leaf = leaf.and_then(|emit| root_leaf(&emit, m, &source, entry, &host, mem.as_ref()));
         match ThreadsRun::open(source, table, entry, args, fuel, mem, host, pump, leaf) {
-            Ok(t) => Some(Ok(CoopRun {
+            Ok(t) => Ok(CoopRun {
                 exec: CoopExec::Threads(t),
-            })),
-            Err(refused) => Some(Err(refused.0)),
+            }),
+            Err(refused) => {
+                let (t, host, _) = *refused;
+                Err(Box::new((Some(t), host)))
+            }
         }
     }
 
@@ -17849,7 +17985,7 @@ struct ThreadRun {
     bell: super::Bell,
     /// The hook a punted call's store calls as its answer posts: ring [`Self::bell`].
     on_answer: std::sync::Arc<dyn Fn() + Send + Sync>,
-    /// Whether the thread that opened the run watches it ([`ThreadPlatform::root_on_opener`]), or
+    /// Whether the thread that opened the run watches it ([`ThreadPlatform::opener`]), or
     /// its embedder, while it pumps it. A run nobody watches starts a watcher of its own
     /// ([`Self::start_watcher`]).
     watched: bool,
@@ -17940,13 +18076,22 @@ pub struct ThreadPlatform {
     pub now_ns: fn() -> u64,
     /// The emitted tier the run's tasks tier up to, if any ([`ThreadTier`]).
     pub tier: Option<ThreadTier>,
-    /// Whether the thread that opens a run runs its root task too. Otherwise the root starts on a
-    /// thread of its own, like every other task, and the opener watches the run: it settles the run
-    /// on each ring of the run's bell. A browser opens a run on the Worker the page started for its
-    /// root, since another Worker costs a run about 11 ms to start, and its page cannot wait to
-    /// watch. Such a run starts a watcher of its own only once a task parks on what only a ring of
-    /// its bell ends (#2757).
-    pub root_on_opener: bool,
+    /// What the thread that opens a run does ([`Opener`]).
+    pub opener: Opener,
+}
+
+/// What the thread that opens a run on executor 2 does ([`ThreadPlatform::opener`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Opener {
+    /// It watches the run: it settles the run on each ring of the run's bell, and the root starts on
+    /// a thread of its own, like every other task.
+    Watches,
+    /// It runs the root task, and the run starts a watcher of its own only once a task parks on what
+    /// only a ring of its bell ends (#2757). A browser opens a run on the Worker the page started for
+    /// its root, since another Worker costs a run about 11 ms to start, and its page cannot wait to
+    /// watch. The Cranelift JIT's too (#2958): its root runs on the embedder's calling thread, as it
+    /// does off executor 2. A futex stop needs no watcher to skip its settle (#2982).
+    RunsRoot,
 }
 
 /// A thread a run starts ([`ThreadPlatform::spawn`]), for the platform to run on a thread of its own.
@@ -17962,7 +18107,7 @@ impl ThreadPlatform {
         spawn: |f, _| std::thread::Builder::new().spawn(f).map(drop),
         now_ns: sched_wall_now,
         tier: None,
-        root_on_opener: false,
+        opener: Opener::Watches,
     };
 }
 
@@ -17994,6 +18139,34 @@ pub struct ThreadTier {
     /// ([`EmittedCall::over`]) it returns by the emitted code's next fuel check, whatever it
     /// returns: the run waits for its thread.
     pub run: fn(&mut EmittedCall<'_>) -> Result<(), Trap>,
+    /// #2958 — a tier whose emitted code makes the §12 thread ops itself and parks its own frames
+    /// for them ([`EmittedCall::park`]): the Cranelift JIT's, for a program [`native_scope`]
+    /// admits. `None` for a tier that bounces them to the interpreter.
+    pub native: Option<NativeTier>,
+}
+
+/// #2958 — what a native tier needs from the run beyond [`ThreadTier`].
+#[derive(Clone)]
+pub struct NativeTier {
+    /// Called once as the run ends ([`ThreadRun::conclude`]): the tier's running code, which does not
+    /// read [`EmittedCall::over`], stops at its next poll of its domain's end. (Scaffolding: one end
+    /// word both sides share replaces it, #2958 slice 1b.)
+    pub on_end: std::sync::Arc<dyn Fn() + Send + Sync>,
+    /// The tier's own run state, for its [`ThreadTier::run`] to find ([`EmittedCall::native`]).
+    pub state: std::sync::Arc<dyn std::any::Any + Send + Sync>,
+}
+
+pub use temen_ir::seams::NativeStop;
+
+/// #2958 — whether an emitted call is its task's whole run ([`EmittedCall::entry`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CallEntry {
+    /// A call the task's interpreted code made, or a §22 invoke.
+    Call,
+    /// The run's root task's entry.
+    Root,
+    /// A spawned thread's entry.
+    Thread,
 }
 
 /// What a call on the emitted tier runs ([`EmittedCall::target`]).
@@ -18038,8 +18211,17 @@ pub struct EmittedCall<'a> {
     /// guard left (#2126). `run` sets it, and the task's window records it, as it records an
     /// interpreted fault (#2275).
     pub fault: Option<u64>,
-    /// A call out of the emitted code back into the interpreter ([`Bounce`]).
-    pub bounce: &'a mut Bounce<'a>,
+    /// #2958 — the task's `vcpu.tls` seed: its id in its domain.
+    pub tls: i64,
+    /// #2958 — whether the call is its task's entry, which the task ran whole ([`CallEntry`]).
+    pub entry: CallEntry,
+    /// #2958 — on a native tier, the budget node the task's fuel draws from (`None` when its fuel
+    /// is a fixed allowance, or the tier is not native): what the tier's own fuel cell charges, so
+    /// its code burns from the one source a task's fuel has.
+    pub fuel_node: Option<super::NodeRef>,
+    /// What the emitted code calls back into on its task ([`TaskSeam`]).
+    seam: &'a mut dyn TaskSeam,
+    native: Option<&'a NativeTier>,
     table: &'a SharedSlots,
     host: &'a std::sync::Mutex<super::Host>,
     now: &'a std::cell::Cell<u64>,
@@ -18048,6 +18230,37 @@ pub struct EmittedCall<'a> {
 }
 
 impl EmittedCall<'_> {
+    /// A call out of the emitted code back into the interpreter (`env.call_interp`): function
+    /// `target` of the task's dispatch table, its arguments in `io` and its results written back
+    /// over them, run over the task's live window and powerbox, with how many words the emitted
+    /// frames beneath it pushed to the thread's spill stack ([`EmittedCall::spill`]). Returns how
+    /// many results it wrote.
+    #[inline]
+    pub fn bounce(&mut self, target: u32, io: &mut [i64], pushed: usize) -> Result<usize, Trap> {
+        self.seam.bounce(target, io, pushed)
+    }
+
+    /// #2958 — apply §12 op `stop` for the task this call runs, as the rules apply an interpreted
+    /// op's, parking this thread with the emitted frames on its stack until the task can run:
+    /// `(status, value)` for a join, the result in `[0]` otherwise. `Err` when the task or the run
+    /// ended meanwhile, or the op traps; the emitted code then unwinds. Only a native tier's code
+    /// makes one ([`ThreadTier::native`]).
+    #[inline]
+    pub fn park(&mut self, stop: NativeStop) -> Result<[i64; 2], Trap> {
+        self.seam.park(stop)
+    }
+
+    /// #2958 — the powerbox the call runs under: its domain's host cell, which a native tier's
+    /// `call.cap`s serialize through.
+    pub fn host_cell(&self) -> *const std::sync::Mutex<super::Host> {
+        self.host
+    }
+
+    /// #2958 — the run's native tier ([`ThreadTier::native`]), if its tier is one.
+    pub fn native(&self) -> Option<&NativeTier> {
+        self.native
+    }
+
     /// The generation of the task's dispatch table: it moves with every install and uninstall, so
     /// a host that mirrors the table in emitted code rebuilds only when it changed.
     pub fn table_gen(&self) -> u32 {
@@ -18146,11 +18359,142 @@ struct SurfacedInvoke {
 /// A task a stop made, with the window view and fuel hand its new thread starts with.
 type NewTask = (usize, Option<Mem>, Fuel);
 
-/// A call out of emitted code back into the interpreter (`env.call_interp`): function
-/// `target` of the task's dispatch table, its arguments in `io` and its results written back over
-/// them, run over the task's live window and powerbox, with how many words the emitted frames beneath
-/// it pushed to the thread's spill stack ([`EmittedCall::spill`]). Returns how many results it wrote.
-pub type Bounce<'a> = dyn FnMut(u32, &mut [i64], usize) -> Result<usize, Trap> + 'a;
+/// What emitted code calls back into on its task ([`EmittedCall::bounce`], [`EmittedCall::park`]):
+/// one borrow of the task, its window and its fuel for the call, so neither path needs a runtime
+/// borrow check (#2958).
+trait TaskSeam {
+    fn bounce(&mut self, target: u32, io: &mut [i64], pushed: usize) -> Result<usize, Trap>;
+    fn park(&mut self, stop: NativeStop) -> Result<[i64; 2], Trap>;
+}
+
+/// [`ThreadRun::emitted`]'s seam: what one emitted call's bounces and parks run over.
+struct CallSeam<'s, 'f, 't> {
+    run: &'s ThreadRun,
+    table: &'s SharedSlots,
+    fuel: &'s mut Fuel,
+    mem: &'s mut Option<Mem>,
+    host: &'s std::sync::Mutex<super::Host>,
+    fibers: &'s mut FiberCell<'f>,
+    task: Option<BounceTask<'t>>,
+    spill: &'s [u64],
+    pages: &'s mut PageTable,
+    paged: bool,
+    now: &'s std::cell::Cell<u64>,
+    pagestate: &'s std::cell::Cell<(*const u8, usize)>,
+}
+
+impl TaskSeam for CallSeam<'_, '_, '_> {
+    fn bounce(&mut self, target: u32, io: &mut [i64], pushed: usize) -> Result<usize, Trap> {
+        let host = self.host;
+        // A tier that does not spill, or a count past its stack, leaves `gc.roots` refused: a scan
+        // that cannot see the emitted frames' words would miss roots.
+        let words = (!self.spill.is_empty())
+            .then(|| self.spill.get(..pushed))
+            .flatten();
+        let mut parked = None;
+        let first = self.task.as_ref().zip(words).map(|(t, w)| t.beneath(w));
+        let mut ran = coop_bounce(
+            &self.run.source,
+            self.table,
+            self.fuel,
+            self.mem,
+            &mut HostCell::Shared(host),
+            self.fibers,
+            self.task.as_ref().map(|_| BounceRunCtx {
+                park: Some(&mut parked),
+            }),
+            target,
+            io,
+            first.as_ref(),
+        );
+        drop(first);
+        // #2443 — the call stopped for its task's scheduler: the task stops with it, and the call
+        // runs on once the task can, until it returns.
+        while let Some((cont, stop)) = parked.take() {
+            let cont = self
+                .task
+                .as_mut()
+                .ok_or(Trap::Malformed)?
+                .park(cont, stop)?;
+            let under = self.task.as_ref().zip(words).map(|(t, w)| t.beneath(w));
+            ran = drive_nested(
+                &self.run.source,
+                self.table,
+                VTask::of(cont, 0),
+                self.fuel,
+                self.mem,
+                &mut HostCell::Shared(host),
+                self.fibers,
+                Some(BounceRunCtx {
+                    park: Some(&mut parked),
+                }),
+                under.as_ref(),
+                false,
+            )
+            .map(|ran| {
+                let vals = ran.done();
+                for (slot, v) in io.iter_mut().zip(&vals) {
+                    *slot = val_to_slot(*v);
+                }
+                vals.len()
+            });
+        }
+        // The bounce may have grown the window or moved its page map, which the emitted code reads
+        // again after it.
+        match self.mem.as_ref() {
+            Some(m) if self.paged => {
+                self.now.set(self.pages.sync(m));
+                self.pagestate
+                    .set((self.pages.table.as_ptr(), self.pages.table.len()));
+            }
+            m => self
+                .now
+                .set(m.map_or(0, |m| m.scalar_extent().unwrap_or(0))),
+        }
+        ran
+    }
+
+    fn park(&mut self, stop: NativeStop) -> Result<[i64; 2], Trap> {
+        let m = self.mem.as_ref();
+        let stop = match stop {
+            NativeStop::Spawn { func, arg0, arg1 } => VcpuStop::Spawn {
+                func,
+                arg0,
+                arg1,
+                dst: 0,
+                module: 0,
+            },
+            NativeStop::Join { handle } => VcpuStop::Join { handle, dst: 0 },
+            NativeStop::Wait {
+                addr,
+                expected,
+                wide,
+                timeout,
+            } => {
+                let ty = if wide { IntTy::I64 } else { IntTy::I32 };
+                let width = super::atomic_width(ty);
+                VcpuStop::Wait {
+                    base: m.ok_or(Trap::Malformed)?.prepare_wait(addr, ty)?,
+                    expected: expected & super::width_mask(width),
+                    width,
+                    timeout: (timeout >= 0).then_some(timeout as u64),
+                    dst: 0,
+                }
+            }
+            NativeStop::Notify { addr, count } => VcpuStop::Notify {
+                base: m.ok_or(Trap::Malformed)?.confine_for_notify(addr)?,
+                count,
+                dst: 0,
+            },
+        };
+        let cell = self
+            .task
+            .as_mut()
+            .ok_or(Trap::Malformed)?
+            .park_native(stop)?;
+        Ok([cell[0].i64(), cell[1].i64()])
+    }
+}
 
 /// A thread steps this many tier-ups at most before it looks at the run, as a preemption makes it:
 /// a loop of calls that each tier up never spends a quantum.
@@ -18202,7 +18546,7 @@ enum ParkFor {
 /// on the wall clock (the core's `clock` reads nanoseconds since the run started, so the rules'
 /// deadline arithmetic is the pump's); a fiber op takes the core's lock ([`FiberCell::Core`]); the
 /// root runs on a thread of its own while this one watches the run, settling it on each ring of its
-/// bell ([`ThreadRun::watch`]), unless this thread runs the root ([`ThreadPlatform::root_on_opener`]),
+/// bell ([`ThreadRun::watch`]), unless this thread runs the root ([`ThreadPlatform::opener`]),
 /// when the run starts a watcher of its own once it needs one ([`ThreadRun::start_watcher`]); no
 /// parked thread polls (#2757); and the run ends when its root does, the other tasks stopping at
 /// their next look, or with the pump's deadlock verdict ([`ThreadRun::settle`]). It returns once
@@ -18272,7 +18616,12 @@ impl ThreadRun {
         let Some(node) = host.begin_activation(fuel, RootWindow::of(mem.as_ref())) else {
             return Err(Box::new((Trap::ThreadFault, host, mem)));
         };
-        let root_fuel = Fuel::drawn(node);
+        // #2958 — on a native tier every task's code burns its tier's own cell, which draws from this
+        // node ([`EmittedCall::fuel_node`]): the run's fuel, and every task's hand of it, only names it.
+        let root_fuel = match parks_natively(&host) {
+            true => Fuel::native(node),
+            false => Fuel::drawn(node),
+        };
         // The run's processes ring its bell, armed by the embedder or the run's own.
         let bell = host.external_wake().unwrap_or_default();
         let root = host.into_cell();
@@ -18289,7 +18638,7 @@ impl ThreadRun {
             (host.run_door(), host.thread_platform())
         };
         let watched = match driver {
-            Driver::Platform => !platform.root_on_opener,
+            Driver::Platform => platform.opener == Opener::Watches,
             Driver::Embedder => true,
             Driver::Held => false,
         };
@@ -18358,7 +18707,7 @@ impl ThreadRun {
         self.start_thread(move || run_task_thread(r, 0, view, hand), None);
     }
 
-    /// Run the root on this thread, the opener's ([`ThreadPlatform::root_on_opener`]).
+    /// Run the root on this thread, the opener's ([`ThreadPlatform::opener`]).
     fn run_root_here(self: &std::sync::Arc<Self>) {
         let (view, hand) = self.state.lock_unpoisoned().hand(0);
         run_task_thread(std::sync::Arc::clone(self), 0, view, hand);
@@ -18623,6 +18972,45 @@ impl BounceTask<'_> {
             _ => Err(Trap::ThreadFault),
         }
     }
+
+    /// #2958 — [`park`](Self::park) for a native tier's own §12 op: the same rules and the same wait,
+    /// with no continuation. The task's VM goes back to the table with a result cell
+    /// ([`TaskVm::native`]) the rules deliver into, and the thread takes the cell back when the task
+    /// can run. A stop that does not park (a spawn, a notify, a wait the rules answer at once)
+    /// returns as soon as it is applied.
+    fn park_native(&mut self, stop: VcpuStop) -> Result<[Reg; 2], Trap> {
+        let (run, ti) = (self.run, self.ti);
+        let mut g = run.state.lock_unpoisoned();
+        if g.over.is_some() || matches!(g.core.tasks[ti].state, TaskState::Done(_)) {
+            return Err(Trap::ThreadFault);
+        }
+        std::mem::swap(&mut *g.core.tasks[ti].vm, self.vm);
+        g.core.tasks[ti].vm.native = Some([Reg::default(); 2]);
+        let (made, _) = run.apply(&mut g, ti, Ok(stop), *self.exits);
+        g = start_tasks(run, g, made);
+        let runs = loop {
+            let next;
+            (g, next) = run.await_runnable(g, ti, false);
+            match next {
+                Next::Run => break true,
+                Next::Stop => break false,
+                Next::Carry(a) => {
+                    let (view, _) = g.hand(0);
+                    g = carry(run, g, a, view, Fuel::fixed(0));
+                }
+            }
+        };
+        std::mem::swap(&mut *g.core.tasks[ti].vm, self.vm);
+        *self.exits = g.core.hooked_twins.len();
+        // A rule that ended the task (a trap, its domain's end) leaves it `Done`: its op does not
+        // return.
+        let ended = matches!(g.core.tasks[ti].state, TaskState::Done(_));
+        release(g);
+        match self.vm.native.take() {
+            Some(cell) if runs && !ended => Ok(cell),
+            _ => Err(Trap::ThreadFault),
+        }
+    }
 }
 
 /// Let go of executor 2's lock, then signal the threads its holder woke ([`ThreadRun::wake`]).
@@ -18673,6 +19061,11 @@ impl ThreadRun {
                     let tier = self.platform.tier.as_ref().ok_or(Trap::Malformed)?;
                     let paged = vm.vt.active.jit_page_checked;
                     let target = EmittedTarget::Region { module, func };
+                    let entry = match dst {
+                        TierUpDst::Frame(_) => CallEntry::Call,
+                        TierUpDst::Entry { .. } if ti == 0 => CallEntry::Root,
+                        TierUpDst::Entry { .. } => CallEntry::Thread,
+                    };
                     let task = BounceTask {
                         run: self,
                         ti,
@@ -18685,7 +19078,7 @@ impl ThreadRun {
                         Some(task),
                         ctx,
                         state,
-                        target,
+                        (target, entry),
                         &argv,
                         (mapped, paged),
                     )?;
@@ -18774,6 +19167,7 @@ impl ThreadRun {
         };
         let mut cell = fibers.cell();
         let at = (inv.mapped, tier.root.page_checked);
+        let target = (target, CallEntry::Call);
         let (vals, _) = self.emitted(tier, &mut cell, None, ctx, state, target, &inv.argv, at)?;
         // A short reply is malformed, as the pump's `deliver_jit_invoke_vals` has it.
         if vals.len() < inv.results.len() {
@@ -18798,10 +19192,10 @@ impl ThreadRun {
         &self,
         tier: &ThreadTier,
         fibers: &mut FiberCell,
-        mut task: Option<BounceTask<'_>>,
+        task: Option<BounceTask<'_>>,
         ctx: &mut RunCtx,
         state: &mut TierState,
-        target: EmittedTarget<'_>,
+        (target, entry): (EmittedTarget<'_>, CallEntry),
         argv: &[i64],
         at: (u64, bool),
     ) -> Result<(Vec<i64>, u64), Trap> {
@@ -18836,64 +19230,21 @@ impl ThreadRun {
             table, fuel, mem, ..
         } = ctx;
         let table: &SharedSlots = table;
-        let mut bounce = |target: u32, io: &mut [i64], pushed: usize| {
-            // A tier that does not spill, or a count past its stack, leaves `gc.roots` refused: a
-            // scan that cannot see the emitted frames' words would miss roots.
-            let words = (!spill.is_empty()).then(|| spill.get(..pushed)).flatten();
-            let mut parked = None;
-            let first = task.as_ref().zip(words).map(|(t, w)| t.beneath(w));
-            let mut ran = coop_bounce(
-                &self.source,
-                table,
-                fuel,
-                mem,
-                &mut HostCell::Shared(host),
-                fibers,
-                task.as_ref().map(|_| BounceRunCtx {
-                    park: Some(&mut parked),
-                }),
-                target,
-                io,
-                first.as_ref(),
-            );
-            drop(first);
-            // #2443 — the call stopped for its task's scheduler: the task stops with it, and the
-            // call runs on once the task can, until it returns.
-            while let Some((cont, stop)) = parked.take() {
-                let cont = task.as_mut().ok_or(Trap::Malformed)?.park(cont, stop)?;
-                let under = task.as_ref().zip(words).map(|(t, w)| t.beneath(w));
-                ran = drive_nested(
-                    &self.source,
-                    table,
-                    VTask::of(cont, 0),
-                    fuel,
-                    mem,
-                    &mut HostCell::Shared(host),
-                    fibers,
-                    Some(BounceRunCtx {
-                        park: Some(&mut parked),
-                    }),
-                    under.as_ref(),
-                    false,
-                )
-                .map(|ran| {
-                    let vals = ran.done();
-                    for (slot, v) in io.iter_mut().zip(&vals) {
-                        *slot = val_to_slot(*v);
-                    }
-                    vals.len()
-                });
-            }
-            // The bounce may have grown the window or moved its page map, which the emitted code
-            // reads again after it.
-            match mem.as_ref() {
-                Some(m) if paged => {
-                    now.set(pages.sync(m));
-                    pagestate.set((pages.table.as_ptr(), pages.table.len()));
-                }
-                m => now.set(m.map_or(0, |m| m.scalar_extent().unwrap_or(0))),
-            }
-            ran
+        let tls = task.as_ref().map_or(0, |t| t.vm.vt.active.tls);
+        let fuel_node = tier.native.as_ref().and_then(|_| fuel.source());
+        let mut seam = CallSeam {
+            run: self,
+            table,
+            fuel,
+            mem,
+            host,
+            fibers,
+            task,
+            spill,
+            pages,
+            paged,
+            now: &now,
+            pagestate: &pagestate,
         };
         let mut call = EmittedCall {
             target,
@@ -18905,7 +19256,11 @@ impl ThreadRun {
             results: Vec::new(),
             work: 0,
             fault: None,
-            bounce: &mut bounce,
+            tls,
+            entry,
+            fuel_node,
+            seam: &mut seam,
+            native: tier.native.as_ref(),
             table,
             host,
             now: &now,
@@ -18914,7 +19269,7 @@ impl ThreadRun {
         };
         let ran = (tier.run)(&mut call);
         let (results, work, fault) = (call.results, call.work, call.fault);
-        if let (Err(Trap::MemoryFault), Some(rel), Some(m)) = (&ran, fault, mem.as_ref()) {
+        if let (Err(Trap::MemoryFault), Some(rel), Some(m)) = (&ran, fault, seam.mem.as_ref()) {
             m.report_fault_rel(rel);
         }
         ran.map(|()| (results, work))
@@ -18944,6 +19299,10 @@ impl ThreadRun {
         if g.over.is_none() {
             g.over = Some(res);
             self.over.store(true, std::sync::atomic::Ordering::SeqCst);
+            // #2958 — a native tier's running code does not read `over`.
+            if let Some(n) = self.platform.tier.as_ref().and_then(|t| t.native.as_ref()) {
+                (n.on_end)();
+            }
             // Its watcher has to look in order to leave.
             self.ring();
         }
@@ -19629,7 +19988,7 @@ impl ThreadRun {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Driver {
     /// Nothing outside it: the opener runs its root where the platform says so
-    /// ([`ThreadPlatform::root_on_opener`]), or watches it.
+    /// ([`ThreadPlatform::opener`]), or watches it.
     Platform,
     /// An embedder that pumps it ([`ThreadsRun`]): the opener watches it, whatever the platform says.
     Embedder,

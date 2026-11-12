@@ -15,6 +15,7 @@
 
 use temen_interp::{run, Trap, Value};
 use temen_jit::{compile_and_run, JitOutcome, TrapKind};
+use temen_run::jit_kernel::{self, Route};
 use temen_text::parse_module;
 use temen_verify::verify_module;
 
@@ -106,19 +107,32 @@ fn trap_matches(t: &Trap, k: &TrapKind) -> bool {
     t.code() == k.code() // one wire code for both engines (#1735)
 }
 
-fn assert_jit_matches_interp(src: &str) {
+/// The JIT's outcome on each route a case runs on while both exist (#2958): today's thread runtime,
+/// and the kernel's, unless `declined` names the clause that keeps the case off it.
+fn jit_routes(m: &temen_ir::Module, declined: Option<&'static str>) -> Vec<JitOutcome> {
+    Route::BOTH
+        .iter()
+        .filter_map(|r| match r {
+            Route::Today => Some(compile_and_run(m, 0, &[]).expect("jit compile/run")),
+            Route::Kernel => jit_kernel::expect_kernel(m, 0, &[], None, declined),
+        })
+        .collect()
+}
+
+fn assert_jit_matches_interp(src: &str, declined: Option<&'static str>) {
     let m = parse_module(src).unwrap_or_else(|e| panic!("parse: {e:?}\n{src}"));
     verify_module(&m).unwrap_or_else(|e| panic!("verify: {e:?}\n{src}"));
     let mut fuel = 50_000_000u64;
     let interp = run(&m, 0, &[], &mut fuel);
-    let jit = compile_and_run(&m, 0, &[]).expect("jit compile/run");
-    match (&interp, &jit) {
-        (Ok(vals), JitOutcome::Returned(slots)) => {
-            let want: Vec<i64> = vals.iter().map(to_slot).collect();
-            assert_eq!(&want, slots, "interp vs jit results differ\n{src}");
+    for jit in jit_routes(&m, declined) {
+        match (&interp, &jit) {
+            (Ok(vals), JitOutcome::Returned(slots)) => {
+                let want: Vec<i64> = vals.iter().map(to_slot).collect();
+                assert_eq!(&want, slots, "interp vs jit results differ\n{src}");
+            }
+            (Err(t), JitOutcome::Trapped(k)) if trap_matches(t, k) => {}
+            _ => panic!("interp {interp:?} vs jit {jit:?} disagree\n{src}"),
         }
-        (Err(t), JitOutcome::Trapped(k)) if trap_matches(t, k) => {}
-        _ => panic!("interp {interp:?} vs jit {jit:?} disagree\n{src}"),
     }
 }
 
@@ -148,7 +162,7 @@ fn thread_spawn_join_sums_results() {
         \x20 return v1\n\
           }\n\
         }\n";
-    assert_jit_matches_interp(src);
+    assert_jit_matches_interp(src, Some("no window"));
 }
 
 /// Four worker threads each `atomic.rmw.add` a shared counter 100×; the total is exactly 400 on every
@@ -156,7 +170,7 @@ fn thread_spawn_join_sums_results() {
 /// i64 counter, `mem[16400+4i]` i32 handle of worker `i`.
 #[test]
 fn thread_atomic_counter() {
-    assert_jit_matches_interp(ATOMIC4);
+    assert_jit_matches_interp(ATOMIC4, None);
 }
 
 /// **Real multi-core execution.** The same counter with four vCPUs on real OS threads (1:1, the VM's
@@ -169,9 +183,11 @@ fn thread_parallel_atomic_counter() {
     let m = parse_module(ATOMIC4).expect("parse");
     verify_module(&m).expect("verify");
     for _ in 0..40 {
-        match compile_and_run(&m, 0, &[]).expect("jit") {
-            JitOutcome::Returned(x) => assert_eq!(x, [400], "parallel total wrong"),
-            other => panic!("unexpected {other:?}"),
+        for jit in jit_routes(&m, None) {
+            match jit {
+                JitOutcome::Returned(x) => assert_eq!(x, [400], "parallel total wrong"),
+                other => panic!("unexpected {other:?}"),
+            }
         }
     }
 }
@@ -212,7 +228,7 @@ const FUTEX: &str = "memory 16\n\
 
 #[test]
 fn thread_futex_handoff() {
-    assert_jit_matches_interp(FUTEX);
+    assert_jit_matches_interp(FUTEX, None);
 }
 
 /// The futex handoff with real parallel vCPUs: the consumer genuinely parks on `atomic.wait` (on its
@@ -223,9 +239,11 @@ fn thread_parallel_futex_handoff() {
     let m = parse_module(FUTEX).expect("parse");
     verify_module(&m).expect("verify");
     for _ in 0..40 {
-        match compile_and_run(&m, 0, &[]).expect("jit") {
-            JitOutcome::Returned(x) => assert_eq!(x, [987654], "parallel futex payload wrong"),
-            other => panic!("unexpected {other:?}"),
+        for jit in jit_routes(&m, None) {
+            match jit {
+                JitOutcome::Returned(x) => assert_eq!(x, [987654], "parallel futex payload wrong"),
+                other => panic!("unexpected {other:?}"),
+            }
         }
     }
 }
@@ -264,7 +282,7 @@ fn thread_with_fiber_inside() {
         \x20 return v2\n\
           }\n\
         }\n";
-    assert_jit_matches_interp(src);
+    assert_jit_matches_interp(src, Some("no window"));
 }
 
 /// Fibers + threads on the **parallel** pool: four worker threads each drive their own generator fiber
@@ -345,13 +363,15 @@ fn thread_parallel_with_fibers() {
     verify_module(&m).expect("verify");
     // Σ over i in 0..4 of (i*10 + 42) = (0+10+20+30) + 4*42 = 60 + 168 = 228.
     for _ in 0..40 {
-        match compile_and_run(&m, 0, &[]).expect("jit") {
-            JitOutcome::Returned(x) => assert_eq!(x, [228], "parallel fiber+thread sum wrong"),
-            other => panic!("unexpected {other:?}"),
+        for jit in jit_routes(&m, Some("fibers")) {
+            match jit {
+                JitOutcome::Returned(x) => assert_eq!(x, [228], "parallel fiber+thread sum wrong"),
+                other => panic!("unexpected {other:?}"),
+            }
         }
     }
     // And it matches the interpreter (cooperative).
-    assert_jit_matches_interp(src);
+    assert_jit_matches_interp(src, Some("fibers"));
 }
 
 /// Joining the same handle twice finds it spent the second time → status `-EBADF` (#2667), on both
@@ -373,7 +393,7 @@ fn thread_double_join_is_spent() {
         \x20 return v1\n\
           }\n\
         }\n";
-    assert_jit_matches_interp(src);
+    assert_jit_matches_interp(src, Some("no window"));
 }
 
 /// **The fiber handle namespace is domain-wide on both backends (D57 3b-ii).** The JIT's fiber
@@ -419,7 +439,7 @@ fn fiber_namespace_is_domain_wide() {
         \x20 return v1\n\
           }\n\
         }\n";
-    assert_jit_matches_interp(src);
+    assert_jit_matches_interp(src, Some("no window"));
     // Pin the absolute result too (worker handle 1 ⇒ join 1 ⇒ 100, + root fiber's 7+41 = 148):
     // the old per-thread JIT tables produced 48 here (worker handle 0).
     let m = parse_module(src).expect("parse");
@@ -466,7 +486,7 @@ fn fiber_suspended_on_root_migrates_to_spawned_vcpu() {
           }\n\
         }\n";
     // Both backends agree (the differential)…
-    assert_jit_matches_interp(src);
+    assert_jit_matches_interp(src, Some("no window"));
     // …and the absolute migration semantics: the fiber *continued* on the worker, stack intact.
     let m = parse_module(src).expect("parse");
     let mut fuel = 1_000_000u64;
@@ -615,9 +635,11 @@ fn concurrent_fiber_steal_stress() {
     // Σ over id in 0..16 of (3·id+1) + (7·id+2) = 10·(0+…+15) + 3·16 = 1200 + 48 = 1248.
     let reps = if cfg!(windows) { 10 } else { 30 };
     for _ in 0..reps {
-        match compile_and_run(&m, 0, &[]).expect("jit") {
-            JitOutcome::Returned(x) => assert_eq!(x, [1248], "steal-stress sum wrong"),
-            other => panic!("unexpected {other:?}"),
+        for jit in jit_routes(&m, Some("fibers")) {
+            match jit {
+                JitOutcome::Returned(x) => assert_eq!(x, [1248], "steal-stress sum wrong"),
+                other => panic!("unexpected {other:?}"),
+            }
         }
     }
     // And the interpreter (its real M:N pool) agrees on the invariant.

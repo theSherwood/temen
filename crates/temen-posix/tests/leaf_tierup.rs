@@ -221,7 +221,7 @@ fn bounce_entry(call: &mut EmittedCall<'_>) -> Result<(), Trap> {
     THREAD_TIERUPS.lock().unwrap().push(module);
     let mut io = call.argv.to_vec();
     io.resize(io.len().max(1), 0);
-    let n = (call.bounce)(func, &mut io, 0)?;
+    let n = call.bounce(func, &mut io, 0)?;
     call.results = io[..n].to_vec();
     Ok(())
 }
@@ -281,6 +281,7 @@ fn run_tree(exec: Exec, guest_text: &str, command: &str, leaf: bool) -> (Ending,
                     modules: None,
                     leaf: Some(leaf),
                     run: bounce_entry,
+                    native: None,
                 }),
                 ..ThreadPlatform::OS
             });

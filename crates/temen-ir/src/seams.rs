@@ -179,3 +179,29 @@ pub fn handler_never_parks(funcs: &[Func], func: FuncIdx) -> bool {
         || s.has_svc
         || s.has_fork)
 }
+
+/// #2958 — a §12 op an engine's native code makes, for the scheduling core it runs on to apply as an
+/// interpreted op's stop (`temen_interp::bytecode::EmittedCall::park`): the Cranelift JIT's, when its
+/// vCPUs run as executor 2's tasks. Addresses are window-relative, as the guest wrote them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NativeStop {
+    Spawn {
+        func: u32,
+        arg0: i64,
+        arg1: i64,
+    },
+    Join {
+        handle: i32,
+    },
+    /// `timeout` in ns, negative for none; `wide` is a 64-bit wait.
+    Wait {
+        addr: u64,
+        expected: u64,
+        wide: bool,
+        timeout: i64,
+    },
+    Notify {
+        addr: u64,
+        count: i32,
+    },
+}
