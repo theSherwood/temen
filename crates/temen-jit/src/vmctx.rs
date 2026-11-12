@@ -261,10 +261,25 @@ impl VmCtx {
     /// #2488 — a context for another vCPU of this context's domain: the same instance and the same
     /// end, charging `fuel`. It must not outlive the domain's root context, which owns the end.
     pub(crate) fn vcpu(&self, fuel: *mut crate::FuelCell) -> VmCtx {
+        // SAFETY: the end is this domain's own, which the contract above keeps live.
+        unsafe { self.vcpu_ending(self.end, fuel) }
+    }
+
+    /// #2958 — [`Self::vcpu`] over the end word `end` in place of this context's own: a kernel
+    /// run's, which executor 2 owns (`kernel_rt::KernelRun::run_vcpu`).
+    ///
+    /// # Safety
+    /// `end` is live for as long as the returned context.
+    pub(crate) unsafe fn vcpu_ending(
+        &self,
+        end: *const AtomicI64,
+        fuel: *mut crate::FuelCell,
+    ) -> VmCtx {
         VmCtx {
             // A domain that already ended stops the vCPU at its first check.
-            trap: AtomicI64::new(self.ended().unwrap_or(0)),
-            end: self.end,
+            // SAFETY: the caller's contract.
+            trap: AtomicI64::new(unsafe { &*end }.load(Ordering::Relaxed)),
+            end,
             cap_ctx: self.cap_ctx,
             epoch: self.epoch,
             fuel,

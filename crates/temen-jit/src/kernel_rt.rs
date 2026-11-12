@@ -3,9 +3,9 @@
 //! tasks, starts their threads and applies the §12 rules, and the Cranelift JIT is its emitted tier.
 //! This module gives the run what it needs of the JIT:
 //!
-//! - [`KernelRun`]: a compiled module's window and one root context whose end every vCPU shares;
+//! - [`KernelRun`]: a compiled module's window and the root context every vCPU's is made from;
 //!   [`KernelRun::run_vcpu`] runs a task's entry on the calling thread, as `os_thread_rt::run_child`
-//!   runs a spawned vCPU's.
+//!   runs a spawned vCPU's, over the run's one end word, which executor 2 owns.
 //! - [`routed`]: where the `thread.spawn`, `thread.join`, `memory.wait` and `memory.notify` thunks
 //!   send a kernel vCPU's op, instead of the OS-thread runtime, through its [`KernelPark`] hook. The
 //!   kernel parks the thread there, with the emitted frames on its stack (the embedder's hook calls
@@ -22,6 +22,7 @@
 //! context of its own with a hook of its own, and reaches this one through no pointer.
 
 use crate::{mem, slot_record, CompiledModule, FuelCell, TrapKind, VmCtx};
+use std::sync::atomic::AtomicI64;
 pub use temen_ir::seams::NativeStop;
 
 /// The scheduling core's side of a vCPU's §12 ops: apply `stop`, park the thread until the task can
@@ -63,7 +64,11 @@ pub enum VcpuEntry<'a> {
     Thread { func: u32, arg0: i64, arg1: i64 },
 }
 
-/// One kernel run of a compiled module: its window and the root context whose end its vCPUs share.
+/// One kernel run of a compiled module: its window and the root context its vCPUs' are made from.
+///
+/// The root context is a template only: no code runs on it, and its own end word is never read or
+/// raised on this route. Every vCPU, the root task's included, runs on a copy over the run's end word
+/// ([`Self::run_vcpu`]). It goes with slice 7 of #2958 (a native task with no interpreter VM).
 pub struct KernelRun {
     cm: CompiledModule,
     window: mem::GuestWindow,
@@ -74,8 +79,8 @@ pub struct KernelRun {
 }
 
 // SAFETY: the compiled code is finalized and only read; the window is shared by design (the guest's
-// atomics are real ones); the root context is read by each vCPU (`vcpu`) and written only through its
-// atomic end. Every vCPU is gone before the run drops it (executor 2 waits for its threads).
+// atomics are real ones); the root context is only read, as each vCPU's is made from it. Every vCPU is
+// gone before the run drops it (executor 2 waits for its threads).
 unsafe impl Send for KernelRun {}
 unsafe impl Sync for KernelRun {}
 
@@ -143,18 +148,14 @@ impl KernelRun {
         cm.null_guard > cm.win_mapped as u64 || self.window.seed_null_guard(cm.null_guard)
     }
 
-    /// End the domain: every vCPU still running stops at its next poll of the domain's end.
-    pub fn end(&self) {
-        self.root.raise(crate::DOMAIN_DONE_CODE as i64);
-    }
-
     /// Whether `cm`'s code carries fuel checks, so each vCPU's own cell must be handed to it
     /// ([`Self::run_vcpu`]).
     pub fn metered(&self) -> bool {
         !self.root.fuel.is_null()
     }
 
-    /// Run `entry` on this thread as a vCPU with `vcpu.tls` seed `tls`: its §12 ops through `hook`,
+    /// Run `entry` on this thread as a vCPU with `vcpu.tls` seed `tls`, over the run's end word `end`
+    /// (executor 2's, `EmittedCall::end`, which it sets as the run ends): its §12 ops through `hook`,
     /// its `call.cap`s through `cap_ctx` (a `*const Mutex<Host>` for the locked thunk), its fuel
     /// charged to `fuel` (code compiled without fuel checks never reads it). Returns its results, or
     /// the domain's end code it stopped on.
@@ -166,12 +167,14 @@ impl KernelRun {
         &self,
         entry: VcpuEntry<'_>,
         tls: i64,
+        end: &AtomicI64,
         hook: &mut dyn KernelPark,
         cap_ctx: *mut core::ffi::c_void,
         fuel: &mut FuelCell,
     ) -> Result<Vec<i64>, i64> {
         let cm = &self.cm;
-        let mut vm = self.root.vcpu(fuel);
+        // SAFETY: `end` outlives `vm`, which this call drops before it returns.
+        let mut vm = unsafe { self.root.vcpu_ending(end, fuel) };
         vm.cap_ctx = cap_ctx;
         // The hook outlives the guarded call below, which is the only place a thunk reads it.
         let hook: *mut (dyn KernelPark + '_) = hook;

@@ -50,14 +50,14 @@ self.onmessage = async (e) => {
   // results at `out`, returning how many, or -(1 + the code the emitted code trapped with). On a
   // spilling tier its frames push to the thread's spill stack, which lives as long as the thread. The
   // emitted code runs on a slice of fuel: each time it spends one it asks for another, which it gets
-  // unless the run's `over` byte is set, so a run that ends while this thread is in emitted code
-  // stops it within a slice. The emitted tier is not metered: the slice is only how often it looks.
+  // unless the run's end word at `over` (an aligned i64) is set, so a run that ends while this thread
+  // is in emitted code stops it within a slice. The emitted tier is not metered: the slice is only how often it looks.
   const X2_SLICE = 1n << 20n;
   let x2Tier = null, x2LeafTier = null, x2Over = 0, x2Win = 0, x2Mapped = 0n;
   // #2474: how many slices the emitted code has spent, so a tier-up can report the work it did.
   let x2Slices = 0;
   const x2Fuel = () => {
-    if (Atomics.load(new Uint8Array(memory.buffer), x2Over) !== 0) return undefined;
+    if (Atomics.load(new BigInt64Array(memory.buffer), x2Over / 8) !== 0n) return undefined;
     x2Slices++;
     return X2_SLICE;
   };

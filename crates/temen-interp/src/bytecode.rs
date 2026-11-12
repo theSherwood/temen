@@ -17990,9 +17990,10 @@ struct ThreadRun {
     /// ([`Self::start_watcher`]).
     watched: bool,
     ended: std::sync::Condvar,
-    /// Whether the run is over ([`Threads::over`]), for emitted code to read without the lock
-    /// ([`EmittedCall::over`]).
-    over: std::sync::atomic::AtomicBool,
+    /// The run's end word, for emitted code to read without the lock ([`EmittedCall::end`]): `0`
+    /// while it runs. [`Self::conclude`] sets it to `DOMAIN_DONE` once [`Threads::over`] holds the
+    /// verdict, unless a native tier's code ended it first ([`ThreadTier::native`]).
+    end: std::sync::atomic::AtomicI64,
     /// The embedder's door into the run from outside it ([`Host::set_run_door`]), if it has one.
     door: Option<std::sync::Arc<RunDoor>>,
 }
@@ -18136,7 +18137,7 @@ pub struct ThreadTier {
     /// it may take one that parks. `None` interprets them.
     pub leaf: Option<LeafEmitter>,
     /// Run one call on the emitted tier, on the calling thread. Once the run is over
-    /// ([`EmittedCall::over`]) it returns by the emitted code's next fuel check, whatever it
+    /// ([`EmittedCall::end`]) it returns by the emitted code's next fuel check, whatever it
     /// returns: the run waits for its thread.
     pub run: fn(&mut EmittedCall<'_>) -> Result<(), Trap>,
     /// #2958 — a tier whose emitted code makes the §12 thread ops itself and parks its own frames
@@ -18145,13 +18146,11 @@ pub struct ThreadTier {
     pub native: Option<NativeTier>,
 }
 
-/// #2958 — what a native tier needs from the run beyond [`ThreadTier`].
+/// #2958 — what a native tier needs from the run beyond [`ThreadTier`]. Its code polls the run's
+/// own end word ([`EmittedCall::end`]) as its domain's end, and raises it first-wins as it traps: a
+/// set word then means only that the run is ending, and the verdict is [`ThreadRun::conclude`]'s.
 #[derive(Clone)]
 pub struct NativeTier {
-    /// Called once as the run ends ([`ThreadRun::conclude`]): the tier's running code, which does not
-    /// read [`EmittedCall::over`], stops at its next poll of its domain's end. (Scaffolding: one end
-    /// word both sides share replaces it, #2958 slice 1b.)
-    pub on_end: std::sync::Arc<dyn Fn() + Send + Sync>,
     /// The tier's own run state, for its [`ThreadTier::run`] to find ([`EmittedCall::native`]).
     pub state: std::sync::Arc<dyn std::any::Any + Send + Sync>,
 }
@@ -18200,8 +18199,10 @@ pub struct EmittedCall<'a> {
     /// ([`super::Region::foreign_id`], #1414 ED-2), where the host places the window and the
     /// call's context.
     pub memory: Option<u32>,
-    /// Set once the run is over. Emitted code still running then stops at its next fuel check.
-    pub over: &'a std::sync::atomic::AtomicBool,
+    /// The run's end word: nonzero once the run is ending. Emitted code still running then stops at
+    /// its next fuel check. A native tier's code polls it as its domain's end, and raises it as it
+    /// traps ([`NativeTier`]).
+    pub end: &'a std::sync::atomic::AtomicI64,
     /// The results, as raw i64 slots: `run` fills them.
     pub results: Vec<i64>,
     /// #2474 — the work the call did on the emitted tier, the fuel its code burned: `run` counts it,
@@ -18687,7 +18688,7 @@ impl ThreadRun {
             bell,
             watched,
             ended: std::sync::Condvar::new(),
-            over: std::sync::atomic::AtomicBool::new(false),
+            end: std::sync::atomic::AtomicI64::new(0),
             door,
         });
         if let Some(door) = &run.door {
@@ -19252,7 +19253,7 @@ impl ThreadRun {
             mapped,
             win,
             memory,
-            over: &self.over,
+            end: &self.end,
             results: Vec::new(),
             work: 0,
             fault: None,
@@ -19294,15 +19295,17 @@ impl ThreadRun {
     }
 
     /// End the run with `res`, unless it is over already. Every thread stops at its next look, and
-    /// emitted code at its next fuel check ([`EmittedCall::over`]).
+    /// emitted code at its next fuel check ([`EmittedCall::end`]).
     fn conclude(&self, g: &mut Threads, res: Result<Vec<Value>, Trap>) {
         if g.over.is_none() {
             g.over = Some(res);
-            self.over.store(true, std::sync::atomic::Ordering::SeqCst);
-            // #2958 — a native tier's running code does not read `over`.
-            if let Some(n) = self.platform.tier.as_ref().and_then(|t| t.native.as_ref()) {
-                (n.on_end)();
-            }
+            // First end wins: a native tier's trap may have set it already ([`NativeTier`]).
+            let _ = self.end.compare_exchange(
+                0,
+                temen_ir::trap_code::DOMAIN_DONE,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            );
             // Its watcher has to look in order to leave.
             self.ring();
         }
