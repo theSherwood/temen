@@ -607,3 +607,112 @@ fn the_kill_door_ends_vcpus_that_only_take_the_futex_fast_paths() {
         assert!(took < PROMPT, "{op}: the kill took {took:?}");
     }
 }
+
+/// #2995 — a root that writes, through a host procedure (handle `handle`), into a page of its
+/// `readonly` data segment: the procedure's borrow of the page must be refused (`-EFAULT`), as the
+/// hardware refuses the write. A notify keeps it in the kernel's scope.
+fn ro_write(handle: i32) -> temen_ir::Module {
+    module(&format!(
+        "memory 18
+data ro 98304 \"efghefgh\"
+func () -> (i64) {{
+block 0 () {{
+  va = i64.const 16400
+  vc = i32.const 1
+  vk = atomic.notify va vc
+  vh = i32.const {handle}
+  vb = i64.const 98304
+  vr = call.cap 13 0 (i64) -> (i64) vh(vb)
+  return vr
+  }}
+}}
+"
+    ))
+}
+
+/// Grant `host` a procedure that writes eight bytes at its argument through the guest window, and
+/// answers `0`, or `-EFAULT` when the window refuses the write.
+fn grant_writer(host: &mut Host) -> i32 {
+    use temen_interp::{put_results, CapState, HostProcGrant, ProcHandler};
+    host.grant_host_proc(HostProcGrant::new(
+        ProcHandler::Sync(Box::new(|_op, args, out, mem, _minter| {
+            let at = args.first().copied().unwrap_or(0) as u64;
+            let wrote = mem.and_then(|m| m.write_bytes(at, b"XXXXXXXX"));
+            put_results(out, &[if wrote.is_some() { 0 } else { -14 }])
+        })),
+        CapState::Stateless,
+    ))
+}
+
+/// `f` on a thread of its own, its answer within [`PROMPT`]: a run that hangs fails the test
+/// instead of the suite (the thread is left behind).
+fn bounded<T: Send + 'static>(what: &str, f: impl FnOnce() -> T + Send + 'static) -> T {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(f());
+    });
+    rx.recv_timeout(PROMPT)
+        .unwrap_or_else(|_| panic!("{what} did not end within {PROMPT:?}"))
+}
+
+/// #2995 — on the kernel route the host's page map knew nothing of the readonly pages the kernel
+/// protected, so the procedure's write passed its borrow check and faulted in host code under the
+/// domain's `Host` lock; the fault handler unwound the vCPU with the lock held, and the run's end
+/// hung on it. Both routes now refuse the borrow as the oracle does.
+#[test]
+fn a_host_procedures_write_into_a_readonly_page_is_refused_on_both_routes() {
+    use temen_interp::Value;
+    // The oracle.
+    let mut host = Host::new();
+    let m = ro_write(grant_writer(&mut host));
+    let oracle = temen_interp::run_with_host(&m, 0, &[], &mut 1_000_000, &mut host);
+    assert_eq!(oracle, Ok(vec![Value::I64(-14)]), "the oracle refuses it");
+    // The kernel route, asserting it ran there.
+    let kernel = bounded("the kernel route", || {
+        let mut host = Host::new();
+        let m = ro_write(grant_writer(&mut host));
+        let admitted = jit_kernel::admit(&m, &host, None, false).expect("in the kernel's scope");
+        let start = jit_kernel::Start {
+            entry: 0,
+            args: &[],
+            init_mem: &[],
+            reserved_log2: temen_ir::DEFAULT_RESERVED_LOG2,
+            fuel: u64::MAX,
+            snapshot_cap: None,
+            kill: None,
+        };
+        let end = jit_kernel::run(admitted, start, &mut host).expect("compiles");
+        assert!(end.vcpus >= 1, "it ran as kernel tasks");
+        end.result
+    });
+    assert_eq!(kernel, Ok(vec![-14]), "the kernel route");
+    // Today's route: a run that keeps its code is declined by the kernel (`kept code`), so it runs on
+    // the JIT's own runtime, whose window start seeds the host's page map (`window_aliases`).
+    let today = bounded("today's route", || {
+        let handle = std::cell::Cell::new(0);
+        let probe = temen_run::instantiate(ro_write(0)).expect("instantiate");
+        let cfg = temen_run::RunConfig {
+            jit_code: Some(temen_run::JitCodeCache::default()),
+            ..temen_run::RunConfig::default()
+        };
+        // The powerbox grants its own handles first: learn the procedure's, then run the program
+        // that names it.
+        let mut learn = |h: &mut Host| handle.set(grant_writer(h));
+        // (Its own call, through handle 0, is refused: only the handle is wanted.)
+        let _ =
+            probe.run_with_caps_and_host(temen_run::Backend::TreeWalk, &cfg, &[], Some(&mut learn));
+        let mut grant = |h: &mut Host| {
+            grant_writer(h);
+        };
+        temen_run::instantiate(ro_write(handle.get()))
+            .expect("instantiate")
+            .run_with_caps_and_host(temen_run::Backend::Jit, &cfg, &[], Some(&mut grant))
+            .expect("runs")
+            .outcome
+    });
+    assert_eq!(
+        today,
+        temen_run::Outcome::Returned(vec![Value::I64(-14)]),
+        "today's route"
+    );
+}

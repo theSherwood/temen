@@ -4169,6 +4169,35 @@ unsafe fn window_aliases(
     }
 }
 
+/// #2995 — the read-only half of [`window_aliases`], for the kernel route's window (#2958): `host`'s
+/// page map for window `[base, base+mapped)` starts with the read-only pages `ro` the window's data
+/// segments made, so a capability's borrow of one is refused as the hardware refuses it. Not
+/// [`Host::start_window`]: the run's activation already charged the window's runs, from the kernel's
+/// own `Mem` over it, and charging them again here would count them twice. #2958 slice 3 replaces
+/// this with the JIT's own window start. `false` on a target with no window backend.
+///
+/// # Safety
+/// `[base, base+reserved)` is `host`'s live reservation.
+pub(crate) unsafe fn seed_kernel_window(
+    host: &mut Host,
+    base: *mut u8,
+    mapped: u64,
+    reserved: u64,
+    ro: &[[u64; 2]],
+) -> bool {
+    #[cfg(any(unix, windows))]
+    {
+        host.start_window_pages(base as usize, temen_interp::ShadowArena::EMPTY);
+        MprotectWindow::of(host, base, mapped, reserved).seed_readonly(ro);
+        true
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (host, base, mapped, reserved, ro);
+        false
+    }
+}
+
 /// #2864 — the [`temen_jit::GrantListCheck`] a detached spawn makes before it is admitted: its grant
 /// records read from the parent's window, as [`grant_detached_child_build`] reads them, and their
 /// handles checked as the interpreters check them ([`Host::check_grant_list`]). `1`, or `0` with the
