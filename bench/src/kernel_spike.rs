@@ -11,7 +11,7 @@
 //! meters fuel.
 //!
 //! `SPIKE_SECTIONS` picks sections, comma-separated: `compute`, `spawn`, `park` (the default three),
-//! `k1000`, `nowake`, `pairs`. `SPIKE_K` picks the park section's K values (`0,100,1000` by
+//! `k1000`, `nowake`, `pairs`, `always` (#2985). `SPIKE_K` picks the park section's K values (`0,100,1000` by
 //! default), `SPIKE_LANES` its lanes.
 
 use std::time::{Duration, Instant};
@@ -110,10 +110,106 @@ fn x2_interp(m: &Module) -> Lane<'_> {
     })
 }
 
+/// #2985 — what one run cost the OS's scheduler, for every lane alike: the voluntary context switches
+/// of every thread of this process (a thread that blocks and sleeps makes one), the involuntary
+/// ones, and executor 2's own count of its parks that blocked ([`temen_interp::bytecode::thread_blocks`]),
+/// which the voluntary count is checked against.
+#[derive(Clone, Copy, Default)]
+struct Sw {
+    vol: f64,
+    invol: f64,
+    blocks: f64,
+}
+
+impl Sw {
+    /// The counts now. `getrusage(RUSAGE_SELF)` keeps the counts of threads that have exited. Off
+    /// unix the switch counts read 0.
+    fn now() -> Sw {
+        #[cfg(unix)]
+        // SAFETY: `getrusage` writes the struct it is handed and reads nothing else.
+        let (vol, invol) = unsafe {
+            let mut ru = std::mem::zeroed::<libc::rusage>();
+            libc::getrusage(libc::RUSAGE_SELF, &mut ru);
+            (ru.ru_nvcsw as f64, ru.ru_nivcsw as f64)
+        };
+        #[cfg(not(unix))]
+        let (vol, invol) = (0.0, 0.0);
+        Sw {
+            vol,
+            invol,
+            blocks: temen_interp::bytecode::thread_blocks() as f64,
+        }
+    }
+
+    fn minus(self, o: Sw) -> Sw {
+        Sw {
+            vol: self.vol - o.vol,
+            invol: self.invol - o.invol,
+            blocks: self.blocks - o.blocks,
+        }
+    }
+
+    fn per(self, d: f64) -> Sw {
+        Sw {
+            vol: self.vol / d,
+            invol: self.invol / d,
+            blocks: self.blocks / d,
+        }
+    }
+}
+
+/// `SPIKE_RAW=1`: print each rep's value and counts as well, to fit a lane's time against its block
+/// rate (#2985).
+fn raw() -> bool {
+    std::env::var_os("SPIKE_RAW").is_some()
+}
+
+/// How many threads this process has (`/proc/self/status`), `None` where there is no such file.
+fn threads_now() -> Option<usize> {
+    let s = std::fs::read_to_string("/proc/self/status").ok()?;
+    let l = s.lines().find(|l| l.starts_with("Threads:"))?;
+    l[8..].trim().parse().ok()
+}
+
+/// Run `lane` on `args` and count what it cost the scheduler ([`Sw`]). A thread's counts join the
+/// process's only once the OS has reaped it, which can be after the run that joined it returns, so
+/// the count waits (untimed, and bounded) until the threads the run started are gone.
+fn counted(lane: &mut Lane<'_>, args: &[i64]) -> ((i64, Duration), Sw) {
+    let before = threads_now();
+    let s0 = Sw::now();
+    let out = lane(args);
+    let t0 = Instant::now();
+    while threads_now() > before {
+        assert!(
+            t0.elapsed() < Duration::from_secs(5),
+            "the run's threads did not exit: {:?} against {before:?} before it",
+            threads_now()
+        );
+        std::thread::yield_now();
+    }
+    (out, Sw::now().minus(s0))
+}
+
 /// Median and spread of `xs`, as `median [min..max]`.
 fn stats(xs: &mut [f64]) -> (f64, f64, f64) {
     xs.sort_by(|a, b| a.partial_cmp(b).unwrap());
     (xs[xs.len() / 2], xs[0], xs[xs.len() - 1])
+}
+
+/// Per-op scheduler counts over the reps, as one row: voluntary switches, involuntary ones, and
+/// executor 2's blocks.
+fn sw_row(sws: &[Sw]) -> String {
+    let col = |f: fn(&Sw) -> f64| {
+        let mut xs: Vec<f64> = sws.iter().map(f).collect();
+        let (m, lo, hi) = stats(&mut xs);
+        format!("{m:.3} [{lo:.3}..{hi:.3}]")
+    };
+    format!(
+        "per op: vol cs {}  invol cs {}  x2 blocks {}",
+        col(|s| s.vol),
+        col(|s| s.invol),
+        col(|s| s.blocks),
+    )
 }
 
 fn fmt(x: (f64, f64, f64), unit: &str) -> String {
@@ -135,14 +231,25 @@ fn per_iter(
 ) {
     let mut per_lane: Vec<Vec<f64>> = vec![Vec::new(); lanes.len()];
     let mut setup: Vec<Vec<f64>> = vec![Vec::new(); lanes.len()];
+    let mut sws: Vec<Vec<Sw>> = vec![Vec::new(); lanes.len()];
     for _ in 0..reps {
-        for (i, (_, lane)) in lanes.iter_mut().enumerate() {
-            let (r0, t0) = lane(&args(n_small));
-            let (r1, t1) = lane(&args(n_big));
+        for (i, (name, lane)) in lanes.iter_mut().enumerate() {
+            let ((r0, t0), s0) = counted(lane, &args(n_small));
+            let ((r1, t1), s1) = counted(lane, &args(n_big));
             std::hint::black_box((r0, r1));
             let d = t1.as_secs_f64() - t0.as_secs_f64();
-            per_lane[i].push(d * 1e9 / ((n_big - n_small) as f64 * per) / unit_ns);
+            let ops = (n_big - n_small) as f64 * per;
+            per_lane[i].push(d * 1e9 / ops / unit_ns);
             setup[i].push(t0.as_secs_f64() * 1e3);
+            let sw = s1.minus(s0).per(ops);
+            if raw() {
+                let v = d * 1e9 / ops / unit_ns;
+                println!(
+                    "    raw {label} {name} {v:.3} vol {:.3} blocks {:.3}",
+                    sw.vol, sw.blocks
+                );
+            }
+            sws[i].push(sw);
         }
     }
     for (i, (name, _)) in lanes.iter().enumerate() {
@@ -151,6 +258,7 @@ fn per_iter(
             fmt(stats(&mut per_lane[i]), unit),
             fmt(stats(&mut setup[i]), "ms"),
         );
+        println!("  {:<33} {}", "", sw_row(&sws[i]));
     }
 }
 
@@ -239,6 +347,131 @@ pub fn run(reps: usize) {
     }
     if on("pairs") {
         run_pairs(reps);
+    }
+    if on("always") {
+        run_always(reps);
+    }
+}
+
+/// #2985 — the always-block hand-off ([`crate::kernel_spike_ir::always_ir`]): the pingpong with a
+/// turn of work before each notify, long enough that the waiter is asleep before every notify comes.
+/// The zero-delay pingpong is a race between a notify and its waiter reaching its sleep (#2963), so
+/// its cost is the lane's block rate as much as its path; here every lane blocks on every hand-off
+/// (the `vol cs` and `x2 blocks` columns show whether it did), and what is left once the work is
+/// taken out is the path: the stops, the park and the wake.
+///
+/// Each lane's work count is calibrated to `SPIKE_WORK_US` (`20,100` by default) from the work alone
+/// on that lane, and the work alone ([`crate::kernel_spike_ir::always_work_ir`]) is measured again
+/// in every rep, interleaved with the pingpong, and taken out.
+fn run_always(reps: usize) {
+    println!(
+        "\nalways block: the pingpong with a turn of work before each notify (us per hand-off):"
+    );
+    let pp = parse(&crate::kernel_spike_ir::always_ir());
+    let alone = parse(&crate::kernel_spike_ir::always_work_ir());
+    let targets: Vec<f64> = std::env::var("SPIKE_WORK_US")
+        .map(|v| {
+            v.split(',')
+                .map(|x| x.parse().expect("SPIKE_WORK_US"))
+                .collect()
+        })
+        .unwrap_or_else(|_| vec![20.0, 100.0]);
+    let pick = std::env::var("SPIKE_LANES").unwrap_or_default();
+    let lanes = |m| {
+        let all: Vec<(&str, Lane<'_>)> = vec![
+            ("today", today(m, 0, Host::new(), true)),
+            ("kernel", kernel(m, 0)),
+            ("x2-interp", x2_interp(m)),
+        ];
+        (all.into_iter())
+            .filter(|(n, _)| pick.is_empty() || pick.split(',').any(|x| x == *n))
+            .collect::<Vec<_>>()
+    };
+    let (mut pps, mut alones) = (lanes(&pp), lanes(&alone));
+    // ns per step of work on each lane: the fastest of a few runs.
+    let calib = 20_000i64;
+    let steps: Vec<f64> = (alones.iter_mut())
+        .map(|(_, lane)| {
+            (0..3)
+                .map(|_| {
+                    let (_, a) = lane(&[10, calib]);
+                    let (_, b) = lane(&[110, calib]);
+                    (b.as_secs_f64() - a.as_secs_f64()) * 1e9 / (100.0 * calib as f64)
+                })
+                .fold(f64::INFINITY, f64::min)
+        })
+        .collect();
+    let (n_small, n_big) = (20i64, 520i64);
+    let turns = (n_big - n_small) as f64;
+    for target in targets {
+        // Both native lanes run the same Cranelift code for the work, so they take the same count
+        // (today's), and their hand-offs compare rep by rep with no work taken out.
+        let native = (pps.iter().position(|(n, _)| *n == "today")).map(|t| steps[t]);
+        let ws: Vec<i64> = (pps.iter().zip(&steps))
+            .map(|((n, _), s)| {
+                let s = if *n == "x2-interp" {
+                    *s
+                } else {
+                    native.unwrap_or(*s)
+                };
+                ((target * 1e3 / s) as i64).max(1)
+            })
+            .collect();
+        println!("  work {target} us a turn:");
+        let k = pps.len();
+        let (mut hand, mut work, mut left) = (vec![vec![]; k], vec![vec![]; k], vec![vec![]; k]);
+        let mut sws: Vec<Vec<Sw>> = vec![Vec::new(); k];
+        for _ in 0..reps {
+            for i in 0..k {
+                let w = ws[i];
+                let ((_, a0), _) = counted(&mut alones[i].1, &[n_small, w]);
+                let ((_, a1), _) = counted(&mut alones[i].1, &[n_big, w]);
+                let ((_, p0), s0) = counted(&mut pps[i].1, &[n_small, w]);
+                let ((_, p1), s1) = counted(&mut pps[i].1, &[n_big, w]);
+                // The pingpong's root and partner each take `n` turns: 2n hand-offs, 2n turns of work
+                // in series.
+                let h = (p1.as_secs_f64() - p0.as_secs_f64()) * 1e6 / (2.0 * turns);
+                let wk = (a1.as_secs_f64() - a0.as_secs_f64()) * 1e6 / turns;
+                hand[i].push(h);
+                work[i].push(wk);
+                left[i].push(h - wk);
+                let sw = s1.minus(s0).per(2.0 * turns);
+                if raw() {
+                    let name = pps[i].0;
+                    println!(
+                        "    raw always{target} {name} {h:.3} work {wk:.3} vol {:.3}",
+                        sw.vol
+                    );
+                }
+                sws[i].push(sw);
+            }
+        }
+        // Paired by rep, before any column is sorted: each lane's hand-off less today's, over the
+        // same work count.
+        let t = pps.iter().position(|(n, _)| *n == "today");
+        let vs_today: Vec<Option<String>> = (0..k)
+            .map(|i| {
+                t.filter(|&t| t != i && ws[t] == ws[i]).map(|t| {
+                    let mut d: Vec<f64> =
+                        (hand[i].iter().zip(&hand[t])).map(|(a, b)| a - b).collect();
+                    format!("  vs today {}", fmt(stats(&mut d), "us"))
+                })
+            })
+            .collect();
+        for i in 0..k {
+            println!(
+                "    {:<10} steps {:>8}  hand-off {:>26}  work {:>26}  left {:>26}",
+                pps[i].0,
+                ws[i],
+                fmt(stats(&mut hand[i]), "us"),
+                fmt(stats(&mut work[i]), "us"),
+                fmt(stats(&mut left[i]), "us"),
+            );
+            if let Some(d) = &vs_today[i] {
+                println!("    {:<10} {d}", "");
+            }
+            println!("    {:<10} {}", "", sw_row(&sws[i]));
+        }
     }
 }
 

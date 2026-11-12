@@ -53,3 +53,7 @@ wat = "1"
 opt-level = 3
 
 [workspace]
+
+# #2985: `getrusage`, for the kernel probe's per-lane context-switch counts.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
