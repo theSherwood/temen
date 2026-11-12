@@ -227,9 +227,8 @@ pub fn run(
             run: tier_run,
             native: Some(NativeTier { state }),
         }),
-        // The root runs on the caller's thread, as the JIT's own runtime runs it, and the run is
-        // watched from its start (#2958 condition 7).
-        opener: Opener::RunsRootWatched,
+        // The root runs on the caller's thread, as the JIT's own runtime runs it.
+        opener: Opener::RunsRoot,
         ..ThreadPlatform::OS
     };
     host.set_thread_platform(platform);
