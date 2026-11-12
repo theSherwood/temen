@@ -12369,6 +12369,10 @@ struct Waits {
 
 impl Drop for Waits {
     fn drop(&mut self) {
+        // A test that failed reports its own panic, not this one's abort.
+        if std::thread::panicking() {
+            return;
+        }
         debug_assert_eq!(
             self.count.total(),
             self.n as u64 + self.sticky,
@@ -19096,8 +19100,10 @@ impl ThreadRun {
         let mut fibers = FiberCell::Core(&self.state, env);
         // #2958 slice 2 — a futex op answered without the lock ([`Self::no_wake`]) is no stop, and
         // `step_vcpu` cannot hand back what is left of its quantum (it starts each `resume` afresh),
-        // so a step after one runs a share of a quantum: a loop of such ops looks at the run within
-        // two quanta, as a loop that only computes does within one.
+        // so a step after one runs a share of a quantum, and a share that runs out steps on rather
+        // than stopping: this loop's iterations bound the whole step at two quanta, so a loop of
+        // such ops looks at the run within two, as a loop that only computes does within one, and
+        // a thread that answers one and then computes pays no extra look.
         let (mut quantum, mut answered) = (COOP_QUANTUM, 0);
         for _ in 0..TIERUP_LOOK {
             match step_vcpu(
@@ -19117,6 +19123,7 @@ impl ThreadRun {
                     vm.vt.active.set(dst, v);
                     quantum = COOP_QUANTUM / TIERUP_LOOK as u64;
                 }
+                Ok(VcpuStop::Preempted) if quantum < COOP_QUANTUM => {}
                 Ok(VcpuStop::TierUp {
                     module,
                     func,

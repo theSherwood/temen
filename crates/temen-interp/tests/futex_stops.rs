@@ -550,6 +550,24 @@ block 1 (vi: i64) {{
 /// The loops [`forever`] makes, the futex ones first.
 const LOOPS: [&str; 3] = ["notify", "wait", "compute"];
 
+/// Wait until a run of [`forever`]`(op)` is in its loop: in a debug build, until its fast paths have
+/// answered an op since `before` ([`bytecode::futex_no_wakes`], which only a debug build counts),
+/// which also shows they ran; otherwise, and for the compute loop, a while.
+fn reach_the_loop(op: &str, before: u64) {
+    if !cfg!(debug_assertions) || op == "compute" {
+        std::thread::sleep(Duration::from_millis(100));
+        return;
+    }
+    let until = Instant::now() + GIVE_UP;
+    while bytecode::futex_no_wakes() <= before {
+        assert!(
+            Instant::now() < until,
+            "no {op} was answered without the lock in {GIVE_UP:?}"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
 /// #2958 slice 2 — threads that only notify a word nothing waits on, or only wait on a word that
 /// already differs, take no stop: a door stop still ends them promptly, as it ends threads that only
 /// compute (each thread's quantum, or the [`bytecode::futex_no_wakes`]-counted run of answers that
@@ -565,7 +583,7 @@ fn a_stop_ends_threads_that_only_take_the_futex_fast_paths() {
             let rx = run(&forever(op), Vec::new(), opener, move |h| {
                 h.set_run_door(stop)
             });
-            std::thread::sleep(Duration::from_millis(100));
+            reach_the_loop(op, before);
             let asked = Instant::now();
             while !door.stop() {
                 std::thread::yield_now();
@@ -575,12 +593,6 @@ fn a_stop_ends_threads_that_only_take_the_futex_fast_paths() {
             eprintln!("door stop of a {op} loop ({opener:?}): {took:?}");
             assert_eq!(r, Err(Trap::OutOfFuel), "stopped ({op}, {opener:?})");
             assert!(took < PROMPT, "the stop took {took:?} ({op}, {opener:?})");
-            if cfg!(debug_assertions) && op != "compute" {
-                assert!(
-                    bytecode::futex_no_wakes() > before,
-                    "the fast path ran ({op})"
-                );
-            }
         }
     }
 }
@@ -592,13 +604,14 @@ fn a_kill_ends_threads_that_only_take_the_futex_fast_paths() {
     let _turn = serial();
     for op in LOOPS {
         for opener in OPENERS {
+            let before = bytecode::futex_no_wakes();
             let source = Arc::new(KillOnDemand::default());
             let src = Arc::clone(&source);
             let rx = run(&forever(op), Vec::new(), opener, move |h| {
                 h.arm_external_wake();
                 h.set_signal_source(src, Arc::new(AtomicBool::new(false)));
             });
-            std::thread::sleep(Duration::from_millis(100));
+            reach_the_loop(op, before);
             let asked = Instant::now();
             source.kill();
             let r = rx.recv_timeout(GIVE_UP).expect("the killed loop ran on");
