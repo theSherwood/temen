@@ -1,7 +1,7 @@
 //! **#2958 — the kernel-route probe** (the `--kernel-spike` mode): today's Cranelift JIT, whose
 //! threads run on its own runtime, against the kernel route, where they are tasks of executor 2's
-//! scheduling core (`temen_run::jit_kernel`). Phase 1's exit condition is read from it (#2958); its
-//! park-and-wake sections land in slice 1b.
+//! scheduling core (`temen_run::jit_kernel`), and, for the park-and-wake sections, executor 2
+//! interpreting the same program, for reference. Phase 1's exit condition is read from it (#2958).
 //!
 //! Every lane is a release build on this machine, and the lanes run interleaved: each rep runs every
 //! lane once before the next rep starts. A row reports the median over the reps and the spread
@@ -10,10 +10,12 @@
 //! itself is reported apart. Every lane compiles afresh, untimed, before each run (#2953). No lane
 //! meters fuel.
 //!
-//! `SPIKE_SECTIONS` picks sections, comma-separated: `compute` and `spawn` (both by default).
+//! `SPIKE_SECTIONS` picks sections, comma-separated: `compute`, `spawn`, `park` (the default three),
+//! `k1000`, `nowake`, `pairs`. `SPIKE_K` picks the park section's K values (`0,100,1000` by
+//! default), `SPIKE_LANES` its lanes.
 
 use std::time::{Duration, Instant};
-use temen_interp::Host;
+use temen_interp::{Host, Value};
 use temen_ir::Module;
 use temen_jit::{CompiledModule, JitOutcome};
 use temen_run::jit_kernel;
@@ -78,6 +80,36 @@ fn kernel(m: &Module, entry: u32) -> Lane<'_> {
     })
 }
 
+/// Executor 2 interpreting `m`: no emitted tier.
+fn x2_interp(m: &Module) -> Lane<'_> {
+    Box::new(move |args| {
+        let vals: Vec<Value> = args.iter().map(|a| Value::I64(*a)).collect();
+        let t0 = Instant::now();
+        let mut run = temen_interp::bytecode::CoopRun::new_parallel(
+            m,
+            0,
+            &vals,
+            u64::MAX,
+            Host::new(),
+            &[],
+            RESERVED,
+            None,
+            false,
+        )
+        .expect("subset")
+        .expect("open");
+        let out = run.run();
+        let dt = t0.elapsed();
+        match out {
+            temen_interp::bytecode::CoopEvent::Done(v) => match v[0] {
+                Value::I64(x) => (x, dt),
+                ref o => panic!("x2: {o:?}"),
+            },
+            _ => panic!("x2: the run did not end with a value"),
+        }
+    })
+}
+
 /// Median and spread of `xs`, as `median [min..max]`.
 fn stats(xs: &mut [f64]) -> (f64, f64, f64) {
     xs.sort_by(|a, b| a.partial_cmp(b).unwrap());
@@ -127,7 +159,13 @@ pub fn run(reps: usize) {
     println!("#2958: today's Cranelift JIT vs the kernel route (vCPUs as executor 2 tasks)");
     println!("  median [min..max] over {reps} interleaved reps; release build\n");
     let only = std::env::var("SPIKE_SECTIONS").unwrap_or_default();
-    let on = |s: &str| only.is_empty() || only.split(',').any(|x| x == s);
+    let on = |s: &str| {
+        if only.is_empty() {
+            ["compute", "spawn", "park"].contains(&s)
+        } else {
+            only.split(',').any(|x| x == s)
+        }
+    };
     if on("compute") {
         // A module with no §12 op keeps today's path (the `no §12 op` clause): these rows are the
         // declined path's own cost, to compare against main's build of this probe.
@@ -189,5 +227,144 @@ pub fn run(reps: usize) {
                 sb.0 / sa.0
             );
         }
+    }
+    if on("park") {
+        run_park(reps);
+    }
+    if on("k1000") {
+        run_k1000(reps);
+    }
+    if on("nowake") {
+        run_nowake(reps);
+    }
+    if on("pairs") {
+        run_pairs(reps);
+    }
+}
+
+/// The #2868 probe: a pingpong, two vCPUs handing a turn word back and forth through
+/// `memory.wait`/`memory.notify`, beside `k` threads parked for good on a word nothing notifies.
+/// `func 0 (n, k)`: spawn the `k` idlers, wait until each has counted itself in, spawn the partner,
+/// then take `n` turns and join it. Each turn is two hand-offs.
+pub fn pingpong_ir() -> &'static str {
+    crate::kernel_spike_ir::PINGPONG_IR
+}
+
+/// The park-and-wake section: the pingpong beside K idle parked threads, per hand-off. The short
+/// span's K = 1,000 row is not usable for today's lane (its fixed cost of spawning 1,000 threads
+/// swamps the span): read K = 1,000 from [`run_k1000`].
+fn run_park(reps: usize) {
+    println!("\npark and wake: #2868 pingpong beside K idle parked threads (us per hand-off):");
+    let m = parse(pingpong_ir());
+    let ks: Vec<i64> = std::env::var("SPIKE_K")
+        .map(|v| v.split(',').map(|x| x.parse().expect("SPIKE_K")).collect())
+        .unwrap_or_else(|_| vec![0, 100, 1_000]);
+    let pick = std::env::var("SPIKE_LANES").unwrap_or_default();
+    for k in ks {
+        let lanes = vec![
+            ("today", today(&m, 0, Host::new(), true)),
+            ("kernel", kernel(&m, 0)),
+            ("x2-interp", x2_interp(&m)),
+        ];
+        let mut lanes: Vec<_> = lanes
+            .into_iter()
+            .filter(|(n, _)| pick.is_empty() || pick.split(',').any(|x| x == *n))
+            .collect();
+        let span = if k >= 1_000 {
+            (100, 2_100)
+        } else {
+            (100, 5_100)
+        };
+        let args = move |n| vec![n, k];
+        per_iter(
+            &format!("K = {k}"),
+            &mut lanes,
+            args,
+            span,
+            2.0,
+            reps,
+            1e3,
+            "us",
+        );
+    }
+}
+
+/// K = 1,000 of the pingpong with a span long enough that today's run, whose fixed cost is spawning
+/// the 1,000 threads (about 0.6 s, give or take 0.2 s), still subtracts to a usable range.
+fn run_k1000(reps: usize) {
+    println!("\npark and wake, K = 1000, long span (us per hand-off):");
+    let m = parse(pingpong_ir());
+    let mut lanes = [
+        ("today", today(&m, 0, Host::new(), true)),
+        ("kernel", kernel(&m, 0)),
+    ];
+    let args = |n| vec![n, 1_000];
+    per_iter(
+        "K = 1000",
+        &mut lanes,
+        args,
+        (100, 200_100),
+        2.0,
+        reps,
+        1e3,
+        "us",
+    );
+}
+
+/// The no-wake probe ([`crate::kernel_spike_ir::NOWAKE_IR`]): ns per `memory.notify` with no
+/// waiter and per `memory.wait` that answers not-equal at once, beside `k` threads parked for good.
+/// No thread wakes, so the OS's wake cost is out of it: what is left is the runtime's own per-op
+/// cost, which a futex-based guest mutex pays on each contended unlock.
+fn run_nowake(reps: usize) {
+    println!("\nno wake: a notify with no waiter / a wait that answers not-equal (ns per op):");
+    let m = parse(crate::kernel_spike_ir::NOWAKE_IR);
+    for (mode, what) in [(0i64, "notify, none"), (1, "wait, not-equal")] {
+        for k in [0i64, 100, 1_000] {
+            let args = move |n| vec![n, k, mode];
+            // A span long enough that each lane's fixed cost (spawning the K threads, about 0.6 s
+            // at K = 1,000 on today's lane) subtracts to a usable range.
+            let long = if k >= 1_000 { 20_001_000 } else { 2_001_000 };
+            let mut lanes = [
+                ("today", today(&m, 0, Host::new(), true)),
+                ("kernel", kernel(&m, 0)),
+            ];
+            let label = format!("{what}, K = {k}");
+            per_iter(
+                &label,
+                &mut lanes,
+                args,
+                (1_000, long),
+                1.0,
+                reps,
+                1.0,
+                "ns",
+            );
+        }
+    }
+}
+
+/// The run-lock probe ([`crate::kernel_spike_ir::PAIRS_IR`]): `p` independent pingpong pairs, each
+/// on a turn word of its own a cache line apart, so nothing but the runtime's own locks couples
+/// them. Per pair, a hand-off costs what it does alone if the runtime runs unrelated hand-offs in
+/// parallel, and up to `p` times that if one lock serializes them.
+fn run_pairs(reps: usize) {
+    println!("\nrun lock: P independent pingpong pairs at once (us per hand-off, per pair):");
+    let m = parse(crate::kernel_spike_ir::PAIRS_IR);
+    for p in [1i64, 2, 4] {
+        let mut lanes = [
+            ("today", today(&m, 0, Host::new(), true)),
+            ("kernel", kernel(&m, 0)),
+        ];
+        let args = move |n| vec![n, p];
+        per_iter(
+            &format!("P = {p}"),
+            &mut lanes,
+            args,
+            (100, 5_100),
+            2.0,
+            reps,
+            1e3,
+            "us",
+        );
     }
 }
