@@ -12367,15 +12367,22 @@ struct Waits {
     sticky: u64,
 }
 
+impl Waits {
+    /// Whether the stripes hold exactly the waiters and the fiber waits that never count out: what
+    /// every count in and out leaves them as, outside [`wait_task`]'s one hold of the lock.
+    fn counted(&self) -> bool {
+        self.count.total() == self.n as u64 + self.sticky
+    }
+}
+
 impl Drop for Waits {
     fn drop(&mut self) {
         // A test that failed reports its own panic, not this one's abort.
         if std::thread::panicking() {
             return;
         }
-        debug_assert_eq!(
-            self.count.total(),
-            self.n as u64 + self.sticky,
+        debug_assert!(
+            self.counted(),
             "every futex wait counted in once and out once"
         );
     }
@@ -12434,8 +12441,15 @@ impl Tasks {
     }
 
     /// #2868 — task `i`, just parked on a futex wait (`BlockedWait`), keyed `key`, leaves the live
-    /// list until its wait ends ([`Waits`]).
+    /// list until its wait ends ([`Waits`]). #2958 slice 2 — it counts in on its key first
+    /// ([`Waits::count`]), as every waiter does before anything can compare its word.
     fn park_wait(&mut self, i: usize, key: super::FutexKey) {
+        self.waits.count.enter(&key);
+        self.file_wait(i, key);
+    }
+
+    /// [`Self::park_wait`]'s filing, for a waiter already counted in on `key` ([`wait_task`]).
+    fn file_wait(&mut self, i: usize, key: super::FutexKey) {
         let TaskState::BlockedWait { deadline, .. } = self.slots[i].state else {
             unreachable!("only a futex wait parks aside");
         };
@@ -12452,8 +12466,6 @@ impl Tasks {
         }
         w.n += 1;
         *w.in_domain.entry(self.slots[i].domain).or_default() += 1;
-        // #2958 slice 2 — counted in before the wait rule compares its word ([`wait_task`]).
-        w.count.enter(&key);
         self.slots[i].waits_on = Some(key);
     }
 
@@ -19526,6 +19538,10 @@ impl ThreadRun {
             std::sync::Arc::ptr_eq(&self.count, &g.core.tasks.waits.count),
             "a notify reads the counts its run's waiters write"
         );
+        debug_assert!(
+            g.core.tasks.waits.counted(),
+            "the futex counts are the waiters"
+        );
         let had = g.core.tasks.len();
         // A notify and an untimed wait read no clock (#2963).
         let untimed = matches!(
@@ -20479,20 +20495,25 @@ fn wait_task(
     dst: u32,
 ) {
     let site = mem.map_or(super::FutexSite::Anon(base), |m| m.futex_site(base));
-    // #2958 slice 2 — park first, which counts the waiter in on its key ([`Tasks::park_wait`]),
-    // then compare: a notify that reads the count without the run lock either sees the waiter, or
-    // made its store before this read ([`super::futex_count`]). A word that already changed ends
-    // the wait at once, as if it had not parked.
+    let key = site_key_in(mem, base, site);
+    // #2958 slice 2 — count in on the key, then compare: a notify that reads the count without the
+    // run lock either sees this waiter, or made its store before this read ([`super::futex_count`]).
+    // This is the one place a waiter counts in without filing ([`Tasks::park_wait`] counts and
+    // files), and it files or counts out before it returns, under the same hold of the lock: outside
+    // that hold a key's count is its queue plus the fiber waits that never count out.
+    tasks.waits.count.enter(&key);
+    if mem.map_or(0, |m| m.atomic_value(base, width)) != expected {
+        tasks.waits.count.leave(&key);
+        tasks[ti].deliver(dst, Reg::from_i32(super::WAIT_NOT_EQUAL));
+        return;
+    }
     tasks[ti].state = TaskState::BlockedWait {
         addr: base,
         site,
         deadline: timeout.map(|t| clock.saturating_add(t)),
         dst,
     };
-    tasks.park_wait(ti, site_key_in(mem, base, site));
-    if mem.map_or(0, |m| m.atomic_value(base, width)) != expected {
-        tasks.end_wait(ti, super::WAIT_NOT_EQUAL);
-    }
+    tasks.file_wait(ti, key);
 }
 
 /// `memory.wait` by task `ti` over its domain's window `mem` and fiber registry (`fibers`,

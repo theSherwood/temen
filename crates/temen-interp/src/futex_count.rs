@@ -9,7 +9,9 @@
 //!
 //! **Who counts.** Every waiter of every engine, inside the shared wait rule: a task counts in when
 //! it joins its key's wait queue (`Tasks::park_wait`) and out when it leaves it (`Tasks::unpark_wait`),
-//! and the wait rule parks *before* it compares the word (`wait_task`). A fiber's wait counts in and
+//! except in the wait rule itself (`wait_task`), which counts in before it compares the word and
+//! then either files the task in the queue or counts out, under one hold of the run lock. A fiber's
+//! wait counts in and
 //! never out ([`FutexCount::enter`] without a `leave`), because its exits are spread over the fiber
 //! machinery; phase 2 of #2958 moves fiber waits into the kernel's wait index, and they count out
 //! there.
