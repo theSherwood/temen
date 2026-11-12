@@ -98,7 +98,8 @@ fn main() {
 ///
 /// `blocks` is how many times per iteration a parallel-driver thread's park blocked in the OS
 /// ([`bytecode::thread_blocks`]): a pingpong iteration is two hand-offs, and most of its cost is
-/// its blocks. `jit` is today's Cranelift JIT, for the pingpong kernels, with `--features run`.
+/// its blocks. `jit` is `temen-run`'s JIT backend, for the pingpong kernels, with `--features run`:
+/// these modules use §12 ops, so it runs them on the kernel route, as executor 2 tasks (#2958).
 fn concurrency(only: &[String]) {
     println!("\nconcurrency (ns per iteration, compute-isolated by subtraction):");
     println!(
@@ -171,10 +172,11 @@ fn pingpong_work() {
         "{:>12}  {:>9}  {:>10}  {:>8}  {:>8}  {:>9}  {:>8}",
         "lane", "count", "hand-off", "work", "left", "blocks", "cpu"
     );
-    // (lane, its run of a kernel, whether it counts executor 2's blocks).
+    // (lane, its run of a kernel, whether it counts executor 2's blocks). The `jit` lane runs on the
+    // kernel route, whose tasks park on executor 2's parks, so its blocks are counted too (#2985).
     type Lane = (&'static str, fn(&ir::Module), bool);
     #[cfg(feature = "run")]
-    let jit: Option<Lane> = Some(("jit", lane_jit, false));
+    let jit: Option<Lane> = Some(("jit", lane_jit, true));
     #[cfg(not(feature = "run"))]
     let jit: Option<Lane> = None;
     let lanes: [Lane; 3] = [
@@ -258,7 +260,7 @@ fn lane_parallel(m: &ir::Module) {
     std::hint::black_box(run_parallel_args(m, &[]));
 }
 
-/// Today's Cranelift JIT, through `temen-run`, with fuel unmetered.
+/// `temen-run`'s JIT backend, with fuel unmetered: the kernel route for a module with a §12 op (#2958).
 #[cfg(feature = "run")]
 fn lane_jit(m: &ir::Module) {
     let inst = temen_run::instantiate(m.clone()).expect("the JIT instantiates the kernel");

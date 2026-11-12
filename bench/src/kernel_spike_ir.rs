@@ -322,3 +322,100 @@ block 0 (vi: i64, vj: i64) {
   }
 }
 "#;
+
+/// One side of [`always_ir`]'s pingpong, as function text: `func (n, w)` takes `n` turns on the turn
+/// word, each when the word reads `me`: `w` steps of a dependent multiply-add (the work, kept live
+/// through a store), then the word set to `next` and a notify. `head` opens its block 0, which must
+/// branch to block 1 with `(vn, vw, vh, vi, vx)`; `end` is its block 7 `(vh9, vx9)`.
+fn always_side(me: u32, next: u32, head: &str, end: &str, notify: bool) -> String {
+    let notify = if notify {
+        "  vc6 = i32.const 1\n  vwk6 = atomic.notify vt6 vc6\n"
+    } else {
+        ""
+    };
+    format!(
+        r#"func (i64, i64) -> (i64) {{
+{head}
+block 1 (vn1: i64, vw1: i64, vh1: i32, vi1: i64, vx1: i64) {{
+  vlt1 = i64.lt_u vi1 vn1
+  br_if vlt1 2(vn1, vw1, vh1, vi1, vx1) 7(vh1, vx1)
+}}
+block 2 (vn2: i64, vw2: i64, vh2: i32, vi2: i64, vx2: i64) {{
+  vt2 = i64.const 16400
+  vcur2 = i32.atomic.load vt2
+  vme2 = i32.const {me}
+  veq2 = i32.eq vcur2 vme2
+  br_if veq2 4(vn2, vw2, vh2, vi2, vx2, vw2) 3(vn2, vw2, vh2, vi2, vx2, vcur2)
+}}
+block 3 (vn3: i64, vw3: i64, vh3: i32, vi3: i64, vx3: i64, vcur3: i32) {{
+  vt3 = i64.const 16400
+  vinf3 = i64.const -1
+  vs3 = i32.atomic.wait vt3 vcur3 vinf3
+  br 2(vn3, vw3, vh3, vi3, vx3)
+}}
+block 4 (vn4: i64, vw4: i64, vh4: i32, vi4: i64, vx4: i64, vk4: i64) {{
+  vz4 = i64.const 0
+  vdone4 = i64.eq vk4 vz4
+  br_if vdone4 6(vn4, vw4, vh4, vi4, vx4) 5(vn4, vw4, vh4, vi4, vx4, vk4)
+}}
+block 5 (vn5: i64, vw5: i64, vh5: i32, vi5: i64, vx5: i64, vk5: i64) {{
+  vm5 = i64.const 6364136223846793005
+  vy5 = i64.mul vx5 vm5
+  vone5 = i64.const 1
+  vx5n = i64.add vy5 vone5
+  vk5n = i64.sub vk5 vone5
+  br 4(vn5, vw5, vh5, vi5, vx5n, vk5n)
+}}
+block 6 (vn6: i64, vw6: i64, vh6: i32, vi6: i64, vx6: i64) {{
+  vs6 = i64.const 16384
+  i64.store vs6 vx6
+  vt6 = i64.const 16400
+  vnext6 = i32.const {next}
+  i32.atomic.store vt6 vnext6
+{notify}  vone6 = i64.const 1
+  vin6 = i64.add vi6 vone6
+  br 1(vn6, vw6, vh6, vin6, vx6)
+}}
+{end}
+}}
+"#
+    )
+}
+
+/// #2985 — the always-block pingpong ([`crate::kernel_spike::run_always`]): `func 0 (n, w)` spawns
+/// its partner (`func 1`) and the two take `n` turns each on one word, each turn `w` steps of work
+/// before its store and notify. With the work far longer than a sleep takes to reach, the waiter is
+/// asleep before every notify: each hand-off blocks.
+pub fn always_ir() -> String {
+    let root = always_side(
+        0,
+        1,
+        "block 0 (vn: i64, vw: i64) {\n  vh = thread.spawn 1 vn vw\n  vz = i64.const 0\n  br 1(vn, vw, vh, vz, vz)\n}",
+        "block 7 (vh9: i32, vx9: i64) {\n  vst9, vr9 = thread.join vh9\n  return vx9\n}",
+        true,
+    );
+    let partner = always_side(
+        1,
+        0,
+        "block 0 (vn: i64, vw: i64) {\n  vh = i32.const 0\n  vz = i64.const 0\n  br 1(vn, vw, vh, vz, vz)\n}",
+        "block 7 (vh9: i32, vx9: i64) {\n  return vx9\n}",
+        true,
+    );
+    format!("memory 16\n{root}{partner}")
+}
+
+/// #2985 — [`always_ir`]'s work alone, to take out of its hand-off: `func 0 (n, w)` joins one trivial
+/// thread (so every lane runs it as it runs the pingpong), then takes `n` turns of `w` steps each,
+/// with the same stores and no notify: what is left of a hand-off once this is taken out is the
+/// stops, the park and the wake.
+pub fn always_work_ir() -> String {
+    let root = always_side(
+        0,
+        0,
+        "block 0 (vn: i64, vw: i64) {\n  vz0 = i64.const 0\n  vh = thread.spawn 1 vz0 vz0\n  vst0, vr0 = thread.join vh\n  vz = i64.const 0\n  br 1(vn, vw, vh, vz, vz)\n}",
+        "block 7 (vh9: i32, vx9: i64) {\n  return vx9\n}",
+        false,
+    );
+    let idle = "func (i64, i64) -> (i64) {\nblock 0 (va: i64, vb: i64) {\n  return va\n  }\n}\n";
+    format!("memory 16\n{root}{idle}")
+}
