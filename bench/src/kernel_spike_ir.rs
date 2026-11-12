@@ -326,7 +326,7 @@ block 0 (vi: i64, vj: i64) {
 /// One side of [`always_ir`]'s pingpong, as function text: `func (n, w)` takes `n` turns on the turn
 /// word, each when the word reads `me`: `w` steps of a dependent multiply-add (the work, kept live
 /// through a store), then the word set to `next` and a notify. `head` opens its block 0, which must
-/// branch to block 1 with `(vn, vw, vh, vi, vx)`; `end` is its block 9 `(vh9, vx9)`.
+/// branch to block 1 with `(vn, vw, vh, vi, vx)`; `end` is its block 7 `(vh9, vx9)`.
 fn always_side(me: u32, next: u32, head: &str, end: &str, notify: bool) -> String {
     let notify = if notify {
         "  vc6 = i32.const 1\n  vwk6 = atomic.notify vt6 vc6\n"
@@ -338,7 +338,7 @@ fn always_side(me: u32, next: u32, head: &str, end: &str, notify: bool) -> Strin
 {head}
 block 1 (vn1: i64, vw1: i64, vh1: i32, vi1: i64, vx1: i64) {{
   vlt1 = i64.lt_u vi1 vn1
-  br_if vlt1 2(vn1, vw1, vh1, vi1, vx1) 9(vh1, vx1)
+  br_if vlt1 2(vn1, vw1, vh1, vi1, vx1) 7(vh1, vx1)
 }}
 block 2 (vn2: i64, vw2: i64, vh2: i32, vi2: i64, vx2: i64) {{
   vt2 = i64.const 16400
@@ -391,14 +391,14 @@ pub fn always_ir() -> String {
         0,
         1,
         "block 0 (vn: i64, vw: i64) {\n  vh = thread.spawn 1 vn vw\n  vz = i64.const 0\n  br 1(vn, vw, vh, vz, vz)\n}",
-        "block 9 (vh9: i32, vx9: i64) {\n  vst9, vr9 = thread.join vh9\n  return vx9\n}",
+        "block 7 (vh9: i32, vx9: i64) {\n  vst9, vr9 = thread.join vh9\n  return vx9\n}",
         true,
     );
     let partner = always_side(
         1,
         0,
         "block 0 (vn: i64, vw: i64) {\n  vh = i32.const 0\n  vz = i64.const 0\n  br 1(vn, vw, vh, vz, vz)\n}",
-        "block 9 (vh9: i32, vx9: i64) {\n  return vx9\n}",
+        "block 7 (vh9: i32, vx9: i64) {\n  return vx9\n}",
         true,
     );
     format!("memory 16\n{root}{partner}")
@@ -413,7 +413,7 @@ pub fn always_work_ir() -> String {
         0,
         0,
         "block 0 (vn: i64, vw: i64) {\n  vz0 = i64.const 0\n  vh = thread.spawn 1 vz0 vz0\n  vst0, vr0 = thread.join vh\n  vz = i64.const 0\n  br 1(vn, vw, vh, vz, vz)\n}",
-        "block 9 (vh9: i32, vx9: i64) {\n  return vx9\n}",
+        "block 7 (vh9: i32, vx9: i64) {\n  return vx9\n}",
         false,
     );
     let idle = "func (i64, i64) -> (i64) {\nblock 0 (va: i64, vb: i64) {\n  return va\n  }\n}\n";

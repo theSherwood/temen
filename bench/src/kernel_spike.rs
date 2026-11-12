@@ -154,6 +154,12 @@ impl Sw {
     }
 }
 
+/// `SPIKE_RAW=1`: print each rep's value and counts as well, to fit a lane's time against its block
+/// rate (#2985).
+fn raw() -> bool {
+    std::env::var_os("SPIKE_RAW").is_some()
+}
+
 /// How many threads this process has (`/proc/self/status`), `None` where there is no such file.
 fn threads_now() -> Option<usize> {
     let s = std::fs::read_to_string("/proc/self/status").ok()?;
@@ -223,7 +229,7 @@ fn per_iter(
     let mut setup: Vec<Vec<f64>> = vec![Vec::new(); lanes.len()];
     let mut sws: Vec<Vec<Sw>> = vec![Vec::new(); lanes.len()];
     for _ in 0..reps {
-        for (i, (_, lane)) in lanes.iter_mut().enumerate() {
+        for (i, (name, lane)) in lanes.iter_mut().enumerate() {
             let ((r0, t0), s0) = counted(lane, &args(n_small));
             let ((r1, t1), s1) = counted(lane, &args(n_big));
             std::hint::black_box((r0, r1));
@@ -231,7 +237,12 @@ fn per_iter(
             let ops = (n_big - n_small) as f64 * per;
             per_lane[i].push(d * 1e9 / ops / unit_ns);
             setup[i].push(t0.as_secs_f64() * 1e3);
-            sws[i].push(s1.minus(s0).per(ops));
+            let sw = s1.minus(s0).per(ops);
+            if raw() {
+                let v = d * 1e9 / ops / unit_ns;
+                println!("    raw {label} {name} {v:.3} vol {:.3} blocks {:.3}", sw.vol, sw.blocks);
+            }
+            sws[i].push(sw);
         }
     }
     for (i, (name, _)) in lanes.iter().enumerate() {
@@ -380,8 +391,15 @@ fn run_always(reps: usize) {
     let (n_small, n_big) = (20i64, 520i64);
     let turns = (n_big - n_small) as f64;
     for target in targets {
-        let ws: Vec<i64> = (steps.iter())
-            .map(|s| ((target * 1e3 / s) as i64).max(1))
+        // Both native lanes run the same Cranelift code for the work, so they take the same count
+        // (today's), and their hand-offs compare rep by rep with no work taken out.
+        let native = (pps.iter().position(|(n, _)| *n == "today"))
+            .map(|t| steps[t]);
+        let ws: Vec<i64> = (pps.iter().zip(&steps))
+            .map(|((n, _), s)| {
+                let s = if *n == "x2-interp" { *s } else { native.unwrap_or(*s) };
+                ((target * 1e3 / s) as i64).max(1)
+            })
             .collect();
         println!("  work {target} us a turn:");
         let k = pps.len();
@@ -401,9 +419,26 @@ fn run_always(reps: usize) {
                 hand[i].push(h);
                 work[i].push(wk);
                 left[i].push(h - wk);
-                sws[i].push(s1.minus(s0).per(2.0 * turns));
+                let sw = s1.minus(s0).per(2.0 * turns);
+                if raw() {
+                    let name = pps[i].0;
+                    println!("    raw always{target} {name} {h:.3} work {wk:.3} vol {:.3}", sw.vol);
+                }
+                sws[i].push(sw);
             }
         }
+        // Paired by rep, before any column is sorted: each lane's hand-off less today's, over the
+        // same work count.
+        let t = pps.iter().position(|(n, _)| *n == "today");
+        let vs_today: Vec<Option<String>> = (0..k)
+            .map(|i| {
+                t.filter(|&t| t != i && ws[t] == ws[i]).map(|t| {
+                    let mut d: Vec<f64> =
+                        (hand[i].iter().zip(&hand[t])).map(|(a, b)| a - b).collect();
+                    format!("  vs today {}", fmt(stats(&mut d), "us"))
+                })
+            })
+            .collect();
         for i in 0..k {
             println!(
                 "    {:<10} steps {:>8}  hand-off {:>26}  work {:>26}  left {:>26}",
@@ -413,6 +448,9 @@ fn run_always(reps: usize) {
                 fmt(stats(&mut work[i]), "us"),
                 fmt(stats(&mut left[i]), "us"),
             );
+            if let Some(d) = &vs_today[i] {
+                println!("    {:<10} {d}", "");
+            }
             println!("    {:<10} {}", "", sw_row(&sws[i]));
         }
     }
