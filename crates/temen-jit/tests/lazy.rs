@@ -251,3 +251,36 @@ fn instances_of_one_compile_wait_on_the_same_compiles() {
         }
     });
 }
+
+/// #2996 — a guest fault in code compiled at its first call, on the linked copy that replaces it,
+/// and in another instance of the same code, is the guest's `MemoryFault`: each of those lands in
+/// the module's code arena, which the fault handler registers before any of it exists.
+#[test]
+fn a_fault_in_code_compiled_at_first_call_traps() {
+    let last = FUNCS - 1;
+    let mut s = format!(
+        "memory 16\nfunc () -> (i64) {{\nblock 0 () {{\n  v0 = call {last} ()\n  return v0\n  }}\n}}\n"
+    );
+    for _ in 1..last {
+        s += "func () -> (i64) {\nblock 0 () {\n  v0 = i64.const 1\n  return v0\n  }\n}\n";
+    }
+    // The page past the 64 KiB window: in the reservation, backed by nothing.
+    s += "func () -> (i64) {\nblock 0 () {\n  v0 = i64.const 1048576\n  v1 = i64.load v0\n  return v1\n  }\n}\n";
+    let m = temen_text::parse_module(&s).expect("parse");
+    temen_verify::verify_module(&m).expect("verify");
+    let faults = |cm: &mut CompiledModule, what: &str| match cm.run(&[], None, None).expect("run").0
+    {
+        JitOutcome::Trapped(temen_jit::TrapKind::MemoryFault) => {}
+        other => panic!("{what}: {other:?}"),
+    };
+    let mut cm = compile(&m);
+    assert!(cm.compiles_lazily(), "the module compiles at first calls");
+    faults(&mut cm, "while compiling at first calls");
+    assert!(cm.wait_linked(), "the linked copy is published");
+    faults(&mut cm, "on the linked copy");
+    let code = cm.share().expect("only code");
+    faults(
+        &mut code.instance(InstanceAddrs::NONE, None),
+        "in another instance",
+    );
+}

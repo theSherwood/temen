@@ -133,6 +133,24 @@ wasm?" answer lives in one place:
   composes to any depth at depth-independent per-access cost. wasm has no native
   *runtime* nesting (only interpreter-in-wasm or link-time component composition),
   so multi-tenant hosts and plugin-in-plugin fall out for free.
+- **Durable domains (freeze / thaw / restore)** — a running domain can be quiesced,
+  serialized to bytes (window pages + per-page prots, shadow control state, handle
+  table) and restored to **bytewise-equivalent** execution, possibly on the other
+  backend or another host (§21, `DURABILITY.md`). It falls out of decisions already
+  settled (total IR, out-of-band control stack, block-local SSA, the masked window)
+  rather than new escape-TCB; the architecture makes it cheap where wasm makes it hard.
+- **Record/replay & time-travel debugging** — with no ambient authority, guest
+  nondeterminism enters through capabilities, so the capability boundary *is* the
+  recording boundary: in deterministic mode a run replays exactly, and stepping
+  backward follows from replay to any prior point (§19, `DEBUGGING.md`). Under real
+  concurrency, race outcomes bypass that boundary and a faithful replay must also
+  record the schedule (§19's caveat).
+- **Guest-driven JIT** — a guest (an interpreter running inside the sandbox) can
+  generate IR at runtime, submit it through the `Jit` capability, and call the
+  verified, Cranelift-compiled result (§22). wasm's W^X and immutable modules force
+  such a guest to ship its own interpreter or round-trip to the host for a fresh
+  module. Here it needed no verifier, IR or escape-TCB change: the verifier is the
+  trust hinge for exactly this.
 - **Lean by exclusion** — no GC, no JS interop, no UTF-16 / `externref` /
   component-IDL surface. This deliberately narrows the market to systems/native
   languages (C/C++/Rust/Zig/Swift) — managed languages are *not* first-class — in

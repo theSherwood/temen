@@ -206,7 +206,7 @@ pub(crate) unsafe extern "C" fn fuel_refill(cell: *mut FuelCell) {
 /// process, by the same ISA configuration as every guest compile, and never freed: every cell points
 /// at it. The static owns the module, not just the code's address, so the module's own allocations
 /// stay reachable; a `mem::forget` left LeakSanitizer to report them at every exit (#2277).
-fn refill_trampoline() -> usize {
+pub(crate) fn refill_trampoline() -> usize {
     static TRAMPOLINE: std::sync::OnceLock<(crate::OwnedJit, usize)> = std::sync::OnceLock::new();
     TRAMPOLINE
         .get_or_init(|| {
