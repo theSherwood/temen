@@ -438,6 +438,24 @@ block 0 (v0: i64) {
 #[test]
 fn a_longjmp_to_a_returned_activation_traps_on_every_engine() {
     assert_every_engine(RETURNED, 0, Err(MALFORMED));
+}
+
+/// #2877 — the same program, optimized: the inliner must not move func 1's checkpoint into the
+/// root's activation (`Func::takes_checkpoints`), where func 2's `longjmp` would find it live and
+/// return 7 out of a frame whose activation returned.
+#[test]
+fn optimization_keeps_a_returned_activations_checkpoint_dead() {
+    let m = parse_module(RETURNED).expect("parse");
+    let opt = temen_opt::optimize_module(&m);
+    // Checked first, so an inliner that moves the checkpoint fails here rather than running a
+    // program whose JIT run would then spin (it has no fuel to stop it).
+    assert!(
+        !opt.funcs[0].takes_checkpoints(),
+        "func 1's `setjmp` was inlined into the root"
+    );
+    let src = temen_text::print_module(&opt);
+    assert_every_engine(&src, 0, Err(MALFORMED));
+    assert_every_engine(&src, 1, Ok(vec![0]));
     assert_every_engine(RETURNED, 1, Ok(vec![0]));
 }
 

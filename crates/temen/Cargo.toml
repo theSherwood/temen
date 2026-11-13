@@ -50,6 +50,8 @@ wat = "1"
 # The embedding runtime — its `cap_thunk` (JIT CapThunk → reference-Host bridge) is shared by
 # the C-frontend differential tests instead of a copy-pasted local one.
 temen-run = { path = "../temen-run" }
+# The optimizer, for `setjmp_repro.rs`: a checkpoint's liveness must survive optimization (#2877).
+temen-opt.workspace = true
 # The freeze/thaw transform, for the cross-backend durable differential (`durable_jit.rs`).
 temen-durable = { path = "../temen-durable" }
 # The §12 snapshot artifact codec, exercised across backends by `durable_jit.rs`.

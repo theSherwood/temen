@@ -2609,10 +2609,7 @@ fn compile_func(f: &Func, view: &ModuleView<'_>, fuse: bool) -> Option<Program> 
     nslots += 1;
     let mut block_pc = vec![0u32; f.blocks.len()];
     // #2877 — a function that takes `setjmp` checkpoints drops them at each exit.
-    let leave = f
-        .blocks
-        .iter()
-        .any(|b| b.insts.iter().any(|i| matches!(i, Inst::SetJmp { .. })));
+    let leave = f.takes_checkpoints();
     // One op per instruction and one per terminator, less any compare a branch fuses: sized once
     // rather than grown (#2586).
     let nops = f.blocks.iter().map(|b| b.insts.len() + 1).sum();

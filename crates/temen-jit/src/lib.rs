@@ -9899,10 +9899,7 @@ fn build_clif(
         }
     }
     let (mut lower, params) = open_function(&mut b, plan, &f.params, &f.results, func_idx)?;
-    lower.setjmp_leave = f
-        .blocks
-        .iter()
-        .any(|blk| blk.insts.iter().any(|i| matches!(i, Inst::SetJmp { .. })));
+    lower.setjmp_leave = f.takes_checkpoints();
     if setjmp {
         let fp_var = b.declare_var(I64);
         let fp = b.ins().get_frame_pointer(I64);
