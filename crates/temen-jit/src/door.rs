@@ -49,6 +49,11 @@ impl Wakers {
             .retain(|(i, _)| *i != id);
     }
 
+    /// #2953 — drop every waker, at a run's end: its registrations are its own run's.
+    pub(crate) fn clear(&self) {
+        self.list.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    }
+
     /// [`Self::add`] for as long as the returned registration lives.
     pub(crate) fn register(&self, w: Waker) -> Registration<'_> {
         Registration {
