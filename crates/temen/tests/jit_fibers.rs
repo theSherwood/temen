@@ -335,6 +335,8 @@ debug.loc 2 0 0 0 9 3
         0,
     )
     .expect("compile");
+    // A run takes its parked fibers' backtraces as it ends only when asked (#3020).
+    cm.keep_parked_backtraces(true);
 
     // Before the run no fiber has been created, so there is nothing to walk.
     assert!(

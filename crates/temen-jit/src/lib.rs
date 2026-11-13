@@ -3243,23 +3243,52 @@ pub struct VarMachineInfo {
 }
 
 /// #3020 — a run's fibers: the domain-shared table its vCPUs create them in and the root's runtime
-/// over it ([`CompiledModule::begin_fibers`]). Made when the run starts and dropped when it ends, so
-/// a fiber lives no longer than the run that made it: it holds that run's window base and context,
-/// which die with the run.
+/// over it ([`CompiledModule::begin_fibers`]). A local of the run ([`CompiledModule::run_code_raw`]),
+/// so the run owns them on every way out of it: when it is dropped the root's runtime is unpublished
+/// and every fiber goes, its stack and charge with it ([`fiber_rt::SharedFiberTable::end`]). A fiber
+/// lives no longer than the run that made it: it holds that run's window base and context, which
+/// die with the run.
 #[cfg(fiber_rt)]
 struct RunFibers {
     table: Arc<fiber_rt::SharedFiberTable>,
     /// The root vCPU's runtime: `None` for a module that runs no `cont.*` of its own (the table then
     /// serves only the durable vCPU-context allocator).
     root: Option<Box<fiber_rt::FiberRuntime>>,
+    /// While the root's runtime is published to this thread, what it replaced.
+    prev: Option<*mut fiber_rt::FiberRuntime>,
+}
+
+#[cfg(fiber_rt)]
+impl RunFibers {
+    /// Publish the root's runtime to this thread for the run's guest code ([`fiber_rt::set_current`]).
+    fn publish(&mut self) {
+        if let Some(rt) = self.root.as_mut() {
+            self.prev = Some(fiber_rt::set_current(
+                &mut **rt as *mut fiber_rt::FiberRuntime,
+            ));
+        }
+    }
+
+    /// Give this thread back the runtime the root's replaced.
+    fn unpublish(&mut self) {
+        if let Some(p) = self.prev.take() {
+            fiber_rt::set_current(p);
+        }
+    }
 }
 
 #[cfg(fiber_rt)]
 impl Drop for RunFibers {
-    /// The run has ended: each fiber it left hands its charge back now (#2112), even if something
-    /// keeps the table (a held site its embedder holds, which a closed site never reads again).
+    /// The run is over. Its fibers' charges go back on every way out (#2112). Their stacks go too,
+    /// unless the run is unwinding from a panic: then its vCPUs were not joined and one may still be
+    /// on a fiber's stack, which is left to the process rather than freed under it.
     fn drop(&mut self) {
-        self.table.release_charges();
+        self.unpublish();
+        if std::thread::panicking() {
+            self.table.release_charges();
+        } else {
+            self.table.end();
+        }
     }
 }
 
@@ -3427,15 +3456,15 @@ pub struct CompiledModule {
     // --- §12/§14 runtimes this instance's code runs on, which its vmctx names or an entry publishes;
     // --- they must live exactly as long as the instance can run. Each instance has its own
     // --- ([`Self::instance`], temen#2389).
-    /// #3020 — the run's fiber table and root fiber runtime: built when a run starts
-    /// ([`Self::begin_fibers`]), dropped when it ends. `None` between runs, so no fiber a run
-    /// created outlives it, and a later run's handle names nothing of an earlier run's.
+    /// #3020 — whether a run takes the backtraces of the fibers it leaves parked as it ends, for
+    /// [`Self::fiber_backtrace`] ([`Self::keep_parked_backtraces`]). Off by default: the work scales
+    /// with what the guest left.
     #[cfg(fiber_rt)]
-    run_fibers: Option<RunFibers>,
-    /// #3020 — the backtraces of the fibers the last run left parked, taken as it ended
-    /// ([`Self::fiber_backtrace`]): empty unless the module carried `-g`.
+    keep_parked_backtraces: bool,
+    /// #3020 — those backtraces, from the last run: each fiber's handle, the table's slot count its
+    /// handles are read against, and its frames.
     #[cfg(fiber_rt)]
-    parked_backtraces: Vec<(i64, Vec<JitFrameLoc>)>,
+    parked_backtraces: (usize, Vec<(i64, Vec<JitFrameLoc>)>),
     #[cfg(fiber_rt)]
     domain: Option<Box<os_thread_rt::Domain>>,
     /// Kept alive because the instance names it ([`VmCtx::nursery`]) for its `Instantiator` sites.
@@ -3553,17 +3582,24 @@ impl CompiledModule {
     /// suspend switch. Adjacent duplicate positions are collapsed. Empty if `handle` names no parked
     /// fiber or the module carried no `-g`. Host-side tooling, off the running guest's path (§2a).
     ///
-    /// #3020 — between runs, the fibers the last run left parked, as they were when it ended: the run
-    /// took their backtraces before its table went.
+    /// #3020 — a fiber lives no longer than its run, so this answers between runs, for the fibers
+    /// the last run left parked, as they were when it ended, and only once
+    /// [`Self::keep_parked_backtraces`] asked the run to take them.
     #[cfg(fiber_rt)]
     pub fn fiber_backtrace(&self, handle: i64) -> Vec<JitFrameLoc> {
-        match &self.run_fibers {
-            Some(f) => self.parked_backtrace(&f.table, handle),
-            None => (self.parked_backtraces.iter())
-                .find(|(h, _)| *h == handle)
-                .map(|(_, frames)| frames.clone())
-                .unwrap_or_default(),
-        }
+        let (slots, parked) = &self.parked_backtraces;
+        (parked.iter())
+            .find(|(h, _)| fiber_rt::names_same_fiber(*h, handle, *slots))
+            .map(|(_, frames)| frames.clone())
+            .unwrap_or_default()
+    }
+
+    /// #3020 — have each run take, as it ends, the backtraces of the fibers it leaves parked, for
+    /// [`Self::fiber_backtrace`]. A debugger's opt-in: the work scales with what the guest left
+    /// (every word of every parked stack), so a run does none of it by default.
+    #[cfg(fiber_rt)]
+    pub fn keep_parked_backtraces(&mut self, keep: bool) {
+        self.keep_parked_backtraces = keep;
     }
 
     /// #3020 — a run's fibers, built at its start: the table if the module needs one, and the root's
@@ -3587,7 +3623,11 @@ impl CompiledModule {
                 }
                 rt
             });
-            RunFibers { table, root }
+            RunFibers {
+                table,
+                root,
+                prev: None,
+            }
         })
     }
 
@@ -3597,14 +3637,15 @@ impl CompiledModule {
     fn parked_backtraces_of(
         &self,
         table: &fiber_rt::SharedFiberTable,
-    ) -> Vec<(i64, Vec<JitFrameLoc>)> {
-        if self.src_ranges.is_empty() {
-            return Vec::new();
+    ) -> (usize, Vec<(i64, Vec<JitFrameLoc>)>) {
+        if !self.keep_parked_backtraces || self.src_ranges.is_empty() {
+            return (0, Vec::new());
         }
-        (table.runnable_handles().into_iter())
+        let parked = (table.runnable_handles().into_iter())
             .map(|h| (h, self.parked_backtrace(table, h)))
             .filter(|(_, frames)| !frames.is_empty())
-            .collect()
+            .collect();
+        (table.slot_count(), parked)
     }
 
     /// [`Self::fiber_backtrace`] of `handle` in `table`, a live run's.
@@ -4624,9 +4665,9 @@ impl CompiledModule {
             #[cfg(fiber_rt)]
             rest: None,
             #[cfg(fiber_rt)]
-            run_fibers: None,
+            keep_parked_backtraces: false,
             #[cfg(fiber_rt)]
-            parked_backtraces: Vec::new(),
+            parked_backtraces: (0, Vec::new()),
             #[cfg(fiber_rt)]
             domain,
             #[cfg(fiber_rt)]
@@ -4910,9 +4951,9 @@ impl CompiledModule {
             #[cfg(fiber_rt)]
             rest: None,
             #[cfg(fiber_rt)]
-            run_fibers: None,
+            keep_parked_backtraces: false,
             #[cfg(fiber_rt)]
-            parked_backtraces: Vec::new(),
+            parked_backtraces: (0, Vec::new()),
             #[cfg(fiber_rt)]
             domain,
             #[cfg(fiber_rt)]
@@ -5366,6 +5407,12 @@ impl CompiledModule {
         // The trampoline reads exactly `n_params` arg slots; a shorter buffer would be an
         // out-of-bounds read from safe code. (The one-shot wrappers always pass exact-length
         // args; this check makes the now-public entry sound rather than contractual.)
+        // #3020 — the last run's parked backtraces describe fibers that are gone once a run starts,
+        // whatever it does next.
+        #[cfg(fiber_rt)]
+        {
+            (*this).parked_backtraces = (0, Vec::new());
+        }
         if args.len() < n_params {
             return Err(JitError::Malformed);
         }
@@ -5449,13 +5496,7 @@ impl CompiledModule {
         // that the window / fn-table / trap-cell / call-trampoline are all known.
         // #3020 — and its fiber table and root runtime, which end with it.
         #[cfg(fiber_rt)]
-        {
-            debug_assert!(
-                (*this).run_fibers.is_none(),
-                "a fiber table outlived its run"
-            );
-            (*this).run_fibers = (*this).begin_fibers();
-        }
+        let mut run_fibers = (*this).begin_fibers();
         #[cfg(fiber_rt)]
         {
             let t = &*this;
@@ -5469,7 +5510,7 @@ impl CompiledModule {
                     t.call_tramp,
                     window.fault_range(),
                     t.fiber_cfg,
-                    t.run_fibers.as_ref().map(|f| Arc::clone(&f.table)), // spawned vCPUs build over it
+                    run_fibers.as_ref().map(|f| Arc::clone(&f.table)), // spawned vCPUs build over it
                     t.instance.epoch as usize, // §5 kill-path: so parked vCPUs (futex/join) observe the interrupt
                     t.durable, // slice 3.3: run spawned children inline (single-worker) under a freeze/thaw
                     t.shadow,  // #2518: where its freeze word is
@@ -5495,7 +5536,7 @@ impl CompiledModule {
         // Publish the root fiber runtime (when the module uses `cont.*`) so its thunks find it via the
         // thread-local for the duration of the entry; spawned vCPUs publish their own.
         #[cfg(fiber_rt)]
-        let prev_rt = {
+        {
             // The OS-thread stack pointer in *this* (`run_inner`) frame — above the guarded guest
             // call below and every guest root frame it pushes — is the high bound for `gc.roots`'
             // scan of the root computation's frames. Captured via a local's address here (not a
@@ -5508,10 +5549,8 @@ impl CompiledModule {
             // before the root re-enters under REWINDING, so a thaw `cont.resume` resolves + re-enters
             // them. Done before `set_current` (and the run), while the window/table/trap cell are set.
             let seed = std::mem::take(&mut t.frozen_seed);
-            t.run_fibers
-                .as_mut()
-                .and_then(|f| f.root.as_mut())
-                .map(|rt| {
+            if let Some(f) = run_fibers.as_mut() {
+                if let Some(rt) = f.root.as_mut() {
                     rt.set_root_entry_sp(entry_sp);
                     // Arm the durable fiber-switch swap for the root vCPU (DURABILITY.md §12.8): the
                     // window base is known now. (Spawned vCPUs are multi-vCPU durability, Phase 3.2.)
@@ -5529,9 +5568,10 @@ impl CompiledModule {
                             &vm as *const VmCtx as u64, // the fibers are this instance's
                         );
                     }
-                    fiber_rt::set_current(&mut **rt as *mut fiber_rt::FiberRuntime)
-                })
-        };
+                }
+                f.publish();
+            }
+        }
 
         // §12.8 concurrent-thaw stage 2: the parked-vCPU thaw no longer needs a `Domain.thawing` flag —
         // the thaw re-spawns frozen vCPUs as concurrent OS threads (below), so a re-issued `atomic.wait`
@@ -5705,7 +5745,7 @@ impl CompiledModule {
         if !faulted && vm.ended().is_none() && !(*this).durable {
             if let (Some(rest), Some(d)) = ((*this).rest.take(), (*this).domain.as_deref()) {
                 let d = d as *const os_thread_rt::Domain;
-                let table = (*this).run_fibers.as_ref().map(|f| Arc::clone(&f.table));
+                let table = run_fibers.as_ref().map(|f| Arc::clone(&f.table));
                 let table = table.unwrap_or_else(|| {
                     Arc::new(fiber_rt::SharedFiberTable::new(
                         1,
@@ -5743,7 +5783,7 @@ impl CompiledModule {
             && !faulted
             && fiber_rt::window_is_unwinding(mem_base as u64, (*this).shadow)
         {
-            if let Some(rt) = (*this).run_fibers.as_mut().and_then(|f| f.root.as_mut()) {
+            if let Some(rt) = run_fibers.as_mut().and_then(|f| f.root.as_mut()) {
                 let rt = &mut **rt as *mut fiber_rt::FiberRuntime;
                 fiber_rt::freeze_drive(rt, &vm as *const VmCtx as u64);
                 (*this).frozen_out = fiber_rt::take_frozen(rt); // read back by the durable entry
@@ -5786,8 +5826,8 @@ impl CompiledModule {
         // ---- Teardown: transient references again. ----
         (*this).live_fault_range = None;
         #[cfg(fiber_rt)]
-        if let Some(p) = prev_rt {
-            fiber_rt::set_current(p);
+        if let Some(f) = run_fibers.as_mut() {
+            f.unpublish();
         }
         // S1c: join every async §14 child OS thread before freeing the window — a child copies to/from
         // the parent window, so none may outlive it (mirrors the vCPU `join_all` just below).
@@ -5849,7 +5889,7 @@ impl CompiledModule {
             && !faulted
             && fiber_rt::window_is_unwinding(mem_base as u64, (*this).shadow)
         {
-            if let Some(f) = (*this).run_fibers.as_ref().filter(|f| f.root.is_some()) {
+            if let Some(f) = run_fibers.as_ref().filter(|f| f.root.is_some()) {
                 let flattened: Vec<usize> = (*this).frozen_out.iter().map(|f| f.slot).collect();
                 let rest = f.table.unflattened_for_freeze(&flattened);
                 (*this).frozen_out.extend(rest);
@@ -5876,8 +5916,9 @@ impl CompiledModule {
         // #3020 — and its fibers end with it: their stacks and charges go, and no later run's handle
         // can name one. A debugger may still ask for a parked one's backtrace, taken now.
         #[cfg(fiber_rt)]
-        if let Some(f) = (*this).run_fibers.take() {
+        if let Some(f) = run_fibers.take() {
             (*this).parked_backtraces = (*this).parked_backtraces_of(&f.table);
+            drop(f);
         }
         // Snapshot the in-window bytes when asked (the escape-oracle; a reactor's state). #2176: a run
         // that asks for none copies nothing — a copy of a 32 MiB window is a page fault per page, for
@@ -8887,8 +8928,8 @@ fn compile_child_windowed(
         fork_hook: None,
         #[cfg(fiber_rt)]
         rest: None,
-        run_fibers: None,
-        parked_backtraces: Vec::new(),
+        keep_parked_backtraces: false,
+        parked_backtraces: (0, Vec::new()),
         domain: None,
         _nursery: None,
         #[cfg(setjmp_rt)]

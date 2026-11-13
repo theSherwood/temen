@@ -195,6 +195,15 @@ fn fiber_handle_generation(handle: i64) -> u64 {
     ((handle as u64) >> FIBER_GEN_SHIFT) & FIBER_HANDLE_GEN_MASK
 }
 
+/// #3020 — whether `handle` names the fiber `canonical` names in a table of `slots` slots, as
+/// [`SharedFiberTable::resolve`] reads a handle: its slot masked to the table, its generation masked.
+pub(crate) fn names_same_fiber(canonical: i64, handle: i64, slots: usize) -> bool {
+    let mask = slots.next_power_of_two() - 1;
+    let slot = |h: i64| (h as u64 as usize) & mask;
+    slot(handle) == slot(canonical)
+        && fiber_handle_generation(handle) == fiber_handle_generation(canonical)
+}
+
 #[cfg(all(test, not(loom)))]
 mod fiber_handle_tag_tests {
     use super::{fiber_handle, fiber_handle_generation};
@@ -619,6 +628,31 @@ impl SharedFiberTable {
     pub(crate) fn release_charges(&self) {
         for c in self.lock().charges.iter_mut() {
             *c = FiberCharge::none();
+        }
+    }
+
+    /// #3020 — this table's run has ended, and nothing runs on any of its fibers: every fiber goes,
+    /// its stack and its charge with it. By ownership: each slot's [`Fiber`] is taken out and
+    /// dropped, whatever holds the slot. A fiber parked on an event keeps an `Arc` of its own slot in
+    /// a frame on its own stack, which no unwinding ever drops, so waiting for the last reference
+    /// would keep the stack for the life of the process. The slots go too, so a table something
+    /// still holds (a closed held site's) names no fiber.
+    /// How many slots the table holds, which a handle's slot is masked to.
+    pub(crate) fn slot_count(&self) -> usize {
+        self.lock().slots.len()
+    }
+
+    pub(crate) fn end(&self) {
+        let slots = {
+            let mut t = self.lock();
+            for c in t.charges.iter_mut() {
+                *c = FiberCharge::none();
+            }
+            t.free.clear();
+            std::mem::take(&mut t.slots)
+        };
+        for s in slots {
+            drop(s.fiber.lock().unwrap_or_else(|e| e.into_inner()).take());
         }
     }
 }
