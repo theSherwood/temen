@@ -969,6 +969,7 @@ dependencies = [
  "temen-interp",
  "temen-ir",
  "temen-jit",
+ "temen-mask",
  "temen-opt",
  "temen-peval",
  "temen-posix",

@@ -36,6 +36,8 @@ temen-verify.workspace = true
 # domain (grant_jit_durable). Tooling-tier (temen-durable → temen-ir only), so no TCB layering concern.
 temen-durable.workspace = true
 temen-interp.workspace = true
+# #2958 slice 3: the kernel's futex reads of a JIT window confine through the fuzzed bound.
+temen-mask.workspace = true
 temen-exec.workspace = true
 temen-fs.workspace = true
 # The POSIX personality (temen-posix): exposed as a named `HostCap` (`posix_cap`) so the LLVM on-ramp

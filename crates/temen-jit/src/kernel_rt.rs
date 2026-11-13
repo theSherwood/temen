@@ -64,6 +64,9 @@ pub enum VcpuEntry<'a> {
     Thread { func: u32, arg0: i64, arg1: i64 },
 }
 
+/// A started [`KernelRun`], and the byte ranges its window's data segments made read-only.
+pub type Started = (KernelRun, Vec<[u64; 2]>);
+
 /// One kernel run of a compiled module: its window and the root context its vCPUs' are made from.
 ///
 /// The root context is a template only: no code runs on it, and its own end word is never read or
@@ -85,11 +88,19 @@ unsafe impl Send for KernelRun {}
 unsafe impl Sync for KernelRun {}
 
 impl KernelRun {
-    /// Reserve `cm`'s window, read-write over its declared extent and unseeded: the kernel's window
-    /// seeds it ([`Self::window`]), then [`Self::protect`]. `armed` is the fuel cell `cm` was compiled
-    /// with, if any, kept for as long as its code. `None` when the OS refuses the window, or `cm` is
-    /// one the kernel does not run (fibers, §14 nesting, durability).
-    pub fn new(cm: CompiledModule, armed: Option<Box<FuelCell>>) -> Option<KernelRun> {
+    /// Start `cm`'s window as a fresh run's is started (`CompiledModule::seed_window`): `init_mem`,
+    /// then the data segments with the read-only ones protected, or a thaw's layout
+    /// (`CompiledModule::set_restore`), then the NULL guard. With it, the byte ranges the data
+    /// segments made read-only, which the embedder's page map starts with. `armed` is the fuel cell
+    /// `cm` was compiled with, if any, kept for as long as its code. `None` when `cm` is one the
+    /// kernel does not run (fibers, §14 nesting, durability, a target without the fiber runtime);
+    /// `Some(None)` when the OS refuses the window or a protection it needs (#2305, #2286), a run that
+    /// ends as one the process cannot hold.
+    pub fn new(
+        cm: CompiledModule,
+        armed: Option<Box<FuelCell>>,
+        init_mem: &[u8],
+    ) -> Option<Option<Started>> {
         if !crate::fiber_supported()
             || cm.fibers
             || cm.nests
@@ -98,14 +109,17 @@ impl KernelRun {
         {
             return None;
         }
-        let window = mem::GuestWindow::try_new(cm.win_mapped, cm.win_reserved)?;
+        let Some((window, ro)) = cm.seed_window(Some(init_mem)) else {
+            return Some(None);
+        };
         let root = VmCtx::new(cm.instance, cm.window_at(window.base()));
-        Some(KernelRun {
+        let run = KernelRun {
             cm,
             window,
             root,
             _armed: armed,
-        })
+        };
+        Some(Some((run, ro)))
     }
 
     /// The window: `(base, reserved bytes)`.
@@ -129,32 +143,6 @@ impl KernelRun {
         self.window.read_low(snap)
     }
 
-    /// Once the kernel has seeded the window: map the read-only data segments read-only, and the NULL
-    /// guard, as a fresh run's window is (`CompiledModule::seed_window`). Returns the byte ranges it
-    /// made read-only, for the host's page map (#2995), or `None` if the OS refused one. (Its seeding
-    /// is the kernel's while the kernel keeps a `Mem` of its own over the window: one page map, #2958
-    /// slice 3, leaves the JIT's seeding the only one.)
-    pub fn protect(&self) -> Option<Vec<[u64; 2]>> {
-        let cm = &self.cm;
-        let mut ro = Vec::new();
-        if let Some(size_log2) = cm.mem_size_log2 {
-            let size = 1u64 << size_log2;
-            for d in cm.data.iter().filter(|d| d.readonly) {
-                let lo = d.offset.min(size);
-                let hi = d.offset.saturating_add(d.bytes.len() as u64).min(size);
-                if hi > lo {
-                    if !self.window.protect(lo, hi - lo, mem::Prot::Ro) {
-                        return None;
-                    }
-                    ro.push([lo, hi]);
-                }
-            }
-        }
-        let guarded =
-            cm.null_guard > cm.win_mapped as u64 || self.window.seed_null_guard(cm.null_guard);
-        guarded.then_some(ro)
-    }
-
     /// The window's backed size, its declared memory.
     pub fn mapped(&self) -> u64 {
         self.cm.win_mapped as u64
@@ -173,8 +161,7 @@ impl KernelRun {
     /// the domain's end code it stopped on.
     ///
     /// # Safety
-    /// `cap_ctx` is what the module's `call.cap` thunk takes, live for the call; the kernel seeded and
-    /// [`protect`](Self::protect)ed the window first.
+    /// `cap_ctx` is what the module's `call.cap` thunk takes, live for the call.
     pub unsafe fn run_vcpu(
         &self,
         entry: VcpuEntry<'_>,
