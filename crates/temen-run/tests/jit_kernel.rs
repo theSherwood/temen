@@ -793,7 +793,6 @@ fn granted(
     // Today's route: a run that keeps its code is declined by the kernel (`kept code`), so it runs on
     // the JIT's own runtime, whose window start seeds the host's page map (`window_aliases`).
     let today = bounded("today's route", move || {
-        let handle = std::cell::Cell::new(0);
         let cfg = temen_run::RunConfig {
             jit_code: Some(temen_run::JitCodeCache::default()),
             limits: temen_run::Limits {
@@ -803,35 +802,116 @@ fn granted(
             },
             ..temen_run::RunConfig::default()
         };
-        // The powerbox grants its own handles first: learn the one `grant` adds, then run the
-        // program that names it. (The probe's own run is not wanted.)
-        let mut learn = |h: &mut Host| handle.set(grant(h));
-        let probe = temen_run::instantiate(make(0)).expect("instantiate");
-        let _ =
-            probe.run_with_caps_and_host(temen_run::Backend::TreeWalk, &cfg, &[], Some(&mut learn));
-        let mut again = |h: &mut Host| {
-            grant(h);
-        };
-        let ran = temen_run::instantiate(make(handle.get()))
-            .expect("instantiate")
-            .run_with_caps_and_host(temen_run::Backend::Jit, &cfg, &[], Some(&mut again));
-        match ran {
-            Ok(r) => match r.outcome {
-                temen_run::Outcome::Returned(v) => Ok(values(v)),
-                o => panic!("{o:?}"),
-            },
-            // "guest trapped (MemoryFault) — …": the trap's name.
-            Err(e) => Err(e
-                .split_once('(')
-                .and_then(|(_, rest)| rest.split_once(')'))
-                .map_or(e.clone(), |(name, _)| name.to_string())),
-        }
+        instance_run(make, grant, temen_run::Backend::Jit, &cfg)
     });
     [
         ("the oracle", oracle),
         ("the kernel route", kernel),
         ("today's route", today),
     ]
+}
+
+/// The program `make(handle)` makes, instanced as an embedder instances one (`temen_run::instantiate`,
+/// its powerbox granted and its imports bound), with one capability more, `grant`'s `handle`, run on
+/// `backend` under `cfg`. An exit answers `Err("Exit(code)")`, a trap its name.
+fn instance_run(
+    make: fn(i32) -> temen_ir::Module,
+    grant: fn(&mut Host) -> i32,
+    backend: temen_run::Backend,
+    cfg: &temen_run::RunConfig,
+) -> Answer {
+    let handle = std::cell::Cell::new(0);
+    // The powerbox grants its own handles first: learn the one `grant` adds, then run the program
+    // that names it. (The probe's own run is not wanted.)
+    let mut learn = |h: &mut Host| handle.set(grant(h));
+    let probe = temen_run::instantiate(make(0)).expect("instantiate");
+    let _ = probe.run_with_caps_and_host(temen_run::Backend::TreeWalk, cfg, &[], Some(&mut learn));
+    let mut again = |h: &mut Host| {
+        grant(h);
+    };
+    let inst = temen_run::instantiate(make(handle.get())).expect("instantiate");
+    if backend == temen_run::Backend::Jit {
+        let kernel = cfg.jit_code.is_none();
+        assert_eq!(
+            inst.kernel_route(cfg).is_ok(),
+            kernel,
+            "the JIT run's route: {:?}",
+            inst.kernel_route(cfg)
+        );
+    }
+    match inst.run_with_caps_and_host(backend, cfg, &[], Some(&mut again)) {
+        Ok(r) => match r.outcome {
+            temen_run::Outcome::Returned(v) => Ok(v
+                .into_iter()
+                .map(|x| match x {
+                    temen_interp::Value::I64(n) => n,
+                    temen_interp::Value::I32(n) => n as i64,
+                    other => panic!("{other:?}"),
+                })
+                .collect()),
+            temen_run::Outcome::Exited(c) => Err(format!("Exit({c})")),
+        },
+        // "guest trapped (MemoryFault) — …": the trap's name.
+        Err(e) => Err(e
+            .split_once('(')
+            .and_then(|(_, rest)| rest.split_once(')'))
+            .map_or(e.clone(), |(name, _)| name.to_string())),
+    }
+}
+
+/// #2958 slice 4 — `make(handle)` on the oracle (the tree-walker), the kernel route and today's route,
+/// each instanced as an embedder instances it ([`instance_run`]) under the same limits, so a reading
+/// of the run's own budget (its fuel included) compares across them; each JIT route asserts its
+/// route and must end within [`PROMPT`]. `oracle` false leaves the oracle out, for a program whose
+/// threads only overlap where they run at once (the oracle's cooperative scheduler runs one).
+fn by_instance(
+    make: fn(i32) -> temen_ir::Module,
+    grant: fn(&mut Host) -> i32,
+    oracle: bool,
+) -> Vec<(&'static str, Answer)> {
+    use temen_run::Backend;
+    let cfg = |keep: bool| temen_run::RunConfig {
+        jit_code: keep.then(temen_run::JitCodeCache::default),
+        limits: temen_run::Limits {
+            fuel: Some(50_000_000),
+            mem: Some(CEILING_MEM),
+            maps: Some(CEILING_MAPS),
+            ..temen_run::Limits::default()
+        },
+        ..temen_run::RunConfig::default()
+    };
+    let mut lanes = Vec::new();
+    if oracle {
+        lanes.push((
+            "the oracle",
+            instance_run(make, grant, Backend::TreeWalk, &cfg(false)),
+        ));
+    }
+    lanes.push((
+        "the kernel route",
+        bounded("the kernel route", move || {
+            instance_run(make, grant, Backend::Jit, &cfg(false))
+        }),
+    ));
+    lanes.push((
+        "today's route",
+        bounded("today's route", move || {
+            instance_run(make, grant, Backend::Jit, &cfg(true))
+        }),
+    ));
+    lanes
+}
+
+/// Every lane of [`by_instance`] answers `want`.
+fn all_answer(
+    make: fn(i32) -> temen_ir::Module,
+    grant: fn(&mut Host) -> i32,
+    oracle: bool,
+    want: Answer,
+) {
+    for (route, answer) in by_instance(make, grant, oracle) {
+        assert_eq!(answer, want, "{route}");
+    }
 }
 
 /// #2958 slice 3 — the race on the kernel route, overlapping by construction: a spawned vCPU sets a
@@ -1299,4 +1379,376 @@ block 0 () {{
     let [_, (_, kernel), (_, today)] = granted(|h| program(h, true), maps);
     assert_eq!(kernel, Ok(vec![1]), "the kernel route reads the region");
     assert_eq!(today, Ok(vec![1]), "today's route reads the region");
+}
+
+/// A root that makes one §12 op (so the kernel admits it), then `body`, returning `vr`.
+fn rooted(body: &str) -> temen_ir::Module {
+    module(&format!(
+        "memory 16
+func () -> (i64) {{
+block 0 () {{
+  vq = i64.const 16400
+  vone = i32.const 1
+  vk = atomic.notify vq vone
+{body}
+  return vr
+  }}
+}}
+"
+    ))
+}
+
+/// #2958 slice 4 — a `Stream` write the kernel serves in the dispatch: five bytes to a captured
+/// stdout, answered alike on every route.
+#[test]
+fn a_stream_write_answers_as_the_oracle_on_both_routes() {
+    fn make(h: i32) -> temen_ir::Module {
+        rooted(&format!(
+            "  vc = i32.const {h}
+  vp = i64.const 16384
+  vw = i64.const 478560413032
+  i64.store vp vw
+  vl = i64.const 5
+  vr = call.cap 0 1 (i64, i64) -> (i64) vc(vp, vl)"
+        ))
+    }
+    all_answer(
+        make,
+        |h| h.grant_stream(temen_interp::StreamRole::Out),
+        true,
+        Ok(vec![5]),
+    );
+}
+
+/// #2958 slice 4 — `Clock.now`: two reads a nanosecond apart on the host's deterministic clock.
+#[test]
+fn a_clock_read_answers_as_the_oracle_on_both_routes() {
+    fn make(h: i32) -> temen_ir::Module {
+        rooted(&format!(
+            "  vc = i32.const {h}
+  vid = i64.const 0
+  vt0 = call.cap 2 0 (i64) -> (i64) vc(vid)
+  vt1 = call.cap 2 0 (i64) -> (i64) vc(vid)
+  vr = i64.sub vt1 vt0"
+        ))
+    }
+    all_answer(make, Host::grant_clock, true, Ok(vec![1]));
+}
+
+/// #2958 slice 4, condition 5 — a `Budget` node under the run's own: its room of fuel, `mem` and
+/// `maps`, read before any thread is spawned, so no other vCPU runs; then a `split` and its child's
+/// `mem` room. Every route reads the same, the run's fuel included: its fuel cell draws from the same
+/// node in the same chunks (#2977 differs only per spawned thread, and this spawns none).
+#[test]
+fn a_budget_read_and_split_answer_as_the_oracle_on_both_routes() {
+    fn make(h: i32) -> temen_ir::Module {
+        rooted(&format!(
+            "  vc = i32.const {h}
+  vf0 = i64.const 0
+  vfuel = call.cap 14 1 (i64) -> (i64) vc(vf0)
+  vf1 = i64.const 1
+  vmem = call.cap 14 1 (i64) -> (i64) vc(vf1)
+  vf5 = i64.const 5
+  vmaps = call.cap 14 1 (i64) -> (i64) vc(vf5)
+  vneg = i64.const -1
+  vhalf = i64.const 1048576
+  vs = call.cap 14 0 (i64, i64, i64) -> (i64) vc(vneg, vhalf, vneg)
+  vsh = i32.wrap_i64 vs
+  vsm = call.cap 14 1 (i64) -> (i64) vsh(vf1)
+  vr0 = i64.add vfuel vmem
+  vr1 = i64.add vr0 vmaps
+  vr = i64.add vr1 vsm"
+        ))
+    }
+    let lanes = by_instance(make, |h| h.grant_budget(-1, -1, -1), true);
+    let want = lanes[0].1.clone();
+    assert!(want.as_ref().is_ok_and(|v| v[0] > 0), "{want:?}");
+    for (route, answer) in lanes {
+        assert_eq!(answer, want, "{route}");
+    }
+}
+
+/// #2958 slice 4 — the `AddressSpace` mints: `sub` (op 4) mints a child space over a sub-range, and
+/// `create_region` (op 5) a §13 region; the handles each mints, alike on every route.
+#[test]
+fn the_address_space_mints_answer_as_the_oracle_on_both_routes() {
+    fn make(h: i32) -> temen_ir::Module {
+        rooted(&format!(
+            "  vc = i32.const {h}
+  voff = i64.const 32768
+  vlog = i64.const 12
+  vsub = call.cap 5 4 (i64, i64) -> (i64) vc(voff, vlog)
+  vlen = i64.const 65536
+  vreg = call.cap 5 5 (i64) -> (i64) vc(vlen)
+  vk1 = i64.const 1000000
+  vhi = i64.mul vsub vk1
+  vr = i64.add vhi vreg"
+        ))
+    }
+    fn grant(h: &mut Host) -> i32 {
+        h.set_region_factory(temen_run::new_shared_region);
+        h.grant_memory()
+    }
+    let lanes = by_instance(make, grant, true);
+    let want = lanes[0].1.clone();
+    assert!(
+        want.as_ref().is_ok_and(|v| v[0] > 0),
+        "both minted: {want:?}"
+    );
+    for (route, answer) in lanes {
+        assert_eq!(answer, want, "{route}");
+    }
+}
+
+/// #2958 slice 4 — the `self` namespace's reflection the kernel serves: the handle count (op 0), the
+/// type of a handle (op 2) and `parallelism` (op 19), alike on every route.
+#[test]
+fn self_reflection_answers_as_the_oracle_on_both_routes() {
+    fn make(h: i32) -> temen_ir::Module {
+        rooted(&format!(
+            "  vz = i32.const 0
+  vn = call.cap 4294967295 0 () -> (i64) vz ()
+  vh = i64.const {h}
+  vt = call.cap 4294967295 2 (i64) -> (i64) vz (vh)
+  vp = call.cap 4294967295 19 () -> (i64) vz ()
+  vk1 = i64.const 1000
+  vn1 = i64.mul vn vk1
+  vt1 = i64.add vn1 vt
+  vk2 = i64.const 1000000
+  vp1 = i64.mul vp vk2
+  vr = i64.add vt1 vp1"
+        ))
+    }
+    let lanes = by_instance(make, Host::grant_clock, true);
+    let want = lanes[0].1.clone();
+    assert!(want.is_ok(), "{want:?}");
+    for (route, answer) in lanes {
+        assert_eq!(answer, want, "{route}");
+    }
+}
+
+/// #2958 slice 4, condition 6 — `Exit` from the root, on handle `exit`, while a spawned sibling
+/// `sibling` does: `wait`
+/// parks it on a word nothing notifies; `spin` loops forever on a word nothing writes. The run ends
+/// `Exit(7)` on every route, the sibling stopped (parked: woken by the end; spinning: at its next
+/// check of the domain's end).
+fn exits_beside(sibling: &str, exit: i32) -> temen_ir::Module {
+    let body = match sibling {
+        "wait" => {
+            "  va = i64.const 16384\n  vx = i32.const 0\n  vto = i64.const -1\n  vs = i32.atomic.wait va vx vto\n  vr = i64.extend_i32_u vs\n  return vr\n  }\n"
+        }
+        _ => {
+            "  br 1()\n}\nblock 1 () {\n  va = i64.const 16384\n  vs = i32.atomic.load va\n  vgo = i32.eqz vs\n  br_if vgo 1() 2()\n}\nblock 2 () {\n  vr = i64.const 0\n  return vr\n  }\n"
+        }
+    };
+    module(&format!(
+        "memory 16
+func () -> (i64) {{
+block 0 () {{
+  vz = i64.const 0
+  vh = thread.spawn 1 vz vz
+  ve = i32.const {exit}
+  vcode = i64.const 7
+  vr = call.cap 1 0 (i64) -> (i64) ve(vcode)
+  return vr
+  }}
+}}
+func (i64, i64) -> (i64) {{
+block 0 (va0: i64, vb0: i64) {{
+{body}}}
+"
+    ))
+}
+
+#[test]
+fn an_exit_beside_a_parked_sibling_ends_the_run_on_every_route() {
+    all_answer(
+        |h| exits_beside("wait", h),
+        Host::grant_exit,
+        true,
+        Err("Exit(7)".into()),
+    );
+}
+
+#[test]
+fn an_exit_beside_a_spinning_sibling_ends_the_run_on_every_route() {
+    // On the JIT routes the sibling spins on a thread of its own; the oracle, which runs one task at
+    // a time, gives the answer they must match.
+    all_answer(
+        |h| exits_beside("spin", h),
+        Host::grant_exit,
+        true,
+        Err("Exit(7)".into()),
+    );
+}
+
+/// #2958 slice 4 — `Exit` from a spawned vCPU ends its whole domain, the root parked in a join.
+#[test]
+fn an_exit_from_a_thread_ends_the_run_on_every_route() {
+    fn make(h: i32) -> temen_ir::Module {
+        module(&format!(
+            "memory 16
+func () -> (i64) {{
+block 0 () {{
+  vz = i64.const 0
+  vh = thread.spawn 1 vz vz
+  vst, vv = thread.join vh
+  return vv
+  }}
+}}
+func (i64, i64) -> (i64) {{
+block 0 (va0: i64, vb0: i64) {{
+  ve = i32.const {h}
+  vcode = i64.const 7
+  vr = call.cap 1 0 (i64) -> (i64) ve(vcode)
+  return vr
+  }}
+}}
+"
+        ))
+    }
+    all_answer(make, Host::grant_exit, true, Err("Exit(7)".into()));
+}
+
+/// #2958 slice 4, condition 6 — `Exit` from the root while a sibling is inside a host call: an
+/// unlocked host procedure (#2645, which runs with the domain's `Host` lock let go) that marks its
+/// entry in the window and returns once the root has marked its exit (its op 1 hands the root the
+/// exit handle). The root waits for the entry
+/// mark, marks, and exits, so the sibling is inside the call when the root's exit lands, by
+/// construction. The run ends `Exit(7)` once the call returns and the sibling sees the domain's end.
+/// (Not on the oracle, which runs one task at a time: its call would wait for a root that cannot run.)
+#[test]
+fn an_exit_beside_a_sibling_inside_a_host_call_ends_the_run_on_both_routes() {
+    fn make(h: i32) -> temen_ir::Module {
+        module(&format!(
+            "memory 16
+func () -> (i64) {{
+block 0 () {{
+  vp = i32.const {h}
+  vz = i64.const 0
+  vex = call.cap 13 1 (i64) -> (i64) vp(vz)
+  ve = i32.wrap_i64 vex
+  vh = thread.spawn 1 vz vz
+  br 1(ve)
+}}
+block 1 (ve1: i32) {{
+  vin = i64.const 16384
+  vs = i32.atomic.load vin
+  vgo = i32.eqz vs
+  br_if vgo 1(ve1) 2(ve1)
+}}
+block 2 (ve2: i32) {{
+  vout = i64.const 16388
+  vone = i32.const 1
+  i32.atomic.store vout vone
+  vcode = i64.const 7
+  vr = call.cap 1 0 (i64) -> (i64) ve2(vcode)
+  return vr
+  }}
+}}
+func (i64, i64) -> (i64) {{
+block 0 (va0: i64, vb0: i64) {{
+  vp = i32.const {h}
+  vz = i64.const 0
+  vr = call.cap 13 0 (i64) -> (i64) vp(vz)
+  return vr
+  }}
+}}
+"
+        ))
+    }
+    fn grant(h: &mut Host) -> i32 {
+        use temen_interp::{put_results, CapState, HostProcGrant, ProcHandler};
+        let exit = h.grant_exit();
+        h.grant_host_proc(HostProcGrant::new(
+            ProcHandler::Unlocked(std::sync::Arc::new(move |op, _args, out, mem| {
+                // Op 1 answers the exit handle, so the root holds both.
+                if op == 1 {
+                    return put_results(out, &[exit as i64]);
+                }
+                let mem = mem.ok_or(Trap::Malformed)?;
+                mem.write_bytes(16384, &1u32.to_le_bytes())
+                    .ok_or(Trap::MemoryFault)?;
+                // The root marks its exit next; a bound keeps a wrong program from hanging the test.
+                for _ in 0..1u64 << 32 {
+                    if mem.read_bytes(16388, 4).is_some_and(|b| b != [0; 4]) {
+                        break;
+                    }
+                    std::hint::spin_loop();
+                }
+                put_results(out, &[0])
+            })),
+            CapState::Stateless,
+        ))
+    }
+    all_answer(make, grant, false, Err("Exit(7)".into()));
+}
+
+/// #2958 slice 4 — the calls the kernel route declines, inline, each with the clause that names what
+/// removes it (`native_scope`'s `kernel_op`, default-deny), under a host that holds what makes it
+/// park where that matters.
+#[test]
+fn each_declined_call_names_its_clause() {
+    // A self op takes no arguments; every other call one.
+    let call = |ty: u32, op: u32| {
+        let args = match ty {
+            u32::MAX => "() -> (i64) vc ()",
+            _ => "(i64) -> (i64) vc(vz)",
+        };
+        rooted(&format!(
+            "  vc = i32.const 0\n  vz = i64.const 0\n  vr = call.cap {ty} {op} {args}"
+        ))
+    };
+    let blocking_stdin = || {
+        let mut h = Host::new();
+        h.stdin_block = true;
+        h
+    };
+    let pipe = || {
+        let mut h = Host::new();
+        h.grant_pipe();
+        h
+    };
+    let blocking = || {
+        let mut h = Host::new();
+        h.grant_blocking(Duration::ZERO, None);
+        h
+    };
+    // A host procedure its embedder answers later: a call parks.
+    let host_answered = || {
+        let mut h = Host::new();
+        let requests = temen_interp::CapRequests::default();
+        h.grant_host_proc(temen_interp::HostProcGrant::declared("later", &requests));
+        h
+    };
+    let selfop = u32::MAX;
+    let rows: Vec<(temen_ir::Module, Host, &str)> = vec![
+        (call(0, 0), blocking_stdin(), "stream parks"),
+        (call(0, 0), pipe(), "stream parks"),
+        (call(0, 1), pipe(), "stream parks"),
+        (call(0, 3), Host::new(), "cap"),
+        (call(selfop, 16), Host::new(), "stream parks"),
+        // `fuel` is the table's, but the bytecode compile declines the op first.
+        (call(selfop, 13), Host::new(), "bytecode"),
+        (call(4, 7), Host::new(), "region signal"),
+        (call(10, 0), blocking(), "host-proc parks"),
+        (call(13, 0), host_answered(), "host-proc parks"),
+        (call(6, 17), Host::new(), "§14 children"),
+        (call(7, 0), Host::new(), "§14 children"),
+        (call(8, 1), Host::new(), "§14 children"),
+        (call(11, 0), Host::new(), "jit cap"),
+        (call(16, 0), Host::new(), "cap"),
+        (call(0x1000_0000, 0), Host::new(), "serving"),
+    ];
+    let wrong: Vec<String> = rows
+        .iter()
+        .enumerate()
+        .filter_map(|(i, (m, host, clause))| {
+            let got = jit_kernel::admit(m, host, false).err();
+            (got != Some(*clause)).then(|| format!("row {i}: {got:?}, not {clause:?}"))
+        })
+        .collect();
+    assert!(wrong.is_empty(), "{wrong:#?}");
+    // And what it admits beside them: a stream read with a non-blocking stdin and no pipe.
+    assert!(jit_kernel::admit(&call(0, 0), &Host::new(), false).is_ok());
 }
