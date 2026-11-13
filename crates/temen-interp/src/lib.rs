@@ -21662,13 +21662,19 @@ pub type CapPageMap = Arc<CapPages>;
 /// A JIT window's page map ([`CapPageMap`]): host page index → its state (absent ⇒ region default),
 /// and what a reader keys a futex word on a §13 alias by (#2958 slice 4).
 #[derive(Default)]
+///
+/// Two locks, both leaves: neither is held while the other is taken, and neither across a system
+/// call. A futex key takes `pages`, lets it go, then takes `regions`.
 pub struct CapPages {
     pages: Mutex<BTreeMap<u64, temen_ir::PageState>>,
     /// The backing identity of each §13 region a page of the window aliases, by the host's region
     /// id: the backing allocation's address, the identity every engine keys a region word on
     /// ([`FutexKey::Region`]). Written once an alias is in, before its pages are marked, so a reader
     /// that sees a `Backed` page finds its region here. An id names one backing for as long as a page
-    /// aliases it (a region is not closed while mapped, #2358).
+    /// aliases it (a region is not closed while mapped, #2358), and a map of a reused id writes its
+    /// new backing's identity before any page names it. Entries are not removed: a host's region ids
+    /// are slots it reuses ([`Host::hold_region`]), so this holds at most one entry per slot, as many
+    /// as the regions the domain has held at once.
     regions: Mutex<BTreeMap<u32, u64>>,
     /// A page of the window has been a §13 alias: set before the first `Backed` entry is written, and
     /// never cleared. A futex key reads the map only once it is set, so a window with no alias keys

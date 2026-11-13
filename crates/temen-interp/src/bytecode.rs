@@ -8976,7 +8976,8 @@ pub fn native_scope(m: &Module, host: &Host) -> Result<(), &'static str> {
 /// an operand. **Default-deny**: what this does not list, the kernel route declines, and `Err` names
 /// the clause and so what removes it (#2958's plan, section B):
 ///
-/// - **`stream parks`**: a stream op that can park ([`stream_op_parks`]), or `self.pipe`, which
+/// - **`stream parks`**: a stream op that can park ([`stream_op_parks`]; any op past `close`), or
+///   `self.pipe`, which
 ///   mints a pipe end mid-run and so makes that check stale (slice 5);
 /// - **`host-proc parks`**: a host procedure that may park ([`host_proc_parks`]), or the offload
 ///   exerciser `Blocking` (slice 5);
@@ -8987,8 +8988,8 @@ pub fn native_scope(m: &Module, host: &Host) -> Result<(), &'static str> {
 /// - **`serving`**: a service point or a call through a guest interface (#2791, #2792);
 /// - **`§14 children`**: `Instantiator`, `Module`, `ModuleLoader` (a later phase);
 /// - **`jit cap`**: §22 `Jit` and its code handles: two dispatch tables (a later phase);
-/// - **`cap`**: anything else, `FreezeAuthority` (a `CapFault` on every engine, with no consumer)
-///   and an op no interface has.
+/// - **`cap`**: `FreezeAuthority` (a `CapFault` on every engine, with no consumer) and an op no
+///   interface has.
 fn kernel_op(host: &Host, type_id: u32, op: u32, handle: Option<i32>) -> Result<(), &'static str> {
     use super::OpParks;
     use temen_ir::cap_id::*;
@@ -8998,6 +8999,8 @@ fn kernel_op(host: &Host, type_id: u32, op: u32, handle: Option<i32>) -> Result<
         (STREAM, 0..=2) | (EXIT, 0) | (CLOCK, 0) | (ADDRESS_SPACE, 0..=5) | (BUDGET, 0..=3) => {
             Ok(())
         }
+        // Ops past `close` may park anyhow ([`image_parks`]).
+        (STREAM, _) => Err("stream parks"),
         (SHARED_REGION, 0..=3 | 5 | 6) => Ok(()),
         (SHARED_REGION, 7) => Err("region signal"),
         (HOST_PROC, _) => match host_proc_parks(host, handle) {

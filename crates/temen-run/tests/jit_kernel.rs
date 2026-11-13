@@ -1726,7 +1726,8 @@ fn each_declined_call_names_its_clause() {
         (call(0, 0), blocking_stdin(), "stream parks"),
         (call(0, 0), pipe(), "stream parks"),
         (call(0, 1), pipe(), "stream parks"),
-        (call(0, 3), Host::new(), "cap"),
+        (call(0, 3), Host::new(), "stream parks"),
+        (call(4, 4), Host::new(), "cap"),
         (call(selfop, 16), Host::new(), "stream parks"),
         // `fuel` is the table's, but the bytecode compile declines the op first.
         (call(selfop, 13), Host::new(), "bytecode"),

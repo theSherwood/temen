@@ -574,6 +574,10 @@ unsafe fn cap_thunk_impl(
     // same iface in its eval loop; both share the Host-side state and validator, so they stay in
     // differential lockstep.
     if type_id == cap_id::JIT {
+        // #2958 slice 4 — every `Jit` op is the JIT's own runtime's (`jit cap`).
+        if kernel_backstop(vm) {
+            return;
+        }
         jit_native_op(
             host, op, handle, arg_slots, results, n_results, vm, gm, mem_base,
         );
