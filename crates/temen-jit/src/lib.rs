@@ -4076,19 +4076,12 @@ impl CompiledModule {
         // (the `setjmp_rt` cfg); elsewhere `ensure_supported` has already rejected the ops.
         #[cfg(setjmp_rt)]
         let uses_setjmp = module_uses_setjmp(m);
-        // Fail-closed (guard against cross-stack corruption): the instance's checkpoint table is one
-        // stack of checkpoints ordered by frame pointer (#2877), which holds only while every
-        // checkpoint lives on the one native stack the instance's guarded calls run on. A module that
-        // mixes `setjmp` with fibers/threads would take checkpoints on other stacks (a `longjmp` could
-        // then restore into the wrong one). The on-ramp never emits that combo, but a hand-crafted IR
-        // module could — so decline the JIT and let the interpreters (which keep each checkpoint with
-        // its own frame) cover it. A table per native stack is the follow-on.
+        // Fail-closed (#2877): the instance's checkpoint table is one stack ordered by the frame
+        // pointers of the one native stack its guarded calls start on, so a module whose code can run
+        // beside it on another stack is declined, and the interpreters cover it
+        // ([`setjmp_rt::admits`], asked again by `define_extra` for every unit).
         #[cfg(setjmp_rt)]
-        if uses_setjmp && (uses_fibers || uses_threads) {
-            return Err(JitError::Unsupported(
-                "setjmp/longjmp combined with fibers/threads is not supported on the JIT yet",
-            ));
-        }
+        setjmp_rt::admits(uses_setjmp, &m.funcs, !m.impl_exports.is_empty())?;
         #[cfg(setjmp_rt)]
         let setjmp_runtime: Option<Box<setjmp_rt::SetjmpRuntime>> = if uses_setjmp {
             Some(Box::new(setjmp_rt::SetjmpRuntime::new()))
@@ -5962,6 +5955,10 @@ impl CompiledModule {
                 ));
             }
         }
+        // #2877 — the module's own rule, asked of the unit: an instance with a `setjmp` table admits
+        // no code that runs beside it on another stack, whatever hosting it was granted.
+        #[cfg(setjmp_rt)]
+        setjmp_rt::admits(!self.instance.setjmp.is_null(), funcs, false)?;
         // Shared code cannot take the unit (#1825): refused before anything is recorded.
         let mut module = arena_mut(&mut self.module)?;
         // Intern the unit's signatures (its functions' own + its call sites') into the

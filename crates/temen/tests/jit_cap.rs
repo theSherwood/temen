@@ -120,90 +120,28 @@ const COMPILE_INVOKE: &str = "memory 16\nfunc (i32, i32, i32) -> (i32) {\nblock 
 /// `(i64,i64)->(i64)` suspends its arg, then on the next resume adds 100 and returns.
 const COMPILE_INVOKE_0ARG: &str = "memory 16\nfunc (i32) -> (i64) {\nblock 0 (v0: i32) {\n  v1 = i64.const 20480\n  v2 = i64.const BLOBLEN\n  v3 = call.cap 11 0 (i64, i64) -> (i64) v0 (v1, v2)\n  v4 = call.cap 11 1 (i64) -> (i64) v0 (v3)\n  return v4\n  }\n}\nfunc (i64, i64) -> (i64) {\nblock 0 (v0: i64, v1: i64) {\n  v2 = suspend v1\n  v3 = i64.const 100\n  v4 = i64.add v2 v3\n  return v4\n  }\n}\n";
 
-/// Like [`diff_run`], but grant the `Jit` domain **fiber-hosting** (`grant_jit_fibers`, DESIGN.md §22
-/// "Concurrency"): a submitted unit may run §12 fibers (`cont.*`). Same differential assertions
-/// (result equivalence, the same fiber/cap trap kinds, byte-identical final memory).
-fn diff_run_fibers(guest_src: &str, blob_bytes: &[u8], user_args: &[i64]) -> (JitOutcome, Vec<u8>) {
-    let m = parse_module(guest_src).expect("parse guest");
-    verify_module(&m).expect("verify guest");
-    let mut init = vec![0u8; BLOB_OFF + blob_bytes.len()];
-    init[BLOB_OFF..].copy_from_slice(blob_bytes);
-
-    let mut host_i = Host::new();
-    let h_i = grant_jit_fibers(&mut host_i, &m, 0);
-    let mut iargs = vec![Value::I32(h_i)];
-    iargs.extend(user_args.iter().map(|&a| Value::I32(a as i32)));
-    let mut fuel = 50_000_000u64;
-    let (ires, imem) = run_capture_reserved_with_host(
-        &m,
-        0,
-        &iargs,
-        &mut fuel,
-        &init,
-        DEFAULT_RESERVED_LOG2,
-        &mut host_i,
-    );
-
-    let mut host_j = Host::new();
-    let h_j = grant_jit_fibers(&mut host_j, &m, 0);
-    assert_eq!(
-        h_i, h_j,
-        "identical powerbox setup must mint identical handles"
-    );
-    let mut jargs = vec![h_j as i64];
-    jargs.extend_from_slice(user_args);
-    let (jout, jmem) = jit_cap_run(
-        &m,
-        0,
-        &jargs,
-        &MemLayout::image(init.to_vec()),
-        DEFAULT_RESERVED_LOG2,
-        0,
-        &mut host_j,
-        None,
-    )
-    .expect("jit run");
-
-    match (&ires, &jout) {
-        (Ok(vals), JitOutcome::Returned(slots)) => {
-            assert_eq!(vals.len(), slots.len(), "result arity");
-            for (v, s) in vals.iter().zip(slots) {
-                let iv = match v {
-                    Value::I32(x) => *x as i64,
-                    Value::I64(x) => *x,
-                    other => panic!("scalar result expected, got {other:?}"),
-                };
-                assert_eq!(iv, *s, "interp {ires:?} != jit {jout:?}");
-            }
-        }
-        // The same trap on both engines: one wire code (#1735).
-        (Err(t), JitOutcome::Trapped(k)) if t.code() == k.code() => {}
-        other => panic!("backends disagree: {other:?}"),
-    }
-    assert_eq!(imem, jmem.bytes(), "final memory must be byte-identical");
-    (jout, jmem.bytes().to_vec())
-}
-
-/// Like [`diff_run_t`], but grant the `Jit` domain **thread-hosting** (`grant_jit_threads`,
-/// CONSOLIDATION.md §11): an **installed** submitted unit may use §12 threads (`thread.spawn`/`join`)
-/// and the futex. Reserves a `2^table_log2`-slot table so the guest can `install` (the supported path
-/// for a threaded unit — `invoke` stays a seam-free leaf and CapFaults). Same differential assertions
-/// (result equivalence, matching cap/thread trap kinds, byte-identical final memory). The interpreter
-/// drives spawned vCPUs cooperatively (`drive`); the JIT runs them as real OS threads on the parent's
-/// scheduler `Domain` (stood up by `enable_thread_hosting`) — both fold to the same result.
-fn diff_run_threads(
+/// How `guest_src`, with `blob_bytes` at `BLOB_OFF` and its `Jit` handle first among `user_args`,
+/// ends on the tree-walker and on the JIT, each over a host `grant` mints the handle on with a
+/// `2^table_log2`-slot install table: the interpreter's result and final window, then the JIT's.
+fn run_both(
     guest_src: &str,
     blob_bytes: &[u8],
     user_args: &[i64],
+    grant: fn(&mut Host, &temen_ir::Module, u8) -> i32,
     table_log2: u8,
-) -> (JitOutcome, Vec<u8>) {
+) -> (
+    Result<Vec<Value>, temen_interp::Trap>,
+    Vec<u8>,
+    JitOutcome,
+    Vec<u8>,
+) {
     let m = parse_module(guest_src).expect("parse guest");
     verify_module(&m).expect("verify guest");
     let mut init = vec![0u8; BLOB_OFF + blob_bytes.len()];
     init[BLOB_OFF..].copy_from_slice(blob_bytes);
 
     let mut host_i = Host::new();
-    let h_i = grant_jit_threads(&mut host_i, &m, table_log2);
+    let h_i = grant(&mut host_i, &m, table_log2);
     let mut iargs = vec![Value::I32(h_i)];
     iargs.extend(user_args.iter().map(|&a| Value::I32(a as i32)));
     let mut fuel = 50_000_000u64;
@@ -218,7 +156,7 @@ fn diff_run_threads(
     );
 
     let mut host_j = Host::new();
-    let h_j = grant_jit_threads(&mut host_j, &m, table_log2);
+    let h_j = grant(&mut host_j, &m, table_log2);
     assert_eq!(
         h_i, h_j,
         "identical powerbox setup must mint identical handles"
@@ -236,7 +174,19 @@ fn diff_run_threads(
         None,
     )
     .expect("jit run");
+    (ires, imem, jout, jmem.bytes().to_vec())
+}
 
+/// [`run_both`] under `grant`, asserting the two agree: the same results, or the same trap (one wire
+/// code, #1735), and byte-identical final memory. The JIT's outcome and window.
+fn diff_run_granted(
+    guest_src: &str,
+    blob_bytes: &[u8],
+    user_args: &[i64],
+    grant: fn(&mut Host, &temen_ir::Module, u8) -> i32,
+    table_log2: u8,
+) -> (JitOutcome, Vec<u8>) {
+    let (ires, imem, jout, jmem) = run_both(guest_src, blob_bytes, user_args, grant, table_log2);
     match (&ires, &jout) {
         (Ok(vals), JitOutcome::Returned(slots)) => {
             assert_eq!(vals.len(), slots.len(), "result arity");
@@ -249,12 +199,40 @@ fn diff_run_threads(
                 assert_eq!(iv, *s, "interp {ires:?} != jit {jout:?}");
             }
         }
-        // The same trap on both engines: one wire code (#1735).
         (Err(t), JitOutcome::Trapped(k)) if t.code() == k.code() => {}
         other => panic!("backends disagree: {other:?}"),
     }
-    assert_eq!(imem, jmem.bytes(), "final memory must be byte-identical");
-    (jout, jmem.bytes().to_vec())
+    assert_eq!(imem, jmem, "final memory must be byte-identical");
+    (jout, jmem)
+}
+
+/// Like [`diff_run`], but grant the `Jit` domain **fiber-hosting** (`grant_jit_fibers`, DESIGN.md §22
+/// "Concurrency"): a submitted unit may run §12 fibers (`cont.*`). Same differential assertions
+/// (result equivalence, the same fiber/cap trap kinds, byte-identical final memory).
+fn diff_run_fibers(guest_src: &str, blob_bytes: &[u8], user_args: &[i64]) -> (JitOutcome, Vec<u8>) {
+    diff_run_granted(guest_src, blob_bytes, user_args, grant_jit_fibers, 0)
+}
+
+/// Like [`diff_run_t`], but grant the `Jit` domain **thread-hosting** (`grant_jit_threads`,
+/// CONSOLIDATION.md §11): an **installed** submitted unit may use §12 threads (`thread.spawn`/`join`)
+/// and the futex. Reserves a `2^table_log2`-slot table so the guest can `install` (the supported path
+/// for a threaded unit — `invoke` stays a seam-free leaf and CapFaults). Same differential assertions
+/// (result equivalence, matching cap/thread trap kinds, byte-identical final memory). The interpreter
+/// drives spawned vCPUs cooperatively (`drive`); the JIT runs them as real OS threads on the parent's
+/// scheduler `Domain` (stood up by `enable_thread_hosting`) — both fold to the same result.
+fn diff_run_threads(
+    guest_src: &str,
+    blob_bytes: &[u8],
+    user_args: &[i64],
+    table_log2: u8,
+) -> (JitOutcome, Vec<u8>) {
+    diff_run_granted(
+        guest_src,
+        blob_bytes,
+        user_args,
+        grant_jit_threads,
+        table_log2,
+    )
 }
 
 /// **Threads in an installed submitted unit — native tier** (CONSOLIDATION.md §11, the §11 slice-2
@@ -1487,4 +1465,106 @@ fn a_park_seam_fails_the_serve_qualification() {
         "memory 12\nfunc () -> (i64) {\nblock 0 () {\n  v = i64.const 7\n  return v\n  }\n}\n",
     );
     assert!(!bytecode::serve_qualifies(&plain.funcs));
+}
+
+/// #2877 (audit finding 1) — the setjmp + fibers decline is the base module's only: a base that uses
+/// `setjmp` (its fiber body `longjmp`s), granted fiber hosting, submits a unit whose entry takes a
+/// checkpoint and resumes a fiber that `longjmp`s to it, across the fiber switch. The interpreters
+/// give the oracle's answer; the JIT must never `_longjmp` from the fiber's stack into the entry's, so
+/// it refuses the unit (`setjmp_rt::admits`): a split by tier, as for a threaded unit under a
+/// fibers-only grant.
+#[test]
+fn a_submitted_unit_cannot_longjmp_out_of_its_fiber() {
+    let b = blob(
+        "memory 16
+func () -> (i64) {
+block 0 () {
+  vb = i64.const 40000
+  vs = setjmp vb
+  vz = i32.const 0
+  vc = i32.eq vs vz
+  br_if vc 1(vb) 2(vs)
+  }
+block 1 (vb1: i64) {
+  v0 = i32.const 1
+  v1 = i64.const 32768
+  v2 = cont.new v0 v1
+  v4, v5 = cont.resume v2 vb1
+  return v5
+  }
+block 2 (vr: i32) {
+  vw = i64.extend_i32_u vr
+  vk = i64.const 1000
+  vx = i64.add vw vk
+  return vx
+  }
+}
+",
+    );
+    let base = COMPILE_INVOKE_0ARG.replace(
+        "  v2 = suspend v1\n  v3 = i64.const 100\n  v4 = i64.add v2 v3\n  return v4\n",
+        "  v2 = i32.const 5\n  longjmp v1 v2\n  unreachable\n",
+    );
+    let guest = with_len(&base, b.len());
+    let (ires, _, jout, _) = run_both(&guest, &b, &[], grant_jit_fibers, 0);
+    assert_eq!(
+        ires,
+        Err(temen_interp::Trap::Malformed),
+        "the interpreters keep each checkpoint with its frame: the fiber's `longjmp` finds none"
+    );
+    assert!(
+        matches!(jout, JitOutcome::Trapped(TrapKind::CapFault)),
+        "the JIT refuses the unit at its compile, and the invoke of the refused handle faults: {jout:?}"
+    );
+}
+
+/// #2877 (audit finding 1, threads) — as [`a_submitted_unit_cannot_longjmp_out_of_its_fiber`], over
+/// a thread-hosting grant: an installed unit's entry takes a checkpoint and spawns a vCPU that
+/// `longjmp`s to it from its own thread.
+#[test]
+fn a_submitted_unit_cannot_longjmp_out_of_its_thread() {
+    let unit = "memory 16
+func () -> (i32) {
+block 0 () {
+  vb = i64.const 40000
+  vs = setjmp vb
+  vz = i32.const 0
+  vc = i32.eq vs vz
+  br_if vc 1(vb) 2(vs)
+  }
+block 1 (vb1: i64) {
+  vsp = i64.const 0
+  vt = thread.spawn 1 vsp vb1
+  vr_st, vr = thread.join vt
+  vr32 = i32.wrap_i64 vr
+  return vr32
+  }
+block 2 (vr2: i32) {
+  vk = i32.const 1000
+  vx = i32.add vr2 vk
+  return vx
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, varg: i64) {
+  v5 = i32.const 5
+  longjmp varg v5
+  unreachable
+  }
+}
+";
+    let b = blob(unit);
+    // The base takes the thread-hosting grant and has a `setjmp` table (its func 1, never called).
+    let guest_src = "memory 16\nfunc (i32) -> (i32) {\nblock 0 (v0: i32) {\n  v1 = i64.const 20480\n  v2 = i64.const BLOBLEN\n  v3 = call.cap 11 0 (i64, i64) -> (i64) v0 (v1, v2)\n  v4 = call.cap 11 3 (i64) -> (i64) v0 (v3)\n  v5 = i32.wrap_i64 v4\n  v6 = call.dyn () -> (i32) v5 ()\n  return v6\n  }\n}\nfunc (i64) -> (i64) {\nblock 0 (v0: i64) {\n  v1 = setjmp v0\n  v2 = i64.extend_i32_u v1\n  return v2\n  }\n}\n";
+    let guest = with_len(guest_src, b.len());
+    let (ires, _, jout, _) = run_both(&guest, &b, &[], grant_jit_threads, 4);
+    assert_eq!(
+        ires,
+        Err(temen_interp::Trap::Malformed),
+        "the spawned vCPU's `longjmp` finds no checkpoint of its own"
+    );
+    assert!(
+        matches!(jout, JitOutcome::Trapped(TrapKind::CapFault)),
+        "the JIT refuses the unit at its compile, and the dispatch of the refused handle faults: {jout:?}"
+    );
 }

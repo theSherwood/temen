@@ -780,3 +780,33 @@ fn a_call_starts_no_thread_on_executor_2() {
         );
     });
 }
+
+/// #2877 — a held module that uses `setjmp` and serves no interface: its entry takes a checkpoint
+/// and returns, so the domain rests, and every call is refused, because a held domain's activations
+/// are calls of its served handlers and it has none. On the JIT no activation ever runs on another
+/// thread over the instance's `setjmp` table. (A module that uses `setjmp` and serves is declined
+/// at the JIT's compile.)
+fn a_held_domain_with_setjmp_and_no_interface_takes_no_call(on: Executor) {
+    bounded(move || {
+        let m = module(
+            "memory 17
+func (i32) -> (i64) {
+block 0 (vexit: i32) {
+  vb = i64.const 40000
+  vs = setjmp vb
+  vr = i64.extend_i32_u vs
+  vone = i64.const 1
+  vt = i64.add vr vone
+  return vt
+  }
+}
+",
+        );
+        let (host, exit) = host_for(&m);
+        let (d, results) = hold(on, m, 0, &[Value::I32(exit)], host);
+        assert_eq!(results, vec![Value::I64(1)], "start answers the entry");
+        assert_eq!(call(&d, 0, &[]), Reply::Failed(EINVAL), "no op to call");
+    });
+}
+
+on_every_executor!(a_held_domain_with_setjmp_and_no_interface_takes_no_call);

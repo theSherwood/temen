@@ -780,3 +780,77 @@ fn the_runs_fuel_stops_a_spinning_twin_on_every_engine() {
         assert_eq!(traps[0].trap, temen_interp::Trap::OutOfFuel, "{backend:?}");
     }
 }
+
+/// #2877 — a twin `longjmp`s to a checkpoint its parent took before the fork. The program uses
+/// `setjmp`, so it is not bare (FORK.md §9.5, refusal 2): the JIT answers its `fork` `-ENOSYS` and no
+/// twin ever runs, so no checkpoint table or native stack is shared between copies. The interpreters
+/// fork it, and the twin's frames carry their checkpoints with them: its `longjmp` lands in its own
+/// copy of `_start`, which exits `50 + 7`, and the parent exits with the twin's status. On a refusal
+/// the parent exits `100 + errno`.
+const FORK_AFTER_SETJMP: &str = "\
+func () -> () {
+block 0 () {
+  b = i64.const 40000
+  v = setjmp b
+  z = i32.const 0
+  first = i32.eq v z
+  br_if first 1() 2(v)
+  }
+block 1 () {
+  p = call.import 0 ()
+  pz = i64.const 0
+  child = i64.eq p pz
+  neg = i64.lt_s p pz
+  br_if child 3() 4(p, neg)
+  }
+block 2 (jv: i32) {
+  j50 = i32.const 50
+  je = i32.add jv j50
+  call.import 2 (je)
+  unreachable
+  }
+block 3 () {
+  cb = i64.const 40000
+  c7 = i32.const 7
+  longjmp cb c7
+  unreachable
+  }
+block 4 (pp: i64, pneg: i32) {
+  br_if pneg 5(pp) 6()
+  }
+block 5 (ep: i64) {
+  e100 = i64.const 100
+  e = i64.sub e100 ep
+  ec = i32.wrap_i64 e
+  call.import 2 (ec)
+  unreachable
+  }
+block 6 () {
+  wany = i64.const -1
+  wst = i64.const 41000
+  wz = i64.const 0
+  ww = call.import 1 (wany, wst, wz, wz)
+  whi = i64.const 41001
+  wcode = i32.load8_u whi
+  call.import 2 (wcode)
+  unreachable
+  }
+}
+export 0 func \"_start\" 0
+";
+
+#[test]
+fn a_twin_longjmps_to_a_checkpoint_taken_before_the_fork_only_where_it_forks() {
+    for backend in [Backend::TreeWalk, Backend::Bytecode] {
+        assert_eq!(
+            run_on(FORK_AFTER_SETJMP, true, backend, &RunConfig::default()),
+            Outcome::Exited(57),
+            "{backend:?}: the twin resumes its own copy of the checkpoint"
+        );
+    }
+    assert_eq!(
+        run_on(FORK_AFTER_SETJMP, true, Backend::Jit, &RunConfig::default()),
+        Outcome::Exited(100 + 38),
+        "the JIT answers -ENOSYS: no twin runs"
+    );
+}

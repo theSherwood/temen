@@ -27,9 +27,10 @@
 //! [`rt_longjmp`], which reads the token, checks the checkpoint and `_longjmp`s from its own frame,
 //! which holds nothing to drop. The code never holds a host `jmp_buf` pointer it could forge (#2534).
 //!
-//! **One stack.** A module that mixes `setjmp` with fibers or threads is declined at compile time
-//! (`CompiledModule::compile`), so an instance's checkpoints all live on the one native stack its
-//! guarded calls run on, which the frame-pointer order relies on.
+//! **One stack.** Code that would run beside the table on another native stack — fibers, threads,
+//! a served interface's handlers — is refused wherever it enters an instance with a table
+//! ([`admits`]), so an instance's checkpoints all live on the one native stack its guarded calls run
+//! on, which the frame-pointer order relies on.
 //!
 //! Unix-only (the `setjmp_rt` cfg = `fiber_rt && unix`): `libc` is a unix-only dependency here and the
 //! plain `_setjmp`/`_longjmp` symbols are unix; Windows `setjmp` is SEH-coupled (a follow-on).
@@ -49,6 +50,36 @@ extern "C" {
     /// frame's SP and `_longjmp` returns into it).
     fn _setjmp(env: *mut c_void) -> c_int;
     fn _longjmp(env: *mut c_void, val: c_int) -> !;
+}
+
+/// #2877 — whether the code `funcs` may be admitted to an instance whose code takes `setjmp`
+/// checkpoints (`setjmp`: it uses them, or its table exists), the one rule asked wherever code enters
+/// an instance: `CompiledModule::compile` for a module, `define_extra` for a unit (which covers a
+/// unit replayed from a code directory or a thaw). The table is ordered by the frame pointers of the
+/// one native stack the instance's guarded calls start on, so no code may run beside it on another:
+/// - a fiber or a spawned vCPU (`cont.*`, `thread.*`), and with them `gc.roots` and the futex, the
+///   ops that need the fiber or thread runtime — the set the JIT declined with `setjmp` before;
+/// - a serve handler (`serves`: the module has an `impl_exports` interface), whose residencies run
+///   on pool or caller threads and give the window's gate back mid-call, so their guarded calls on
+///   the one table would not nest; a held domain's activations are calls of those same handlers.
+///
+/// Hosting alone (`enable_fiber_hosting` / `enable_thread_hosting`) starts no stack, so it is not
+/// asked there: only code that runs can. The interpreters keep each checkpoint with its frame and run
+/// what this declines. A table per native stack (#2939) lifts it.
+pub(crate) fn admits(
+    setjmp: bool,
+    funcs: &[temen_ir::Func],
+    serves: bool,
+) -> Result<(), crate::JitError> {
+    let beside = |f: &temen_ir::Func| {
+        f.uses_fibers() || f.uses_gc_roots() || f.uses_threads() || f.uses_futex()
+    };
+    if setjmp && (serves || funcs.iter().any(beside)) {
+        return Err(crate::JitError::Unsupported(
+            "setjmp/longjmp combined with fibers, threads or a served interface is not supported on the JIT yet",
+        ));
+    }
+    Ok(())
 }
 
 /// Address of libc `_setjmp`, which each `SetJmp` site calls inline (`HostFn::Setjmp`).
@@ -220,8 +251,10 @@ pub(crate) unsafe extern "C" fn rt_longjmp(vm: &crate::VmCtx, fp: u64, buf: u64,
     };
     let env = runtime(vm).and_then(|rt| {
         let mut st = rt.lock();
+        // `get`: nothing here may panic inside an `extern "C"` frame, whatever the table holds.
         let i = st.floor
-            + st.live()[st.floor..]
+            + st.live()
+                .get(st.floor..)?
                 .iter()
                 .rposition(|c| c.token == token)?;
         let target = st.slots[i].fp;
@@ -245,19 +278,23 @@ pub(crate) unsafe extern "C" fn rt_longjmp(vm: &crate::VmCtx, fp: u64, buf: u64,
 /// and restores the floor it found. A no-op for a module without `setjmp`.
 ///
 /// **Scopes on one table nest strictly** (enter A, enter B, exit B, exit A), which is what makes the
-/// floor a stack. What guarantees it, per way an instance's code is entered:
-/// - a plain run: the run's one thread, on which each nested `invoke_extra` or serve handler is a
-///   call inside the outer bracket;
-/// - fibers and threads: a module that mixes them with `setjmp` is declined at compile time
-///   (`CompiledModule::compile`), so no second stack or thread ever enters this table;
-/// - a held or served domain: its activations run one at a time under the window's gate, inside the
-///   resting root's own bracket, and each residency of an activation's fiber is a bracket of its own
-///   that closes before the fiber parks and the gate is handed on.
+/// floor a stack. The contract: an instance with a table runs its guarded calls on one thread at a
+/// time, on one native stack, each nested call inside the one that made it. What holds it, per way
+/// an instance's code is entered:
+/// - a run: `CompiledModule::run` takes `&mut self`; `run_raw`, `run_twin` and `invoke_extra` are
+///   `unsafe`, their contract that no other thread touches the instance while a run is in flight and
+///   that a nested `invoke_extra` or serve handler comes only from a `call.cap` of that run, on its
+///   thread. The `Send`/`Sync` impls let a plain §14 child's code run on several threads at once, and
+///   a child declines `setjmp` (it has no table);
+/// - fibers, threads and served interfaces: code that would run beside the table on another stack is
+///   refused where it enters the instance ([`admits`]: `compile` for the module, `define_extra` for a
+///   unit), so no second stack or thread ever enters this table. A held domain's activations are calls
+///   of its served handlers, so a held module with `setjmp` takes none;
+/// - a fork twin is an instance of its own with an empty table, and a program with `setjmp` is never
+///   forked on the JIT (FORK.md §9.5: it is not bare).
 ///
-/// So a suspended fiber's checkpoints die when its residency's bracket closes: a `longjmp` to one
-/// after it resumes traps `SetjmpFault`, never reaches a frame. Should scopes ever overlap without
-/// nesting, the drop still truncates to the floor this scope set, so no checkpoint of a call that
-/// ended stays reachable (debug builds assert the nesting).
+/// Should scopes ever overlap without nesting, the drop still truncates to the floor this scope set,
+/// so no checkpoint of a call that ended stays reachable (debug builds assert the nesting).
 pub(crate) struct Scope<'a> {
     rt: Option<&'a SetjmpRuntime>,
     /// The floor this scope set: the table's live count at entry.

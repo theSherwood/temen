@@ -841,3 +841,73 @@ fn jit_durable_fiber_past_the_arena_faults_like_the_oracle() {
     );
     assert_eq!(created(&jsnap), 10, "the JIT ran the same ten fibers");
 }
+
+/// #2878 — a thaw residue is untrusted (DURABILITY.md §5), so a seed is bounded by the arena as
+/// `cont.new` is: an interp-frozen one-fiber artifact whose residue is padded to eleven fibers, one
+/// more than `TEST_ARENA`'s ten fiber contexts hold. Both engines seed the ten that fit and stop at
+/// the eleventh (slot 10, context 11), whose resume would write past the arena; the root's rewind
+/// names only fiber 0, so both run on to the uninterrupted answer.
+#[test]
+fn a_thaw_seed_past_the_arena_is_not_seeded_on_either_engine() {
+    let m = parse_module(FIBER_SRC).expect("parse");
+    let inst = transform_module(&m).expect("transform");
+    verify_module(&inst).expect("verify");
+    let mut ihost = Host::new();
+    ihost.set_durable(true);
+    let mut iwin = init_durable_window(WINDOW, TEST_ARENA);
+    write_state(&mut iwin, TEST_ARENA, STATE_UNWINDING);
+    let mut ifuel = 1_000_000u64;
+    let (ires, isnap) =
+        run_capture_reserved_with_host(&inst, 0, &[], &mut ifuel, &iwin, WINDOW_LOG2, &mut ihost);
+    assert!(ires.is_ok());
+    let artifact = freeze(&inst, &isnap, &ihost).expect("freeze");
+    let mut thost = Host::new();
+    let mut thaw_win = restore(&artifact, &inst, &mut thost).expect("restore");
+    begin_thaw(&mut thaw_win, TEST_ARENA, 0);
+    let real = thost.frozen_fibers().to_vec();
+    assert_eq!(real.len(), 1, "the artifact carried one frozen fiber");
+    let padded: Vec<InterpFrozen> = (0..11)
+        .map(|slot| InterpFrozen {
+            slot,
+            ..real[0].clone()
+        })
+        .collect();
+    assert_eq!(TEST_ARENA.ctx_ceiling(), 10, "contexts 1..=10 hold fibers");
+
+    let mut jhost = Host::new();
+    let (jout, _win, DurableResidue { .. }) = compile_and_run_durable(
+        &inst,
+        0,
+        &[],
+        &thaw_win,
+        WINDOW_LOG2,
+        temen_run::cap_thunk,
+        &mut jhost as *mut Host as *mut c_void,
+        DurableRun {
+            seed: DurableResidue {
+                fibers: jit_seed(&padded),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )
+    .expect("JIT thaw");
+    assert!(
+        matches!(jout, JitOutcome::Returned(ref s) if s == &[107]),
+        "JIT thaw: {jout:?}"
+    );
+
+    thost.set_durable(true);
+    thost.set_frozen_fibers(padded);
+    let mut tfuel = 1_000_000u64;
+    let (tres, _) = run_capture_reserved_with_host(
+        &inst,
+        0,
+        &[],
+        &mut tfuel,
+        &thaw_win,
+        WINDOW_LOG2,
+        &mut thost,
+    );
+    assert_eq!(tres, Ok(vec![Value::I64(107)]), "oracle thaw");
+}

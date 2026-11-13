@@ -2966,6 +2966,12 @@ fn seed_domain(s: &mut Sched, sched: &Arc<Scheduler>, mut root: Box<VCpu>, resid
         let mut seed: Vec<FrozenFiber> = thaw_fibers;
         seed.sort_by_key(|f| f.slot);
         for (expected, ff) in seed.into_iter().enumerate() {
+            // #2878 — the residue is untrusted (DURABILITY.md §5): a slot whose context would lie
+            // past the arena is not seeded, as `cont.new` refuses one ([`ShadowContexts::fiber_fits`]),
+            // and the rewound `cont.resume` that names it fails closed.
+            if !root.domain.registry.seed_fits(arena) {
+                break;
+            }
             let got = if ff.is_free() {
                 root.domain.registry.seed_free(ff.generation)
             } else {
@@ -13130,6 +13136,13 @@ impl FiberRegistry {
     /// `shadow` table (so the swap re-points there). Seed in ascending slot order to rebuild the
     /// dense handle namespace; returns the slot, which must equal the recorded one. `charge` is the
     /// fiber's, taken again (#2112): the freeze handed it back.
+    /// #2878 — whether the next slot a thaw seeds owns a context inside `arena`, as
+    /// [`Self::create`] requires of a durable fiber ([`ShadowContexts::fiber_fits`]).
+    fn seed_fits(&self, arena: ShadowArena) -> bool {
+        let t = self.lock();
+        t.contexts.fiber_fits(arena, t.fibers.len())
+    }
+
     fn seed_frozen(
         &self,
         func: i32,

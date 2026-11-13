@@ -670,3 +670,48 @@ block 2 (v7: i64) {
         "the second run reached the first's checkpoint: {second:?}"
     );
 }
+
+/// #2877 — a module that uses `setjmp` and serves an interface is declined by the JIT before it
+/// runs (`setjmp_rt::admits`): its handlers' residencies run on pool or caller threads and give the
+/// window's gate back mid-call, so their guarded calls on the one checkpoint table would not nest. The
+/// interpreters keep each checkpoint with its frame and run it.
+#[test]
+fn a_module_with_setjmp_that_serves_is_declined_on_the_jit_and_runs_on_the_interpreters() {
+    let src = "memory 16
+type 0 func () -> (i64)
+type 1 interface { ping: 0 }
+export 0 interface \"svc\" 1 { ping: 1 }
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  v1 = i64.const 48000
+  v2 = setjmp v1
+  v3 = i64.extend_i32_u v2
+  v4 = i64.add v3 v0
+  return v4
+  }
+}
+func () -> (i64) {
+block 0 () {
+  v0 = i64.const 5
+  return v0
+  }
+}
+";
+    let m = parse_module(src).expect("parse");
+    verify_module(&m).expect("verify");
+    let mut fuel = 1_000_000u64;
+    assert_eq!(
+        run(&m, 0, &[Value::I64(3)], &mut fuel),
+        Ok(vec![Value::I64(3)])
+    );
+    let mut fuel = 1_000_000u64;
+    let byte = temen_interp::bytecode::compile_and_run(&m, 0, &[Value::I64(3)], &mut fuel);
+    assert_eq!(byte, Some(Ok(vec![Value::I64(3)])), "bytecode");
+    assert!(
+        matches!(
+            compile_and_run(&m, 0, &[3]),
+            Err(temen_jit::JitError::Unsupported(_))
+        ),
+        "the JIT declines it"
+    );
+}

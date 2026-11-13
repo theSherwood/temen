@@ -792,6 +792,14 @@ impl SharedFiberTable {
         slot
     }
 
+    /// #2878 — whether the next slot a thaw seeds owns a context inside the arena, as `create`
+    /// requires of a durable fiber ([`ShadowContexts::fiber_fits`]): the snapshot that names how many
+    /// fibers to seed is untrusted (DURABILITY.md §5), and each resume raw-stores into the context.
+    fn seed_fits(&self) -> bool {
+        let t = self.lock();
+        t.contexts.fiber_fits(self.shadow, t.slots.len())
+    }
+
     /// #1684 — thaw-seed a free slot (its fiber finished before the freeze) at its generation, on
     /// the free list.
     fn seed_free(&self, generation: u64) -> usize {
@@ -1804,7 +1812,7 @@ pub(crate) unsafe fn take_frozen(rt: *mut FiberRuntime) -> Vec<crate::FrozenFibe
 ///
 /// Returns `false` (after raising a `FiberFault` on `vm`) if the OS refuses a control-stack
 /// reservation mid-seed — the caller skips the re-entry rather than aborting (ISSUES.md I1); `true`
-/// when every frozen fiber was re-seeded.
+/// when every frozen fiber that fits the arena was re-seeded.
 ///
 /// # Safety
 /// `rt` is the live runtime (its `call_tramp`/`mask`/`type_id` set); the addresses are this run's.
@@ -1825,6 +1833,12 @@ pub(crate) unsafe fn seed_frozen_fibers(
     let mut seed = seed.to_vec();
     seed.sort_by_key(|f| f.slot);
     for (expected, f) in seed.iter().enumerate() {
+        // #2878 — the residue is untrusted (DURABILITY.md §5): a slot whose context would lie past
+        // the arena is not seeded, as `cont.new` refuses one, and the rewound `cont.resume` that
+        // names it fails closed. The oracle's thaw stops at the same slot.
+        if !r.table.seed_fits() {
+            break;
+        }
         if f.is_free() {
             let got = r.table.seed_free(f.generation);
             debug_assert_eq!(got, f.slot, "re-seeded slot matches the recorded handle");
