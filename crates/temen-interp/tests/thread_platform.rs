@@ -1979,3 +1979,150 @@ fn the_runs_end_stops_a_bounced_loop_of_fast_notifies() {
     let took = t0.elapsed();
     assert!(took < std::time::Duration::from_secs(5), "{took:?}");
 }
+
+// ----- #2977: a stack's entry is paid on the task's budget whether or not it tiers up ------------
+
+/// The root spawns function 1 three times (each returns its first argument, 7) and sums the joins.
+/// Function 1 has no fuel safepoint but its entry.
+const SPAWN_THREE_SEVENS: &str = "memory 16
+func () -> (i64) {
+block 0 () {
+  v7 = i64.const 7
+  t0 = thread.spawn 1 v7 v7
+  t1 = thread.spawn 1 v7 v7
+  t2 = thread.spawn 1 v7 v7
+  j0_st, j0 = thread.join t0
+  j1_st, j1 = thread.join t1
+  j2_st, j2 = thread.join t2
+  vs = i64.add j0 j1
+  vr = i64.add vs j2
+  return vr
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (va: i64, vb: i64) {
+  return va
+  }
+}
+";
+
+/// A root with no fuel safepoint but its entry, that returns 7.
+const ROOT_SEVEN: &str = "memory 16
+func () -> (i64) {
+block 0 () {
+  v7 = i64.const 7
+  return v7
+  }
+}
+";
+
+static ANSWERED: AtomicUsize = AtomicUsize::new(0);
+
+/// Emitted code for a task's entry that answers it (`argv[0]`, or 7 for the root's, which takes
+/// none) and charges the task's budget nothing, as the wasm-JIT's emitted code charges its own
+/// `fuel` global and not the budget chain (#1997).
+fn answer_entry(call: &mut EmittedCall<'_>) -> Result<(), Trap> {
+    ANSWERED.fetch_add(1, Ordering::SeqCst);
+    call.results = vec![call.argv.first().copied().unwrap_or(7)];
+    Ok(())
+}
+
+/// `m` on the parallel driver under `platform`, over a flat window: its result and the fuel its
+/// budget was charged.
+fn charged(m: &Module, platform: ThreadPlatform) -> (Result<Vec<Value>, Trap>, u64) {
+    const BUDGET: u64 = 1_000_000;
+    let mut host = Host::new();
+    host.set_thread_platform(platform);
+    let mut fuel = BUDGET;
+    let r = bytecode::compile_and_run_capture_over_parallel_with_host(
+        m,
+        0,
+        &[],
+        &mut fuel,
+        &[],
+        flat_window(),
+        &mut host,
+    )
+    .expect("the parallel driver runs the module")
+    .0;
+    (r, BUDGET - fuel)
+}
+
+/// **A stack's entry costs one on the task's budget, tiered up or not** (#2977, INVARIANTS #9). A
+/// thread whose entry runs on the emitted tier (#1414 ED-1), and a root whose entry does, pay their
+/// entries as they are made, so the budget is charged exactly what the interpreted run charges: the
+/// root's entry and each thread's. The emitted bodies charge the budget nothing yet (#1997), so these
+/// programs keep every other safepoint out of them; with that fixed, a body with back-edges joins.
+#[test]
+fn an_entry_on_the_emitted_tier_pays_once_on_the_tasks_budget() {
+    let threads = module(SPAWN_THREE_SEVENS);
+    let interpreted = charged(&threads, ThreadPlatform::OS);
+    assert_eq!(
+        interpreted,
+        (Ok(vec![Value::I64(21)]), 4),
+        "the root's entry and 3 threads'"
+    );
+    let before = ANSWERED.load(Ordering::SeqCst);
+    let tiered = charged(&threads, tier(Arc::from([false, true]), answer_entry));
+    assert_eq!(
+        ANSWERED.load(Ordering::SeqCst) - before,
+        3,
+        "each thread's entry tiered up"
+    );
+    assert_eq!(
+        tiered, interpreted,
+        "threads: the interpreted run's result and charge"
+    );
+
+    // The root's entry runs on the emitted tier only whole, as a leaf (#1954), on a run its opener
+    // does not pump, which reports no fuel left: its charge is pinned by where it runs out instead.
+    // 1 is exactly enough and 0 is not, leaf or interpreted, so the leaf's root pays exactly one.
+    let root = module(ROOT_SEVEN);
+    for (budget, end) in [(1, Ok(vec![Value::I64(7)])), (0, Err(Trap::OutOfFuel))] {
+        assert_eq!(
+            leaf_root_with(&root, budget, false),
+            end,
+            "interpreted, budget {budget}"
+        );
+        let before = ANSWERED.load(Ordering::SeqCst);
+        assert_eq!(
+            leaf_root_with(&root, budget, true),
+            end,
+            "a leaf, budget {budget}"
+        );
+        let ran = ANSWERED.load(Ordering::SeqCst) - before;
+        assert_eq!(
+            ran,
+            usize::from(budget > 0),
+            "the leaf ran only when its entry was paid"
+        );
+    }
+}
+
+/// [`run_leaf_root`] with `fuel` and a leaf emitter that takes the root (`take`), its code
+/// [`answer_entry`]: the run's end.
+fn leaf_root_with(m: &Module, fuel: u64, take: bool) -> Result<Vec<Value>, Trap> {
+    let mut host = Host::new();
+    host.set_thread_platform(ThreadPlatform {
+        tier: Some(ThreadTier {
+            root: ProgramEmit::default(),
+            spill: 0,
+            modules: None,
+            leaf: Some(Arc::new(move |_: &LeafOffer| take)),
+            run: answer_entry,
+            native: None,
+        }),
+        opener: Opener::RunsRoot,
+        ..ThreadPlatform::OS
+    });
+    let declared = m.memory.expect("a window").size_log2;
+    // The root's entry is paid as the run opens, so a budget that cannot pay it ends the open.
+    let mut run =
+        bytecode::CoopRun::new_parallel(m, 0, &[], fuel, host, &[], declared, None, false)
+            .expect("in subset")?;
+    match run.run() {
+        CoopEvent::Done(vals) => Ok(vals),
+        CoopEvent::Trapped(t) => Err(t),
+        _ => panic!("a run nothing pumps returns at its end"),
+    }
+}

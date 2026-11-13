@@ -499,3 +499,145 @@ block 2 (i: i64) {{
         "a budget far below the work: {short:?}"
     );
 }
+
+// #2977 — a spawned thread's entry costs one on every engine, as the root's does.
+
+/// The root spawns function 1 `n` times (each returning its `7`), joins them in order and returns
+/// the sum. Function 1 has no loop and no call: a thread's only charge is its entry.
+fn spawning(n: usize) -> String {
+    let mut body = String::from("  vz = i64.const 7\n  vacc0 = i64.const 0\n");
+    for i in 0..n {
+        body += &format!("  vh{i} = thread.spawn 1 vz vz\n");
+    }
+    for i in 0..n {
+        let j = i + 1;
+        body += &format!("  vs{i}, vv{i} = thread.join vh{i}\n  vacc{j} = i64.add vacc{i} vv{i}\n");
+    }
+    format!(
+        "memory 16
+func () -> (i64) {{
+block 0 () {{
+{body}  return vacc{n}
+  }}
+}}
+func (i64, i64) -> (i64) {{
+block 0 (va: i64, vb: i64) {{
+  return va
+  }}
+}}
+"
+    )
+}
+
+/// The root spawns one thread that counts its first argument (1000) down to zero, a taken back-edge
+/// per step but the last, and returns the count of steps it took.
+const COUNTING_THREAD: &str = "memory 16
+func () -> (i64) {
+block 0 () {
+  vn = i64.const 1000
+  vh = thread.spawn 1 vn vn
+  vs, vv = thread.join vh
+  return vv
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vn: i64, vb: i64) {
+  vz = i64.const 0
+  br 1(vn, vz)
+}
+block 1 (vi: i64, vc: i64) {
+  vone = i64.const 1
+  vj = i64.sub vi vone
+  vd = i64.add vc vone
+  vdone = i64.eqz vj
+  br_if vdone 2(vd) 1(vj, vd)
+}
+block 2 (vr: i64) {
+  return vr
+  }
+}
+";
+
+/// Run `src` on the Cranelift JIT's kernel route (#2958) with `budget` fuel, asserting it ran there
+/// as kernel tasks: how it ended and the fuel it charged, once every vCPU handed back its draw.
+fn on_the_kernel_route(src: &str, budget: u64) -> (Ended, u64) {
+    use temen_run::jit_kernel;
+    let m = parse_module(src).expect("parse");
+    verify_module(&m).expect("verify");
+    let mut host = temen_interp::Host::new();
+    let admitted = jit_kernel::admit(&m, &host, None, false).expect("in the kernel's scope");
+    let start = jit_kernel::Start {
+        entry: 0,
+        args: &[],
+        init_mem: &[],
+        init: None,
+        reserved_log2: temen_ir::DEFAULT_RESERVED_LOG2,
+        fuel: budget,
+        snapshot_cap: None,
+        kill: None,
+    };
+    let end = jit_kernel::run(admitted, start, &mut host).expect("compiles");
+    assert!(
+        end.vcpus >= 1,
+        "it ran on the kernel route, as kernel tasks"
+    );
+    let ended = match end.outcome().0 {
+        JitOutcome::Returned(v) => match v.as_slice() {
+            [x] => Ended::Returned(*x),
+            other => panic!("the kernel route returned {other:?}"),
+        },
+        JitOutcome::Trapped(TrapKind::OutOfFuel) => Ended::OutOfFuel,
+        other => panic!("the kernel route ended {other:?}"),
+    };
+    (ended, budget - host.fuel_left())
+}
+
+/// [`assert_three_way`], and the kernel route too: all four end `src` alike and charge alike.
+fn assert_four_way(src: &str, budget: u64) -> (Ended, u64) {
+    let oracle = assert_three_way(src, budget);
+    let kernel = on_the_kernel_route(src, budget);
+    assert_eq!(
+        kernel, oracle,
+        "the kernel route vs the oracle: (how it ended, fuel charged)"
+    );
+    oracle
+}
+
+/// **A spawned thread's entry costs one, on every engine.** The JIT's child prologue charges it, and
+/// the interpreters now charge it as the spawn completes (#2977): `n` threads that only return cost
+/// `1 + n`, the root's entry and theirs, where the interpreters charged `1` before.
+#[test]
+fn jit_fuel_charges_each_spawned_threads_entry_like_the_interpreters() {
+    for n in [1, 2, 5] {
+        assert_eq!(
+            assert_four_way(&spawning(n), 1_000_000),
+            (Ended::Returned(7 * n as i64), 1 + n as u64),
+            "{n} threads"
+        );
+    }
+    // 1000 steps: the root's entry, the thread's, and 999 taken back-edges.
+    assert_eq!(
+        assert_four_way(COUNTING_THREAD, 1_000_000),
+        (Ended::Returned(1000), 1001)
+    );
+}
+
+/// **Near the limit, a thread's entry decides the run alike on every engine.** One thread that only
+/// returns costs 2. With 1 the root's entry takes the budget and the thread's entry runs out, on
+/// every engine; the interpreters completed this run before #2977, and the JIT trapped. With 2 every
+/// engine completes and spends all of it. Budgets where the thread's own work comes out of a drawn
+/// chunk are left out: there the tree-walker strands a waiting root's chunk (#3011) and the kernel
+/// route's half-room draw does too, so they trap where the bytecode engine completes.
+#[test]
+fn jit_fuel_a_threads_entry_runs_out_alike_on_every_engine() {
+    let one = spawning(1);
+    assert_eq!(assert_four_way(&one, 1), (Ended::OutOfFuel, 1));
+    assert_eq!(assert_four_way(&one, 2), (Ended::Returned(7), 2));
+    // Paying an entry keeps none of the draw that paid it: 50 threads spawned before the first join
+    // complete on twice their cost, the chunk rule's least budget, where each one holding a chunk
+    // while it waited ran the root out. Below 100 the engines split by that rule (#3011): the
+    // tree-walker and the kernel route, whose waiting root holds half the room it drew, run out; the
+    // bytecode engine and today's JIT complete on the exact cost, 51.
+    let fifty = spawning(50);
+    assert_eq!(assert_four_way(&fifty, 100), (Ended::Returned(350), 51));
+}

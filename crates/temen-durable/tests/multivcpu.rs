@@ -612,3 +612,101 @@ fn nested_spawn_tree_freezes_and_thaws() {
         "thawed nested tree reloads its saved clock reads (129), not re-issued ones (300)"
     );
 }
+
+/// #2977 — a thread's entry is paid exactly once across a freeze and its thaw. The spawn charges it
+/// as it completes, so a freeze that captures the thread at its first checkpoint, the earliest point a
+/// freeze can hold a thread (it spawns into `UNWINDING`), has paid it already, and the thaw, which
+/// re-creates the thread through `seed_thread` and not through the spawn, pays nothing for it. No
+/// state carries the charge across: the window and residue are what they were before #2977.
+///
+/// Only the tree-walker freezes a threaded run: the bytecode engine hands a durable `thread.*` run to
+/// it, and the Cranelift JIT runs no counted-fuel entry durable.
+#[test]
+fn a_frozen_threads_entry_is_paid_once() {
+    let inst = instrument();
+    let used = |budget: u64, left: u64| budget - left;
+    const BUDGET: u64 = 1_000_000;
+
+    // Uninterrupted: the root's entry and the thread's (the program has no other fuel safepoint).
+    let unfrozen = {
+        let mut h = Host::new();
+        h.set_durable(true);
+        h.clock_ns = 42;
+        let clk = h.grant_clock();
+        let mut fuel = BUDGET;
+        let (r, _) = run_capture_reserved_with_host(
+            &inst,
+            0,
+            &[Value::I32(clk)],
+            &mut fuel,
+            &init_durable_window(WINDOW, TEST_ARENA),
+            SIZE_LOG2,
+            &mut h,
+        );
+        assert_eq!(r, Ok(vec![Value::I64(95)]));
+        used(BUDGET, fuel)
+    };
+    assert_eq!(unfrozen, 2, "the root's entry and the thread's");
+
+    // The freeze run spawns the thread, so it pays both entries, as the unfrozen run does.
+    let (frozen, root_sp, children, snap, clock_after, freeze) = {
+        let mut h = Host::new();
+        h.set_durable(true);
+        h.clock_ns = 42;
+        let clk = h.grant_clock();
+        let mut win = init_durable_window(WINDOW, TEST_ARENA);
+        write_state(&mut win, TEST_ARENA, STATE_UNWINDING);
+        let mut fuel = BUDGET;
+        let (r, snap) = run_capture_reserved_with_host(
+            &inst,
+            0,
+            &[Value::I32(clk)],
+            &mut fuel,
+            &win,
+            SIZE_LOG2,
+            &mut h,
+        );
+        assert!(r.is_ok(), "freeze returns a placeholder: {r:?}");
+        (
+            h.frozen_vcpus().to_vec(),
+            h.frozen_root_sp().expect("root extent recorded"),
+            h.child_generations().to_vec(),
+            snap,
+            h.clock_ns,
+            used(BUDGET, fuel),
+        )
+    };
+    assert_eq!(frozen.len(), 1, "the thread was captured");
+    assert_eq!(freeze, unfrozen, "the freeze paid the thread's entry, once");
+
+    // The thaw re-creates the thread and pays no entry for it: it charges what it charged before
+    // #2977, when the interpreters charged no thread entry at all: 2, measured on main then.
+    let thaw = {
+        let mut win = snap.clone();
+        begin_thaw(&mut win, TEST_ARENA, 0);
+        let mut h = Host::new();
+        h.set_durable(true);
+        h.clock_ns = clock_after;
+        let clk = h.grant_clock();
+        h.set_frozen_vcpus(frozen);
+        h.set_frozen_root_sp(root_sp);
+        h.set_child_generations(children);
+        let mut fuel = BUDGET;
+        let (r, _) = run_capture_reserved_with_host(
+            &inst,
+            0,
+            &[Value::I32(clk)],
+            &mut fuel,
+            &win,
+            SIZE_LOG2,
+            &mut h,
+        );
+        assert_eq!(
+            r,
+            Ok(vec![Value::I64(95)]),
+            "the thaw ends as the unfrozen run"
+        );
+        used(BUDGET, fuel)
+    };
+    assert_eq!(thaw, 2, "the thaw pays no thread entry");
+}
