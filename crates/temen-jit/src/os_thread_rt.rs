@@ -877,7 +877,7 @@ pub(crate) struct Domain {
     /// code's ([`Self::fresh`]), which spawns nothing.
     node: Option<std::sync::Arc<dyn crate::BudgetNode>>,
     /// #2488 — the contexts this run's ended vCPUs left, for the next spawn to reuse
-    /// ([`Self::take_vcpu_ctx`]). Emptied when a run starts ([`Self::set_env`]): each points at its
+    /// ([`Self::take_vcpu_ctx`]). Emptied when the run ends ([`Self::end_run`]): each points at its
     /// run's end. Boxed, since code holds each context's address while the list grows.
     #[allow(clippy::vec_box)]
     vcpu_ctxs: Mutex<Vec<Box<VcpuCtx>>>,
@@ -904,6 +904,11 @@ struct Threads {
     live: usize,
     /// OS-thread handles, joined by `run_inner` at run end so no vCPU outlives the window/code.
     joins: Vec<std::thread::JoinHandle<()>>,
+    /// #3029 — the domain's vCPUs are being joined ([`Domain::join_all`]): no vCPU starts any more.
+    /// Set under this lock as the handles are taken, and `thread.spawn` checks it under the same lock,
+    /// so every vCPU that started pushed its handle before the take, and one the take joins cannot
+    /// leave another behind.
+    closed: bool,
 }
 
 #[derive(Default)]
@@ -1338,7 +1343,13 @@ impl Domain {
         durable: bool,
         shadow: temen_ir::durable_abi::ShadowArena,
     ) {
-        lock(&self.vcpu_ctxs).clear();
+        debug_assert!(
+            {
+                let t = lock(&self.threads);
+                t.joins.is_empty() && !t.closed && lock(&self.pending_spawns).is_empty()
+            },
+            "a run starts on a domain whose last run did not end"
+        );
         *lock(&self.env) = Some(Env {
             mem_base,
             fn_table_base,
@@ -1352,6 +1363,97 @@ impl Domain {
             shadow,
         });
         *lock(&self.fiber_table) = fiber_table;
+    }
+
+    /// #2953 — end a run of the domain's instance: everything the run left starts fresh for the next
+    /// one, so a reused `CompiledModule`'s run answers as a fresh compile's first run does. The run's
+    /// handles retire with it: an unjoined vCPU's or §14 child's ended with the domain
+    /// ([`Self::begin_teardown`]), as the oracle discards a finished run's vCPUs.
+    ///
+    /// Called once the run's vCPUs are joined ([`Self::join_all`]), its §14 children harvested, its
+    /// freeze residue taken and its kill and freeze wakes retired, so no guest code of the run can
+    /// reach the domain. Through `&self`: a host may still reach [`Self::park`] (a wake by
+    /// [`crate::CompiledModule::park_hub`]'s address, an [`outside_waker`]), so nothing it reads is
+    /// written. At the run's end, not the next one's start: a thaw seeds the table before its run
+    /// ([`crate::CompiledModule::set_durable`], #2619).
+    ///
+    /// One destructure names every field: each is per-run, and reset below, or configuration the
+    /// instance keeps (`_`). A field added to the domain does not compile until it is one or the
+    /// other.
+    pub(crate) fn end_run(&self) {
+        let Domain {
+            env,
+            fiber_table,
+            threads,
+            pending_spawns,
+            frozen_vcpus,
+            completed_children,
+            frozen_fibers,
+            children,
+            cur_task,
+            next_task,
+            trap_capture,
+            quiesce,
+            parked,
+            killing,
+            lanes,
+            vcpu_ctxs,
+            // The futex table and the wakers are kept, not replaced: hosts outside the run reach
+            // them between runs (`CompiledModule::park_hub`'s users wake the futex table by the
+            // domain's address; an `outside_waker` holds it weakly), so no join can make a
+            // replacement exclusive. Their contents are the run's, emptied under their own locks.
+            park,
+            wakers,
+            // Kept: the lane chain its embedder installed and what the domain is (its hub, its budget
+            // node), which are configuration; and the link to its nursery's child executor, which the
+            // nursery owns. That executor carries run state of its own (#3024), not reset here.
+            quiesce_cv: _,
+            child_exec: _,
+            lane_cv: _,
+            lane_chain: _,
+            hub: _,
+            node: _,
+        } = self;
+        debug_assert_eq!(self.hub, 0, "only a run's own domain ends a run");
+        // A durable run defers a spawn while its window is not `NORMAL` (an armed trigger, a freeze),
+        // and runs the child only at a freeze or before a park: one the run never reached ends with it
+        // unrun, as the oracle discards a finished run's queued vCPUs. What it took goes back.
+        for p in std::mem::take(&mut *lock(pending_spawns)) {
+            lock(threads).live -= 1;
+            self.vcpu_ended();
+            if let Some(table) = lock(fiber_table).as_ref() {
+                table.free_vcpu_context(p.ctx);
+            }
+        }
+        *lock(env) = None;
+        *lock(fiber_table) = None;
+        {
+            let mut t = lock(threads);
+            debug_assert!(t.live == 1 && t.joins.is_empty(), "a vCPU outlived its run");
+            *t = Threads {
+                live: 1,
+                joins: Vec::new(),
+                closed: false,
+            };
+        }
+        lock(frozen_vcpus).clear();
+        lock(completed_children).clear();
+        lock(frozen_fibers).clear();
+        // The table's nursery link is the instance's; its handles are the run's.
+        *lock(&children.table) = temen_ir::handles::Table::default();
+        *lock(cur_task) = 0;
+        *lock(next_task) = 1;
+        *lock(trap_capture) = None;
+        *lock(quiesce) = 0;
+        debug_assert_eq!(parked.load(Ordering::Acquire), 0, "a park outlived its run");
+        parked.store(0, Ordering::Release);
+        killing.store(0, Ordering::Release);
+        lock(lanes).clear();
+        lock(vcpu_ctxs).clear();
+        // A vCPU's waiter leaves at teardown; a fiber's event-parked one can stay queued, and a
+        // later run's `notify` would count it.
+        lock(&park.futex).clear();
+        wakers.clear();
     }
 
     /// The domain-shared fiber table (for a spawned vCPU to build its `FiberRuntime` over).
@@ -1803,7 +1905,12 @@ impl Domain {
     pub(crate) fn join_all(&self, blocked: bool) {
         // Drain handles out of the lock first (joining holds no lock; a joining child may still touch
         // `threads` via nested ops, though by teardown all guest code has returned).
-        let joins: Vec<_> = std::mem::take(&mut lock(&self.threads).joins);
+        // #3029 — closed as the handles are taken: a vCPU still running cannot start one after.
+        let joins: Vec<_> = {
+            let mut t = lock(&self.threads);
+            t.closed = true;
+            std::mem::take(&mut t.joins)
+        };
         let _pg = blocked.then(|| ParkGuard::new(&self.hub().parked));
         for j in joins {
             let _ = j.join();
@@ -2316,11 +2423,13 @@ pub(crate) unsafe extern "C" fn thread_spawn(
         // table — so a spawn-join loop never trips, matching the interpreter. A §14 child's vCPU is
         // bounded by the run-wide count, as the oracle's one scheduler bounds every vCPU of the run
         // (its own `live` is then only this domain's share, for its teardown).
-        let at_ceiling = if std::ptr::eq(hub, dom) {
-            t.live >= MAX_VCPUS
-        } else {
-            !hub.try_child_start()
-        };
+        // #3029 — and none at all once its domain's vCPUs are being joined: the domain has ended.
+        let at_ceiling = t.closed
+            || if std::ptr::eq(hub, dom) {
+                t.live >= MAX_VCPUS
+            } else {
+                !hub.try_child_start()
+            };
         // #2001 — the vCPU is also one `spawn` of its domain's budget node while it lives
         // ([`Done::publish`] hands it back): a full ceiling refuses it as the live cap does.
         let unfunded = !at_ceiling && !dom.charge_vcpu();
@@ -3897,6 +4006,66 @@ mod tests {
         assert!(dom.try_child_start(), "the last slot");
         assert!(!dom.try_child_start(), "past the ceiling");
         assert_eq!(dom.live_vcpus(), MAX_VCPUS, "a refusal takes no slot");
+    }
+
+    /// #2953 — a run's end leaves the domain as a fresh one: the handles it issued retire, a slot's
+    /// next handle is the one a fresh table issues, and the next spawn is task 1 again.
+    #[test]
+    fn a_run_s_end_leaves_the_domain_fresh() {
+        let fresh = Domain::new(None);
+        let first = lock(&fresh.children.table)
+            .issue(ChildEntry::Thread(Done::new(None)))
+            .ok()
+            .expect("a fresh table issues");
+
+        let dom = Domain::new(None);
+        for _ in 0..temen_ir::handles::SLOTS {
+            lock(&dom.children.table)
+                .issue(ChildEntry::Thread(Done::new(None)))
+                .ok()
+                .expect("room for every slot");
+            dom.take_task();
+        }
+        assert!(
+            lock(&dom.children.table)
+                .issue(ChildEntry::Thread(Done::new(None)))
+                .is_err(),
+            "the run filled the table"
+        );
+        dom.end_run();
+        assert_eq!(
+            lock(&dom.children.table)
+                .issue(ChildEntry::Thread(Done::new(None)))
+                .ok(),
+            Some(first),
+            "the next run's first handle is a fresh table's"
+        );
+        assert_eq!(dom.take_task(), 1, "the next run's first spawn is task 1");
+    }
+
+    /// #2953 — what a run leaves in the futex table and the wakers, which hosts keep reaching
+    /// between runs, is emptied too: a queued waiter, a waker registration.
+    #[test]
+    fn a_run_s_end_empties_its_parks() {
+        let dom = Domain::new(None);
+        let key = FutexKey::Host(1);
+        lock(&dom.park.futex)
+            .entry(key)
+            .or_default()
+            .waiters
+            .push(wait_cell_new(false));
+        let fired = std::sync::Arc::new(AtomicBool::new(false));
+        let f = std::sync::Arc::clone(&fired);
+        let _left = dom
+            .wakers
+            .add(Box::new(move || f.store(true, Ordering::SeqCst)));
+        dom.end_run();
+        assert!(
+            lock(&dom.park.futex).is_empty(),
+            "no waiter outlives its run"
+        );
+        dom.wakers.fire();
+        assert!(!fired.load(Ordering::SeqCst), "no waker outlives its run");
     }
 }
 
