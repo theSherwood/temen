@@ -424,6 +424,45 @@ fn a_payload_the_window_does_not_hold_faults_after_the_module_resolves() {
     );
 }
 
+/// #2996 — in the reservation, past the parent's 128 KiB window: a page that is not there.
+const TAIL: u64 = 1 << 20;
+
+/// #2996 — on the Cranelift JIT, a spawn whose record, payload or grant list is on a page that is
+/// not there faults. The host reads each one: the record and payload by `try_access`, the grant list
+/// through the host's checked window view, under the Host lock that a fault taken by the hardware
+/// would have leaked. JIT only: the interpreters read the spawner's window without its page
+/// protections and see zeros there (ISSUE_PLACEHOLDER).
+#[test]
+fn a_record_payload_or_grant_list_on_an_absent_page_faults_on_the_jit() {
+    let record = parent(
+        &format!("  vq = i64.const {TAIL}\n  vh = call.cap 6 17 (i64) -> (i32) vi (vq)"),
+        JOIN_OR_ERRNO,
+        "",
+    );
+    let grants = spawning(
+        SpawnRec {
+            args: (PAYLOAD, 1),
+            grants_ptr: TAIL,
+            grants_n: 1,
+            ..SpawnRec::default()
+        },
+        false,
+        "vb",
+        JOIN_OR_ERRNO,
+    );
+    for (what, m) in [
+        ("a record", record),
+        ("a payload", by_record(TAIL, 8, false)),
+        ("a grant list", grants),
+    ] {
+        assert_eq!(
+            cranelift(&m, PLAIN),
+            Err(Trap::MemoryFault),
+            "{what} on an absent page"
+        );
+    }
+}
+
 /// The control: a payload the region holds reaches the child on every engine.
 #[test]
 fn a_payload_the_region_holds_reaches_the_child() {

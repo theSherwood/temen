@@ -1532,7 +1532,7 @@ pub(crate) unsafe extern "C" fn instantiate_rec(
     // interpreter tiers (#911).
     let mut buf = [0u8; temen_ir::SPAWN_REC_LEN];
     if !crate::mem::try_access(
-        &vm.window(),
+        vm.window(),
         &mut crate::mem::Access::Copy {
             dst: buf.as_mut_ptr(),
             src: (mem_base + rp) as *const u8,
@@ -1847,7 +1847,7 @@ unsafe fn spawn_detached(
                 let mut v = vec![0u8; l as usize];
                 // #2996 — a page that is not readable is the guest's `MemoryFault`, not an unwind.
                 if !crate::mem::try_access(
-                    &vm.window(),
+                    vm.window(),
                     &mut crate::mem::Access::Copy {
                         dst: v.as_mut_ptr(),
                         src: (mem_base as *const u8).add(p as usize),

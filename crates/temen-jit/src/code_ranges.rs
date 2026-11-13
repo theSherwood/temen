@@ -224,7 +224,11 @@ mod live {
             assert!(!t.contains(0xfff) && !t.contains(0x2000));
             t.release(i);
             assert!(!t.contains(0x1000));
-            assert_eq!(t.claim(0x5000, 0x6000), Some(i), "a released slot is reused");
+            assert_eq!(
+                t.claim(0x5000, 0x6000),
+                Some(i),
+                "a released slot is reused"
+            );
         }
 
         #[test]
@@ -243,7 +247,9 @@ mod live {
             let (lo, hi) = TABLE.read(slot.0).expect("published");
             assert_eq!(hi - lo, ARENA);
             let here = crate::fuel::refill_trampoline();
-            assert!(!pc_is_jit(a_modules_code_is_in_its_registered_range as *const () as usize));
+            assert!(!pc_is_jit(
+                a_modules_code_is_in_its_registered_range as *const () as usize
+            ));
             assert!(pc_is_jit(here), "the fuel trampoline is JIT code");
             drop(slot);
             assert!(!pc_is_jit(lo));
@@ -299,7 +305,10 @@ mod loom_tests {
             };
             let f = published.load(Ordering::Acquire);
             if f != 0 {
-                assert!(t.contains(f), "code reached through the publication is covered");
+                assert!(
+                    t.contains(f),
+                    "code reached through the publication is covered"
+                );
             }
             w.join().unwrap();
         });

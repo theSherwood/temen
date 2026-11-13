@@ -517,7 +517,14 @@ pub(crate) unsafe extern "C" fn mem_copy(vm: &crate::VmCtx, dst: u64, src: u64, 
     if w.pages != 0 && !(pages_admit(vm, src, len, false) && pages_admit(vm, dst, len, true)) {
         return;
     }
-    if !try_access(&w, &mut Access::Copy { dst: d, src: s, len: len as usize }) {
+    if !try_access(
+        w,
+        &mut Access::Copy {
+            dst: d,
+            src: s,
+            len: len as usize,
+        },
+    ) {
         fault(vm);
     }
 }
@@ -538,7 +545,14 @@ pub(crate) unsafe extern "C" fn mem_fill(vm: &crate::VmCtx, dst: u64, val: u64, 
     if w.pages != 0 && !pages_admit(vm, dst, len, true) {
         return;
     }
-    if !try_access(&w, &mut Access::Fill { dst: d, val: val as u8, len: len as usize }) {
+    if !try_access(
+        w,
+        &mut Access::Fill {
+            dst: d,
+            val: val as u8,
+            len: len as usize,
+        },
+    ) {
         fault(vm);
     }
 }
@@ -564,11 +578,19 @@ unsafe fn probe(p: *const u8, len: usize) {
 pub(crate) enum Access {
     /// Copy `len ≥ 1` bytes, overlap-safe; the ends of both spans are read first (I21), so a span
     /// past the backed extent faults before any byte is written.
-    Copy { dst: *mut u8, src: *const u8, len: usize },
+    Copy {
+        dst: *mut u8,
+        src: *const u8,
+        len: usize,
+    },
     /// Set `len ≥ 1` bytes to `val`; the span's ends are read first (I21).
     Fill { dst: *mut u8, val: u8, len: usize },
     /// Load the `width`-byte word (1, 2, 4 or 8, aligned) at `src` into `out`.
-    Load { src: *const u8, width: u32, out: u64 },
+    Load {
+        src: *const u8,
+        width: u32,
+        out: u64,
+    },
 }
 
 /// Run `a` on window `w`. `false` if it faulted on the window: the access did not complete (a copy
@@ -1376,7 +1398,10 @@ mod pal {
             let addr = rec.ExceptionInformation[1];
             // #2996 — a host access to the window that may fault: back to its own landing, the
             // guarded call's state untouched.
-            if let Some(f) = TRY.with(|g| g.get()).filter(|f| addr >= f.lo && addr < f.hi) {
+            if let Some(f) = TRY
+                .with(|g| g.get())
+                .filter(|f| addr >= f.lo && addr < f.hi)
+            {
                 TRY.with(|g| g.set(None));
                 resume_at_landing(&mut *ep.ContextRecord, &*f.jb);
                 return EXCEPTION_CONTINUE_EXECUTION;
@@ -1399,7 +1424,10 @@ mod pal {
             // an illegal instruction inside an armed guarded guest call is our emitted memory-fault
             // trap. Recover exactly like a guarded access violation (unwind to `run_guarded`).
             let pc = (*ep.ContextRecord).Rip as usize;
-            if let Some(f) = GUARD.with(|g| g.get()).filter(|_| !host_fault(&*ep.ContextRecord, pc)) {
+            if let Some(f) = GUARD
+                .with(|g| g.get())
+                .filter(|_| !host_fault(&*ep.ContextRecord, pc))
+            {
                 capture_trap_frame(&*ep.ContextRecord);
                 resume_at_landing(&mut *ep.ContextRecord, &*f.jb);
                 return EXCEPTION_CONTINUE_EXECUTION;
@@ -1445,9 +1473,15 @@ mod pal {
         // The trampoline calls an `Entry`-shaped function; `f` takes its one argument in the first
         // register, which is where the trampoline puts `a`.
         let entry: Entry = core::mem::transmute(f);
-        let tripped =
-            temen_win_guarded_call(entry, arg as *const i64, core::ptr::null_mut(), core::ptr::null_mut(),
-                core::ptr::null(), core::ptr::null_mut(), jb_ptr) != 0;
+        let tripped = temen_win_guarded_call(
+            entry,
+            arg as *const i64,
+            core::ptr::null_mut(),
+            core::ptr::null_mut(),
+            core::ptr::null(),
+            core::ptr::null_mut(),
+            jb_ptr,
+        ) != 0;
         TRY.with(|g| g.set(None));
         !tripped
     }

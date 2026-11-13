@@ -2671,7 +2671,11 @@ fn arena_mut(module: &mut Arc<OwnedJit>) -> Result<ArenaGuard<'_>, JitError> {
 
 impl Drop for Arena {
     fn drop(&mut self) {
-        let m = self.module.get_mut().unwrap_or_else(|p| p.into_inner()).take();
+        let m = self
+            .module
+            .get_mut()
+            .unwrap_or_else(|p| p.into_inner())
+            .take();
         // Out of the fault handler's table before the pages go back: a later mapping there is not
         // JIT code.
         drop(self.slot.take());

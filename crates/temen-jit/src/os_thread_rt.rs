@@ -3101,7 +3101,7 @@ fn width_mask(width: u32) -> u64 {
 /// # Safety
 /// `phys` is a span of `width` bytes in `vm`'s window reservation.
 unsafe fn read_phys(vm: &crate::VmCtx, phys: u64, width: u32) -> Option<u64> {
-    crate::mem::try_load(&vm.window(), phys as *const u8, width)
+    crate::mem::try_load(vm.window(), phys as *const u8, width)
 }
 
 /// `<ty>.atomic.wait` thunk: if the `width`-byte value at confined `phys` still equals `expected`, park
@@ -3201,7 +3201,9 @@ unsafe fn thread_wait_here(
             vm.raise(crate::TrapKind::MemoryFault as i64);
             return 0;
         }
-        Some(v) if v & mask == expected & mask => dom.drive_deferred_before_park(dom.current_task()),
+        Some(v) if v & mask == expected & mask => {
+            dom.drive_deferred_before_park(dom.current_task())
+        }
         Some(_) => {}
     }
     // D66 — a parked vCPU holds no lane. This is what makes a bounded domain composable rather than
