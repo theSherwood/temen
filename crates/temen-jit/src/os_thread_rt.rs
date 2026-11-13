@@ -3978,12 +3978,14 @@ mod tests {
         let fresh = Domain::new(None);
         let first = lock(&fresh.children.table)
             .issue(ChildEntry::Thread(Done::new(None)))
+            .ok()
             .expect("a fresh table issues");
 
         let dom = Domain::new(None);
         for _ in 0..temen_ir::handles::SLOTS {
             lock(&dom.children.table)
                 .issue(ChildEntry::Thread(Done::new(None)))
+                .ok()
                 .expect("room for every slot");
             dom.take_task();
         }
