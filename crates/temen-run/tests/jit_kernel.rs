@@ -1219,3 +1219,97 @@ block 0 () {{
     assert_eq!(kernel, Err("MemoryFault".into()), "the page stays unmapped");
     assert_eq!(today, Ok(vec![1]), "today's route reads the region");
 }
+
+/// Twelve spawned vCPUs, while the root counts to 200,000 and returns 7. `wait`: each loops on a 5 ms
+/// timed `i32.atomic.wait` on one word nothing notifies, so the run ends with timed waiters parked,
+/// whose deadlines pass while their threads are still leaving; otherwise each returns at once.
+fn timed_waiters(wait: bool) -> temen_ir::Module {
+    let spawns: String = (0..12)
+        .map(|i| format!("  vh{i} = thread.spawn 1 vz vz\n"))
+        .collect();
+    let worker = match wait {
+        true => "  va = i64.const 16400\n  vx = i32.const 0\n  vto = i64.const 5000000\n  vk = i32.atomic.wait va vx vto\n  br 1()",
+        false => "  vr = i64.const 0\n  return vr",
+    };
+    module(&format!(
+        "memory 16
+func () -> (i64) {{
+block 0 () {{
+  vz = i64.const 0
+{spawns}  vi0 = i64.const 0
+  br 1(vi0)
+  }}
+block 1 (vi: i64) {{
+  vone = i64.const 1
+  vn = i64.add vi vone
+  vlim = i64.const 200000
+  vdone = i64.ge_u vn vlim
+  br_if vdone 2() 1(vn)
+  }}
+block 2 () {{
+  vr = i64.const 7
+  return vr
+  }}
+}}
+func (i64, i64) -> (i64) {{
+block 0 (va0: i64, vb0: i64) {{
+  br 1()
+  }}
+block 1 () {{
+{worker}
+  }}
+}}
+"
+    ))
+}
+
+/// What a run of `m` holds of a fresh host's node once it has ended ([`temen_interp::NodeRef::
+/// mem_and_maps`]), on the kernel route (native tasks) and on executor 2 interpreting, each having
+/// returned 7.
+fn held_after(m: &temen_ir::Module) -> [(i64, i64); 2] {
+    let mut host = Host::new();
+    let node = host.own_node();
+    let admitted = jit_kernel::admit(m, &host, None, false).expect("in the kernel's scope");
+    let start = jit_kernel::Start {
+        entry: 0,
+        args: &[],
+        init_mem: &[],
+        init: None,
+        reserved_log2: temen_ir::DEFAULT_RESERVED_LOG2,
+        fuel: temen_interp::DEFAULT_FUEL,
+        snapshot_cap: None,
+        kill: None,
+    };
+    let end = jit_kernel::run(admitted, start, &mut host).expect("compiles");
+    assert_eq!(end.vcpus, 13, "every vCPU ran as a kernel task");
+    assert_eq!(result(end.outcome().0), Ok(vec![7]), "kernel route");
+    let kernel = node.mem_and_maps();
+    let mut host = Host::new();
+    let node = host.own_node();
+    let mut fuel = temen_interp::DEFAULT_FUEL;
+    let (r, _) = temen_interp::bytecode::compile_and_run_capture_over_parallel_with_host(
+        m,
+        0,
+        &[],
+        &mut fuel,
+        &[],
+        None,
+        &mut host,
+    )
+    .expect("in the engine's subset");
+    assert_eq!(r, Ok(vec![temen_interp::Value::I64(7)]), "executor 2");
+    [kernel, node.mem_and_maps()]
+}
+
+/// A run that ends with timed waiters parked returns the root's value and leaves its host's node
+/// holding what a run whose threads all returned leaves (the root's window), on both executor 2
+/// lanes. Once the verdict is in no rule advances a task (`ThreadRun::settle`): a leaver's wait whose
+/// deadline passes after the verdict is never answered, and nothing a host reads after the run
+/// depends on whether a thread happened to wake after it.
+#[test]
+fn a_run_that_ends_with_timed_waiters_parked_holds_what_a_returned_one_does() {
+    let returned = held_after(&timed_waiters(false));
+    for _ in 0..4 {
+        assert_eq!(held_after(&timed_waiters(true)), returned);
+    }
+}
