@@ -133,3 +133,36 @@ fn gc_roots_into_an_absent_buffer_faults() {
     );
     faults_everywhere("gc.roots", program(&body, ""));
 }
+
+// The guest's own faults, where its code runs on a stack the root did not start with. Each must
+// still be the guest's `MemoryFault`: the code faulting is emitted code, in its module's arena.
+
+/// A load from a page that is not there, as a fiber's body.
+const LOADS_THE_TAIL: &str = "func (i64, i64) -> (i64) {
+block 0 (vsp: i64, varg: i64) {
+  va = i64.const 1048576
+  vr = i64.load va
+  return vr
+  }
+}
+";
+
+/// A guest load faulting inside a fiber.
+#[test]
+fn a_guest_fault_in_a_fiber_traps() {
+    let body = "  v0 = ref.func 1
+  v1 = i64.const 0
+  v2 = cont.new v0 v1
+  vs, vv = cont.resume v2 v1";
+    faults_everywhere("a fiber's load", program(body, LOADS_THE_TAIL));
+}
+
+/// A guest load faulting inside a spawned vCPU.
+#[test]
+fn a_guest_fault_in_a_spawned_vcpu_traps() {
+    let body = "  vsp = i64.const 32768
+  va = i64.const 0
+  vt = thread.spawn 1 vsp va
+  vst, vr = thread.join vt";
+    faults_everywhere("a spawned vCPU's load", program(body, LOADS_THE_TAIL));
+}
