@@ -18536,7 +18536,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     // the child's fuel as the spawn completes, so a freeze after the spawn has paid it
                     // and a thaw, which re-creates the thread through `seed_thread`, pays nothing.
                     // Out of fuel ends the run, as a thread's own `OutOfFuel` does.
-                    child_fuel.burn()?;
+                    child_fuel.pay_entry()?;
                     let parent_id = *id; // the spawning vCPU's task — the child's `parent_task`
                     let csched = sched.clone();
                     // A debugged run shares one breakpoint/watchpoint set across all threads
@@ -23090,6 +23090,17 @@ impl Fuel {
             self.refill()?;
         }
         self.left -= 1;
+        Ok(())
+    }
+
+    /// #2977 — pay a stack's entry before the stack runs: burn one, and keep none of the draw that
+    /// paid it. A thread waits in the run queue after its spawn has paid, and a chunk held there is
+    /// fuel no running vCPU can burn: a thousand queued threads would strand a thousand chunks.
+    pub(crate) fn pay_entry(&mut self) -> Result<(), Trap> {
+        self.burn()?;
+        if let Some(s) = self.src.as_ref().filter(|_| !self.native) {
+            s.give_back(std::mem::take(&mut self.left));
+        }
         Ok(())
     }
 

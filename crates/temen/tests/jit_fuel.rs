@@ -633,4 +633,11 @@ fn jit_fuel_a_threads_entry_runs_out_alike_on_every_engine() {
     let one = spawning(1);
     assert_eq!(assert_four_way(&one, 1), (Ended::OutOfFuel, 1));
     assert_eq!(assert_four_way(&one, 2), (Ended::Returned(7), 2));
+    // Paying an entry keeps none of the draw that paid it: 50 threads spawned before the first join
+    // complete on twice their cost, the chunk rule's least budget, where each one holding a chunk
+    // while it waited ran the root out. Below 100 the engines split by that rule (#3011): the
+    // tree-walker and the kernel route, whose waiting root holds half the room it drew, run out; the
+    // bytecode engine and today's JIT complete on the exact cost, 51.
+    let fifty = spawning(50);
+    assert_eq!(assert_four_way(&fifty, 100), (Ended::Returned(350), 51));
 }
