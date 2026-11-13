@@ -3093,18 +3093,15 @@ fn width_mask(width: u32) -> u64 {
     }
 }
 
-/// Read the `width`-byte value at confined physical address `phys` (the lowering's alignment guard
-/// ensures it is aligned).
+/// Read the `width`-byte value at confined physical address `phys` in `vm`'s window (the lowering's
+/// alignment guard ensures it is aligned). `None` if the page is not readable: the guest's
+/// `MemoryFault`, which the caller raises once it holds nothing (#2996: the read runs under the hub
+/// lock, so it must not unwind; [`crate::mem::try_access`]).
 ///
 /// # Safety
-/// `phys` points at `width` readable bytes in the guest window.
-unsafe fn read_phys(phys: u64, width: u32) -> u64 {
-    match width {
-        1 => *(phys as *const u8) as u64,
-        2 => *(phys as *const u16) as u64,
-        4 => *(phys as *const u32) as u64,
-        _ => *(phys as *const u64),
-    }
+/// `phys` is a span of `width` bytes in `vm`'s window reservation.
+unsafe fn read_phys(vm: &crate::VmCtx, phys: u64, width: u32) -> Option<u64> {
+    crate::mem::try_load(&vm.window(), phys as *const u8, width)
 }
 
 /// `<ty>.atomic.wait` thunk: if the `width`-byte value at confined `phys` still equals `expected`, park
@@ -3199,8 +3196,13 @@ unsafe fn thread_wait_here(
         );
     }
     // #1904 — a wait that would park runs the deferred children first: the notifier may be one.
-    if read_phys(phys, width) & mask == expected & mask {
-        dom.drive_deferred_before_park(dom.current_task());
+    match read_phys(vm, phys, width) {
+        None => {
+            vm.raise(crate::TrapKind::MemoryFault as i64);
+            return 0;
+        }
+        Some(v) if v & mask == expected & mask => dom.drive_deferred_before_park(dom.current_task()),
+        Some(_) => {}
     }
     // D66 — a parked vCPU holds no lane. This is what makes a bounded domain composable rather than
     // deadlock-prone: under a cap of 1, a vCPU that waits must let its peer run, or the notify it is
@@ -3212,11 +3214,19 @@ unsafe fn thread_wait_here(
     // Canonical key (S1b/S1c): a region-mapped page keys on `(backing, region offset)` so aliases at
     // different window offsets rendezvous; a plain page keys on the absolute address as before. The
     // value re-check below still reads the real `phys` — queue on the canonical key, compare on the
-    // address (mirrors the interpreter's split key/addr park).
+    // address (mirrors the interpreter's split key/addr park). A re-check that finds the page gone
+    // (a racing unmap) does not park, and is the guest's `MemoryFault` once the lock is dropped.
+    let faulted = core::cell::Cell::new(false);
     let status = futex_wait(
         &hub.park,
         futex_key_of(phys),
-        || read_phys(phys, width) & mask == expected & mask,
+        || match read_phys(vm, phys, width) {
+            Some(v) => v & mask == expected & mask,
+            None => {
+                faulted.set(true);
+                false
+            }
+        },
         deadline,
         dom.env().epoch_addr,
         freeze,
@@ -3233,6 +3243,11 @@ unsafe fn thread_wait_here(
         // before).
         || vm.ended().is_some(),
     );
+    // The re-check's fault ends the vCPU as an abort does, the lane untaken.
+    if faulted.get() {
+        vm.raise(crate::TrapKind::MemoryFault as i64);
+        return 0;
+    }
     // Back from the park: re-take the lane before any guest code runs again. An abort (kill or a
     // torn-down domain) leaves it untaken and the caller's trailing guard unwinds, exactly as the
     // wait statuses below do.
@@ -3281,7 +3296,12 @@ unsafe fn fiber_futex_wait(
     let cell = wait_cell_new(false);
     {
         let mut g = lock(&dom.hub().park.futex);
-        if read_phys(phys, width) & mask != expected & mask {
+        let Some(v) = read_phys(vm, phys, width) else {
+            drop(g);
+            vm.raise(TrapKind::MemoryFault as i64);
+            return 0;
+        };
+        if v & mask != expected & mask {
             // Insta-wake (the park-vs-store race, closed): deliver `WAIT_NOT_EQUAL` without
             // queueing — but still park once below, so the resumer sees the one transient
             // `FIBER_PARKED` the oracle's register-then-recheck shows (fiber_parks.rs).

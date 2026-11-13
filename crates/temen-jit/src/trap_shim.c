@@ -24,6 +24,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ucontext.h>
+#include <unistd.h>
 
 static _Thread_local sigjmp_buf g_buf;
 static _Thread_local volatile int g_armed = 0;
@@ -43,9 +44,8 @@ extern void temen_store_trap_frame(uintptr_t pc, uintptr_t fp);
 extern int temen_walk_in_progress(void);
 extern void temen_walk_abort(void);
 
-/* Memory-fault capture: extract the faulting (pc, fp) from the signal ucontext and hand off the walk.
- * Async-signal-safe: only the ucontext read + the (stack-reading, TLS-writing) store. */
-static void temen_capture_frame(void *uc) {
+/* The faulting (pc, fp) from the signal ucontext; both 0 on an arch we don't decode. */
+static void temen_fault_pc_fp(void *uc, uintptr_t *pc_out, uintptr_t *fp_out) {
     uintptr_t pc = 0, fp = 0;
 #if defined(__linux__) && defined(__x86_64__)
     ucontext_t *c = (ucontext_t *)uc;
@@ -66,7 +66,95 @@ static void temen_capture_frame(void *uc) {
 #else
     (void)uc; /* an arch we don't decode: pc/fp stay 0 → the host yields an empty backtrace */
 #endif
+    *pc_out = pc;
+    *fp_out = fp;
+}
+
+/* Memory-fault capture: extract the faulting (pc, fp) from the signal ucontext and hand off the walk.
+ * Async-signal-safe: only the ucontext read + the (stack-reading, TLS-writing) store. */
+static void temen_capture_frame(void *uc) {
+    uintptr_t pc, fp;
+    temen_fault_pc_fp(uc, &pc, &fp);
     temen_store_trap_frame(pc, fp); /* walk + stash in the shared (trap_capture.c) thread-local */
+}
+
+/* #2996 — which code faulted. A guarded fault is the guest's only when its pc is JIT-emitted code
+ * (`code_ranges.rs`, loads only). `temen_fault_strict` says whether a guarded fault anywhere else is
+ * fatal, which it is in a build with debug assertions; in a release build it is unwound as before. */
+extern int temen_pc_is_jit(uintptr_t pc);
+extern int temen_fault_strict(void);
+
+/* Async-signal-safe: hex into a stack buffer, then write(2). */
+static char *temen_hex(char *p, uintptr_t v) {
+    *p++ = '0';
+    *p++ = 'x';
+    int started = 0;
+    for (int shift = (int)(sizeof v * 8) - 4; shift >= 0; shift -= 4) {
+        unsigned d = (unsigned)(v >> shift) & 0xf;
+        if (d || started || shift == 0) {
+            *p++ = (char)(d < 10 ? '0' + d : 'a' + d - 10);
+            started = 1;
+        }
+    }
+    return p;
+}
+
+static void temen_report_host_fault(int sig, uintptr_t pc, uintptr_t addr) {
+    static const char head[] = "temen-jit: host code faulted on guest memory inside a guarded call: pc=";
+    char buf[192];
+    char *p = buf;
+    memcpy(p, head, sizeof head - 1);
+    p += sizeof head - 1;
+    p = temen_hex(p, pc);
+    memcpy(p, " addr=", 6);
+    p += 6;
+    p = temen_hex(p, addr);
+    memcpy(p, " sig=", 5);
+    p += 5;
+    p = temen_hex(p, (uintptr_t)sig);
+    *p++ = '\n';
+    ssize_t n = write(2, buf, (size_t)(p - buf));
+    (void)n;
+}
+
+/* Whether the guarded fault at `pc` is a host bug to die of (#2996): `pc` is decoded, is not JIT
+ * code, and the build is strict. Reported here, before the caller chains to the default action. */
+static int temen_host_fault(int sig, void *uc, uintptr_t addr) {
+    uintptr_t pc, fp;
+    temen_fault_pc_fp(uc, &pc, &fp);
+    if (pc == 0 || temen_pc_is_jit(pc) || !temen_fault_strict())
+        return 0;
+    temen_report_host_fault(sig, pc, addr);
+    return 1;
+}
+
+/* ---- #2996: a host access to the window that may fault --------------------------------------
+ *
+ * Some host functions the guest calls read or write its window where only the hardware knows whether
+ * the page is there (a guest's own unmap or protect, the null guard, the uncommitted tail, a racing
+ * vCPU). They run the access through `temen_try_call`, which gives it a recovery point of its own:
+ * a fault on the window during it comes back here, and the call returns 0, so the caller raises the
+ * guest's `MemoryFault` and returns normally, with its locks released by their own destructors. The
+ * jump skips only `f`'s frame, which holds nothing to drop. A fault outside `[lo, hi)` (the window's
+ * fault range) during the try is not recovered: it is a host bug. */
+static _Thread_local sigjmp_buf g_try_buf;
+static _Thread_local volatile int g_trying = 0;
+static _Thread_local volatile uintptr_t g_try_lo = 0;
+static _Thread_local volatile uintptr_t g_try_hi = 0;
+
+int temen_try_call(void (*f)(void *), void *arg, uintptr_t lo, uintptr_t hi) {
+    /* Not nested: a try runs one access and nothing that could start another. */
+    g_try_lo = lo;
+    g_try_hi = hi;
+    /* No mask saved, as at the guarded entry (#2805): the handler runs with the mask the fault found. */
+    if (sigsetjmp(g_try_buf, 0)) {
+        g_trying = 0;
+        return 0;
+    }
+    g_trying = 1;
+    f(arg);
+    g_trying = 0;
+    return 1;
 }
 
 static struct sigaction g_old_segv;
@@ -98,6 +186,12 @@ static void temen_handler(int sig, siginfo_t *info, void *uc) {
      * the way out, with whatever frames the walk had published. */
     if (temen_walk_in_progress())
         temen_walk_abort(); /* does not return */
+    /* A host access to the window that may fault (#2996): back to its own recovery point. First, for
+     * the walk's reason: it is not a guest fault, and the guarded call's state is not its to unwind. */
+    if (g_trying && addr >= g_try_lo && addr < g_try_hi) {
+        g_trying = 0;
+        siglongjmp(g_try_buf, 1); /* back to temen_try_call; does not return */
+    }
     /* SIGILL = the confinement bounds-check trap (Cranelift `trapnz` → `ud2`/`udf`, the memory-fault
      * lowering, DESIGN.md §4/§5). Unlike a guard-page SIGSEGV, `si_addr` is the faulting *instruction*
      * PC (in JIT code), not a window data address, so the [lo,hi) range test does not apply: an
@@ -105,7 +199,7 @@ static void temen_handler(int sig, siginfo_t *info, void *uc) {
      * exactly like a guarded data fault (capture the frame, then siglongjmp out reporting a memory
      * fault). Not armed ⇒ a genuine host illegal instruction: chain to the previous disposition. */
     if (sig == SIGILL) {
-        if (g_armed) {
+        if (g_armed && !temen_host_fault(sig, uc, (uintptr_t)info->si_addr)) {
             g_armed = 0;
             temen_capture_frame(uc);
             siglongjmp(g_buf, 1);
@@ -113,7 +207,7 @@ static void temen_handler(int sig, siginfo_t *info, void *uc) {
         temen_chain(&g_old_ill, sig, info, uc);
         return;
     }
-    if (g_armed && addr >= g_lo && addr < g_hi) {
+    if (g_armed && addr >= g_lo && addr < g_hi && !temen_host_fault(sig, uc, addr)) {
         g_armed = 0;
         temen_capture_frame(uc); /* stash the faulting frame before the stack unwinds (§5 W3) */
         siglongjmp(g_buf, 1);  /* back to temen_run_guarded; does not return */

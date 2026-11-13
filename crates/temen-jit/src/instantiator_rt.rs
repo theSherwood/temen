@@ -1519,8 +1519,8 @@ pub(crate) unsafe extern "C" fn instantiate_rec(
     );
     let rp = record_ptr as u64;
     // #826: `mem_size` is the reserved span, so a record in a `map`-grown tail page is read where
-    // the interpreter's live page map reads it; a record on a still-uncommitted page faults the
-    // copy below through the SIGSEGV guard (`MemoryFault`), exactly like a guest load.
+    // the interpreter's live page map reads it; a record on a page that is not readable is the
+    // copy's `MemoryFault` below, exactly like a guest load's (#2996: by `try_access`, no unwind).
     if rp
         .checked_add(temen_ir::SPAWN_REC_LEN as u64)
         .is_none_or(|e| e > mem_size)
@@ -1531,11 +1531,17 @@ pub(crate) unsafe extern "C" fn instantiate_rec(
     // Copy the record out of the guest window, then share the layout decode with the two
     // interpreter tiers (#911).
     let mut buf = [0u8; temen_ir::SPAWN_REC_LEN];
-    core::ptr::copy_nonoverlapping(
-        (mem_base + rp) as *const u8,
-        buf.as_mut_ptr(),
-        temen_ir::SPAWN_REC_LEN,
-    );
+    if !crate::mem::try_access(
+        &vm.window(),
+        &mut crate::mem::Access::Copy {
+            dst: buf.as_mut_ptr(),
+            src: (mem_base + rp) as *const u8,
+            len: temen_ir::SPAWN_REC_LEN,
+        },
+    ) {
+        vm.raise(TrapKind::MemoryFault as i64);
+        return 0;
+    }
     let Some(sr) = SpawnRec::parse(&buf) else {
         vm.raise(TrapKind::CapFault as i64);
         return 0;
@@ -1838,8 +1844,20 @@ unsafe fn spawn_detached(
         let (p, l) = (args_ptr as u64, args_len as u64);
         match p.checked_add(l) {
             Some(end) if end <= mem_size => {
-                std::slice::from_raw_parts((mem_base as *const u8).add(p as usize), l as usize)
-                    .to_vec()
+                let mut v = vec![0u8; l as usize];
+                // #2996 — a page that is not readable is the guest's `MemoryFault`, not an unwind.
+                if !crate::mem::try_access(
+                    &vm.window(),
+                    &mut crate::mem::Access::Copy {
+                        dst: v.as_mut_ptr(),
+                        src: (mem_base as *const u8).add(p as usize),
+                        len: l as usize,
+                    },
+                ) {
+                    vm.raise(TrapKind::MemoryFault as i64);
+                    return 0;
+                }
+                v
             }
             _ => {
                 vm.raise(TrapKind::MemoryFault as i64);

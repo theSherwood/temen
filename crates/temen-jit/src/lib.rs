@@ -220,6 +220,8 @@ mod door;
 pub use door::{Interrupt, Registration};
 // temen#2452 — compiled code kept on disk, so a later process defines it instead of compiling.
 mod code_dir;
+// #2996 — the live JIT code arenas' ranges, which the fault handler tells guest from host code by.
+mod code_ranges;
 pub use code_dir::CodeDir;
 use code_dir::{Codegen, EmittedCode};
 
@@ -2606,10 +2608,10 @@ struct OwnedJit {
 }
 
 impl OwnedJit {
-    fn new(m: JITModule) -> OwnedJit {
+    fn new((m, slot): (JITModule, code_ranges::CodeSlot)) -> OwnedJit {
         OwnedJit {
             lazy: None,
-            arena: Arc::new(Arena(std::sync::Mutex::new(Some(m)))),
+            arena: Arc::new(Arena::new(m, slot)),
         }
     }
 }
@@ -2619,15 +2621,26 @@ impl OwnedJit {
 /// pages and never writes a finalized segment again, so a define changes nothing that runs. Its
 /// memory is freed when the last holder of it drops: an [`OwnedJit`], or a lazily compiled module's
 /// last worker, which runs no guest code.
-pub(crate) struct Arena(std::sync::Mutex<Option<JITModule>>);
+pub(crate) struct Arena {
+    module: std::sync::Mutex<Option<JITModule>>,
+    /// #2996 — the arena's range in the fault handler's table, released before the memory is.
+    slot: Option<code_ranges::CodeSlot>,
+}
 
 /// The [`JITModule`] of a locked [`Arena`].
 pub(crate) struct ArenaGuard<'a>(std::sync::MutexGuard<'a, Option<JITModule>>);
 
 impl Arena {
+    fn new(m: JITModule, slot: code_ranges::CodeSlot) -> Arena {
+        Arena {
+            module: std::sync::Mutex::new(Some(m)),
+            slot: Some(slot),
+        }
+    }
+
     /// The module, locked.
     pub(crate) fn lock(&self) -> ArenaGuard<'_> {
-        ArenaGuard(self.0.lock().unwrap_or_else(|p| p.into_inner()))
+        ArenaGuard(self.module.lock().unwrap_or_else(|p| p.into_inner()))
     }
 }
 
@@ -2658,7 +2671,10 @@ fn arena_mut(module: &mut Arc<OwnedJit>) -> Result<ArenaGuard<'_>, JitError> {
 
 impl Drop for Arena {
     fn drop(&mut self) {
-        let m = self.0.get_mut().unwrap_or_else(|p| p.into_inner()).take();
+        let m = self.module.get_mut().unwrap_or_else(|p| p.into_inner()).take();
+        // Out of the fault handler's table before the pages go back: a later mapping there is not
+        // JIT code.
+        drop(self.slot.take());
         if let Some(m) = m {
             // SAFETY: per the owners' documented contract, by the time the last `OwnedJit` drops no
             // guest code from this module is executing and no `fn` pointer into it is ever called
@@ -3845,7 +3861,7 @@ impl CompiledModule {
             page_miss: None, // only a §14 child is demand-paged (#2164)
         };
         let claims = fast_claims(fast_resolver, &m.funcs, &m.types);
-        let mut module = new_jit_module(imports, &claims)?;
+        let (mut module, slot) = new_jit_module(imports, &claims)?;
 
         // Declare every function (natural ABI) up front so calls can reference any of them, and
         // everything else the code calls (#2482).
@@ -4438,7 +4454,7 @@ impl CompiledModule {
             MODULE_COMPILES.fetch_add(1, Ordering::Relaxed);
         }
         let module = match entries {
-            None => Arc::new(OwnedJit::new(module)),
+            None => Arc::new(OwnedJit::new((module, slot))),
             Some(e) => {
                 let starts = e
                     .copies
@@ -4469,7 +4485,7 @@ impl CompiledModule {
                     #[cfg(test)]
                     fault: lazy::FAULT.with(|f| f.get()),
                 };
-                let arena = Arc::new(Arena(std::sync::Mutex::new(Some(module))));
+                let arena = Arc::new(Arena::new(module, slot));
                 let service = lazy::Service::start(
                     code,
                     jit_isa()?,
@@ -7211,7 +7227,10 @@ fn host_import(
 ///
 /// It binds every symbol the code calls the host by ([`HostFn`]): temen-jit's functions, and the
 /// compile's `imports`; and Cranelift's libcalls ([`libcalls`]).
-fn new_jit_module(imports: Imports, claims: &FastClaims) -> Result<JITModule, JitError> {
+fn new_jit_module(
+    imports: Imports,
+    claims: &FastClaims,
+) -> Result<(JITModule, code_ranges::CodeSlot), JitError> {
     let mut builder = JITBuilder::with_isa(jit_isa()?, cranelift_module::default_libcall_names());
     for f in HostFn::ALL {
         if let Some(addr) = f.addr(&imports) {
@@ -7230,12 +7249,10 @@ fn new_jit_module(imports: Imports, claims: &FastClaims) -> Result<JITModule, Ji
     // Code + read-only data (float constants, jump tables) from a single contiguous 256 MiB arena
     // (VA only, committed on demand) rather than separate `mmap`s: x64's 32-bit PC-relative
     // relocations (`X86CallPCRel4`/`X86PCRel4`) overflow if ASLR places independent mmaps > 2 GiB
-    // apart (a `compiled_blob.rs` panic on large modules with rodata). Falls back to the default
-    // provider if it cannot map.
-    if let Ok(arena) = cranelift_jit::ArenaMemoryProvider::new_with_size(256 << 20) {
-        builder.memory_provider(Box::new(arena));
-    }
-    Ok(JITModule::new(builder))
+    // apart (a `compiled_blob.rs` panic on large modules with rodata). #2996 — and the arena's range
+    // is what tells the fault handler this module's code from host code (`code_ranges`), so there
+    // is no fallback to separate mappings: no arena, or a full range table, is no module.
+    code_ranges::arena_module(builder)
 }
 
 /// Cranelift's libcalls that name a C runtime function, by the names
@@ -8557,7 +8574,7 @@ fn compile_child_windowed(
         page_miss,
         ..Imports::NONE
     };
-    let mut module = new_jit_module(imports, &FastClaims::new())?;
+    let (mut module, slot) = new_jit_module(imports, &FastClaims::new())?;
     let ids: Vec<FuncId> = declare_all_funcs(&mut module, funcs)?;
     // Nested child: its `call.cap`s go to the coroutine thunk, never a fast path.
     let callees = Callees::new(&mut module, &ids, funcs, types, &FastClaims::new())?;
@@ -8833,7 +8850,7 @@ fn compile_child_windowed(
         func_names: std::collections::HashMap::new(),
         var_locs: Vec::new(),
         debug_types: Vec::new(),
-        module: Arc::new(OwnedJit::new(module)),
+        module: Arc::new(OwnedJit::new((module, slot))),
     })
 }
 
