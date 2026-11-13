@@ -5428,7 +5428,7 @@ impl CompiledModule {
         // sees the kill and unwinds. Nothing re-checks the door on a timer.
         // SAFETY: an armed instance's `epoch` is its door's cell, which its module or embedder keeps
         // alive for the run; the domain and nursery the waker names live in `*this`, past the run.
-        let _kill_wake = (!(*this).instance.epoch.is_null()).then(|| {
+        let kill_wake = (!(*this).instance.epoch.is_null()).then(|| {
             door::Interrupt::of_cell((*this).instance.epoch as usize)
                 .wakers()
                 .register((*this).run_wake())
@@ -5808,6 +5808,15 @@ impl CompiledModule {
         let worker_trap_cap = (*this).domain.as_ref().and_then(|d| d.take_trap_capture());
         #[cfg(not(fiber_rt))]
         let worker_trap_cap: Option<(usize, Vec<usize>, i64)> = None;
+        // #2953 — the run is over for its domain: every vCPU joined, every §14 child harvested, the
+        // freeze residue and a spawned vCPU's trap capture taken. Retire the kill wake (its drop
+        // waits out a `fire` in flight; the freeze wake was retired with the controller above), then
+        // start the domain afresh for the next run, as a fresh compile's.
+        drop(kill_wake);
+        #[cfg(fiber_rt)]
+        if let Some(d) = &(*this).domain {
+            d.end_run();
+        }
         // Snapshot the in-window bytes when asked (the escape-oracle; a reactor's state). #2176: a run
         // that asks for none copies nothing — a copy of a 32 MiB window is a page fault per page, for
         // bytes no one reads.
