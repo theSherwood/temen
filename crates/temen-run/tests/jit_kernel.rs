@@ -814,3 +814,131 @@ fn granted(
         ("today's route", today),
     ]
 }
+
+/// #2958 slice 3 — the race on the kernel route: a spawned vCPU loops `op` (a not-equal wait, the
+/// no-wake fast path's, or a notify) on a word of page 8 while the root, through the address-space
+/// capability `handle`, unmaps and maps that page, or protects it to nothing and back, `turns` times
+/// each. The root then joins the vCPU and answers how many ops it made.
+fn racing(handle: i32, op: &str, protect: bool, turns: u32) -> temen_ir::Module {
+    let op = match op {
+        "wait" => "vx = i32.const 1\n  vto = i64.const 0\n  vk = i32.atomic.wait va vx vto",
+        _ => "vx = i32.const 1\n  vk = atomic.notify va vx",
+    };
+    let (take, give) = match protect {
+        true => (
+            "vp0 = i64.const 0\n  vr0 = call.cap 5 2 (i64, i64, i64) -> (i64) vc(va, vl, vp0)",
+            "vp3 = i64.const 3\n  vr1 = call.cap 5 2 (i64, i64, i64) -> (i64) vc(va, vl, vp3)",
+        ),
+        false => (
+            "vr0 = call.cap 5 1 (i64, i64) -> (i64) vc(va, vl)",
+            "vp3 = i64.const 3\n  vr1 = call.cap 5 0 (i64, i64, i64) -> (i64) vc(va, vl, vp3)",
+        ),
+    };
+    module(&format!(
+        "memory 16
+func () -> (i64) {{
+block 0 () {{
+  vz = i64.const 0
+  vn = i64.const {turns}
+  vh = thread.spawn 1 vn vz
+  br 1(vh, vz)
+}}
+block 1 (vh1: i32, vi: i64) {{
+  vc = i32.const {handle}
+  va = i64.const 32768
+  vl = i64.const 4096
+  {take}
+  {give}
+  vone = i64.const 1
+  vj = i64.add vi vone
+  vlim = i64.const {turns}
+  vdone = i64.ge_u vj vlim
+  br_if vdone 2(vh1) 1(vh1, vj)
+}}
+block 2 (vh2: i32) {{
+  vs, vv = thread.join vh2
+  return vv
+  }}
+}}
+func (i64, i64) -> (i64) {{
+block 0 (vn: i64, vz: i64) {{
+  br 1(vn, vz)
+}}
+block 1 (vi: i64, vdone: i64) {{
+  va = i64.const 32772
+  {op}
+  vone = i64.const 1
+  vj = i64.sub vi vone
+  vd = i64.add vdone vone
+  vend = i64.eqz vj
+  br_if vend 2(vd) 1(vj, vd)
+}}
+block 2 (vr: i64) {{
+  return vr
+  }}
+}}
+"
+    ))
+}
+
+/// The race test: under busy threads, a vCPU's futex ops on a page the root keeps unmapping or
+/// protecting never fault the host, and each run ends with the vCPU's count (every op answered) or a
+/// guest `MemoryFault` (a wait that found the page gone), never anything else. Both shapes of ending
+/// must happen across the runs for the wait, or the test did not race.
+#[test]
+fn futex_ops_racing_page_ops_never_fault_the_host() {
+    const TURNS: u32 = 400;
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    std::thread::scope(|s| {
+        for _ in 0..2 {
+            s.spawn(|| {
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    std::hint::spin_loop();
+                }
+            });
+        }
+        for (op, protect) in [
+            ("wait", false),
+            ("wait", true),
+            ("notify", false),
+            ("notify", true),
+        ] {
+            let (mut done, mut faulted) = (0, 0);
+            for _ in 0..30 {
+                let mut host = Host::new();
+                let m = racing(host.grant_memory(), op, protect, TURNS);
+                let admitted = jit_kernel::admit(&m, &host, None, false).expect("in scope");
+                let start = jit_kernel::Start {
+                    entry: 0,
+                    args: &[],
+                    init_mem: &[],
+                    init: None,
+                    reserved_log2: temen_ir::DEFAULT_RESERVED_LOG2,
+                    fuel: u64::MAX,
+                    snapshot_cap: None,
+                    kill: None,
+                };
+                let end = jit_kernel::run(admitted, start, &mut host).expect("compiles");
+                assert!(end.vcpus >= 1, "it ran as kernel tasks");
+                match end.result {
+                    Ok(v) => {
+                        assert_eq!(v, vec![i64::from(TURNS)], "{op}: every op answered");
+                        done += 1;
+                    }
+                    Err(Trap::MemoryFault) => faulted += 1,
+                    Err(t) => panic!("{op} (protect: {protect}): {t:?}"),
+                }
+            }
+            match op {
+                // A notify reads no memory: it never faults.
+                "notify" => assert_eq!(faulted, 0, "{op}: a notify never faults"),
+                _ => assert!(
+                    faulted > 0,
+                    "{op} (protect: {protect}): the wait raced the page op"
+                ),
+            }
+            let _ = done;
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    });
+}

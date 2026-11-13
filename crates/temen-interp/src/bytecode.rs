@@ -17708,6 +17708,7 @@ mod dbg_domain_end_tests {
             root,
             Domain {
                 mem: None,
+                native: None,
                 host: child.into_cell(),
                 table: table(),
                 program: 0,
