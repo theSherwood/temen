@@ -1023,9 +1023,9 @@ jobs:
           # Each binary and the test filter it runs: held_domain and pool_after_teardown whole; the #2990 test in
           # temen-run's lib (`held::tests`); child_exec's unit tests in temen-jit's lib.
           run_each() {
-            local bin="$1" filter="$2" skip="${3:-^$}" n=0
+            local bin="$1" filter="$2" n=0
             [ -n "$bin" ] || { echo "no test binary built"; exit 1; }
-            for t in $("$bin" --list | sed -n 's/: test$//p' | grep -- "$filter" | grep -v -- "$skip"); do
+            for t in $("$bin" --list | sed -n 's/: test$//p' | grep -- "$filter"); do
               "$bin" --exact "$t"
               n=$((n + 1))
             done
@@ -1033,10 +1033,7 @@ jobs:
             echo "$bin: $n tests"
           }
           exe() { jq -r "select(.target.name == \"$1\" and .profile.test and .executable != null) | .executable"; }
-          # #3025 is open: its pin reports a heap-use-after-free here until its fix (F2) lands, which
-          # removes this skip.
-          run_each "$(cargo test -p temen-run $asan --test held_domain --no-run --message-format=json | exe held_domain)" "" \
-            "^a_fiber_an_activation_left_suspended_runs_on_in_a_later_one::jit$"
+          run_each "$(cargo test -p temen-run $asan --test held_domain --no-run --message-format=json | exe held_domain)" ""
           run_each "$(cargo test -p temen-run $asan --test pool_after_teardown --no-run --message-format=json | exe pool_after_teardown)" ""
           run_each "$(cargo test -p temen-run $asan --lib --no-run --message-format=json | exe temen_run)" "held::tests::"
           run_each "$(cargo test -p temen-jit --features asan -Z build-std --target x86_64-unknown-linux-gnu --lib --no-run --message-format=json | exe temen_jit)" "child_exec::tests::"

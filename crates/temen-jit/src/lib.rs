@@ -5797,8 +5797,12 @@ impl CompiledModule {
         }
         // #2993 — the pool again, now that no vCPU is left: one still running when the nursery joined
         // it above could file a task there since (a spawn, a handler it promoted), on a worker that
-        // join never took, which would outlive the domain. Nothing files after this one: every vCPU
-        // and every task has ended, and a held site has taken no call since its rest.
+        // join never took, which would outlive the domain. Such a task runs guest code in its own
+        // window and powerbox until this join raises the end on it; a child it files lands on this
+        // pool too, and this join waits for it. Nothing can file once this join returns, by
+        // construction: only a vCPU, a pool task or a held call files, `join_all` above joined every
+        // vCPU, this join leaves no task, and a held site has taken no call since its rest. So this
+        // join is the last, and no refusal is needed.
         #[cfg(fiber_rt)]
         if let Some(n) = &(*this)._nursery {
             let froze = (*this).durable
