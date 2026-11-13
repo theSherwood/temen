@@ -1418,7 +1418,9 @@ impl Domain {
         // A durable run defers a spawn while its window is not `NORMAL` (an armed trigger, a freeze),
         // and runs the child only at a freeze or before a park: one the run never reached ends with it
         // unrun, as the oracle discards a finished run's queued vCPUs. What it took goes back.
-        for p in std::mem::take(&mut *lock(pending_spawns)) {
+        // Taken out first, so no lock is held under `pending_spawns` (`set_env` takes `threads` first).
+        let unrun = std::mem::take(&mut *lock(pending_spawns));
+        for p in unrun {
             lock(threads).live -= 1;
             self.vcpu_ended();
             if let Some(table) = lock(fiber_table).as_ref() {
