@@ -3353,9 +3353,12 @@ block 0 (v0: i64, v1: i64) {
     /// - adds 1 to a plain counter under a lock: an exchange lock at each width, and two
     ///   `testAndSet` flags in bytes 1 and 2 of a word whose bytes 0 and 3 must survive.
     ///
-    /// A plain exchange can leave a lock held with no holder: a waiter's write of 1 lands after the
-    /// holder's release. So a lock gives up after 2^20 tries and its thread returns 1, which sets
-    /// the mask's bit 15. The test fails instead of hanging.
+    /// A waiter that finds a lock held sleeps on its word (`atomic.wait`) until the holder's release
+    /// notifies it, rather than spinning a bounded number of times: on a real CPU a holder can be
+    /// descheduled for longer than any spin count, and a waiter that gave up would leave every
+    /// summed cell short (#2467). A release that is lost leaves every thread parked, which the run
+    /// ends as a stall, so the test fails instead of hanging. Bit 15 of the mask is set when a
+    /// joined thread returned nonzero.
     #[cfg(unix)]
     fn atomics_driver(n: i64) -> String {
         use std::fmt::Write;
@@ -3428,7 +3431,7 @@ block 0 (v0: i64, v1: i64) {
                 k + 1
             );
         }
-        // A thread returns 1 when a lock never came free: a plain exchange can leave one held.
+        // A joined thread returns 0; anything else sets bit 15.
         let _ = write!(
             s,
             "  j01 = i64.or j0 j1\n  j23 = i64.or j2 j3\n  j = i64.or j01 j23\n  \
@@ -3499,17 +3502,16 @@ block 5 (e: i64, i: i64) {{
   y = i32.add x one
   weak = i32.const 0
   ok = call.import 12 (h, e32, y, weak, mo, mo)
-  zero = i64.const 0
-  br_if ok 6(e, i, zero) 5(e, i)
+  br_if ok 6(e, i) 5(e, i)
   }}
-block 6 (e: i64, i: i64, s: i64) {{
+block 6 (e: i64, i: i64) {{
   mo = i32.const 5
   l = i64.const {c56}
   one = i64.const 1
   was = call.import 3 (l, one, mo)
   zero = i64.const 0
   held = i64.ne was zero
-  br_if held 15(e, i, s) 7(e, i)
+  br_if held 15(e, i) 7(e, i)
   }}
 block 7 (e: i64, i: i64) {{
   p = i64.const {c64}
@@ -3521,14 +3523,16 @@ block 7 (e: i64, i: i64) {{
   l = i64.const {c56}
   zero = i64.const 0
   call.import 1 (l, zero, mo)
-  br 8(e, i, zero)
+  all = i32.const -1
+  woke = atomic.notify l all
+  br 8(e, i)
   }}
-block 8 (e: i64, i: i64, s: i64) {{
+block 8 (e: i64, i: i64) {{
   mo = i32.const 5
   l = i64.const {c72}
   one = i32.const 1
   was = call.import 13 (l, one, mo)
-  br_if was 16(e, i, s) 9(e, i)
+  br_if was 16(e, i) 9(e, i)
   }}
 block 9 (e: i64, i: i64) {{
   p = i64.const {c80}
@@ -3540,14 +3544,15 @@ block 9 (e: i64, i: i64) {{
   l = i64.const {c72}
   zero = i32.const 0
   call.import 11 (l, zero, mo)
-  s = i64.const 0
-  br 10(e, i, s)
+  all = i32.const -1
+  woke = atomic.notify l all
+  br 10(e, i)
   }}
-block 10 (e: i64, i: i64, s: i64) {{
+block 10 (e: i64, i: i64) {{
   mo = i32.const 5
   f = i64.const {c89}
   was = call.import 6 (f, mo)
-  br_if was 17(e, i, s) 11(e, i)
+  br_if was 17(e, i) 11(e, i)
   }}
 block 11 (e: i64, i: i64) {{
   p = i64.const {c96}
@@ -3558,14 +3563,16 @@ block 11 (e: i64, i: i64) {{
   mo = i32.const 5
   f = i64.const {c89}
   call.import 7 (f, mo)
-  s = i64.const 0
-  br 12(e, i, s)
+  wd = i64.const {c88}
+  all = i32.const -1
+  woke = atomic.notify wd all
+  br 12(e, i)
   }}
-block 12 (e: i64, i: i64, s: i64) {{
+block 12 (e: i64, i: i64) {{
   mo = i32.const 5
   f = i64.const {c90}
   was = call.import 6 (f, mo)
-  br_if was 18(e, i, s) 13(e, i)
+  br_if was 18(e, i) 13(e, i)
   }}
 block 13 (e: i64, i: i64) {{
   p = i64.const {c104}
@@ -3576,6 +3583,9 @@ block 13 (e: i64, i: i64) {{
   mo = i32.const 5
   f = i64.const {c90}
   call.import 7 (f, mo)
+  wd = i64.const {c88}
+  all = i32.const -1
+  woke = atomic.notify wd all
   ni = i64.add i one
   br 1(e, ni)
   }}
@@ -3583,37 +3593,55 @@ block 14 () {{
   r = i64.const 0
   return r
   }}
-block 15 (e: i64, i: i64, s: i64) {{
+block 15 (e: i64, i: i64) {{
+  l = i64.const {c56}
   one = i64.const 1
-  t = i64.add s one
-  cap = i64.const {spin}
-  stuck = i64.lt_u cap t
-  br_if stuck 19() 6(e, i, t)
+  ever = i64.const -1
+  r = i64.atomic.wait l one ever
+  br 6(e, i)
   }}
-block 16 (e: i64, i: i64, s: i64) {{
-  one = i64.const 1
-  t = i64.add s one
-  cap = i64.const {spin}
-  stuck = i64.lt_u cap t
-  br_if stuck 19() 8(e, i, t)
+block 16 (e: i64, i: i64) {{
+  l = i64.const {c72}
+  one = i32.const 1
+  ever = i64.const -1
+  r = i32.atomic.wait l one ever
+  br 8(e, i)
   }}
-block 17 (e: i64, i: i64, s: i64) {{
-  one = i64.const 1
-  t = i64.add s one
-  cap = i64.const {spin}
-  stuck = i64.lt_u cap t
-  br_if stuck 19() 10(e, i, t)
+block 17 (e: i64, i: i64) {{
+  wd = i64.const {c88}
+  w = i32.atomic.load wd
+  w64 = i64.extend_i32_u w
+  k = i64.const 8
+  sh = i64.shr_u w64 k
+  ff = i64.const 255
+  flag = i64.and sh ff
+  zero = i64.const 0
+  set = i64.ne flag zero
+  br_if set 19(e, i, w) 10(e, i)
   }}
-block 18 (e: i64, i: i64, s: i64) {{
-  one = i64.const 1
-  t = i64.add s one
-  cap = i64.const {spin}
-  stuck = i64.lt_u cap t
-  br_if stuck 19() 12(e, i, t)
+block 18 (e: i64, i: i64) {{
+  wd = i64.const {c88}
+  w = i32.atomic.load wd
+  w64 = i64.extend_i32_u w
+  k = i64.const 16
+  sh = i64.shr_u w64 k
+  ff = i64.const 255
+  flag = i64.and sh ff
+  zero = i64.const 0
+  set = i64.ne flag zero
+  br_if set 20(e, i, w) 12(e, i)
   }}
-block 19 () {{
-  r = i64.const 1
-  return r
+block 19 (e: i64, i: i64, w: i32) {{
+  wd = i64.const {c88}
+  ever = i64.const -1
+  r = i32.atomic.wait wd w ever
+  br 10(e, i)
+  }}
+block 20 (e: i64, i: i64, w: i32) {{
+  wd = i64.const {c88}
+  ever = i64.const -1
+  r = i32.atomic.wait wd w ever
+  br 12(e, i)
   }}
 }}
 ",
@@ -3629,11 +3657,11 @@ block 19 () {{
             c64 = c + 64,
             c72 = c + 72,
             c80 = c + 80,
+            c88 = c + 88,
             c89 = c + 89,
             c90 = c + 90,
             c96 = c + 96,
             c104 = c + 104,
-            spin = 1 << 20,
         );
         s
     }

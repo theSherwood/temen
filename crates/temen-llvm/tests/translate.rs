@@ -15378,3 +15378,166 @@ declare i8 @llvm.scmp.i8.i16(i16, i16)
 "#;
     assert_eq!(run_ll_i64("narrow_scmp", src), -1 + 10 - 100);
 }
+
+/// #3016: a narrow value sits zero-extended in its container (§3b), so a signed reader sign-extends
+/// it first, and a producer whose result can carry bits past its width masks them off. Each row is
+/// a site that did neither; `%p` is `-20`. The first is the bug as it was found: ttf-parser reads a
+/// glyph's points as big-endian `i16`s, `sitofp` read `-20` as `65516.0`, the glyph's box then
+/// failed its `i16` range check, and unir's compositor drew no glyph that reaches below the
+/// baseline. A `uitofp` reads a container as it is, so it shows a producer's stray bits.
+#[test]
+fn narrow_values_keep_their_sign_and_width() {
+    let cases: [(&str, &str, i64); 15] = [
+        (
+            "a glyph box's big-endian i16, through float and Rust's `as`, range-checked",
+            "%buf = alloca [2 x i8]
+  store i8 -1, ptr %buf
+  %b1 = getelementptr i8, ptr %buf, i64 1
+  store i8 -20, ptr %b1
+  %raw = load i16, ptr %buf
+  %v = call i16 @llvm.bswap.i16(i16 %raw)
+  %f = sitofp i16 %v to float
+  %i = call i32 @llvm.fptosi.sat.i32.f32(float %f)
+  %o = add i32 %i, 32768
+  %ok = icmp ult i32 %o, 65536
+  %h = trunc i32 %i to i16
+  %w = sext i16 %h to i64
+  %r = select i1 %ok, i64 %w, i64 99999",
+            -20,
+        ),
+        (
+            "sitofp i8",
+            "%h = trunc i64 %p to i8
+  %f = sitofp i8 %h to double
+  %r = fptosi double %f to i64",
+            -20,
+        ),
+        (
+            "sitofp i48, loaded",
+            "%a = alloca i64
+  store i64 %p, ptr %a
+  %h = load i48, ptr %a
+  %f = sitofp i48 %h to double
+  %r = fptosi double %f to i64",
+            -20,
+        ),
+        (
+            "icmp slt i48, loaded",
+            "%a = alloca i64
+  store i64 %p, ptr %a
+  %h = load i48, ptr %a
+  %c = icmp slt i48 %h, 0
+  %r = zext i1 %c to i64",
+            1,
+        ),
+        (
+            "smax.i48, loaded",
+            "%a = alloca i64
+  store i64 %p, ptr %a
+  %h = load i48, ptr %a
+  %m = call i48 @llvm.smax.i48(i48 %h, i48 5)
+  %r = sext i48 %m to i64",
+            5,
+        ),
+        (
+            "abs.i16",
+            "%h = trunc i64 %p to i16
+  %m = call i16 @llvm.abs.i16(i16 %h, i1 false)
+  %r = zext i16 %m to i64",
+            20,
+        ),
+        (
+            "ctlz.i16 of 1",
+            "%x = add i64 %p, 21
+  %h = trunc i64 %x to i16
+  %m = call i16 @llvm.ctlz.i16(i16 %h, i1 false)
+  %r = zext i16 %m to i64",
+            15,
+        ),
+        (
+            "cttz.i8 of 0",
+            "%x = add i64 %p, 20
+  %h = trunc i64 %x to i8
+  %m = call i8 @llvm.cttz.i8(i8 %h, i1 false)
+  %r = zext i8 %m to i64",
+            8,
+        ),
+        (
+            "fptosi to i16, read by uitofp",
+            "%f = sitofp i64 %p to float
+  %h = fptosi float %f to i16
+  %u = uitofp i16 %h to double
+  %r = fptosi double %u to i64",
+            65516,
+        ),
+        (
+            "sext i8 to i16, read by uitofp",
+            "%b = trunc i64 %p to i8
+  %h = sext i8 %b to i16
+  %u = uitofp i16 %h to double
+  %r = fptosi double %u to i64",
+            65516,
+        ),
+        (
+            "trunc to i48, read by uitofp",
+            "%h = trunc i64 %p to i48
+  %u = uitofp i48 %h to double
+  %r = fptosi double %u to i64",
+            (1 << 48) - 20,
+        ),
+        (
+            "smax.i16, read by uitofp",
+            "%h = trunc i64 %p to i16
+  %m = call i16 @llvm.smax.i16(i16 %h, i16 -30)
+  %u = uitofp i16 %m to double
+  %r = fptosi double %u to i64",
+            65516,
+        ),
+        (
+            "sadd.sat.i16, read by uitofp",
+            "%h = trunc i64 %p to i16
+  %m = call i16 @llvm.sadd.sat.i16(i16 %h, i16 -10)
+  %u = uitofp i16 %m to double
+  %r = fptosi double %u to i64",
+            65506,
+        ),
+        (
+            "vector.reduce.add.v16i8, read by uitofp",
+            "%b = trunc i64 %p to i8
+  %v0 = insertelement <16 x i8> zeroinitializer, i8 %b, i32 0
+  %v1 = insertelement <16 x i8> %v0, i8 %b, i32 1
+  %m = call i8 @llvm.vector.reduce.add.v16i8(<16 x i8> %v1)
+  %u = uitofp i8 %m to double
+  %r = fptosi double %u to i64",
+            216,
+        ),
+        (
+            "vector.reduce.smin.v16i8, read by uitofp",
+            "%b = trunc i64 %p to i8
+  %v0 = insertelement <16 x i8> zeroinitializer, i8 %b, i32 0
+  %v1 = insertelement <16 x i8> %v0, i8 %b, i32 1
+  %m = call i8 @llvm.vector.reduce.smin.v16i8(<16 x i8> %v1)
+  %u = uitofp i8 %m to double
+  %r = fptosi double %u to i64",
+            236,
+        ),
+    ];
+    let decls = "declare i16 @llvm.bswap.i16(i16)
+declare i32 @llvm.fptosi.sat.i32.f32(float)
+declare i48 @llvm.smax.i48(i48, i48)
+declare i16 @llvm.smax.i16(i16, i16)
+declare i16 @llvm.abs.i16(i16, i1)
+declare i16 @llvm.ctlz.i16(i16, i1)
+declare i8 @llvm.cttz.i8(i8, i1)
+declare i16 @llvm.sadd.sat.i16(i16, i16)
+declare i8 @llvm.vector.reduce.add.v16i8(<16 x i8>)
+declare i8 @llvm.vector.reduce.smin.v16i8(<16 x i8>)
+";
+    for (what, body, want) in cases {
+        let src = format!(
+            "{decls}define i64 @f(i64 %p) {{\n  {body}\n  ret i64 %r\n}}\n\
+             define i64 @run() {{\n  %r = call i64 @f(i64 -20)\n  ret i64 %r\n}}\n"
+        );
+        assert_eq!(run_ll_i64(what, &src), want, "{what}");
+    }
+}

@@ -5,18 +5,24 @@
 //! **computing each value's concrete result as it emits** — so the final `ret i64` value is known
 //! by construction (the *oracle*), with no separate interpreter to carry its own bugs. Every
 //! program is UB-free by construction (shift amounts `< width`, in-bounds array indices, fixed loop
-//! bounds, no div, no poison flags), so it must **never trap**, and all three temen backends
+//! bounds, divisors never zero nor a signed `-1`, float conversions only of values the target
+//! holds, no poison flags), so it must **never trap**, and all three temen backends
 //! (tree-walker, bytecode, JIT) must return the oracle value. A divergence is an **on-ramp
 //! translation bug** — the I23 class, where every backend agrees with the *wrong* IR (so an
 //! interp-vs-JIT differential can't see it; the source-semantics oracle can).
 //!
-//! Coverage spans the translation surface that has bitten us and its neighbours:
+//! Scalar ops run at the narrow widths (`i8`, `i16`, `i48`) as well as at `i32`/`i64`: a narrow
+//! value lives in a wider container, where #3016's class lived (a signed reader taking the
+//! zero-extended form as it is; a producer leaving bits past the width). Coverage spans the
+//! translation surface that has bitten us and its neighbours:
 //! - `getelementptr` with distinct source element types — instruction-form over an `alloca` **and**
 //!   **constexpr** GEPs over a global (`i8` vs `[N x i32]` — the I23 const-GEP-stride path);
 //! - 2-lane (`<2 x i32>`, packed-i64) *and* 128-bit vector min/max, widen/narrow, and width
 //!   conversions (the I23 vec2-minmax path);
-//! - scalar bit-manipulation intrinsics (`ctpop`/`ctlz`/`cttz`/`bswap`/`bitreverse`/`abs`) and
-//!   funnel-shift rotates (`fshl`/`fshr`);
+//! - scalar bit-manipulation intrinsics (`ctpop`/`ctlz`/`cttz`/`bswap`/`bitreverse`/`abs`),
+//!   funnel-shift rotates (`fshl`/`fshr`), min/max, saturating add/sub and division;
+//! - width conversions between every pair of widths, and int↔float round trips (`sitofp`/`uitofp`
+//!   then `fptosi`/`fptoui`);
 //! - vector shifts, vector `icmp`+`select` (`<N x i1>` masks), and `shufflevector`;
 //! - control flow — phi-merge diamonds and fixed-bound counted loops (back-edges, phi lowering,
 //!   loop-variant GEP indices); and
@@ -123,21 +129,13 @@ fn cttz_bits(v: u64, bits: u32) -> u64 {
         m.trailing_zeros() as u64
     }
 }
-/// `llvm.bswap`: reverse the `bits`-wide byte order (`bits` is a byte multiple: 32 or 64 here).
+/// `llvm.bswap`: reverse the `bits`-wide byte order (`bits` a multiple of 16).
 fn bswap_bits(v: u64, bits: u32) -> u64 {
-    match bits {
-        32 => (v as u32).swap_bytes() as u64,
-        64 => v.swap_bytes(),
-        _ => unreachable!("bswap only over i32/i64"),
-    }
+    mask(v, bits).swap_bytes() >> (64 - bits)
 }
 /// `llvm.bitreverse`: reverse all `bits` bits.
 fn bitrev_bits(v: u64, bits: u32) -> u64 {
-    match bits {
-        32 => (v as u32).reverse_bits() as u64,
-        64 => v.reverse_bits(),
-        _ => unreachable!("bitreverse only over i32/i64"),
-    }
+    mask(v, bits).reverse_bits() >> (64 - bits)
 }
 /// `llvm.abs(x, is_int_min_poison=false)`: two's-complement absolute value; `abs(INT_MIN)=INT_MIN`.
 fn abs_bits(v: u64, bits: u32) -> u64 {
@@ -254,7 +252,10 @@ impl Helper {
     }
 }
 
-const SCALAR_TYS: [u32; 2] = [32, 64];
+/// The scalar widths: the containers' own, and narrow ones in each container (#3016).
+const SCALAR_TYS: [u32; 5] = [8, 16, 32, 48, 64];
+/// The widths the on-ramp lowers funnel shifts and saturating ops at (it refuses `i33`–`i63`).
+const POW2_TYS: [u32; 4] = [8, 16, 32, 64];
 const SHAPES: [Shape; 3] = [
     Shape {
         lanes: 4,
@@ -405,10 +406,10 @@ pub fn gen_program(g: &mut Gen) -> (String, i64) {
 
     let steps = 12 + g.u(40);
     for _ in 0..steps {
-        match g.u(24) {
+        match g.u(28) {
             // ---- scalar integer binops (wrapping / bitwise) ----
             0 => {
-                let bits = SCALAR_TYS[g.u(2)];
+                let bits = SCALAR_TYS[g.u(SCALAR_TYS.len())];
                 let (a, av) = p.any_scalar(g, bits);
                 let (b, bv) = p.any_scalar(g, bits);
                 let (op, r) = match g.u(6) {
@@ -425,7 +426,7 @@ pub fn gen_program(g: &mut Gen) -> (String, i64) {
             }
             // ---- shifts (amount < width, no poison) ----
             1 => {
-                let bits = SCALAR_TYS[g.u(2)];
+                let bits = SCALAR_TYS[g.u(SCALAR_TYS.len())];
                 let (a, av) = p.any_scalar(g, bits);
                 let amt = (g.byte() as u32) % bits;
                 let (op, r) = match g.u(3) {
@@ -439,7 +440,7 @@ pub fn gen_program(g: &mut Gen) -> (String, i64) {
             }
             // ---- icmp + select ----
             2 => {
-                let bits = SCALAR_TYS[g.u(2)];
+                let bits = SCALAR_TYS[g.u(SCALAR_TYS.len())];
                 let (a, av) = p.any_scalar(g, bits);
                 let (b, bv) = p.any_scalar(g, bits);
                 let (pred, cond) = match g.u(6) {
@@ -458,26 +459,33 @@ pub fn gen_program(g: &mut Gen) -> (String, i64) {
                 p.emit(&format!("{d} = select i1 {c}, i{bits} {x}, i{bits} {y}"));
                 p.push_scalar(d, bits, if cond { xv } else { yv });
             }
-            // ---- width conversions ----
+            // ---- width conversions, between any two widths ----
             3 => {
-                let (a, av) = p.any_scalar(g, 32);
+                let i = g.u(SCALAR_TYS.len() - 1);
+                let (from, to) = (
+                    SCALAR_TYS[i],
+                    SCALAR_TYS[i + 1 + g.u(SCALAR_TYS.len() - 1 - i)],
+                );
+                let (a, av) = p.any_scalar(g, from);
                 let d = p.fresh();
                 match g.u(2) {
                     0 => {
-                        p.emit(&format!("{d} = sext i32 {a} to i64"));
-                        p.push_scalar(d, 64, sext(av, 32) as u64);
+                        p.emit(&format!("{d} = sext i{from} {a} to i{to}"));
+                        p.push_scalar(d, to, sext(av, from) as u64);
                     }
                     _ => {
-                        p.emit(&format!("{d} = zext i32 {a} to i64"));
-                        p.push_scalar(d, 64, mask(av, 32));
+                        p.emit(&format!("{d} = zext i{from} {a} to i{to}"));
+                        p.push_scalar(d, to, mask(av, from));
                     }
                 }
             }
             4 => {
-                let (a, av) = p.any_scalar(g, 64);
+                let i = 1 + g.u(SCALAR_TYS.len() - 1);
+                let (from, to) = (SCALAR_TYS[i], SCALAR_TYS[g.u(i)]);
+                let (a, av) = p.any_scalar(g, from);
                 let d = p.fresh();
-                p.emit(&format!("{d} = trunc i64 {a} to i32"));
-                p.push_scalar(d, 32, mask(av, 32));
+                p.emit(&format!("{d} = trunc i{from} {a} to i{to}"));
+                p.push_scalar(d, to, mask(av, to));
             }
             // ---- vector binops ----
             5 => {
@@ -643,7 +651,7 @@ pub fn gen_program(g: &mut Gen) -> (String, i64) {
             }
             // ---- control flow: a diamond with a phi merge (forward-only ⇒ still terminating) ----
             15 => {
-                let bits = SCALAR_TYS[g.u(2)];
+                let bits = SCALAR_TYS[g.u(SCALAR_TYS.len())];
                 let (a, av) = p.any_scalar(g, bits);
                 let (b, bv) = p.any_scalar(g, bits);
                 let (pred, cond) = match g.u(6) {
@@ -728,10 +736,14 @@ pub fn gen_program(g: &mut Gen) -> (String, i64) {
             }
             // ---- scalar bit-manipulation intrinsics (ctpop/ctlz/cttz/bswap/bitreverse/abs) ----
             18 => {
-                let bits = SCALAR_TYS[g.u(2)];
+                let op = g.u(6);
+                let bits = match SCALAR_TYS[g.u(SCALAR_TYS.len())] {
+                    8 if op == 3 => 16, // `bswap` takes whole byte pairs
+                    b => b,
+                };
                 let (a, av) = p.any_scalar(g, bits);
                 let m = mask(av, bits);
-                let (nm, r): (&str, u64) = match g.u(6) {
+                let (nm, r): (&str, u64) = match op {
                     0 => ("ctpop", m.count_ones() as u64),
                     1 => ("ctlz", ctlz_bits(m, bits)),
                     2 => ("cttz", cttz_bits(m, bits)),
@@ -753,7 +765,7 @@ pub fn gen_program(g: &mut Gen) -> (String, i64) {
             }
             // ---- funnel shift / rotate (fshl/fshr) ----
             19 => {
-                let bits = SCALAR_TYS[g.u(2)];
+                let bits = POW2_TYS[g.u(POW2_TYS.len())];
                 let (a, av) = p.any_scalar(g, bits);
                 let (b, bv) = p.any_scalar(g, bits);
                 let amt = (g.byte() as u32) % bits;
@@ -849,6 +861,102 @@ pub fn gen_program(g: &mut Gen) -> (String, i64) {
                 ));
                 p.push_vec(d, s, r);
             }
+            // ---- int ↔ float round trips: `sitofp`/`uitofp`, then `fptosi`/`fptoui` back to a
+            //      width that holds the value (no poison). Exact: an `iN` with `N <= 48` is exact
+            //      in a double, and `N <= 16` in a float. ----
+            23 => {
+                let n = [8u32, 16, 32, 48][g.u(4)];
+                let (a, av) = p.any_scalar(g, n);
+                let signed_src = g.u(2) == 0;
+                let v = if signed_src {
+                    sext(av, n)
+                } else {
+                    mask(av, n) as i64
+                };
+                let fty = if n <= 16 && g.u(2) == 0 {
+                    "float"
+                } else {
+                    "double"
+                };
+                let wider: Vec<u32> = SCALAR_TYS.iter().copied().filter(|&m| m >= n).collect();
+                let m = wider[g.u(wider.len())];
+                // A signed value goes back signed; an unsigned one unsigned, or signed into a
+                // wider type.
+                let signed_dst = signed_src || (m > n && g.u(2) == 0);
+                let (f, d) = (p.fresh(), p.fresh());
+                let itof = if signed_src { "sitofp" } else { "uitofp" };
+                let ftoi = if signed_dst { "fptosi" } else { "fptoui" };
+                p.emit(&format!("{f} = {itof} i{n} {a} to {fty}"));
+                p.emit(&format!("{d} = {ftoi} {fty} {f} to i{m}"));
+                p.push_scalar(d, m, v as u64);
+            }
+            // ---- scalar min/max intrinsics ----
+            24 => {
+                let bits = SCALAR_TYS[g.u(SCALAR_TYS.len())];
+                let (a, av) = p.any_scalar(g, bits);
+                let (b, bv) = p.any_scalar(g, bits);
+                let (nm, pick_a) = match g.u(4) {
+                    0 => ("smax", sext(av, bits) >= sext(bv, bits)),
+                    1 => ("smin", sext(av, bits) <= sext(bv, bits)),
+                    2 => ("umax", mask(av, bits) >= mask(bv, bits)),
+                    _ => ("umin", mask(av, bits) <= mask(bv, bits)),
+                };
+                let d = p.fresh();
+                p.emit(&format!(
+                    "{d} = call i{bits} @llvm.{nm}.i{bits}(i{bits} {a}, i{bits} {b})"
+                ));
+                p.push_scalar(d, bits, if pick_a { av } else { bv });
+            }
+            // ---- saturating add/sub ----
+            25 => {
+                let bits = POW2_TYS[g.u(POW2_TYS.len())];
+                let (a, av) = p.any_scalar(g, bits);
+                let (b, bv) = p.any_scalar(g, bits);
+                let (ua, ub) = (mask(av, bits) as u128, mask(bv, bits) as u128);
+                let (sa, sb) = (sext(av, bits) as i128, sext(bv, bits) as i128);
+                let umax = (1u128 << bits) - 1;
+                let (smin, smax) = (-(1i128 << (bits - 1)), (1i128 << (bits - 1)) - 1);
+                let (nm, r) = match g.u(4) {
+                    0 => ("uadd.sat", (ua + ub).min(umax) as u64),
+                    1 => ("usub.sat", ua.saturating_sub(ub) as u64),
+                    2 => ("sadd.sat", (sa + sb).clamp(smin, smax) as u64),
+                    _ => ("ssub.sat", (sa - sb).clamp(smin, smax) as u64),
+                };
+                let d = p.fresh();
+                p.emit(&format!(
+                    "{d} = call i{bits} @llvm.{nm}.i{bits}(i{bits} {a}, i{bits} {b})"
+                ));
+                p.push_scalar(d, bits, r);
+            }
+            // ---- division: the divisor made odd, so never zero, and for a signed op also
+            //      non-negative, so `INT_MIN / -1` cannot arise ----
+            26 => {
+                let bits = SCALAR_TYS[g.u(SCALAR_TYS.len())];
+                let (a, av) = p.any_scalar(g, bits);
+                let (b, bv) = p.any_scalar(g, bits);
+                let signed = g.u(2) == 0;
+                let mut b = b;
+                let mut dv = mask(bv, bits);
+                if signed {
+                    let smax = mask(u64::MAX, bits - 1);
+                    let c = p.fresh();
+                    p.emit(&format!("{c} = and i{bits} {b}, {smax}"));
+                    b = c;
+                    dv &= smax;
+                }
+                let c = p.fresh();
+                p.emit(&format!("{c} = or i{bits} {b}, 1"));
+                dv |= 1;
+                let (nm, r) = match (signed, g.u(2)) {
+                    (true, 0) => ("sdiv", (sext(av, bits) / dv as i64) as u64),
+                    (true, _) => ("srem", (sext(av, bits) % dv as i64) as u64),
+                    (false, 0) => ("udiv", mask(av, bits) / dv),
+                    (false, _) => ("urem", mask(av, bits) % dv),
+                };
+                let d = p.fresh();
+                p.emit(&format!("{d} = {nm} i{bits} {a}, {c}"));
+                p.push_scalar(d, bits, r);
+            }
             // ---- build a vector by insertelement from scalars ----
             _ => {
                 let s = SHAPES[g.u(3)];
@@ -886,8 +994,8 @@ pub fn gen_program(g: &mut Gen) -> (String, i64) {
                     (v.name.clone(), raw)
                 } else {
                     let d = p.fresh();
-                    p.emit(&format!("{d} = zext i32 {} to i64", v.name));
-                    (d, mask(raw, 32))
+                    p.emit(&format!("{d} = zext i{bits} {} to i64", v.name));
+                    (d, mask(raw, bits))
                 };
                 let d = p.fresh();
                 p.emit(&format!("{d} = xor i64 {acc_name}, {}", w.0));
@@ -940,8 +1048,16 @@ pub fn gen_program(g: &mut Gen) -> (String, i64) {
             ));
         }
     }
-    // Scalar bit-manip / funnel-shift intrinsics (unused declares are harmless).
+    // Scalar bit-manip / funnel-shift / min-max / saturating intrinsics (unused declares are
+    // harmless; `bswap` has no `i8`).
     for bits in SCALAR_TYS {
+        for nm in [
+            "smax", "smin", "umax", "umin", "uadd.sat", "usub.sat", "sadd.sat", "ssub.sat",
+        ] {
+            m.push_str(&format!(
+                "declare i{bits} @llvm.{nm}.i{bits}(i{bits}, i{bits})\n"
+            ));
+        }
         m.push_str(&format!("declare i{bits} @llvm.ctpop.i{bits}(i{bits})\n"));
         m.push_str(&format!(
             "declare i{bits} @llvm.ctlz.i{bits}(i{bits}, i1)\n"
@@ -949,7 +1065,9 @@ pub fn gen_program(g: &mut Gen) -> (String, i64) {
         m.push_str(&format!(
             "declare i{bits} @llvm.cttz.i{bits}(i{bits}, i1)\n"
         ));
-        m.push_str(&format!("declare i{bits} @llvm.bswap.i{bits}(i{bits})\n"));
+        if bits != 8 {
+            m.push_str(&format!("declare i{bits} @llvm.bswap.i{bits}(i{bits})\n"));
+        }
         m.push_str(&format!(
             "declare i{bits} @llvm.bitreverse.i{bits}(i{bits})\n"
         ));

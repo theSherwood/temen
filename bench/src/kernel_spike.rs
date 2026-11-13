@@ -7,8 +7,8 @@
 //! lane once before the next rep starts. A row reports the median over the reps and the spread
 //! (min..max). Per-iteration costs are by subtraction of a small-`n` run from a large-`n` one, so
 //! each lane's fixed setup (compiles, the window, the run's open and teardown) cancels; the setup
-//! itself is reported apart. Every lane compiles afresh, untimed, before each run (#2953). No lane
-//! meters fuel.
+//! itself is reported apart. Today's lane compiles once, untimed, and reuses that compile for every
+//! run (#2953). No lane meters fuel.
 //!
 //! `SPIKE_SECTIONS` picks sections, comma-separated: `compute`, `spawn`, `park` (the default three),
 //! `k1000`, `nowake`, `pairs`, `always` (#2985). `SPIKE_K` picks the park section's K values (`0,100,1000` by
@@ -41,11 +41,12 @@ fn today<'a>(m: &'a Module, entry: u32, host: Host, locked: bool) -> Lane<'a> {
         let h = cell.get_mut().unwrap() as *mut Host;
         (temen_run::cap_thunk, h as *mut _)
     };
+    // One compile, reused by every run: a run starts its thread domain fresh (#2953).
+    let mut cm = CompiledModule::compile(
+        m, entry, thunk, ctx, RESERVED, None, None, None, None, None, 0,
+    )
+    .expect("jit compile");
     Box::new(move |args| {
-        let mut cm = CompiledModule::compile(
-            m, entry, thunk, ctx, RESERVED, None, None, None, None, None, 0,
-        )
-        .expect("jit compile");
         let t0 = Instant::now();
         let (out, _) = cm.run(args, None, None).expect("jit run");
         let dt = t0.elapsed();
