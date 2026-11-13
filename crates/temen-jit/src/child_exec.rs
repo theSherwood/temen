@@ -1779,13 +1779,13 @@ impl HeldSite {
 /// # Safety
 /// `Inside`'s context is the caller's live one.
 unsafe fn activation_ctx(root: &VmCtx, caller: &HeldCaller<'_>) -> VmCtx {
-    let own = |c: Box<crate::FuelCell>| Some(crate::fuel::SharedCell::new(c));
+    use crate::fuel::SharedCell;
     let (cell, fuel) = match caller {
-        HeldCaller::Outside(lent) => (own(crate::FuelCell::fixed(**lent)), core::ptr::null_mut()),
+        HeldCaller::Outside(lent) => (Some(SharedCell::fixed(**lent)), core::ptr::null_mut()),
         HeldCaller::Inside(vm) => match vm.fuel.as_ref() {
-            None => (own(crate::FuelCell::fixed(u64::MAX)), core::ptr::null_mut()),
-            Some(c) => match c.sibling() {
-                Some(s) => (own(s), core::ptr::null_mut()),
+            None => (Some(SharedCell::fixed(u64::MAX)), core::ptr::null_mut()),
+            Some(c) => match SharedCell::sibling_of(c) {
+                Some(s) => (Some(s), core::ptr::null_mut()),
                 None => (vm.cell.clone(), vm.fuel),
             },
         },

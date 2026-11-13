@@ -92,22 +92,30 @@ impl FuelCell {
     }
 
     fn with(left: u64, src: Option<Arc<dyn BudgetNode>>) -> Box<FuelCell> {
-        Box::new(FuelCell {
+        Box::new(Self::value(left, src))
+    }
+
+    fn value(left: u64, src: Option<Arc<dyn BudgetNode>>) -> FuelCell {
+        FuelCell {
             left,
             refill: refill_trampoline(),
             remaining: fuel_remaining,
             granted: 0,
             src: Mutex::new(src),
             free: false,
-        })
+        }
+    }
+
+    /// The chain this cell draws from; `None` for a fixed allowance.
+    fn chain(&self) -> Option<Arc<dyn BudgetNode>> {
+        self.src.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// #2488 — a cell for another vCPU of this cell's domain, drawing from the same chain, none drawn
     /// yet. `None` for a fixed allowance: it has no chain to split, so its vCPUs keep sharing this
     /// cell.
     pub(crate) fn sibling(&self) -> Option<Box<FuelCell>> {
-        let src = self.src.lock().unwrap_or_else(|e| e.into_inner());
-        src.clone().map(Self::drawing)
+        self.chain().map(Self::drawing)
     }
 
     /// #2488 — a vCPU that charged this cell has ended: hand back what its draw left, as an ended
@@ -154,9 +162,9 @@ impl FuelCell {
 
 /// #3000 — a cell several contexts may charge, owned by all of them: it goes with the last. Compiled
 /// code charges it through [`Self::get`], whose address never moves, so sharing it costs the charge
-/// path nothing.
+/// path nothing; it is one allocation, as a boxed cell is.
 #[cfg(fiber_rt)]
-pub(crate) struct SharedCell(core::ptr::NonNull<FuelCell>);
+pub(crate) struct SharedCell(core::cell::UnsafeCell<FuelCell>);
 
 // SAFETY: the cell is a `FuelCell`, whose shared state is behind its lock, and whose `left` compiled
 // code charges through the raw pointer, as it does any cell.
@@ -167,21 +175,24 @@ unsafe impl Sync for SharedCell {}
 
 #[cfg(fiber_rt)]
 impl SharedCell {
-    pub(crate) fn new(cell: Box<FuelCell>) -> Arc<SharedCell> {
-        Arc::new(SharedCell(core::ptr::NonNull::from(Box::leak(cell))))
+    /// [`FuelCell::fixed`], shared.
+    pub(crate) fn fixed(n: u64) -> Arc<SharedCell> {
+        Arc::new(SharedCell(core::cell::UnsafeCell::new(FuelCell::value(
+            n, None,
+        ))))
+    }
+
+    /// [`FuelCell::sibling`] of `cell`, shared: `None` for a fixed allowance.
+    pub(crate) fn sibling_of(cell: &FuelCell) -> Option<Arc<SharedCell>> {
+        let src = cell.chain()?;
+        Some(Arc::new(SharedCell(core::cell::UnsafeCell::new(
+            FuelCell::value(0, Some(src)),
+        ))))
     }
 
     /// The cell, live while this is.
     pub(crate) fn get(&self) -> *mut FuelCell {
-        self.0.as_ptr()
-    }
-}
-
-#[cfg(fiber_rt)]
-impl Drop for SharedCell {
-    fn drop(&mut self) {
-        // SAFETY: made from a `Box` by `new`, and dropped once, with the last owner.
-        drop(unsafe { Box::from_raw(self.0.as_ptr()) });
+        self.0.get()
     }
 }
 
