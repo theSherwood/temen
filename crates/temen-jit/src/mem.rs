@@ -367,7 +367,7 @@ impl GuestWindow {
 /// child may run in several windows at once — the plain-child cache), so its `Jit.invoke` derives the
 /// range from the window the thunk was handed.
 pub(crate) fn fault_range_of(base: *mut u8, reserved: usize) -> (usize, usize) {
-    let page = pal::page_size();
+    let page = page_size();
     let lo = base as usize;
     (lo, lo + round_up(reserved, page) + trailing_guard())
 }
@@ -625,7 +625,8 @@ pub(crate) unsafe fn try_access(w: &crate::Window, a: &mut Access) -> bool {
             }
         }
     }
-    pal::install_guard();
+    // No `install_guard`: every caller is a host function called from inside a guarded call, which
+    // installed the handler.
     let (lo, hi) = fault_range_of(w.base, w.reserved as usize);
     pal::try_call(run, a as *mut Access as *mut c_void, lo, hi)
 }
@@ -715,7 +716,7 @@ pub(crate) fn page_size() -> usize {
 /// accesses near a checked base skip their own check (`trusted_reach ≤ guard_size`, DESIGN.md
 /// D61/D67): it reads its reach from here, so the guard cannot shrink under it.
 pub(crate) fn trailing_guard() -> usize {
-    pal::page_size()
+    page_size()
 }
 
 /// Windows-only: make `[base, base+len)` committed read/write across this window's **placeholder**
