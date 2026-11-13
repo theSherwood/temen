@@ -891,7 +891,7 @@ impl SharedFiberTable {
     /// durable freeze driver flattens (DURABILITY.md §12.8). Collected once: flattening a fiber
     /// makes zero forward progress (its post-suspend poll unwinds immediately), so it spawns no new
     /// parked fibers, and it ends `FREE` — the set never grows.
-    fn runnable_handles(&self) -> Vec<i64> {
+    pub(crate) fn runnable_handles(&self) -> Vec<i64> {
         self.lock()
             .slots
             .iter()
