@@ -182,6 +182,17 @@ mod live {
     /// allocation asks it: a one-byte data object, which a bump arena places at offset 0, finalized
     /// so its address can be read. Everything the module allocates after it lies above it, inside
     /// the reservation, so `[base, base + ARENA)` holds all of the module's code and nothing else.
+    ///
+    /// **"The first allocation is at the reservation's base" is cranelift-jit's layout, not its
+    /// API** (`ArenaMemoryProvider` in 0.132 bumps from offset 0, a segment per protection). If it
+    /// stops being true — a header, or anything else, placed ahead of the probe — the registered
+    /// range shifts up: code below the probe is unregistered, so every guest fault there kills the
+    /// process (the suites catch that loudly), and the range's top runs past the reservation into
+    /// whatever is mapped next, where a host fault would be unwound as the guest's (nothing catches
+    /// that). So: the probe must be page-aligned, which a header ahead of it would almost always
+    /// break, and is checked here; and a cranelift-jit upgrade must re-run `code_ranges`' tests,
+    /// which check the range against the OS's own record of the reservation where one is cheap
+    /// (Windows' `VirtualQuery`).
     pub(crate) fn arena_module(
         mut builder: JITBuilder,
     ) -> Result<(JITModule, CodeSlot), crate::JitError> {
@@ -198,6 +209,13 @@ mod live {
         module.define_data(probe, &d).map_err(backend)?;
         module.finalize_definitions().map_err(backend)?;
         let base = module.get_finalized_data(probe).0 as usize;
+        if !base.is_multiple_of(crate::mem::page_size()) {
+            // Not the reservation's base: decline rather than register a range that is not the
+            // arena's (see above). The module's memory is leaked; nothing from it ever ran.
+            return Err(crate::JitError::Unsupported(
+                "the JIT code arena's base could not be found",
+            ));
+        }
         let slot = TABLE
             .claim(base, base + ARENA)
             .ok_or(crate::JitError::Unsupported("too many live JIT modules"))?;
@@ -253,6 +271,58 @@ mod live {
             assert!(pc_is_jit(here), "the fuel trampoline is JIT code");
             drop(slot);
             assert!(!pc_is_jit(lo));
+            // SAFETY: nothing from `m` ever ran.
+            unsafe { m.free_memory() };
+        }
+
+        /// The probe's layout assumption, checked against the OS's own record of the reservation:
+        /// the registered range is exactly one whole allocation, starting at its base. Windows only:
+        /// `VirtualQuery` names a reservation's `AllocationBase`. Linux and macOS keep no such record
+        /// (`/proc/self/maps` merges an adjacent mapping with the same protection into one entry),
+        /// so there the page-alignment check in `arena_module` and the suites' guest faults stand
+        /// in for it. Re-run on every cranelift-jit upgrade: the layout is not an API.
+        #[cfg(windows)]
+        #[test]
+        fn the_registered_range_is_the_arenas_reservation() {
+            use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION};
+            let (m, slot) = crate::new_jit_module(crate::Imports::NONE, &crate::FastClaims::new())
+                .expect("module");
+            let (lo, hi) = TABLE.read(slot.0).expect("published");
+            let query = |at: usize| {
+                // SAFETY: `VirtualQuery` only reads the process's address-space bookkeeping.
+                let mut info: MEMORY_BASIC_INFORMATION = unsafe { core::mem::zeroed() };
+                let n = unsafe {
+                    VirtualQuery(
+                        at as *const core::ffi::c_void,
+                        &mut info,
+                        core::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
+                    )
+                };
+                assert_ne!(n, 0, "VirtualQuery({at:#x})");
+                info
+            };
+            assert_eq!(
+                query(lo).AllocationBase as usize,
+                lo,
+                "lo is the reservation's base"
+            );
+            // Walk the reservation's regions: they end exactly at `hi`.
+            let mut at = lo;
+            while at < hi {
+                let info = query(at);
+                assert_eq!(
+                    info.AllocationBase as usize, lo,
+                    "{at:#x} is in the reservation"
+                );
+                at = info.BaseAddress as usize + info.RegionSize;
+            }
+            assert_eq!(at, hi, "the reservation ends at the range's top");
+            assert_ne!(
+                query(hi).AllocationBase as usize,
+                lo,
+                "nothing past hi is the arena's"
+            );
+            drop(slot);
             // SAFETY: nothing from `m` ever ran.
             unsafe { m.free_memory() };
         }
