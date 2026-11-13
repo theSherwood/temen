@@ -1974,19 +1974,30 @@ fn child_task(
     payer: Option<NodeRef>,
 ) -> Result<(VTask, SharedSlots), Trap> {
     let table = build_table_for(prog.progs.len(), jit_table_log2, module);
-    let vt = entry_task(prog, module as usize, 0, args, payer)?;
+    let vt = entry_task(prog, module as usize, 0, args, payer, None)?;
     Ok((vt, table))
 }
 
 /// A new vCPU's task, entered at `func` of `module` (`unit`, that module's program) with `args`, its
-/// frames homed there: a thread's, a §14/§5 child's or an exec'd image's first frame. `Malformed` for a function `unit` does not have.
+/// frames homed there: the root's, a thread's, a §14/§5 child's or an exec'd image's first frame.
+/// `Malformed` for a function `unit` does not have.
+///
+/// `charge`: the fuel its entry is charged to. Fuel unification (INVARIANTS #9): a stack's first entry
+/// costs one, as a call's does and as the JIT's entry prologue charges it, so the root's and a
+/// thread's entries are paid here, as the task is made. `None` for a durable thaw's root, which
+/// continues an already-charged run, and for a child's or an exec'd image's entry, which the rule
+/// does not reach yet (#3012).
 fn entry_task(
     unit: &Compiled,
     module: usize,
     func: usize,
     args: &[Value],
     payer: Option<NodeRef>,
+    charge: Option<&mut Fuel>,
 ) -> Result<VTask, Trap> {
+    if let Some(fuel) = charge {
+        fuel.burn()?;
+    }
     let mut vt = VTask::new(unit, func, args, payer)?;
     vt.active.module = module;
     vt.active.home = module;
@@ -1997,6 +2008,10 @@ fn entry_task(
 /// its own functions, CONSOLIDATION.md §11) entered with `(arg0, arg1)`. The driver seeds its `vcpu.tls`
 /// word with the dense vCPU id it numbers the thread by (§12; a root's is 0). `Malformed` for a module
 /// or function the run's source does not have.
+///
+/// Its entry is paid from `fuel`, the fuel of the domain it runs in, as the spawn completes
+/// ([`entry_task`], #2977): a freeze after the spawn has paid it, and a thaw re-creates no thread
+/// through here. Out of fuel traps the spawner, which ends the run as the thread's own trap would.
 fn thread_task(
     source: &ModuleSource,
     module: usize,
@@ -2004,6 +2019,7 @@ fn thread_task(
     arg0: i64,
     arg1: i64,
     payer: Option<NodeRef>,
+    fuel: &mut Fuel,
 ) -> Result<VTask, Trap> {
     let cm = source.get(module).ok_or(Trap::Malformed)?;
     entry_task(
@@ -2012,6 +2028,7 @@ fn thread_task(
         func as usize,
         &[Value::I64(arg0), Value::I64(arg1)],
         payer,
+        Some(fuel),
     )
 }
 
@@ -2169,7 +2186,8 @@ fn admit_detached_child(
         Ok(lane) => lane,
         Err(refused) => return Ok(Err(refused)),
     };
-    // #1975 — every exit from here that builds no child hands back what the admission took.
+    // #1975 — every exit from here that builds no child hands back what the admission took, and
+    // discards the child, so its grants take nothing from this domain (`Host::discard`).
     let mut child_host = host.child_host();
     child_host.set_attestation(host.detached_child_attestation(s.pager.is_some()));
     child_host.pager = s.pager;
@@ -2187,6 +2205,7 @@ fn admit_detached_child(
     if let Some((r, o)) = s.premap {
         if !host.stage_premap(r, o, &mut child_host) {
             host.undo_detached_spawn(lease, lane);
+            child_host.discard();
             return Err(Trap::Malformed);
         }
     }
@@ -2196,6 +2215,7 @@ fn admit_detached_child(
         .is_err()
     {
         host.undo_detached_spawn(lease, lane);
+        child_host.discard();
         return Ok(Err(SpawnRefusal::Unbound));
     }
     // D66 — single-spawn lane parity with the tree-walker: this engine's detached children do not yet
@@ -4061,11 +4081,14 @@ fn parallel_domain(
     let source = ModuleSource::shared(std::sync::Arc::new(c));
     let table = source.root_table(host.jit_table_log2());
     host.wire_park_door();
-    Some(Ok((
-        source,
-        table,
-        Mem::root(m, reserved_log2, back, init_mem),
-    )))
+    // #2958 slice 3 — a native tier whose window is its own started it already: the run builds no
+    // `Mem` over it ([`NativeTier::window`]).
+    let tiers_window = host
+        .thread_platform()
+        .tier
+        .is_some_and(|t| t.native.is_some_and(|n| n.window.is_some()));
+    let mem = (!tiers_window).then(|| Mem::root(m, reserved_log2, back, init_mem));
+    Some(Ok((source, table, mem.flatten())))
 }
 
 /// A persistent, single-vCPU **reactor instance** — the "instantiate once, call exports many times"
@@ -4694,6 +4717,7 @@ fn rebuild_detached_domain(
         let table = build_table_for(progs_len, host.jit_table_log2(), es.module as u32);
         return Domain {
             mem: None,
+            native: None,
             host: host.into_cell(),
             table: std::sync::Arc::new(table),
             program: es.module as u32,
@@ -4718,6 +4742,7 @@ fn rebuild_detached_domain(
     let table_log2 = host.jit_table_log2();
     Domain {
         mem: Some(mem),
+        native: None,
         table: std::sync::Arc::new(build_table_for(progs_len, table_log2, es.module as u32)),
         program: es.module as u32,
         fuel: Fuel::fixed(es.fuel),
@@ -6276,7 +6301,8 @@ fn dbg_spawn(
     let env = tasks[ti].domain; // a thread runs in its spawner's domain (shares its window)
     let (vt, live) = {
         let mut host = envs[env].host.lock_unpoisoned();
-        let mut vt = thread_task(source, module, func, arg0, arg1, Some(host.own_node()))?;
+        let (payer, fuel) = (Some(host.own_node()), &mut envs[env].fuel);
+        let mut vt = thread_task(source, module, func, arg0, arg1, payer, fuel)?;
         if tasks.live_count() >= super::MAX_VCPUS {
             return Err(Trap::ThreadFault); // thread bomb
         }
@@ -6412,12 +6438,13 @@ fn service_advance(
                 // engine claims with `may_block` off), so a fiber's park hands its resumer
                 // `FIBER_PARKED`.
                 let e = &mut domains[tasks[ti].domain];
-                futex_wait(
+                let waited = futex_wait(
                     tasks,
                     ti,
                     &mut e.fibers.fibers,
                     &mut e.fibers.sp,
                     &mut e.mem,
+                    e.native.as_ref(),
                     || false,
                     false,
                     clock.saturating_add(*turn), // #2224: this engine's time
@@ -6427,13 +6454,15 @@ fn service_advance(
                     timeout,
                     dst,
                 );
+                if let Err(t) = waited {
+                    complete(tasks, domains, ti, Err(t));
+                }
             }
             Outcome::MemoryNotify { base, count, dst } => {
                 *turn += 1;
-                let win = |env: usize| domains[env].mem.as_ref();
-                let key = futex_key_in(win(tasks[ti].domain), base);
+                let key = futex_key_in(domains[tasks[ti].domain].window(), base);
                 let want = count as u32;
-                let mut woken = wake_waiters(tasks, key, want, win);
+                let mut woken = tasks.notify(key, want);
                 let regs = domains.iter_mut().flat_map(|e| e.fibers.fibers.iter_mut());
                 woken += wake_fiber_waiters(regs, key, want - woken);
                 tasks[ti].deliver(dst, Reg::from_i32(woken as i32));
@@ -6582,6 +6611,7 @@ fn dbg_start_child(
     let eidx = domains.len();
     domains.push(Domain {
         mem,
+        native: None,
         host: child_host.into_cell(),
         table: std::sync::Arc::new(table),
         program: module,
@@ -8290,6 +8320,9 @@ impl ScheduledDebugRun {
                 aliased,
                 "a checkpoint's aliases name the regions it carries"
             );
+            drop(host);
+            // A wait on an aliased page keys on the region it names now.
+            self.refile_waits();
         }
         self.turn = turn;
         self.clock = c.clock;
@@ -8360,6 +8393,7 @@ impl ScheduledDebugRun {
                         spare: None,
                     },
                     suspended: None,
+                    native: None,
                 }),
                 domain: ts.domain,
                 state: match (&ts.state, readmit_parks) {
@@ -8369,7 +8403,8 @@ impl ScheduledDebugRun {
                     (s, _) => s.clone(),
                 },
                 at_bp: ts.at_bp,
-                answers: None, // a debug session holds no domain
+                answers: None,  // a debug session holds no domain
+                waits_on: None, // filed once the windows are back ([`Self::refile_waits`])
                 lease: ts.lease,
                 // #2001 — a live thread is charged again; the task it replaces hands its charge
                 // back as it drops.
@@ -8384,6 +8419,14 @@ impl ScheduledDebugRun {
         // #1866 — last, once the replaced tasks have handed their charges back: the tree as it stood,
         // which already holds every charge the restored tasks and windows carry.
         self.host().set_budget_tree(&c.budgets);
+        self.refile_waits();
+    }
+
+    /// #2868 — each futex wait filed under its key in the windows as they are now, once a restore or
+    /// an undo has rebuilt the tasks or the windows.
+    fn refile_waits(&mut self) {
+        let domains = &self.domains;
+        self.tasks.file_waits(|env| domains[env].window());
     }
 
     /// The run's result once the root has finished (`None` while still running).
@@ -8680,6 +8723,7 @@ fn spawn_task(
     let eidx = domains.len();
     domains.push(Domain {
         mem: child_mem,
+        native: None,
         host: child_host.into_cell(),
         table: std::sync::Arc::new(table),
         fuel: child_fuel,
@@ -8694,6 +8738,7 @@ fn spawn_task(
         state,
         ..TaskSlot::new(vt, eidx, live)
     });
+    tasks.pids.insert(child_ti, pid);
     forked_twins.insert(child_ti);
     pid as i64
 }
@@ -8833,20 +8878,109 @@ fn image_parks(host: &Host, m: &Module, census: &ImageCensus) -> Parks {
     }
     if m.imports.len() != host.import_bindings.len()
         || parks.contains(&OpParks::Otherwise)
-        || census.concurrency
+        || (census.concurrency && !parks_natively(host))
         || census.parks
     {
         return Parks::Otherwise;
     }
-    // #2050: past the check above, a futex op is a wait, which parks the process in its bounce.
-    let suspendable =
-        parks.contains(&OpParks::OnChildren) || parks.contains(&OpParks::OnHost) || census.futex;
+    // #2050: past the check above, a futex op is a wait, which parks the process in its bounce; on
+    // a native tier (#2958) a thread or notify op parks its task in place too.
+    let suspendable = parks.contains(&OpParks::OnChildren)
+        || parks.contains(&OpParks::OnHost)
+        || census.futex
+        || census.concurrency;
     let inline_streams =
         (census.stream_read && stream_op_parks(0)) || (census.stream_write && stream_op_parks(1));
     match suspendable || import_streams || inline_streams {
         true => Parks::Suspendably,
         false => Parks::Never,
     }
+}
+
+/// #2958 — whether `m`'s vCPUs can run as native tasks under `host`: emitted code that makes its §12
+/// ops itself ([`ThreadTier::native`]), on this run's rules. `Err` names the first clause that keeps
+/// the program on its engine's own thread runtime, decided before the run takes anything. This is
+/// the one place the two routes are chosen (INVARIANTS #13, #15): each clause is migration
+/// scaffolding, and names what removes it (#2958's plan, section B).
+///
+/// - **`no §12 op`**: a module with no thread, fiber or futex op keeps its single-threaded path,
+///   with no kernel (the phase that runs every JIT program on the kernel, after phase 2);
+/// - **`durable`**: executor 2 has no freeze driver (#2533; the phase that ports freeze);
+/// - **`bytecode`**: the rules need the module's bytecode compile ([`admits_for`]; slice 7);
+/// - **`no window`**: a thread of a module with no memory interprets ([`tierup_servable`]; slice 6);
+/// - **`fibers`**: a fiber's park runs on the engine's fiber runtime, whose futex core its vCPU
+///   waits share (phase 2);
+/// - **`gc.roots`**: the rules scan an interpreted task's frames, not native ones (a later phase,
+///   or for good if no consumer needs it);
+/// - **`signals`**: delivery into native code is the engine's safepoint redirect, not executor 2's
+///   interrupt (a later phase);
+/// - **`imports`**: an import may bind anything, a parking op or a page op included (slice 4);
+/// - **`cap`**: a `call.cap` other than a host procedure or an address-space op (`map`, `unmap`,
+///   `protect`, `page_size`, through the one page map since #2958 slice 3): a stream, a region (its
+///   futex key on a native window, a later phase), a child or a serve point (#2791, #2792), a §22
+///   `Jit` op (one dispatch table, a later phase);
+/// - **`host-proc parks`**: a host procedure that may park, which needs the engine's own park
+///   (slice 5).
+///
+/// A held run never reaches this: its embedder runs it on the engine's own runtime (#2935).
+pub fn native_scope(m: &Module, host: &Host) -> Result<(), &'static str> {
+    use temen_ir::cap_id::{ADDRESS_SPACE, HOST_PROC};
+    if !m
+        .funcs
+        .iter()
+        .any(|f| f.uses_fibers_or_threads() || f.uses_futex())
+    {
+        return Err("no §12 op");
+    }
+    if host.is_durable() {
+        return Err("durable");
+    }
+    if !admits_for(m, true) {
+        return Err("bytecode");
+    }
+    let spawns = m.funcs.iter().any(|f| f.uses_concurrency_besides_wait());
+    if m.memory.is_none() && spawns {
+        return Err("no window");
+    }
+    if m.funcs.iter().any(temen_ir::Func::uses_fibers) {
+        return Err("fibers");
+    }
+    if m.funcs.iter().any(temen_ir::Func::uses_gc_roots) {
+        return Err("gc.roots");
+    }
+    if host.signal_arm_pair().is_some() {
+        return Err("signals");
+    }
+    if !m.imports.is_empty() {
+        return Err("imports");
+    }
+    let mut host_call = false;
+    for i in m
+        .funcs
+        .iter()
+        .flat_map(|f| &f.blocks)
+        .flat_map(|b| &b.insts)
+    {
+        if let Inst::CapCall(c) = i {
+            match c.type_id {
+                HOST_PROC => host_call = true,
+                ADDRESS_SPACE if c.op <= 3 => {}
+                _ => return Err("cap"),
+            }
+        }
+    }
+    if host_call && host.host_procs_park() != super::OpParks::Never {
+        return Err("host-proc parks");
+    }
+    Ok(())
+}
+
+/// #2958 — whether `host`'s emitted tier makes the §12 thread ops itself ([`ThreadTier::native`]),
+/// so an image that spawns and joins runs whole on it.
+fn parks_natively(host: &Host) -> bool {
+    host.thread_platform()
+        .tier
+        .is_some_and(|t| t.native.is_some())
 }
 
 /// What an image's code does that decides how it runs whole on the emitted tier: the instruction
@@ -8961,15 +9095,19 @@ fn fork_bare(tasks: &[TaskSlot], envs: &[Domain], ti: usize) -> bool {
 /// What a fork twin takes from its parent's process (the oracle's `fork_vcpu`): one `spawn` of the
 /// node they share while it lives (#2001), its task ([`twin_task`]: the `parent` frame answered
 /// `reply` at `dst`), a private copy of its window `mem`, and its powerbox `host` duplicated as
-/// process `pid`, which pays the node for the copy (#2106). `None` refuses the fork, with nothing
-/// left charged: a full ceiling, or a window or powerbox that cannot be duplicated. The powerbox
-/// comes last: its providers register the process as they copy it, so nothing after may refuse the
-/// fork (#2373). The window is copied outside the powerbox's lock.
+/// process `pid`, which pays the node for the copy (#2106). The powerbox is wired as the root's is
+/// ([`wire_process`], on the run's `bell`), for every twin, a personality fork's or a
+/// `clone_caller`'s, as the oracle wires each (#2197): the twin's own `fork()` and `waitpid()` park,
+/// and a signal to it while every task is parked re-runs the settle. `None` refuses the fork, with
+/// nothing left charged: a full ceiling, or a window or powerbox that cannot be duplicated. The
+/// powerbox comes last: its providers register the process as they copy it, so nothing after may
+/// refuse the fork (#2373). The window is copied outside the powerbox's lock.
 fn fork_process(
     host: &std::sync::Mutex<Host>,
     mem: Option<&Mem>,
     pid: u64,
     (parent, dst, reply): (&Vm, u32, i64),
+    bell: Option<&super::Bell>,
 ) -> Option<(Option<Mem>, Host, LiveVcpu, VTask)> {
     let payer = host.lock_unpoisoned().own_node();
     let live = LiveVcpu::charge(payer.clone())?;
@@ -8980,6 +9118,7 @@ fn fork_process(
     };
     let window = mem.map_or(0, Mem::mapped_size);
     let twin_host = host.lock_unpoisoned().fork_powerbox(pid, window)?;
+    wire_process(&twin_host, bell);
     Some((twin_mem, twin_host, live, task))
 }
 
@@ -9109,8 +9248,8 @@ fn exec_image_build(
     let cunit = source.get(cm).ok_or(super::EINVAL)?;
     let child_table = build_table_for(cunit.progs.len(), child_host.jit_table_log2(), cm as u32);
     let payer = Some(child_host.own_node());
-    let mut new_vt =
-        entry_task(&cunit, cm, entry as usize, &child_args, payer).map_err(|_| super::EINVAL)?;
+    let mut new_vt = entry_task(&cunit, cm, entry as usize, &child_args, payer, None)
+        .map_err(|_| super::EINVAL)?;
     if let Some(leaf) = leaf {
         new_vt.active.tier_up_leaf(leaf);
     }
@@ -10589,6 +10728,61 @@ mod tasks_tests {
         let walked: Vec<usize> = tasks.live_mut().map(|(i, _)| i).collect();
         assert_eq!(walked, [0, 2, 3, 4]);
     }
+
+    /// Park task `i` of `tasks` on a futex wait on `key`, timed out at `deadline` if any.
+    fn wait(tasks: &mut Tasks, i: usize, key: super::super::FutexKey, deadline: Option<u64>) {
+        tasks[i].state = TaskState::BlockedWait {
+            addr: 0,
+            site: super::super::FutexSite::Anon(0),
+            deadline,
+            dst: 0,
+        };
+        tasks.park_wait(i, key);
+    }
+
+    /// #2868 — a futex wait waits aside: out of the live list each round walks, still a live task, and
+    /// back in the list, runnable, once a notify on its own word takes it (the lowest task index
+    /// first), its deadline passes, or it ends. A notify costs what it wakes.
+    #[test]
+    fn a_futex_wait_waits_aside_until_its_word_its_deadline_or_its_end() {
+        use super::super::FutexKey;
+        let (a, b) = (FutexKey::Anon(1, 16), FutexKey::Anon(1, 24));
+        let mut tasks: Tasks = (0..5).map(|_| stalled_tests::runnable()).collect();
+        wait(&mut tasks, 3, a, None);
+        wait(&mut tasks, 1, a, None);
+        wait(&mut tasks, 2, b, Some(50));
+        wait(&mut tasks, 4, a, Some(90));
+        assert_eq!(tasks.live().collect::<Vec<_>>(), [0], "only what can move");
+        assert_eq!(tasks.live_count(), 5, "a waiter is live");
+        assert_eq!(tasks.members(), [0, 1, 2, 3, 4]);
+        assert_eq!(tasks.next_deadline(), Some(50));
+        assert_eq!(tasks.notify(a, 2), 2);
+        assert_eq!(
+            tasks.live().collect::<Vec<_>>(),
+            [0, 1, 3],
+            "the lowest indices first"
+        );
+        assert!(matches!(tasks[1].state, TaskState::Runnable));
+        tasks.time_out(60);
+        assert_eq!(tasks.live().collect::<Vec<_>>(), [0, 1, 2, 3]);
+        assert_eq!(
+            tasks.next_deadline(),
+            Some(90),
+            "task 2's deadline has gone with it"
+        );
+        assert_eq!(tasks.notify(b, 1), 0, "nothing waits on b now");
+        // An end takes a waiter out wherever it waits, as `complete` does: here task 4, on `a` and
+        // its deadline.
+        tasks.unpark_wait(4);
+        tasks[4].state = TaskState::Done(Err(Trap::ThreadFault));
+        assert_eq!(tasks.notify(a, u32::MAX), 0);
+        assert_eq!(tasks.next_deadline(), None);
+        tasks.prune();
+        assert_eq!(tasks.live().collect::<Vec<_>>(), [0, 1, 2, 3]);
+        // #2975 — the emptied queues left the map; the spare kept the storage, holding no waiter.
+        assert!(tasks.waits.on.is_empty());
+        assert!(tasks.waits.spare.is_empty() && tasks.waits.spare.capacity() > 0);
+    }
 }
 
 /// #1198 — whether task `t`'s process is stopped (SIGTSTP/SIGTTIN/SIGTTOU, before its SIGCONT): a
@@ -11797,13 +11991,18 @@ fn payer(host: &mut HostCell) -> Option<NodeRef> {
 impl HostCell<'_> {
     /// Run `f` with exclusive access to the powerbox: directly (`Excl`) or under a brief lock
     /// (`Shared`). `f`'s result is owned (no borrow escapes the lock), so the lock is held only across
-    /// the one host call.
+    /// the one host call. `f` is called in one place, so each use inlines one copy of it (#2847).
     #[inline]
     fn with<R>(&mut self, f: impl FnOnce(&mut Host) -> R) -> R {
-        match self {
-            HostCell::Excl(h) => f(h),
-            HostCell::Shared(m) => f(&mut m.lock_unpoisoned()),
-        }
+        let mut held;
+        let host = match self {
+            HostCell::Excl(h) => &mut **h,
+            HostCell::Shared(m) => {
+                held = m.lock_unpoisoned();
+                &mut *held
+            }
+        };
+        f(host)
     }
 }
 
@@ -12014,6 +12213,10 @@ fn resolve_fiber_entry(
 /// replays — the root's is the caller's, lent per call).
 struct Domain {
     mem: Option<Mem>,
+    /// #2958 slice 3 — the window of a domain whose tasks run on a native tier over a window of the
+    /// tier's own (the Cranelift JIT's, its page map the domain's `Host`'s): the rules read it through
+    /// [`Domain::window`], and the domain has no [`Mem`] over it. `None` everywhere else.
+    native: Option<NativeWindow>,
     /// The domain's live powerbox, in its cell ([`DomainCell`]): a §3.6 live-callee offer holds the
     /// SAME callee the tree-walker's `wire_live_impl` machinery expects — enqueue, offer-shape, and
     /// settle all go through the shared type.
@@ -12046,7 +12249,18 @@ struct Domain {
     children: temen_ir::handles::Table<usize>,
 }
 
+/// #2958 slice 3 — a native tier's window ([`Domain::native`]), shared by the domain and its run.
+type NativeWindow = std::sync::Arc<dyn super::FutexWindow + Send + Sync>;
+
 impl Domain {
+    /// The window the §12 rules read: the native tier's, or the domain's own [`Mem`].
+    fn window(&self) -> Option<&dyn super::FutexWindow> {
+        match &self.native {
+            Some(w) => Some(&**w),
+            None => self.mem.as_ref().map(|m| m as &dyn super::FutexWindow),
+        }
+    }
+
     /// A run's root domain, the run's domain `0`: its window, powerbox, table and fuel, running unit
     /// 0 of the run's program, with no fibers or children yet.
     fn root(
@@ -12057,6 +12271,7 @@ impl Domain {
     ) -> Domain {
         Domain {
             mem,
+            native: None,
             host,
             table,
             fuel,
@@ -12140,6 +12355,7 @@ fn coop_start_child(
     let eidx = domains.len();
     domains.push(Domain {
         mem,
+        native: None,
         host: child_host.into_cell(),
         table: std::sync::Arc::new(table),
         fuel,
@@ -12173,6 +12389,81 @@ struct Tasks {
     /// The tasks that ended in a trap whose domain's teardown has not run yet
     /// ([`teardown_domains`]), as [`complete`] and [`Tasks::push`] record them.
     failed: Vec<usize>,
+    /// #1827 — each process's root task (a personality `fork`'s twin, a `clone_caller` twin, a
+    /// spawned process), with the pid its parent knows it by.
+    pids: std::collections::BTreeMap<usize, u64>,
+    /// #1827 — the processes that trapped, in completion order, as [`complete`] records them: a
+    /// process's trap is its parent's business, reaped as a status, so it does not end the run. The
+    /// run's end publishes them for [`super::last_twin_traps`], as the oracle's does (#1665).
+    twin_traps: Vec<super::TwinTrap>,
+    /// #2868 — the tasks parked on a futex wait, aside from [`Self::live`].
+    waits: Waits,
+}
+
+/// #2868 — the tasks parked on a futex wait, held aside from the live list ([`Tasks::live`]), so a
+/// round's rules walk only what can move: a thread parked for good costs nothing until its word is
+/// notified, its wait times out, or its domain ends. A notify takes its waiters from its word's
+/// queue, lowest task index first, as a scan of the tasks woke them, and so costs what it wakes.
+/// What ends a wait goes through [`Tasks::end_wait`], which puts the task back in the live list. A
+/// waiting task names its key itself ([`TaskSlot::waits_on`]).
+#[derive(Default)]
+struct Waits {
+    /// Each word's waiters in index order, by the key their parks took ([`site_key_in`]).
+    on: std::collections::HashMap<super::FutexKey, std::collections::VecDeque<usize>>,
+    /// The timed waits, by deadline.
+    due: std::collections::BTreeSet<(u64, usize)>,
+    /// How many wait.
+    n: usize,
+    /// How many wait in each domain that has had a waiter: a domain whose every other task has
+    /// ended is still alive. A domain's count goes with it ([`Tasks::forget_domain`]).
+    in_domain: std::collections::BTreeMap<usize, usize>,
+    /// #2963 — the tasks the last [`Tasks::notify`] woke, in the order it woke them. Executor 2 takes
+    /// them under the same lock hold: a futex stop wakes their threads ([`ThreadRun::apply`]), and
+    /// the wake scan after a settle sees them among the rest ([`ThreadRun::wake`]). Each notify
+    /// starts it afresh, so a driver that wakes no threads leaves it be, and it never holds more
+    /// than one notify's waiters.
+    woken: Vec<usize>,
+    /// #2958 slice 2 — how many wait on each key, for a notify to read without the run lock
+    /// ([`super::futex_count`]): a task counts in as it joins [`Self::on`] ([`Tasks::park_wait`])
+    /// and out as it leaves ([`Tasks::unpark_wait`]), so the count is the queue's size, per stripe.
+    /// Executor 2's run holds the other handle ([`ThreadRun::count`]).
+    count: std::sync::Arc<super::futex_count::FutexCount>,
+    /// How many fiber waits have counted in, never to count out ([`futex_wait`]): what the stripes
+    /// hold beyond [`Self::n`].
+    sticky: u64,
+    /// #2975 — the storage of the last queue a wait emptied, always empty, for the next key a wait
+    /// files under: a wait allocates no queue and a notify frees none, once warm. Storage only:
+    /// what waits is in [`Self::on`].
+    spare: std::collections::VecDeque<usize>,
+}
+
+impl Waits {
+    /// Key `key`'s queue, emptied: it leaves the map and its storage becomes the spare.
+    fn drop_queue(&mut self, key: &super::FutexKey) {
+        if let Some(q) = self.on.remove(key) {
+            debug_assert!(q.is_empty(), "only an empty queue is dropped");
+            self.spare = q;
+        }
+    }
+
+    /// Whether the stripes hold exactly the waiters and the fiber waits that never count out: what
+    /// every count in and out leaves them as, outside [`wait_task`]'s one hold of the lock.
+    fn counted(&self) -> bool {
+        self.count.total() == self.n as u64 + self.sticky
+    }
+}
+
+impl Drop for Waits {
+    fn drop(&mut self) {
+        // A test that failed reports its own panic, not this one's abort.
+        if std::thread::panicking() {
+            return;
+        }
+        debug_assert!(
+            self.counted(),
+            "every futex wait counted in once and out once"
+        );
+    }
 }
 
 impl std::ops::Deref for Tasks {
@@ -12215,11 +12506,196 @@ impl Tasks {
     }
 
     fn enter(&mut self, i: usize) {
+        self.enter_live(i);
+        if let TaskState::Done(Err(_)) = self.slots[i].state {
+            self.failed.push(i);
+        }
+    }
+
+    fn enter_live(&mut self, i: usize) {
         if let Err(at) = self.live.binary_search(&i) {
             self.live.insert(at, i);
         }
-        if let TaskState::Done(Err(_)) = self.slots[i].state {
-            self.failed.push(i);
+    }
+
+    /// #2868 — task `i`, just parked on a futex wait (`BlockedWait`), keyed `key`, leaves the live
+    /// list until its wait ends ([`Waits`]). #2958 slice 2 — it counts in on its key first
+    /// ([`Waits::count`]), as every waiter does before anything can compare its word.
+    fn park_wait(&mut self, i: usize, key: super::FutexKey) {
+        self.waits.count.enter(&key);
+        self.file_wait(i, key);
+    }
+
+    /// [`Self::park_wait`]'s filing, for a waiter already counted in on `key` ([`wait_task`]).
+    fn file_wait(&mut self, i: usize, key: super::FutexKey) {
+        let TaskState::BlockedWait { deadline, .. } = self.slots[i].state else {
+            unreachable!("only a futex wait parks aside");
+        };
+        if let Ok(at) = self.live.binary_search(&i) {
+            self.live.remove(at);
+        }
+        let w = &mut self.waits;
+        debug_assert!(w.spare.is_empty(), "the spare queue holds no waiter");
+        let q = (w.on.entry(key)).or_insert_with(|| std::mem::take(&mut w.spare));
+        if let Err(at) = q.binary_search(&i) {
+            q.insert(at, i);
+        }
+        if let Some(d) = deadline {
+            w.due.insert((d, i));
+        }
+        w.n += 1;
+        *w.in_domain.entry(self.slots[i].domain).or_default() += 1;
+        self.slots[i].waits_on = Some(key);
+    }
+
+    /// #2868 — task `i` no longer waits aside, however its wait ended: it is back in the live list.
+    /// One that does not wait aside is left as it is.
+    fn unpark_wait(&mut self, i: usize) {
+        let Some(key) = self.slots[i].waits_on else {
+            return;
+        };
+        let w = &mut self.waits;
+        if let Some(q) = w.on.get_mut(&key) {
+            if let Ok(at) = q.binary_search(&i) {
+                q.remove(at);
+            }
+            if q.is_empty() {
+                w.drop_queue(&key);
+            }
+        }
+        self.leave_wait(i);
+    }
+
+    /// [`Self::unpark_wait`] for a task already taken out of its key's queue ([`Self::notify`]): it
+    /// counts out, leaves the deadline index and the counts, and is back in the live list.
+    fn leave_wait(&mut self, i: usize) {
+        let Some(key) = self.slots[i].waits_on.take() else {
+            unreachable!("only a waiter leaves its wait");
+        };
+        let w = &mut self.waits;
+        w.count.leave(&key);
+        if let TaskState::BlockedWait {
+            deadline: Some(d), ..
+        } = self.slots[i].state
+        {
+            w.due.remove(&(d, i));
+        }
+        w.n -= 1;
+        if let Some(n) = w.in_domain.get_mut(&self.slots[i].domain) {
+            *n -= 1;
+        }
+        self.enter_live(i);
+    }
+
+    /// #2868 — end task `i`'s futex wait with `status` at its `dst`: it runs on.
+    fn end_wait(&mut self, i: usize, status: i32) {
+        self.unpark_wait(i);
+        self.answer_wait(i, status);
+    }
+
+    /// Hand task `i`, out of its wait, `status` at its `dst`: it runs on.
+    fn answer_wait(&mut self, i: usize, status: i32) {
+        if let TaskState::BlockedWait { dst, .. } = self.slots[i].state {
+            self.slots[i].deliver(dst, Reg::from_i32(status));
+            self.slots[i].state = TaskState::Runnable;
+        }
+    }
+
+    /// `memory.notify` on futex `key`: wake up to `count` of its waiting tasks, lowest task index
+    /// first (deterministic), and answer how many it woke.
+    fn notify(&mut self, key: super::FutexKey, count: u32) -> u32 {
+        self.waits.woken.clear();
+        let mut woken = 0;
+        while woken < count {
+            // #2975 — it takes its waiter from the queue it found, which it drops once empty.
+            let w = &mut self.waits;
+            let Some(q) = w.on.get_mut(&key) else {
+                break;
+            };
+            let Some(i) = q.pop_front() else {
+                unreachable!("an empty queue leaves the map");
+            };
+            if q.is_empty() {
+                w.drop_queue(&key);
+            }
+            self.leave_wait(i);
+            self.answer_wait(i, super::WAIT_WOKEN);
+            self.waits.woken.push(i);
+            woken += 1;
+        }
+        woken
+    }
+
+    /// Wake every task whose futex wait's deadline the logical `clock` has reached,
+    /// `WAIT_TIMED_OUT` at its `dst`.
+    fn time_out(&mut self, clock: u64) {
+        while let Some(&(due, i)) = self.waits.due.first() {
+            if due > clock {
+                break;
+            }
+            self.end_wait(i, super::WAIT_TIMED_OUT);
+        }
+    }
+
+    /// The earliest deadline among the tasks' futex waits: what the logical clock advances to when no
+    /// task is runnable. An infinite wait has none, so a run whose every waiter is indefinite reaches
+    /// its driver's deadlock exit instead of a `WAIT_TIMED_OUT` the guest never asked for (#1638).
+    fn next_deadline(&self) -> Option<u64> {
+        self.waits.due.first().map(|&(due, _)| due)
+    }
+
+    /// The tasks waiting aside on a futex wait, in no order.
+    fn waiting(&self) -> impl Iterator<Item = usize> + '_ {
+        self.waits.on.values().flatten().copied()
+    }
+
+    /// Whether a task waits aside on a futex wait.
+    fn any_waiting(&self) -> bool {
+        self.waits.n != 0
+    }
+
+    /// The domains a task waits aside in.
+    fn waiting_domains(&self) -> impl Iterator<Item = usize> + '_ {
+        (self.waits.in_domain.iter()).filter_map(|(&k, &n)| (n != 0).then_some(k))
+    }
+
+    /// Whether a task of domain `k` waits aside on a futex wait.
+    fn waits_in(&self, k: usize) -> bool {
+        self.waits.in_domain.get(&k).is_some_and(|&n| n != 0)
+    }
+
+    /// Domain `k` has ended, every task of it gone: its count goes too.
+    fn forget_domain(&mut self, k: usize) {
+        self.waits.in_domain.remove(&k);
+    }
+
+    /// Every task a domain-wide rule reaches (a kill, a domain's end): the live ones and those
+    /// waiting aside, in index order.
+    fn members(&self) -> Vec<usize> {
+        let mut all: Vec<usize> = self.live().chain(self.waiting()).collect();
+        all.sort_unstable();
+        all
+    }
+
+    /// #2868 — file every futex wait under the key its site has in the windows `win` names now: after
+    /// a debug restore or undo rebuilt the tasks or their windows, under the same sites
+    /// ([`super::FutexSite`]).
+    ///
+    /// #2958 slice 2 — each waiter counts out of its old key's stripe and into its new one, so a
+    /// notify reading the stripes without the run lock would see neither in between. None does: a
+    /// restore or an undo runs on the cooperative debugger's core ([`SchedCore`]), whose run has no
+    /// thread but the one doing this, and only executor 2's threads read a count without the lock.
+    fn file_waits<'a>(&mut self, win: impl Fn(usize) -> Option<&'a dyn super::FutexWindow>) {
+        let waiting: Vec<usize> = (self.members().into_iter())
+            .filter(|&i| matches!(self.slots[i].state, TaskState::BlockedWait { .. }))
+            .collect();
+        for &i in &waiting {
+            self.unpark_wait(i);
+        }
+        for i in waiting {
+            if let TaskState::BlockedWait { addr, site, .. } = self.slots[i].state {
+                self.park_wait(i, site_key_in(win(self.slots[i].domain), addr, site));
+            }
         }
     }
 
@@ -12247,11 +12723,12 @@ impl Tasks {
     }
 
     /// How many tasks are live: what the `MAX_VCPUS` anti-bomb gate counts, as the oracle's
-    /// scheduler counts `live`.
+    /// scheduler counts `live`. A task waiting aside is live.
     fn live_count(&self) -> usize {
-        (self.live())
+        let running = (self.live())
             .filter(|&i| !matches!(self.slots[i].state, TaskState::Done(_)))
-            .count()
+            .count();
+        running + self.waits.n
     }
 
     /// Drop the tasks that have ended from [`Self::live`], once each executor's rules have seen
@@ -12259,6 +12736,14 @@ impl Tasks {
     /// with them: what a joiner or a reaper reads of an ended task is its result. The debug
     /// scheduler never prunes, so its inspection still reads where a thread ended.
     fn prune(&mut self) {
+        // #2868 — a futex wait waits aside from the first round after its park.
+        debug_assert!(
+            (self.live.iter())
+                .all(|&i| !matches!(self.slots[i].state, TaskState::BlockedWait { .. }))
+                && (self.waiting())
+                    .all(|i| matches!(self.slots[i].state, TaskState::BlockedWait { .. })),
+            "a futex wait waits aside, and only a futex wait does"
+        );
         let slots = &mut self.slots;
         (self.live).retain(|&i| {
             let t = &mut slots[i];
@@ -12298,6 +12783,8 @@ struct TaskSlot {
     /// #2695 step 2 — `Some` on an **activation** of a held domain: a call it runs, at the op's
     /// handler, on the fuel of the caller it answers. It charges its domain no vCPU.
     answers: Option<Box<Answers>>,
+    /// #2868 — the key of the futex wait the task waits aside on ([`Waits`]), while it does.
+    waits_on: Option<super::FutexKey>,
 }
 
 /// #2695 step 2 — the call an activation of a held domain answers ([`TaskSlot::answers`]).
@@ -12317,6 +12804,7 @@ impl TaskSlot {
             vm: Box::new(TaskVm {
                 vt,
                 suspended: None,
+                native: None,
             }),
             domain,
             state: TaskState::Runnable,
@@ -12324,6 +12812,7 @@ impl TaskSlot {
             live,
             at_bp: false,
             answers: None,
+            waits_on: None,
         }
     }
 
@@ -12331,6 +12820,14 @@ impl TaskSlot {
     /// ([`TaskVm::parked_frame`]): a woken wait's status, a joined child's result, a call's reply. The
     /// one way the scheduler's rules write a task's registers, its own included.
     fn deliver(&mut self, dst: u32, value: Reg) {
+        // #2958 — a native task's parked op has no frame: its results land in its cell.
+        if let Some(cell) = self.vm.native.as_mut() {
+            debug_assert!((dst as usize) < cell.len(), "a native result past its cell");
+            if let Some(r) = cell.get_mut(dst as usize) {
+                *r = value;
+            }
+            return;
+        }
         self.vm.parked_frame().set(dst, value);
     }
 
@@ -12350,6 +12847,9 @@ struct TaskVm {
     /// #1896 — the rest of a call that parked in a bounce out of this task's emitted leaf, run once
     /// the park clears.
     suspended: Option<Box<Suspended>>,
+    /// #2958 — set while a native task's §12 op is parked ([`BounceTask::park_native`]): where the
+    /// rules deliver its results, from register 0.
+    native: Option<[Reg; 2]>,
 }
 
 impl TaskVm {
@@ -12784,17 +13284,20 @@ fn freeze_rule_here(site: super::ParkSite) -> super::FreezeRule {
 /// [`freeze_step`]). `true` when it re-admitted one.
 fn admit_parks(tasks: &mut Tasks) -> bool {
     use super::FreezeRule;
-    let mut admitted = false;
+    // The freeze ended each futex wait, not its event: the thaw re-issues it (#1769). #2868 — they
+    // wait aside.
+    debug_assert!(freeze_rule_here(super::ParkSite::Futex) == FreezeRule::Reissue);
+    let waiting: Vec<usize> = tasks.waiting().collect();
+    let mut admitted = !waiting.is_empty();
+    for i in waiting {
+        tasks.end_wait(i, temen_ir::durable_abi::WAIT_FROZEN);
+    }
     for (_, t) in tasks.live_mut() {
         let Some(site) = t.state.park_site() else {
             continue;
         };
         if freeze_rule_here(site) != FreezeRule::Reissue {
             continue;
-        }
-        // The freeze ended this wait, not its event: the thaw re-issues it (#1769).
-        if let TaskState::BlockedWait { dst, .. } = t.state {
-            t.deliver(dst, Reg::from_i32(temen_ir::durable_abi::WAIT_FROZEN));
         }
         t.state = TaskState::Runnable;
         admitted = true;
@@ -12805,13 +13308,14 @@ fn admit_parks(tasks: &mut Tasks) -> bool {
 /// The oracle's `quiesced_parks_only`: something is parked that a freeze could re-admit — a
 /// `svc.wait` (or a resumer idling beside it) or a futex wait — and no futex wait has a deadline.
 fn quiesced_parks_only(tasks: &Tasks, fibers: &[FiberState]) -> bool {
-    let mut any = false;
+    // #2868 — the futex waits wait aside.
+    if tasks.next_deadline().is_some() {
+        return false;
+    }
+    let mut any = tasks.any_waiting();
     for i in tasks.live() {
-        match tasks[i].state {
-            TaskState::BlockedSvc | TaskState::BlockedOnFiber { .. } => any = true,
-            TaskState::BlockedWait { deadline: None, .. } => any = true,
-            TaskState::BlockedWait { .. } => return false,
-            _ => {}
+        if let TaskState::BlockedSvc | TaskState::BlockedOnFiber { .. } = tasks[i].state {
+            any = true;
         }
     }
     for f in fibers {
@@ -13009,7 +13513,7 @@ fn fail_call(
 /// bounce, so only these stops can wait in a leaf's; any other refuses, as a bounce that cannot wait
 /// does. `win` is the task's window, which a futex wait's site is taken on.
 fn hand_off(
-    tasks: &mut [TaskSlot],
+    tasks: &mut Tasks,
     forked_twins: &mut std::collections::BTreeSet<usize>,
     hooked_twins: &std::collections::BTreeSet<usize>,
     ti: usize,
@@ -13028,12 +13532,15 @@ fn hand_off(
         VcpuStop::Wait {
             base, timeout, dst, ..
         } => {
+            let site = win.ok_or(Trap::CapFault)?.futex_site(base);
             tasks[ti].state = TaskState::BlockedWait {
                 addr: base,
-                site: win.ok_or(Trap::CapFault)?.futex_site(base),
+                site,
                 deadline: timeout.map(|t| clock.saturating_add(t)),
                 dst,
             };
+            let win = win.map(|m| m as &dyn super::FutexWindow);
+            tasks.park_wait(ti, site_key_in(win, base, site));
             return Ok(None);
         }
         VcpuStop::SpawnSelf { cmd, plan, dst } => {
@@ -13510,17 +14017,35 @@ fn settle_wakes(
     // still mid-step on its thread is marked done too, and its thread drops the stop it brings
     // back). It runs before the exit-hook step below, so the twin retires (WIFSIGNALED via
     // `term_sig`) and the signaller's `waitpid` reaps it in the same settle. Domain-scoped
-    // (invariant 12).
-    let killed: Vec<usize> = (tasks.live())
-        .filter(|&ti2| {
-            let t = &tasks[ti2];
-            !matches!(t.state, TaskState::Done(_))
-                && (domains[t.domain].host.lock_unpoisoned().signal_poll())
-                    .is_some_and(|(_, s)| s.killed())
-        })
-        .collect();
-    for ti2 in killed {
-        complete(tasks, domains, ti2, Err(Trap::ThreadFault));
+    // (invariant 12). #2868 — a domain is asked once for each run of its tasks in the list, and a
+    // task waiting aside is one of a killed domain's members.
+    let mut killed_domains: Vec<usize> = Vec::new();
+    let mut last = None;
+    let alive = (tasks.live())
+        .filter(|&i| !matches!(tasks[i].state, TaskState::Done(_)))
+        .map(|i| tasks[i].domain);
+    for k in alive.chain(tasks.waiting_domains()) {
+        // A domain's tasks are mostly side by side in the list.
+        if last == Some(k) {
+            continue;
+        }
+        last = Some(k);
+        let killed =
+            || (domains[k].host.lock_unpoisoned().signal_poll()).is_some_and(|(_, s)| s.killed());
+        if !killed_domains.contains(&k) && killed() {
+            killed_domains.push(k);
+        }
+    }
+    if !killed_domains.is_empty() {
+        let killed: Vec<usize> = (tasks.members().into_iter())
+            .filter(|&i| {
+                !matches!(tasks[i].state, TaskState::Done(_))
+                    && killed_domains.contains(&tasks[i].domain)
+            })
+            .collect();
+        for ti2 in killed {
+            complete(tasks, domains, ti2, Err(Trap::ThreadFault));
+        }
     }
     // FORK.md §8.6 / #1807 — a child domain that has finished (every task on its domain done, cleanly
     // or not) releases its pipe ends once: the tree-walker's domain-finish `drop_all_pipe_*`. A
@@ -13529,6 +14054,7 @@ fn settle_wakes(
     // is the run's, which its teardown handles.
     // #2229 — a domain's last task to end is in the live list, done, until the next prune: the
     // domains to look at are those of the live list's tasks, each with whether one is still live.
+    // #2868 — a task waiting aside is alive too.
     let mut live = std::collections::BTreeMap::<usize, bool>::new();
     for i in tasks.live() {
         let t = &tasks[i];
@@ -13539,7 +14065,8 @@ fn settle_wakes(
     let mut finished: Vec<usize> = Vec::new();
     let mut ends = Vec::new();
     for (k, live) in live {
-        if !live && released.domains.insert(k) {
+        if !live && !tasks.waits_in(k) && released.domains.insert(k) {
+            tasks.forget_domain(k);
             let mut h = domains[k].host.lock_unpoisoned();
             // #1936 — its end post is signalled, every task of it done, its waiters woken below, in
             // this settle: before the run can be read as deadlocked.
@@ -13780,15 +14307,13 @@ impl SchedCore {
     ) -> Result<SchedCore, Trap> {
         let mut h = host.lock_unpoisoned();
         reapply_installs(&h, source, &table)?;
-        // Fuel unification (safepoint-anchored): charge one fuel for *entering the top-level entry
-        // function*, mirroring the per-callee-entry charge at `Op::Call`/`CallIndirect`/`TailCall*` and
-        // the JIT's entry-prologue charge, so the tree-walker, bytecode, and JIT engines burn identically.
-        // Gated exactly as the tree-walker's `drive` (`super::drive_arc`): a durable **thaw** re-enters to
-        // continue an already-charged run (the root re-enters under `REWINDING`), so it must not re-charge.
-        if !thaws(&h, mem.as_ref()) {
-            fuel.burn()?;
-        }
-        let root_vt = VTask::new(&source.primary(), entry as usize, args, Some(h.own_node()))?;
+        // Fuel unification: the root's entry is paid as its task is made, as a thread's is
+        // ([`entry_task`]). Gated exactly as the tree-walker's `drive` (`super::drive_arc`): a durable
+        // **thaw** re-enters to continue an already-charged run (the root re-enters under
+        // `REWINDING`), so it must not re-charge.
+        let charge = (!thaws(&h, mem.as_ref())).then_some(&mut fuel);
+        let root = &source.primary();
+        let root_vt = entry_task(root, 0, entry as usize, args, Some(h.own_node()), charge)?;
         let tasks: Tasks = std::iter::once(TaskSlot::new(root_vt, 0, LiveVcpu::none())).collect();
         wire_kill(&h);
         // #1122/#1146/#1262 — the run's bell ([`SchedCore::bell`]): wire the root's personality
@@ -13940,6 +14465,11 @@ impl CoopSched {
     /// Not a run that froze: the cut carries them.
     fn pump(&mut self, source: &ModuleSource, budget: u64) -> Result<CoopStep, Trap> {
         let step = self.pump_to_pause(source, budget);
+        // #1827 — the run is over: its processes that trapped are published on the thread that
+        // pumped it, as the oracle publishes its own. A held run's end is its `finish`.
+        if matches!(step, Ok(CoopStep::Done(_)) | Err(_)) && self.core.held.is_none() {
+            super::publish_twin_traps(std::mem::take(&mut self.core.tasks.twin_traps));
+        }
         let ended = match &step {
             Ok(CoopStep::Done(_)) => !root_unwinding(&self.core.domains),
             Ok(_) => false,
@@ -14221,7 +14751,7 @@ impl CoopSched {
             // #2538 — and while a task waits on a call: its answer is drained between quanta, so a
             // lone runnable task must yield to let it through, or a thread that waits on the world
             // never wakes while another spins on it.
-            let (quantum, preemptible) = if next_wait_deadline(tasks).is_some() || {
+            let (quantum, preemptible) = if tasks.next_deadline().is_some() || {
                 let (mut runnable, mut awaits_call) = (0, false);
                 for t in tasks.live().map(|i| &tasks[i]) {
                     if matches!(t.state, TaskState::Runnable) {
@@ -14373,8 +14903,10 @@ impl CoopSched {
             // The step is over: what follows may lock any domain's cell, this task's included.
             drop(guard);
             tasks[ti].answers = lent;
-            // The first fault recorded wins; the run entry clears the slot beforehand.
-            if let Some(a) = fault {
+            // The first fault recorded wins; the run entry clears the slot beforehand. A process's
+            // own is not the run's: its trap is recorded apart ([`complete`], #1827), as the oracle
+            // keeps a twin's out of the run's trap origin (#1665).
+            if let Some(a) = fault.filter(|_| !tasks.pids.contains_key(&ti)) {
                 super::LAST_CAPTURE_FAULT.with(|c| _ = c.borrow_mut().get_or_insert(a));
             }
             // #2224 — logical time moves with work: a quantum that ran out moves the clock by its
@@ -14395,7 +14927,9 @@ impl CoopSched {
                 Ok(VcpuStop::CapPending { id, .. }) => Some(*id),
                 _ => None,
             };
-            if let Some(step) = core.on_stop(emit, source, ti, stop) {
+            // The pump settles every round whatever the stop changed: its round's settle is its only
+            // look at what the world did meanwhile (#2963).
+            if let Applied::Pause(step) = core.on_stop(emit, source, ti, stop) {
                 return Ok(step);
             }
             // #2695 step 2 — an activation that has answered frees its slot, and the embedder's call
@@ -14531,6 +15065,25 @@ impl CoopSched {
     }
 }
 
+/// What applying a stop to the run changed ([`SchedCore::on_stop`]), for its executor to follow up.
+/// Every stop changes anything unless its rule says otherwise.
+enum Applied {
+    /// The pump pauses for its host: a tier-up, a task's entry included, or an emitted `Jit.invoke`,
+    /// recorded in the `EmitTier`.
+    Pause(CoopStep),
+    /// #2963 — a futex stop that moved only futex task state: the stopping task, which runs on or
+    /// waits aside, and the tasks its notify woke, which [`Waits::woken`] holds until the stop's
+    /// executor takes them under the same lock hold ([`ThreadRun::apply`]). No task ended, no fiber
+    /// moved, and no park of any other kind began or ended, so a settle after it would find only
+    /// what the last one found and what the world did since, which wakes its own waiters
+    /// ([`ThreadRun::apply`]). It relies on no task being runnable yet held back by something a
+    /// futex park could release: a dispatch-time lane on the bytecode drivers (#1600) would make a
+    /// lane-freeing park [`Applied::All`].
+    Futex,
+    /// Anything may have changed.
+    All,
+}
+
 impl SchedCore {
     /// The stop half of a pump round (#1414 3e): what a task's step stopped on, applied to the run,
     /// one arm per stop (a park, a spawn, a fork, a live call, a futex op, a JIT op). `Some(step)`
@@ -14547,7 +15100,7 @@ impl SchedCore {
         source: &ModuleSource,
         ti: usize,
         stop: Result<VcpuStop, Trap>,
-    ) -> Option<CoopStep> {
+    ) -> Applied {
         let SchedCore {
             tasks,
             domains,
@@ -14595,7 +15148,7 @@ impl SchedCore {
                 *pending_tierup = Some((ti, dst, results));
                 *pending_call = Some((module, func));
                 let window = domains[tasks[ti].domain].mem.as_ref();
-                return Some(CoopStep::TierUp {
+                return Applied::Pause(CoopStep::TierUp {
                     module,
                     func,
                     argv,
@@ -14648,7 +15201,7 @@ impl SchedCore {
                 // park probe).
                 if callee_env.is_some_and(|k| dead_domains.contains(&k)) {
                     fail_call(tasks, domains, ti, dst, sig.results(), super::CAP_REVOKED);
-                    return None;
+                    return Applied::All;
                 }
                 // #2695 step 2 — a call made in a held run names who pays for it: the activation that
                 // serves it runs on its caller's fuel, whichever thread starts it.
@@ -14720,7 +15273,7 @@ impl SchedCore {
                     paged.filter(|&(p, ..)| !dead_domains.contains(&p))
                 else {
                     complete(tasks, domains, ti, Err(Trap::MemoryFault));
-                    return None;
+                    return Applied::All;
                 };
                 let pager = std::sync::Arc::clone(&domains[pager_env].host);
                 let ticket = pager.lock_unpoisoned().request_page(export, sink);
@@ -14905,8 +15458,13 @@ impl SchedCore {
                         Some(caller_env).filter(|&ck| ck != 0).and_then(|ck| {
                             let env = &domains[ck];
                             let at = (&tasks[caller_ti].vm.vt.active, caller_dst, reply_twin);
-                            let (twin_mem, twin_host, live, twin_vt) =
-                                fork_process(&env.host, env.mem.as_ref(), twin_pid, at)?;
+                            let (twin_mem, twin_host, live, twin_vt) = fork_process(
+                                &env.host,
+                                env.mem.as_ref(),
+                                twin_pid,
+                                at,
+                                bell.as_ref(),
+                            )?;
                             Some((ck, twin_mem, twin_host, live, twin_vt))
                         })
                     } else {
@@ -14933,6 +15491,7 @@ impl SchedCore {
                     let twin_eidx = domains.len();
                     domains.push(Domain {
                         mem: twin_mem,
+                        native: None,
                         host: twin_host.into_cell(),
                         table: std::sync::Arc::new(twin_table),
                         fuel: domains[ck].fuel.for_thread(),
@@ -14945,6 +15504,7 @@ impl SchedCore {
                     });
                     let twin_ti = tasks.len();
                     tasks.push(TaskSlot::new(twin_vt, twin_eidx, live));
+                    tasks.pids.insert(twin_ti, twin_ti as u64);
                     // Mark the twin reapable so a later servicer-side `wait()` (`reap`) can deliver
                     // its exit status to the parent (FORK.md §8.6); retired when reaped.
                     forked_twins.insert(twin_ti);
@@ -15061,7 +15621,7 @@ impl SchedCore {
                 macro_rules! refuse {
                     ($e:expr) => {{
                         tasks[ti].deliver(dst, Reg::from_i32($e as i32));
-                        return None;
+                        return Applied::All;
                     }};
                 }
                 // Admissible from a clean root computation only (no serve handler, root fiber, a
@@ -15112,6 +15672,7 @@ impl SchedCore {
                                 let eidx = domains.len();
                                 domains.push(Domain {
                                     mem: Some(built.mem),
+                                    native: None,
                                     host: built.host.into_cell(),
                                     table: std::sync::Arc::new(built.table),
                                     fuel,
@@ -15165,11 +15726,11 @@ impl SchedCore {
                 // from any other fiber keeps its placeholder.
                 if tasks[ti].vm.vt.active.dispatch().is_some() || tasks[ti].answers.is_some() {
                     tasks[ti].deliver(dst, Reg::from_i64(super::EINVAL));
-                    return None;
+                    return Applied::All;
                 }
                 if tasks[ti].vm.vt.active_id != ROOT_FIBER {
                     tasks[ti].deliver(dst, Reg::from_i64(temen_ir::errno::ENOSYS));
-                    return None;
+                    return Applied::All;
                 }
                 let r = spawn_task(
                     tasks,
@@ -15206,7 +15767,7 @@ impl SchedCore {
                     let win = domains[env].mem.as_ref();
                     // The return-twice `0`; the parent keeps the twin's pid, set below.
                     let at = (&tasks[ti].vm.vt.active, dst, 0);
-                    fork_process(&domains[env].host, win, twin_pid, at)
+                    fork_process(&domains[env].host, win, twin_pid, at, bell.as_ref())
                 } else {
                     None
                 };
@@ -15215,10 +15776,6 @@ impl SchedCore {
                         tasks[ti].deliver(dst, Reg::from_i64(super::EAGAIN));
                     }
                     Some((twin_mem, twin_host, live, mut twin_vt)) => {
-                        // #1080 / #1262 — the twin's own park door, so its own `fork()`/`waitpid()`
-                        // park (a bash pipeline subshell is a twin that forks and waits its
-                        // command), and its signal doors on the run's bell.
-                        wire_process(&twin_host, bell.as_ref());
                         // #1297: the twin's own dispatch table, seeded with the caller's installs.
                         let caller = &domains[env];
                         let (twin_table, twin_fuel, program) = (
@@ -15243,6 +15800,7 @@ impl SchedCore {
                         let twin_eidx = domains.len();
                         domains.push(Domain {
                             mem: twin_mem,
+                            native: None,
                             host: twin_host.into_cell(),
                             table: std::sync::Arc::new(twin_table),
                             fuel: twin_fuel,
@@ -15255,6 +15813,7 @@ impl SchedCore {
                         });
                         debug_assert_eq!(tasks.len(), twin_ti, "twin lands at its pre-read index");
                         tasks.push(TaskSlot::new(twin_vt, twin_eidx, live));
+                        tasks.pids.insert(twin_ti, twin_pid);
                         forked_twins.insert(twin_ti);
                         tasks[ti].deliver(dst, Reg::from_i64(twin_pid as i64));
                     }
@@ -15282,25 +15841,26 @@ impl SchedCore {
                 dst,
                 module,
             }) => {
-                let node = domains[tasks[ti].domain].host.lock_unpoisoned().own_node();
+                let e = &mut domains[tasks[ti].domain];
+                let node = e.host.lock_unpoisoned().own_node();
                 let payer = Some(node.clone());
-                let mut child = match thread_task(source, module as usize, func, arg0, arg1, payer)
-                {
+                let (m, fuel) = (module as usize, &mut e.fuel);
+                let mut child = match thread_task(source, m, func, arg0, arg1, payer, fuel) {
                     Ok(vt) => vt,
                     Err(t) => {
                         complete(tasks, domains, ti, Err(t));
-                        return None;
+                        return Applied::All;
                     }
                 };
                 if tasks.live_count() >= super::MAX_VCPUS {
                     complete(tasks, domains, ti, Err(Trap::ThreadFault)); // thread bomb
-                    return None;
+                    return Applied::All;
                 }
                 // #2001 — the thread is one `spawn` of its domain's node while it lives: a full
                 // ceiling refuses it as the live cap does.
                 let Some(live) = LiveVcpu::charge(node) else {
                     complete(tasks, domains, ti, Err(Trap::ThreadFault));
-                    return None;
+                    return Applied::All;
                 };
                 // #926 slice 2, #2248: a `thread.spawn` child tiers up its own eligible calls when
                 // the program it runs has an emit: the run's own, or a granted module's that a
@@ -15319,13 +15879,13 @@ impl SchedCore {
                 // dispatch through the table the emit reads (#2273, [`child_runs_emit`]).
                 // A thread shares its spawner's domain: its window, powerbox and child table.
                 let env = tasks[ti].domain;
+                // A domain over a native tier's own window (#2958 slice 3) is the tier's to serve.
                 let window = domains[env].mem.as_ref();
+                let servable = domains[env].native.is_some()
+                    || tierup_servable(window, domains[0].mem.as_ref());
                 let dispatches =
                     env == 0 || child_runs_emit(module, &domains[env].host.lock_unpoisoned());
-                if let Some(e) = programs
-                    .of(module)
-                    .filter(|_| dispatches && tierup_servable(window, domains[0].mem.as_ref()))
-                {
+                if let Some(e) = programs.of(module).filter(|_| dispatches && servable) {
                     let durable = domains[env].host.lock_unpoisoned().is_durable();
                     child.active.tier_up(module, e, !durable);
                 }
@@ -15364,11 +15924,11 @@ impl SchedCore {
                     Ok(Ok(c)) => c,
                     Ok(Err(refused)) => {
                         tasks[ti].deliver(dst, Reg::from_i32(refused.errno() as i32));
-                        return None;
+                        return Applied::All;
                     }
                     Err(t) => {
                         complete(tasks, domains, ti, Err(t));
-                        return None;
+                        return Applied::All;
                     }
                 };
                 // #816 env-routed tier-up, as for a confined child: the child tiers up its
@@ -15404,12 +15964,13 @@ impl SchedCore {
                 // The wait is against THIS task's domain's registry and window. A child's `wait`
                 // on its mapped ring flag must not re-read an unrelated root byte.
                 let e = &mut domains[tasks[ti].domain];
-                futex_wait(
+                let waited = futex_wait(
                     tasks,
                     ti,
                     &mut e.fibers.fibers,
                     &mut e.fibers.sp,
                     &mut e.mem,
+                    e.native.as_ref(),
                     || durable,
                     true,
                     *clock,
@@ -15419,21 +15980,38 @@ impl SchedCore {
                     timeout,
                     dst,
                 );
+                if let Err(t) = waited {
+                    complete(tasks, domains, ti, Err(t));
+                }
+                // #2963 — a task's own wait answered not-equal, or parked aside: nothing else moved.
+                // A fiber's park, and a fault, are anything's business.
+                let own = matches!(
+                    tasks[ti].state,
+                    TaskState::Runnable | TaskState::BlockedWait { .. }
+                );
+                if own && !fiber {
+                    return Applied::Futex;
+                }
             }
             Ok(VcpuStop::Notify { base, count, dst }) => {
                 // Wake up to `count` waiters, lowest task index first (deterministic). Key on the
                 // notifying task's own memory + backing identity (mirrors the wait arm), so a notify
                 // from one child's window matches a waiter parked from another child's window on the
                 // same `SharedRegion` byte.
-                let win = |env: usize| domains[env].mem.as_ref();
-                let key = futex_key_in(win(tasks[ti].domain), base);
+                let key = futex_key_in(domains[tasks[ti].domain].window(), base);
                 let want = count as u32;
-                let mut woken = wake_waiters(tasks, key, want, win);
+                let tasks_woken = tasks.notify(key, want);
                 // §3.6 slice 5a: then event-parked FIBER waiters, in every domain: the root's
                 // registry, then each child domain's.
                 let regs = domains.iter_mut().flat_map(|e| e.fibers.fibers.iter_mut());
-                woken += wake_fiber_waiters(regs, key, want - woken);
+                let fibers_woken = wake_fiber_waiters(regs, key, want - tasks_woken);
+                let woken = tasks_woken + fibers_woken;
                 tasks[ti].deliver(dst, Reg::from_i32(woken as i32));
+                // #2963 — only the tasks it woke moved ([`Waits::woken`]); a woken fiber's resumer
+                // is anything's business.
+                if fibers_woken == 0 {
+                    return Applied::Futex;
+                }
             }
             // #1936 — a post's signal: its op completed, so the task runs on.
             Ok(VcpuStop::WakeRegion(w)) => wake_region(tasks, domains, &w),
@@ -15455,7 +16033,7 @@ impl SchedCore {
                 let active = &mut tasks[ti].vm.vt.active;
                 if let Err(t) = jit_install(unit, source, table, active, dst, record) {
                     complete(tasks, domains, ti, Err(t));
-                    return None;
+                    return Applied::All;
                 }
             }
             Ok(VcpuStop::JitUninstall { h, slot, dst }) => {
@@ -15468,7 +16046,7 @@ impl SchedCore {
                 let cleared = jit_uninstall(jit_table, source, table, slot, active, dst, forget);
                 if let Err(t) = cleared {
                     complete(tasks, domains, ti, Err(t));
-                    return None;
+                    return Applied::All;
                 }
             }
             Ok(VcpuStop::JitInvoke {
@@ -15523,7 +16101,7 @@ impl SchedCore {
                 };
                 if let Some((wasm, mapped)) = surfaced {
                     *pending_jit = Some((ti, dst as usize, results.clone()));
-                    return Some(CoopStep::JitInvoke {
+                    return Applied::Pause(CoopStep::JitInvoke {
                         code,
                         wasm,
                         argv,
@@ -15570,12 +16148,12 @@ impl SchedCore {
                     }
                     Err(t) => {
                         complete(tasks, domains, ti, Err(t));
-                        return None;
+                        return Applied::All;
                     }
                 }
             }
         }
-        None
+        Applied::All
     }
 }
 
@@ -16150,6 +16728,7 @@ impl HeldPump {
         } = r;
         let core = &mut sched.core;
         refund_ended_windows(&mut core.tasks, &mut core.domains, true);
+        super::publish_twin_traps(std::mem::take(&mut core.tasks.twin_traps));
         let root = std::sync::Arc::clone(&core.domains[0].host);
         // The tasks hand their fuel back as they go, before the powerbox does.
         drop(sched);
@@ -16256,7 +16835,10 @@ impl HeldThreads {
         };
         // This thread waits on a park of its own while it carries the call, and counts in.
         match g.parks.get_mut(a) {
-            Some(park) => *park = Park::default(),
+            Some(park) => {
+                debug_assert!(!park.thread && !park.asleep, "an activation's slot is free");
+                *park = Park::default();
+            }
             None => g.parks.push(Park::default()),
         }
         g.live += 1;
@@ -16333,7 +16915,7 @@ impl CoopRun {
     /// wake from another of the embedder's threads ([`RunDoor::wake`], [`CoopEvent::Paused`]); or its
     /// end. After an idle, the pumping thread may [`wait`](Self::wait) for the run to change.
     /// Otherwise the run tells of nothing, and its first `run` returns at its end, with the root on
-    /// this thread where the platform says so ([`ThreadPlatform::root_on_opener`]). A browser's Worker
+    /// this thread where the platform says so ([`ThreadPlatform::opener`]). A browser's Worker
     /// runs a program that declares no host-answered call and is fed no input so.
     ///
     /// Its emitted tier is the platform's, so it surfaces no tier-up and no §22 invoke, and a
@@ -16351,18 +16933,54 @@ impl CoopRun {
         back: Option<std::sync::Arc<super::Region>>,
         pump: bool,
     ) -> Option<Result<CoopRun, Trap>> {
+        match Self::open_parallel(
+            m,
+            entry,
+            args,
+            fuel,
+            host,
+            init_mem,
+            reserved_log2,
+            back,
+            pump,
+        ) {
+            Ok(run) => Some(Ok(run)),
+            Err(refused) => refused.0.map(Err),
+        }
+    }
+
+    /// [`Self::new_parallel`], giving the host back whenever no run starts: with the trap that
+    /// refused it (its window, or the process's room for its activation), or with none when `m` is
+    /// outside the engine's subset or its host is durable. For an embedder whose caller keeps its host
+    /// whatever the run does (#2958, the Cranelift JIT's kernel route).
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_parallel(
+        m: &Module,
+        entry: FuncIdx,
+        args: &[Value],
+        fuel: u64,
+        host: Host,
+        init_mem: &[u8],
+        reserved_log2: u8,
+        back: Option<std::sync::Arc<super::Region>>,
+        pump: bool,
+    ) -> Result<CoopRun, Box<(Option<Trap>, Host)>> {
         let (source, table, mem) =
-            match parallel_domain(m, entry, &host, reserved_log2, back, init_mem)? {
-                Ok(start) => start,
-                Err(t) => return Some(Err(t)),
+            match parallel_domain(m, entry, &host, reserved_log2, back, init_mem) {
+                Some(Ok(start)) => start,
+                Some(Err(t)) => return Err(Box::new((Some(t), host))),
+                None => return Err(Box::new((None, host))),
             };
         let leaf = host.thread_platform().tier.and_then(|t| t.leaf);
         let leaf = leaf.and_then(|emit| root_leaf(&emit, m, &source, entry, &host, mem.as_ref()));
         match ThreadsRun::open(source, table, entry, args, fuel, mem, host, pump, leaf) {
-            Ok(t) => Some(Ok(CoopRun {
+            Ok(t) => Ok(CoopRun {
                 exec: CoopExec::Threads(t),
-            })),
-            Err(refused) => Some(Err(refused.0)),
+            }),
+            Err(refused) => {
+                let (t, host, _) = *refused;
+                Err(Box::new((Some(t), host)))
+            }
         }
     }
 
@@ -17134,6 +17752,7 @@ mod dbg_domain_end_tests {
             root,
             Domain {
                 mem: None,
+                native: None,
                 host: child.into_cell(),
                 table: table(),
                 program: 0,
@@ -17285,6 +17904,45 @@ const PIPE_SPIN_NS: u64 = 20_000;
 /// [`thread_wakes`]' count.
 static THREAD_WAKES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// [`futex_fast_stops`]' count, kept only in a debug build.
+#[cfg(debug_assertions)]
+static FAST_STOPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// #2982 — in a debug build, how many futex stops this process's executor 2 runs have applied
+/// without a settle ([`Applied::Futex`]), for a test to show the path was taken; `0` in a release
+/// build, which keeps no count.
+pub fn futex_fast_stops() -> u64 {
+    #[cfg(debug_assertions)]
+    return FAST_STOPS.load(std::sync::atomic::Ordering::Relaxed);
+    #[cfg(not(debug_assertions))]
+    0
+}
+
+/// [`futex_no_wakes`]' count, kept only in a debug build.
+#[cfg(debug_assertions)]
+static NO_WAKES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// #2958 slice 2 — in a debug build, how many futex ops this process's executor 2 runs have answered
+/// without the run lock ([`ThreadRun::no_wake`]): a notify with no waiter, a wait whose word already
+/// differed. For a test to show the path was taken; `0` in a release build, which keeps no count.
+pub fn futex_no_wakes() -> u64 {
+    #[cfg(debug_assertions)]
+    return NO_WAKES.load(std::sync::atomic::Ordering::Relaxed);
+    #[cfg(not(debug_assertions))]
+    0
+}
+
+/// [`thread_blocks`]' count.
+static THREAD_BLOCKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// #2963 — how many times this process's executor 2 threads have slept on a park and blocked: the
+/// sleep found no wake already waiting for it ([`Signal::wait`]), so the OS put the thread to
+/// sleep. A park whose wake landed first wakes without blocking. A pingpong's cost is mostly its
+/// blocks, so `temen-bench --threads` reads this per hand-off.
+pub fn thread_blocks() -> u64 {
+    THREAD_BLOCKS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// #2757 — how many times this process's executor 2 threads have woken from a sleep: a parked task's
 /// thread ([`ThreadRun::park`]) or a watcher ([`ThreadRun::watching`]). Each wakes only when something
 /// may end a park, never on a timer, so a test reads this before and after an idle window to prove
@@ -17304,6 +17962,18 @@ struct Threads {
     /// The parks to signal once the lock is let go ([`release`]): a thread signalled under the
     /// lock would wake only to wait for it.
     woken: Vec<std::sync::Arc<Signal>>,
+    /// #2963 — how many threads step a task, or are about to look at it, rather than sleep on its
+    /// park: those that will take the lock again with no wake. A park that would leave none settles
+    /// first ([`ThreadRun::park`]). [`Threads::set_park`] alone writes it.
+    awake: usize,
+    /// #2982 — the ring count of the run's bell ([`ThreadRun::bell`]) that its last settle read
+    /// before it ran; `None` until the first, so the run's first stop settles whatever it is: what
+    /// the world did before the run wired its doors to the bell rang nothing (a kill asked of its
+    /// signal source before it started, say). A futex stop skips its settle only while the bell still reads
+    /// this ([`ThreadRun::apply`]): whatever the world does that a settle would find rings the
+    /// bell, or wakes the parked thread it concerns itself. A ring that lands during a settle,
+    /// after its read, is seen by the next stop.
+    seen: Option<u64>,
     /// The run's result once it is over: its root's, or a deadlock's `ThreadFault`. Every thread
     /// ends at its next look.
     over: Option<Result<Vec<Value>, Trap>>,
@@ -17342,8 +18012,11 @@ struct Park {
     signal: std::sync::Arc<Signal>,
     /// Whether the thread waits on `signal` and nothing has woken it yet. The wake scan wakes it once
     /// its task needs no rule to go on ([`ThreadRun::awake`]), whatever changed its state: a rule, or
-    /// a store outside the lock (a continue).
+    /// a store outside the lock (a continue). Written through [`Threads::set_park`].
     asleep: bool,
+    /// #2963 — whether a thread steps the task or sleeps on this park ([`carry`]). Written through
+    /// [`Threads::set_park`].
+    thread: bool,
     /// #2757 — what the thread's park registered on the pipes it waits on ([`ThreadRun::listen`]),
     /// until the thread wakes.
     listen: Option<Listen>,
@@ -17383,6 +18056,9 @@ impl Signal {
     /// end early: its caller looks again either way. No clock is read, which wasm32 lacks.
     fn wait(&self, timeout: Option<std::time::Duration>) {
         let mut woken = self.woken.lock_unpoisoned();
+        if !*woken {
+            THREAD_BLOCKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         match timeout {
             None => {
                 while !*woken {
@@ -17421,9 +18097,27 @@ impl Threads {
 
     /// Wake task `j`'s thread when the lock is let go ([`release`]).
     fn rouse(&mut self, j: usize) {
+        self.set_park(j, None, Some(false));
+        self.woken
+            .push(std::sync::Arc::clone(&self.parks[j].signal));
+    }
+
+    /// #2963 — set whether a thread is on task `j`'s park, and whether it sleeps there, keeping
+    /// [`Self::awake`]: the only writer of either, and of the count.
+    fn set_park(&mut self, j: usize, thread: Option<bool>, asleep: Option<bool>) {
         let park = &mut self.parks[j];
-        park.asleep = false;
-        self.woken.push(std::sync::Arc::clone(&park.signal));
+        let was = park.thread && !park.asleep;
+        park.thread = thread.unwrap_or(park.thread);
+        park.asleep = asleep.unwrap_or(park.asleep);
+        let now = park.thread && !park.asleep;
+        self.awake = self.awake + usize::from(now) - usize::from(was);
+    }
+
+    /// #2963 — [`Self::awake`] as the parks have it.
+    fn awake_by_parks(&self) -> usize {
+        (self.parks.iter())
+            .filter(|p| p.thread && !p.asleep)
+            .count()
     }
 
     /// What a thread steps a task of domain `env` over: its own view of the domain's window and its
@@ -17444,6 +18138,9 @@ impl Threads {
 struct ThreadRun {
     /// The run's program.
     source: std::sync::Arc<ModuleSource>,
+    /// #2958 slice 3 — the root domain's native window ([`Domain::native`]), which its tasks' calls
+    /// read without the run's lock ([`futex_window`]).
+    native: Option<NativeWindow>,
     /// The root domain's powerbox, the same cell as the core's domain `0`'s: the embedder's door
     /// and the run's end reach it without the core's lock.
     root: DomainCell,
@@ -17458,16 +18155,21 @@ struct ThreadRun {
     bell: super::Bell,
     /// The hook a punted call's store calls as its answer posts: ring [`Self::bell`].
     on_answer: std::sync::Arc<dyn Fn() + Send + Sync>,
-    /// Whether the thread that opened the run watches it ([`ThreadPlatform::root_on_opener`]), or
+    /// Whether the thread that opened the run watches it ([`ThreadPlatform::opener`]), or
     /// its embedder, while it pumps it. A run nobody watches starts a watcher of its own
     /// ([`Self::start_watcher`]).
     watched: bool,
     ended: std::sync::Condvar,
-    /// Whether the run is over ([`Threads::over`]), for emitted code to read without the lock
-    /// ([`EmittedCall::over`]).
-    over: std::sync::atomic::AtomicBool,
+    /// The run's end word, for emitted code to read without the lock ([`EmittedCall::end`]): `0`
+    /// while it runs. [`Self::conclude`] sets it to `DOMAIN_DONE` once [`Threads::over`] holds the
+    /// verdict, unless a native tier's code ended it first ([`ThreadTier::native`]).
+    end: std::sync::atomic::AtomicI64,
     /// The embedder's door into the run from outside it ([`Host::set_run_door`]), if it has one.
     door: Option<std::sync::Arc<RunDoor>>,
+    /// #2958 slice 2 — the run's futex wait counts, the same table as its tasks' [`Waits::count`]
+    /// (taken at open; only the cooperative debugger's restore rebuilds a core's tasks), for a notify
+    /// to read without the lock ([`Self::no_wake`]).
+    count: std::sync::Arc<super::futex_count::FutexCount>,
 }
 
 /// The embedder's door into a run on executor 2 from outside it (#1414 S5a, 5b-2): it can
@@ -17549,13 +18251,22 @@ pub struct ThreadPlatform {
     pub now_ns: fn() -> u64,
     /// The emitted tier the run's tasks tier up to, if any ([`ThreadTier`]).
     pub tier: Option<ThreadTier>,
-    /// Whether the thread that opens a run runs its root task too. Otherwise the root starts on a
-    /// thread of its own, like every other task, and the opener watches the run: it settles the run
-    /// on each ring of the run's bell. A browser opens a run on the Worker the page started for its
-    /// root, since another Worker costs a run about 11 ms to start, and its page cannot wait to
-    /// watch. Such a run starts a watcher of its own only once a task parks on what only a ring of
-    /// its bell ends (#2757).
-    pub root_on_opener: bool,
+    /// What the thread that opens a run does ([`Opener`]).
+    pub opener: Opener,
+}
+
+/// What the thread that opens a run on executor 2 does ([`ThreadPlatform::opener`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Opener {
+    /// It watches the run: it settles the run on each ring of the run's bell, and the root starts on
+    /// a thread of its own, like every other task.
+    Watches,
+    /// It runs the root task, and the run starts a watcher of its own only once a task parks on what
+    /// only a ring of its bell ends (#2757). A browser opens a run on the Worker the page started for
+    /// its root, since another Worker costs a run about 11 ms to start, and its page cannot wait to
+    /// watch. The Cranelift JIT's too (#2958): its root runs on the embedder's calling thread, as it
+    /// does off executor 2. A futex stop needs no watcher to skip its settle (#2982).
+    RunsRoot,
 }
 
 /// A thread a run starts ([`ThreadPlatform::spawn`]), for the platform to run on a thread of its own.
@@ -17571,7 +18282,7 @@ impl ThreadPlatform {
         spawn: |f, _| std::thread::Builder::new().spawn(f).map(drop),
         now_ns: sched_wall_now,
         tier: None,
-        root_on_opener: false,
+        opener: Opener::Watches,
     };
 }
 
@@ -17600,9 +18311,47 @@ pub struct ThreadTier {
     /// it may take one that parks. `None` interprets them.
     pub leaf: Option<LeafEmitter>,
     /// Run one call on the emitted tier, on the calling thread. Once the run is over
-    /// ([`EmittedCall::over`]) it returns by the emitted code's next fuel check, whatever it
+    /// ([`EmittedCall::end`]) it returns by the emitted code's next fuel check, whatever it
     /// returns: the run waits for its thread.
     pub run: fn(&mut EmittedCall<'_>) -> Result<(), Trap>,
+    /// #2958 — a tier whose emitted code makes the §12 thread ops itself and parks its own frames
+    /// for them ([`EmittedCall::park`]): the Cranelift JIT's, for a program [`native_scope`]
+    /// admits. `None` for a tier that bounces them to the interpreter.
+    pub native: Option<NativeTier>,
+}
+
+/// #2958 — what a native tier needs from the run beyond [`ThreadTier`]. Its code polls the run's
+/// own end word ([`EmittedCall::end`]) as its domain's end, and raises it first-wins as it traps: a
+/// set word then means only that the run is ending, and the verdict is [`ThreadRun::conclude`]'s.
+#[derive(Clone)]
+pub struct NativeTier {
+    /// The tier's own run state, for its [`ThreadTier::run`] to find ([`EmittedCall::native`]).
+    pub state: std::sync::Arc<dyn std::any::Any + Send + Sync>,
+    /// #2958 slice 3 — the tier's own window, if the module has one: the run builds no [`Mem`] over
+    /// it, its rules read it through the one page map ([`super::FutexWindow`]), and its activation
+    /// charges what the tier's window start says it holds.
+    pub window: Option<TierWindow>,
+}
+
+/// #2958 slice 3 — a native tier's window ([`NativeTier::window`]), already started by the tier: what
+/// the rules read it through, and what the run's activation charges for it.
+#[derive(Clone)]
+pub struct TierWindow {
+    pub read: std::sync::Arc<dyn super::FutexWindow + Send + Sync>,
+    pub charge: super::RootWindow,
+}
+
+pub use temen_ir::seams::NativeStop;
+
+/// #2958 — whether an emitted call is its task's whole run ([`EmittedCall::entry`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CallEntry {
+    /// A call the task's interpreted code made, or a §22 invoke.
+    Call,
+    /// The run's root task's entry.
+    Root,
+    /// A spawned thread's entry.
+    Thread,
 }
 
 /// What a call on the emitted tier runs ([`EmittedCall::target`]).
@@ -17636,8 +18385,10 @@ pub struct EmittedCall<'a> {
     /// ([`super::Region::foreign_id`], #1414 ED-2), where the host places the window and the
     /// call's context.
     pub memory: Option<u32>,
-    /// Set once the run is over. Emitted code still running then stops at its next fuel check.
-    pub over: &'a std::sync::atomic::AtomicBool,
+    /// The run's end word: nonzero once the run is ending. Emitted code still running then stops at
+    /// its next fuel check. A native tier's code polls it as its domain's end, and raises it as it
+    /// traps ([`NativeTier`]).
+    pub end: &'a std::sync::atomic::AtomicI64,
     /// The results, as raw i64 slots: `run` fills them.
     pub results: Vec<i64>,
     /// #2474 — the work the call did on the emitted tier, the fuel its code burned: `run` counts it,
@@ -17647,8 +18398,17 @@ pub struct EmittedCall<'a> {
     /// guard left (#2126). `run` sets it, and the task's window records it, as it records an
     /// interpreted fault (#2275).
     pub fault: Option<u64>,
-    /// A call out of the emitted code back into the interpreter ([`Bounce`]).
-    pub bounce: &'a mut Bounce<'a>,
+    /// #2958 — the task's `vcpu.tls` seed: its id in its domain.
+    pub tls: i64,
+    /// #2958 — whether the call is its task's entry, which the task ran whole ([`CallEntry`]).
+    pub entry: CallEntry,
+    /// #2958 — on a native tier, the budget node the task's fuel draws from (`None` when its fuel
+    /// is a fixed allowance, or the tier is not native): what the tier's own fuel cell charges, so
+    /// its code burns from the one source a task's fuel has.
+    pub fuel_node: Option<super::NodeRef>,
+    /// What the emitted code calls back into on its task ([`TaskSeam`]).
+    seam: &'a mut dyn TaskSeam,
+    native: Option<&'a NativeTier>,
     table: &'a SharedSlots,
     host: &'a std::sync::Mutex<super::Host>,
     now: &'a std::cell::Cell<u64>,
@@ -17657,6 +18417,37 @@ pub struct EmittedCall<'a> {
 }
 
 impl EmittedCall<'_> {
+    /// A call out of the emitted code back into the interpreter (`env.call_interp`): function
+    /// `target` of the task's dispatch table, its arguments in `io` and its results written back
+    /// over them, run over the task's live window and powerbox, with how many words the emitted
+    /// frames beneath it pushed to the thread's spill stack ([`EmittedCall::spill`]). Returns how
+    /// many results it wrote.
+    #[inline]
+    pub fn bounce(&mut self, target: u32, io: &mut [i64], pushed: usize) -> Result<usize, Trap> {
+        self.seam.bounce(target, io, pushed)
+    }
+
+    /// #2958 — apply §12 op `stop` for the task this call runs, as the rules apply an interpreted
+    /// op's, parking this thread with the emitted frames on its stack until the task can run:
+    /// `(status, value)` for a join, the result in `[0]` otherwise. `Err` when the task or the run
+    /// ended meanwhile, or the op traps; the emitted code then unwinds. Only a native tier's code
+    /// makes one ([`ThreadTier::native`]).
+    #[inline]
+    pub fn park(&mut self, stop: NativeStop) -> Result<[i64; 2], Trap> {
+        self.seam.park(stop)
+    }
+
+    /// #2958 — the powerbox the call runs under: its domain's host cell, which a native tier's
+    /// `call.cap`s serialize through.
+    pub fn host_cell(&self) -> *const std::sync::Mutex<super::Host> {
+        self.host
+    }
+
+    /// #2958 — the run's native tier ([`ThreadTier::native`]), if its tier is one.
+    pub fn native(&self) -> Option<&NativeTier> {
+        self.native
+    }
+
     /// The generation of the task's dispatch table: it moves with every install and uninstall, so
     /// a host that mirrors the table in emitted code rebuilds only when it changed.
     pub fn table_gen(&self) -> u32 {
@@ -17755,11 +18546,162 @@ struct SurfacedInvoke {
 /// A task a stop made, with the window view and fuel hand its new thread starts with.
 type NewTask = (usize, Option<Mem>, Fuel);
 
-/// A call out of emitted code back into the interpreter (`env.call_interp`): function
-/// `target` of the task's dispatch table, its arguments in `io` and its results written back over
-/// them, run over the task's live window and powerbox, with how many words the emitted frames beneath
-/// it pushed to the thread's spill stack ([`EmittedCall::spill`]). Returns how many results it wrote.
-pub type Bounce<'a> = dyn FnMut(u32, &mut [i64], usize) -> Result<usize, Trap> + 'a;
+/// What emitted code calls back into on its task ([`EmittedCall::bounce`], [`EmittedCall::park`]):
+/// one borrow of the task, its window and its fuel for the call, so neither path needs a runtime
+/// borrow check (#2958).
+trait TaskSeam {
+    fn bounce(&mut self, target: u32, io: &mut [i64], pushed: usize) -> Result<usize, Trap>;
+    fn park(&mut self, stop: NativeStop) -> Result<[i64; 2], Trap>;
+}
+
+/// [`ThreadRun::emitted`]'s seam: what one emitted call's bounces and parks run over.
+struct CallSeam<'s, 'f, 't> {
+    run: &'s ThreadRun,
+    table: &'s SharedSlots,
+    fuel: &'s mut Fuel,
+    mem: &'s mut Option<Mem>,
+    host: &'s std::sync::Mutex<super::Host>,
+    fibers: &'s mut FiberCell<'f>,
+    task: Option<BounceTask<'t>>,
+    spill: &'s [u64],
+    pages: &'s mut PageTable,
+    paged: bool,
+    now: &'s std::cell::Cell<u64>,
+    pagestate: &'s std::cell::Cell<(*const u8, usize)>,
+    /// How many futex ops in a row the call has answered without the rules ([`ThreadRun::no_wake`]).
+    answered: u32,
+}
+
+/// The window a call's futex ops read ([`ThreadRun::no_wake`], [`CallSeam::park`]): its run's native
+/// window when its tier has one (#2958 slice 3), or its task's view of its domain's [`Mem`].
+fn futex_window<'a>(
+    run: &'a ThreadRun,
+    mem: &'a Option<Mem>,
+) -> Option<&'a dyn super::FutexWindow> {
+    match &run.native {
+        Some(w) => Some(&**w),
+        None => mem.as_ref().map(|m| m as &dyn super::FutexWindow),
+    }
+}
+
+impl TaskSeam for CallSeam<'_, '_, '_> {
+    fn bounce(&mut self, target: u32, io: &mut [i64], pushed: usize) -> Result<usize, Trap> {
+        let host = self.host;
+        // A tier that does not spill, or a count past its stack, leaves `gc.roots` refused: a scan
+        // that cannot see the emitted frames' words would miss roots.
+        let words = (!self.spill.is_empty())
+            .then(|| self.spill.get(..pushed))
+            .flatten();
+        let mut parked = None;
+        let first = self.task.as_ref().zip(words).map(|(t, w)| t.beneath(w));
+        let mut ran = coop_bounce(
+            &self.run.source,
+            self.table,
+            self.fuel,
+            self.mem,
+            &mut HostCell::Shared(host),
+            self.fibers,
+            self.task.as_ref().map(|_| BounceRunCtx {
+                park: Some(&mut parked),
+            }),
+            target,
+            io,
+            first.as_ref(),
+        );
+        drop(first);
+        // #2443 — the call stopped for its task's scheduler: the task stops with it, and the call
+        // runs on once the task can, until it returns.
+        while let Some((mut cont, stop)) = parked.take() {
+            let mem = futex_window(self.run, self.mem);
+            let task = self.task.as_mut().ok_or(Trap::Malformed)?;
+            let cont = match self
+                .run
+                .no_wake(&mut self.answered, &task.vm.vt, mem, &stop)
+            {
+                Some((dst, v)) => {
+                    cont.set(dst, v);
+                    cont
+                }
+                None => task.park(cont, stop)?,
+            };
+            let under = self.task.as_ref().zip(words).map(|(t, w)| t.beneath(w));
+            ran = drive_nested(
+                &self.run.source,
+                self.table,
+                VTask::of(cont, 0),
+                self.fuel,
+                self.mem,
+                &mut HostCell::Shared(host),
+                self.fibers,
+                Some(BounceRunCtx {
+                    park: Some(&mut parked),
+                }),
+                under.as_ref(),
+                false,
+            )
+            .map(|ran| {
+                let vals = ran.done();
+                for (slot, v) in io.iter_mut().zip(&vals) {
+                    *slot = val_to_slot(*v);
+                }
+                vals.len()
+            });
+        }
+        // The bounce may have grown the window or moved its page map, which the emitted code reads
+        // again after it.
+        match self.mem.as_ref() {
+            Some(m) if self.paged => {
+                self.now.set(self.pages.sync(m));
+                self.pagestate
+                    .set((self.pages.table.as_ptr(), self.pages.table.len()));
+            }
+            m => self
+                .now
+                .set(m.map_or(0, |m| m.scalar_extent().unwrap_or(0))),
+        }
+        ran
+    }
+
+    fn park(&mut self, stop: NativeStop) -> Result<[i64; 2], Trap> {
+        let m = futex_window(self.run, self.mem);
+        let stop = match stop {
+            NativeStop::Spawn { func, arg0, arg1 } => VcpuStop::Spawn {
+                func,
+                arg0,
+                arg1,
+                dst: 0,
+                module: 0,
+            },
+            NativeStop::Join { handle } => VcpuStop::Join { handle, dst: 0 },
+            NativeStop::Wait {
+                addr,
+                expected,
+                wide,
+                timeout,
+            } => {
+                let width = if wide { 8 } else { 4 };
+                VcpuStop::Wait {
+                    base: m.ok_or(Trap::Malformed)?.prepare_wait(addr, width)?,
+                    expected: expected & super::width_mask(width),
+                    width,
+                    timeout: (timeout >= 0).then_some(timeout as u64),
+                    dst: 0,
+                }
+            }
+            NativeStop::Notify { addr, count } => VcpuStop::Notify {
+                base: m.ok_or(Trap::Malformed)?.confine_for_notify(addr)?,
+                count,
+                dst: 0,
+            },
+        };
+        let task = self.task.as_mut().ok_or(Trap::Malformed)?;
+        if let Some((_, v)) = self.run.no_wake(&mut self.answered, &task.vm.vt, m, &stop) {
+            return Ok([v.i64(), 0]);
+        }
+        let cell = task.park_native(stop)?;
+        Ok([cell[0].i64(), cell[1].i64()])
+    }
+}
 
 /// A thread steps this many tier-ups at most before it looks at the run, as a preemption makes it:
 /// a loop of calls that each tier up never spends a quantum.
@@ -17811,7 +18753,7 @@ enum ParkFor {
 /// on the wall clock (the core's `clock` reads nanoseconds since the run started, so the rules'
 /// deadline arithmetic is the pump's); a fiber op takes the core's lock ([`FiberCell::Core`]); the
 /// root runs on a thread of its own while this one watches the run, settling it on each ring of its
-/// bell ([`ThreadRun::watch`]), unless this thread runs the root ([`ThreadPlatform::root_on_opener`]),
+/// bell ([`ThreadRun::watch`]), unless this thread runs the root ([`ThreadPlatform::opener`]),
 /// when the run starts a watcher of its own once it needs one ([`ThreadRun::start_watcher`]); no
 /// parked thread polls (#2757); and the run ends when its root does, the other tasks stopping at
 /// their next look, or with the pump's deadlock verdict ([`ThreadRun::settle`]). It returns once
@@ -17878,10 +18820,22 @@ impl ThreadRun {
         leaf: Option<LeafStart>,
     ) -> Result<std::sync::Arc<ThreadRun>, Refused> {
         super::LAST_CAPTURE_FAULT.with(|c| *c.borrow_mut() = None);
-        let Some(node) = host.begin_activation(fuel, RootWindow::of(mem.as_ref())) else {
+        // #2958 slice 3 — a native tier's window is the tier's own: the run charges what its start
+        // holds, and its rules read it through the tier's page map, with no `Mem` over it.
+        let native = host.thread_platform().tier.and_then(|t| t.native?.window);
+        let charge = match &native {
+            Some(w) => w.charge,
+            None => RootWindow::of(mem.as_ref()),
+        };
+        let Some(node) = host.begin_activation(fuel, charge) else {
             return Err(Box::new((Trap::ThreadFault, host, mem)));
         };
-        let root_fuel = Fuel::drawn(node);
+        // #2958 — on a native tier every task's code burns its tier's own cell, which draws from this
+        // node ([`EmittedCall::fuel_node`]): the run's fuel, and every task's hand of it, only names it.
+        let root_fuel = match parks_natively(&host) {
+            true => Fuel::native(node),
+            false => Fuel::drawn(node),
+        };
         // The run's processes ring its bell, armed by the embedder or the run's own.
         let bell = host.external_wake().unwrap_or_default();
         let root = host.into_cell();
@@ -17893,12 +18847,14 @@ impl ThreadRun {
                 Ok(core) => core,
                 Err(t) => return Err(Box::new((t, Host::from_cell(root), mem))),
             };
+        let native = native.map(|w| w.read);
+        core.domains[0].native = native.clone();
         let (door, platform) = {
             let host = root.lock_unpoisoned();
             (host.run_door(), host.thread_platform())
         };
         let watched = match driver {
-            Driver::Platform => !platform.root_on_opener,
+            Driver::Platform => platform.opener == Opener::Watches,
             Driver::Embedder => true,
             Driver::Held => false,
         };
@@ -17917,13 +18873,18 @@ impl ThreadRun {
         if let Some(leaf) = leaf {
             core.arm_leaf(leaf);
         }
+        let count = std::sync::Arc::clone(&core.tasks.waits.count);
         let run = std::sync::Arc::new(ThreadRun {
             source,
             root,
+            native,
+            count,
             state: std::sync::Mutex::new(Threads {
                 core,
                 parks: vec![Park::default()],
                 woken: Vec::new(),
+                awake: 0,
+                seen: None,
                 over: None,
                 fault: None,
                 live: 1, // the root's
@@ -17945,7 +18906,7 @@ impl ThreadRun {
             bell,
             watched,
             ended: std::sync::Condvar::new(),
-            over: std::sync::atomic::AtomicBool::new(false),
+            end: std::sync::atomic::AtomicI64::new(0),
             door,
         });
         if let Some(door) = &run.door {
@@ -17965,7 +18926,7 @@ impl ThreadRun {
         self.start_thread(move || run_task_thread(r, 0, view, hand), None);
     }
 
-    /// Run the root on this thread, the opener's ([`ThreadPlatform::root_on_opener`]).
+    /// Run the root on this thread, the opener's ([`ThreadPlatform::opener`]).
     fn run_root_here(self: &std::sync::Arc<Self>) {
         let (view, hand) = self.state.lock_unpoisoned().hand(0);
         run_task_thread(std::sync::Arc::clone(self), 0, view, hand);
@@ -17995,6 +18956,8 @@ impl ThreadRun {
         let footprint = Footprint::of(&core.domains, &run.source);
         drop(run);
         refund_ended_windows(&mut core.tasks, &mut core.domains, true);
+        // #1827 — on the caller's thread, as the pump publishes them.
+        super::publish_twin_traps(std::mem::take(&mut core.tasks.twin_traps));
         // The root's window goes back to the caller; the rest of the run, the root's fuel with it,
         // goes now.
         let mem = core.domains[0].mem.take();
@@ -18053,6 +19016,7 @@ fn carry<'g>(
 ) -> std::sync::MutexGuard<'g, Threads> {
     let (mut mem, mut fuel) = (mem, fuel);
     let activation = g.core.tasks[ti].answers.is_some();
+    g.set_park(ti, Some(true), None);
     let mut env = g.core.tasks[ti].domain;
     // An exec gives the task's domain the image's window, or moves the task into a domain of its
     // own: its thread steps over the new one.
@@ -18072,9 +19036,12 @@ fn carry<'g>(
         match next {
             Next::Run => {}
             Next::Stop => break,
+            // The thread leaves the task's park while it carries the activation, and comes back.
             Next::Carry(a) => {
                 let (view, _) = g.hand(0);
+                g.set_park(ti, Some(false), None);
                 g = carry(run, g, a, view, Fuel::fixed(0));
+                g.set_park(ti, Some(true), None);
                 continue;
             }
         }
@@ -18113,7 +19080,8 @@ fn carry<'g>(
             break;
         }
         std::mem::swap(&mut g.core.tasks[ti].vm, &mut vm);
-        if let Some(a) = fault {
+        // A process's own is not the run's, as on the pump (#1827).
+        if let Some(a) = fault.filter(|_| !g.core.tasks.pids.contains_key(&ti)) {
             g.fault.get_or_insert(a);
         }
         exec = matches!(stop, Ok(VcpuStop::Exec { .. }));
@@ -18122,6 +19090,7 @@ fn carry<'g>(
         invoke = surfaced;
         g = start_tasks(run, g, made);
     }
+    g.set_park(ti, Some(false), None);
     // #2695 step 2 — an activation that has answered goes: its carrier back to its own task, and
     // its slot to the next activation.
     if activation {
@@ -18222,6 +19191,45 @@ impl BounceTask<'_> {
             _ => Err(Trap::ThreadFault),
         }
     }
+
+    /// #2958 — [`park`](Self::park) for a native tier's own §12 op: the same rules and the same wait,
+    /// with no continuation. The task's VM goes back to the table with a result cell
+    /// ([`TaskVm::native`]) the rules deliver into, and the thread takes the cell back when the task
+    /// can run. A stop that does not park (a spawn, a notify, a wait the rules answer at once)
+    /// returns as soon as it is applied.
+    fn park_native(&mut self, stop: VcpuStop) -> Result<[Reg; 2], Trap> {
+        let (run, ti) = (self.run, self.ti);
+        let mut g = run.state.lock_unpoisoned();
+        if g.over.is_some() || matches!(g.core.tasks[ti].state, TaskState::Done(_)) {
+            return Err(Trap::ThreadFault);
+        }
+        std::mem::swap(&mut *g.core.tasks[ti].vm, self.vm);
+        g.core.tasks[ti].vm.native = Some([Reg::default(); 2]);
+        let (made, _) = run.apply(&mut g, ti, Ok(stop), *self.exits);
+        g = start_tasks(run, g, made);
+        let runs = loop {
+            let next;
+            (g, next) = run.await_runnable(g, ti, false);
+            match next {
+                Next::Run => break true,
+                Next::Stop => break false,
+                Next::Carry(a) => {
+                    let (view, _) = g.hand(0);
+                    g = carry(run, g, a, view, Fuel::fixed(0));
+                }
+            }
+        };
+        std::mem::swap(&mut *g.core.tasks[ti].vm, self.vm);
+        *self.exits = g.core.hooked_twins.len();
+        // A rule that ended the task (a trap, its domain's end) leaves it `Done`: its op does not
+        // return.
+        let ended = matches!(g.core.tasks[ti].state, TaskState::Done(_));
+        release(g);
+        match self.vm.native.take() {
+            Some(cell) if runs && !ended => Ok(cell),
+            _ => Err(Trap::ThreadFault),
+        }
+    }
 }
 
 /// Let go of executor 2's lock, then signal the threads its holder woke ([`ThreadRun::wake`]).
@@ -18249,16 +19257,32 @@ impl ThreadRun {
         state: &mut TierState,
     ) -> Result<VcpuStop, Trap> {
         let mut fibers = FiberCell::Core(&self.state, env);
+        // #2958 slice 2 — a futex op answered without the lock ([`Self::no_wake`]) is no stop, and
+        // `step_vcpu` cannot hand back what is left of its quantum (it starts each `resume` afresh),
+        // so a step after one runs a share of a quantum, and a share that runs out steps on rather
+        // than stopping: this loop's iterations bound the whole step at two quanta, so a loop of
+        // such ops looks at the run within two, as a loop that only computes does within one, and
+        // a thread that answers one and then computes pays no extra look.
+        let (mut quantum, mut answered) = (COOP_QUANTUM, 0);
         for _ in 0..TIERUP_LOOK {
             match step_vcpu(
                 &mut vm.vt,
                 &mut fibers,
                 &self.source,
                 ctx,
-                COOP_QUANTUM,
+                quantum,
                 true, // a blocking `cont.resume` idles the task on the fiber (I48)
                 true, // the quantum is the thread's look at the run: a kill, or the run's end
             ) {
+                Ok(stop @ (VcpuStop::Wait { .. } | VcpuStop::Notify { .. })) => {
+                    let mem = ctx.mem.as_ref().map(|m| m as &dyn super::FutexWindow);
+                    let Some((dst, v)) = self.no_wake(&mut answered, &vm.vt, mem, &stop) else {
+                        return Ok(stop);
+                    };
+                    vm.vt.active.set(dst, v);
+                    quantum = COOP_QUANTUM / TIERUP_LOOK as u64;
+                }
+                Ok(VcpuStop::Preempted) if quantum < COOP_QUANTUM => {}
                 Ok(VcpuStop::TierUp {
                     module,
                     func,
@@ -18272,6 +19296,11 @@ impl ThreadRun {
                     let tier = self.platform.tier.as_ref().ok_or(Trap::Malformed)?;
                     let paged = vm.vt.active.jit_page_checked;
                     let target = EmittedTarget::Region { module, func };
+                    let entry = match dst {
+                        TierUpDst::Frame(_) => CallEntry::Call,
+                        TierUpDst::Entry { .. } if ti == 0 => CallEntry::Root,
+                        TierUpDst::Entry { .. } => CallEntry::Thread,
+                    };
                     let task = BounceTask {
                         run: self,
                         ti,
@@ -18284,7 +19313,7 @@ impl ThreadRun {
                         Some(task),
                         ctx,
                         state,
-                        target,
+                        (target, entry),
                         &argv,
                         (mapped, paged),
                     )?;
@@ -18373,6 +19402,7 @@ impl ThreadRun {
         };
         let mut cell = fibers.cell();
         let at = (inv.mapped, tier.root.page_checked);
+        let target = (target, CallEntry::Call);
         let (vals, _) = self.emitted(tier, &mut cell, None, ctx, state, target, &inv.argv, at)?;
         // A short reply is malformed, as the pump's `deliver_jit_invoke_vals` has it.
         if vals.len() < inv.results.len() {
@@ -18397,10 +19427,10 @@ impl ThreadRun {
         &self,
         tier: &ThreadTier,
         fibers: &mut FiberCell,
-        mut task: Option<BounceTask<'_>>,
+        task: Option<BounceTask<'_>>,
         ctx: &mut RunCtx,
         state: &mut TierState,
-        target: EmittedTarget<'_>,
+        (target, entry): (EmittedTarget<'_>, CallEntry),
         argv: &[i64],
         at: (u64, bool),
     ) -> Result<(Vec<i64>, u64), Trap> {
@@ -18435,64 +19465,22 @@ impl ThreadRun {
             table, fuel, mem, ..
         } = ctx;
         let table: &SharedSlots = table;
-        let mut bounce = |target: u32, io: &mut [i64], pushed: usize| {
-            // A tier that does not spill, or a count past its stack, leaves `gc.roots` refused: a
-            // scan that cannot see the emitted frames' words would miss roots.
-            let words = (!spill.is_empty()).then(|| spill.get(..pushed)).flatten();
-            let mut parked = None;
-            let first = task.as_ref().zip(words).map(|(t, w)| t.beneath(w));
-            let mut ran = coop_bounce(
-                &self.source,
-                table,
-                fuel,
-                mem,
-                &mut HostCell::Shared(host),
-                fibers,
-                task.as_ref().map(|_| BounceRunCtx {
-                    park: Some(&mut parked),
-                }),
-                target,
-                io,
-                first.as_ref(),
-            );
-            drop(first);
-            // #2443 — the call stopped for its task's scheduler: the task stops with it, and the
-            // call runs on once the task can, until it returns.
-            while let Some((cont, stop)) = parked.take() {
-                let cont = task.as_mut().ok_or(Trap::Malformed)?.park(cont, stop)?;
-                let under = task.as_ref().zip(words).map(|(t, w)| t.beneath(w));
-                ran = drive_nested(
-                    &self.source,
-                    table,
-                    VTask::of(cont, 0),
-                    fuel,
-                    mem,
-                    &mut HostCell::Shared(host),
-                    fibers,
-                    Some(BounceRunCtx {
-                        park: Some(&mut parked),
-                    }),
-                    under.as_ref(),
-                    false,
-                )
-                .map(|ran| {
-                    let vals = ran.done();
-                    for (slot, v) in io.iter_mut().zip(&vals) {
-                        *slot = val_to_slot(*v);
-                    }
-                    vals.len()
-                });
-            }
-            // The bounce may have grown the window or moved its page map, which the emitted code
-            // reads again after it.
-            match mem.as_ref() {
-                Some(m) if paged => {
-                    now.set(pages.sync(m));
-                    pagestate.set((pages.table.as_ptr(), pages.table.len()));
-                }
-                m => now.set(m.map_or(0, |m| m.scalar_extent().unwrap_or(0))),
-            }
-            ran
+        let tls = task.as_ref().map_or(0, |t| t.vm.vt.active.tls);
+        let fuel_node = tier.native.as_ref().and_then(|_| fuel.source());
+        let mut seam = CallSeam {
+            run: self,
+            table,
+            fuel,
+            mem,
+            host,
+            fibers,
+            task,
+            spill,
+            pages,
+            paged,
+            now: &now,
+            pagestate: &pagestate,
+            answered: 0,
         };
         let mut call = EmittedCall {
             target,
@@ -18500,11 +19488,15 @@ impl ThreadRun {
             mapped,
             win,
             memory,
-            over: &self.over,
+            end: &self.end,
             results: Vec::new(),
             work: 0,
             fault: None,
-            bounce: &mut bounce,
+            tls,
+            entry,
+            fuel_node,
+            seam: &mut seam,
+            native: tier.native.as_ref(),
             table,
             host,
             now: &now,
@@ -18513,10 +19505,17 @@ impl ThreadRun {
         };
         let ran = (tier.run)(&mut call);
         let (results, work, fault) = (call.results, call.work, call.fault);
-        if let (Err(Trap::MemoryFault), Some(rel), Some(m)) = (&ran, fault, mem.as_ref()) {
+        if let (Err(Trap::MemoryFault), Some(rel), Some(m)) = (&ran, fault, seam.mem.as_ref()) {
             m.report_fault_rel(rel);
         }
         ran.map(|()| (results, work))
+    }
+
+    /// #2982 — how many times the run's bell has rung. A stop reads it under the run's lock: the
+    /// bell's lock is the innermost of the run's (a ring under the run's lock takes it, and nothing
+    /// takes the run's lock, or a powerbox's, while holding it), so the read cannot deadlock.
+    fn rings(&self) -> u64 {
+        *self.bell.0.lock_unpoisoned()
     }
 
     /// Ring the run's bell: its watcher looks at the run.
@@ -18531,11 +19530,17 @@ impl ThreadRun {
     }
 
     /// End the run with `res`, unless it is over already. Every thread stops at its next look, and
-    /// emitted code at its next fuel check ([`EmittedCall::over`]).
+    /// emitted code at its next fuel check ([`EmittedCall::end`]).
     fn conclude(&self, g: &mut Threads, res: Result<Vec<Value>, Trap>) {
         if g.over.is_none() {
             g.over = Some(res);
-            self.over.store(true, std::sync::atomic::Ordering::SeqCst);
+            // First end wins: a native tier's trap may have set it already ([`NativeTier`]).
+            let _ = self.end.compare_exchange(
+                0,
+                temen_ir::trap_code::DOMAIN_DONE,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            );
             // Its watcher has to look in order to leave.
             self.ring();
         }
@@ -18560,6 +19565,79 @@ impl ThreadRun {
     /// [`RunDoor::stop`]'s half: end the run as stopped and wake its threads, unless its lock is
     /// busy (`false`, and the caller asks again). It never waits. The run's watcher leaves once a
     /// woken thread does ([`ThreadExit`]).
+    /// #2958 slice 2 — answer futex op `stop` of a task whose active VM is `vt`, over the thread's
+    /// view `mem` of its window, without the run lock, when the rules would only answer it and move
+    /// nothing: a `memory.notify` that no task can be waiting on answers 0 woken, a `memory.wait`
+    /// whose word already differs answers `WAIT_NOT_EQUAL`: the answer and the register it lands in.
+    /// `None` sends the stop to the rules.
+    ///
+    /// The one place each engine on executor 2 takes it, before the lock: an interpreted task's
+    /// step ([`Self::step`]), a bounce out of emitted code ([`CallSeam::bounce`], the browser tier's
+    /// outlined futex ops among them) and a native tier's own op ([`CallSeam::park`]).
+    ///
+    /// - **The checks come first, and are the rules' own.** `stop` carries a `base` its op made with
+    ///   [`super::FutexWindow::prepare_wait`] (bounded to the reservation through temen-mask,
+    ///   naturally aligned, every page readable in the window's page map: the NULL guard and the
+    ///   unmapped tail refuse) or [`super::FutexWindow::confine_for_notify`]; a refused address
+    ///   trapped there, before this, as on the slow path. The wait's read is the rules' compare on
+    ///   the same window, which needs no run lock: the lock orders a compare against a park, and a
+    ///   not-equal answer parks nothing.
+    /// - **The read is the window's guarded read** ([`super::FutexWindow::wait_word`]), the one the
+    ///   rules' compare ([`wait_task`]) makes: a page a guest's page op took since the op's check is
+    ///   refused, never read, so the host never faults (#2958 slice 3). A refused read sends the stop
+    ///   to the rules, whose compare faults it: one fault site.
+    /// - **The notify** reads its key's count after a fence ([`super::futex_count`], the
+    ///   store-buffering argument). Its key is the rules' ([`futex_key_in`]) on the same backing.
+    /// - **A fiber's wait** goes to the rules: its not-equal answer parks the fiber once
+    ///   (`FIBER_PARKED`), as the oracle's does.
+    /// - **Nothing else is skipped.** Neither op charges fuel or reads the clock on its slow path, and
+    ///   neither parks, so no gate is given back (a held run) and no wake is missed.
+    /// - **A thread still meets the rules.** What the run asks of its threads (its end, a kill, a
+    ///   stop at the door, a ring) a thread sees at a stop, at an emitted safepoint (the run's end
+    ///   word, fuel) or at its quantum. A futex op is the only stop a loop of them makes, and a
+    ///   bounce's interpreter and a killed task's emitted code poll neither, so `answered` counts
+    ///   the thread's answers in a row and the [`TIERUP_LOOK`]th op goes to the rules anyway: a
+    ///   loop of these ops is told within that many of them, where on the slow path it was told at
+    ///   the next.
+    fn no_wake(
+        &self,
+        answered: &mut u32,
+        vt: &VTask,
+        mem: Option<&dyn super::FutexWindow>,
+        stop: &VcpuStop,
+    ) -> Option<(u32, Reg)> {
+        if *answered >= TIERUP_LOOK {
+            *answered = 0;
+            return None;
+        }
+        let m = mem?;
+        let answer = match *stop {
+            VcpuStop::Wait {
+                base,
+                expected,
+                width,
+                dst,
+                ..
+            } => (vt.active_id == ROOT_FIBER
+                && m.wait_word(base, width).is_some_and(|w| w != expected))
+            .then_some((dst, super::WAIT_NOT_EQUAL)),
+            VcpuStop::Notify { base, dst, .. } => self
+                .count
+                .quiet(&super::futex_key_of(m, base))
+                .then_some((dst, 0)),
+            _ => None,
+        };
+        match answer {
+            Some(_) => {
+                *answered += 1;
+                #[cfg(debug_assertions)]
+                NO_WAKES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            None => *answered = 0,
+        }
+        answer.map(|(dst, v)| (dst, Reg::from_i32(v)))
+    }
+
     fn try_stop(&self) -> bool {
         use std::sync::TryLockError;
         let mut g = match self.state.try_lock() {
@@ -18597,15 +19675,61 @@ impl ThreadRun {
         stop: Result<VcpuStop, Trap>,
         exits: usize,
     ) -> (Vec<NewTask>, Option<SurfacedInvoke>) {
+        debug_assert!(
+            g.core.tasks.waits.woken.is_empty(),
+            "a notify's wakes were taken"
+        );
+        debug_assert!(
+            std::sync::Arc::ptr_eq(&self.count, &g.core.tasks.waits.count),
+            "a notify reads the counts its run's waiters write"
+        );
+        debug_assert!(
+            g.core.tasks.waits.counted(),
+            "the futex counts are the waiters"
+        );
         let had = g.core.tasks.len();
-        g.core.clock = self.now();
+        // A notify and an untimed wait read no clock (#2963).
+        let untimed = matches!(
+            stop,
+            Ok(VcpuStop::Notify { .. } | VcpuStop::Wait { timeout: None, .. })
+        );
+        if !untimed {
+            g.core.clock = self.now();
+        }
         let Threads { core, emit, .. } = &mut *g;
         // A thread runs its own task's tier-ups ([`ThreadRun::step`]), so no tier-up reaches the
         // rules. An emitted §22 invoke does, and goes back to the task's thread, which runs it
         // ([`ThreadRun::invoke`]).
-        let invoke = match core.on_stop(emit, &self.source, ti, stop) {
-            None => None,
-            Some(CoopStep::JitInvoke {
+        let applied = core.on_stop(emit, &self.source, ti, stop);
+        // #2963 — a futex stop that moved only futex task state wakes the threads of the tasks it
+        // woke, and nothing else: what a settle would find besides is the world's doing since the
+        // last one, and each such store rings the run's bell or wakes the thread parked on it
+        // ([`Self::park`]). So it skips the settle while the bell has not rung since the last one
+        // (#2982, [`Threads::seen`]), and not once the run is over or holds a domain, whose gate a
+        // park gives back. If the stop leaves the run idle, the park that puts its last thread to
+        // sleep settles first.
+        // The bell's lock last: only a futex stop of a live run that holds no domain pays for it.
+        if matches!(applied, Applied::Futex)
+            && g.over.is_none()
+            && g.core.held.is_none()
+            && g.seen == Some(self.rings())
+        {
+            #[cfg(debug_assertions)]
+            FAST_STOPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let mut woken = std::mem::take(&mut g.core.tasks.waits.woken);
+            for j in woken.drain(..) {
+                if g.parks.get(j).is_some_and(|p| p.asleep) && self.awake(&g.core, j) {
+                    g.rouse(j);
+                }
+            }
+            // Its buffer goes back, so a notify allocates nothing once warm.
+            g.core.tasks.waits.woken = woken;
+            return (Vec::new(), None);
+        }
+        let Threads { core, emit, .. } = &mut *g;
+        let invoke = match applied {
+            Applied::Futex | Applied::All => None,
+            Applied::Pause(CoopStep::JitInvoke {
                 code,
                 wasm,
                 argv,
@@ -18630,7 +19754,7 @@ impl ThreadRun {
             }
             // Nothing else surfaces from the rules here: every tier-up, a task's entry included, runs
             // on the task's thread.
-            Some(_) => {
+            Applied::Pause(_) => {
                 debug_assert!(false, "executor 2 surfaced a pause it cannot serve");
                 emit.pending_tierup = None;
                 complete(&mut core.tasks, &mut core.domains, ti, Err(Trap::CapFault));
@@ -18673,8 +19797,13 @@ impl ThreadRun {
     /// Then the run's end: its root is done, or the pump's deadlock verdict — nothing can move on
     /// its own ([`Self::idle`]), and no park is one an embedder can wake through the armed
     /// external-wake bell (#1122). Every change to a task's state is followed by this under the same
-    /// lock, so the run cannot go idle unseen.
+    /// lock, or by a thread left awake to look: a futex stop that moved only futex task state skips
+    /// it ([`Applied::Futex`]), and the park that would leave no thread awake settles first
+    /// ([`Self::park`]). So the run cannot go idle unseen.
     fn settle(&self, g: &mut Threads) {
+        debug_assert_eq!(g.awake, g.awake_by_parks(), "the awake count is the parks'");
+        // #2982 — read before anything here looks, so a ring after this is the next stop's to see.
+        g.seen = Some(self.rings());
         let core = &mut g.core;
         let rests = Held::rests(&core.held);
         // #2695 step 2 — a resting held domain ends when any of its members exits or traps.
@@ -18771,11 +19900,22 @@ impl ThreadRun {
     /// A task the rules have just made has no thread yet. Every settle is followed by this scan, so
     /// the tasks that ended have been seen by every rule here, and leave the live list (#2229).
     fn wake(&self, g: &mut Threads) {
+        // #2963 — the tasks a notify woke are the live ones this scan looks at: whatever notified
+        // them, a stop's rule or a settle's post, they are taken here.
+        g.core.tasks.waits.woken.clear();
         let over = g.over.is_some();
         for k in 0..g.core.tasks.live.len() {
             let j = g.core.tasks.live[k];
             if g.parks.get(j).is_some_and(|p| p.asleep) && (over || self.awake(&g.core, j)) {
                 g.rouse(j);
+            }
+        }
+        // #2868 — a task waiting aside needs a rule to go on, until the run is over.
+        if over {
+            for j in g.core.tasks.waiting().collect::<Vec<_>>() {
+                if g.parks.get(j).is_some_and(|p| p.asleep) {
+                    g.rouse(j);
+                }
             }
         }
         g.core.tasks.prune();
@@ -18879,11 +20019,13 @@ impl ThreadRun {
     /// still counts, as does a runnable task of a stopped process, which the pump's pick skips: only
     /// another task, or an embedder through the external-wake bell, wakes it.
     fn idle(&self, core: &SchedCore) -> bool {
-        core.tasks.live().all(|j| match core.tasks[j].state {
-            TaskState::Done(_) => true,
-            TaskState::Runnable => self.stopped(core, j),
-            _ => matches!(self.park_for(core, j), ParkFor::Wake | ParkFor::Ring(None)),
-        })
+        // #2868 — a futex wait waits aside: one with a deadline moves on its own.
+        core.tasks.next_deadline().is_none()
+            && core.tasks.live().all(|j| match core.tasks[j].state {
+                TaskState::Done(_) => true,
+                TaskState::Runnable => self.stopped(core, j),
+                _ => matches!(self.park_for(core, j), ParkFor::Wake | ParkFor::Ring(None)),
+            })
     }
 
     /// Whether no task can run now: each is done, parked, or a runnable task of a stopped process.
@@ -18920,8 +20062,10 @@ impl ThreadRun {
         ti: usize,
     ) -> std::sync::MutexGuard<'g, Threads> {
         let mut until = None;
+        let mut looked = false;
         match self.park_for(&g.core, ti) {
-            // Only a rule ends this park, and the rule's holder settled after it.
+            // Only a rule ends this park, and the rule's holder settled after it, or left a thread
+            // awake to look (#2963).
             ParkFor::Wake => {}
             ParkFor::Until(at) => until = Some(at),
             ParkFor::Ring(call) => {
@@ -18936,6 +20080,7 @@ impl ThreadRun {
                 if !listen.only_pipes || listen.pipes.iter().any(|(p, _)| p.ready()) {
                     self.settle(&mut g);
                     self.wake(&mut g);
+                    looked = true;
                     if self.awake(&g.core, ti) || g.over.is_some() || g.carried(ti).is_some() {
                         return g;
                     }
@@ -18952,7 +20097,19 @@ impl ThreadRun {
                 }
             }
         }
-        g.parks[ti].asleep = true;
+        // #2963 — the run cannot go idle unseen: a futex stop does not settle ([`Self::apply`]), so
+        // the park that would leave no thread awake to look settles first, and the verdict is the
+        // one that stop's settle would have reached.
+        if g.awake == 1 && !looked {
+            self.settle(&mut g);
+            self.wake(&mut g);
+            if self.awake(&g.core, ti) || g.over.is_some() || g.carried(ti).is_some() {
+                // A listen this park registered goes with the look.
+                g.parks[ti].listen = None;
+                return g;
+            }
+        }
+        g.set_park(ti, None, Some(true));
         let signal = std::sync::Arc::clone(&g.parks[ti].signal);
         let left = until.map(|at| std::time::Duration::from_nanos(at.saturating_sub(self.now())));
         // A pipe park looks for its store a moment before it sleeps: a stream's next write
@@ -18973,8 +20130,8 @@ impl ThreadRun {
             signal.wait(left);
         }
         let mut g = self.state.lock_unpoisoned();
+        g.set_park(ti, None, Some(false));
         let park = &mut g.parks[ti];
-        park.asleep = false;
         // A store into a pipe it waits on woke it: its settle re-admits the task.
         let fired = park.fired();
         park.listen = None;
@@ -19150,7 +20307,7 @@ impl ThreadRun {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Driver {
     /// Nothing outside it: the opener runs its root where the platform says so
-    /// ([`ThreadPlatform::root_on_opener`]), or watches it.
+    /// ([`ThreadPlatform::opener`]), or watches it.
     Platform,
     /// An embedder that pumps it ([`ThreadsRun`]): the opener watches it, whatever the platform says.
     Embedder,
@@ -19189,9 +20346,25 @@ enum Watched {
 fn complete(tasks: &mut Tasks, envs: &mut [Domain], ti: usize, res: Result<Vec<Value>, Trap>) {
     let mut work = vec![(ti, res)];
     while let Some((done, res)) = work.pop() {
+        // #2868 — a task killed in its futex wait ends in the live list, where the rules that look
+        // for an end find it.
+        tasks.unpark_wait(done);
         // #2229 — its domain's teardown finds it here.
         if res.is_err() {
             tasks.failed.push(done);
+        }
+        // #1827 — a process's trap is recorded apart, by its pid, as the oracle records it. Its
+        // `exit`, with any status, is not a trap. Like the JIT's, the record names no frames or
+        // fault address.
+        if let (Some(&pid), Err(trap)) = (tasks.pids.get(&done), &res) {
+            if !matches!(trap, Trap::Exit(_)) {
+                tasks.twin_traps.push(super::TwinTrap {
+                    task: pid,
+                    trap: *trap,
+                    backtrace: Vec::new(),
+                    fault: None,
+                });
+            }
         }
         tasks[done].state = TaskState::Done(res.clone());
         tasks[done].live = LiveVcpu::none(); // #2001: its `spawn` goes back
@@ -19415,7 +20588,7 @@ fn child_ctl(
 /// spawned, as the tree-walker's kill ends a child and its subtree. A domain with nothing left alive
 /// is left as it is, its children with it: killing a child that has ended does nothing.
 fn kill_domain(tasks: &mut Tasks, envs: &mut [Domain], k: usize) {
-    let live: Vec<usize> = (tasks.live())
+    let live: Vec<usize> = (tasks.members().into_iter())
         .filter(|&i| tasks[i].domain == k && !matches!(tasks[i].state, TaskState::Done(_)))
         .collect();
     if live.is_empty() {
@@ -19436,47 +20609,70 @@ fn kill_domain(tasks: &mut Tasks, envs: &mut [Domain], k: usize) {
 /// The futex rendezvous key of `addr` in window `m` (#1731): backing identity plus address, or a
 /// §13 region's identity plus offset ([`Mem::futex_key`]). Every detached window starts at base 0,
 /// so the address alone would rendezvous across windows (#1283).
-fn futex_key_in(m: Option<&Mem>, addr: u64) -> super::FutexKey {
-    m.map_or(super::FutexKey::Anon(0, addr), |m| m.futex_key(addr))
+fn futex_key_in(m: Option<&dyn super::FutexWindow>, addr: u64) -> super::FutexKey {
+    m.map_or(super::FutexKey::Anon(0, addr), |m| {
+        super::futex_key_of(m, addr)
+    })
 }
 
 /// The rendezvous key of a task parked at `addr` and `site` of window `m`, through the backings `m`
 /// names now: the key [`futex_key_in`] gave at the park, or after a debug `restore` its equal in
 /// the rebuilt window ([`super::FutexSite`]).
-fn site_key_in(m: Option<&Mem>, addr: u64, site: super::FutexSite) -> super::FutexKey {
+fn site_key_in(
+    m: Option<&dyn super::FutexWindow>,
+    addr: u64,
+    site: super::FutexSite,
+) -> super::FutexKey {
     m.map_or(super::FutexKey::Anon(0, addr), |m| m.site_key(site))
 }
 
 /// `memory.wait` at `base` in task `ti`'s window `mem`: `WAIT_NOT_EQUAL` at `dst` now if the word
 /// already changed (the cooperative analogue of the futex compare-under-lock), else park the task at
-/// its address's site until a `notify` ([`wake_waiters`]) or the `deadline` on the logical `clock` —
+/// its address's site until a `notify` ([`Tasks::notify`]) or the `deadline` on the logical `clock` —
 /// `None` for an infinite wait, which ends by `notify` or not at all (#1638). The site is taken
 /// before the word is read, as Linux takes the key: a page another thread remaps in between is
 /// then read through its new mapping, and the wait answers not-equal instead of parking on a key
-/// the read did not see.
+/// the read did not see. The word is read through the window's guarded read
+/// ([`super::FutexWindow::wait_word`]): a word the window refuses now (a native window whose page an
+/// unmap or protect took since the op's check) faults the wait with `MemoryFault`, the one place a
+/// refused read faults (#2958 slice 3).
 #[allow(clippy::too_many_arguments)] // the wait op's operands
 fn wait_task(
-    tasks: &mut [TaskSlot],
+    tasks: &mut Tasks,
     ti: usize,
-    mem: Option<&Mem>,
+    mem: Option<&dyn super::FutexWindow>,
     clock: u64,
     base: u64,
     expected: u64,
     width: u32,
     timeout: Option<u64>,
     dst: u32,
-) {
+) -> Result<(), Trap> {
     let site = mem.map_or(super::FutexSite::Anon(base), |m| m.futex_site(base));
-    if mem.map_or(0, |m| m.atomic_value(base, width)) != expected {
+    let key = site_key_in(mem, base, site);
+    // #2958 slice 2 — count in on the key, then compare: a notify that reads the count without the
+    // run lock either sees this waiter, or made its store before this read ([`super::futex_count`]).
+    // This is the one place a waiter counts in without filing ([`Tasks::park_wait`] counts and
+    // files), and it files or counts out before it returns, under the same hold of the lock: outside
+    // that hold a key's count is its queue plus the fiber waits that never count out.
+    tasks.waits.count.enter(&key);
+    let Some(word) = mem.map_or(Some(0), |m| m.wait_word(base, width)) else {
+        tasks.waits.count.leave(&key);
+        return Err(Trap::MemoryFault);
+    };
+    if word != expected {
+        tasks.waits.count.leave(&key);
         tasks[ti].deliver(dst, Reg::from_i32(super::WAIT_NOT_EQUAL));
-    } else {
-        tasks[ti].state = TaskState::BlockedWait {
-            addr: base,
-            site,
-            deadline: timeout.map(|t| clock.saturating_add(t)),
-            dst,
-        };
+        return Ok(());
     }
+    tasks[ti].state = TaskState::BlockedWait {
+        addr: base,
+        site,
+        deadline: timeout.map(|t| clock.saturating_add(t)),
+        dst,
+    };
+    tasks.file_wait(ti, key);
+    Ok(())
 }
 
 /// `memory.wait` by task `ti` over its domain's window `mem` and fiber registry (`fibers`,
@@ -19485,14 +20681,17 @@ fn wait_task(
 /// resumer gets `FIBER_PARKED` and runs on — or, under a blocking resume on a driver that
 /// `can_idle`, idles on the fiber (`BlockedOnFiber`) — until a `notify` ([`wake_fiber_waiters`]),
 /// the deadline ([`fire_next_timeout`]) or the park-time value recheck wakes it. `durable` is asked
-/// only for a fiber's park. The one wait rule of the pump and the debugger (#2215).
+/// only for a fiber's park. The one wait rule of the pump and the debugger (#2215). `native` is the
+/// domain's native window ([`Domain::native`]), which a task's wait reads in place of `mem`. `Err`
+/// is the trap the wait ends its task with ([`wait_task`]).
 #[allow(clippy::too_many_arguments)] // the wait op's operands
 fn futex_wait(
-    tasks: &mut [TaskSlot],
+    tasks: &mut Tasks,
     ti: usize,
     fibers: &mut [FiberState],
     fiber_sp: &mut [u64],
     mem: &mut Option<Mem>,
+    native: Option<&NativeWindow>,
     durable: impl FnOnce() -> bool,
     can_idle: bool,
     clock: u64,
@@ -19501,17 +20700,25 @@ fn futex_wait(
     width: u32,
     timeout: Option<u64>,
     dst: u32,
-) {
+) -> Result<(), Trap> {
     if tasks[ti].vm.vt.active_id == ROOT_FIBER {
-        let mem = mem.as_ref();
-        return wait_task(tasks, ti, mem, clock, base, expected, width, timeout, dst);
+        let win = match native {
+            Some(w) => Some(&**w as &dyn super::FutexWindow),
+            None => mem.as_ref().map(|m| m as &dyn super::FutexWindow),
+        };
+        return wait_task(tasks, ti, win, clock, base, expected, width, timeout, dst);
     }
     // The key before the read, as [`wait_task`] takes its site.
-    let (key, cur) = mem
+    let key = mem
         .as_ref()
-        .map_or((super::FutexKey::Anon(0, base), 0), |m| {
-            (m.futex_key(base), m.atomic_value(base, width))
-        });
+        .map_or(super::FutexKey::Anon(0, base), |m| m.futex_key(base));
+    // #2958 slice 2 — a fiber's wait counts in on its key before its read, as a task's does, and
+    // never out: its wait ends in the fiber machinery, not in [`Waits`]. The key's stripe stays on
+    // the slow path for the rest of the run. Phase 2 of #2958 puts fiber waits in the kernel's wait
+    // index, where they count out as a task's do.
+    tasks.waits.count.enter(&key);
+    tasks.waits.sticky += 1;
+    let cur = mem.as_ref().map_or(0, |m| m.atomic_value(base, width));
     // The park-time recheck closes the park-vs-store race: a store that already landed wakes the
     // fiber with `WAIT_NOT_EQUAL`, after the one transient `FIBER_PARKED`, like the oracle.
     let woken = (cur != expected).then_some(super::WAIT_NOT_EQUAL);
@@ -19534,9 +20741,10 @@ fn futex_wait(
     if let Some(k) = idle {
         tasks[ti].state = TaskState::BlockedOnFiber { fiber: k };
     }
+    Ok(())
 }
 
-/// `memory.notify`'s fiber half: after the task waiters ([`wake_waiters`]), wake up to `want`
+/// `memory.notify`'s fiber half: after the task waiters ([`Tasks::notify`]), wake up to `want`
 /// event-parked fibers on `key`, in `fibers` order — each domain's registry in turn, lowest slot
 /// first, so the wake order is deterministic like the task scan. Returns how many it woke; a woken
 /// fiber's status is delivered when a `cont.resume` claims it.
@@ -19595,7 +20803,7 @@ fn next_timeout<'a>(tasks: &Tasks, fibers: impl Iterator<Item = &'a FiberState>)
     };
     fibers
         .filter_map(fiber_deadline)
-        .chain(next_wait_deadline(tasks))
+        .chain(tasks.next_deadline())
         .min()
 }
 
@@ -19708,7 +20916,7 @@ fn interrupt_parks(tasks: &mut Tasks, domains: &[Domain]) -> bool {
 /// Time out every futex wait whose deadline `clock` has reached: a task's (`WAIT_TIMED_OUT` at its
 /// `dst`), and an event-parked fiber's in any domain's registry (`fibers`), made claimable with it.
 fn time_out_due(tasks: &mut Tasks, fibers: &mut [&mut Vec<FiberState>], clock: u64) {
-    time_out_waits(tasks, clock);
+    tasks.time_out(clock);
     for f in fibers.iter_mut().flat_map(|reg| reg.iter_mut()) {
         if let FiberState::WaitParked {
             deadline: Some(deadline),
@@ -19723,72 +20931,14 @@ fn time_out_due(tasks: &mut Tasks, fibers: &mut [&mut Vec<FiberState>], clock: u
     }
 }
 
-/// `memory.notify` on futex `key`: wake up to `count` waiting tasks whose key matches, lowest task
-/// index first (deterministic), each keyed through its own window, `win(env)` ([`site_key_in`]).
-/// Returns how many it woke.
-fn wake_waiters<'a>(
-    tasks: &mut Tasks,
-    key: super::FutexKey,
-    count: u32,
-    win: impl Fn(usize) -> Option<&'a Mem>,
-) -> u32 {
-    let mut woken = 0u32;
-    for (_, t) in tasks.live_mut() {
-        if woken >= count {
-            break;
-        }
-        if let TaskState::BlockedWait {
-            addr, site, dst, ..
-        } = t.state
-        {
-            if site_key_in(win(t.domain), addr, site) == key {
-                t.deliver(dst, Reg::from_i32(super::WAIT_WOKEN));
-                t.state = TaskState::Runnable;
-                woken += 1;
-            }
-        }
-    }
-    woken
-}
-
 /// #1936 — wake every task and event-parked fiber waiting on region word `w`, in every domain: a
 /// post's `signal` ([`Outcome::WakeRegion`]), or a child's end post at its end. `memory.notify` with
 /// no count, keyed as the word's waiters keyed their parks, whichever window they map it in.
 fn wake_region(tasks: &mut Tasks, domains: &mut [Domain], w: &super::RegionWake) {
     let key = w.key();
-    wake_waiters(tasks, key, u32::MAX, |env| domains[env].mem.as_ref());
+    tasks.notify(key, u32::MAX);
     let regs = domains.iter_mut().flat_map(|e| e.fibers.fibers.iter_mut());
     wake_fiber_waiters(regs, key, u32::MAX);
-}
-
-/// The earliest deadline among the tasks' futex waits — what the logical clock advances to when no
-/// task is runnable. An infinite wait has none, so a run whose every waiter is indefinite reaches
-/// its driver's deadlock exit instead of a `WAIT_TIMED_OUT` the guest never asked for (#1638).
-fn next_wait_deadline(tasks: &Tasks) -> Option<u64> {
-    (tasks.live().map(|i| &tasks[i]))
-        .filter_map(|t| match t.state {
-            TaskState::BlockedWait { deadline, .. } => deadline,
-            _ => None,
-        })
-        .min()
-}
-
-/// Wake every task whose futex wait's deadline the logical `clock` has reached, `WAIT_TIMED_OUT` at
-/// its `dst`.
-fn time_out_waits(tasks: &mut Tasks, clock: u64) {
-    for (_, t) in tasks.live_mut() {
-        if let TaskState::BlockedWait {
-            deadline: Some(deadline),
-            dst,
-            ..
-        } = t.state
-        {
-            if deadline <= clock {
-                t.deliver(dst, Reg::from_i32(super::WAIT_TIMED_OUT));
-                t.state = TaskState::Runnable;
-            }
-        }
-    }
 }
 
 /// Domain lifetime & teardown, cooperative-bytecode form (DESIGN.md §12, owner 2026-07-24;
@@ -19824,9 +20974,11 @@ fn teardown_domains(
                     // The root domain: a live member left means the sweep hasn't run yet (once
                     // every member is Done the caller's root check ends the run).
                     0 if !rests
-                        && tasks.live().any(|u| {
-                            tasks[u].domain == 0 && !matches!(tasks[u].state, TaskState::Done(_))
-                        }) =>
+                        && (tasks.waits_in(0)
+                            || tasks.live().any(|u| {
+                                tasks[u].domain == 0
+                                    && !matches!(tasks[u].state, TaskState::Done(_))
+                            })) =>
                     {
                         return Some((0, *trap));
                     }
@@ -19854,7 +21006,9 @@ fn teardown_domains(
         if env == 0 && rests {
             ended = Some(trap);
         }
-        let members: Vec<usize> = (tasks.live()).filter(|&i| tasks[i].domain == env).collect();
+        let members: Vec<usize> = (tasks.members().into_iter())
+            .filter(|&i| tasks[i].domain == env)
+            .collect();
         for i in members {
             // A kill that reaches a joiner may have ended a later member already.
             if !matches!(tasks[i].state, TaskState::Done(_)) {
@@ -21569,25 +22723,6 @@ impl Vm {
                             }
                         }
                     }
-                    // §3.6 (I36 slice 2) — caller-side parking: a call through a live-callee
-                    // offer never reaches the generic dispatch. The task stops to make it, and the
-                    // driver enqueues it on the callee's inbound queue and parks the task until the
-                    // handler's reply (the tree-walker's caller-parking arm, task-level).
-                    if let Some(target) = host.with(|p| p.live_impl_of(h, *type_id)) {
-                        let sig = target.sig(*op, argv.len(), results.len())?;
-                        self.module = module;
-                        self.cur = cur;
-                        self.base = base;
-                        self.pc = pc + 1;
-                        return Ok(Outcome::LiveCall(LiveCall {
-                            callee: target.callee,
-                            export: target.export,
-                            op: *op,
-                            args: argv.to_vec(),
-                            sig,
-                            dst: *dst,
-                        }));
-                    }
                     // #2109: the host copies the call's buffers in one go ([`super::SoleMem`]).
                     let mut sole = mem.as_mut().map(super::SoleMem);
                     let gm = sole.as_mut().map(|m| m as &mut dyn GuestMem);
@@ -21602,7 +22737,7 @@ impl Vm {
                     // into its own `dst`. That is the `EINTR(42)` → `0` flake, at ~20% per attempt.
                     // Under one lock the flags are what they always meant to be: extra return values
                     // of this dispatch, unreachable by any other vCPU.
-                    let mut unlocked = None;
+                    let (mut unlocked, mut live) = (None, None);
                     let (r, parks) = host.with(|p| {
                         let r = p.cap_dispatch_slots_deferring(
                             *type_id,
@@ -21613,6 +22748,7 @@ impl Vm {
                             gm,
                             Some(&mut pending_id),
                             Some(&mut unlocked),
+                            Some(&mut live),
                         );
                         // Drain unconditionally (the tree-walker's park site does the same): a flag
                         // only ever means "the op *this* dispatch just ran wants to park", so one
@@ -21624,6 +22760,26 @@ impl Vm {
                     // parallel driver its other tasks make their host calls meanwhile. It raised no
                     // park, so the rest of this arm only delivers its results.
                     r?;
+                    // §3.6 (I36 slice 2) — caller-side parking: a call through a live-callee
+                    // offer does not complete in the dispatch, which hands its target back. The task
+                    // stops to make it, and the driver enqueues it on the callee's inbound queue and
+                    // parks the task until the handler's reply (the tree-walker's caller-parking arm,
+                    // task-level).
+                    if let Some(target) = live {
+                        let sig = target.sig(argv.len(), results.len())?;
+                        self.module = module;
+                        self.cur = cur;
+                        self.base = base;
+                        self.pc = pc + 1;
+                        return Ok(Outcome::LiveCall(LiveCall {
+                            callee: target.callee,
+                            export: target.export,
+                            op: target.op,
+                            args: argv.to_vec(),
+                            sig,
+                            dst: *dst,
+                        }));
+                    }
                     if let Some(call) = unlocked {
                         call.run(argv, res, sole.as_mut().map(|m| m as &mut dyn GuestMem))?;
                     }

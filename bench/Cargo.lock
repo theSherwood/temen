@@ -1417,6 +1417,7 @@ checksum = "adb6935a6f5c20170eeceb1a3835a49e12e19d792f6dd344ccc76a985ca5a6ca"
 name = "temen-bench-vs-wasmtime"
 version = "0.0.0"
 dependencies = [
+ "libc",
  "temen-interp",
  "temen-ir",
  "temen-jit",
@@ -1579,6 +1580,7 @@ dependencies = [
  "temen-interp",
  "temen-ir",
  "temen-jit",
+ "temen-mask",
  "temen-opt",
  "temen-peval",
  "temen-posix",

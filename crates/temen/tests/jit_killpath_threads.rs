@@ -19,33 +19,45 @@
 use std::time::Duration;
 
 use temen_jit::{compile_and_run_with_host_interruptible, JitOutcome, TrapKind};
+use temen_run::jit_kernel::{self, Route};
 use temen_text::parse_module;
 use temen_verify::verify_module;
 
-/// Compile `src`, arm the kill-path, and let a watchdog request the kill after `delay_ms`. Returns
-/// the outcome — which must be `Trapped(OutOfFuel)` once *every* vCPU (the root + its spawned
-/// siblings) has unwound (`run_inner` joins them all before returning).
-fn run_killed(src: &str, delay_ms: u64) -> JitOutcome {
+/// Compile `src`, arm the kill-path, and let a watchdog request the kill after `delay_ms`, on each
+/// route the JIT's threads run on while both exist (#2958): today's thread runtime, and the
+/// kernel's, whose run the same door stops. Returns each outcome — which must be
+/// `Trapped(OutOfFuel)` once *every* vCPU (the root + its spawned siblings) has unwound.
+fn run_killed(src: &str, delay_ms: u64) -> Vec<JitOutcome> {
     let m = parse_module(src).expect("parse");
     verify_module(&m).expect("verify");
-    let interrupt = temen_jit::Interrupt::new();
-    let wd = interrupt.clone();
-    let watchdog = std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(delay_ms));
-        wd.fire(); // request the domain kill
-    });
-    // The guest makes no `call.cap`, so the thunk is never invoked (null ctx never read).
-    let outcome = compile_and_run_with_host_interruptible(
-        &m,
-        0,
-        &[0i64],
-        temen_run::cap_thunk,
-        core::ptr::null_mut(),
-        &interrupt,
-    )
-    .expect("jit compiles");
-    watchdog.join().unwrap();
-    outcome
+    Route::BOTH
+        .iter()
+        .filter_map(|route| {
+            let interrupt = temen_jit::Interrupt::new();
+            let wd = interrupt.clone();
+            let watchdog = std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(delay_ms));
+                wd.fire(); // request the domain kill
+            });
+            let outcome = match route {
+                // The guest makes no `call.cap`, so the thunk is never invoked (null ctx never read).
+                Route::Today => Some(
+                    compile_and_run_with_host_interruptible(
+                        &m,
+                        0,
+                        &[0i64],
+                        temen_run::cap_thunk,
+                        core::ptr::null_mut(),
+                        &interrupt,
+                    )
+                    .expect("jit compiles"),
+                ),
+                Route::Kernel => jit_kernel::expect_kernel(&m, 0, &[0i64], Some(&interrupt), None),
+            };
+            watchdog.join().unwrap();
+            outcome
+        })
+        .collect()
 }
 
 /// The root vCPU spawns a sibling that **spins**, then spins itself: both poll the shared baked
@@ -77,7 +89,7 @@ block 1 (v2: i64) {
 ";
     assert_eq!(
         run_killed(src, 100),
-        JitOutcome::Trapped(TrapKind::OutOfFuel),
+        vec![JitOutcome::Trapped(TrapKind::OutOfFuel); 2],
         "a multithreaded spinning domain must be killed whole"
     );
 }
@@ -118,7 +130,7 @@ block 1 (v6: i64) {
 ";
     assert_eq!(
         run_killed(src, 100),
-        JitOutcome::Trapped(TrapKind::OutOfFuel),
+        vec![JitOutcome::Trapped(TrapKind::OutOfFuel); 2],
         "a sibling parked in an infinite futex wait must be woken and killed"
     );
 }
@@ -149,7 +161,7 @@ block 1 (v5: i64) {
     let started = std::time::Instant::now();
     assert_eq!(
         run_killed(src, 300),
-        JitOutcome::Trapped(TrapKind::OutOfFuel),
+        vec![JitOutcome::Trapped(TrapKind::OutOfFuel); 2],
         "the kill ends the run"
     );
     let took = started.elapsed();

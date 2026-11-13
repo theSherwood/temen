@@ -22,7 +22,7 @@ use wasmtime::{Engine, Linker, Module, Store};
 /// **imported** (the wasi-threads shape — the host owns the one shared memory). Both words sit one
 /// guard up: Temen's JIT unmaps `[0, 16384)` as a NULL guard (#1094), so words at 0 and 4 faulted
 /// (#2563).
-fn parallel_wat(nworkers: u32, steps: u32) -> String {
+pub(crate) fn parallel_wat(nworkers: u32, steps: u32) -> String {
     format!(
         r#"
 (module

@@ -133,6 +133,24 @@ wasm?" answer lives in one place:
   composes to any depth at depth-independent per-access cost. wasm has no native
   *runtime* nesting (only interpreter-in-wasm or link-time component composition),
   so multi-tenant hosts and plugin-in-plugin fall out for free.
+- **Durable domains (freeze / thaw / restore)** — a running domain can be quiesced,
+  serialized to bytes (window pages + per-page prots, shadow control state, handle
+  table) and restored to **bytewise-equivalent** execution, possibly on the other
+  backend or another host (§21, `DURABILITY.md`). It falls out of decisions already
+  settled (total IR, out-of-band control stack, block-local SSA, the masked window)
+  rather than new escape-TCB; the architecture makes it cheap where wasm makes it hard.
+- **Record/replay & time-travel debugging** — with no ambient authority, guest
+  nondeterminism enters through capabilities, so the capability boundary *is* the
+  recording boundary: in deterministic mode a run replays exactly, and stepping
+  backward follows from replay to any prior point (§19, `DEBUGGING.md`). Under real
+  concurrency, race outcomes bypass that boundary and a faithful replay must also
+  record the schedule (§19's caveat).
+- **Guest-driven JIT** — a guest (an interpreter running inside the sandbox) can
+  generate IR at runtime, submit it through the `Jit` capability, and call the
+  verified, Cranelift-compiled result (§22). wasm's W^X and immutable modules force
+  such a guest to ship its own interpreter or round-trip to the host for a fresh
+  module. Here it needed no verifier, IR or escape-TCB change: the verifier is the
+  trust hinge for exactly this.
 - **Lean by exclusion** — no GC, no JS interop, no UTF-16 / `externref` /
   component-IDL surface. This deliberately narrows the market to systems/native
   languages (C/C++/Rust/Zig/Swift) — managed languages are *not* first-class — in
@@ -2378,6 +2396,21 @@ iteration on the pump, ~57 µs on executor 2, which starts a thread per task. Th
 keeps its full scans: it never prunes, so its inspection still reads where an ended thread stopped.
 Pinned in `tasks_tests`.
 
+**A thread parked on a futex costs nothing until its word is notified (#2868, 2026-11-11).** A task
+waiting for good was still live, so every round walked it about a dozen times, the kill check took
+its domain's host lock for it, and every `notify` re-keyed it through its window. Beside 1,000
+threads parked on a word nothing notifies, a pingpong hand-off cost 64 µs on the pump and 200 µs on
+executor 2, against 0.5 and about 9 µs beside none. A futex wait now waits aside from the live list
+(`Waits`): filed under the key its park took, in task order, and under its deadline when it has one.
+A `notify` takes its waiters from its word's queue, lowest task index first as before, so it costs
+what it wakes; a deadline is the deadline index's; a kill, a domain's end and a freeze reach the
+waiters through the members the rules ask for (`Tasks::members`). Each puts the task back in the
+live list. The same hand-off now costs 0.59 µs on the pump and about 10 µs on executor 2, the cost
+of a hand-off beside none. The kill check asks a domain's host once per run of its tasks in the
+live list, not once per task. The debug scheduler files its waits too, and files them again under the keys their sites have once a restore
+or an undo has rebuilt the windows. Pinned in `tasks_tests` and by `temen-bench --threads
+pingpong_idle`.
+
 Pinned constraints (tests in `temen/tests/host_park.rs`, `temen-run/tests/fast_cap.rs`): a parkable
 registration is **never** `fast_cap_resolver`-claimed; **sync ops never pay for parkable ops'
 existence** — no completion id, no table touch unless a handler already returned `Offload`
@@ -2683,7 +2716,7 @@ metering is read-before minus read-after. Deferred, named-consumer-gated: a per-
 (caller-side D19 attenuation) and an admission fuel floor (gate-side refusal when the caller
 can't fund a handler).
 
-### Held domains — a domain at rest takes calls as a library provider does  [BUILT on the tree-walker and the bytecode engine's executors, #2695 step 2]
+### Held domains — a domain at rest takes calls as a library provider does  [BUILT on every executor, #2695 step 2]
 
 A domain its embedder holds (`HeldDomain`) outlives its entry: once the entry returns, it
 **rests**. Its threads keep running, and it ends only when it ends itself (any member's exit or
@@ -2700,7 +2733,9 @@ no running main, so each call into it, from its embedder or from a domain of its
 - **Admitted by the callee's policy**: `Single`, run-to-park, serializes the domain's activations
   against each other, never against its own threads. The tree-walker builds that as a lane of
   width 1 over the activations (D66's mechanism: held across a quantum's end, given back at a
-  park); the bytecode engine, as a gate checked before an activation steps, with the same rules.
+  park); the bytecode engine, as a gate checked before an activation steps, with the same rules;
+  the Cranelift JIT, as its serve windows' gate, which an activation gives back at every park, a
+  join's included (a serve handler's join keeps it: it blocks the serving vCPU).
 - **With the thread-local word the domain's main thread left** (`vcpu.tls`). Under `Single` the
   calls run one at a time, as that thread would run them. The caller's word would name the
   caller's memory.
@@ -2722,9 +2757,18 @@ The executor is the embedder's choice (`Executor`):
   too. A call runs on its caller's thread, which carries the activation until it answers: the
   embedder's thread for the embedder's call, the calling task's thread for a call from inside the
   run. The activation has no thread of its own.
+- **The Cranelift JIT** (`temen_run::hold`, where its host glue is) runs each of the domain's
+  threads on an OS thread of its own, between calls too; its root rests on the thread its entry ran
+  on. A call runs on its caller's thread, as on executor 2, and one that parks is its caller's to
+  carry: the caller resumes it each time it is runnable again, and no worker of the run's pool runs
+  it. An activation is a vCPU context of the domain on a fuel cell its call funds: the embedder's
+  loan, or a draw on the inside caller's budget. So a held run's code always charges fuel, whatever
+  its own budget. A call whose fiber stack the OS refuses answers `-EAGAIN`.
 
 On both bytecode executors an activation is a task of the domain on its caller's fuel, which
-charges no vCPU. A module the bytecode engine declines is held by the tree-walker (INVARIANTS #9).
+charges no vCPU. A module the bytecode engine declines is held by the tree-walker (INVARIANTS #9),
+and so is one asked for on the JIT that can serve its offers in a serve loop (`svc.poll`,
+`svc.wait`): its calls do not reach a thread parked in `svc.wait` there yet (#2895).
 
 ### Invariants this holds
 
@@ -3694,8 +3738,9 @@ own window and attenuated handles), not `Jit`. **`Jit` adds speed to a guest; it
 domain.**
 
 **Door held open — one inert code-handle kind (CONSOLIDATION §6, deferred).** `Module` and
-`JitCode` are both "code as a capability with no callable ops, named by another capability's
-verbs"; the unit-vs-domain difference is a property of the *verb* (`invoke`/`install` run in the
+`JitCode` are both "code as a capability that no op of its own runs, named by another capability's
+verbs" (a `Module`'s two ops only describe it: its window and an unbound import, #1908, #2874); the
+unit-vs-domain difference is a property of the *verb* (`invoke`/`install` run in the
 caller's world; `instantiate` spawns a child), not of the handle — even the §22 preconditions are
 verb-time checks. Unifying would delete a cap kind and unlock **compile-then-sandbox** (JIT a
 plugin, then instantiate it as a confined child), which today has no bridge. Unlike the landed

@@ -70,6 +70,10 @@ thread_local! {
     /// ([`quantum_end`]): the worker loop's own reference, published for one residency. Null
     /// outside one, as on a run's root and on a 1:1 vCPU.
     static RUNNING_FOR: Cell<*const Arc<ChildExec>> = const { Cell::new(std::ptr::null()) };
+    /// #2695 — the pool's name for the task whose fiber this thread is running, innermost: a worker's
+    /// task, or a held domain's activation its carrier resumes. `0` outside one. A call that task
+    /// makes into a held domain is carried by it ([`Carrier`]).
+    static RUNNING_TASK: Cell<u64> = const { Cell::new(0) };
 }
 
 /// The limit-taking buffer-ABI trampoline a task's fiber body enters the child through
@@ -478,6 +482,16 @@ pub(crate) struct Window {
     /// with the pool, so the serve op cannot see it woken: it stays in its serve op until the
     /// handler is back ([`ServeSite::self_calls_in_flight`]).
     self_calls: AtomicUsize,
+    /// #2695 — a held domain's window ([`HeldSite`]). Each of its handlers keeps a `vcpu.tls` word
+    /// of its own, from the main thread's at rest, rather than the one the gate's last holder left.
+    /// And its calls run one at a time, each until it parks (DESIGN.md §12a), a join included: a
+    /// serve handler's join keeps the gate, as on the oracle it blocks the serving vCPU
+    /// ([`Task::keep_lanes`]), but an activation is no serving vCPU's.
+    held: bool,
+    /// #2695 — where a thread outside the run waits for a held domain's gate ([`Window::wait_take_outside`]):
+    /// an embedder's, whose wait is no park of the run, as its call is no task of it.
+    outside: Mutex<()>,
+    outside_cv: Condvar,
 }
 
 // SAFETY: a window is shared by its serve op and its handlers, wherever they run. Its fields are
@@ -637,8 +651,48 @@ impl Window {
         if self.gate_waiters.load(Ordering::SeqCst) != 0 {
             // SAFETY: the window's handler context names its live domain, whose hub its parks use.
             unsafe { os_thread_rt::wake_host_parks_in(self.vm.sched as usize, self.gate_key()) };
+            if self.held {
+                self.wake_outside();
+            }
         }
         true
+    }
+
+    /// #2695 — wake the threads outside the run waiting for a held domain's gate, each to look again
+    /// ([`Self::wait_take_outside`]): at a release, and at the domain's end.
+    fn wake_outside(&self) {
+        let _g = lock(&self.outside);
+        self.outside_cv.notify_all();
+    }
+
+    /// #2695 — `me`, a thread outside the run (an embedder's), takes a held domain's gate, waiting while
+    /// another holds it. Its wait is no park of the run, which its call is not a task of: the deadlock
+    /// verdict never counts it. `false` once `ended` holds.
+    fn wait_take_outside(&self, me: u64, ended: &dyn Fn() -> bool) -> bool {
+        let free = || self.held_by(me) || (self.open.load(Ordering::Acquire) && self.take(me));
+        if free() {
+            return true;
+        }
+        let mut g = lock(&self.outside);
+        loop {
+            if free() {
+                return true;
+            }
+            if ended() {
+                return false;
+            }
+            // Counted before the last look, as a waiter in the run counts itself: a release before
+            // the count is seen by the look, and one after it sees the count and wakes this wait.
+            self.gate_waiters.fetch_add(1, Ordering::SeqCst);
+            let taken = free();
+            if !taken && !ended() {
+                g = self.outside_cv.wait(g).unwrap_or_else(|e| e.into_inner());
+            }
+            self.gate_waiters.fetch_sub(1, Ordering::SeqCst);
+            if taken {
+                return true;
+            }
+        }
     }
 
     /// The key gate waiters park on, in the run's hub: the window's address, tagged clear of every
@@ -754,8 +808,11 @@ pub fn handler_steps_aside(vm: &VmCtx, self_call: bool) -> Option<GateAside> {
     }
     // #2842 — the `vcpu.tls` word goes with the gate, to whichever handler of the window or its
     // serve op takes it next (R2: the word goes with execution), and the call counts before the gate
-    // goes, so the serve op that takes it next sees both.
-    w.tls.store(vcpu_tls::get(), Ordering::Relaxed);
+    // goes, so the serve op that takes it next sees both. #2695 — a held domain's handler keeps its
+    // own.
+    if !w.held {
+        w.tls.store(vcpu_tls::get(), Ordering::Relaxed);
+    }
     if self_call {
         w.self_calls.fetch_add(1, Ordering::SeqCst);
     }
@@ -780,7 +837,9 @@ pub unsafe fn handler_steps_back(aside: GateAside, vm: &VmCtx) -> bool {
     if !window.wait_take(aside.me, vm) {
         return false;
     }
-    vcpu_tls::seed(window.tls.load(Ordering::Relaxed));
+    if !window.held {
+        vcpu_tls::seed(window.tls.load(Ordering::Relaxed));
+    }
     true
 }
 
@@ -820,8 +879,19 @@ pub(crate) struct HandlerTask {
     shell: Shell,
     /// The callee window's fault range: its residencies' guard bracket.
     fault: (usize, usize),
-    /// Its window, whose handler context ([`Window::vm`]) it runs as.
+    /// Its window.
     window: Arc<Window>,
+    /// The context it runs as: its window's handler context ([`Window::vm`]), or, for a held
+    /// domain's activation, one of its own, on the fuel its caller lends it ([`HeldSite::activate`]).
+    vm: Arc<VmCtx>,
+    /// #2695 — a held domain's activation's own `vcpu.tls` word, from the main thread's at rest; `None`
+    /// for a serve handler, which runs with its window's ([`Window::held`]).
+    tls: Option<i64>,
+    /// #2695 — who carries it once it parks: its caller, which resumes it, not a worker ([`Carrier`]).
+    carrier: Option<Arc<Carrier>>,
+    /// #2695 — the fuel cell its context charges, when it has one of its own: a held domain's
+    /// activation's, which its call funds. Kept for the context's life.
+    _cell: Option<Box<crate::FuelCell>>,
     /// The serve-handler nesting count between residencies (#2160).
     serve_handlers: u32,
     /// It holds its window's gate: taken for a residency, and kept across a quantum's end and a
@@ -866,7 +936,7 @@ impl HandlerTask {
 
     /// How it ended, once its fiber has.
     fn end(&mut self) -> HandlerEnd {
-        match self.window.vm.ended() {
+        match self.vm.ended() {
             Some(code) => HandlerEnd::Trapped(code),
             None => HandlerEnd::Returned(self.shell.results[..self.n_results].to_vec()),
         }
@@ -1001,6 +1071,9 @@ impl ServeSite {
             gate: AtomicU64::new(0),
             gate_waiters: AtomicUsize::new(0),
             self_calls: AtomicUsize::new(0),
+            held: false,
+            outside: Mutex::new(()),
+            outside_cv: Condvar::new(),
         });
         // Its handler context names it, for the gate a handler's park gives back.
         window
@@ -1131,6 +1204,21 @@ impl ServeSite {
     /// # Safety
     /// The caller holds the gate, the site's vCPU is parked in its serve op, and `inline_ok(func)`.
     pub unsafe fn run_inline(&self, func: u32, args: &[i64]) -> Result<HandlerEnd, ServeRefused> {
+        self.run_inline_as(&self.window.vm, None, func, args)
+    }
+
+    /// [`Self::run_inline`] as context `vm`, with `tls` its own `vcpu.tls` word, or the window's
+    /// (`None`): a held domain's activation runs as one of its own ([`HeldSite::activate`]).
+    ///
+    /// # Safety
+    /// As [`Self::run_inline`]; `vm` is a context of the site's domain.
+    unsafe fn run_inline_as(
+        &self,
+        vm: &VmCtx,
+        tls: Option<i64>,
+        func: u32,
+        args: &[i64],
+    ) -> Result<HandlerEnd, ServeRefused> {
         let cc = &*self.cc;
         let Some((code, n_params, n_results)) = cc.handler_tramp(func) else {
             return Err(ServeRefused::NoHandler);
@@ -1138,11 +1226,10 @@ impl ServeSite {
         if args.len() != n_params {
             return Err(ServeRefused::NoHandler);
         }
-        let vm = &*self.window.vm;
         vm.handlers().fetch_add(1, Ordering::SeqCst);
         let mut results = vec![0i64; n_results.max(1)];
         let caller_tls = vcpu_tls::get();
-        vcpu_tls::seed(self.window.tls.load(Ordering::Relaxed));
+        vcpu_tls::seed(tls.unwrap_or_else(|| self.window.tls.load(Ordering::Relaxed)));
         let caller_handlers = vcpu_tls::serve_handlers();
         vcpu_tls::set_serve_handlers(caller_handlers + 1);
         let (lo, hi) = mem::fault_range_of(self.mem_base, self.mem_reserved as usize);
@@ -1157,7 +1244,9 @@ impl ServeSite {
             hi,
         );
         vcpu_tls::set_serve_handlers(caller_handlers);
-        self.window.tls.store(vcpu_tls::get(), Ordering::Relaxed);
+        if tls.is_none() {
+            self.window.tls.store(vcpu_tls::get(), Ordering::Relaxed);
+        }
         vcpu_tls::seed(caller_tls);
         if faulted {
             vm.raise(mem::FAULT_TRAP);
@@ -1186,6 +1275,21 @@ impl ServeSite {
         args: &[i64],
         make_done: &mut dyn FnMut() -> HandlerDone,
     ) -> Result<Ran, ServeRefused> {
+        let h = self.handler(func, args, &self.window.vm)?;
+        Ok(self.exec.run_here(h, fiber_rt::context_id(), make_done))
+    }
+
+    /// Handler `func` with `args`, on a fiber of its own (an idle one of the window's, else a new
+    /// one), to run as context `vm`: the window's vCPU, or a held domain's activation's own.
+    ///
+    /// # Safety
+    /// This thread's context holds the gate: the window's idle fibers are its holder's.
+    unsafe fn handler(
+        &self,
+        func: u32,
+        args: &[i64],
+        vm: &Arc<VmCtx>,
+    ) -> Result<HandlerTask, ServeRefused> {
         let cc = &*self.cc;
         let Some((code, n_params, n_results)) = cc.handler_tramp(func) else {
             return Err(ServeRefused::NoHandler);
@@ -1193,9 +1297,7 @@ impl ServeSite {
         if args.len() != n_params {
             return Err(ServeRefused::NoHandler);
         }
-        // SAFETY: the starter holds the gate (the caller's contract), as this thread's context.
-        let me = fiber_rt::context_id();
-        let idle = self.window.idle(me).pop();
+        let idle = self.window.idle(fiber_rt::context_id()).pop();
         let mut shell = match idle {
             Some(shell) => shell,
             None => Shell::new(cc, &self.table).ok_or(ServeRefused::NoStack)?,
@@ -1211,21 +1313,462 @@ impl ServeSite {
             mem_base: self.mem_base,
             fn_table: cc.fn_table.base(),
             // The entry ABI spells the vmctx as its trap cell (`VmCtx` field 0).
-            vm: Arc::as_ptr(&self.window.vm) as *mut i64,
+            vm: Arc::as_ptr(vm) as *mut i64,
         });
-        let window = Arc::clone(&self.window);
-        let h = HandlerTask {
+        Ok(HandlerTask {
             shell,
             fault: mem::fault_range_of(self.mem_base, self.mem_reserved as usize),
-            window,
+            vm: Arc::clone(vm),
+            window: Arc::clone(&self.window),
+            tls: None,
+            carrier: None,
+            _cell: None,
             serve_handlers: 0,
             holds_lanes: true,
             domain: self.domain,
             n_results,
             reusable: false,
             done: None,
+        })
+    }
+}
+
+/// #2695 step 2 — who calls a held domain ([`HeldSite::activate`]).
+pub enum HeldCaller<'a> {
+    /// A thread outside the run, the embedder's, lending the call `fuel`: what it leaves comes back.
+    Outside(&'a mut u64),
+    /// A vCPU or task of the run, calling through a live offer, as context `vm`: it funds the call
+    /// from its own budget.
+    Inside(&'a VmCtx),
+}
+
+/// #2695 step 2 — who carries a held domain's activation once it parks ([`HeldSite::activate`]): the
+/// thread of control of its call, which resumes it each time it is runnable again, as executor 2's
+/// caller does. No worker of the pool runs it (owner, 2026-11-11).
+pub(crate) struct Carrier {
+    /// Set when the activation is runnable again: its carrier takes it back.
+    woken: std::sync::atomic::AtomicBool,
+    by: CarriedBy,
+}
+
+enum CarriedBy {
+    /// An OS thread, the embedder's or a vCPU's: unparked.
+    Thread(std::thread::Thread),
+    /// A task of the pool: re-offered, under the pool's lock, which its wake runs under.
+    Task(u64),
+}
+
+impl Carrier {
+    /// The carrier of an activation called from this thread of control.
+    fn here() -> Arc<Carrier> {
+        let by = match RUNNING_TASK.with(Cell::get) {
+            0 => CarriedBy::Thread(std::thread::current()),
+            id => CarriedBy::Task(id),
         };
-        Ok(self.exec.run_here(h, me, make_done))
+        Arc::new(Carrier {
+            woken: std::sync::atomic::AtomicBool::new(false),
+            by,
+        })
+    }
+
+    /// The activation is runnable again: wake its carrier. Under the pool's lock (`g`).
+    fn wake(&self, exec: &Arc<ChildExec>, g: &mut ExecState) {
+        self.woken.store(true, Ordering::SeqCst);
+        match &self.by {
+            CarriedBy::Thread(t) => t.unpark(),
+            CarriedBy::Task(id) => exec.wake_parked(g, Wake::Task(*id)),
+        }
+    }
+
+    /// Wait until the activation is runnable again: on this thread, or, for a task of the pool, as its
+    /// park (as `vm`'s, the caller's context), which frees its worker. `false` when the task's own
+    /// domain ended meanwhile: it unwinds, and its activation runs on in the pool.
+    ///
+    /// # Safety
+    /// `vm` is the live context of the call, for a task's carrier.
+    unsafe fn wait(&self, vm: Option<&VmCtx>) -> bool {
+        match (&self.by, vm) {
+            (CarriedBy::Task(_), Some(vm)) => {
+                // loom models no host park.
+                #[cfg(loom)]
+                let _ = vm;
+                #[cfg(not(loom))]
+                {
+                    let key = (1 << 61) | self as *const Carrier as u64;
+                    let parked = os_thread_rt::park_host_call(
+                        vm,
+                        None,
+                        key,
+                        os_thread_rt::Parks::Fiber,
+                        None,
+                        || !self.woken.load(Ordering::SeqCst),
+                    );
+                    if !matches!(parked, os_thread_rt::HostPark::Woken) {
+                        return false;
+                    }
+                }
+            }
+            _ => {
+                while !self.woken.load(Ordering::SeqCst) {
+                    std::thread::park();
+                }
+            }
+        }
+        self.woken.store(false, Ordering::SeqCst);
+        true
+    }
+}
+
+/// #2695 step 2 — a held domain at rest, as its calls reach it ([`crate::CompiledModule::set_rest`]):
+/// a serving vCPU parked for good, whose window is open while it rests. Each call, the embedder's or
+/// one from inside its run, is an **activation**: a new fiber in the domain at the op's handler,
+/// called with exactly the op's arguments, on the caller's thread, which funds it. The calls run
+/// one at a time under the window's gate (`Single`), each until it parks, and each starts with the
+/// main thread's `vcpu.tls` word. One that parks is the caller's to carry ([`Carrier`]).
+pub struct HeldSite {
+    site: ServeSite,
+    /// The resting root's context, which each activation's is a vCPU context of. Live until the rest
+    /// returns, and read only by an activation that counted itself in flight and then found the site
+    /// open ([`Self::activate`], [`InFlight`]): the rest closes the site before it waits for the
+    /// count, so such an activation is one it waits for. The site itself outlives the run (its
+    /// embedder holds the `Arc`), and so may this pointer, dead (#2990).
+    root: *const VmCtx,
+    /// The main thread's `vcpu.tls` word at rest.
+    tls: i64,
+    /// Activations in flight: the rest waits for them before the domain's window and code go.
+    inflight: AtomicUsize,
+    /// The domain no longer takes calls: its rest has ended, or is ending.
+    closed: std::sync::atomic::AtomicBool,
+    /// Its embedder asked for the end ([`Self::end`]).
+    end_asked: Mutex<bool>,
+    /// Where the rest waits: for the end, then for the activations in flight.
+    rest_cv: Condvar,
+}
+
+// SAFETY: as `ServeSite`'s; `root` is the resting root's context, live while the rest runs, and
+// read by an activation only after it counted itself in flight and found the site open, which the
+// rest waits for. A closed site touches only what it owns (#2990).
+unsafe impl Send for HeldSite {}
+unsafe impl Sync for HeldSite {}
+
+/// An activation in flight ([`HeldSite::activate`]), counted out when it leaves.
+struct InFlight<'a>(&'a HeldSite);
+
+impl Drop for InFlight<'_> {
+    fn drop(&mut self) {
+        let site = self.0;
+        // The rest waits for the domain's end, which an activation may have made, and once it is
+        // ending, for the last activation. The end is read while this one still counts, so the
+        // root's context is live; the rest's look at the count, under the lock this wake takes,
+        // sees this one gone or this one sees the domain closed.
+        //
+        // #2990 — but only while the site is open. A call that counted itself in after the rest
+        // had seen the count reach 0 and returned finds the site closed and leaves at once, and by
+        // then the root's context may be gone: it must not be read. The rest sets `closed` before
+        // it waits on the count, so an activation that sees the site open is one the rest waits
+        // for, and one that sees it closed notifies below anyway.
+        // SAFETY: the rest does not return while an activation counts in flight and the site is
+        // open.
+        let ended = !site.closed() && unsafe { (*site.root).ended().is_some() };
+        site.inflight.fetch_sub(1, Ordering::SeqCst);
+        if ended || site.closed() {
+            let _g = lock(&site.end_asked);
+            site.rest_cv.notify_all();
+        }
+    }
+}
+
+impl HeldSite {
+    /// The site of a domain whose root `root` returned and now rests: its module `cc`, its window at
+    /// `mem_base`, its fiber table `table` and thread domain `domain`, and `tls`, the main thread's
+    /// word at rest. The run's pool, made now if the run has none, keeps an activation that parks.
+    ///
+    /// # Safety
+    /// Called on the root's thread, after its entry returned and before its teardown; every pointer
+    /// is live until [`Self::rest`] returns.
+    pub(crate) unsafe fn new(
+        root: &VmCtx,
+        cc: &CompiledModule,
+        mem_base: *mut u8,
+        mem_reserved: u64,
+        table: Arc<SharedFiberTable>,
+        domain: &Domain,
+        tls: i64,
+    ) -> Arc<HeldSite> {
+        let hub = domain.hub();
+        let exec = hub.child_exec().unwrap_or_else(|| {
+            let e = ChildExec::new(hub as *const Domain as usize);
+            hub.set_child_exec(Arc::clone(&e));
+            e
+        });
+        let window = Arc::new(Window {
+            tls: std::sync::atomic::AtomicI64::new(tls),
+            ring: Box::new(|| {}),
+            served: AtomicU64::new(0),
+            vm: Arc::new(root.vcpu(root.fuel)),
+            idle: std::cell::UnsafeCell::new(Vec::new()),
+            pooled: AtomicUsize::new(0),
+            open: std::sync::atomic::AtomicBool::new(true),
+            gate: AtomicU64::new(0),
+            gate_waiters: AtomicUsize::new(0),
+            self_calls: AtomicUsize::new(0),
+            held: true,
+            outside: Mutex::new(()),
+            outside_cv: Condvar::new(),
+        });
+        window
+            .vm
+            .handler_window
+            .store(Arc::as_ptr(&window) as *mut Window, Ordering::Release);
+        Arc::new(HeldSite {
+            site: ServeSite {
+                cc: cc as *const CompiledModule,
+                mem_base,
+                mem_reserved,
+                table,
+                domain: domain as *const Domain,
+                exec,
+                window,
+            },
+            root: root as *const VmCtx,
+            tls,
+            inflight: AtomicUsize::new(0),
+            closed: std::sync::atomic::AtomicBool::new(false),
+            end_asked: Mutex::new(false),
+            rest_cv: Condvar::new(),
+        })
+    }
+
+    /// The domain rests: until its embedder ends it ([`Self::end`]) or it ends itself (a trap or an
+    /// exit of an activation or a thread, a kill). Then it ends: it takes no more calls, its parks
+    /// are woken to find the end, and the activations in flight unwind or return, which this waits
+    /// for. On the root's thread, before its teardown.
+    ///
+    /// # Safety
+    /// As [`Self::new`].
+    pub(crate) unsafe fn rest(&self) {
+        let root = &*self.root;
+        // A vCPU's end, a kill and a freeze fire the run's wakers. (loom models no run.)
+        #[cfg(not(loom))]
+        let _woken = {
+            let rest = self as *const HeldSite as usize;
+            os_thread_rt::wake_on_run_event(
+                root,
+                Box::new(move || {
+                    // SAFETY: the registration lives in `rest`, which outlives every firing of it.
+                    let site = unsafe { &*(rest as *const HeldSite) };
+                    let _g = lock(&site.end_asked);
+                    site.rest_cv.notify_all();
+                }),
+            )
+        };
+        let killed = || os_thread_rt::epoch_fired(root.epoch as usize);
+        {
+            let mut asked = lock(&self.end_asked);
+            while !*asked && root.ended().is_none() && !killed() {
+                asked = self.rest_cv.wait(asked).unwrap_or_else(|e| e.into_inner());
+            }
+        }
+        self.closed.store(true, Ordering::SeqCst);
+        if killed() {
+            root.raise(TrapKind::OutOfFuel as i64);
+        }
+        if root.ended().is_none() {
+            root.raise(crate::DOMAIN_DONE_CODE as i64);
+        }
+        // Every park of the domain looks again and finds the end: its threads', and its parked
+        // activations', which their carriers run once more to unwind.
+        (*self.site.domain).wake_own_parked();
+        self.site.exec.wake_locked(Wake::All);
+        self.site.window.wake_outside();
+        let mut g = lock(&self.end_asked);
+        while self.inflight.load(Ordering::SeqCst) != 0 {
+            g = self.rest_cv.wait(g).unwrap_or_else(|e| e.into_inner());
+        }
+        drop(g);
+        self.site.set_open(false);
+    }
+
+    /// End the domain ([`Self::rest`]): its embedder lets it go.
+    pub fn end(&self) {
+        *lock(&self.end_asked) = true;
+        self.rest_cv.notify_all();
+    }
+
+    /// Whether the domain has stopped taking calls: it has ended, or is ending.
+    pub fn closed(&self) -> bool {
+        self.closed.load(Ordering::SeqCst)
+    }
+
+    /// Run handler `func` with `args` as an activation of the domain on this thread, for `caller`:
+    /// its end, `Trapped` once the domain has ended (a call into a dead domain), or `None` when the
+    /// caller's own domain ended while it waited (its trap cell set to unwind it). `Err` when the
+    /// module has no such handler, or the OS refused its stack.
+    ///
+    /// May be called at any time, before or after the domain's run returned: its embedder holds the
+    /// `Arc<HeldSite>` past the run. A closed site answers `Trapped` at once and touches only what
+    /// the site owns; an open one is read only while this call counts in flight, which the rest waits
+    /// for before the run's context, window and module go (#2990).
+    ///
+    /// # Safety
+    /// `Inside`'s context is the caller's live one.
+    pub unsafe fn activate(
+        &self,
+        func: u32,
+        args: &[i64],
+        caller: HeldCaller<'_>,
+    ) -> Result<Option<HandlerEnd>, ServeRefused> {
+        self.inflight.fetch_add(1, Ordering::SeqCst);
+        let _out = InFlight(self);
+        let revoked = Ok(Some(HandlerEnd::Trapped(crate::DOMAIN_DONE_CODE as i64)));
+        if self.closed() {
+            return revoked;
+        }
+        let root = &*self.root;
+        let cc = &*self.site.cc;
+        match cc.handler_tramp(func) {
+            Some((_, n_params, _)) if n_params == args.len() => {}
+            _ => return Err(ServeRefused::NoHandler),
+        }
+        // Its context: a vCPU context of the domain on the fuel the call funds it with. A cell of its
+        // own holding the embedder's loan, or drawing on the inside caller's budget; the caller's
+        // own cell, shared, when that draws on none (a fixed allowance); or, for a caller that
+        // charges no cell, an unbounded one, as the domain's code charges one whatever it runs for.
+        let (inside, lent) = match caller {
+            HeldCaller::Outside(fuel) => (None, Some(fuel)),
+            HeldCaller::Inside(vm) => (Some(vm), None),
+        };
+        // A live offer reaches the domain only from its own run (spawns wire them, and a held run
+        // forks no twin), whose hub its gate waits park in and whose pool carries its parks.
+        debug_assert!(inside.is_none_or(|vm| std::ptr::eq(
+            os_thread_rt::current_domain(vm.sched as *const Domain).hub(),
+            (*self.site.domain).hub()
+        )));
+        let mut cell = match (&lent, inside.and_then(|vm| vm.fuel.as_ref())) {
+            (Some(fuel), _) => Some(crate::FuelCell::fixed(**fuel)),
+            (None, Some(c)) => c.sibling(),
+            (None, None) => Some(crate::FuelCell::fixed(u64::MAX)),
+        };
+        let fuel = match cell.as_deref_mut() {
+            Some(c) => c as *mut crate::FuelCell,
+            None => inside.map_or(root.fuel, |vm| vm.fuel),
+        };
+        let vm = Arc::new(root.vcpu(fuel));
+        let window = &self.site.window;
+        vm.handler_window
+            .store(Arc::as_ptr(window) as *mut Window, Ordering::Release);
+        let me = fiber_rt::context_id();
+        let ended = || self.closed() || root.ended().is_some();
+        let gated = match inside {
+            None => window.wait_take_outside(me, &ended),
+            Some(cvm) => window.wait_take(me, cvm),
+        };
+        if !gated {
+            return match inside {
+                Some(cvm) if cvm.ended().is_some() && !ended() => Ok(None),
+                _ => revoked,
+            };
+        }
+        // The domain ended while the call waited for its gate (a waiter inside the run waits on as
+        // its own domain's park, which the callee's end does not stop): a call into a dead domain.
+        if ended() {
+            self.site.step_aside();
+            return revoked;
+        }
+        if self.site.inline_ok(func) {
+            let end = self.site.run_inline_as(&vm, Some(self.tls), func, args);
+            // Back to its own caller: a direct call settles nothing in the pool.
+            self.site.step_aside();
+            if let (Some(fuel), Some(c)) = (lent, cell.as_ref()) {
+                *fuel = c.can_burn();
+            }
+            return end.map(Some);
+        }
+        self.carry(&vm, cell.take(), func, args, inside, lent)
+    }
+
+    /// The activation of handler `func` on a fiber of its own, started here under the gate: run here
+    /// until it ends, and each time it parks, here again once it is runnable. Its carrier is this
+    /// thread of control ([`Carrier`]).
+    ///
+    /// # Safety
+    /// As [`Self::activate`]; this thread's context holds the gate.
+    unsafe fn carry(
+        &self,
+        vm: &Arc<VmCtx>,
+        cell: Option<Box<crate::FuelCell>>,
+        func: u32,
+        args: &[i64],
+        inside: Option<&VmCtx>,
+        lent: Option<&mut u64>,
+    ) -> Result<Option<HandlerEnd>, ServeRefused> {
+        let site = &self.site;
+        let mut h = match site.handler(func, args, vm) {
+            Ok(h) => h,
+            Err(refused) => {
+                site.step_aside();
+                return Err(refused);
+            }
+        };
+        // Its end, wherever it ends: here, or in the pool's drain once its carrier is gone. With it,
+        // what its cell has left, read while the cell is still the task's.
+        let slot: Arc<Mutex<Option<(HandlerEnd, u64)>>> = Arc::new(Mutex::new(None));
+        h.done = Some(Box::new({
+            let (slot, vm) = (Arc::clone(&slot), Arc::clone(vm));
+            move |end| {
+                // SAFETY: a context's cell outlives its handler, which is ending now.
+                let left = unsafe { vm.fuel.as_ref() }.map_or(0, crate::FuelCell::can_burn);
+                *lock(&slot) = Some((end, left));
+            }
+        }));
+        let carrier = Carrier::here();
+        h.tls = Some(self.tls);
+        h.carrier = Some(Arc::clone(&carrier));
+        h._cell = cell;
+        let me = fiber_rt::context_id();
+        let (id, mut task) = site.exec.enlist(h);
+        let mut hand = true;
+        loop {
+            let ran = site.exec.reside_on(id, task, hand);
+            if ran.ended {
+                if ran.held {
+                    site.step_aside();
+                }
+                break;
+            }
+            // Parked, or preempted: take it back once it is runnable again, here.
+            task = loop {
+                if let Some(t) = site.exec.take_carried(id) {
+                    break t;
+                }
+                if !carrier.wait(inside) {
+                    // Its caller's domain ended: it unwinds, and the pool runs its activation on.
+                    site.exec.uncarry(id, None);
+                    return Ok(None);
+                }
+            };
+            // A park on a whole-vCPU wait (a join) kept the gate ([`Task::keep_lanes`]). Any other
+            // runs under the gate taken again, unless the domain has ended: it then runs once more,
+            // to unwind.
+            hand = !task.holds_lanes()
+                && !self.closed()
+                && match inside {
+                    None => site.window.wait_take_outside(me, &|| self.closed()),
+                    Some(cvm) => site.window.wait_take(me, cvm),
+                };
+            if !hand && !task.holds_lanes() && !self.closed() {
+                // Its caller's domain ended while it waited for the gate.
+                site.exec.uncarry(id, Some(task));
+                return Ok(None);
+            }
+        }
+        let ended = lock(&slot).take();
+        Ok(ended.map(|(end, left)| {
+            if let Some(fuel) = lent {
+                *fuel = left;
+            }
+            end
+        }))
     }
 }
 
@@ -1261,11 +1804,17 @@ impl Task {
     /// After a residency that ended `outcome`: whether the task keeps its lanes. A task its quantum
     /// preempted does (#2237). So does a handler parked on a whole-vCPU wait (a join, a page fault):
     /// on the oracle that wait blocks the serving vCPU, so no other handler of its window runs. A
+    /// held domain's activation gives its gate back at a join, as at any park ([`Window::held`]). A
     /// handler keeps only a gate it holds (one the teardown resumed holds none).
     fn keep_lanes(&mut self, outcome: &Outcome) -> bool {
         let keep = match (&*self, outcome) {
             (_, Outcome::Yielded) => true,
-            (Task::Handler(h), Outcome::Parked { .. }) => h.shell.slot.parked_on().blocks_vcpu(),
+            (Task::Handler(h), Outcome::Parked { .. }) => {
+                let on = h.shell.slot.parked_on();
+                on.blocks_vcpu()
+                    && !(h.window.held
+                        && matches!(on, fiber_rt::ParkOn::Thread | fiber_rt::ParkOn::Child))
+            }
             _ => false,
         };
         match self {
@@ -1273,6 +1822,14 @@ impl Task {
             Task::Handler(h) => h.holds_lanes &= keep,
         }
         keep
+    }
+
+    /// #2695 — the task, no longer carried: the pool runs it ([`ChildExec::uncarry`]).
+    fn take_carrier(mut self: Box<Self>) -> Box<Self> {
+        if let Task::Handler(h) = &mut *self {
+            h.carrier = None;
+        }
+        self
     }
 
     /// The window of a handler.
@@ -1286,7 +1843,7 @@ impl Task {
     fn vm(&self) -> &Arc<VmCtx> {
         match self {
             Task::Child(t) => &t.vm,
-            Task::Handler(h) => &h.window.vm,
+            Task::Handler(h) => &h.vm,
         }
     }
 
@@ -1395,6 +1952,9 @@ struct Entry {
     /// #2074 — the task's instance (its trap cell in field 0), reachable while a worker holds the
     /// task, for [`ChildExec::kill`] and the run's teardown.
     vm: Arc<VmCtx>,
+    /// #2695 — a held domain's activation's caller, which takes it back each time it is runnable:
+    /// no worker picks it ([`Carrier`]).
+    carrier: Option<Arc<Carrier>>,
 }
 
 struct ExecState {
@@ -1615,6 +2175,7 @@ impl ChildExec {
                 killed: false,
                 dom,
                 vm,
+                carrier: None,
             },
         );
         g.runnable.push_back(id);
@@ -1679,8 +2240,18 @@ impl ChildExec {
         let Task::Handler(h) = &*task else {
             unreachable!("only a handler is promoted");
         };
-        h.window.pooled.fetch_add(1, Ordering::AcqRel);
         let mut g = lock(&self.state);
+        let id = self.admit(&mut g, h);
+        g.tasks.get_mut(&id).expect("admitted").task = Some(task);
+        g.runnable.push_back(id);
+        self.offer(&mut g, id);
+    }
+
+    /// #2742 — handler `h` joins the pool's tasks, under its lock (`g`), one of its window's handlers
+    /// until it ends: counted as the window's, and in the run's live tasks while the window counts.
+    /// Its entry holds no task: its caller files it.
+    fn admit(&self, g: &mut ExecState, h: &HandlerTask) -> u64 {
+        h.window.pooled.fetch_add(1, Ordering::AcqRel);
         let id = g.next_id;
         g.next_id += 1;
         // #2845 — one whose domain has ended meanwhile (it parked on a caller's thread while a trap
@@ -1702,22 +2273,21 @@ impl ChildExec {
                 d.handler_started();
             }
         }
-        let vm = Arc::clone(&h.window.vm);
         g.tasks.insert(
             id,
             Entry {
-                task: Some(task),
+                task: None,
                 parked: false,
                 deadline: None,
                 counted: false,
                 woken: false,
                 killed: false,
                 dom: None,
-                vm,
+                vm: Arc::clone(&h.vm),
+                carrier: h.carrier.clone(),
             },
         );
-        g.runnable.push_back(id);
-        self.offer(&mut g, id);
+        id
     }
 
     /// #2742 — a woken handler of window `key`, taken out of the queue for the serve op, which holds
@@ -1728,7 +2298,8 @@ impl ChildExec {
             tasks, runnable, ..
         } = &mut *g;
         let at = runnable.iter().position(|id| {
-            let t = tasks.get(id).and_then(|e| e.task.as_ref());
+            let e = tasks.get(id).filter(|e| e.carrier.is_none());
+            let t = e.and_then(|e| e.task.as_ref());
             t.and_then(|t| t.window()).is_some_and(|w| w.key() == key)
         })?;
         let id = runnable.remove(at).expect("position is in range");
@@ -1740,19 +2311,30 @@ impl ChildExec {
     /// #2742 — one residency of handler task `id` here, lent the caller's gate. Its end runs its
     /// `done`; a park files it with the pool. One that keeps the gate (a quantum's end, a whole-vCPU
     /// park) takes it from the caller, and gives it back when it lets go of it on a worker.
-    fn reside_here(self: &Arc<Self>, id: u64, mut task: Box<Task>) -> Ran {
+    fn reside_here(self: &Arc<Self>, id: u64, task: Box<Task>) -> Ran {
+        self.reside_on(id, task, true)
+    }
+
+    /// [`Self::reside_here`], `hand`ing the handler its resumer's gate or not: a carried handler
+    /// that kept its gate through its park resumes with it, and one unwinding at its domain's end
+    /// runs without one, as the pool runs either ([`Self::pick`]).
+    fn reside_on(self: &Arc<Self>, id: u64, mut task: Box<Task>, hand: bool) -> Ran {
         let me = fiber_rt::context_id();
         let Task::Handler(h) = &mut *task else {
             unreachable!("only a handler is resumed here");
         };
         let (window, hid) = (Arc::clone(&h.window), h.id());
-        let handed = window.hand(me, hid);
-        debug_assert!(
-            handed,
-            "a woken handler is resumed under its resumer's gate"
-        );
-        h.holds_lanes = true;
+        if hand {
+            let handed = window.hand(me, hid);
+            debug_assert!(
+                handed,
+                "a woken handler is resumed under its resumer's gate"
+            );
+            h.holds_lanes = true;
+        }
+        let prev = RUNNING_TASK.with(|c| c.replace(id));
         let outcome = self.run_handler(h, false);
+        RUNNING_TASK.with(|c| c.set(prev));
         let keep = task.keep_lanes(&outcome);
         let ended = matches!(outcome, Outcome::Finished | Outcome::Done);
         // One that ended gives the gate back to its resumer before its end is told; one that parked
@@ -1771,6 +2353,49 @@ impl ChildExec {
         }
     }
 
+    /// #2695 — carried handler `id`, if it is runnable: taken out of the queue for its carrier to resume
+    /// ([`HeldSite::activate`]). `None` while it is parked, or held by its carrier already.
+    fn take_carried(&self, id: u64) -> Option<Box<Task>> {
+        let mut g = lock(&self.state);
+        let ExecState {
+            tasks, runnable, ..
+        } = &mut *g;
+        let at = runnable.iter().position(|&r| r == id)?;
+        runnable.remove(at);
+        let e = tasks.get_mut(&id).expect("queued");
+        e.woken = false;
+        e.task.take()
+    }
+
+    /// #2695 — carried handler `id`'s carrier is gone (its caller's domain ended while it waited): the
+    /// pool runs it on from here, as one it holds, so it still unwinds at its domain's end.
+    fn uncarry(self: &Arc<Self>, id: u64, taken: Option<Box<Task>>) {
+        let mut g = lock(&self.state);
+        let Some(e) = g.tasks.get_mut(&id) else {
+            return;
+        };
+        e.carrier = None;
+        if let Some(task) = taken {
+            // Taken back runnable, and given up before it ran: runnable in the pool's queue again.
+            e.task = Some(task.take_carrier());
+            g.runnable.push_back(id);
+        } else if let Some(Task::Handler(h)) = e.task.as_deref_mut() {
+            h.carrier = None;
+        }
+        if g.runnable.contains(&id) {
+            self.find_worker(&mut g, id);
+        }
+    }
+
+    /// #2695 — enlist handler `h`, a held domain's activation its caller carries, before its first
+    /// residency ([`Self::admit`]): held by its carrier, not queued. Its domain's end waits for it
+    /// from now, wherever it ends.
+    fn enlist(self: &Arc<Self>, h: HandlerTask) -> (u64, Box<Task>) {
+        h.vm.handlers().fetch_add(1, Ordering::SeqCst);
+        let id = self.admit(&mut lock(&self.state), &h);
+        (id, Box::new(Task::Handler(h)))
+    }
+
     /// #2742 — handler `hid`'s worker gives its window's gate back, if the handler still holds it
     /// (its park gave it back already), and whoever waits for it is woken.
     fn release_gate(&self, window: Option<&Arc<Window>>, hid: u64) {
@@ -1785,7 +2410,8 @@ impl ChildExec {
     fn offer_gate(self: &Arc<Self>, key: usize) {
         let mut g = lock(&self.state);
         let waiting = g.runnable.iter().copied().find(|id| {
-            let t = g.tasks.get(id).and_then(|e| e.task.as_ref());
+            let e = g.tasks.get(id).filter(|e| e.carrier.is_none());
+            let t = e.and_then(|e| e.task.as_ref());
             t.and_then(|t| t.window()).is_some_and(|w| w.key() == key)
         });
         if let Some(id) = waiting {
@@ -2010,6 +2636,11 @@ impl ChildExec {
     /// firing a deadline), finds one at once, which runs it beside the waker. Waking every free worker at each
     /// wake, as before, cost one switch per free worker.
     fn offer(self: &Arc<Self>, g: &mut ExecState, id: u64) {
+        // #2695 — a carried handler goes to its carrier, never a worker.
+        if let Some(carrier) = g.tasks.get(&id).and_then(|e| e.carrier.clone()) {
+            carrier.wake(self, g);
+            return;
+        }
         if g.runnable.len() == 1 && self.on_own_worker() {
             return;
         }
@@ -2045,7 +2676,8 @@ impl ChildExec {
         // A handler's gate is its window's own: taken here for the handler `position` admits, the
         // first one taken (a handler's lane chain is empty, so the lanes admit it at once).
         let mut chains = g.runnable.iter().map(|id| {
-            g.tasks.get(id).and_then(|e| e.task.as_ref()).and_then(|t| {
+            let e = g.tasks.get(id).filter(|e| e.carrier.is_none());
+            e.and_then(|e| e.task.as_ref()).and_then(|t| {
                 if let (Some(w), false) = (t.window(), t.holds_lanes() || unwinding(t)) {
                     let hid = Arc::as_ptr(t.slot()) as u64;
                     if !g.windows[&w.key()].open || !(w.held_by(hid) || w.take(hid)) {
@@ -2115,7 +2747,10 @@ impl ChildExec {
             let outcome = if task.retiring() {
                 Outcome::Retiring
             } else {
-                self.run_once(&mut task, worker, true)
+                let prev = RUNNING_TASK.with(|c| c.replace(id));
+                let outcome = self.run_once(&mut task, worker, true);
+                RUNNING_TASK.with(|c| c.set(prev));
+                outcome
             };
             // The lane goes back before anything else: a peer 1:1 vCPU or sibling task may be
             // queued behind it. `lane_leave` touches only the domain's lane lock, so it is safe to
@@ -2378,8 +3013,10 @@ impl ChildExec {
             fib: h.shell.fib,
             rt: &mut h.shell.rt,
             fault: h.fault,
-            vm: &h.window.vm,
-            tls: h.window.tls.load(Ordering::Relaxed),
+            vm: &h.vm,
+            tls: h
+                .tls
+                .unwrap_or_else(|| h.window.tls.load(Ordering::Relaxed)),
             serve_handlers: h.serve_handlers,
             domain: h.domain,
             shadow: None,
@@ -2387,8 +3024,10 @@ impl ChildExec {
         let (outcome, tls, handlers) = self.reside(r, pool);
         // #2842 — the word is the gate holder's: one that gave the gate back for a wait gave the
         // word back with it ([`handler_steps_aside`]), and whoever holds the gate now may have
-        // changed it since.
-        if h.window.held_by(h.id()) {
+        // changed it since. #2695 — a held domain's activation keeps its own.
+        if let Some(own) = h.tls.as_mut() {
+            *own = tls;
+        } else if h.window.held_by(h.id()) {
             h.window.tls.store(tls, Ordering::Relaxed);
         }
         h.serve_handlers = handlers;

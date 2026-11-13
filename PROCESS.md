@@ -526,7 +526,12 @@ object, and *who holds authority over its backing* is the whole visibility story
   window cannot hold, `-ENOEXEC` for a module that cannot run as the child, `-EPERM` for a
   durable spawner without freeze authority, `-EBADF` for a budget that is not a `Budget`,
   `-EAGAIN` for lanes the spawner cannot grant, `-ENOMEM` for no room, and `-ENOENT` for an
-  import no grant binds. Pinned by `temen-interp/tests/detached_windows.rs`: detached
+  import no grant binds. A spawner asks the child's `Module` which import that is: op 2,
+  `unbound(grants, n, buf, cap)`, builds and binds a child from the list as the spawn does, then
+  discards it, and answers the first import nothing binds (#2874). Op 1, `window()`, answers the
+  window a spawn of the module gets, so a spawner can size a budget before it spawns (#1908). A
+  refusal after the child's powerbox was built discards it too, which gives back the pipe ends it
+  was granted (#2875). Pinned by `temen-interp/tests/detached_windows.rs`: detached
   serve/park/reply round-trip (142), the side-by-side attest report (nested 257 vs
   detached 1), quota exhaustion, forged-budget refusal. **Folded into `Budget.mem` (R2, done):**
   the standalone `WindowMinter` capability and its side table are **retired** — the spawn's budget is a

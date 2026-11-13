@@ -110,6 +110,10 @@ mod setjmp_rt;
 // loom-verified. Available where `temen_fiber::supported()` (x86-64 unix).
 #[cfg(fiber_rt)]
 mod os_thread_rt;
+// #2958: a program's vCPUs as tasks of executor 2's scheduling core, for what
+// `temen_interp::bytecode::native_scope` admits. Off `fiber_rt` the JIT lowers no §12 op, so no
+// program reaches it ([`KernelRun::new`] refuses).
+pub mod kernel_rt;
 // PROCESS.md S1b/S1c: the canonical-key futex region registry — `temen-run` records a §13 `map`'s pages
 // (so the JIT futex thunks canonicalize `Backed` addresses) and purges them at teardown. Real-runtime
 // only; the loom futex model has no regions (`futex_key_of` is `Anon`-only there).
@@ -187,8 +191,8 @@ pub unsafe fn fiber_park_outside() {
 mod vcpu_tls;
 #[cfg(fiber_rt)]
 pub use child_exec::{
-    handler_steps_aside, handler_steps_back, GateAside, HandlerDone, HandlerEnd, Ran, ServeRefused,
-    ServeSite,
+    handler_steps_aside, handler_steps_back, GateAside, HandlerDone, HandlerEnd, HeldCaller,
+    HeldSite, Ran, ServeRefused, ServeSite,
 };
 
 /// #1952, #2742 — whether the running code is in a guest fiber (`cont.*`): a park there yields
@@ -216,6 +220,8 @@ mod door;
 pub use door::{Interrupt, Registration};
 // temen#2452 — compiled code kept on disk, so a later process defines it instead of compiling.
 mod code_dir;
+// #2996 — the live JIT code arenas' ranges, which the fault handler tells guest from host code by.
+mod code_ranges;
 pub use code_dir::CodeDir;
 use code_dir::{Codegen, EmittedCode};
 
@@ -1019,8 +1025,8 @@ pub struct ResolvedModule {
 /// granted module's code/data (so a guest can only instantiate modules it was given). Returns
 /// nonzero and fills `out` on success, `0` for a forged/closed/wrong handle. Deliberately a
 /// *separate* callback from [`CapThunk`]: module resolution yields host pointers, which must never
-/// be reachable from a guest-issued `call.cap` (the generic dispatch on a Module handle is an inert
-/// `CapFault`) — only the host-side nesting runtime calls this.
+/// be reachable from a guest-issued `call.cap` (the generic dispatch on a Module handle answers only
+/// its declared window and the name of an import) — only the host-side nesting runtime calls this.
 ///
 /// # Safety
 /// `ctx` is the same host pointer as the run's `cap_ctx`; `out` points at a writable
@@ -2277,6 +2283,14 @@ pub struct CapturedSeed {
 /// The run injects that reply, rewinds the root in place, and carries on past the fork call.
 pub type ForkHook = Box<dyn FnMut(&ForkPoint<'_>) -> i64 + Send>;
 
+/// #2695 step 2 — what a **held** run does once its root's entry returns ([`CompiledModule::set_rest`]):
+/// it is handed the domain's [`HeldSite`], where its calls run as activations, and the entry's
+/// results, for its embedder. The domain then rests on the root's thread, its threads running on,
+/// until its embedder ends it or it ends itself ([`HeldSite::end`]); only then does its teardown
+/// begin.
+#[cfg(fiber_rt)]
+pub type Rest = Box<dyn FnOnce(&Arc<HeldSite>, &[i64]) + Send>;
+
 /// #1768 — a run frozen at a fork, as its [`ForkHook`] sees it: the live window, unwound into its
 /// root's shadow stack, and what a private duplicate of it needs.
 pub struct ForkPoint<'a> {
@@ -2595,10 +2609,11 @@ struct OwnedJit {
 }
 
 impl OwnedJit {
-    fn new(m: JITModule) -> OwnedJit {
+    fn new(new: code_ranges::NewModule) -> OwnedJit {
+        let (m, slot) = new.into_parts();
         OwnedJit {
             lazy: None,
-            arena: Arc::new(Arena(std::sync::Mutex::new(Some(m)))),
+            arena: Arc::new(Arena::new(m, slot)),
         }
     }
 }
@@ -2608,15 +2623,26 @@ impl OwnedJit {
 /// pages and never writes a finalized segment again, so a define changes nothing that runs. Its
 /// memory is freed when the last holder of it drops: an [`OwnedJit`], or a lazily compiled module's
 /// last worker, which runs no guest code.
-pub(crate) struct Arena(std::sync::Mutex<Option<JITModule>>);
+pub(crate) struct Arena {
+    module: std::sync::Mutex<Option<JITModule>>,
+    /// #2996 — the arena's range in the fault handler's table, released before the memory is.
+    slot: Option<code_ranges::CodeSlot>,
+}
 
 /// The [`JITModule`] of a locked [`Arena`].
 pub(crate) struct ArenaGuard<'a>(std::sync::MutexGuard<'a, Option<JITModule>>);
 
 impl Arena {
+    fn new(m: JITModule, slot: code_ranges::CodeSlot) -> Arena {
+        Arena {
+            module: std::sync::Mutex::new(Some(m)),
+            slot: Some(slot),
+        }
+    }
+
     /// The module, locked.
     pub(crate) fn lock(&self) -> ArenaGuard<'_> {
-        ArenaGuard(self.0.lock().unwrap_or_else(|p| p.into_inner()))
+        ArenaGuard(self.module.lock().unwrap_or_else(|p| p.into_inner()))
     }
 }
 
@@ -2647,7 +2673,14 @@ fn arena_mut(module: &mut Arc<OwnedJit>) -> Result<ArenaGuard<'_>, JitError> {
 
 impl Drop for Arena {
     fn drop(&mut self) {
-        let m = self.0.get_mut().unwrap_or_else(|p| p.into_inner()).take();
+        let m = self
+            .module
+            .get_mut()
+            .unwrap_or_else(|p| p.into_inner())
+            .take();
+        // Out of the fault handler's table before the pages go back: a later mapping there is not
+        // JIT code.
+        drop(self.slot.take());
         if let Some(m) = m {
             // SAFETY: per the owners' documented contract, by the time the last `OwnedJit` drops no
             // guest code from this module is executing and no `fn` pointer into it is ever called
@@ -3368,6 +3401,9 @@ pub struct CompiledModule {
     /// #1768 — the embedder's fork hook ([`Self::set_fork_hook`]): set on a run armed to fork, whose
     /// root unwinds at a fork call for the hook to duplicate. `None` for every other run.
     fork_hook: Option<ForkHook>,
+    /// #2695 step 2 — a held run's rest ([`Self::set_rest`]); `None` for every other run.
+    #[cfg(fiber_rt)]
+    rest: Option<Rest>,
     // --- §12/§14 runtimes this instance's code runs on, which its vmctx names or an entry publishes;
     // --- they must live exactly as long as the instance can run. Each instance has its own
     // --- ([`Self::instance`], temen#2389).
@@ -4456,7 +4492,8 @@ impl CompiledModule {
                     #[cfg(test)]
                     fault: lazy::FAULT.with(|f| f.get()),
                 };
-                let arena = Arc::new(Arena(std::sync::Mutex::new(Some(module))));
+                let (module, slot) = module.into_parts();
+                let arena = Arc::new(Arena::new(module, slot));
                 let service = lazy::Service::start(
                     code,
                     jit_isa()?,
@@ -4523,6 +4560,8 @@ impl CompiledModule {
             held_tail: None,
             window_ready: None,
             fork_hook: None,
+            #[cfg(fiber_rt)]
+            rest: None,
             #[cfg(fiber_rt)]
             fiber_rt,
             #[cfg(fiber_rt)]
@@ -4830,6 +4869,8 @@ impl CompiledModule {
             window_ready: None,
             fork_hook: None,
             #[cfg(fiber_rt)]
+            rest: None,
+            #[cfg(fiber_rt)]
             fiber_rt,
             #[cfg(fiber_rt)]
             domain,
@@ -4870,6 +4911,16 @@ impl CompiledModule {
     /// single-threaded, non-durable root — the embedder's contract; `None` disarms.
     pub fn set_fork_hook(&mut self, hook: Option<ForkHook>) {
         self.fork_hook = hook;
+    }
+
+    /// #2695 step 2 — hold this module's next run: once its root's entry returns, the domain rests
+    /// instead of ending, and `rest` is handed its [`HeldSite`] and the entry's results ([`Rest`]).
+    /// Its calls then run as activations on their callers' threads until it ends. Only for a
+    /// non-durable run with a thread domain ([`Self::enable_thread_hosting`]), whose code charges fuel:
+    /// each call lends its own. A run that ends in its entry rests not at all.
+    #[cfg(fiber_rt)]
+    pub fn set_rest(&mut self, rest: Option<Rest>) {
+        self.rest = rest;
     }
 
     /// Make the next run **durable** (DURABILITY.md §12.8) on a caller-built module — the
@@ -5591,6 +5642,29 @@ impl CompiledModule {
             }
             #[cfg(not(fiber_rt))]
             let _ = landed;
+        }
+
+        // #2695 step 2 — a held domain rests here: its entry returned, and its threads run on. Its calls
+        // run as activations on their callers' threads ([`HeldSite`]) until it ends, and only then
+        // does its teardown below begin. The site holds the module, the window and the root's
+        // context raw: no Rust reference into `*this` is live while the activations run.
+        #[cfg(fiber_rt)]
+        if !faulted && vm.ended().is_none() && !(*this).durable {
+            if let (Some(rest), Some(d)) = ((*this).rest.take(), (*this).domain.as_deref()) {
+                let d = d as *const os_thread_rt::Domain;
+                let table = (*this).fiber_table.clone().unwrap_or_else(|| {
+                    Arc::new(fiber_rt::SharedFiberTable::new(
+                        1,
+                        temen_ir::durable_abi::ShadowArena::EMPTY,
+                        None,
+                    ))
+                });
+                let reserved = (*this).win_reserved as u64;
+                let site =
+                    HeldSite::new(&vm, &*this, mem_base, reserved, table, &*d, vcpu_tls::get());
+                rest(&site, &results[..n_results]);
+                site.rest();
+            }
         }
 
         // §5 W3 — the **root vCPU's** trap-time backtrace capture (this run thread's thread-local): a
@@ -7172,7 +7246,10 @@ fn host_import(
 ///
 /// It binds every symbol the code calls the host by ([`HostFn`]): temen-jit's functions, and the
 /// compile's `imports`; and Cranelift's libcalls ([`libcalls`]).
-fn new_jit_module(imports: Imports, claims: &FastClaims) -> Result<JITModule, JitError> {
+fn new_jit_module(
+    imports: Imports,
+    claims: &FastClaims,
+) -> Result<code_ranges::NewModule, JitError> {
     let mut builder = JITBuilder::with_isa(jit_isa()?, cranelift_module::default_libcall_names());
     for f in HostFn::ALL {
         if let Some(addr) = f.addr(&imports) {
@@ -7191,12 +7268,10 @@ fn new_jit_module(imports: Imports, claims: &FastClaims) -> Result<JITModule, Ji
     // Code + read-only data (float constants, jump tables) from a single contiguous 256 MiB arena
     // (VA only, committed on demand) rather than separate `mmap`s: x64's 32-bit PC-relative
     // relocations (`X86CallPCRel4`/`X86PCRel4`) overflow if ASLR places independent mmaps > 2 GiB
-    // apart (a `compiled_blob.rs` panic on large modules with rodata). Falls back to the default
-    // provider if it cannot map.
-    if let Ok(arena) = cranelift_jit::ArenaMemoryProvider::new_with_size(256 << 20) {
-        builder.memory_provider(Box::new(arena));
-    }
-    Ok(JITModule::new(builder))
+    // apart (a `compiled_blob.rs` panic on large modules with rodata). #2996 — and the arena's range
+    // is what tells the fault handler this module's code from host code (`code_ranges`), so there
+    // is no fallback to separate mappings: no arena, or a full range table, is no module.
+    code_ranges::arena_module(builder)
 }
 
 /// Cranelift's libcalls that name a C runtime function, by the names
@@ -8776,6 +8851,8 @@ fn compile_child_windowed(
         held_tail: None,
         window_ready: None,
         fork_hook: None,
+        #[cfg(fiber_rt)]
+        rest: None,
         fiber_rt: None,
         domain: None,
         _nursery: None,

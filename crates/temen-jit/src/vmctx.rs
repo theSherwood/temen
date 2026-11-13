@@ -127,8 +127,12 @@ pub struct VmCtx {
     window: Window,
     /// #2319 — the `call.cap` thunk's own state on this context, opaque to the JIT
     /// ([`Self::thunk_state`]): made by the thunk's first call, dropped with the context. Never read
-    /// by compiled code.
-    thunk_state: std::sync::OnceLock<Box<dyn core::any::Any + Send + Sync>>,
+    /// by compiled code. #2847 — beside it, the type it was made as.
+    thunk_state: std::sync::OnceLock<(core::any::TypeId, Box<dyn core::any::Any + Send + Sync>)>,
+    /// #2958 — on a vCPU that runs as a task of executor 2's scheduling core, where its §12 ops go
+    /// ([`crate::kernel_rt`]): set by `KernelRun::run_vcpu` for its guarded call, `None` on every
+    /// other context. Never read by compiled code, so it sits past every field the code loads.
+    pub(crate) kernel: Option<core::ptr::NonNull<dyn crate::kernel_rt::KernelPark>>,
 }
 
 /// The per-instance addresses a [`VmCtx`] is filled from — everything but the trap cell, which each
@@ -250,16 +254,32 @@ impl VmCtx {
             #[cfg(fiber_rt)]
             owned_handlers: Some(owned_handlers),
             thunk_state: std::sync::OnceLock::new(),
+            kernel: None,
         }
     }
 
     /// #2488 — a context for another vCPU of this context's domain: the same instance and the same
     /// end, charging `fuel`. It must not outlive the domain's root context, which owns the end.
     pub(crate) fn vcpu(&self, fuel: *mut crate::FuelCell) -> VmCtx {
+        // SAFETY: the end is this domain's own, which the contract above keeps live.
+        unsafe { self.vcpu_ending(self.end, fuel) }
+    }
+
+    /// #2958 — [`Self::vcpu`] over the end word `end` in place of this context's own: a kernel
+    /// run's, which executor 2 owns (`kernel_rt::KernelRun::run_vcpu`).
+    ///
+    /// # Safety
+    /// `end` is live for as long as the returned context.
+    pub(crate) unsafe fn vcpu_ending(
+        &self,
+        end: *const AtomicI64,
+        fuel: *mut crate::FuelCell,
+    ) -> VmCtx {
         VmCtx {
             // A domain that already ended stops the vCPU at its first check.
-            trap: AtomicI64::new(self.ended().unwrap_or(0)),
-            end: self.end,
+            // SAFETY: the caller's contract.
+            trap: AtomicI64::new(unsafe { &*end }.load(Ordering::Relaxed)),
+            end,
             cap_ctx: self.cap_ctx,
             epoch: self.epoch,
             fuel,
@@ -282,6 +302,7 @@ impl VmCtx {
             #[cfg(fiber_rt)]
             owned_handlers: None,
             thunk_state: std::sync::OnceLock::new(),
+            kernel: None,
         }
     }
 
@@ -337,9 +358,15 @@ impl VmCtx {
         &self,
         init: impl FnOnce() -> T,
     ) -> Option<&T> {
-        self.thunk_state
-            .get_or_init(|| Box::new(init()))
-            .downcast_ref()
+        use core::any::{Any, TypeId};
+        let (made, state) = self
+            .thunk_state
+            .get_or_init(|| (TypeId::of::<T>(), Box::new(init())));
+        // #2847 — the type the state was made as is recorded beside it, so a call compares two ids
+        // where `downcast_ref` asks the state for its type through its vtable on every call.
+        // SAFETY: `state` was made as a `made`, which is `T`.
+        (*made == TypeId::of::<T>())
+            .then(|| unsafe { &*(&**state as *const (dyn Any + Send + Sync)).cast::<T>() })
     }
 
     /// The code that ended this context's domain, or `None` while it runs.

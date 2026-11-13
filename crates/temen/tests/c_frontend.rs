@@ -155,6 +155,35 @@ fn c_to_ir_with(src: &str, flags: &[&str]) -> String {
     std::fs::read_to_string(&irfile).unwrap()
 }
 
+/// #1908, #2874 — chibicc lowers the two `Module` builtins to `call.cap MODULE` ops 1 and 2, with
+/// the module handle as the call's handle and the rest as its arguments, as the LLVM on-ramp does
+/// (`temen-llvm`'s `detached_builtin.rs`).
+#[test]
+fn c_module_builtins_lower_to_the_module_ops() {
+    let ir = c_to_ir(
+        r#"
+long __vm_module_window(int module);
+long __vm_module_unbound(int module, const void *grants, long n, char *buf, long cap);
+int main(void) {
+  char buf[16];
+  return (int)(__vm_module_window(6) + __vm_module_unbound(6, 0, 0, buf, 16));
+}
+"#,
+    );
+    let m = parse_module(&ir).expect("parse");
+    let module = temen_ir::cap_id::MODULE;
+    let caps: Vec<(u32, usize)> = m
+        .funcs
+        .iter()
+        .flat_map(|f| f.blocks.iter().flat_map(|b| b.insts.iter()))
+        .filter_map(|i| match i {
+            temen_ir::Inst::CapCall(c) if c.type_id == module => Some((c.op, c.args.len())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(caps, vec![(1, 0), (2, 4)], "window, then unbound:\n{ir}");
+}
+
 /// Regression for #868: arithmetic with a non-numeric, non-pointer operand (e.g. `int + struct`)
 /// must produce a clean diagnostic, not a crash. `new_add`/`new_sub` fell through to the pointer
 /// path and dereferenced a NULL `ty->base` — a segfault, which leaves *no* exit code (the process

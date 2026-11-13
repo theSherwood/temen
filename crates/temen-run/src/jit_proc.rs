@@ -105,6 +105,14 @@ pub(crate) fn drives_jit(calls: &BTreeSet<(u32, u32)>, host: &Host) -> bool {
         .any(|&(t, o)| may_reach(t, o, host, |t, _| t == cap_id::JIT))
 }
 
+/// #2695 — whether a program making `calls` can serve its offers in a serve loop over `host`: reach
+/// `svc.poll` or `svc.wait` ([`temen_ir::durable_abi::is_serve_op`]).
+pub(crate) fn serves(calls: &BTreeSet<(u32, u32)>, host: &Host) -> bool {
+    calls
+        .iter()
+        .any(|&(t, o)| may_reach(t, o, host, temen_ir::durable_abi::is_serve_op))
+}
+
 /// How a program forks on the JIT (FORK.md §9.5): its **fork sites** — the dispatch pairs of the calls
 /// that can dispatch the fork op — and the shadow arena its root unwinds into.
 pub(crate) struct ForkPlan {
@@ -982,12 +990,13 @@ pub(crate) enum Entry<'a> {
 /// threads or runs fibers (§12; waiting and notifying alone make no second caller, so a program
 /// that only sleeps on a futex — nim's `nanosleep` — is single-threaded, and can fork). Or it has
 /// a service point: the JIT's one serve loop runs over the locked cell, root or child (#2166). Or
-/// its detached children can call it back (#744): it declares an impl-export and spawns detached
-/// (op 17), so a spawn may grant the child a live offer into the root's cell.
+/// its detached children can call it back (#744): it declares an impl-export and builds a detached
+/// child's powerbox (a spawn, op 17, or `Module.unbound`, #2874), which may grant the child a live
+/// offer into the root's cell.
 pub(crate) fn locked(m: &Module) -> bool {
     m.funcs.iter().any(|f| f.uses_fibers_or_threads())
         || crate::has_service_point(m)
-        || (!m.impl_exports.is_empty() && crate::spawns_detached(m))
+        || (!m.impl_exports.is_empty() && crate::builds_detached_children(m))
 }
 
 /// Run `f` over `host` in the shape a program's `call.cap`s need ([`CapCtx`]): a [`locked`]
@@ -1384,7 +1393,7 @@ fn interp_result(
 }
 
 /// The interpreters' [`Trap`] for a JIT trap kind: the same trap wire code (#1735).
-fn trap_of(kind: TrapKind) -> Trap {
+pub(crate) fn trap_of(kind: TrapKind) -> Trap {
     Trap::from_code(kind.code()).expect("every trap kind is a trap")
 }
 

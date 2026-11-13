@@ -13,10 +13,16 @@ publish = false
 # heavy `wgpu` dependency never enters the default `cargo build`/`test`. Its tests run on any adapter,
 # lavapipe (Mesa software Vulkan) in CI, and fail on a host with none.
 
+[features]
+# The capability a guest is granted (`webgpu_cap`), which needs temen's VM. A host that runs the
+# protocol in-process, with no guest, turns it off and takes the backend alone (`Wgpu`).
+default = ["cap"]
+cap = ["dep:temen-run", "dep:temen-interp"]
+
 [dependencies]
 temen-gpu = { path = "../temen-gpu" }
-temen-run = { path = "../temen-run" }
-temen-interp = { path = "../temen-interp" }
+temen-run = { path = "../temen-run", optional = true }
+temen-interp = { path = "../temen-interp", optional = true }
 wgpu = "24"
 pollster = "0.4"
 
@@ -26,3 +32,8 @@ temen-llvm = { path = "../temen-llvm" }
 temen-verify = { path = "../temen-verify" }
 # Encode the guest-rendered RGBA into a PNG (demo 3 artifact) in the test.
 image = { version = "0.25", default-features = false, features = ["png"] }
+# A window for the window surface's test (#2837): an X11 window over the system's libxcb, which
+# Mesa's X11 presentation needs anyway, loaded at run time. The test starts an Xvfb when there is no
+# display.
+x11rb = { version = "0.13", features = ["allow-unsafe-code", "dl-libxcb"] }
+raw-window-handle = "0.6"

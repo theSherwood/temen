@@ -190,6 +190,8 @@ pub mod di;
 /// The in-house textual-`.ll` reader (LLVM.md §8 Q1a) — the sole ingest, replacing the `llvm-ir`/
 /// libLLVM binding: full-width constants, version-tolerant, no libLLVM link.
 pub mod ll;
+/// #2961 — interfaces a C or Rust module serves or imports ([`serve`]).
+mod serve;
 
 /// Why a translation could not be produced.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -722,7 +724,14 @@ fn translate_impl(
     // below): otherwise a read-only global (the constant format string) shares page 0 with `FMT_BUF`
     // and D40 page-granular protection makes `utoa`'s scratch writes fault. (`printf` already forces
     // this via its `write` import; `snprintf` has no import of its own, hence the explicit term.)
+    // #2961 — a module that serves or imports an interface runs as a program: its `main` is reached
+    // through the powerbox entry, which a spawn starts as the child entry.
+    let names_iface = m
+        .global_vars
+        .iter()
+        .any(|g| name_str(&g.name).starts_with(serve::IFACE_PREFIX));
     let needs_powerbox_entry = !imports.is_empty()
+        || names_iface
         || need_sbrk
         || uses_blocking
         || has_global_ctors
@@ -848,6 +857,29 @@ fn translate_impl(
         tls_layout,
         mut link_data,
     ) = globals_layout(m, &name2idx, globals_base, ba, stack_page, opts.link_unit)?;
+    // #2961 — the interfaces this module serves or imports, each op's source signature checked
+    // against its descriptor. An imported one is a grouped manifest slot under its name.
+    let ifaces = serve::collect(m, &gbytes, &defined_names)?;
+    if opts.link_unit && !ifaces.list.is_empty() {
+        return unsup("a link unit (#1746) cannot serve or import an interface (#2961)");
+    }
+    for iface in &ifaces.list {
+        if !iface.served {
+            if caps.contains_key(&iface.name) {
+                return unsup(format!(
+                    "interface `{}` has the name of a capability import this module already uses",
+                    iface.name
+                ));
+            }
+            caps.insert(iface.name.clone(), imports.len() as u32);
+            imports.push(temen_ir::Import {
+                name: iface.name.clone(),
+                // Interned with the type section at module build, below.
+                shape: temen_ir::ImportShape::Interface(u32::MAX),
+                mode: temen_ir::ImportMode::Required,
+            });
+        }
+    }
     // Synthesize the glibc ctype tables (flags + lower/upper case maps) as **read-only data in the
     // module image** when the program calls the ctype locators (`isalpha`/`isspace`/`tolower`/… lower to
     // `__ctype_b_loc`/`__ctype_tolower_loc`/`__ctype_toupper_loc`, e.g. Embench `slre`). Placed after the
@@ -919,6 +951,12 @@ fn translate_impl(
         reserve_top += EH_REGION_SIZE;
         b
     });
+    // #2961 — the serve stack a served op runs on ([`serve`]).
+    let serve_stack = ifaces.any_served().then(|| {
+        let b = reserve_top.next_multiple_of(16);
+        reserve_top = b + serve::SERVE_STACK_SIZE;
+        b
+    });
     let helpers = Helpers {
         memcpy: take(need_memcpy),
         sbrk: take(need_sbrk),
@@ -973,6 +1011,7 @@ fn translate_impl(
         eh_base,
         eh_typeids,
         eh_subtype_ids,
+        ifaces: std::rc::Rc::new(serve::Lowering::new(&ifaces)),
     };
 
     // §varargs / old-C **indirect** drift (#802): pre-scan for varargs indirect call sites (the
@@ -1144,6 +1183,9 @@ fn translate_impl(
     }
     if let Some(eb) = eh_base {
         top = top.max(eb + EH_REGION_SIZE);
+    }
+    if let Some(sb) = serve_stack {
+        top = top.max(sb + serve::SERVE_STACK_SIZE);
     }
     // The durable **shadow arena** (#1534): where a freeze/thaw run of this guest keeps its
     // per-context shadow regions. Reserved only when the caller asks for one — placement is the
@@ -1439,9 +1481,26 @@ fn translate_impl(
     // on an import dedups to that import's declared `Func` entry (the structural equality the
     // verifier's `ImportSigMismatch` check requires).
     for imp in &mut imports {
-        let t = intern_sig(&sig_types, import_sig(&imp.name));
-        imp.shape = temen_ir::ImportShape::Func(t);
+        imp.shape = match imp.shape {
+            // #2961 — an imported interface: the whole op list behind one slot.
+            temen_ir::ImportShape::Interface(_) => {
+                let iface = ifaces.list.iter().find(|i| i.name == imp.name);
+                let ops = &iface.expect("an interface import names an interface").ops;
+                temen_ir::ImportShape::Interface(serve::intern_iface(&sig_types, ops))
+            }
+            temen_ir::ImportShape::Func(_) => {
+                temen_ir::ImportShape::Func(intern_sig(&sig_types, import_sig(&imp.name)))
+            }
+        };
     }
+    // #2961 — each served interface: an impl-export whose ops are trampolines onto the serve stack.
+    let impl_exports = serve::impl_exports(
+        &ifaces,
+        &name2idx,
+        serve_stack.unwrap_or(0),
+        &sig_types,
+        &mut funcs,
+    );
     // A link unit's function-symbol imports follow, each declared with the signature its call sites
     // were interned with (#1746).
     if let Some(link) = &link_ctx {
@@ -1481,7 +1540,7 @@ fn translate_impl(
     let mut t = Translated {
         module: Module {
             types,
-            impl_exports: vec![],
+            impl_exports,
             // A whole module bakes pointer-valued globals (every offset is known at translate time)
             // and has no data symbols. A link unit exports its external-linkage globals and leaves its
             // initializer pointers for the linker to fill in (#1746).
@@ -1540,6 +1599,7 @@ fn translate_impl(
     t.module.raise();
     // A constant an integer op reads is the op's immediate (#2585).
     t.module.fold_immediates();
+    serve::check_handlers(&t.module)?;
     Ok(t)
 }
 
@@ -5796,6 +5856,9 @@ struct Helpers {
     /// that type matches (itself + every thrown type derived from it; see [`build_eh_subtypes`]). The
     /// `llvm.eh.typeid.for` lowering uses it to make `icmp eq sel, typeid.for(C)` mean "thrown is-a C".
     eh_subtype_ids: HashMap<String, Vec<u32>>,
+    /// #2961 — what the call lowering needs of the module's interfaces ([`serve::Lowering`]). Shared,
+    /// since every block's context carries a copy of the helpers.
+    ifaces: std::rc::Rc<serve::Lowering>,
 }
 
 /// Does the module call an external (not guest-defined) function with name `n`?
@@ -13623,6 +13686,49 @@ fn lower_vm_builtin(
             ctx.bind_dest(&c.dest, r);
             Ok(true)
         }
+        // #2961 — the service points (§3.6): `long __vm_svc_wait(void)` parks until a call of one of
+        // this domain's served interfaces arrives, runs its op, and answers how many it served (0
+        // once no caller can come); `long __vm_svc_poll(void)` serves what is queued without
+        // parking.
+        "__vm_svc_wait" | "__vm_svc_poll" => {
+            let handle = ctx.push(Inst::ConstI32(0)); // self-namespace: the handle is unused
+            let sig = ctx.intern_sig(temen_ir::FuncType {
+                params: vec![],
+                results: vec![ValType::I64],
+            });
+            let r = ctx.push(Inst::CapCall(Box::new(temen_ir::CapCall {
+                type_id: temen_ir::CAP_SELF_TYPE_ID,
+                op: if name == "__vm_svc_wait" { 10 } else { 9 },
+                sig,
+                handle,
+                args: vec![].into(),
+            })));
+            ctx.bind_dest(&c.dest, r);
+            Ok(true)
+        }
+        // #2961 — `int __vm_serve_grant(const char *descriptor)`: the grant-record handle that names
+        // this module's served interface `descriptor` (its `__temen_iface__<name>`) as a live offer
+        // its serve loop answers, `GRANT_SERVE_LIVE_TAG | export`. Decided here, so the source never
+        // depends on the export order.
+        "__vm_serve_grant" => {
+            let sym = global_name_of(vm_arg(c, 0)?).ok_or_else(|| {
+                Error::Unsupported("__vm_serve_grant: the argument must be a descriptor".into())
+            })?;
+            let k = ctx
+                .helpers
+                .ifaces
+                .grants
+                .get(&sym)
+                .copied()
+                .ok_or_else(|| {
+                    Error::Unsupported(format!(
+                        "__vm_serve_grant: `{sym}` is not an interface this module serves"
+                    ))
+                })?;
+            let r = ctx.push(Inst::ConstI32((temen_ir::GRANT_SERVE_LIVE_TAG | k) as i32));
+            ctx.bind_dest(&c.dest, r);
+            Ok(true)
+        }
         // §7 host-defined capability call: `long __vm_host_call(int handle, int op, long a, long b,
         // long c, long d)` → `call.cap HOST_PROC op handle (a,b,c,d)`. The generic bridge to an
         // **embedder-registered** capability (`Host::grant_host_proc` — the wasm-import analogue): the
@@ -13908,13 +14014,24 @@ fn lower_vm_builtin(
         // budget, long field)` → `call.cap BUDGET 1` answers the room left along its chain;
         // `long __vm_budget_close(int budget)` → `call.cap BUDGET 3` gives the handle up (#2384).
         // The split is how a spawner bounds what one child may spend, by handing it the node.
-        "__vm_budget_split" | "__vm_budget_read" | "__vm_budget_close" => {
-            let (op, n) = match name {
-                "__vm_budget_split" => (0, 3),
-                "__vm_budget_read" => (1, 1),
-                _ => (3, 0),
+        // `Module` (`temen_ir::cap_id::MODULE`): `long __vm_module_window(int module)` → op 1, the
+        // window a spawn of it gets (#1908); `long __vm_module_unbound(int module, const void
+        // *grants, long n, char *buf, long cap)` → op 2, the first import a child granted that list
+        // leaves unbound, which a spawn refuses with `-ENOENT` (#2874).
+        "__vm_budget_split"
+        | "__vm_budget_read"
+        | "__vm_budget_close"
+        | "__vm_module_window"
+        | "__vm_module_unbound" => {
+            use temen_ir::cap_id::{BUDGET, MODULE};
+            let (type_id, op, n) = match name {
+                "__vm_budget_split" => (BUDGET, 0, 3),
+                "__vm_budget_read" => (BUDGET, 1, 1),
+                "__vm_budget_close" => (BUDGET, 3, 0),
+                "__vm_module_window" => (MODULE, 1, 0),
+                _ => (MODULE, 2, 4),
             };
-            let handle = ctx.operand_i32(vm_arg(c, 0)?)?; // the Budget handle
+            let handle = ctx.operand_i32(vm_arg(c, 0)?)?; // the Budget or Module handle
             let args = (1..=n)
                 .map(|i| ctx.operand_i64(vm_arg(c, i)?))
                 .collect::<Result<Vec<_>, _>>()?;
@@ -13924,7 +14041,7 @@ fn lower_vm_builtin(
             };
             let sig = ctx.intern_sig(sig); // #922
             let r = ctx.push(Inst::CapCall(Box::new(temen_ir::CapCall {
-                type_id: temen_ir::cap_id::BUDGET,
+                type_id,
                 op,
                 sig,
                 handle,
@@ -13965,6 +14082,67 @@ fn lower_vm_builtin(
         }
         _ => Ok(false),
     }
+}
+
+/// #2961 — a call of an imported interface's op ([`serve`]): a `call.import` of that op through the
+/// interface's slot, its arguments and results the op's own, so its `cap` slots are translated by
+/// whoever serves it. Two or more results are a small struct, as for a direct call (§3a).
+fn lower_iface_call(
+    ctx: &mut BlockCtx,
+    c: &crate::ll::ast::Call,
+    name: &str,
+) -> Result<bool, Error> {
+    let Some((iface, op, sig, storage)) = ctx.helpers.ifaces.ops.get(name).cloned() else {
+        return Ok(false);
+    };
+    if c.arguments.len() != sig.params.len() {
+        return unsup(format!(
+            "`{name}` takes {} arguments, called with {}",
+            sig.params.len(),
+            c.arguments.len()
+        ));
+    }
+    let import = ctx.import_of(&iface)?;
+    // A `cap` the source holds in an `i64` (a widened struct-return field) is narrowed for the call
+    // and widened back from it ([`serve::conversion`]).
+    let convert =
+        |ctx: &mut BlockCtx, v: ValIdx, have: ValType, want: ValType| match serve::conversion(
+            have, want,
+        ) {
+            Some(op) => ctx.push(Inst::Convert { op, a: v }),
+            None => v,
+        };
+    let mut args = Vec::with_capacity(sig.params.len());
+    for (k, (a, _attrs)) in c.arguments.iter().enumerate() {
+        let v = ctx.operand(a)?;
+        args.push(convert(ctx, v, storage.params[k], sig.params[k]));
+    }
+    let n = sig.results.len();
+    let inst = Inst::CallImport(Box::new(temen_ir::CallImport {
+        import,
+        op,
+        sig: ctx.intern_sig(sig.clone()),
+        args: args.into(),
+    }));
+    if c.dest.is_none() || n == 0 {
+        ctx.push_effect(inst);
+        return Ok(true);
+    }
+    let rs: Vec<ValIdx> = ctx
+        .push_multi(inst, n)
+        .into_iter()
+        .zip(sig.results.iter().zip(&storage.results))
+        .map(|(v, (&have, &want))| convert(ctx, v, have, want))
+        .collect();
+    match &rs[..] {
+        [r] => ctx.bind_dest(&c.dest, *r),
+        _ => {
+            if let Some(&vid) = c.dest.as_ref().and_then(|d| ctx.s.name2id.get(d)) {
+                ctx.agg.insert(vid, rs);
+            }
+        }
+    }
+    Ok(true)
 }
 
 fn lower_io_call(ctx: &mut BlockCtx, c: &crate::ll::ast::Call, name: &str) -> Result<bool, Error> {
@@ -20551,6 +20729,9 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
         // to the matching Temen IR op or `Memory` capability call. Gated on the name being external (a
         // guest-defined function of the same name shadows it), like the libc/libm rules below.
         if let Some(name) = callee_name(c) {
+            if !ctx.name2idx.contains_key(&name) && lower_iface_call(ctx, c, &name)? {
+                return Ok(());
+            }
             if !ctx.name2idx.contains_key(&name) && lower_vm_builtin(ctx, c, &name)? {
                 return Ok(());
             }

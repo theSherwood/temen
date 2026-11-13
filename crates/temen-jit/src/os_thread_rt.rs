@@ -46,6 +46,7 @@ use crate::{mem, slot_record, TrapKind};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
+use temen_ir::seams::NativeStop;
 
 // loom swaps the synchronization primitives for its model-checked versions; `Arc` and `JoinHandle`
 // stay std (loom doesn't track them, and the real spawn path is `cfg(not(loom))`). The futex core is
@@ -84,7 +85,7 @@ pub(crate) fn woke() {
 
 /// True iff the kill-path is armed (`addr != 0`) **and** the host has set the interrupt cell — i.e.
 /// a parked vCPU should stop waiting and unwind (its next epoch poll in guest code traps `OutOfFuel`).
-fn epoch_fired(addr: usize) -> bool {
+pub(crate) fn epoch_fired(addr: usize) -> bool {
     // SAFETY: a non-zero `addr` is the run's live interrupt cell (an `AtomicU64`); it outlives every
     // vCPU (joined before `run_inner` frees it). A relaxed load suffices — we only need eventual
     // visibility of the host's store, and the kill is idempotent.
@@ -2242,6 +2243,15 @@ pub(crate) unsafe extern "C" fn thread_spawn(
     arg0: u64,
     arg1: u64,
 ) -> i32 {
+    // #2958: a kernel vCPU's spawn is the kernel's.
+    let stop = NativeStop::Spawn {
+        func: func_idx,
+        arg0: arg0 as i64,
+        arg1: arg1 as i64,
+    };
+    if let Some([handle, _]) = crate::kernel_rt::routed(vm, stop) {
+        return handle as i32;
+    }
     let dom = current_domain(vm.sched as *const Domain);
     let hub = dom.hub();
     let env = dom.env();
@@ -2869,6 +2879,11 @@ pub(crate) unsafe extern "C" fn thread_join(
     status_out: *mut i64,
 ) -> i64 {
     *status_out = 0;
+    // #2958: a kernel vCPU's join is the kernel's.
+    if let Some([status, value]) = crate::kernel_rt::routed(vm, NativeStop::Join { handle }) {
+        *status_out = status;
+        return value;
+    }
     let dom = current_domain(vm.sched as *const Domain);
     match dom.children.name(handle) {
         ChildRef::Thread(done) => join_thread(dom, handle, &done, status_out, vm),
@@ -3078,18 +3093,15 @@ fn width_mask(width: u32) -> u64 {
     }
 }
 
-/// Read the `width`-byte value at confined physical address `phys` (the lowering's alignment guard
-/// ensures it is aligned).
+/// Read the `width`-byte value at confined physical address `phys` in `vm`'s window (the lowering's
+/// alignment guard ensures it is aligned). `None` if the page is not readable: the guest's
+/// `MemoryFault`, which the caller raises once it holds nothing (#2996: the read runs under the hub
+/// lock, so it must not unwind; [`crate::mem::try_access`]).
 ///
 /// # Safety
-/// `phys` points at `width` readable bytes in the guest window.
-unsafe fn read_phys(phys: u64, width: u32) -> u64 {
-    match width {
-        1 => *(phys as *const u8) as u64,
-        2 => *(phys as *const u16) as u64,
-        4 => *(phys as *const u32) as u64,
-        _ => *(phys as *const u64),
-    }
+/// `phys` is a span of `width` bytes in `vm`'s window reservation.
+unsafe fn read_phys(vm: &crate::VmCtx, phys: u64, width: u32) -> Option<u64> {
+    crate::mem::try_load(vm.window(), phys as *const u8, width)
 }
 
 /// `<ty>.atomic.wait` thunk: if the `width`-byte value at confined `phys` still equals `expected`, park
@@ -3118,6 +3130,16 @@ pub(crate) unsafe extern "C" fn thread_wait(
     width: u32,
     timeout: i64,
 ) -> i32 {
+    // #2958: a kernel vCPU's wait is the kernel's.
+    let stop = NativeStop::Wait {
+        addr: off,
+        expected,
+        wide: width == 8,
+        timeout,
+    };
+    if let Some([status, _]) = crate::kernel_rt::routed(vm, stop) {
+        return status as i32;
+    }
     // #2742 — a serve handler's futex wait gives its window's gate back meanwhile, as an event park
     // does ([`park_host_call`]); one whose domain ended meanwhile unwinds.
     let aside = crate::child_exec::handler_steps_aside(vm, false);
@@ -3174,8 +3196,15 @@ unsafe fn thread_wait_here(
         );
     }
     // #1904 — a wait that would park runs the deferred children first: the notifier may be one.
-    if read_phys(phys, width) & mask == expected & mask {
-        dom.drive_deferred_before_park(dom.current_task());
+    match read_phys(vm, phys, width) {
+        None => {
+            vm.raise(crate::TrapKind::MemoryFault as i64);
+            return 0;
+        }
+        Some(v) if v & mask == expected & mask => {
+            dom.drive_deferred_before_park(dom.current_task())
+        }
+        Some(_) => {}
     }
     // D66 — a parked vCPU holds no lane. This is what makes a bounded domain composable rather than
     // deadlock-prone: under a cap of 1, a vCPU that waits must let its peer run, or the notify it is
@@ -3187,11 +3216,19 @@ unsafe fn thread_wait_here(
     // Canonical key (S1b/S1c): a region-mapped page keys on `(backing, region offset)` so aliases at
     // different window offsets rendezvous; a plain page keys on the absolute address as before. The
     // value re-check below still reads the real `phys` — queue on the canonical key, compare on the
-    // address (mirrors the interpreter's split key/addr park).
+    // address (mirrors the interpreter's split key/addr park). A re-check that finds the page gone
+    // (a racing unmap) does not park, and is the guest's `MemoryFault` once the lock is dropped.
+    let faulted = core::cell::Cell::new(false);
     let status = futex_wait(
         &hub.park,
         futex_key_of(phys),
-        || read_phys(phys, width) & mask == expected & mask,
+        || match read_phys(vm, phys, width) {
+            Some(v) => v & mask == expected & mask,
+            None => {
+                faulted.set(true);
+                false
+            }
+        },
         deadline,
         dom.env().epoch_addr,
         freeze,
@@ -3208,6 +3245,11 @@ unsafe fn thread_wait_here(
         // before).
         || vm.ended().is_some(),
     );
+    // The re-check's fault ends the vCPU as an abort does, the lane untaken.
+    if faulted.get() {
+        vm.raise(crate::TrapKind::MemoryFault as i64);
+        return 0;
+    }
     // Back from the park: re-take the lane before any guest code runs again. An abort (kill or a
     // torn-down domain) leaves it untaken and the caller's trailing guard unwinds, exactly as the
     // wait statuses below do.
@@ -3256,7 +3298,12 @@ unsafe fn fiber_futex_wait(
     let cell = wait_cell_new(false);
     {
         let mut g = lock(&dom.hub().park.futex);
-        if read_phys(phys, width) & mask != expected & mask {
+        let Some(v) = read_phys(vm, phys, width) else {
+            drop(g);
+            vm.raise(TrapKind::MemoryFault as i64);
+            return 0;
+        };
+        if v & mask != expected & mask {
             // Insta-wake (the park-vs-store race, closed): deliver `WAIT_NOT_EQUAL` without
             // queueing — but still park once below, so the resumer sees the one transient
             // `FIBER_PARKED` the oracle's register-then-recheck shows (fiber_parks.rs).
@@ -3564,6 +3611,11 @@ pub(crate) unsafe extern "C" fn fiber_resume_block(
 /// # Safety
 /// `vm` is the running context, whose `sched` is the run's live `Domain`.
 pub(crate) unsafe extern "C" fn thread_notify(vm: &crate::VmCtx, off: u64, count: i32) -> i32 {
+    // #2958: a kernel vCPU's notify is the kernel's.
+    if let Some([woken, _]) = crate::kernel_rt::routed(vm, NativeStop::Notify { addr: off, count })
+    {
+        return woken as i32;
+    }
     let Some(phys) = vm.window().span(off, 4) else {
         return 0;
     };

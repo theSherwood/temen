@@ -1254,6 +1254,32 @@ pub fn parse_module_debug(src: &str) -> Result<Module, ParseError> {
     parse_module_inner(src, true)
 }
 
+/// Parse one function type in the text IR's own syntax, `(t, …) -> (t, …)`: the form a `type N func`
+/// entry, an import or a `call.cap` writes inline. What a frontend reads an interface's op shapes
+/// with, so the tree has one type grammar (#2961).
+pub fn parse_func_type(src: &str) -> Result<FuncType, ParseError> {
+    let (toks, lines) = tokenize(src)?;
+    let mut p = Parser {
+        toks: &toks,
+        lines: &lines,
+        pos: 0,
+        fn_results: Vec::new(),
+        imports: Vec::new(),
+        types: Vec::new(),
+        auto_debug: false,
+        auto_locs: Vec::new(),
+        auto_vars: Vec::new(),
+        pending_self_handle: false,
+    };
+    let params = p.parse_type_list()?;
+    p.expect(&Tok::Arrow)?;
+    let results = p.parse_type_list()?;
+    if !p.at_end() {
+        return err("trailing text after a function type");
+    }
+    Ok(FuncType { params, results })
+}
+
 /// The synthetic source name auto debug info attributes lines to (matched by the DAP breakpoint
 /// request's `source.path`).
 pub const AUTO_DEBUG_FILE: &str = "source.temt";
@@ -4579,5 +4605,21 @@ block 0 (v0: i32, v1: i64) {
         assert_eq!(parse_module(&printed).expect("reparse"), m);
         let over = src.replace("4294967295", "4294967296");
         assert!(parse_module(&over).is_err(), "an i32 immediate past u32");
+    }
+}
+
+#[cfg(test)]
+mod func_type_tests {
+    use super::*;
+
+    #[test]
+    fn a_function_type_parses_alone_and_trailing_text_is_refused() {
+        let ft = parse_func_type("(i64, cap) -> (i64, cap)").unwrap();
+        assert_eq!(ft.params, [ValType::I64, ValType::Cap]);
+        assert_eq!(ft.results, [ValType::I64, ValType::Cap]);
+        assert!(parse_func_type("() -> ()").unwrap().params.is_empty());
+        for bad in ["", "(i64)", "(i64) -> i64", "() -> () x", "(i8) -> ()"] {
+            assert!(parse_func_type(bad).is_err(), "{bad:?}");
+        }
     }
 }

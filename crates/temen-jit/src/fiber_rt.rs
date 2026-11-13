@@ -2073,7 +2073,7 @@ pub(crate) unsafe extern "C" fn gc_roots(vm: u64, args: *const GcRootsArgs) -> i
         // physically at `mem_base + off`. #826: `bound` (`mapped` here) is the **reserved**
         // span, so a roots buffer in a `map`-grown tail page is
         // admitted where the interpreter's live page map admits it; a write into an uncommitted or
-        // `Ro` page faults through the SIGSEGV guard (`MemoryFault`), exactly like a guest store.
+        // `Ro` page is a `MemoryFault` (below), exactly like a guest store's.
         let masked = buf & mask;
         let nbytes = (nwrite as u64) * 8;
         // #2164 — a demand-paged child's unsupplied pages are committed, and its access table gates
@@ -2094,10 +2094,25 @@ pub(crate) unsafe extern "C" fn gc_roots(vm: u64, args: *const GcRootsArgs) -> i
             return 0;
         }
         let dst = (mem_base + masked) as *mut u8;
-        let mut off = 0usize;
-        for w in roots.iter().take(nwrite) {
-            std::ptr::copy_nonoverlapping(w.to_le_bytes().as_ptr(), dst.add(off), 8);
-            off += 8;
+        let bytes: Vec<u8> = roots
+            .iter()
+            .take(nwrite)
+            .flat_map(|r| r.to_le_bytes())
+            .collect();
+        // #2996 — an unwritable buffer page is the guest's `MemoryFault`, not an unwind past the
+        // roots set this frame owns.
+        if !bytes.is_empty()
+            && !crate::mem::try_access(
+                &w,
+                &mut crate::mem::Access::Copy {
+                    dst,
+                    src: bytes.as_ptr(),
+                    len: bytes.len(),
+                },
+            )
+        {
+            crate::VmCtx::at(vm).raise(TrapKind::MemoryFault as i64);
+            return 0;
         }
     }
     total as i64

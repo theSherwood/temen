@@ -19,11 +19,15 @@ pub fn require_adapter() {
     );
 }
 
-/// The demo `crates/temen-run/demos/webgpu/<name>.c`, built for temen and instantiated.
+/// The demo `crates/temen-run/demos/webgpu/<name>.c`, built for temen and instantiated. Each build
+/// writes a file of its own, so tests that build one demo at once never share it.
 pub fn guest(name: &str) -> temen_run::Instance {
+    static BUILDS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let n = BUILDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let demo = root.join(format!("../temen-run/demos/webgpu/{name}.c"));
-    let ll = std::env::temp_dir().join(format!("temen_webgpu_{name}_{}.ll", std::process::id()));
+    let ll =
+        std::env::temp_dir().join(format!("temen_webgpu_{name}_{}_{n}.ll", std::process::id()));
     let status = Command::new("clang")
         .args([
             "-O2",

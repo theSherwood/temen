@@ -942,7 +942,7 @@ fn bounce_leaf(call: &mut EmittedCall<'_>) -> Result<(), Trap> {
     THREAD_TIERUPS.fetch_add(1, Ordering::SeqCst);
     let mut io = call.argv.to_vec();
     io.resize(io.len().max(1), 0);
-    let n = (call.bounce)(func, &mut io, 0)?;
+    let n = call.bounce(func, &mut io, 0)?;
     call.results = io[..n].to_vec();
     Ok(())
 }
@@ -971,6 +971,7 @@ fn run_leaf(
                     modules: t.modules,
                     leaf: t.leaf,
                     run: bounce_leaf,
+                    native: None,
                 }),
                 ..ThreadPlatform::OS
             });

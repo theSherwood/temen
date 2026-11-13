@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 use fake_foreign::{fake_child_window, fake_word};
 use temen_interp::bytecode::{
     self, ChildBacking, CoopEvent, EmittedCall, EmittedTarget, Hotness, LeafOffer, ModuleOffer,
-    ProgramEmit, ThreadPlatform, ThreadStart, ThreadTier, TierUpConfig,
+    Opener, ProgramEmit, ThreadPlatform, ThreadStart, ThreadTier, TierUpConfig,
 };
 use temen_interp::{Host, JitValidated, Region, Trap, Value};
 use temen_ir::{Module, SpawnRec, ValType};
@@ -194,7 +194,7 @@ fn bounce_whole_call(call: &mut EmittedCall<'_>) -> Result<(), Trap> {
     };
     let mut io = [0i64; 8];
     io[..call.argv.len()].copy_from_slice(call.argv);
-    let n = (call.bounce)(func, &mut io, 0)?;
+    let n = call.bounce(func, &mut io, 0)?;
     call.results = io[..n].to_vec();
     Ok(())
 }
@@ -214,6 +214,7 @@ fn tier(
             leaf: None,
             modules: None,
             run,
+            native: None,
         }),
         ..ThreadPlatform::OS
     }
@@ -333,8 +334,9 @@ fn run_leaf_root(m: &Module, take: Option<bool>) -> (Result<Vec<Value>, Trap>, L
                 take
             })),
             run: recording_leaf_calls,
+            native: None,
         }),
-        root_on_opener: true,
+        opener: Opener::RunsRoot,
         ..ThreadPlatform::OS
     });
     let declared = m.memory.expect("a window").size_log2;
@@ -614,7 +616,7 @@ fn spin_until_stopped(call: &mut EmittedCall<'_>) -> Result<(), Trap> {
     SPUN.fetch_add(1, Ordering::SeqCst);
     signal_root(call);
     let since = std::time::Instant::now();
-    while !call.over.load(Ordering::SeqCst) {
+    while call.end.load(Ordering::SeqCst) == 0 {
         // Far past the root's end: the run never stopped this code, and would wait for it forever.
         assert!(
             since.elapsed() < std::time::Duration::from_secs(60),
@@ -747,6 +749,7 @@ fn invoke_tier(run: fn(&mut EmittedCall<'_>) -> Result<(), Trap>) -> ThreadPlatf
             leaf: None,
             modules: None,
             run,
+            native: None,
         }),
         ..ThreadPlatform::OS
     }
@@ -837,6 +840,7 @@ fn run_paged(
             leaf: None,
             modules: None,
             run,
+            native: None,
         }),
         ..ThreadPlatform::OS
     });
@@ -973,7 +977,7 @@ fn protect_in_a_bounce(call: &mut EmittedCall<'_>) -> Result<(), Trap> {
     let before = pagestate_now(call);
     let mut io = [0i64; 8];
     io[0] = call.argv[0];
-    (call.bounce)(3, &mut io, 0)?;
+    call.bounce(3, &mut io, 0)?;
     let after = pagestate_now(call);
     AROUND_THE_BOUNCE.lock().unwrap().extend([before, after]);
     bounce_whole_call(call)
@@ -1014,7 +1018,7 @@ fn spill_then_collect(call: &mut EmittedCall<'_>) -> Result<(), Trap> {
         base.add(1).write(v0 as u64 + 8);
     }
     let mut io = [0i64; 8];
-    (call.bounce)(2, &mut io, 2)?;
+    call.bounce(2, &mut io, 2)?;
     call.results = vec![io[0] + 8];
     Ok(())
 }
@@ -1039,6 +1043,7 @@ fn a_collector_under_each_threads_emitted_frame_sees_its_spilled_words() {
             leaf: None,
             modules: None,
             run: spill_then_collect,
+            native: None,
         }),
         ..ThreadPlatform::OS
     };
@@ -1397,6 +1402,7 @@ fn a_childs_root_task_tiers_up_over_its_own_memory() {
                 })
             })),
             run: recording_child_calls,
+            native: None,
         }),
         ..ThreadPlatform::OS
     };
@@ -1691,6 +1697,7 @@ fn a_bounce_spawns_and_joins_a_child_whose_entry_spawns_a_thread() {
                 })
             })),
             run: recording_child_bounces,
+            native: None,
         }),
         ..ThreadPlatform::OS
     };
@@ -1845,4 +1852,277 @@ fn a_fork_join_runs_with_its_spawner_and_threads_emitted() {
         5,
         "the root's call to the spawner and the four threads' entries ran emitted"
     );
+}
+
+// ----- #2958 slice 2: the futex fast paths on the interpreted and bounce entries ---------------
+
+/// A spawned thread (function 1) runs `op` at `addr` in a `memory 16` window, nothing waiting or
+/// notifying beside it; the root joins it and returns what the op answered, or ends with its trap.
+/// A wait expects 1 of a word that holds 0 (a not-equal answer), with a 1 ms timeout.
+fn op_in_thread(op: &str, addr: u64) -> Module {
+    let body = match op {
+        "wait" => format!(
+            "  va = i64.const {addr}\n  vx = i32.const 1\n  vt = i64.const 1000000\n  vs = i32.atomic.wait va vx vt\n"
+        ),
+        _ => format!("  va = i64.const {addr}\n  vc = i32.const 1\n  vs = atomic.notify va vc\n"),
+    };
+    module(&format!(
+        "memory 16
+func () -> (i64) {{
+block 0 () {{
+  vz = i64.const 0
+  vh = thread.spawn 1 vz vz
+  vst, vv = thread.join vh
+  return vv
+  }}
+}}
+func (i64, i64) -> (i64) {{
+block 0 (va0: i64, vb0: i64) {{
+{body}  vr = i64.extend_i32_u vs
+  return vr
+  }}
+}}
+"
+    ))
+}
+
+/// The oracle's answer for `m`.
+fn oracle(m: &Module) -> Result<Vec<Value>, Trap> {
+    let mut fuel = 50_000_000;
+    temen_interp::run(m, 0, &[], &mut fuel)
+}
+
+/// The rows of [`a_futex_op_with_no_waiter_answers_as_the_oracle_on_both_entries`]: the NULL guard,
+/// a mapped word, a misaligned one, past the declared window, and past the reservation.
+const BAD_AND_GOOD: [u64; 6] = [0, 4096, 16_384, 16_386, 65_536, 1 << 30];
+
+/// #2958 slice 2 — a notify or a wait with no waiter, at every kind of address, answers as the
+/// oracle does on executor 2's interpreted entry and on its bounce entry (the thread's code served
+/// whole through a bounce, as the browser tier's outlined futex ops are): the op's own checks trap a
+/// bad address before any fast answer, and a good one answers 0 woken or not-equal.
+#[test]
+fn a_futex_op_with_no_waiter_answers_as_the_oracle_on_both_entries() {
+    let before = bytecode::futex_no_wakes();
+    for op in ["wait", "notify"] {
+        for addr in BAD_AND_GOOD {
+            let m = op_in_thread(op, addr);
+            let want = oracle(&m);
+            let interpreted = run_over(&m, ThreadPlatform::OS, None);
+            assert_eq!(interpreted, want, "{op} at {addr}, interpreted");
+            let bounced = run_over(
+                &m,
+                tier(Arc::from([false, true]), bounce_whole_call),
+                flat_window(),
+            );
+            assert_eq!(bounced, want, "{op} at {addr}, bounced");
+        }
+    }
+    if cfg!(debug_assertions) {
+        assert!(bytecode::futex_no_wakes() > before, "the fast paths ran");
+    }
+}
+
+/// The root spawns function 1, which sets the cell at 16392 and then notifies word 16400, which
+/// nothing waits on, forever. The root waits for the cell and returns 42 without joining it.
+fn root_leaves_a_notify_loop() -> Module {
+    let op = "va = i64.const 16400\n  vc = i32.const 1\n  vk = atomic.notify va vc";
+    module(&format!(
+        "memory 16
+func () -> (i64) {{
+block 0 () {{
+  vz = i64.const 0
+  vh = thread.spawn 1 vz vz
+  br 1()
+  }}
+block 1 () {{
+  vc = i64.const 16392
+  vs = i32.atomic.load vc
+  vzero = i32.const 0
+  vwait = i32.eq vs vzero
+  br_if vwait 1() 2()
+  }}
+block 2 () {{
+  vr = i64.const 42
+  return vr
+  }}
+}}
+func (i64, i64) -> (i64) {{
+block 0 (va0: i64, vb0: i64) {{
+  vc = i64.const 16392
+  vone = i32.const 1
+  i32.atomic.store vc vone
+  br 1()
+  }}
+block 1 () {{
+  {op}
+  br 1()
+  }}
+}}
+"
+    ))
+}
+
+/// #2958 slice 2 — a loop of notifies answered without the rules, inside a bounce, whose interpreter
+/// polls neither the run's end nor fuel: the run's end still reaches it, because every
+/// `TIERUP_LOOK`th op goes to the rules, which tell the thread the run is over. (A bounce answers a
+/// not-equal wait itself, before any stop, so a bounced loop of those is told nothing, on main as
+/// here: #2988.)
+#[test]
+fn the_runs_end_stops_a_bounced_loop_of_fast_notifies() {
+    let t0 = std::time::Instant::now();
+    let ran = run_over(
+        &root_leaves_a_notify_loop(),
+        tier(Arc::from([false, true]), bounce_whole_call),
+        flat_window(),
+    );
+    assert_eq!(ran, Ok(vec![Value::I64(42)]));
+    let took = t0.elapsed();
+    assert!(took < std::time::Duration::from_secs(5), "{took:?}");
+}
+
+// ----- #2977: a stack's entry is paid on the task's budget whether or not it tiers up ------------
+
+/// The root spawns function 1 three times (each returns its first argument, 7) and sums the joins.
+/// Function 1 has no fuel safepoint but its entry.
+const SPAWN_THREE_SEVENS: &str = "memory 16
+func () -> (i64) {
+block 0 () {
+  v7 = i64.const 7
+  t0 = thread.spawn 1 v7 v7
+  t1 = thread.spawn 1 v7 v7
+  t2 = thread.spawn 1 v7 v7
+  j0_st, j0 = thread.join t0
+  j1_st, j1 = thread.join t1
+  j2_st, j2 = thread.join t2
+  vs = i64.add j0 j1
+  vr = i64.add vs j2
+  return vr
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (va: i64, vb: i64) {
+  return va
+  }
+}
+";
+
+/// A root with no fuel safepoint but its entry, that returns 7.
+const ROOT_SEVEN: &str = "memory 16
+func () -> (i64) {
+block 0 () {
+  v7 = i64.const 7
+  return v7
+  }
+}
+";
+
+static ANSWERED: AtomicUsize = AtomicUsize::new(0);
+
+/// Emitted code for a task's entry that answers it (`argv[0]`, or 7 for the root's, which takes
+/// none) and charges the task's budget nothing, as the wasm-JIT's emitted code charges its own
+/// `fuel` global and not the budget chain (#1997).
+fn answer_entry(call: &mut EmittedCall<'_>) -> Result<(), Trap> {
+    ANSWERED.fetch_add(1, Ordering::SeqCst);
+    call.results = vec![call.argv.first().copied().unwrap_or(7)];
+    Ok(())
+}
+
+/// `m` on the parallel driver under `platform`, over a flat window: its result and the fuel its
+/// budget was charged.
+fn charged(m: &Module, platform: ThreadPlatform) -> (Result<Vec<Value>, Trap>, u64) {
+    const BUDGET: u64 = 1_000_000;
+    let mut host = Host::new();
+    host.set_thread_platform(platform);
+    let mut fuel = BUDGET;
+    let r = bytecode::compile_and_run_capture_over_parallel_with_host(
+        m,
+        0,
+        &[],
+        &mut fuel,
+        &[],
+        flat_window(),
+        &mut host,
+    )
+    .expect("the parallel driver runs the module")
+    .0;
+    (r, BUDGET - fuel)
+}
+
+/// **A stack's entry costs one on the task's budget, tiered up or not** (#2977, INVARIANTS #9). A
+/// thread whose entry runs on the emitted tier (#1414 ED-1), and a root whose entry does, pay their
+/// entries as they are made, so the budget is charged exactly what the interpreted run charges: the
+/// root's entry and each thread's. The emitted bodies charge the budget nothing yet (#1997), so these
+/// programs keep every other safepoint out of them; with that fixed, a body with back-edges joins.
+#[test]
+fn an_entry_on_the_emitted_tier_pays_once_on_the_tasks_budget() {
+    let threads = module(SPAWN_THREE_SEVENS);
+    let interpreted = charged(&threads, ThreadPlatform::OS);
+    assert_eq!(
+        interpreted,
+        (Ok(vec![Value::I64(21)]), 4),
+        "the root's entry and 3 threads'"
+    );
+    let before = ANSWERED.load(Ordering::SeqCst);
+    let tiered = charged(&threads, tier(Arc::from([false, true]), answer_entry));
+    assert_eq!(
+        ANSWERED.load(Ordering::SeqCst) - before,
+        3,
+        "each thread's entry tiered up"
+    );
+    assert_eq!(
+        tiered, interpreted,
+        "threads: the interpreted run's result and charge"
+    );
+
+    // The root's entry runs on the emitted tier only whole, as a leaf (#1954), on a run its opener
+    // does not pump, which reports no fuel left: its charge is pinned by where it runs out instead.
+    // 1 is exactly enough and 0 is not, leaf or interpreted, so the leaf's root pays exactly one.
+    let root = module(ROOT_SEVEN);
+    for (budget, end) in [(1, Ok(vec![Value::I64(7)])), (0, Err(Trap::OutOfFuel))] {
+        assert_eq!(
+            leaf_root_with(&root, budget, false),
+            end,
+            "interpreted, budget {budget}"
+        );
+        let before = ANSWERED.load(Ordering::SeqCst);
+        assert_eq!(
+            leaf_root_with(&root, budget, true),
+            end,
+            "a leaf, budget {budget}"
+        );
+        let ran = ANSWERED.load(Ordering::SeqCst) - before;
+        assert_eq!(
+            ran,
+            usize::from(budget > 0),
+            "the leaf ran only when its entry was paid"
+        );
+    }
+}
+
+/// [`run_leaf_root`] with `fuel` and a leaf emitter that takes the root (`take`), its code
+/// [`answer_entry`]: the run's end.
+fn leaf_root_with(m: &Module, fuel: u64, take: bool) -> Result<Vec<Value>, Trap> {
+    let mut host = Host::new();
+    host.set_thread_platform(ThreadPlatform {
+        tier: Some(ThreadTier {
+            root: ProgramEmit::default(),
+            spill: 0,
+            modules: None,
+            leaf: Some(Arc::new(move |_: &LeafOffer| take)),
+            run: answer_entry,
+            native: None,
+        }),
+        opener: Opener::RunsRoot,
+        ..ThreadPlatform::OS
+    });
+    let declared = m.memory.expect("a window").size_log2;
+    // The root's entry is paid as the run opens, so a budget that cannot pay it ends the open.
+    let mut run =
+        bytecode::CoopRun::new_parallel(m, 0, &[], fuel, host, &[], declared, None, false)
+            .expect("in subset")?;
+    match run.run() {
+        CoopEvent::Done(vals) => Ok(vals),
+        CoopEvent::Trapped(t) => Err(t),
+        _ => panic!("a run nothing pumps returns at its end"),
+    }
 }

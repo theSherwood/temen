@@ -11,6 +11,7 @@
 /// Phase-1b bytecode-dispatch engine (see `INTERP_PERF.md`) — a flat, operand-resolved execution
 /// path, not yet the default; gated by the equality harness against this interpreter.
 pub mod bytecode;
+mod futex_count;
 pub mod journal;
 pub mod moment;
 
@@ -2320,6 +2321,22 @@ pub enum Executor {
     /// calls too, and a call on its caller's. It holds the modules the bytecode engine admits; the
     /// tree-walker holds the others.
     Threads,
+    /// The Cranelift JIT: the domain's threads on threads of their own, and a call on its caller's.
+    /// It lives outside this crate: `temen_run::hold` starts a domain on it ([`HeldEngine`]). Here,
+    /// with no JIT to reach, the tree-walker holds it.
+    Jit,
+}
+
+/// #2695 step 2 — a held domain on an engine outside this crate, which holds it for a
+/// [`HeldDomain`] ([`HeldDomain::of`]): the Cranelift JIT, held by `temen_run::hold`. Its methods
+/// are [`HeldDomain`]'s.
+pub trait HeldEngine: Send + Sync {
+    /// [`HeldDomain::call`].
+    fn call(&self, export: u32, op: u32, args: &[i64], fuel: &mut u64) -> Reply;
+    /// [`HeldDomain::end`], unless it has ended already.
+    fn finish(&mut self) -> Option<(Host, Option<Trap>)>;
+    /// [`HeldDomain::executor`].
+    fn executor(&self) -> Executor;
 }
 
 /// Where a [`HeldDomain`] runs.
@@ -2331,16 +2348,20 @@ enum HeldOn {
     },
     Pump(Box<bytecode::HeldPump>),
     Threads(Box<bytecode::HeldThreads>),
+    Engine(Box<dyn HeldEngine>),
 }
 
 /// The thread a held domain's run is on, which answers the run and hands the powerbox back.
 type HeldRun = std::thread::JoinHandle<(Result<Vec<Value>, Trap>, Host)>;
 
-/// #2695 step 2 — who holds a domain ([`Host::held`]): the tree-walker's run, through its link, or
-/// the bytecode engine's ([`bytecode::HeldPump`], [`bytecode::HeldThreads`]).
+/// #2695 step 2 — who holds a domain ([`Host::held`]): the tree-walker's run, through its link, the
+/// bytecode engine's ([`bytecode::HeldPump`], [`bytecode::HeldThreads`]), or an engine outside this
+/// crate ([`HeldEngine`]), with the site its calls enter once the domain rests
+/// ([`Host::held_site`]).
 pub(crate) enum Holder {
     Tree(Arc<HeldLink>),
     Bytecode,
+    Engine(Option<Arc<dyn std::any::Any + Send + Sync>>),
 }
 
 impl HeldDomain {
@@ -2375,7 +2396,7 @@ impl HeldDomain {
                 Ok(Err(refused)) => return Err(refused),
                 Err(host) => *host,
             },
-            Executor::TreeWalker => host,
+            Executor::TreeWalker | Executor::Jit => host,
         };
         if host.is_durable() {
             return Err((Trap::ThreadFault, Box::new(host)));
@@ -2415,6 +2436,7 @@ impl HeldDomain {
             HeldOn::Tree { link, .. } => link,
             HeldOn::Pump(p) => return p.call(export, op, args, fuel),
             HeldOn::Threads(t) => return t.call(export, op, args, fuel),
+            HeldOn::Engine(e) => return e.call(export, op, args, fuel),
         };
         let Some(sched) = link.scheduler() else {
             return Reply::Failed(CAP_REVOKED);
@@ -2454,10 +2476,19 @@ impl HeldDomain {
     /// The executor the domain runs on: the one it was started on, or the tree-walker if the pump
     /// declined its module.
     pub fn executor(&self) -> Executor {
-        match self.on {
+        match &self.on {
             HeldOn::Tree { .. } => Executor::TreeWalker,
             HeldOn::Pump(_) => Executor::Pump,
             HeldOn::Threads(_) => Executor::Threads,
+            HeldOn::Engine(e) => e.executor(),
+        }
+    }
+
+    /// A domain an engine outside this crate holds ([`HeldEngine`]), as `temen_run::hold` holds one
+    /// on the Cranelift JIT.
+    pub fn of(engine: Box<dyn HeldEngine>) -> HeldDomain {
+        HeldDomain {
+            on: HeldOn::Engine(engine),
         }
     }
 
@@ -2473,6 +2504,7 @@ impl HeldDomain {
             HeldOn::Tree { link, run } => (link, run.take()?),
             HeldOn::Pump(p) => return p.finish(),
             HeldOn::Threads(t) => return t.finish(),
+            HeldOn::Engine(e) => return e.finish(),
         };
         if let Some(sched) = link.scheduler() {
             let mut s = sched.lock();
@@ -4119,9 +4151,11 @@ pub struct TwinTrap {
     pub task: u64,
     pub trap: Trap,
     /// The trap-time call stack, innermost frame first. Frames name the image the twin was running
-    /// when it trapped — after an `execve`, the *new* image, not the program that forked it.
+    /// when it trapped — after an `execve`, the *new* image, not the program that forked it. The
+    /// tree-walker's only: the bytecode engine and the JIT leave it empty.
     pub backtrace: Vec<IrPc>,
     /// The window-relative faulting address, for a `MemoryFault` (see [`last_capture_fault_addr`]).
+    /// The tree-walker's only, as [`Self::backtrace`] is.
     pub fault: Option<u64>,
 }
 
@@ -4153,14 +4187,16 @@ thread_local! {
 /// Every fork twin that **trapped** in the last run on this thread, in completion order — empty if
 /// none did (a twin that `exit`s, with any status, is not a trap). The run itself can have finished
 /// cleanly: a crashed command is its parent's business, reaped as status `128`, and this is the only
-/// place the crash's kind and frames survive. Tree-walker runs only, the same scope as
-/// [`last_capture_backtrace`].
+/// place the crash's kind and frames survive. Every engine's run publishes it: the tree-walker's,
+/// the bytecode engine's (#1827) and the JIT's process tree (#1768). Only the tree-walker's names
+/// frames and a fault address.
 pub fn last_twin_traps() -> Vec<TwinTrap> {
     LAST_TWIN_TRAPS.with(|c| c.borrow().clone())
 }
 
 /// #1768 — publish the twins that trapped in a run driven by **another engine** (the JIT's process
-/// tree), so [`last_twin_traps`] answers for whichever engine ran last on this thread.
+/// tree, the bytecode engine's drivers), so [`last_twin_traps`] answers for whichever engine ran
+/// last on this thread.
 pub fn publish_twin_traps(traps: Vec<TwinTrap>) {
     LAST_TWIN_TRAPS.with(|c| *c.borrow_mut() = traps);
 }
@@ -5918,7 +5954,7 @@ fn frames_to_pcs(frames: &[Frame]) -> Vec<IrPc> {
 /// offsets — in the same or different domains) rendezvous. The Linux distinction, exactly: a private
 /// page keys on its virtual address (`FUTEX_PRIVATE`), a shared page on its backing identity + offset.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
-enum FutexKey {
+pub enum FutexKey {
     /// A normal (anonymous) window page — keyed by `(backing identity, backing-absolute address)`.
     /// The address alone is **not** a sound identity across domains (#1283): every window starts at 0
     /// of its own backing, and all of a run's domains share one `wait_waiters`, so two detached
@@ -5944,7 +5980,7 @@ enum FutexKey {
 /// parks on the site rather than the key. A page remapped under a parked waiter leaves its site as it
 /// was, as the key would be.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum FutexSite {
+pub enum FutexSite {
     Anon(u64),
     Region(u32, u64),
 }
@@ -15893,13 +15929,13 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
             // until it lands — a fiber alone, the root with its vCPU. A full queue is the call's
             // failure, `-EAGAIN`: probeable backpressure, never a trap, for an op that can carry it.
             macro_rules! live_call {
-                ($target:expr, $op:expr, $argv:expr, $sig:expr) => {{
+                ($target:expr, $argv:expr, $sig:expr) => {{
                     let target: LiveTarget = $target;
-                    let op: u32 = $op;
+                    let op = target.op;
                     let csig = call_sig(&cur_types, $sig);
                     // INVARIANTS #8: the op's own signature, not the call site's, says which
                     // slots are handles.
-                    let sig = target.sig(op, csig.params.len(), csig.results.len())?;
+                    let sig = target.sig(csig.params.len(), csig.results.len())?;
                     let (ticket, callee_id) = issue_live_call(
                         host,
                         *durable_sp_ctx,
@@ -16599,7 +16635,8 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                     );
                                 }
                                 // #1975 — every exit from here that spawns nothing hands back what
-                                // the admission took, so the spawn charges nothing.
+                                // the admission took, so the spawn charges nothing, and discards the
+                                // child, so its grants take nothing from this domain (`Host::discard`).
                                 let undo = || {
                                     host.lock_unpoisoned()
                                         .undo_detached_spawn(lease, child_lane_val)
@@ -16612,6 +16649,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                     let staged = host.lock_unpoisoned().stage_premap(r, o, &mut ch);
                                     if !(staged && ch.apply_premap(&mut fm) >= 0) {
                                         undo();
+                                        ch.discard();
                                         return Err(Trap::Malformed);
                                     }
                                 }
@@ -16619,6 +16657,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                     ch.bind_child_manifest(&cm.module.imports, &cm.module.types);
                                 if bound.is_err() {
                                     undo();
+                                    ch.discard();
                                     frames[top]
                                         .vals
                                         .push(Reg::from_i32(SpawnRefusal::Unbound.errno() as i32));
@@ -16822,6 +16861,21 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     } = &**c;
                     let h = get_i32(&frames[top].vals, *handle)?;
                     jit_invoke_body!(h, args, call_sig(&cur_types, *sig))
+                }
+                // `Module.unbound` (op 2): served here so that its child grants a #744 live
+                // self-serve grant through this powerbox's cell, as this engine's spawns do
+                // (`authorize_eval_grants`). Every other engine serves it on the shared dispatch,
+                // through `Host::own_cell`; the answer is `Host::module_unbound`'s on each.
+                Inst::CapCall(c) if c.type_id == cap_id::MODULE && c.op == 2 => {
+                    let temen_ir::CapCall { handle, args, .. } = &**c;
+                    let h = get_i32(&frames[top].vals, *handle)?;
+                    let (mut arg_stack, mut arg_heap) = ([0; CALL_STACK_SLOTS], Vec::new());
+                    let argv = arg_slots(&mut arg_stack, &mut arg_heap, &frames[top].vals, args)?;
+                    let gm = mem.as_mut().map(|m| m as &mut dyn GuestMem);
+                    let r = host
+                        .lock_unpoisoned()
+                        .module_unbound(h, argv, gm, Some(host))?;
+                    frames[top].vals.push(Reg::from_i64(r));
                 }
                 // §3.6 slices 2+3+5b — the service points. `svc.poll` (op 9) serves everything
                 // currently runnable and returns the count of *completed* dispatches;
@@ -17282,18 +17336,6 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     // #2319 — the call's arg and result slots, on this stack when they fit.
                     let (mut arg_stack, mut arg_heap) = ([0; CALL_STACK_SLOTS], Vec::new());
                     let argv = arg_slots(&mut arg_stack, &mut arg_heap, &frames[top].vals, args)?;
-                    // §3.6 slice 3 — caller-side parking: a call through a live-callee offer
-                    // does not dispatch here. It enqueues on the callee's inbound queue, wakes
-                    // the callee's `svc.wait` (if parked), and parks THIS fiber until the
-                    // handler's reply (`Blocked::CapReply`). A full callee queue is probeable
-                    // backpressure (`-EAGAIN` as the call's result), never a trap.
-                    let live = {
-                        let hg = host.lock_unpoisoned();
-                        hg.live_impl_of(h, *type_id)
-                    };
-                    if let Some(target) = live {
-                        live_call!(target, *op, argv.to_vec(), *sig);
-                    }
                     // CALLS.md increment 3 (slice 1): an **instanced** offer runs its sub-run with
                     // the caller powerbox lock narrowed to the two `cap`-slot translation edges —
                     // never held across the provider drive (CALLS.md §1 defect / §4 lock discipline).
@@ -17322,7 +17364,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     // host locking). Threads of a domain serialize their capability calls here.
                     let mut hg = HostCall::lock(host, sched);
                     let mut pending_id = None;
-                    let mut unlocked = None;
+                    let (mut unlocked, mut live) = (None, None);
                     // #2495 — under a recording host this engine offers no parking face: it tapes
                     // no delivered value, so a host-answered call declines before its embedder
                     // sees it. A pool job runs inline under a tape on either face.
@@ -17339,7 +17381,18 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         gm,
                         face,
                         Some(&mut unlocked),
+                        Some(&mut live),
                     )?;
+                    // §3.6 slice 3 — caller-side parking: a call through a live-callee offer
+                    // does not complete in the dispatch, which hands its target back. This fiber
+                    // enqueues on the callee's inbound queue, wakes the callee's `svc.wait` (if
+                    // parked), and parks until the handler's reply (`Blocked::CapReply`). A full
+                    // callee queue is probeable backpressure (`-EAGAIN` as the call's result),
+                    // never a trap.
+                    if let Some(target) = live {
+                        drop(hg);
+                        live_call!(target, argv.to_vec(), *sig);
+                    }
                     // §12 parking-on-blocking: a punted offloadable dispatch — release the host
                     // lock **before** waiting (the §5b serialization fix), then take the scalar
                     // completion. The placeholder `results` is discarded.
@@ -17566,10 +17619,10 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     // fiber until the reply. Same backpressure and race story as slice 3.
                     let live = {
                         let hg = host.lock_unpoisoned();
-                        hg.import_live_target(*import)
+                        hg.import_live_target(*import | (*op << 16))
                     };
-                    if let Some((target, base_op)) = live {
-                        live_call!(target, base_op + *op, argv.to_vec(), *sig);
+                    if let Some(target) = live {
+                        live_call!(target, argv.to_vec(), *sig);
                     }
                     // CALLS.md increment 3 (slice 1): an instanced offer bound to this slot runs
                     // with the narrowed powerbox lock (see the `call.cap` arm). Probe reproduces the
@@ -17606,6 +17659,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         gm,
                         None,
                         Some(&mut unlocked),
+                        None,
                     )?;
                     // An import-routed blocking-stdin read doesn't park on this engine (the
                     // `set_stdin_blocking` park is `call.cap`'s); the flag is consumed so it can't
@@ -17676,8 +17730,8 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         let hg = host.lock_unpoisoned();
                         hg.import_live_target(*import)
                     };
-                    if let Some((target, base_op)) = live {
-                        live_call!(target, base_op, argv.to_vec(), *sig);
+                    if let Some(target) = live {
+                        live_call!(target, argv.to_vec(), *sig);
                     }
                     // CALLS.md increment 3 (slice 1): a symbolic slot bound to an instanced offer
                     // runs with the narrowed powerbox lock. CallSym is "a flat call.import (op 0)",
@@ -17712,6 +17766,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         gm,
                         None,
                         Some(&mut unlocked),
+                        None,
                     )?;
                     // FORK.md §8.6 — pipe blocking rides this dispatch (a command's `write`/`read`
                     // are `call.sym` imports bound to pipe ends): a `read` on an empty FIFO with
@@ -17815,6 +17870,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         gm,
                         None,
                         Some(&mut unlocked),
+                        None,
                     )?;
                     let _ = hg.take_stdin_parked(); // no stdin parking here (see call.import)
                                                     // #1621/#1647/#1826 — requests and pipe parks are honored here too. No consumer
@@ -18411,9 +18467,15 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     let cdomain = Arc::clone(domain);
                     // The domain's one fuel budget (INVARIANTS #6): an activation draws its caller's, but
                     // a thread it spawns is its domain's (#2695).
-                    let child_fuel = answers
+                    let mut child_fuel = answers
                         .as_ref()
                         .map_or_else(|| fuel.for_thread(), |a| a.home.for_thread());
+                    // Fuel unification (#2977): a stack's first entry costs one, a thread's as the
+                    // root's (`drive_over_cell`) and as the JIT's child prologue charges it. Paid on
+                    // the child's fuel as the spawn completes, so a freeze after the spawn has paid it
+                    // and a thaw, which re-creates the thread through `seed_thread`, pays nothing.
+                    // Out of fuel ends the run, as a thread's own `OutOfFuel` does.
+                    child_fuel.pay_entry()?;
                     let parent_id = *id; // the spawning vCPU's task — the child's `parent_task`
                     let csched = sched.clone();
                     // A debugged run shares one breakpoint/watchpoint set across all threads
@@ -21502,6 +21564,34 @@ pub trait GuestMem {
     }
 }
 
+/// #2958 slice 3 — what the §12 futex rules read of a domain's window: an interpreter's [`Mem`], or a
+/// native tier's own window read through the page map its `Host` keeps (the Cranelift JIT's
+/// `MprotectWindow`). One reader for the rule's compare and for the no-wake fast path, so a window
+/// whose pages can lose host access under a read has one place that guards it. No defaults: each
+/// implementation answers every question, as the confinement path must.
+pub trait FutexWindow {
+    /// A `memory.wait` of `width` bytes at guest `addr`: the confined base (the word's address in the
+    /// window), naturally aligned and on a page a load may read; `Err(MemoryFault)` otherwise.
+    fn prepare_wait(&self, addr: u64, width: u32) -> Result<u64, Trap>;
+    /// A `memory.notify` at guest `addr`: the confined base; `Err(MemoryFault)` outside the window.
+    fn confine_for_notify(&self, addr: u64) -> Result<u64, Trap>;
+    /// **The guarded read**: the `width`-byte word at confined, aligned `base`, loaded atomically
+    /// (sequentially consistent), or `None` where the load would fault. A host-side read of a guest
+    /// word goes through here and nowhere else: it never faults the host, and a value it answers to a
+    /// guest racing its own page op is one the guest could have read.
+    fn wait_word(&self, base: u64, width: u32) -> Option<u64>;
+    /// Where a wait at confined `base` parks ([`FutexSite`]).
+    fn futex_site(&self, base: u64) -> FutexSite;
+    /// The rendezvous key of `site` ([`FutexKey`]): what a waiter files under and a notifier wakes,
+    /// and what the no-wake count's stripe is a function of.
+    fn site_key(&self, site: FutexSite) -> FutexKey;
+}
+
+/// The rendezvous key of confined `base` in `w` (#1731): its site's key.
+fn futex_key_of(w: &dyn FutexWindow, base: u64) -> FutexKey {
+    w.site_key(w.futex_site(base))
+}
+
 /// §4/§7 a JIT cap-path window **page map**: host page index → its state (absent ⇒ region default).
 /// Shared + persistent across a run's `call.cap`s (see [`Host::cap_window_pages`]) so a guest-grown
 /// page stays borrowable.
@@ -22423,6 +22513,15 @@ impl NodeRef {
         }
     }
 
+    /// What this node holds of the window's `mem` and the process's `maps` (#2268): the readout a
+    /// differential compares across engines (INVARIANTS #3).
+    pub fn mem_and_maps(&self) -> (i64, i64) {
+        (
+            self.tree.used(self.node, BUDGET_MEM),
+            self.tree.used(self.node, BUDGET_MAPS),
+        )
+    }
+
     /// The fuel room left along the whole chain, `-1` when every level is unbounded.
     pub fn fuel_room(&self) -> i64 {
         let nodes = self.tree.0.lock_unpoisoned();
@@ -22879,6 +22978,8 @@ impl core::ops::DerefMut for HostBuffer {
 pub(crate) struct Fuel {
     left: u64,
     src: Option<NodeRef>,
+    /// #2958 — a native task's ([`Fuel::native`]): it names its node and never draws from it.
+    native: bool,
 }
 
 impl Fuel {
@@ -22887,12 +22988,30 @@ impl Fuel {
         Fuel {
             left: 0,
             src: Some(src),
+            native: false,
+        }
+    }
+
+    /// #2958 — the fuel of a task whose code is a native tier's: it names the node the tier's own
+    /// cell draws from ([`Self::source`]) and draws nothing itself, so no chunk is ever stranded in
+    /// it while the task's code burns elsewhere. A burn charges nothing: the tier's code charged the
+    /// same safepoint (its entry prologue, for the root's entry charge). Its refill grants without a
+    /// draw and hands nothing back, so [`Self::burn`]'s hot path is every fuel's.
+    pub(crate) fn native(src: NodeRef) -> Fuel {
+        Fuel {
+            left: 0,
+            src: Some(src),
+            native: true,
         }
     }
 
     /// A fixed allowance of `n`, never refilled.
     pub(crate) fn fixed(n: u64) -> Fuel {
-        Fuel { left: n, src: None }
+        Fuel {
+            left: n,
+            src: None,
+            native: false,
+        }
     }
 
     /// Burn one unit, at a safepoint.
@@ -22905,6 +23024,17 @@ impl Fuel {
         Ok(())
     }
 
+    /// #2977 — pay a stack's entry before the stack runs: burn one, and keep none of the draw that
+    /// paid it. A thread waits in the run queue after its spawn has paid, and a chunk held there is
+    /// fuel no running vCPU can burn: a thousand queued threads would strand a thousand chunks.
+    pub(crate) fn pay_entry(&mut self) -> Result<(), Trap> {
+        self.burn()?;
+        if let Some(s) = self.src.as_ref().filter(|_| !self.native) {
+            s.give_back(std::mem::take(&mut self.left));
+        }
+        Ok(())
+    }
+
     /// Whether one unit is there to burn, drawing it if `left` is spent: a charge decided ahead of
     /// work that must not trap half-done (an offer crossing's checkout, CALLS.md 5b).
     pub(crate) fn has_one(&mut self) -> bool {
@@ -22914,6 +23044,11 @@ impl Fuel {
     /// Refill a spent `left` with a draw; a spent chain (or a spent fixed allowance) is `OutOfFuel`.
     #[cold]
     fn refill(&mut self) -> Result<(), Trap> {
+        // #2958 — a native task's fuel draws nothing: what it "burns" its tier's code charged.
+        if self.native {
+            self.left = u64::MAX;
+            return Ok(());
+        }
         let drawn = self.src.as_ref().ok_or(Trap::OutOfFuel)?.draw();
         self.left = match drawn {
             None => {
@@ -22928,11 +23063,13 @@ impl Fuel {
 
     /// What this vCPU can still burn: `left` plus the chain's room, `u64::MAX` when unmetered.
     pub(crate) fn can_burn(&self) -> u64 {
+        // A native task's `left` was drawn from nothing ([`Self::native`]).
+        let left = if self.native { 0 } else { self.left };
         match &self.src {
-            None => self.left,
+            None => left,
             Some(s) => match s.fuel_room() {
                 r if r < 0 => u64::MAX,
-                r => self.left.saturating_add(r as u64),
+                r => left.saturating_add(r as u64),
             },
         }
     }
@@ -22951,6 +23088,7 @@ impl Fuel {
     /// fixed allowance, starts with a copy of it, as every thread did before (#1944 slice 3).
     pub(crate) fn for_thread(&self) -> Fuel {
         match &self.src {
+            Some(s) if self.native => Fuel::native(s.clone()),
             Some(s) => Fuel::drawn(s.clone()),
             None => Fuel::fixed(self.left),
         }
@@ -22959,7 +23097,7 @@ impl Fuel {
 
 impl Drop for Fuel {
     fn drop(&mut self) {
-        if let Some(s) = &self.src {
+        if let Some(s) = self.src.as_ref().filter(|_| !self.native) {
             s.give_back(self.left);
         }
     }
@@ -24951,7 +25089,7 @@ pub fn read_slice(window: &[u8], off: u64, len: usize) -> Result<Vec<u8>, Trap> 
 /// bytecode driver). `exec_module` and every other admission see a negative handle and refuse it
 /// fail-closed through `can_regrant`, as does a spawner in no cell. Non-durable (`callee_task: None`
 /// — freeze refuses), the deferred durability story.
-pub const GRANT_SERVE_LIVE_TAG: u32 = 0x8000_0000;
+pub use temen_ir::GRANT_SERVE_LIVE_TAG;
 
 /// #2219 — the **empty grant** on a §14 named-grant record's `handle` field: the parent grants
 /// *nothing* under the record's name, and the child's import of that name binds to an empty slot
@@ -25285,6 +25423,11 @@ impl Reply {
 pub struct LiveTarget {
     pub callee: Arc<Mutex<Host>>,
     pub export: u32,
+    /// The op the call reaches in the callee's interface: the call site's own for a direct
+    /// `call.cap`, the bound op behind the slot (its remap applied) for a `call.import`, whose call
+    /// site packs `slot | op << 16`. The dispatch that resolves the target sets it, so no engine
+    /// re-derives it from the call site (#2961).
+    pub op: u32,
     sigs: Arc<[FuncType]>,
 }
 
@@ -25294,8 +25437,8 @@ impl LiveTarget {
     /// never the call site's claim: a caller that declared an integer result a `cap` would otherwise
     /// take the callee's handle of that number. An op the interface lacks, or a call of another
     /// arity, is `CapFault`, as at the instanced boundary.
-    pub fn sig(&self, op: u32, n_params: usize, n_results: usize) -> Result<OpSig, Trap> {
-        let op = op as usize;
+    pub fn sig(&self, n_params: usize, n_results: usize) -> Result<OpSig, Trap> {
+        let op = self.op as usize;
         self.sigs
             .get(op)
             .filter(|s| s.params.len() == n_params && s.results.len() == n_results)
@@ -26404,6 +26547,9 @@ pub struct Host {
     /// guest's page ops ([`ShadowArena::fences`]), as the interpreters' `Mem` fences its own.
     /// [`ShadowArena::EMPTY`], fencing nothing, for a window no engine started so.
     cap_shadow: ShadowArena,
+    /// #2958 slice 3 — the window takes no §13 region alias: a native tier reads it with every word
+    /// keyed on its own backing ([`Host::refuse_cap_window_aliases`]). Cleared as a window starts.
+    cap_no_alias: bool,
     /// Guest-driven `Jit` unit tables (iface 11), indexed by the id a [`Binding::JitTable`] carries.
     /// Append-only for the life of the `Host` (units are never removed — `release` only revokes
     /// the *handle*; code reclaim is a DESIGN.md §22 follow-up), so unit `Arc`s and native pointers stay
@@ -27173,6 +27319,7 @@ impl Host {
             exec_replace: None,
             cap_pages: None,
             cap_shadow: ShadowArena::EMPTY,
+            cap_no_alias: false,
             jit_tables: Vec::new(),
             jit_validator: None,
             module_validator: None,
@@ -27735,14 +27882,22 @@ impl Host {
                 }
                 // §3.6 / FORK.md §8.5 — the named grant may be a **live-callee** offer
                 // (`child_offer` / a re-granted `regrant_into_child`, a `Binding::LiveImpl`) rather
-                // than a wired `offer_func`. It is name-less at this layer, so coverage matches its
-                // ops by signature; a match binds the slot to the LiveImpl handle, and `call.import`
+                // than a wired `offer_func`. A grouped import's coverage matches its ops by the
+                // offer interface's op names (#2961: matching name-less bound every same-shaped op
+                // to the first); a flat import is one op under the slot's own name, so it matches
+                // by signature. A match binds the slot to the LiveImpl handle, and `call.import`
                 // then rides `import_live_target` (parks the caller on the child's serve loop). This
                 // is what lets a child's *named* `fork` import route to the fork offer — the binding
                 // half a compiled-C `fork()` needs, where the hand-written guest used self.resolve.
-                if let Some(es) = self.resolve_live_impl(h).map(|e| Arc::clone(&e.sigs)) {
-                    let empty: [String; 0] = [];
-                    match coverage_remap(&req_names, &req_sigs, &empty, &es) {
+                if let Some((en, es)) = self
+                    .resolve_live_impl(h)
+                    .map(|e| (Arc::clone(&e.names), Arc::clone(&e.sigs)))
+                {
+                    let en: &[String] = match im.shape {
+                        temen_ir::ImportShape::Interface(_) => &en,
+                        temen_ir::ImportShape::Func(_) => &[],
+                    };
+                    match coverage_remap(&req_names, &req_sigs, en, &es) {
                         Some(remap) => match self.type_id_of(h) {
                             Some(tid) => {
                                 let b = if rebindable {
@@ -28849,6 +29004,35 @@ impl Host {
         }
     }
 
+    /// #2695 step 2 — an engine outside this crate holds this domain (`true`), as `temen_run::hold`
+    /// holds one on the Cranelift JIT, or has let it go (`false`). A call from inside its run waits
+    /// for it to rest ([`Host::held_site`]) rather than queue for a serve loop.
+    pub fn hold_for_engine(&mut self, held: bool) {
+        self.held = held.then_some(Holder::Engine(None));
+    }
+
+    /// Whether an engine outside this crate holds this domain ([`Host::hold_for_engine`]).
+    pub fn held_for_engine(&self) -> bool {
+        matches!(self.held, Some(Holder::Engine(_)))
+    }
+
+    /// The site a held domain's calls enter once it rests, as its engine published it
+    /// ([`Host::set_held_site`]); `None` while its entry runs, and once it has ended.
+    pub fn held_site(&self) -> Option<Arc<dyn std::any::Any + Send + Sync>> {
+        match &self.held {
+            Some(Holder::Engine(site)) => site.clone(),
+            _ => None,
+        }
+    }
+
+    /// Publish (`Some`) or withdraw (`None`) the site a domain held by an engine outside this crate
+    /// takes its calls at ([`Host::held_site`]).
+    pub fn set_held_site(&mut self, site: Option<Arc<dyn std::any::Any + Send + Sync>>) {
+        if let Some(Holder::Engine(at)) = &mut self.held {
+            *at = site;
+        }
+    }
+
     /// #1458 — capture every host capability's declared state, positionally over `host_procs`
     /// (`None` where a capability isn't [`CapState::Captured`]). The in-session half of a moment: pair with
     /// [`restore_cap_states`](Host::restore_cap_states) to rewind the capabilities alongside the
@@ -28941,7 +29125,9 @@ impl Host {
             _ => {
                 let m = Arc::new(Mutex::new(BTreeMap::new()));
                 self.cap_pages = Some((base, Arc::clone(&m)));
+                // The shadow and the alias refusal are the window's, as its page map is.
                 self.cap_shadow = ShadowArena::EMPTY;
+                self.cap_no_alias = false;
                 m
             }
         }
@@ -28962,6 +29148,19 @@ impl Host {
         self.cap_shadow
     }
 
+    /// #2958 slice 3 — the window [`Host::cap_window_pages`] names takes no §13 region alias from
+    /// here on: the Cranelift JIT's kernel route sets it as the window starts, since its rules key
+    /// every word of the window on the window's own backing. A `map_region` of the window is refused
+    /// (`-EINVAL`), whatever path asks for it. Until the next window starts.
+    pub fn refuse_cap_window_aliases(&mut self) {
+        self.cap_no_alias = true;
+    }
+
+    /// Whether the window takes no §13 region alias ([`Host::refuse_cap_window_aliases`]).
+    pub fn cap_window_refuses_aliases(&self) -> bool {
+        self.cap_no_alias
+    }
+
     /// #2268 — the page map of JIT window `base` as the window starts, before its guest runs: what
     /// [`Host::reset_cap_pages`] staged for it (a thaw's), else a fresh one, never an earlier window's,
     /// whose address this one may reuse. Its first `call.cap` finds it ([`Host::cap_window_pages`]).
@@ -28972,6 +29171,7 @@ impl Host {
         }
         let pages = self.cap_window_pages(base);
         self.cap_shadow = shadow;
+        self.cap_no_alias = false;
         pages
     }
 
@@ -30439,9 +30639,15 @@ impl Host {
             child.budgets = Arc::clone(&self.budgets);
             child.own_budget = node;
             (child.paid_runs, child.leased) = (lease.runs, lease.bytes);
-            if let Some(h) = child.try_grant(cap_id::BUDGET, Binding::Budget(node)) {
-                child.cap_names.insert(0, ("budget".to_string(), h));
-            }
+            child.name_budget(node);
+        }
+    }
+
+    /// Hold budget node `node` under the name `"budget"`, first in this host's directory, so a
+    /// grant of that name never shadows it.
+    fn name_budget(&mut self, node: u32) {
+        if let Some(h) = self.try_grant(cap_id::BUDGET, Binding::Budget(node)) {
+            self.cap_names.insert(0, ("budget".to_string(), h));
         }
     }
 
@@ -31949,31 +32155,31 @@ impl Host {
         }
     }
 
-    /// §3.6 slice 4 — the live-callee target behind import slot `i`, iff the slot is bound to a
-    /// [`Binding::LiveImpl`] handle: `(callee, export, base_op)`. The `call.import` route's
-    /// pre-dispatch probe (an ordinarily-bound slot answers `None` and flows to the ordinary
-    /// dispatch); the consumer's op offsets from `base_op` (flat/identity mapping this slice —
-    /// coverage-remapped grouped bindings ride a later slice).
-    fn import_live_target(&self, i: u32) -> Option<(LiveTarget, u32)> {
-        let b = self.import_binding(i)?;
-        if !b.bound {
-            return None;
+    /// §3.6 slice 4 — the live-callee target behind a `call.import` (`packed` = `slot | op << 16`,
+    /// as [`Host::import_target`] reads it), iff the slot is bound to a [`Binding::LiveImpl`]
+    /// handle. The op is the bound one, through the slot's remap, as for any other binding. The
+    /// `call.import` route's pre-dispatch probe: an ordinarily-bound slot answers `None` and flows to
+    /// the ordinary dispatch.
+    fn import_live_target(&self, packed: u32) -> Option<LiveTarget> {
+        let (type_id, op, handle) = self.import_target(packed).ok()?;
+        match self.resolve(handle, type_id) {
+            Ok(Binding::LiveImpl(i)) => self.live_target(i, op),
+            _ => None,
         }
-        Some((self.live_impl_of(b.handle, b.type_id)?, b.op))
     }
 
     /// The live-callee target behind `handle` iff it resolves to a [`Binding::LiveImpl`] of the
-    /// right `type_id` — the eval loop's pre-dispatch probe (a non-LiveImpl handle answers
-    /// `None` and flows to the ordinary dispatch).
-    pub fn live_impl_of(&self, handle: i32, type_id: u32) -> Option<LiveTarget> {
-        match self.resolve(handle, type_id) {
-            Ok(Binding::LiveImpl(i)) => self.live_impls.get(i as usize).map(|e| LiveTarget {
-                callee: Arc::clone(&e.callee),
-                export: e.export,
-                sigs: Arc::clone(&e.sigs),
-            }),
-            _ => None,
-        }
+    /// right `type_id` — the `call.import` routes' pre-dispatch probe (a non-LiveImpl handle answers
+    /// `None` and flows to the ordinary dispatch). A direct `call.cap` takes its target from the
+    /// dispatch's live face ([`Host::cap_dispatch_slots_deferring`]).
+    /// The live-callee target of live impl `i`.
+    fn live_target(&self, i: u32, op: u32) -> Option<LiveTarget> {
+        self.live_impls.get(i as usize).map(|e| LiveTarget {
+            callee: Arc::clone(&e.callee),
+            export: e.export,
+            op,
+            sigs: Arc::clone(&e.sigs),
+        })
     }
 
     /// CALLS.md increment 3, slice 1 — the eval-loop pre-probe (direct `call.cap` form) mirroring
@@ -32513,8 +32719,8 @@ impl Host {
     /// borrows [`Host::modules`] (append-only), so views into it stay valid for as long as this
     /// `Host` lives — which outlives the run, the same lifetime contract as the `call.cap` ctx
     /// itself. Host-side callers only; never reachable from a guest `call.cap` (the generic
-    /// dispatch on a `Module` handle is an inert `CapFault`), so no host address ever leaks into a
-    /// guest-readable value.
+    /// dispatch on a `Module` handle answers only the module's declared window and the name of an
+    /// import), so no host address ever leaks into a guest-readable value.
     pub fn resolve_module_parts(
         &self,
         handle: i32,
@@ -32528,6 +32734,69 @@ impl Host {
             // temen#2168: what names its code to the JIT's cache of compiled children.
             g.digest,
         ))
+    }
+
+    /// `Module` op 2 ([`cap_id::MODULE`]): the name of the first import of the module behind
+    /// `handle` that a child granted the list at `args[0]` (`args[1]` records) would leave unbound,
+    /// copied into `[args[2], args[2] + min(len, args[3]))`. Answers its length, or `0` when every
+    /// import binds. The child's powerbox is built as every spawn builds it
+    /// ([`Self::spawn_child_powerbox`]), its imports bound as every spawn binds them
+    /// ([`Self::bind_manifest_slots`]), and then it is discarded ([`Self::discard`]), so the answer
+    /// is the spawn's own. Only the admission is left out, and the one thing it grants is the
+    /// child's budget, which no import can bind; the child holds this host's node in its place, under
+    /// the name the spawn's holds its own by.
+    ///
+    /// `cell` is the cell a #744 live self-serve grant calls back through, as at this engine's
+    /// spawn: the tree-walker's own, else [`Self::own_cell`]. A list the spawn would trap on traps
+    /// here too, before anything is built: a record outside the window is a `MemoryFault`, and a
+    /// grant the spawn may not make a `CapFault`. A name that the window cannot take is `-EFAULT`.
+    pub(crate) fn module_unbound(
+        &mut self,
+        handle: i32,
+        args: &[i64],
+        mem: Option<&mut dyn GuestMem>,
+        cell: Option<&Arc<Mutex<Host>>>,
+    ) -> Result<i64, Trap> {
+        let g = self.resolve_module(handle)?.clone();
+        let arg = |i: usize| args.get(i).map_or(0, |&a| a as u64);
+        let list = match arg(1) {
+            0 => Vec::new(),
+            n => {
+                let m = mem.as_deref().ok_or(Trap::MemoryFault)?;
+                read_grant_records(arg(0), n, |o, l| {
+                    m.read_bytes(o, l as u64).ok_or(Trap::MemoryFault)
+                })?
+            }
+        };
+        if !self.can_grant_list(&list, cell.is_some()) {
+            return Err(Trap::CapFault);
+        }
+        let reservation = g
+            .memory_log2()
+            .map_or(0, |l| 1u64 << window_reserved_log2(l));
+        let (mut child, _, _) = self
+            .spawn_child_powerbox(&list, reservation, self.attestation, None, cell)
+            .ok_or(Trap::CapFault)?;
+        child.name_budget(self.own_budget);
+        let refused = child
+            .bind_manifest_slots(&g.module.imports, &g.module.types)
+            .err();
+        child.discard();
+        let Some(i) = refused else {
+            return Ok(0);
+        };
+        let name = g.module.imports[i as usize].name.as_bytes();
+        let n = name
+            .len()
+            .min(usize::try_from(arg(3)).unwrap_or(usize::MAX));
+        if n > 0
+            && mem
+                .and_then(|m| m.write_bytes(arg(2), &name[..n]))
+                .is_none()
+        {
+            return Ok(EFAULT);
+        }
+        Ok(name.len() as i64)
     }
 
     /// Grant a §13 `SharedRegion` capability backed by a fresh `len`-byte zero-filled host buffer,
@@ -34182,7 +34451,7 @@ impl Host {
                 .grant_entry_into_child(cell, name, *handle, &mut ch)
                 .is_none()
             {
-                ch.abandon();
+                ch.discard();
                 return None;
             }
         }
@@ -34291,6 +34560,23 @@ impl Host {
             .for_each(|undo| undo());
     }
 
+    /// Give back what building this child's powerbox took from its granter, for a child that will
+    /// never run: a spawn refused after its grants were made, or the scratch child of
+    /// `Module.unbound`. Its providers' state goes ([`Self::abandon`]), and so do the counts its
+    /// re-granted pipe ends added, which no end of a run will now release: kept, they would keep a
+    /// reader from seeing EOF and the pipe's channel charge from coming back.
+    ///
+    /// The pipes whose last end this releases are not returned to wake: the granter still holds
+    /// each end it granted, so only its own close, on another vCPU meanwhile, could leave this one
+    /// last, and then the pipe's wakers fire ([`Self::drop_pipe_writer`]).
+    ///
+    /// Every engine's spawn discards a child it refuses after the build, the JIT's through its binder
+    /// hook (`temen_run::child_bind_imports`).
+    pub fn discard(mut self) {
+        self.abandon();
+        let _ = self.release_pipe_ends();
+    }
+
     /// A spawned process whose image could not be built in its powerbox (this, from
     /// [`Self::spawn_powerbox`]), or a new process the OS gave no thread: it exits with `status` as
     /// it is born. The window it was charged for goes back ([`Self::release_memory`]) and its pipe
@@ -34369,6 +34655,15 @@ impl Host {
     /// ([`bytecode::RunDoor`]).
     pub fn set_run_door(&mut self, door: Arc<bytecode::RunDoor>) {
         self.run_door = Some(door);
+    }
+
+    /// #2958 — put `door` in place of the door this host's run has, if any, and hand that one back:
+    /// an embedder that sets a door for one run gives the host its own back after it.
+    pub fn replace_run_door(
+        &mut self,
+        door: Option<Arc<bytecode::RunDoor>>,
+    ) -> Option<Arc<bytecode::RunDoor>> {
+        std::mem::replace(&mut self.run_door, door)
     }
 
     /// The run's door, if its embedder set one ([`Host::set_run_door`]).
@@ -34796,7 +35091,7 @@ impl Host {
         out: &mut [i64],
         mem: Option<&mut dyn GuestMem>,
     ) -> Result<(), Trap> {
-        self.cap_dispatch_slots_deferring(type_id, op, handle, args, out, mem, None, None)
+        self.cap_dispatch_slots_deferring(type_id, op, handle, args, out, mem, None, None, None)
     }
 
     /// [`Host::cap_dispatch_slots`] into `n` result slots of its own, for a caller that wants them
@@ -34827,11 +35122,16 @@ impl Host {
     /// - `unlocked` (#2645): a call to an unlocked host procedure ([`ProcHandler::Unlocked`])
     ///   returns at once with `*unlocked = Some(call)` instead of running. Drop the host lock, then
     ///   [`UnlockedCall::run`] with the same arguments, result slots and window.
+    /// - `live` (§3.6 slice 3, #2847): a call through a live-callee offer returns at once with
+    ///   `*live = Some(target)`, decided by the dispatch's one `resolve`. The caller makes the call:
+    ///   it enqueues on the callee's inbound queue and waits for the reply, which host-side dispatch
+    ///   cannot. A call handed back is never taped, since no host answers it.
     ///
     /// A face the caller does not offer gets byte-identical inline semantics
     /// (decline-never-diverge, INVARIANTS.md 9). Under a W1 tape a pool punt and an unlocked call
     /// run inline, so the recorded crossing carries the real result.
     #[allow(clippy::too_many_arguments)] // the call's own six, and the two faces a caller offers
+    #[inline]
     pub fn cap_dispatch_slots_deferring(
         &mut self,
         type_id: u32,
@@ -34842,6 +35142,37 @@ impl Host {
         mem: Option<&mut dyn GuestMem>,
         pending: Option<&mut Option<u64>>,
         unlocked: Option<&mut Option<UnlockedCall>>,
+        live: Option<&mut Option<LiveTarget>>,
+    ) -> Result<(), Trap> {
+        // #2847 — a reserved pseudo-id (an import, a dynamic or self call, an attach) out of line:
+        // a call through a granted handle reaches the live dispatch past two tests, which inline
+        // into each engine's call.
+        if type_id >= temen_ir::CAP_DYN_TYPE_ID {
+            return self
+                .cap_dispatch_pseudo(type_id, op, handle, args, out, mem, pending, unlocked, live);
+        }
+        if self.tapes(type_id, op) {
+            return self.cap_dispatch_taped(type_id, op, handle, args, out, mem, pending, live);
+        }
+        self.cap_dispatch_slots_inner(type_id, op, handle, args, out, mem, pending, unlocked, live)
+    }
+
+    /// [`Host::cap_dispatch_slots_deferring`] for a reserved pseudo-id: an import or a dynamic call
+    /// translates to the call it names, a self extension answers here, and the rest takes the
+    /// ordinary flow, tape first.
+    #[allow(clippy::too_many_arguments)] // as `cap_dispatch_slots_deferring`
+    #[inline(never)]
+    fn cap_dispatch_pseudo(
+        &mut self,
+        type_id: u32,
+        op: u32,
+        handle: i32,
+        args: &[i64],
+        out: &mut [i64],
+        mem: Option<&mut dyn GuestMem>,
+        pending: Option<&mut Option<u64>>,
+        unlocked: Option<&mut Option<UnlockedCall>>,
+        live: Option<&mut Option<LiveTarget>>,
     ) -> Result<(), Trap> {
         // §12: under a W1 tape, force punts inline (`pending = None` downstream) — a `Pending`
         // placeholder on the tape would replay as a phantom result; the inline run records the
@@ -34912,16 +35243,19 @@ impl Host {
                 _ => Err(Trap::CapFault),
             };
         }
-        // W1 record/replay (DEBUGGING.md): only the nondeterministic *input* caps are taped —
-        // deterministic / structural caps re-run faithfully on a fresh powerbox and are left live.
-        // #2645: and only while a tape is active, so an untaped call runs on the faces its caller
-        // offers, and its window writes are not copied for a tape no one keeps.
-        if is_recorded_input(type_id, op)
-            && (self.cap_record.is_some() || self.cap_replay.is_some())
-        {
-            return self.cap_dispatch_taped(type_id, op, handle, args, out, mem, pending);
+        if self.tapes(type_id, op) {
+            return self.cap_dispatch_taped(type_id, op, handle, args, out, mem, pending, live);
         }
-        self.cap_dispatch_slots_inner(type_id, op, handle, args, out, mem, pending, unlocked)
+        self.cap_dispatch_slots_inner(type_id, op, handle, args, out, mem, pending, unlocked, live)
+    }
+
+    /// W1 record/replay (DEBUGGING.md): whether this call is taped. Only the nondeterministic *input*
+    /// caps are — deterministic / structural caps re-run faithfully on a fresh powerbox and are left
+    /// live. #2645: and only while a tape is active, so an untaped call runs on the faces its caller
+    /// offers, and its window writes are not copied for a tape no one keeps.
+    #[inline]
+    fn tapes(&self, type_id: u32, op: u32) -> bool {
+        (self.cap_record.is_some() || self.cap_replay.is_some()) && is_recorded_input(type_id, op)
     }
 
     /// A taped call ([`Host::cap_dispatch_slots_deferring`]'s W1 record/replay): served from the
@@ -34939,6 +35273,7 @@ impl Host {
         out: &mut [i64],
         mem: Option<&mut dyn GuestMem>,
         pending: Option<&mut Option<u64>>,
+        live: Option<&mut Option<LiveTarget>>,
     ) -> Result<(), Trap> {
         // Replay: serve the next recorded crossing if it matches this call (a mismatch means the
         // re-execution diverged before this point — fall through to live as a best effort).
@@ -34981,6 +35316,7 @@ impl Host {
                     rerun,
                     None,
                     None,
+                    None,
                 );
             }
             // Re-apply any guest-window writes the cap made (a buffer-filling `read`), then
@@ -34995,7 +35331,7 @@ impl Host {
         }
         // Record: run live through a `RecordingMem` so any guest-window writes are captured,
         // then log the crossing for a future replay.
-        let mut pending = pending;
+        let (mut pending, mut live) = (pending, live);
         let (result, mem_writes) = match mem {
             Some(m) => {
                 let mut rec_mem = RecordingMem {
@@ -35011,6 +35347,7 @@ impl Host {
                     Some(&mut rec_mem),
                     pending.as_deref_mut(),
                     None,
+                    live.as_deref_mut(),
                 );
                 (r, rec_mem.writes)
             }
@@ -35024,6 +35361,7 @@ impl Host {
                     None,
                     pending.as_deref_mut(),
                     None,
+                    live.as_deref_mut(),
                 ),
                 Vec::new(),
             ),
@@ -35034,8 +35372,10 @@ impl Host {
             // (completed) read joins the tape. Likewise a **punted** dispatch (#1366 host-
             // answered, or an offloaded job): its result slots are a placeholder the
             // completion fills in later — a host-answered call's delivered value is taped
-            // where a driver delivers it instead ([`Completions::take_record`]).
-            let punted = pending.as_deref().is_some_and(|p| p.is_some());
+            // where a driver delivers it instead ([`Completions::take_record`]). And a live call
+            // its caller makes (#2847): no host answers it, so no tape here carries it.
+            let punted = pending.as_deref().is_some_and(|p| p.is_some())
+                || live.as_deref().is_some_and(|l| l.is_some());
             if !self.stdin_parked && !punted {
                 rec.push(CapRecord {
                     type_id,
@@ -35066,6 +35406,7 @@ impl Host {
         mem: Option<&mut dyn GuestMem>,
         pending: Option<&mut Option<u64>>,
         unlocked: Option<&mut Option<UnlockedCall>>,
+        live: Option<&mut Option<LiveTarget>>,
     ) -> Result<(), Trap> {
         // Phase-2 `import.attach` (IMPORTS.md): (re)bind rebindable import slot `op` to the handle
         // in `args[0]`. The new handle must resolve **live under the slot's declared interface
@@ -35271,6 +35612,15 @@ impl Host {
                 }
             }
         };
+        // §3.6 slice 3, #2847 — a call through a live-callee offer is its caller's to make: handed
+        // back on the face the caller offers, decided by this one resolve, before any check of the
+        // op, which the callee's own signature decides.
+        if let (Binding::LiveImpl(i), Some(slot)) = (resolved, live) {
+            if let Some(target) = self.live_target(i, op) {
+                *slot = Some(target);
+                return Ok(());
+            }
+        }
         // An op the interface does not have, decided by the interface's **shape** where one is
         // seeded ([`builtin_iface_shape`]) rather than restated per binding arm below. A `CapFault`,
         // not an errno: `op` is an immediate in the instruction, so an unknown op is a property of
@@ -35285,9 +35635,9 @@ impl Host {
             }
         }
         match resolved {
-            // §3.6 slice 3: a live-callee offer is serviced by the eval loop (enqueue + park —
-            // host-side dispatch cannot park). Reaching it here means a backend tier without
-            // the servicing arm: answer probeable, never trap.
+            // §3.6 slice 3: a live-callee offer is its caller's to call, handed back above on its
+            // live face (enqueue + park — host-side dispatch cannot park). Reaching it here means a
+            // caller that offers none: answer probeable, never trap.
             Binding::LiveImpl(_) => put_results(out, &[EINVAL]),
             // #1440: freeze authority is pure authority, like `Module` — the freeze path consults it,
             // nothing calls it. An `EINVAL` rather than a trap keeps it probeable (INVARIANTS #5:
@@ -35998,10 +36348,24 @@ impl Host {
                 }
                 _ => put_results(out, &[EINVAL]),
             },
-            // A §14 `Module` handle confers instantiation authority (a spawn names it) and has no
-            // callable op. Its op 0 looked an export up by name, to pick a child's entry; a child
-            // starts at its module's function 0 now (#2219), so it went.
-            Binding::Module(_) => Err(Trap::CapFault),
+            // A §14 `Module` handle confers instantiation authority (a spawn names it), and its ops
+            // answer what a spawner asks of it ([`cap_id::MODULE`]): op 1 its declared window
+            // (#1908), op 2 the first import a grant list leaves unbound, through a child the
+            // spawn's own code builds and binds. The tree-walker serves op 2 in its eval loop, with
+            // the cell its spawns grant through; every other engine reaches it here, with this
+            // host's own. Op 0 is retired (#2219).
+            Binding::Module(id) => match op {
+                1 => {
+                    let declared = self.modules.get(id as usize).and_then(|g| g.memory_log2());
+                    put_results(out, &[declared.map_or(EINVAL, i64::from)])
+                }
+                2 => {
+                    let cell = self.own_cell();
+                    let r = self.module_unbound(handle, args, mem, cell.as_ref())?;
+                    put_results(out, &[r])
+                }
+                _ => Err(Trap::CapFault),
+            },
             // Guest-driven `Jit` (iface 11, DESIGN.md §22). This generic arm is the **reference**
             // path (an interpreter run, or a wiring-bug fallback): op 0 `compile` validates +
             // stores the unit and mints its handle; op 2 `release` revokes one. op 1 `invoke` can
@@ -36080,8 +36444,8 @@ impl Host {
                 }
                 _ => put_results(out, &[EINVAL]),
             },
-            // A `CompiledCode` handle has no directly callable ops (like `Module`): it is only
-            // *named* in `Jit.invoke`/`release`.
+            // A `CompiledCode` handle has no directly callable ops: it is only *named* in
+            // `Jit.invoke`/`release`.
             Binding::JitCode { .. } => Err(Trap::CapFault),
             // §12 Blocking: `op 0 work(arg) -> mix(arg)`. As a *direct* call.cap it runs inline and
             // blocks the caller (the degenerate single path); a batched `submit` instead overlaps it
@@ -39118,6 +39482,27 @@ fn sparse_prots(
     })
 }
 
+/// The interpreter's window: its own checks, unchanged. Its `wait_word` reads without a second check:
+/// an interpreted window never loses host access (an unmap is a page-map change and a zero fill), so
+/// a read racing one answers zero or the old value, as the compare under the run's lock always has.
+impl FutexWindow for Mem {
+    fn prepare_wait(&self, addr: u64, width: u32) -> Result<u64, Trap> {
+        Mem::prepare_wait(self, addr, if width == 8 { IntTy::I64 } else { IntTy::I32 })
+    }
+    fn confine_for_notify(&self, addr: u64) -> Result<u64, Trap> {
+        Mem::confine_for_notify(self, addr)
+    }
+    fn wait_word(&self, base: u64, width: u32) -> Option<u64> {
+        Some(self.atomic_value(base, width))
+    }
+    fn futex_site(&self, base: u64) -> FutexSite {
+        Mem::futex_site(self, base)
+    }
+    fn site_key(&self, site: FutexSite) -> FutexKey {
+        Mem::site_key(self, site)
+    }
+}
+
 impl GuestMem for Mem {
     fn window_size(&self) -> u64 {
         self.window.reserved()
@@ -40045,6 +40430,67 @@ mod host_proc_slot_tests {
                 "minting: {minting}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod live_face_tests {
+    //! #2847 — a call through a live-callee offer is handed back on the dispatch's live face,
+    //! decided by its one resolve. A caller that offers no face gets `-EINVAL`, and a call handed
+    //! back is never taped.
+    use super::*;
+
+    /// A host holding a live impl of an offer shaped as `Stream`, which interns to `Stream`'s id,
+    /// so its `read` is a recorded input; the handle and that id.
+    fn wired() -> (Host, i32, u32) {
+        let mut host = Host::new();
+        let callee = Arc::new(Mutex::new(Host::new()));
+        let rw = FuncType {
+            params: vec![ValType::I64, ValType::I64],
+            results: vec![ValType::I64],
+        };
+        let unit = FuncType {
+            params: vec![],
+            results: vec![],
+        };
+        let names = ["read", "write", "close"].map(String::from);
+        let h = host
+            .wire_live_impl(&callee, 0, &names, &[rw.clone(), rw, unit])
+            .expect("wired");
+        let type_id = host.type_id_of(h).expect("a live handle");
+        (host, h, type_id)
+    }
+
+    #[test]
+    fn a_live_call_is_handed_back_and_never_taped() {
+        let (mut host, h, type_id) = wired();
+        assert_eq!(type_id, cap_id::STREAM, "the shape interns to Stream's id");
+        host.record_caps();
+        let mut live = None;
+        let r = host.cap_dispatch_slots_deferring(
+            type_id,
+            0,
+            h,
+            &[0, 0],
+            &mut [0],
+            None,
+            None,
+            None,
+            Some(&mut live),
+        );
+        assert_eq!(r, Ok(()));
+        assert!(live.is_some(), "the dispatch hands the target back");
+        assert!(
+            host.cap_record.as_ref().is_some_and(|tape| tape.is_empty()),
+            "and no tape carries the call"
+        );
+        // A caller that offers no live face gets the probeable errno.
+        let mut out = [0];
+        assert_eq!(
+            host.cap_dispatch_slots(type_id, 0, h, &[0, 0], &mut out, None),
+            Ok(())
+        );
+        assert_eq!(out, [EINVAL]);
     }
 }
 
@@ -41838,6 +42284,7 @@ mod fork_powerbox_tests {
                 &mut [0],
                 None,
                 Some(&mut id),
+                None,
                 None,
             );
             assert_eq!(r, Ok(()), "a punted call answers later");
@@ -44095,6 +44542,7 @@ mod offload_pool_tests {
             &mut [0],
             None,
             Some(&mut id),
+            None,
             None,
         );
         assert_eq!(r, Ok(()), "the call punts");

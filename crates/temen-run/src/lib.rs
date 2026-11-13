@@ -53,9 +53,13 @@ pub use descriptors::raise_descriptor_limit;
 use descriptors::Descriptor;
 pub mod exec;
 pub mod fs;
+mod held;
 mod jit_proc;
+// #2958: a JIT program's vCPUs as executor 2's tasks.
+pub mod jit_kernel;
 pub use jit_proc::JitCodeCache;
 pub mod posix;
+pub use held::hold;
 use temen_jit::{CompiledModule, JitFrameLoc, JitOutcome, Parks, TrapKind};
 pub use temen_peval::{SpecArg, SpecConfig};
 
@@ -224,7 +228,7 @@ pub unsafe extern "C" fn cap_thunk(
     let host = &*(ctx as *mut Host);
     let pending_face = n_results == 1 && !host.is_durable() && !host.records_caps();
     loop {
-        let (mut pending_id, mut park) = (None, None);
+        let (mut pending_id, mut park, mut live) = (None, None, None);
         cap_thunk_impl(
             ctx,
             mem_base,
@@ -241,7 +245,25 @@ pub unsafe extern "C" fn cap_thunk(
             pending_face.then_some(&mut pending_id),
             None, // one caller at a time: an unlocked procedure runs inline
             &mut park,
+            &mut live,
         );
+        // CALLS.md 5c.1b — the caller side of the JIT parked transport (§10.2 arm 5): a call through
+        // a minted live-impl, which the dispatch handed back, enqueues on the callee child's shared
+        // cell and **thread-blocks** on the reply.
+        if let Some(target) = live {
+            let host = &mut *(ctx as *mut Host);
+            let fast = host.handoff();
+            let out = result_slots(results, n_results);
+            live_impl_call(
+                &mut CallerHost::Owned(host),
+                &target,
+                fast,
+                call_args,
+                out,
+                vm,
+            );
+            return;
+        }
         if let Some(id) = pending_id {
             let comps = (*(ctx as *mut Host)).completions();
             let r = cap_wait(&comps, id, temen_jit::fiber_active(), vm);
@@ -458,10 +480,16 @@ pub unsafe extern "C" fn jit_sig_return(vm: &temen_jit::VmCtx) {
 /// wait) under the domain lock — the caller takes the completion id, releases the lock, and
 /// waits on [`Host::completions`]. `unlocked` (#2645) is the same for an unlocked host procedure:
 /// the caller takes the call, releases the lock, and runs it ([`Host::cap_dispatch_slots_deferring`]).
+/// `live` (#2847) is a call through a live-callee offer, which the dispatch hands back: each thunk
+/// makes it as its caller can, the locked one with the domain lock released.
 ///
 /// # Safety
 /// Same contract as [`cap_thunk`].
+///
+/// #2847 — inlined into each thunk, which specializes it to the faces that thunk offers: a call
+/// marshals none of its fifteen arguments, and the two copies come to less code than the one.
 #[allow(clippy::too_many_arguments)]
+#[inline(always)]
 unsafe fn cap_thunk_impl(
     ctx: *mut c_void,
     mem_base: *mut u8,
@@ -478,6 +506,7 @@ unsafe fn cap_thunk_impl(
     pending: Option<&mut Option<u64>>,
     unlocked: Option<&mut Option<UnlockedCall>>,
     park: &mut Option<HostParkReq>,
+    live: &mut Option<LiveTarget>,
 ) {
     let host = &mut *(ctx as *mut Host);
     // PROCESS.md S1b/S1c — the canonical-key futex region recorder, installed on the root thread's first
@@ -550,21 +579,6 @@ unsafe fn cap_thunk_impl(
         );
         return;
     }
-    // CALLS.md 5c.1b — the caller side of the JIT parked transport (§10.2 arm 5): a `call.cap`
-    // whose handle resolves to a minted live-impl enqueues on the callee child's shared cell and
-    // **thread-blocks** on the reply, instead of falling to the generic dispatch (whose LiveImpl
-    // arm answers `-EINVAL`). The `host` borrow above is dead on this path; the target is
-    // re-derived from `ctx` in its own short scope before any callee lock is taken.
-    let target = {
-        let h = &*(ctx as *mut Host);
-        h.live_impl_of(handle, type_id).map(|t| (t, h.handoff()))
-    };
-    if let Some((target, fast)) = target {
-        let out = result_slots(results, n_results);
-        let caller = &mut CallerHost::Owned(&mut *(ctx as *mut Host));
-        live_impl_call(caller, &target, fast, op, arg_slots, out, vm);
-        return;
-    }
     // #1768 — a JIT process's powerbox serves its personality's caller requests (`fork`, `execve`,
     // a blocking `waitpid`) and its pipes' parks here, after the op that raised one
     // ([`jit_proc::serve_request`]).
@@ -593,9 +607,21 @@ unsafe fn cap_thunk_impl(
     // The dispatch writes its results straight into the call's result slots, which the compiled
     // code zeroed (#2361, #2319). A deferred call writes none there, and it raised no park.
     let out = result_slots(results, n_results);
-    let r = host
-        .cap_dispatch_slots_deferring(type_id, op, handle, arg_slots, out, view, pending, unlocked);
+    let r = host.cap_dispatch_slots_deferring(
+        type_id,
+        op,
+        handle,
+        arg_slots,
+        out,
+        view,
+        pending,
+        unlocked,
+        Some(&mut *live),
+    );
     match r {
+        // #2847 — a call through a live-callee offer, handed back: the thunk makes it, and the
+        // dispatch left no transient.
+        Ok(()) if live.is_some() => {}
         Ok(()) => {
             // Every transient the op left is drained, acted on or not: one left set would land on a
             // later call.
@@ -776,32 +802,9 @@ pub unsafe extern "C" fn cap_thunk_locked(
     // A parked op runs again from the top: its dispatch re-takes the lock (#1826).
     loop {
         let mut guard = m.lock().unwrap_or_else(|e| e.into_inner());
-        // CALLS.md 5c.1b — a **locked-domain caller** takes the parked transport too, with this
-        // domain's guard released before it blocks (#2139): blocking on a sibling's reply while
-        // holding it would deadlock (A holds A waiting B; B blocked on A's lock).
-        if let Some(target) = guard.live_impl_of(handle, type_id) {
-            let fast = guard.handoff();
-            drop(guard);
-            let arg_slots = if n_args == 0 {
-                &[][..]
-            } else {
-                std::slice::from_raw_parts(args, n_args as usize)
-            };
-            let out = result_slots(results, n_results);
-            live_impl_call(
-                &mut CallerHost::Cell(m),
-                &target,
-                fast,
-                op,
-                arg_slots,
-                out,
-                vm,
-            );
-            return;
-        }
         let host_ptr = &mut *guard as *mut Host as *mut c_void;
         let mut pending_id = None;
-        let mut unlocked = None;
+        let (mut unlocked, mut live) = (None, None);
         let mut park = None;
         // #2495 — no parking face under a recording host, as in [`cap_thunk`].
         let face = (!guard.records_caps()).then_some(&mut pending_id);
@@ -821,7 +824,18 @@ pub unsafe extern "C" fn cap_thunk_locked(
             face,
             Some(&mut unlocked),
             &mut park,
+            &mut live,
         );
+        // CALLS.md 5c.1b — a **locked-domain caller** takes the parked transport too, with this
+        // domain's guard released before it blocks (#2139): blocking on a sibling's reply while
+        // holding it would deadlock (A holds A waiting B; B blocked on A's lock).
+        if let Some(target) = live {
+            let fast = guard.handoff();
+            drop(guard);
+            let out = result_slots(results, n_results);
+            live_impl_call(&mut CallerHost::Cell(m), &target, fast, call_args, out, vm);
+            return;
+        }
         // #2645 — an unlocked host procedure runs with the domain lock released, so the run's other
         // vCPUs make their host calls meanwhile. Its window copies each take the lock
         // ([`LockedWindow`]). It raised no park.
@@ -1430,19 +1444,27 @@ pub fn jit_cap_run(
 ) -> Result<(JitOutcome, temen_interp::MemLayout), temen_jit::JitError> {
     // A fresh window: its page map is `init`'s, none from an earlier run (see `reset_cap_pages`).
     host.reset_cap_pages(init.page_map());
+    // #2958 — a program `jit_kernel::admit` admits runs its vCPUs as executor 2's tasks.
+    if let Ok(admitted) = jit_kernel::admit(m, host, Some(init), false) {
+        let start = jit_kernel::Start {
+            entry,
+            args,
+            init_mem: init.bytes(),
+            init: Some(init),
+            reserved_log2,
+            fuel: temen_interp::DEFAULT_FUEL,
+            snapshot_cap: Some(1 << 18),
+            kill: None,
+        };
+        let end = jit_kernel::run(admitted, start, host)?;
+        let (outcome, bytes) = end.outcome();
+        return Ok((outcome, jit_layout(m, host, bytes, Vec::new())));
+    }
     // #1944 slice 3, #2113 — an activation of the run `host` roots, as `jit_run`'s: the default fuel,
     // and its window (with what `init` grew) and main vCPU charged to its node.
     // #2268 — and what its window will hold of the process's mappings, reserved before the window is
     // built: a fresh window's bound, and the runs a thaw's page map adds to it.
-    let fresh = RootWindow::fresh(m, reserved_log2);
-    let restored = init
-        .page_map()
-        .window_runs(temen_ir::module_null_guard(), 1u64 << reserved_log2);
-    let window = RootWindow {
-        grown: init.page_map().grown_bytes(),
-        runs: fresh.runs + restored.saturating_sub(temen_ir::WINDOW_RUNS),
-        ..fresh
-    };
+    let window = jit_root_window(m, Some(init), reserved_log2);
     let Some(node) = host.begin_activation(temen_interp::DEFAULT_FUEL, window) else {
         // A run the process has no room for does not start: its main vCPU is refused.
         return Ok((JitOutcome::Trapped(TrapKind::ThreadFault), init.clone()));
@@ -3373,12 +3395,12 @@ unsafe fn live_impl_call(
     caller: &mut CallerHost,
     target: &LiveTarget,
     fast: bool,
-    op: u32,
     args: &[i64],
     out: &mut [i64],
     vm: &temen_jit::VmCtx,
 ) {
-    let Ok(sig) = target.sig(op, args.len(), out.len()) else {
+    let op = target.op;
+    let Ok(sig) = target.sig(args.len(), out.len()) else {
         vm.raise(TrapKind::CapFault as i64);
         return;
     };
@@ -3467,6 +3489,12 @@ unsafe fn live_call(
         // Not a JIT run's shared cell (e.g. an interp-tier callee reached from a JIT run): no
         // serve loop here can ever answer, so keep the pre-5c.1 probeable answer.
         return Some(Reply::Failed(EINVAL));
+    }
+    // #2695 step 2 — a domain the JIT holds takes its calls as activations on their callers'
+    // threads, once it rests.
+    if guard.held_for_engine() {
+        drop(guard);
+        return held::held_call(caller, callee, export, op, args, params, vm);
     }
     // A guest fiber's call takes the queue: it parks the fiber at least once, as the oracle's
     // register-then-recheck does (#1952), and a handoff would answer it before it could.
@@ -3856,8 +3884,10 @@ pub unsafe extern "C" fn child_bind_imports(
     let child_cell = &*(child_ctx as *const Mutex<Host>);
     if let Some(m) = parent.spawn_module(module as i32) {
         // §3.3 withhold: the spawn fails closed at the JIT call site, answering this code (#2864).
+        // The child never runs, so it is discarded here, which gives back what its grants took.
         let mut child = child_cell.lock().unwrap_or_else(|e| e.into_inner());
         if child.bind_child_manifest(&m.imports, &m.types).is_err() {
+            std::mem::take(&mut *child).discard();
             return temen_ir::SpawnRefusal::Unbound.errno() as i32;
         }
         // The child runs this program: its own self module, as the interpreter's spawn arms stamp it
@@ -3963,10 +3993,11 @@ pub unsafe extern "C" fn grant_detached_child_build(
     out: *mut temen_jit::GrantChild,
     vm: &temen_jit::VmCtx,
 ) -> i32 {
-    let Some(grants) = read_grant_records(mem_base, mem_size, grants_ptr, grants_n, vm) else {
+    let parent = &mut *(ctx as *mut Host);
+    let _ = (mem_base, mem_size); // the window is `vm`'s (#2996: read through the host's view)
+    let Some(grants) = read_grant_records(parent, grants_ptr, grants_n, vm) else {
         return 0;
     };
-    let parent = &mut *(ctx as *mut Host);
     let lease = temen_interp::Lease {
         budget,
         bytes,
@@ -4108,27 +4139,146 @@ unsafe fn window_aliases(
     ro: &[[u64; 2]],
     shadow: temen_interp::ShadowArena,
 ) -> i32 {
+    match window_view(host, base, mapped, reserved, ro, shadow, false) {
+        Some(wm) => {
+            host.start_window(wm.window_runs());
+            1
+        }
+        None => 0,
+    }
+}
+
+/// [`window_aliases`] but its charge: the view of `host`'s fresh window that every host-side path
+/// takes, its page map started. With `no_alias`, the window takes no §13 region alias from its start
+/// on ([`Host::refuse_cap_window_aliases`]): a pre-map is refused with the rest. `None` when a
+/// pre-map was refused, or on a target with no window backend.
+///
+/// # Safety
+/// `[base, base+reserved)` is `host`'s live reservation.
+#[cfg(any(unix, windows))]
+unsafe fn window_view(
+    host: &mut Host,
+    base: *mut u8,
+    mapped: u64,
+    reserved: u64,
+    ro: &[[u64; 2]],
+    shadow: temen_interp::ShadowArena,
+    no_alias: bool,
+) -> Option<MprotectWindow> {
+    install_region_hook(host, base, reserved);
+    host.start_window_pages(base as usize, shadow);
+    if no_alias {
+        host.refuse_cap_window_aliases();
+    }
+    let mut wm = MprotectWindow::of(host, base, mapped, reserved);
+    wm.seed_readonly(ro);
+    // §2.2 / #2164 — a demand-paged child's window starts unmapped, as on the interpreters:
+    // seeded, then demand-paged, then pre-mapped.
+    if wm.table.is_some() {
+        wm.demand_page();
+    }
+    (host.apply_premap(&mut wm) >= 0).then_some(wm)
+}
+#[cfg(not(any(unix, windows)))]
+unsafe fn window_view(
+    _host: &mut Host,
+    _base: *mut u8,
+    _mapped: u64,
+    _reserved: u64,
+    _ro: &[[u64; 2]],
+    _shadow: temen_interp::ShadowArena,
+    _no_alias: bool,
+) -> Option<std::convert::Infallible> {
+    None
+}
+
+/// #2958 slice 3 — the kernel route's window start, after `seed_window`: the window's view
+/// ([`window_view`]), what its rules read the window through, and the runs of page state it holds,
+/// which the run's activation settles to ([`Host::start_window`]) once it has charged the bound
+/// ([`jit_root_window`]), as [`window_aliases`] settles the JIT's own run. `None` as
+/// [`window_view`].
+///
+/// # Safety
+/// `[base, base+reserved)` is `host`'s live reservation, kept mapped for as long as `keep` lives:
+/// the reader holds it.
+pub(crate) unsafe fn start_window_view(
+    host: &mut Host,
+    base: *mut u8,
+    mapped: u64,
+    reserved: u64,
+    ro: &[[u64; 2]],
+    shadow: temen_interp::ShadowArena,
+    keep: Arc<dyn std::any::Any + Send + Sync>,
+) -> Option<(Arc<dyn temen_interp::FutexWindow + Send + Sync>, u64)> {
+    // From its start on, no path maps a region into the window, a pre-map included: the rules key
+    // every word of it on its own backing (the reader's `futex_site`).
+    let wm = window_view(host, base, mapped, reserved, ro, shadow, true)?;
     #[cfg(any(unix, windows))]
     {
-        install_region_hook(host, base, reserved);
-        host.start_window_pages(base as usize, shadow);
-        let mut wm = MprotectWindow::of(host, base, mapped, reserved);
-        wm.seed_readonly(ro);
-        // §2.2 / #2164 — a demand-paged child's window starts unmapped, as on the interpreters:
-        // seeded, then demand-paged, then pre-mapped.
-        if wm.table.is_some() {
-            wm.demand_page();
-        }
-        if host.apply_premap(&mut wm) < 0 {
-            return 0;
-        }
-        host.start_window(wm.window_runs());
-        1
+        let runs = wm.window_runs();
+        Some((Arc::new(KernelWindow(wm, keep)), runs))
     }
     #[cfg(not(any(unix, windows)))]
     {
-        let _ = (base, mapped, reserved, host, ro, shadow);
-        0
+        let _ = keep;
+        match wm {}
+    }
+}
+
+/// #2958 slice 3 — the JIT's window as the kernel's rules read it: [`MprotectWindow`]'s guarded
+/// read, shared by the run's threads, and what keeps the window mapped while it can be read.
+#[cfg(any(unix, windows))]
+struct KernelWindow(
+    MprotectWindow,
+    #[allow(dead_code)] Arc<dyn std::any::Any + Send + Sync>,
+);
+
+// SAFETY: the view is only read (`&self`), its page map is behind its own lock, and its pointers
+// are the run's window, which the view's second field keeps mapped for as long as the view lives.
+#[cfg(any(unix, windows))]
+unsafe impl Send for KernelWindow {}
+#[cfg(any(unix, windows))]
+unsafe impl Sync for KernelWindow {}
+
+#[cfg(any(unix, windows))]
+impl temen_interp::FutexWindow for KernelWindow {
+    fn prepare_wait(&self, addr: u64, width: u32) -> Result<u64, Trap> {
+        self.0.prepare_wait(addr, width)
+    }
+    fn confine_for_notify(&self, addr: u64) -> Result<u64, Trap> {
+        self.0.confine_for_notify(addr)
+    }
+    fn wait_word(&self, base: u64, width: u32) -> Option<u64> {
+        self.0.wait_word(base, width)
+    }
+    fn futex_site(&self, base: u64) -> temen_interp::FutexSite {
+        self.0.futex_site(base)
+    }
+    fn site_key(&self, site: temen_interp::FutexSite) -> temen_interp::FutexKey {
+        self.0.site_key(site)
+    }
+}
+
+/// #2268 — what a JIT run's activation charges for its window before the window exists: its
+/// module's declared memory, what `init` grew, a fresh window's bound of runs and the runs a thaw's
+/// page map adds to it, and its reservation. The run then settles the runs to what its start made
+/// ([`Host::start_window`]). Both of the JIT's routes charge this.
+pub(crate) fn jit_root_window(
+    m: &Module,
+    init: Option<&temen_interp::MemLayout>,
+    reserved_log2: u8,
+) -> RootWindow {
+    let fresh = RootWindow::fresh(m, reserved_log2);
+    let Some(init) = init else {
+        return fresh;
+    };
+    let restored = init
+        .page_map()
+        .window_runs(temen_ir::module_null_guard(), 1u64 << reserved_log2);
+    RootWindow {
+        grown: init.page_map().grown_bytes(),
+        runs: fresh.runs + restored.saturating_sub(temen_ir::WINDOW_RUNS),
+        ..fresh
     }
 }
 
@@ -4147,10 +4297,11 @@ pub unsafe extern "C" fn grant_list_check(
     grants_n: u64,
     vm: &temen_jit::VmCtx,
 ) -> i32 {
-    let Some(grants) = read_grant_records(mem_base, mem_size, grants_ptr, grants_n, vm) else {
+    let parent = &mut *(ctx as *mut Host);
+    let _ = (mem_base, mem_size); // the window is `vm`'s (#2996: read through the host's view)
+    let Some(grants) = read_grant_records(parent, grants_ptr, grants_n, vm) else {
         return 0;
     };
-    let parent = &*(ctx as *mut Host);
     match parent.check_grant_list(&grants) {
         Ok(()) => 1,
         Err(t) => {
@@ -4263,27 +4414,30 @@ pub unsafe extern "C" fn child_end_signal(post: *mut c_void) {
     }
 }
 
-/// The by-name builders' grant list: [`temen_interp::read_grant_records`] over the parent's window
-/// `[mem_base, mem_base + mem_size)`. `None` with the parse's trap raised on `vm`.
+/// The by-name builders' grant list: [`temen_interp::read_grant_records`] over the parent's window,
+/// `vm`'s. `None` with the parse's trap raised on `vm`.
 ///
-/// # Safety
-/// `[mem_base, mem_base + mem_size)` is the parent's window (its reserved span: a read of an
-/// uncommitted page faults through the SIGSEGV guard, like a guest access).
-unsafe fn read_grant_records(
-    mem_base: *mut u8,
-    mem_size: u64,
+/// #2996 — read through `host`'s view of the window, which checks each record against the page map
+/// every protection change goes through, as every other host access under the Host lock does: a
+/// record on a page the guest cannot read is its `MemoryFault`, as on the interpreters, and never a
+/// hardware fault taken with the Host lock held.
+fn read_grant_records(
+    host: &mut Host,
     grants_ptr: u64,
     grants_n: u64,
     vm: &temen_jit::VmCtx,
 ) -> Option<Vec<(String, i32)>> {
-    let read = |off: u64, len: usize| -> Result<Vec<u8>, Trap> {
-        match off.checked_add(len as u64) {
-            // SAFETY: `[off, off + len)` lies inside the window, per the bound just checked.
-            Some(end) if end <= mem_size => {
-                Ok(unsafe { std::slice::from_raw_parts(mem_base.add(off as usize), len) }.to_vec())
-            }
-            _ => Err(Trap::MemoryFault),
-        }
+    #[cfg(any(unix, windows))]
+    let read = {
+        let w = vm.window();
+        let view = MprotectWindow::of(host, w.base, w.mapped, w.reserved);
+        move |off: u64, len: usize| view.read_bytes(off, len as u64).ok_or(Trap::MemoryFault)
+    };
+    // No window backend on any other target (nor a JIT to call this).
+    #[cfg(not(any(unix, windows)))]
+    let read = {
+        let _ = host;
+        |_: u64, _: usize| Err::<Vec<u8>, _>(Trap::MemoryFault)
     };
     temen_interp::read_grant_records(grants_ptr, grants_n, read)
         .map_err(|t| vm.raise(t.code()))
@@ -4499,6 +4653,9 @@ pub struct MprotectWindow {
     /// page too), so the table, not the hardware, gates its accesses there; host code still trusts
     /// this map. `None` for any other window.
     table: Option<Arc<[std::sync::atomic::AtomicU8]>>,
+    /// #2958 slice 3 — the window takes no §13 region alias ([`Host::refuse_cap_window_aliases`]):
+    /// [`GuestMem::map_region`] refuses, so no page of it is ever `Backed`.
+    no_alias: bool,
 }
 
 #[cfg(any(unix, windows))]
@@ -4615,6 +4772,7 @@ impl MprotectWindow {
             null_guard: 0,
             shadow: temen_interp::ShadowArena::EMPTY,
             table: None,
+            no_alias: false,
         }
     }
 
@@ -4662,6 +4820,8 @@ impl MprotectWindow {
         // #2426: and the runtime-private pages of a durable module's window, as its start recorded
         // them.
         self.set_shadow(host.cap_window_shadow());
+        // #2958 slice 3: and whether it takes a §13 region alias at all.
+        self.no_alias = host.cap_window_refuses_aliases();
     }
 
     /// #2426: install the shadow arena the window's module declared (see the `shadow` field).
@@ -4685,7 +4845,10 @@ impl MprotectWindow {
     /// child's carve is smaller than the guard, the interpreter left it unguarded, and this tier
     /// refused its low pages as unmapped — a `CapFault` where the oracle joins cleanly.
     pub fn set_null_guard(&mut self, guard: u64) {
-        if guard == 0 || !guard.is_multiple_of(self.page) || guard > self.mapped {
+        // #2847 — a host page is a power of two, so a mask tests page exactness: a call's fit
+        // divides nothing.
+        debug_assert!(self.page.is_power_of_two());
+        if guard == 0 || guard & (self.page - 1) != 0 || guard > self.mapped {
             return;
         }
         self.null_guard = guard;
@@ -4807,12 +4970,18 @@ impl MprotectWindow {
     /// One page's access state: `None` ⇒ faults (unmapped), `Some(writable)` ⇒ committed — the
     /// same default rule as the interpreter (`temen_interp::Mem::page_access`).
     fn page_access(&self, page: u64) -> Option<bool> {
+        self.access_of(page, self.prot_get(page))
+    }
+
+    /// [`Self::page_access`]'s rule, for `page` whose map entry is `st`: the one rule every reader of
+    /// this map applies.
+    fn access_of(&self, page: u64, st: Option<PageState>) -> Option<bool> {
         // #964: the reserved NULL region reads as unmapped — a cap-buffer borrow at/near NULL is
         // refused exactly as the interpreter's `Unmapped`-seeded page map refuses it.
         if page * self.page < self.null_guard {
             return None;
         }
-        match self.prot_get(page) {
+        match st {
             Some(PageState::Rw) => Some(true),
             Some(PageState::Ro) => Some(false),
             Some(PageState::Backed { writable, .. }) => Some(writable),
@@ -4821,6 +4990,106 @@ impl MprotectWindow {
         }
     }
 
+    /// The window's bound, as the interpreter confines to it: temen-mask's reserved check.
+    fn confine(&self, addr: u64, width: u32) -> Result<u64, Trap> {
+        // A reservation is a power of two; one that were not would confine to less, fail-closed.
+        debug_assert!(self.reserved.is_power_of_two());
+        temen_mask::Window::new(self.reserved.ilog2() as u8)
+            .checked_reserved(addr, 0, width)
+            .ok_or(Trap::MemoryFault)
+    }
+
+    /// Whether the word of `width` bytes at confined, aligned `base` is on a page a load may read,
+    /// under the map's lock `map`, and not on a §13 alias: a native window keys every word on its own
+    /// backing, so a word on an alias would not rendezvous with the region's other mappings. Aliases
+    /// are refused here, fail-closed, until the phase that brings §13 regions onto the kernel route
+    /// keys them on their region (#2958).
+    fn word_readable(&self, map: &BTreeMap<u64, PageState>, base: u64) -> bool {
+        let page = base / self.page;
+        let st = map.get(&page).copied();
+        !matches!(st, Some(PageState::Backed { .. })) && self.access_of(page, st).is_some()
+    }
+}
+
+/// #2958 slice 3 — the kernel route's window: the rules read the JIT's window through the page map
+/// the domain's `Host` keeps for it, the one every host-side access of the window checks
+/// ([`MprotectWindow::reprotect`]'s contract).
+#[cfg(any(unix, windows))]
+impl temen_interp::FutexWindow for MprotectWindow {
+    fn prepare_wait(&self, addr: u64, width: u32) -> Result<u64, Trap> {
+        let base = self.confine(addr, width)?;
+        if !base.is_multiple_of(u64::from(width)) {
+            return Err(Trap::MemoryFault);
+        }
+        let map = self.prot.lock().unwrap_or_else(|e| e.into_inner());
+        match self.word_readable(&map, base) {
+            true => Ok(base),
+            false => Err(Trap::MemoryFault),
+        }
+    }
+    fn confine_for_notify(&self, addr: u64) -> Result<u64, Trap> {
+        self.confine(addr, 1)
+    }
+    /// The guarded read: the check and the load under one hold of the map's lock, which a page op
+    /// takes to revoke a page before it changes the hardware ([`MprotectWindow::reprotect`]). The
+    /// lock is a leaf: nothing is taken while it is held, and no system call is made under it.
+    fn wait_word(&self, base: u64, width: u32) -> Option<u64> {
+        // A naturally aligned word of at most 8 bytes lies on one page.
+        if !matches!(width, 4 | 8) || !base.is_multiple_of(u64::from(width)) {
+            return None;
+        }
+        // The one bound of the window's futex face (temen-mask's).
+        let base = self.confine(base, width).ok()?;
+        let map = self.prot.lock().unwrap_or_else(|e| e.into_inner());
+        if !self.word_readable(&map, base) {
+            return None;
+        }
+        // SAFETY: `[base, base + width)` is inside the reservation, aligned, and on a page the map
+        // says is readable, which the hardware keeps readable while this holds the map's lock (the
+        // contract above). The word is guest memory other vCPUs write with atomics: read it as one.
+        let word = unsafe {
+            let at = self.base.add(base as usize);
+            match width {
+                4 => u64::from(
+                    core::sync::atomic::AtomicU32::from_ptr(at.cast())
+                        .load(core::sync::atomic::Ordering::SeqCst),
+                ),
+                _ => core::sync::atomic::AtomicU64::from_ptr(at.cast())
+                    .load(core::sync::atomic::Ordering::SeqCst),
+            }
+        };
+        drop(map);
+        Some(word)
+    }
+    /// Every word's site is its address: no page of a native window is a §13 alias (`jit_kernel`'s
+    /// `region start` and `native_scope`'s `cap` keep every source of one out), so a key on the
+    /// window's own backing is the word's canonical one. A debug build checks it, so a change that
+    /// lets an alias in fails in tests instead of keying a word apart from the region's waiters.
+    fn futex_site(&self, base: u64) -> temen_interp::FutexSite {
+        debug_assert!(
+            !matches!(
+                self.prot
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get(&(base / self.page)),
+                Some(PageState::Backed { .. })
+            ),
+            "a native window's page is a §13 alias"
+        );
+        temen_interp::FutexSite::Anon(base)
+    }
+    /// The canonical backing key: the window's reservation (its base, unique while the run holds it)
+    /// and the word's offset, as the interpreter keys a word on its backing and address.
+    fn site_key(&self, site: temen_interp::FutexSite) -> temen_interp::FutexKey {
+        let off = match site {
+            temen_interp::FutexSite::Anon(off) | temen_interp::FutexSite::Region(_, off) => off,
+        };
+        temen_interp::FutexKey::Anon(self.base as u64, off)
+    }
+}
+
+#[cfg(any(unix, windows))]
+impl MprotectWindow {
     /// Every page of `[ptr, ptr+len)` is committed (and writable when `write`), within
     /// `[0, reserved)` — the §7 borrow check, mirroring `temen_interp`.
     fn range_committed(&self, ptr: u64, len: u64, write: bool) -> bool {
@@ -4954,16 +5223,75 @@ impl MprotectWindow {
     /// own again — private, zero, inaccessible — so nothing the op does next reaches the region,
     /// which every other mapping of it still reads (#1707). `0`, or the `-errno` of a refusal.
     fn drop_aliases(&mut self, pages: std::ops::RangeInclusive<u64>) -> i64 {
-        for (first, last) in self.alias_runs(pages) {
-            for page in first..=last {
-                self.set_prot(page, 0, false);
-            }
-            let e = self.hw_unalias(first * self.page, (last + 1 - first) * self.page);
+        for run in self.alias_runs(pages) {
+            let mut e = 0;
+            self.reprotect_with(
+                &[run],
+                |w| (run.0..=run.1).for_each(|page| w.set_prot(page, 0, false)),
+                |w, start, len| {
+                    e = w.hw_unalias(start, len);
+                    e == 0
+                },
+                |_, _| {},
+            );
             if e != 0 {
                 return e;
             }
         }
         0
+    }
+
+    /// **The one way a page op changes the window's hardware** (#2958 slice 3), and the contract
+    /// every host-side reader of the window rests on: **a page readable in the page map is readable
+    /// in hardware.** The page op's `revoke` first takes from the map whatever access the op takes
+    /// away, then `hw` changes each run of `runs` (page indices) in hardware, then `grant` gives each
+    /// of their pages its new state in the map, once the hardware has it. So the map is never ahead of
+    /// the hardware: a reader that checks the map and loads under one hold of the map's lock
+    /// ([`temen_interp::FutexWindow::wait_word`]) either sees the page revoked, or loads before the
+    /// revoking call, which waits for its lock to write the map first (the lock's release orders
+    /// the load before the call). A grant the reader misses answers a fault the guest raced itself
+    /// into. Host code that borrows guest memory under the `Host` lock trusts the map the same way.
+    /// A hardware call the OS refuses (`ENOMEM` past `vm.max_map_count`, #2268) stops the op with
+    /// the map granting no more than the hardware may: `-ENOMEM`, and no grant.
+    ///
+    /// Every hardware change of a page op goes through here: [`GuestMem::map`], `unmap`, `protect`,
+    /// and the §13 alias drop ([`MprotectWindow::drop_aliases`]). The other calls that change the
+    /// window's hardware, each named with why it keeps the contract: a §13 `map_region` (revokes in
+    /// the map first itself, its Windows granules one by one), a demand-paged child's `supply`
+    /// (grants only, hardware first), and outside this type the window's start
+    /// (`CompiledModule::seed_window`, before any reader), a snapshot's `restore_rw` (grants, after
+    /// every vCPU has gone), and a fork's copy (a new window).
+    fn reprotect(
+        &mut self,
+        runs: &[(u64, u64)],
+        revoke: impl FnOnce(&mut Self),
+        hw: impl FnMut(&Self, u64, u64) -> bool,
+        grant: impl Fn(&mut Self, u64),
+    ) -> i64 {
+        match self.reprotect_with(runs, revoke, hw, grant) {
+            true => 0,
+            false => ENOMEM,
+        }
+    }
+
+    /// [`MprotectWindow::reprotect`], answering whether every hardware call succeeded.
+    fn reprotect_with(
+        &mut self,
+        runs: &[(u64, u64)],
+        revoke: impl FnOnce(&mut Self),
+        mut hw: impl FnMut(&Self, u64, u64) -> bool,
+        grant: impl Fn(&mut Self, u64),
+    ) -> bool {
+        revoke(self);
+        for &(first, last) in runs {
+            if !hw(self, first * self.page, (last + 1 - first) * self.page) {
+                return false;
+            }
+        }
+        for page in runs.iter().flat_map(|&(first, last)| first..=last) {
+            grant(self, page);
+        }
+        true
     }
 
     // ---- the hardware primitives (the only per-OS part) -----------------------------------------
@@ -5199,17 +5527,12 @@ impl GuestMem for MprotectWindow {
         if e != 0 {
             return e;
         }
-        self.narrow(pages, prot, |w, page| w.set_prot(page, prot, false));
-        for &(first, last) in &runs {
-            let (start, plen) = (first * self.page, (last + 1 - first) * self.page);
-            if !self.zero_private(start, plen, false) || !self.hw_protect(start, plen, prot) {
-                return ENOMEM;
-            }
-        }
-        for page in runs.into_iter().flat_map(|(first, last)| first..=last) {
-            self.set_prot(page, prot, false);
-        }
-        0
+        self.reprotect(
+            &runs,
+            |w| w.narrow(pages, prot, |w, page| w.set_prot(page, prot, false)),
+            |w, start, len| w.zero_private(start, len, false) && w.hw_protect(start, len, prot),
+            |w, page| w.set_prot(page, prot, false),
+        )
     }
     /// §3e op 1 `unmap`: decommit the **whole pages** covering `[offset,offset+len)` — any access
     /// faults, and a re-`map` reads zero. Operates on the page range (page-granular work needs whole
@@ -5234,17 +5557,17 @@ impl GuestMem for MprotectWindow {
         if e != 0 {
             return e;
         }
-        for page in runs.iter().flat_map(|&(first, last)| first..=last) {
-            self.set_prot(page, 0, false);
-        }
         // Zero it, then protect NONE so any later access faults (detect-and-kill).
-        for (first, last) in runs {
-            let (start, plen) = (first * self.page, (last + 1 - first) * self.page);
-            if !self.zero_private(start, plen, true) || !self.hw_protect(start, plen, 0) {
-                return ENOMEM;
-            }
-        }
-        0
+        self.reprotect(
+            &runs,
+            |w| {
+                for page in runs.iter().flat_map(|&(first, last)| first..=last) {
+                    w.set_prot(page, 0, false);
+                }
+            },
+            |w, start, len| w.zero_private(start, len, true) && w.hw_protect(start, len, 0),
+            |_, _| {},
+        )
     }
     fn tail_bytes(&self, offset: u64, len: u64) -> temen_interp::TailBytes {
         let Ok(pages) = self.prot_pages(offset, len) else {
@@ -5292,17 +5615,12 @@ impl GuestMem for MprotectWindow {
                 return e;
             }
         }
-        self.narrow(pages, prot, |w, page| w.protect_page(page, prot));
-        for &(first, last) in &runs {
-            let (start, plen) = (first * self.page, (last + 1 - first) * self.page);
-            if !self.hw_protect(start, plen, prot) {
-                return ENOMEM;
-            }
-        }
-        for page in runs.into_iter().flat_map(|(first, last)| first..=last) {
-            self.protect_page(page, prot);
-        }
-        0
+        self.reprotect(
+            &runs,
+            |w| w.narrow(pages, prot, |w, page| w.protect_page(page, prot)),
+            |w, start, len| w.hw_protect(start, len, prot),
+            |w, page| w.protect_page(page, prot),
+        )
     }
     /// §3e op 3 `page_size`: the hardware protection granularity (`self.page` = the host page) —
     /// the unit `map`/`unmap`/`protect` round to, matching the interpreter's `Mem::page_size` on the
@@ -5334,6 +5652,12 @@ impl GuestMem for MprotectWindow {
         region: u32,
         backing: RegionBacking,
     ) -> i64 {
+        // #2958 slice 3: a window the kernel route reads keys every word on its own backing, so a
+        // region alias there would fault a wait and mis-key a notify. The one way a `Backed` entry
+        // is written, refused before anything changes ([`Host::refuse_cap_window_aliases`]).
+        if self.no_alias {
+            return EINVAL;
+        }
         #[cfg(unix)]
         {
             const PROT_READ: i32 = 1;
@@ -5363,6 +5687,10 @@ impl GuestMem for MprotectWindow {
             } else {
                 libc::PROT_READ
             };
+            // No revoke first: a `MAP_FIXED` replacement is atomic, so every page stays readable
+            // throughout ([`Self::reprotect`]'s contract for the lock-free reader), and no host
+            // writer runs outside the `Host` lock this call holds. A refused `mmap` leaves the
+            // window, and so its map, as they were.
             // SAFETY: `[base+start, +plen) ⊆` the reserved window (validated by `prot_pages`).
             // `MAP_FIXED` replaces those reserved pages with a shared mapping of the region fd at
             // `region_off`; the fd outlives the run (held by the Host's backing).
@@ -5443,6 +5771,14 @@ impl GuestMem for MprotectWindow {
             for i in 0..(len / gran) {
                 let addr = unsafe { self.base.add((win_off + i * gran) as usize) };
                 let roff = region_off + i * gran;
+                // Freeing the granule to a placeholder leaves it inaccessible until its view lands,
+                // so its pages lose their access in the map first ([`Self::reprotect`]'s contract),
+                // and gain the alias once every view is in. A granule after a failing one is left as
+                // it was.
+                let first = *pages.start() + i * (gran / self.page);
+                for page in first..first + gran / self.page {
+                    self.set_prot(page, 0, false);
+                }
                 // SAFETY: `[addr, addr+gran) ⊆` the reserved window (validated by `prot_pages`).
                 // Free-to-placeholder decommits whatever is there (committed or placeholder) leaving
                 // an exact placeholder; `MapViewOfFile3(MEM_REPLACE_PLACEHOLDER)` then aliases the
@@ -6669,15 +7005,19 @@ fn module_nests(m: &temen_ir::Module) -> bool {
     })
 }
 
-/// Whether `m` spawns a **detached** child (`Instantiator` op 17, the record): a spawn
-/// that may grant the child a live offer back into its spawner (#744, [`jit_proc::locked`]).
-fn spawns_detached(m: &Module) -> bool {
+/// Whether `m` builds a **detached** child's powerbox from a grant list, which may grant the child a
+/// live offer back into `m`'s cell (#744, [`jit_proc::locked`]): it spawns one (`Instantiator` op
+/// 17, the record), or asks `Module.unbound` (op 2, #2874), which builds the child a spawn with that
+/// list would get and so admits the grants that spawn would.
+fn builds_detached_children(m: &Module) -> bool {
+    use temen_ir::cap_id::{INSTANTIATOR, MODULE};
     m.funcs.iter().any(|f| {
         f.blocks.iter().any(|b| {
             b.insts.iter().any(|i| {
                 matches!(
                     i,
-                    temen_ir::Inst::CapCall(c) if c.type_id == 6 && c.op == 17
+                    temen_ir::Inst::CapCall(c)
+                        if (c.type_id, c.op) == (INSTANTIATOR, 17) || (c.type_id, c.op) == (MODULE, 2)
                 )
             })
         })
@@ -7576,6 +7916,28 @@ fn jit_run(
     // which pays for its window and main vCPU as an interpreter's does. A chain unbounded at every
     // level meters nothing, and the run's code compiles without fuel checks.
     limits.grant(host);
+    // #2958 — a program `jit_kernel::admit` admits runs its vCPUs as executor 2's tasks.
+    if let Ok(admitted) = jit_kernel::admit(m, host, None, code.is_some()) {
+        let end = with_deadline(limits.deadline, |kill| {
+            let start = jit_kernel::Start {
+                entry: func,
+                args: slots,
+                init_mem: init_mem.unwrap_or(&[]),
+                init: None,
+                reserved_log2: temen_ir::default_reserved_log2(),
+                fuel: limits.fuel(),
+                snapshot_cap,
+                kill,
+            };
+            jit_kernel::run(admitted, start, host)
+        })
+        .map_err(|e| format!("JIT compile failed: {e:?}"))?;
+        let (outcome, snapshot) = end.outcome();
+        if let JitOutcome::Trapped(kind) = outcome {
+            return Err(format!("guest trapped ({kind:?}) — detect-and-kill (§5)"));
+        }
+        return Ok((outcome, snapshot, m.funcs[func as usize].results.clone()));
+    }
     let window = RootWindow::fresh(m, temen_ir::default_reserved_log2());
     let Some(node) = host.begin_activation(limits.fuel(), window) else {
         return Err(no_room_for_run());
