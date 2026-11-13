@@ -1219,3 +1219,48 @@ block 0 () {{
     assert_eq!(kernel, Err("MemoryFault".into()), "the page stays unmapped");
     assert_eq!(today, Ok(vec![1]), "today's route reads the region");
 }
+
+/// #2877 — a threaded program that uses `setjmp` is in the kernel's scope (`native_scope` does not
+/// look at `setjmp`), but the JIT's compile declines it on both routes before anything runs: the
+/// instance's checkpoint table is one stack, ordered by the frame pointers of the one native stack
+/// its guarded calls run on, and a spawned vCPU's thread is another stack.
+#[cfg(unix)]
+#[test]
+fn a_threaded_program_with_setjmp_is_declined_before_it_runs_on_both_routes() {
+    let m = module(
+        "memory 16
+func () -> (i64) {
+block 0 () {
+  vz = i64.const 0
+  vh = thread.spawn 1 vz vz
+  vst, vv = thread.join vh
+  return vv
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (va0: i64, vb0: i64) {
+  vb = i64.const 48000
+  vs = setjmp vb
+  vr = i64.extend_i32_u vs
+  return vr
+  }
+}
+",
+    );
+    assert!(
+        jit_kernel::admit(&m, &Host::new(), None, false).is_ok(),
+        "in the kernel's scope"
+    );
+    assert!(
+        matches!(
+            compile_and_run(&m, 0, &[]),
+            Err(temen_jit::JitError::Unsupported(_))
+        ),
+        "today's route declines it"
+    );
+    assert_eq!(
+        jit_kernel::run_fresh(&m, 0, &[], None).err(),
+        Some("the JIT's compile"),
+        "the kernel route declines it at the compile"
+    );
+}
