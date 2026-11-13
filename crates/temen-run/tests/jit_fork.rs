@@ -787,6 +787,7 @@ fn the_runs_fuel_stops_a_spinning_twin_on_every_engine() {
 /// fork it, and the twin's frames carry their checkpoints with them: its `longjmp` lands in its own
 /// copy of `_start`, which exits `50 + 7`, and the parent exits with the twin's status. On a refusal
 /// the parent exits `100 + errno`.
+#[cfg(unix)] // the JIT's `setjmp` is unix-only (`setjmp_rt`); elsewhere it declines `setjmp`
 const FORK_AFTER_SETJMP: &str = "\
 func () -> () {
 block 0 () {
@@ -839,6 +840,7 @@ block 6 () {
 export 0 func \"_start\" 0
 ";
 
+#[cfg(unix)] // the JIT's `setjmp` is unix-only (`setjmp_rt`); elsewhere it declines `setjmp`
 #[test]
 fn a_twin_longjmps_to_a_checkpoint_taken_before_the_fork_only_where_it_forks() {
     for backend in [Backend::TreeWalk, Backend::Bytecode] {

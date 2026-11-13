@@ -1473,6 +1473,7 @@ fn a_park_seam_fails_the_serve_qualification() {
 /// give the oracle's answer; the JIT must never `_longjmp` from the fiber's stack into the entry's, so
 /// it refuses the unit (`setjmp_rt::admits`): a split by tier, as for a threaded unit under a
 /// fibers-only grant.
+#[cfg(unix)] // the JIT's `setjmp` is unix-only (`setjmp_rt`); elsewhere it declines `setjmp`
 #[test]
 fn a_submitted_unit_cannot_longjmp_out_of_its_fiber() {
     let b = blob(
@@ -1521,6 +1522,7 @@ block 2 (vr: i32) {
 /// #2877 (audit finding 1, threads) — as [`a_submitted_unit_cannot_longjmp_out_of_its_fiber`], over
 /// a thread-hosting grant: an installed unit's entry takes a checkpoint and spawns a vCPU that
 /// `longjmp`s to it from its own thread.
+#[cfg(unix)] // the JIT's `setjmp` is unix-only (`setjmp_rt`); elsewhere it declines `setjmp`
 #[test]
 fn a_submitted_unit_cannot_longjmp_out_of_its_thread() {
     let unit = "memory 16
