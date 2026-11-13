@@ -157,7 +157,7 @@ fn run_held(
                         results: results.to_vec(),
                     });
                 },
-            )));
+            )))?;
             jit_proc::run_image(
                 cc,
                 cm,

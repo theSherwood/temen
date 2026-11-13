@@ -4916,9 +4916,18 @@ impl CompiledModule {
     /// Its calls then run as activations on their callers' threads until it ends. Only for a
     /// non-durable run with a thread domain ([`Self::enable_thread_hosting`]), whose code charges fuel:
     /// each call lends its own. A run that ends in its entry rests not at all.
+    ///
+    /// #2993 — a held domain's calls run on its run's one pool, its nursery's, which its teardown
+    /// joins: a module with none (no install room and no `Instantiator` op) is refused.
     #[cfg(fiber_rt)]
-    pub fn set_rest(&mut self, rest: Option<Rest>) {
+    pub fn set_rest(&mut self, rest: Option<Rest>) -> Result<(), JitError> {
+        if rest.is_some() && self._nursery.is_none() {
+            return Err(JitError::Unsupported(
+                "a held domain needs a nursery: install room or an Instantiator op",
+            ));
+        }
         self.rest = rest;
+        Ok(())
     }
 
     /// Make the next run **durable** (DURABILITY.md §12.8) on a caller-built module — the
@@ -5785,6 +5794,17 @@ impl CompiledModule {
                 // the join and the nursery's harvest, nothing changes it.
                 (*this).frozen_children_out = d.children().generations();
             }
+        }
+        // #2993 — the pool again, now that no vCPU is left: one still running when the nursery joined
+        // it above could file a task there since (a spawn, a handler it promoted), on a worker that
+        // join never took, which would outlive the domain. Nothing files after this one: every vCPU
+        // and every task has ended, and a held site has taken no call since its rest.
+        #[cfg(fiber_rt)]
+        if let Some(n) = &(*this)._nursery {
+            let froze = (*this).durable
+                && !faulted
+                && fiber_rt::window_is_unwinding(mem_base as u64, (*this).shadow);
+            n.join_late(froze);
         }
         // #1684 — every fiber slot nobody flattened rides too (a fresh one, a free one), so the thaw
         // rebuilds the table slot for slot. After `join_all`: no vCPU can still create a fiber.

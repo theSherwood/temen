@@ -1021,6 +1021,12 @@ impl Nursery {
         self.child_exec.wake_locked(crate::child_exec::Wake::All);
     }
 
+    /// #2993 — drive the run's pool to quiescence once more, after the last vCPU is joined: a task one
+    /// of them filed after [`Self::join_children`] ends, and the worker it got is joined.
+    pub(crate) fn join_late(&self, froze: bool) {
+        self.child_exec.shutdown_and_join(!froze);
+    }
+
     pub(crate) fn join_children(&self, froze: bool) -> Vec<crate::DetachedHarvest> {
         // D66 — drive the executor to quiescence: parked tasks are poisoned so they unwind, and
         // unless this is a freeze every running task ends with the run; then the workers are joined.

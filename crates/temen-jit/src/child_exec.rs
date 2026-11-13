@@ -1431,8 +1431,6 @@ pub struct HeldSite {
     root: *const VmCtx,
     /// The main thread's `vcpu.tls` word at rest.
     tls: i64,
-    /// #2993 — the site made its pool: its run has no nursery, whose teardown would join it.
-    own_exec: bool,
     /// Activations in flight: the rest waits for them before the domain's window and code go.
     inflight: AtomicUsize,
     /// The domain no longer takes calls: its rest has ended, or is ending.
@@ -1493,17 +1491,14 @@ impl HeldSite {
         domain: &Domain,
         tls: i64,
     ) -> Arc<HeldSite> {
-        // #2993 — the run's pool, its nursery's: the one its teardown joins. Only a run with no
-        // nursery, which spawns nothing, has none, and the site makes one, which its rest joins.
-        let hub = domain.hub();
-        let (exec, own_exec) = match cc._nursery.as_deref() {
-            Some(n) => (Arc::clone(n.exec()), false),
-            None => {
-                let e = ChildExec::new(hub as *const Domain as usize);
-                hub.set_child_exec(Arc::clone(&e));
-                (e, true)
-            }
-        };
+        // #2993 — the run's one pool, its nursery's, which its teardown joins (`set_rest` refuses a
+        // module with no nursery).
+        let exec = Arc::clone(
+            cc._nursery
+                .as_deref()
+                .expect("a held module has a nursery (`set_rest`)")
+                .exec(),
+        );
         let window = Arc::new(Window {
             tls: std::sync::atomic::AtomicI64::new(tls),
             ring: Box::new(|| {}),
@@ -1535,7 +1530,6 @@ impl HeldSite {
             },
             root: root as *const VmCtx,
             tls,
-            own_exec,
             inflight: AtomicUsize::new(0),
             closed: std::sync::atomic::AtomicBool::new(false),
             end_asked: Mutex::new(false),
@@ -1591,11 +1585,6 @@ impl HeldSite {
         }
         drop(g);
         self.site.set_open(false);
-        // #2993 — every pool a run uses is joined before its window, code and root context go: the
-        // nursery's by its teardown, and one the site made here.
-        if self.own_exec {
-            self.site.exec.shutdown_and_join(true);
-        }
     }
 
     /// End the domain ([`Self::rest`]): its embedder lets it go.
@@ -1639,17 +1628,26 @@ impl HeldSite {
             Some((_, n_params, _)) if n_params == args.len() => {}
             _ => return Err(ServeRefused::NoHandler),
         }
+        // A caller inside the run is one of its own: its gate waits park in the run's hub, its pool
+        // carries its parks, and an activation may share its fixed cell, which only the run's
+        // teardown frees (`activation_ctx`). Spawns wire live offers within a run and a held run
+        // forks no twin, so no other caller should reach here; one that does is refused, in every
+        // build, before anything of it is used (#2993).
+        if let HeldCaller::Inside(vm) = &caller {
+            let ours = !vm.sched.is_null()
+                && std::ptr::eq(
+                    os_thread_rt::current_domain(vm.sched as *const Domain).hub(),
+                    (*self.site.domain).hub(),
+                );
+            if !ours {
+                return revoked;
+            }
+        }
         let vm = Arc::new(activation_ctx(root, &caller));
         let (inside, lent) = match caller {
             HeldCaller::Outside(fuel) => (None, Some(fuel)),
             HeldCaller::Inside(vm) => (Some(vm), None),
         };
-        // A live offer reaches the domain only from its own run (spawns wire them, and a held run
-        // forks no twin), whose hub its gate waits park in and whose pool carries its parks.
-        debug_assert!(inside.is_none_or(|vm| std::ptr::eq(
-            os_thread_rt::current_domain(vm.sched as *const Domain).hub(),
-            (*self.site.domain).hub()
-        )));
         let window = &self.site.window;
         vm.handler_window
             .store(Arc::as_ptr(window) as *mut Window, Ordering::Release);
