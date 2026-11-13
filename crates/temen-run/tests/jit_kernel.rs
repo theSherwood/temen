@@ -718,8 +718,13 @@ fn bounded<T: Send + 'static>(what: &str, f: impl FnOnce() -> T + Send + 'static
     std::thread::spawn(move || {
         let _ = tx.send(f());
     });
-    rx.recv_timeout(PROMPT)
-        .unwrap_or_else(|_| panic!("{what} did not end within {PROMPT:?}"))
+    match rx.recv_timeout(PROMPT) {
+        Ok(v) => v,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            panic!("{what} did not end within {PROMPT:?}")
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => panic!("{what} panicked"),
+    }
 }
 
 /// #2995 — on the kernel route the host's page map knew nothing of the readonly pages the kernel
@@ -737,9 +742,15 @@ fn a_host_procedures_write_into_a_readonly_page_is_refused_on_both_routes() {
 /// How a run ended, as the three routes all spell it: its results, or the trap's name.
 type Answer = Result<Vec<i64>, String>;
 
+/// The root's own ceilings on every route of [`granted`]: `mem` and `maps` bounded, so a `Budget`'s
+/// room reads what the run holds.
+const CEILING_MEM: u64 = 1 << 30;
+const CEILING_MAPS: u64 = 1 << 20;
+
 /// Run the program `make(handle)` makes on the oracle, the kernel route (asserting it ran there) and
 /// today's route, each over a host `grant` granted one capability, `handle`, beside what that route's
-/// host holds. Each JIT route runs on a thread of its own and must end within [`PROMPT`].
+/// host holds, with the root's ceilings [`CEILING_MEM`] and [`CEILING_MAPS`]. Each JIT route runs on
+/// a thread of its own and must end within [`PROMPT`].
 fn granted(
     make: fn(i32) -> temen_ir::Module,
     grant: fn(&mut Host) -> i32,
@@ -753,13 +764,16 @@ fn granted(
             })
             .collect()
     };
+    let ceilings = |h: &mut Host| h.set_grant(CEILING_MEM as i64, -1, -1, CEILING_MAPS as i64);
     let mut host = Host::new();
+    ceilings(&mut host);
     let m = make(grant(&mut host));
     let oracle = temen_interp::run_with_host(&m, 0, &[], &mut 1_000_000, &mut host)
         .map(values)
         .map_err(|t| format!("{t:?}"));
     let kernel = bounded("the kernel route", move || {
         let mut host = Host::new();
+        ceilings(&mut host);
         let m = make(grant(&mut host));
         let admitted = jit_kernel::admit(&m, &host, None, false).expect("in the kernel's scope");
         let start = jit_kernel::Start {
@@ -782,6 +796,11 @@ fn granted(
         let handle = std::cell::Cell::new(0);
         let cfg = temen_run::RunConfig {
             jit_code: Some(temen_run::JitCodeCache::default()),
+            limits: temen_run::Limits {
+                mem: Some(CEILING_MEM),
+                maps: Some(CEILING_MAPS),
+                ..temen_run::Limits::default()
+            },
             ..temen_run::RunConfig::default()
         };
         // The powerbox grants its own handles first: learn the one `grant` adds, then run the
@@ -941,4 +960,125 @@ fn futex_ops_racing_page_ops_never_fault_the_host() {
         }
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
     });
+}
+
+/// #2958 slice 3 — the root, holding the address-space capability `handle` and at `handle + 1` a
+/// host procedure that reads its own budget node, reads it, maps a page of the reserved tail, reads
+/// it, unmaps the page and reads it again, and returns the three readings. A notify keeps it in the
+/// kernel's scope.
+fn page_ops_read(handle: i32) -> temen_ir::Module {
+    let p = handle + 1;
+    module(&format!(
+        "memory 16
+func () -> (i64, i64, i64) {{
+block 0 () {{
+  vq = i64.const 16400
+  vone = i32.const 1
+  vk = atomic.notify vq vone
+  vc = i32.const {handle}
+  vp = i32.const {p}
+  va = i64.const 1048576
+  vl = i64.const 4096
+  vrw = i64.const 3
+  vz = i64.const 0
+  vr0 = call.cap 13 0 (i64) -> (i64) vp(vz)
+  vx = call.cap 5 0 (i64, i64, i64) -> (i64) vc(va, vl, vrw)
+  vr1 = call.cap 13 0 (i64) -> (i64) vp(vz)
+  vy = call.cap 5 1 (i64, i64) -> (i64) vc(va, vl)
+  vr2 = call.cap 13 0 (i64) -> (i64) vp(vz)
+  return vr0, vr1, vr2
+  }}
+}}
+"
+    ))
+}
+
+/// The address-space capability, and after it a host procedure answering what the host's own budget
+/// node holds of `mem` (in pages, the high half) and `maps` (the low half), as [`page_ops_read`]
+/// names them.
+fn grant_memory_and_reader(h: &mut Host) -> i32 {
+    use temen_interp::{put_results, CapState, HostProcGrant, ProcHandler};
+    let m = h.grant_memory();
+    let node = h.own_node();
+    let page = temen_interp::host_page_size() as i64;
+    let p = h.grant_host_proc(HostProcGrant::new(
+        ProcHandler::Sync(Box::new(move |_op, _args, out, _mem, _minter| {
+            let (mem, maps) = node.mem_and_maps();
+            put_results(out, &[(mem / page) << 32 | maps])
+        })),
+        CapState::Stateless,
+    ));
+    assert_eq!(p, m + 1, "the reader follows");
+    m
+}
+
+/// #2958 slice 3 — budget parity (INVARIANTS #3): while the run holds its window, the root's own node
+/// holds the same `mem` and `maps` on the kernel route as on today's, before a guest's `map`, after
+/// it and after its `unmap`. The kernel route's activation charges the bound the JIT's own runtime
+/// charges (`jit_root_window`) and settles it to what the window's start made
+/// (`Host::start_window`), as `window_aliases` does, and a page op charges through the host's
+/// dispatch on both. (The oracle's plain entry opens no activation, so it charges no window: its
+/// readings are not compared.)
+#[test]
+fn the_kernel_route_charges_the_window_as_today_before_and_after_a_page_op() {
+    let [_, (_, kernel), (_, today)] = granted(page_ops_read, grant_memory_and_reader);
+    let r = today.clone().expect("today's route runs");
+    let (mem, maps) = (|x: i64| x >> 32, |x: i64| x & 0xFFFF_FFFF);
+    assert!(mem(r[1]) > mem(r[0]), "a mapped page costs mem: {r:x?}");
+    assert_eq!(r[2], r[0], "and its unmap gives it back: {r:x?}");
+    assert!(maps(r[0]) > 0, "the window's runs are charged: {r:x?}");
+    assert_eq!(kernel, today, "the kernel route against today's");
+}
+
+/// #2958 slice 3 — a restored start runs on the kernel route (the `restored` clause is gone): a run
+/// that protects a page to nothing hands back a layout that says so, and a run started from it waits
+/// on that page and faults, as the window it was captured from would, where a fresh start's wait
+/// times out. The page map is the JIT's own, which a restored layout seeds (`reset_cap_pages`,
+/// `set_restore`).
+#[test]
+fn a_restored_start_runs_on_the_kernel_route_under_its_page_map() {
+    let mut host = Host::new();
+    let handle = host.grant_memory();
+    let protects = module(&format!(
+        "memory 16
+func () -> (i64) {{
+block 0 () {{
+  vq = i64.const 16400
+  vone = i32.const 1
+  vk = atomic.notify vq vone
+  vc = i32.const {handle}
+  va = i64.const 32768
+  vl = i64.const 4096
+  vnone = i64.const 0
+  vr = call.cap 5 2 (i64, i64, i64) -> (i64) vc(va, vl, vnone)
+  return vr
+  }}
+}}
+"
+    ));
+    let fresh = temen_interp::MemLayout::image(Vec::new());
+    let run = |m: &temen_ir::Module, init: &temen_interp::MemLayout, host: &mut Host| {
+        assert!(
+            jit_kernel::admit(m, host, Some(init), false).is_ok(),
+            "the kernel route admits the start"
+        );
+        let r = temen_ir::DEFAULT_RESERVED_LOG2;
+        temen_run::jit_cap_run(m, 0, &[], init, r, 0, host, None).expect("runs")
+    };
+    let (o, layout) = run(&protects, &fresh, &mut host);
+    assert_eq!(result(o), Ok(vec![0]), "the protect");
+    assert!(!layout.is_seed(), "the layout is a restored one");
+    let waits = module(&op_in_thread("wait", 32768));
+    let (o, _) = run(&waits, &layout, &mut Host::new());
+    assert_eq!(
+        result(o),
+        Err(Trap::MemoryFault),
+        "from the layout, the page is gone"
+    );
+    let (o, _) = run(&waits, &fresh, &mut Host::new());
+    assert_eq!(
+        result(o),
+        Ok(vec![2]),
+        "from a fresh start, the wait times out"
+    );
 }

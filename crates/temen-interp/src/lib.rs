@@ -22576,6 +22576,15 @@ impl NodeRef {
         }
     }
 
+    /// What this node holds of the window's `mem` and the process's `maps` (#2268): the readout a
+    /// differential compares across engines (INVARIANTS #3).
+    pub fn mem_and_maps(&self) -> (i64, i64) {
+        (
+            self.tree.used(self.node, BUDGET_MEM),
+            self.tree.used(self.node, BUDGET_MAPS),
+        )
+    }
+
     /// The fuel room left along the whole chain, `-1` when every level is unbounded.
     pub fn fuel_room(&self) -> i64 {
         let nodes = self.tree.0.lock_unpoisoned();
