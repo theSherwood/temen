@@ -142,4 +142,25 @@ fn a_jit_session_prompt_cannot_resume_an_earlier_prompts_fiber() {
         matches!(out, JitOutcome::Trapped(temen_jit::TrapKind::FiberFault)),
         "prompt 2 resumed prompt 1's fiber: {out:?}"
     );
+    // INVARIANTS #9: no engine carries a fiber from one run to the next. Every interpreter run starts
+    // on an empty fiber registry, and no interpreter session can hold one across calls (the reactor
+    // `Session` refuses a module that uses `cont.*`), so prompt 2 is a run of its own there too: its
+    // resume of prompt 1's handle traps on the tree-walker and on the bytecode engine.
+    let args = [Value::I64(1), Value::I64(v[0])];
+    let mut fuel = u64::MAX;
+    let tw = temen_interp::run(&base, 0, &args, &mut fuel);
+    assert_eq!(
+        tw.map_err(|t| t.code()),
+        Err(temen_jit::TrapKind::FiberFault.code()),
+        "the tree-walker"
+    );
+    let mut fuel = u64::MAX;
+    match temen_interp::bytecode::compile_and_run(&base, 0, &args, &mut fuel) {
+        Some(bc) => assert_eq!(
+            bc.map_err(|t| t.code()),
+            Err(temen_jit::TrapKind::FiberFault.code()),
+            "the bytecode engine"
+        ),
+        None => panic!("the bytecode engine declined a fiber module"),
+    }
 }
