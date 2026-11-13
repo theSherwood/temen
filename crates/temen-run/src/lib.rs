@@ -5187,23 +5187,22 @@ impl MprotectWindow {
     /// region it keys a futex word on.
     fn mark_backed(
         &self,
+        map: &mut BTreeMap<u64, PageState>,
         pages: std::ops::RangeInclusive<u64>,
-        (region, backing): (u32, &RegionBacking),
+        region: u32,
         region_off: u64,
         writable: bool,
     ) {
-        self.prot.record_region(region, backing);
         let first = *pages.start();
         for page in pages {
             let off = region_off + (page - first) * self.page;
-            self.prot_set(
-                page,
-                PageState::Backed {
-                    region,
-                    off,
-                    writable,
-                },
-            );
+            let st = PageState::Backed {
+                region,
+                off,
+                writable,
+            };
+            map.insert(page, st);
+            self.mirror(page, st.access());
         }
     }
 
@@ -5285,8 +5284,9 @@ impl MprotectWindow {
     ///
     /// Every hardware change of a page op goes through here: [`GuestMem::map`], `unmap`, `protect`,
     /// and the §13 alias drop ([`MprotectWindow::drop_aliases`]). The other calls that change the
-    /// window's hardware, each named with why it keeps the contract: a §13 `map_region` (revokes in
-    /// the map first itself, its Windows granules one by one), a demand-paged child's `supply`
+    /// window's hardware, each named with why it keeps the contract: a §13 `map_region` (on unix
+    /// it holds the map's lock across its replacement; on windows it revokes each granule in the
+    /// map first), a demand-paged child's `supply`
     /// (grants only, hardware first), and outside this type the window's start
     /// (`CompiledModule::seed_window`, before any reader), a snapshot's `restore_rw` (grants, after
     /// every vCPU has gone), and a fork's copy (a new window).
@@ -5681,8 +5681,9 @@ impl GuestMem for MprotectWindow {
         region: u32,
         backing: RegionBacking,
     ) -> i64 {
-        // #2958 slice 4 — the backing, which the page map keys a region word on.
-        let aliased = backing.clone();
+        // #2958 slice 4 — the backing's identity, which the page map keys a region word on: recorded
+        // first, so the identity lock is never taken under the page map's.
+        self.prot.record_region(region, &backing);
         #[cfg(unix)]
         {
             const PROT_READ: i32 = 1;
@@ -5712,10 +5713,14 @@ impl GuestMem for MprotectWindow {
             } else {
                 libc::PROT_READ
             };
-            // No revoke first: a `MAP_FIXED` replacement is atomic, so every page stays readable
-            // throughout ([`Self::reprotect`]'s contract for the lock-free reader), and no host
-            // writer runs outside the `Host` lock this call holds. A refused `mmap` leaves the
-            // window, and so its map, as they were.
+            // The page map's lock is held across the replacement and the marking, so a host reader
+            // that checks the map and loads under it ([`temen_interp::FutexWindow::wait_word`])
+            // never meets the replacement midway: a `MAP_FIXED` over a live mapping is not atomic to
+            // a concurrent reader on every OS (macOS faults one, #2958 slice 4). No other host
+            // reader runs outside the `Host` lock this call holds; the guest's own loads that race
+            // it fault into the guest. A refused `mmap` leaves the window, and so its map, as they
+            // were.
+            let mut map = self.prot.lock();
             // SAFETY: `[base+start, +plen) ⊆` the reserved window (validated by `prot_pages`).
             // `MAP_FIXED` replaces those reserved pages with a shared mapping of the region fd at
             // `region_off`; the fd outlives the run (held by the Host's backing).
@@ -5737,7 +5742,7 @@ impl GuestMem for MprotectWindow {
                     _ => EINVAL,
                 };
             }
-            self.mark_backed(pages, (region, &aliased), region_off, writable);
+            self.mark_backed(&mut map, pages, region, region_off, writable);
             0
         }
         // §13 windows (issue #1): real shared mappings via **placeholder reservations**. The JIT
@@ -5833,8 +5838,9 @@ impl GuestMem for MprotectWindow {
                         let (first, per) = (*pages.start(), gran / self.page);
                         if i > 0 {
                             self.mark_backed(
+                                &mut self.prot.lock(),
                                 first..=first + i * per - 1,
-                                (region, &aliased),
+                                region,
                                 region_off,
                                 writable,
                             );
@@ -5846,12 +5852,12 @@ impl GuestMem for MprotectWindow {
                     }
                 }
             }
-            self.mark_backed(pages, (region, &aliased), region_off, writable);
+            self.mark_backed(&mut self.prot.lock(), pages, region, region_off, writable);
             0
         }
         #[cfg(not(any(unix, windows)))]
         {
-            let _ = (win_off, region_off, len, prot, region, backing, aliased);
+            let _ = (win_off, region_off, len, prot, region, backing);
             EINVAL
         }
     }
