@@ -234,7 +234,7 @@ fn fueled(m: &temen_ir::Module, budget: u64) -> [(Result<Vec<i64>, Trap>, u64); 
     )
     .expect("jit");
     let mut host = Host::new();
-    let admitted = jit_kernel::admit(m, &host, None, false).expect("in the kernel's scope");
+    let admitted = jit_kernel::admit(m, &host, false).expect("in the kernel's scope");
     let start = jit_kernel::Start {
         entry: 0,
         args: &[],
@@ -775,7 +775,7 @@ fn granted(
         let mut host = Host::new();
         ceilings(&mut host);
         let m = make(grant(&mut host));
-        let admitted = jit_kernel::admit(&m, &host, None, false).expect("in the kernel's scope");
+        let admitted = jit_kernel::admit(&m, &host, false).expect("in the kernel's scope");
         let start = jit_kernel::Start {
             entry: 0,
             args: &[],
@@ -963,7 +963,7 @@ fn futex_ops_racing_page_ops_never_fault_the_host() {
             for _ in 0..30 {
                 let mut host = Host::new();
                 let m = racing(host.grant_memory(), op, protect, turns);
-                let admitted = jit_kernel::admit(&m, &host, None, false).expect("in scope");
+                let admitted = jit_kernel::admit(&m, &host, false).expect("in scope");
                 let start = jit_kernel::Start {
                     entry: 0,
                     args: &[],
@@ -1090,7 +1090,7 @@ block 0 () {{
     let fresh = temen_interp::MemLayout::image(Vec::new());
     let run = |m: &temen_ir::Module, init: &temen_interp::MemLayout, host: &mut Host| {
         assert!(
-            jit_kernel::admit(m, host, Some(init), false).is_ok(),
+            jit_kernel::admit(m, host, false).is_ok(),
             "the kernel route admits the start"
         );
         let r = temen_ir::DEFAULT_RESERVED_LOG2;
@@ -1114,28 +1114,24 @@ block 0 () {{
     );
 }
 
-/// #2958 slice 3 — no page of a native window is a §13 alias: a root host an embedder staged a
-/// pre-map on (`Host::stage_premap`, the op-17 pre-map) is declined (`region start`), so its
-/// futex words are keyed with the region's other mappings on today's route, as before. (The
-/// interpreters apply an op-17 pre-map to a spawned child's window only, so no oracle answers a root
-/// one.) (A captured layout that aliases a region reaches the same clause: `jit_cap_run`
-/// stages its §13 pages as the host's pre-map, `Host::reset_cap_pages`.)
-#[cfg(unix)]
+/// #2958 slice 4 — a root host an embedder staged a pre-map on (`Host::stage_premap`, the op-17
+/// pre-map) runs on the kernel route: the region is aliased into the window as it starts, and a
+/// not-equal wait on the pre-mapped page reads the region (zero), as today's route answered it.
+/// (The interpreters apply an op-17 pre-map to a spawned child's window only, so no oracle answers a
+/// root one. A captured layout that aliases a region reaches the same path: `jit_cap_run` stages
+/// its §13 pages as the host's pre-map, `Host::reset_cap_pages`.)
+#[cfg(any(unix, windows))]
 #[test]
-fn a_root_with_a_region_premapped_is_declined_and_answers_on_todays_route() {
+fn a_root_with_a_region_premapped_runs_on_the_kernel_route() {
     let off = 1u64 << 20;
-    let staged = || {
-        let mut parent = Host::new();
-        parent.set_region_factory(temen_run::new_shared_region);
-        let len = temen_interp::host_region_granularity() as usize;
-        let backing = temen_run::new_shared_region(len).expect("a region");
-        let region = parent.grant_shared_region_backed(backing);
-        let mut root = Host::new();
-        assert!(parent.stage_premap(region, off, &mut root), "staged");
-        root
-    };
-    // A not-equal wait on the pre-mapped page: the region reads zero.
-    let src = format!(
+    let mut parent = Host::new();
+    parent.set_region_factory(temen_run::new_shared_region);
+    let len = temen_interp::host_region_granularity() as usize;
+    let backing = temen_run::new_shared_region(len).expect("a region");
+    let region = parent.grant_shared_region_backed(backing);
+    let mut root = Host::new();
+    assert!(parent.stage_premap(region, off, &mut root), "staged");
+    let m = module(&format!(
         "memory 16
 func () -> (i64) {{
 block 0 () {{
@@ -1148,35 +1144,117 @@ block 0 () {{
   }}
 }}
 "
-    );
-    let m = module(&src);
-    let root = staged();
-    assert_eq!(
-        jit_kernel::admit(&m, &root, None, false).err(),
-        Some("region start"),
-        "the kernel route declines it"
-    );
-    let mut root = root;
+    ));
+    assert_eq!(jit_kernel::admit(&m, &root, false).err(), None, "admitted");
     let init = temen_interp::MemLayout::image(Vec::new());
     let r = temen_ir::DEFAULT_RESERVED_LOG2;
-    let (today, _) =
-        temen_run::jit_cap_run(&m, 0, &[], &init, r, 0, &mut root, None).expect("today's route");
-    assert_eq!(
-        result(today),
-        Ok(vec![1]),
-        "today's route answers not-equal"
-    );
+    let (o, _) = temen_run::jit_cap_run(&m, 0, &[], &init, r, 0, &mut root, None).expect("runs");
+    assert_eq!(result(o), Ok(vec![1]), "the region reads zero: not-equal");
 }
 
-/// #2958 slice 3 — a kernel-route window takes no §13 region alias, by any path: a host procedure
-/// that maps a region into the window it is handed (`GuestMem::map_region`, a public interface) is
-/// refused (`-EINVAL`) there, before anything changes, and a wait at that address faults as on any
-/// unmapped page. Today's route maps it, and its wait reads the region. (The window carries the
-/// refusal, `Host::refuse_cap_window_aliases`; the admission clauses keep the region-mapping
-/// programs they can see on today's route.)
-#[cfg(unix)]
+/// The two aliases [`aliased`] maps one region page at.
+const ALIAS_A: u64 = 1 << 20;
+
+/// #2958 slice 4 — a program over a `SharedRegion` `handle` of one granule: map it read-write at
+/// [`ALIAS_A`] and at the next granule (`B`). A spawned vCPU sets a ready word, notifies it, and
+/// waits at the first word of alias A for a `0` there, with no timeout. The root waits for the ready
+/// word, then notifies the same word through alias B until a notify reports the one waiter woken,
+/// at most `1 << 20` times, and returns `100 +` the joined waiter's answer (`0`, woken) `+` both
+/// maps' answers; `-1` if no notify ever woke it (the words were keyed apart). The overlap is by
+/// construction: the root notifies until it wakes the waiter, and the waiter's one wait cannot end
+/// otherwise.
+fn aliased(handle: i32) -> temen_ir::Module {
+    let g = temen_interp::host_region_granularity();
+    let b = ALIAS_A + g;
+    module(&format!(
+        "memory 16
+func () -> (i64) {{
+block 0 () {{
+  vc = i32.const {handle}
+  va = i64.const {ALIAS_A}
+  vb = i64.const {b}
+  vro = i64.const 0
+  vl = i64.const {g}
+  vp = i64.const 3
+  vm0 = call.cap 4 0 (i64, i64, i64, i64) -> (i64) vc(va, vro, vl, vp)
+  vm1 = call.cap 4 0 (i64, i64, i64, i64) -> (i64) vc(vb, vro, vl, vp)
+  vms = i64.add vm0 vm1
+  vz = i64.const 0
+  vh = thread.spawn 1 vz vz
+  vrw = i64.const 49152
+  vx = i32.const 0
+  vto = i64.const -1
+  vk = i32.atomic.wait vrw vx vto
+  br 1(vh, vms, vz)
+}}
+block 1 (vh1: i32, vms1: i64, vi: i64) {{
+  vbw = i64.const {b}
+  vone = i32.const 1
+  vn = atomic.notify vbw vone
+  vinc = i64.const 1
+  vj = i64.add vi vinc
+  vlim = i64.const 1048576
+  vout = i64.ge_u vj vlim
+  br_if vn 4(vh1, vms1) 2(vh1, vms1, vj, vout)
+}}
+block 2 (vh4: i32, vms4: i64, vj4: i64, vout4: i32) {{
+  br_if vout4 3() 1(vh4, vms4, vj4)
+}}
+block 3 () {{
+  vneg = i64.const -1
+  return vneg
+}}
+block 4 (vh3: i32, vms3: i64) {{
+  vst, vv = thread.join vh3
+  vbase = i64.const 100
+  vsum = i64.add vbase vv
+  vres = i64.add vsum vms3
+  return vres
+  }}
+}}
+func (i64, i64) -> (i64) {{
+block 0 (vn: i64, vz: i64) {{
+  vrw = i64.const 49152
+  vone = i32.const 1
+  i32.atomic.store vrw vone
+  vk = atomic.notify vrw vone
+  vaw = i64.const {ALIAS_A}
+  vx = i32.const 0
+  vto = i64.const -1
+  vs = i32.atomic.wait vaw vx vto
+  vr = i64.extend_i32_u vs
+  return vr
+  }}
+}}
+"
+    ))
+}
+
+/// A host granted a fresh one-granule region (and the factory a guest's own mint would use).
+fn grant_region(h: &mut Host) -> i32 {
+    h.set_region_factory(temen_run::new_shared_region);
+    let len = temen_interp::host_region_granularity() as usize;
+    h.grant_shared_region_backed(temen_run::new_shared_region(len).expect("a region"))
+}
+
+/// #2958 slice 4 — two mappings of one region byte in one window rendezvous: a wait through one alias
+/// is woken by a notify through the other, on the oracle and both JIT routes. On the kernel route
+/// the notify's no-wake fast path finds the waiter counted in under the region's key, and the rules
+/// wake it there: a key on the window's own backing would leave the root notifying no one.
+#[cfg(any(unix, windows))]
 #[test]
-fn a_host_procedure_cannot_map_a_region_into_a_kernel_route_window() {
+fn two_aliases_of_one_region_byte_rendezvous_on_every_route() {
+    for (route, answer) in granted(aliased, grant_region) {
+        assert_eq!(answer, Ok(vec![100]), "{route}");
+    }
+}
+
+/// #2958 slice 4 — a host procedure may map a region into the window it is handed
+/// (`GuestMem::map_region`, a public interface): the kernel route maps it as today's route does,
+/// and a not-equal wait at that address reads the region.
+#[cfg(any(unix, windows))]
+#[test]
+fn a_host_procedure_maps_a_region_into_a_kernel_route_window_as_today() {
     const AT: u64 = 1 << 20;
     // The root calls the procedure, then (with `wait`) waits not-equal at the address it mapped.
     fn program(handle: i32, wait: bool) -> temen_ir::Module {
@@ -1216,9 +1294,9 @@ block 0 () {{
         ))
     }
     let [_, (_, kernel), (_, today)] = granted(|h| program(h, false), maps);
-    assert_eq!(kernel, Ok(vec![-22]), "the kernel route refuses the alias");
+    assert_eq!(kernel, Ok(vec![0]), "the kernel route maps it");
     assert_eq!(today, Ok(vec![0]), "today's route maps it");
     let [_, (_, kernel), (_, today)] = granted(|h| program(h, true), maps);
-    assert_eq!(kernel, Err("MemoryFault".into()), "the page stays unmapped");
+    assert_eq!(kernel, Ok(vec![1]), "the kernel route reads the region");
     assert_eq!(today, Ok(vec![1]), "today's route reads the region");
 }

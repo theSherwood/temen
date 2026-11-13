@@ -1,10 +1,12 @@
 //! #2958 slice 3 — `MprotectWindow`'s futex face (`temen_interp::FutexWindow`), the host code that
 //! reads a guest word at a guest-chosen address on the kernel route, tested as its own unit:
 //!
-//! - **The guarded read against a model.** Random page ops, then random addresses and widths: the
-//!   read is refused exactly when a byte lies outside the reservation, the address is misaligned,
-//!   the page is below the NULL guard, or the page is not readable, and otherwise answers the word.
-//!   A read the model refuses that the window admitted would fault this process.
+//! - **The guarded read against a model.** Random page ops and §13 region maps, then random
+//!   addresses and widths: the read is refused exactly when a byte lies outside the reservation, the
+//!   address is misaligned, the page is below the NULL guard, or the page is not readable, and
+//!   otherwise answers the word. A read the model refuses that the window admitted would fault this
+//!   process. And the keys (#2958 slice 4): two aliases of one region byte key alike, and a word on
+//!   an alias and a private word at the same offset key apart.
 //! - **The race.** Threads read words of a page while another unmaps, maps and protects it, for as
 //!   long as it takes: the process never faults, and each read answers a value or a refusal.
 #![cfg(unix)]
@@ -94,7 +96,14 @@ fn the_guarded_read_refuses_exactly_what_the_model_refuses() {
     let reserved = pages * page;
     for seed in 1..=64u64 {
         let r = Reservation::new(reserved as usize, (prefix * page) as usize);
-        let mut w = MprotectWindow::new(r.base, prefix * page, reserved);
+        let map = temen_interp::CapPageMap::default();
+        let mut w = MprotectWindow::new_shared(r.base, prefix * page, reserved, map.clone());
+        // A region of two pages, which a map aliases one page of at a time.
+        let region = temen_run::new_shared_region((2 * page) as usize).expect("a region");
+        // Which region page each window page aliases, if any.
+        let mut alias: Vec<Option<u64>> = vec![None; pages as usize];
+        // A region map has succeeded: the window's `aliased` is set from then on, never cleared.
+        let mut ever = false;
         w.set_null_guard(guard * page);
         // The NULL guard is the window start's to protect (`seed_window`), not a page op's.
         // SAFETY: the guard's pages lie inside the reservation.
@@ -115,22 +124,69 @@ fn the_guarded_read_refuses_exactly_what_the_model_refuses() {
             let n = 1 + rng.below(3).min(pages - first - 1);
             let (off, len) = (first * page, n * page);
             let prot = [0, 1, 3][rng.below(3) as usize];
-            let (rc, readable) = match rng.below(4) {
+            let rp = rng.below(2);
+            let which = rng.below(5);
+            let (rc, readable) = match which {
                 0 => (w.map(off, len, prot), prot & 1 != 0),
                 1 => (w.unmap(off, len), false),
                 2 => (w.protect(off, len, prot), prot & 1 != 0),
+                3 => (
+                    w.map_region(off, rp * page, page, 3, 7, region.clone()),
+                    true,
+                ),
                 _ => (1, false),
             };
+            // A region map aliases one page.
+            let n = if which == 3 { 1 } else { n };
             if rc == 0 {
-                for m in &mut model[first as usize..(first + n) as usize] {
-                    *m = if readable {
+                for p in first..first + n {
+                    model[p as usize] = if readable {
                         Model::Readable
                     } else {
                         Model::Not
                     };
+                    // A region map makes the page an alias; a protect that leaves access keeps one;
+                    // any other op ends one.
+                    alias[p as usize] = match which {
+                        3 => Some(rp),
+                        2 if readable => alias[p as usize],
+                        _ => None,
+                    };
                 }
+                ever |= which == 3;
             } else if rc < 0 {
                 assert!(first < guard, "seed {seed}: only the guard refuses: {rc}");
+                // A refused op changes nothing, a region map's record of its region included.
+                if which == 3 && !ever {
+                    assert!(
+                        !map.aliased(),
+                        "seed {seed}: a refused map records no alias"
+                    );
+                    assert_eq!(map.region_ident(7), None, "seed {seed}");
+                }
+            }
+            // The keys: at one offset, the words of two readable pages key alike exactly when they
+            // are one page or alias one region page.
+            let o = 4 * rng.below(page / 4);
+            let readable: Vec<u64> = (0..pages)
+                .filter(|&p| matches!(model[p as usize], Model::Readable))
+                .collect();
+            let key = |p: u64| {
+                let base = w.prepare_wait(p * page + o, 4).expect("readable");
+                w.site_key(w.futex_site(base))
+            };
+            for &p in &readable {
+                for &q in &readable {
+                    let same = p == q
+                        || matches!((alias[p as usize], alias[q as usize]), (Some(a), Some(b)) if a == b);
+                    assert_eq!(
+                        key(p) == key(q),
+                        same,
+                        "seed {seed}: pages {p} and {q} at {o:#x}, aliases {:?} and {:?}",
+                        alias[p as usize],
+                        alias[q as usize]
+                    );
+                }
             }
             // Reads at random addresses and widths, including past the reservation.
             for _ in 0..16 {

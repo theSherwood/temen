@@ -1477,7 +1477,7 @@ pub fn jit_cap_run(
     // A fresh window: its page map is `init`'s, none from an earlier run (see `reset_cap_pages`).
     host.reset_cap_pages(init.page_map());
     // #2958 — a program `jit_kernel::admit` admits runs its vCPUs as executor 2's tasks.
-    if let Ok(admitted) = jit_kernel::admit(m, host, Some(init), false) {
+    if let Ok(admitted) = jit_kernel::admit(m, host, false) {
         let start = jit_kernel::Start {
             entry,
             args,
@@ -4171,7 +4171,7 @@ unsafe fn window_aliases(
     ro: &[[u64; 2]],
     shadow: temen_interp::ShadowArena,
 ) -> i32 {
-    match window_view(host, base, mapped, reserved, ro, shadow, false) {
+    match window_view(host, base, mapped, reserved, ro, shadow) {
         Some(wm) => {
             host.start_window(wm.window_runs());
             1
@@ -4181,9 +4181,8 @@ unsafe fn window_aliases(
 }
 
 /// [`window_aliases`] but its charge: the view of `host`'s fresh window that every host-side path
-/// takes, its page map started. With `no_alias`, the window takes no §13 region alias from its start
-/// on ([`Host::refuse_cap_window_aliases`]): a pre-map is refused with the rest. `None` when a
-/// pre-map was refused, or on a target with no window backend.
+/// takes, its page map started. `None` when a pre-map was refused, or on a target with no window
+/// backend.
 ///
 /// # Safety
 /// `[base, base+reserved)` is `host`'s live reservation.
@@ -4195,13 +4194,9 @@ unsafe fn window_view(
     reserved: u64,
     ro: &[[u64; 2]],
     shadow: temen_interp::ShadowArena,
-    no_alias: bool,
 ) -> Option<MprotectWindow> {
     install_region_hook(host, base, reserved);
     host.start_window_pages(base as usize, shadow);
-    if no_alias {
-        host.refuse_cap_window_aliases();
-    }
     let mut wm = MprotectWindow::of(host, base, mapped, reserved);
     wm.seed_readonly(ro);
     // §2.2 / #2164 — a demand-paged child's window starts unmapped, as on the interpreters:
@@ -4219,7 +4214,6 @@ unsafe fn window_view(
     _reserved: u64,
     _ro: &[[u64; 2]],
     _shadow: temen_interp::ShadowArena,
-    _no_alias: bool,
 ) -> Option<std::convert::Infallible> {
     None
 }
@@ -4242,9 +4236,7 @@ pub(crate) unsafe fn start_window_view(
     shadow: temen_interp::ShadowArena,
     keep: Arc<dyn std::any::Any + Send + Sync>,
 ) -> Option<(Arc<dyn temen_interp::FutexWindow + Send + Sync>, u64)> {
-    // From its start on, no path maps a region into the window, a pre-map included: the rules key
-    // every word of it on its own backing (the reader's `futex_site`).
-    let wm = window_view(host, base, mapped, reserved, ro, shadow, true)?;
+    let wm = window_view(host, base, mapped, reserved, ro, shadow)?;
     #[cfg(any(unix, windows))]
     {
         let runs = wm.window_runs();
@@ -4685,9 +4677,6 @@ pub struct MprotectWindow {
     /// page too), so the table, not the hardware, gates its accesses there; host code still trusts
     /// this map. `None` for any other window.
     table: Option<Arc<[std::sync::atomic::AtomicU8]>>,
-    /// #2958 slice 3 — the window takes no §13 region alias ([`Host::refuse_cap_window_aliases`]):
-    /// [`GuestMem::map_region`] refuses, so no page of it is ever `Backed`.
-    no_alias: bool,
 }
 
 #[cfg(any(unix, windows))]
@@ -4778,12 +4767,7 @@ impl MprotectWindow {
     /// **private** fresh page map — for a one-off view. Most callers want [`MprotectWindow::new_shared`]
     /// (the `cap_thunk` path) so growth persists across the run's call.cap calls.
     pub fn new(base: *mut u8, mapped: u64, reserved: u64) -> MprotectWindow {
-        Self::new_shared(
-            base,
-            mapped,
-            reserved,
-            Arc::new(Mutex::new(BTreeMap::new())),
-        )
+        Self::new_shared(base, mapped, reserved, CapPageMap::default())
     }
 
     /// Like [`MprotectWindow::new`], but with a **shared** page map (typically the per-run one from
@@ -4804,7 +4788,6 @@ impl MprotectWindow {
             null_guard: 0,
             shadow: temen_interp::ShadowArena::EMPTY,
             table: None,
-            no_alias: false,
         }
     }
 
@@ -4852,8 +4835,6 @@ impl MprotectWindow {
         // #2426: and the runtime-private pages of a durable module's window, as its start recorded
         // them.
         self.set_shadow(host.cap_window_shadow());
-        // #2958 slice 3: and whether it takes a §13 region alias at all.
-        self.no_alias = host.cap_window_refuses_aliases();
     }
 
     /// #2426: install the shadow arena the window's module declared (see the `shadow` field).
@@ -4895,7 +4876,7 @@ impl MprotectWindow {
         change: temen_interp::ClassChange,
     ) -> (u64, u64) {
         use temen_interp::PageClass;
-        let map = self.prot.lock().unwrap_or_else(|e| e.into_inner());
+        let map = self.prot.lock();
         temen_interp::page_runs(
             &map,
             pages,
@@ -4924,7 +4905,7 @@ impl MprotectWindow {
     pub fn seed_readonly(&mut self, ro: &[[u64; 2]]) {
         let guard = self.null_guard / self.page;
         let prefix = self.mapped.div_ceil(self.page);
-        let mut map = self.prot.lock().unwrap_or_else(|e| e.into_inner());
+        let mut map = self.prot.lock();
         for &[start, end] in ro.iter().filter(|r| r[1] > r[0]) {
             for page in (start / self.page).max(guard)..end.div_ceil(self.page).min(prefix) {
                 let st = *map.entry(page).or_insert(PageState::Ro);
@@ -4935,16 +4916,16 @@ impl MprotectWindow {
 
     /// Read one page's explicit state from the shared map (locks; `None` ⇒ absent / region default).
     fn prot_get(&self, page: u64) -> Option<PageState> {
-        self.prot.lock().unwrap().get(&page).copied()
+        self.prot.lock().get(&page).copied()
     }
     /// Set one page's explicit state in the shared map.
     fn prot_set(&self, page: u64, st: PageState) {
-        self.prot.lock().unwrap().insert(page, st);
+        self.prot.lock().insert(page, st);
         self.mirror(page, st.access());
     }
     /// Clear one page back to the region default (absent).
     fn prot_clear(&self, page: u64) {
-        self.prot.lock().unwrap().remove(&page);
+        self.prot.lock().remove(&page);
         // The default is read-write in the declared window, the only pages the table holds.
         self.mirror(page, temen_ir::PAGE_READ | temen_ir::PAGE_WRITE);
     }
@@ -4970,7 +4951,7 @@ impl MprotectWindow {
     /// until now, takes every page's.
     fn demand_page(&self) {
         let pages = self.mapped.div_ceil(self.page).max(1);
-        let mut map = self.prot.lock().unwrap_or_else(|e| e.into_inner());
+        let mut map = self.prot.lock();
         for page in 0..pages {
             let st = if self.shadow.fences(page, page, self.page) {
                 map.get(&page).copied().unwrap_or(PageState::Rw)
@@ -5032,14 +5013,11 @@ impl MprotectWindow {
     }
 
     /// Whether the word of `width` bytes at confined, aligned `base` is on a page a load may read,
-    /// under the map's lock `map`, and not on a §13 alias: a native window keys every word on its own
-    /// backing, so a word on an alias would not rendezvous with the region's other mappings. Aliases
-    /// are refused here, fail-closed, until the phase that brings §13 regions onto the kernel route
-    /// keys them on their region (#2958).
+    /// under the map's lock `map`. A §13 alias is read through its shared mapping, at the address the
+    /// guest uses, and keyed on its region ([`temen_interp::FutexWindow::futex_site`]).
     fn word_readable(&self, map: &BTreeMap<u64, PageState>, base: u64) -> bool {
-        let page = base / self.page;
-        let st = map.get(&page).copied();
-        !matches!(st, Some(PageState::Backed { .. })) && self.access_of(page, st).is_some()
+        self.access_of(base / self.page, map.get(&(base / self.page)).copied())
+            .is_some()
     }
 }
 
@@ -5053,7 +5031,7 @@ impl temen_interp::FutexWindow for MprotectWindow {
         if !base.is_multiple_of(u64::from(width)) {
             return Err(Trap::MemoryFault);
         }
-        let map = self.prot.lock().unwrap_or_else(|e| e.into_inner());
+        let map = self.prot.lock();
         match self.word_readable(&map, base) {
             true => Ok(base),
             false => Err(Trap::MemoryFault),
@@ -5072,7 +5050,7 @@ impl temen_interp::FutexWindow for MprotectWindow {
         }
         // The one bound of the window's futex face (temen-mask's).
         let base = self.confine(base, width).ok()?;
-        let map = self.prot.lock().unwrap_or_else(|e| e.into_inner());
+        let map = self.prot.lock();
         if !self.word_readable(&map, base) {
             return None;
         }
@@ -5093,30 +5071,38 @@ impl temen_interp::FutexWindow for MprotectWindow {
         drop(map);
         Some(word)
     }
-    /// Every word's site is its address: no page of a native window is a §13 alias (`jit_kernel`'s
-    /// `region start` and `native_scope`'s `cap` keep every source of one out), so a key on the
-    /// window's own backing is the word's canonical one. A debug build checks it, so a change that
-    /// lets an alias in fails in tests instead of keying a word apart from the region's waiters.
+    /// A word on a §13 alias parks at its region's byte, so every mapping of that byte rendezvous
+    /// (`Mem::futex_site`'s rule); any other word at its address. A window that never held an alias
+    /// answers with no lock: `aliased` is set before the first `Backed` entry is written and never
+    /// cleared, so a notify that reads it unset while the window's first `map_region` is in flight
+    /// keys the word as it was before the map, a legal order of the guest's race with its own page op.
     fn futex_site(&self, base: u64) -> temen_interp::FutexSite {
-        debug_assert!(
-            !matches!(
-                self.prot
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .get(&(base / self.page)),
-                Some(PageState::Backed { .. })
-            ),
-            "a native window's page is a §13 alias"
-        );
+        if self.prot.aliased() {
+            if let Some(PageState::Backed { region, off, .. }) =
+                self.prot.lock().get(&(base / self.page)).copied()
+            {
+                return temen_interp::FutexSite::Region(region, off + base % self.page);
+            }
+        }
         temen_interp::FutexSite::Anon(base)
     }
-    /// The canonical backing key: the window's reservation (its base, unique while the run holds it)
-    /// and the word's offset, as the interpreter keys a word on its backing and address.
+    /// The canonical key: a private word on the window's reservation (its base, unique while the run
+    /// holds it) and its offset, as the interpreter keys a word on its backing and address; a region
+    /// word on its backing's allocation, the identity every engine's region key uses
+    /// ([`temen_interp::FutexKey::Region`]). Rendezvous is per run on every engine: a run's waiters
+    /// are in its own wait index (executor 2's, the JIT's hub). So today's route, whose JIT waiters key
+    /// a region word on its OS handle in the JIT's hub, never shares a run with kernel tasks, and the
+    /// two keys never need to meet. A region the window never recorded (unreachable: its pages are
+    /// marked only after it is) fails closed, on an identity no backing has.
     fn site_key(&self, site: temen_interp::FutexSite) -> temen_interp::FutexKey {
-        let off = match site {
-            temen_interp::FutexSite::Anon(off) | temen_interp::FutexSite::Region(_, off) => off,
-        };
-        temen_interp::FutexKey::Anon(self.base as u64, off)
+        match site {
+            temen_interp::FutexSite::Anon(off) => {
+                temen_interp::FutexKey::Anon(self.base as u64, off)
+            }
+            temen_interp::FutexSite::Region(region, off) => {
+                temen_interp::FutexKey::Region(self.prot.region_ident(region).unwrap_or(0), off)
+            }
+        }
     }
 }
 
@@ -5188,14 +5174,18 @@ impl MprotectWindow {
 
     /// Mirror a §13 alias in the software page state: each page of `pages` is committed (RW or RO,
     /// for in-call §7 borrow checks) and names the bytes of `region` it aliases, from `region_off`
-    /// on — what a freeze records in place of the page's bytes (#2025).
+    /// on — what a freeze records in place of the page's bytes (#2025). Called once the alias's
+    /// mapping is in, never for a refused one. #2958 slice 4 — `region`'s backing identity, `ident`,
+    /// is recorded first ([`temen_interp::CapPages::record_region`]), so a reader that sees a page
+    /// `Backed` finds the region it keys a futex word on.
     fn mark_backed(
         &self,
         pages: std::ops::RangeInclusive<u64>,
-        region: u32,
+        (region, ident): (u32, u64),
         region_off: u64,
         writable: bool,
     ) {
+        self.prot.record_region(region, ident);
         let first = *pages.start();
         for page in pages {
             let off = region_off + (page - first) * self.page;
@@ -5212,7 +5202,7 @@ impl MprotectWindow {
 
     /// The maximal runs of §13 alias pages in `pages`, as `(first, last)` page indices.
     fn alias_runs(&self, pages: std::ops::RangeInclusive<u64>) -> Vec<(u64, u64)> {
-        let map = self.prot.lock().unwrap_or_else(|e| e.into_inner());
+        let map = self.prot.lock();
         let mut runs: Vec<(u64, u64)> = Vec::new();
         for (&page, _) in map
             .range(pages)
@@ -5229,7 +5219,7 @@ impl MprotectWindow {
     /// #2370 — the runs of `pages` a page op leaving them `prot` can change
     /// ([`temen_interp::changed_runs`]): every engine's page map visits the same pages.
     fn changed_runs(&self, pages: std::ops::RangeInclusive<u64>, prot: i32) -> Vec<(u64, u64)> {
-        let map = self.prot.lock().unwrap_or_else(|e| e.into_inner());
+        let map = self.prot.lock();
         temen_interp::changed_runs(&map, pages, self.mapped.div_ceil(self.page), prot)
     }
 
@@ -5605,7 +5595,7 @@ impl GuestMem for MprotectWindow {
         let Ok(pages) = self.prot_pages(offset, len) else {
             return temen_interp::TailBytes::default();
         };
-        let map = self.prot.lock().unwrap_or_else(|e| e.into_inner());
+        let map = self.prot.lock();
         temen_interp::window_tail_bytes(&map, pages, self.mapped, self.page, held_tail, |p| {
             matches!(p, PageState::Backed { .. })
         })
@@ -5660,7 +5650,7 @@ impl GuestMem for MprotectWindow {
     /// #2358 — from the page map [`MprotectWindow::map_region`] marks, as the paged `Mem` answers
     /// from its own.
     fn maps_region(&self, region: u32) -> bool {
-        let map = self.prot.lock().unwrap_or_else(|e| e.into_inner());
+        let map = self.prot.lock();
         map.values()
             .any(|s| matches!(*s, PageState::Backed { region: r, .. } if r == region))
     }
@@ -5684,12 +5674,8 @@ impl GuestMem for MprotectWindow {
         region: u32,
         backing: RegionBacking,
     ) -> i64 {
-        // #2958 slice 3: a window the kernel route reads keys every word on its own backing, so a
-        // region alias there would fault a wait and mis-key a notify. The one way a `Backed` entry
-        // is written, refused before anything changes ([`Host::refuse_cap_window_aliases`]).
-        if self.no_alias {
-            return EINVAL;
-        }
+        // #2958 slice 4 — the backing's identity, the one every engine keys a region word on.
+        let ident = Arc::as_ptr(&backing) as *const u8 as u64;
         #[cfg(unix)]
         {
             const PROT_READ: i32 = 1;
@@ -5744,7 +5730,7 @@ impl GuestMem for MprotectWindow {
                     _ => EINVAL,
                 };
             }
-            self.mark_backed(pages, region, region_off, writable);
+            self.mark_backed(pages, (region, ident), region_off, writable);
             0
         }
         // §13 windows (issue #1): real shared mappings via **placeholder reservations**. The JIT
@@ -5841,7 +5827,7 @@ impl GuestMem for MprotectWindow {
                         if i > 0 {
                             self.mark_backed(
                                 first..=first + i * per - 1,
-                                region,
+                                (region, ident),
                                 region_off,
                                 writable,
                             );
@@ -5853,7 +5839,7 @@ impl GuestMem for MprotectWindow {
                     }
                 }
             }
-            self.mark_backed(pages, region, region_off, writable);
+            self.mark_backed(pages, (region, ident), region_off, writable);
             0
         }
         #[cfg(not(any(unix, windows)))]
@@ -7949,7 +7935,7 @@ fn jit_run(
     // level meters nothing, and the run's code compiles without fuel checks.
     limits.grant(host);
     // #2958 — a program `jit_kernel::admit` admits runs its vCPUs as executor 2's tasks.
-    if let Ok(admitted) = jit_kernel::admit(m, host, None, code.is_some()) {
+    if let Ok(admitted) = jit_kernel::admit(m, host, code.is_some()) {
         let end = with_deadline(limits.deadline, |kill| {
             let start = jit_kernel::Start {
                 entry: func,
@@ -9412,7 +9398,7 @@ impl Instance {
         let owned = self.window_override(config);
         let m = owned.as_ref().unwrap_or(&self.module);
         let host = self.diff_host(config, m.memory.map_or(0, |mc| 1u64 << mc.size_log2));
-        jit_kernel::admit(m, &host, None, config.jit_code.is_some()).map(|_| ())
+        jit_kernel::admit(m, &host, config.jit_code.is_some()).map(|_| ())
     }
 
     pub fn run_diff(&self, config: &RunConfig) -> Result<Run, String> {

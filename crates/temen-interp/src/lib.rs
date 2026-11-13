@@ -21655,10 +21655,68 @@ fn futex_key_of(w: &dyn FutexWindow, base: u64) -> FutexKey {
     w.site_key(w.futex_site(base))
 }
 
-/// §4/§7 a JIT cap-path window **page map**: host page index → its state (absent ⇒ region default).
-/// Shared + persistent across a run's `call.cap`s (see [`Host::cap_window_pages`]) so a guest-grown
-/// page stays borrowable.
-pub type CapPageMap = Arc<Mutex<BTreeMap<u64, temen_ir::PageState>>>;
+/// §4/§7 a JIT cap-path window **page map** ([`CapPages`]), shared + persistent across a run's
+/// `call.cap`s (see [`Host::cap_window_pages`]) so a guest-grown page stays borrowable.
+pub type CapPageMap = Arc<CapPages>;
+
+/// A JIT window's page map ([`CapPageMap`]): host page index → its state (absent ⇒ region default),
+/// and what a reader keys a futex word on a §13 alias by (#2958 slice 4).
+#[derive(Default)]
+pub struct CapPages {
+    pages: Mutex<BTreeMap<u64, temen_ir::PageState>>,
+    /// The backing identity of each §13 region a page of the window aliases, by the host's region
+    /// id: the backing allocation's address, the identity every engine keys a region word on
+    /// ([`FutexKey::Region`]). Written once an alias is in, before its pages are marked, so a reader
+    /// that sees a `Backed` page finds its region here. An id names one backing for as long as a page
+    /// aliases it (a region is not closed while mapped, #2358).
+    regions: Mutex<BTreeMap<u32, u64>>,
+    /// A page of the window has been a §13 alias: set before the first `Backed` entry is written, and
+    /// never cleared. A futex key reads the map only once it is set, so a window with no alias keys
+    /// every word with no lock (`Mem`'s `has_regions` rule).
+    aliased: std::sync::atomic::AtomicBool,
+}
+
+impl CapPages {
+    /// A map starting with `pages`, aliasing no region.
+    pub fn new(pages: BTreeMap<u64, temen_ir::PageState>) -> CapPages {
+        CapPages {
+            pages: Mutex::new(pages),
+            ..CapPages::default()
+        }
+    }
+
+    /// The page states, under the map's lock: a leaf, held across no system call and no other lock.
+    pub fn lock(&self) -> std::sync::MutexGuard<'_, BTreeMap<u64, temen_ir::PageState>> {
+        self.pages.lock_unpoisoned()
+    }
+
+    /// A copy, for a fork twin's window, which aliases what this one does.
+    pub fn fork(&self) -> CapPages {
+        CapPages {
+            pages: Mutex::new(self.lock().clone()),
+            regions: Mutex::new(self.regions.lock_unpoisoned().clone()),
+            aliased: std::sync::atomic::AtomicBool::new(self.aliased()),
+        }
+    }
+
+    /// Whether a page of the window has ever been a §13 alias ([`CapPages::aliased`]).
+    pub fn aliased(&self) -> bool {
+        self.aliased.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Record that `region`, whose backing's identity is `ident`, is about to be aliased into the
+    /// window: before the alias's pages are marked `Backed`, once its mapping is in.
+    pub fn record_region(&self, region: u32, ident: u64) {
+        self.aliased
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.regions.lock_unpoisoned().insert(region, ident);
+    }
+
+    /// The backing identity of `region`, `None` for one the window never aliased.
+    pub fn region_ident(&self, region: u32) -> Option<u64> {
+        self.regions.lock_unpoisoned().get(&region).copied()
+    }
+}
 
 /// A [`GuestMem`] over a flat, contiguous window slice — the JIT's representation. The
 /// slice may include trailing guard bytes; `size` is the *logical* window so the §7
@@ -26599,9 +26657,6 @@ pub struct Host {
     /// guest's page ops ([`ShadowArena::fences`]), as the interpreters' `Mem` fences its own.
     /// [`ShadowArena::EMPTY`], fencing nothing, for a window no engine started so.
     cap_shadow: ShadowArena,
-    /// #2958 slice 3 — the window takes no §13 region alias: a native tier reads it with every word
-    /// keyed on its own backing ([`Host::refuse_cap_window_aliases`]). Cleared as a window starts.
-    cap_no_alias: bool,
     /// Guest-driven `Jit` unit tables (iface 11), indexed by the id a [`Binding::JitTable`] carries.
     /// Append-only for the life of the `Host` (units are never removed — `release` only revokes
     /// the *handle*; code reclaim is a DESIGN.md §22 follow-up), so unit `Arc`s and native pointers stay
@@ -27371,7 +27426,6 @@ impl Host {
             exec_replace: None,
             cap_pages: None,
             cap_shadow: ShadowArena::EMPTY,
-            cap_no_alias: false,
             jit_tables: Vec::new(),
             jit_validator: None,
             module_validator: None,
@@ -29175,11 +29229,10 @@ impl Host {
                 Arc::clone(m)
             }
             _ => {
-                let m = Arc::new(Mutex::new(BTreeMap::new()));
+                let m = Arc::new(CapPages::default());
                 self.cap_pages = Some((base, Arc::clone(&m)));
-                // The shadow and the alias refusal are the window's, as its page map is.
+                // The shadow is the window's, as its page map is.
                 self.cap_shadow = ShadowArena::EMPTY;
-                self.cap_no_alias = false;
                 m
             }
         }
@@ -29200,19 +29253,6 @@ impl Host {
         self.cap_shadow
     }
 
-    /// #2958 slice 3 — the window [`Host::cap_window_pages`] names takes no §13 region alias from
-    /// here on: the Cranelift JIT's kernel route sets it as the window starts, since its rules key
-    /// every word of the window on the window's own backing. A `map_region` of the window is refused
-    /// (`-EINVAL`), whatever path asks for it. Until the next window starts.
-    pub fn refuse_cap_window_aliases(&mut self) {
-        self.cap_no_alias = true;
-    }
-
-    /// Whether the window takes no §13 region alias ([`Host::refuse_cap_window_aliases`]).
-    pub fn cap_window_refuses_aliases(&self) -> bool {
-        self.cap_no_alias
-    }
-
     /// #2268 — the page map of JIT window `base` as the window starts, before its guest runs: what
     /// [`Host::reset_cap_pages`] staged for it (a thaw's), else a fresh one, never an earlier window's,
     /// whose address this one may reuse. Its first `call.cap` finds it ([`Host::cap_window_pages`]).
@@ -29223,7 +29263,6 @@ impl Host {
         }
         let pages = self.cap_window_pages(base);
         self.cap_shadow = shadow;
-        self.cap_no_alias = false;
         pages
     }
 
@@ -29245,7 +29284,8 @@ impl Host {
                 PageProt::Backed { .. } => None,
             })
             .collect();
-        self.cap_pages = (!pages.is_empty()).then(|| (UNCLAIMED_BASE, Arc::new(Mutex::new(pages))));
+        self.cap_pages =
+            (!pages.is_empty()).then(|| (UNCLAIMED_BASE, Arc::new(CapPages::new(pages))));
         self.realias = map.aliases();
     }
 
@@ -29260,7 +29300,6 @@ impl Host {
         match &self.cap_pages {
             Some((b, m)) if *b == base || *b == UNCLAIMED_BASE => m
                 .lock()
-                .unwrap_or_else(|e| e.into_inner())
                 .range(mapped.div_ceil(page)..)
                 .filter(|(_, s)| matches!(s, ps::Rw | ps::Ro | ps::Unmapped))
                 .map(|(&p, _)| p * page)
@@ -29300,7 +29339,7 @@ impl Host {
         // The window's page map, host-page-indexed.
         if let Some((_, map)) = &self.cap_pages {
             use temen_ir::PageState as ps;
-            let m = map.lock().unwrap_or_else(|e| e.into_inner());
+            let m = map.lock();
             prot.extend(m.iter().map(|(&p, &st)| {
                 let st = match st {
                     ps::Rw => PageProt::Rw,
@@ -32938,11 +32977,6 @@ impl Host {
         true
     }
 
-    /// Whether [`Host::apply_premap`] has anything to map: an op-17 pre-map, or a JIT thaw's §13
-    /// pages (#2025).
-    pub fn has_premap(&self) -> bool {
-        self.premap.is_some() || !self.realias.is_empty()
-    }
     /// Spawn **pre-map apply** (the child side, once): alias the staged region whole, read-write, into
     /// `mem` at the staged offset through [`region_map`](Self::region_map) — the child's own
     /// `SharedRegion.map` path. #2025 — and the §13 aliases a JIT thaw's window is restored with
@@ -34574,13 +34608,10 @@ impl Host {
     ) -> Option<Host> {
         let pages = self.cap_pages.take();
         let twin = self.fork_powerbox(twin_pid, window);
-        let copy = pages
-            .as_ref()
-            .map(|(_, m)| m.lock_unpoisoned().clone())
-            .unwrap_or_default();
+        let copy = pages.as_ref().map(|(_, m)| m.fork()).unwrap_or_default();
         self.cap_pages = pages;
         let mut twin = twin?;
-        twin.cap_pages = Some((twin_base, Arc::new(Mutex::new(copy))));
+        twin.cap_pages = Some((twin_base, Arc::new(copy)));
         twin.cap_shadow = self.cap_shadow;
         Some(twin)
     }
