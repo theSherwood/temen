@@ -785,7 +785,7 @@ fn a_call_starts_no_thread_on_executor_2() {
 /// offer over itself (`keep(me)`, a `cap` the call grants into the parent), and `outer()` then calls
 /// `inner()` through it. `inner()` waits on a word nobody sets; `peek()` answers whether it has
 /// started, and runs only once it has parked, since the calls run one at a time. `join_child()`
-/// joins the child.
+/// joins the child; `kept()` answers whether `keep` has run.
 fn self_caller() -> String {
     let child = SpawnRec {
         grants_ptr: 16640,
@@ -798,8 +798,8 @@ data 16684 "exec"
 {rec}type 0 func () -> (i64)
 type 1 func (cap) -> (i64)
 type 2 func () -> ()
-type 3 interface {{ keep: 1, inner: 0, outer: 0, peek: 0, boom: 2, join_child: 0 }}
-export 0 interface "svc" 3 {{ keep: 1, inner: 2, outer: 3, peek: 4, boom: 5, join_child: 6 }}
+type 3 interface {{ keep: 1, inner: 0, outer: 0, peek: 0, boom: 2, join_child: 0, kept: 0 }}
+export 0 interface "svc" 3 {{ keep: 1, inner: 2, outer: 3, peek: 4, boom: 5, join_child: 6, kept: 7 }}
 
 func (i32, i32, i32) -> (i64) {{
 block 0 (vi: i32, vm: i32, vb: i32) {{
@@ -823,6 +823,9 @@ func (cap) -> (i64) {{
 block 0 (vme: cap) {{
   va = i64.const 16500
   i32.store va vme
+  vk = i64.const 16504
+  vone = i32.const 1
+  i32.store vk vone
   vr = i64.const 1
   return vr
   }}
@@ -874,6 +877,15 @@ block 0 () {{
   vch = i32.load vsc
   vst, vv = call.cap 6 1 (i32) -> (i64, i64) vi (vch)
   return vv
+  }}
+}}
+
+func () -> (i64) {{
+block 0 () {{
+  vk = i64.const 16504
+  vv = i32.load vk
+  vr = i64.extend_i32_s vv
+  return vr
   }}
 }}
 "#,
@@ -971,7 +983,25 @@ fn a_nested_self_call_parked_when_the_guest_ends_its_domain(on: Executor) {
         let m = module(&self_caller());
         let (host, args) = child_host(&m, GIVER_THEN_BOOM);
         let (d, _) = hold(on, m, 0, &args, host);
+        // The child hands the offer over first: else `outer()` would call through handle 0.
+        let mut kept = Reply::Results(vec![0]);
+        for _ in 0..1_000_000 {
+            kept = call(&d, 6, &[]);
+            if kept != Reply::Results(vec![0]) {
+                break;
+            }
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            kept,
+            Reply::Results(vec![1]),
+            "the child kept its offer in the parent"
+        );
         assert_eq!(call(&d, 2, &[]), Reply::Failed(CAP_REVOKED));
+        // Only the intended path ends the domain this way: the child's `boom()`, once `inner()` has
+        // parked (an `outer()` that found no offer would trap `CapFault`).
+        let (_, end) = d.end();
+        assert_eq!(end, Some(Trap::Unreachable));
     });
 }
 
@@ -984,12 +1014,13 @@ on_every_executor!(a_nested_self_call_parked_when_the_guest_ends_its_domain);
 /// futex wait on a word nobody sets) and `kill(inst, child)`, and spawns the child through the
 /// first, granting it `"exec"`, the live offer over the domain. Its ops:
 ///
-/// - `ping()` answers 1; `join()` joins the child and answers its result; `kill()` kills it.
+/// - `ping()` answers 1; `join()` joins the child and answers `status * 1000 + result` (a trap's wire
+///   code as its status, #2066); `kill()` kills it and answers 0.
 /// - `wait()` marks 16600 and waits for good, through the `wait` unit; `peek()` answers the mark.
 /// - `boom()` traps.
 fn unit_spawner() -> String {
     const SPAWN: &str = "memory 17\nfunc (i64, i64) -> (i64) {\nblock 0 (vi: i64, vr: i64) {\n  vi32 = i32.wrap_i64 vi\n  vch = call.cap 6 17 (i64) -> (i32) vi32 (vr)\n  vc64 = i64.extend_i32_u vch\n  return vc64\n  }\n}\n";
-    const JOIN: &str = "memory 17\nfunc (i64, i64) -> (i64) {\nblock 0 (vi: i64, vc: i64) {\n  vi32 = i32.wrap_i64 vi\n  vc32 = i32.wrap_i64 vc\n  vst, vv = call.cap 6 1 (i32) -> (i64, i64) vi32 (vc32)\n  return vv\n  }\n}\n";
+    const JOIN: &str = "memory 17\nfunc (i64, i64) -> (i64) {\nblock 0 (vi: i64, vc: i64) {\n  vi32 = i32.wrap_i64 vi\n  vc32 = i32.wrap_i64 vc\n  vst, vv = call.cap 6 1 (i32) -> (i64, i64) vi32 (vc32)\n  vk = i64.const 1000\n  vs = i64.mul vst vk\n  vr = i64.add vs vv\n  return vr\n  }\n}\n";
     const WAIT: &str = "memory 17\nfunc (i64, i64) -> (i64) {\nblock 0 (va: i64, vb: i64) {\n  vexp = i32.const 0\n  vto = i64.const -1\n  vst = i32.atomic.wait va vexp vto\n  vr = i64.extend_i32_s vst\n  return vr\n  }\n}\n";
     const KILL: &str = "memory 17\nfunc (i64, i64) -> (i64) {\nblock 0 (vi: i64, vc: i64) {\n  vi32 = i32.wrap_i64 vi\n  vc32 = i32.wrap_i64 vc\n  vr = call.cap 6 12 (i32) -> (i32) vi32 (vc32)\n  vr64 = i64.extend_i32_s vr\n  return vr64\n  }\n}\n";
     let units: Vec<Vec<u8>> = [SPAWN, JOIN, WAIT, KILL]
@@ -1200,14 +1231,50 @@ fn a_killed_unit_childs_parked_call_ends_before_its_parent(on: Executor) {
     bounded(move || {
         let d = hold_unit_spawner(on, 2);
         until_the_child_waits(&d);
-        assert!(matches!(call(&d, 3, &[]), Reply::Results(_)), "kill()");
-        assert!(matches!(call(&d, 1, &[]), Reply::Results(_)), "join()");
+        assert_eq!(call(&d, 3, &[]), Reply::Results(vec![0]), "kill()");
+        let killed = temen_ir::trap_code::THREAD_FAULT * 1000;
+        assert_eq!(call(&d, 1, &[]), Reply::Results(vec![killed]), "join()");
         drop(d);
     });
 }
 
+/// #3030 — what the interpreters do today with the same program: an activation's call of a unit
+/// the entry installed ends the domain with `IndirectCallType`, where the JIT answers. Pinned so the
+/// divergence stays visible until #3030 settles it (INVARIANTS #9).
+fn an_activations_call_of_an_installed_unit_traps_on_the_interpreters(on: Executor) {
+    bounded(move || {
+        let d = hold_unit_spawner(on, 0);
+        assert_eq!(call(&d, 1, &[]), Reply::Failed(CAP_REVOKED));
+        let (_, end) = d.end();
+        assert_eq!(end, Some(Trap::IndirectCallType));
+    });
+}
+
+mod unit_children_on_the_interpreters {
+    #[test]
+    fn tree_walker() {
+        super::an_activations_call_of_an_installed_unit_traps_on_the_interpreters(
+            temen_interp::Executor::TreeWalker,
+        );
+    }
+
+    #[test]
+    fn pump() {
+        super::an_activations_call_of_an_installed_unit_traps_on_the_interpreters(
+            temen_interp::Executor::Pump,
+        );
+    }
+
+    #[test]
+    fn threads() {
+        super::an_activations_call_of_an_installed_unit_traps_on_the_interpreters(
+            temen_interp::Executor::Threads,
+        );
+    }
+}
+
 /// On the JIT alone: the interpreters end the domain with `IndirectCallType` when an activation
-/// calls a unit its entry installed (#3030).
+/// calls a unit its entry installed (#3030, pinned above).
 mod unit_children {
     #[test]
     fn a_child_an_installed_unit_spawned_calls_its_held_parent() {
