@@ -1220,9 +1220,10 @@ block 0 () {{
     assert_eq!(today, Ok(vec![1]), "today's route reads the region");
 }
 
-/// Twelve spawned vCPUs, while the root counts to 200,000 and returns 7. `wait`: each loops on a 5 ms
-/// timed `i32.atomic.wait` on one word nothing notifies, so the run ends with timed waiters parked,
-/// whose deadlines pass while their threads are still leaving; otherwise each returns at once.
+/// Twelve spawned vCPUs, each of which checks in (a count at 16392) and then, with `wait`, loops on a
+/// 5 ms timed `i32.atomic.wait` on a word nothing notifies, or else returns. The root returns 7 once
+/// all twelve have checked in, so every vCPU runs, and with `wait` the run ends with timed waiters
+/// parked, whose deadlines pass while their threads are still leaving.
 fn timed_waiters(wait: bool) -> temen_ir::Module {
     let spawns: String = (0..12)
         .map(|i| format!("  vh{i} = thread.spawn 1 vz vz\n"))
@@ -1236,15 +1237,14 @@ fn timed_waiters(wait: bool) -> temen_ir::Module {
 func () -> (i64) {{
 block 0 () {{
   vz = i64.const 0
-{spawns}  vi0 = i64.const 0
-  br 1(vi0)
+{spawns}  br 1()
   }}
-block 1 (vi: i64) {{
-  vone = i64.const 1
-  vn = i64.add vi vone
-  vlim = i64.const 200000
-  vdone = i64.ge_u vn vlim
-  br_if vdone 2() 1(vn)
+block 1 () {{
+  vc = i64.const 16392
+  vn = i32.atomic.load vc
+  vall = i32.const 12
+  vin = i32.eq vn vall
+  br_if vin 2() 1()
   }}
 block 2 () {{
   vr = i64.const 7
@@ -1253,6 +1253,9 @@ block 2 () {{
 }}
 func (i64, i64) -> (i64) {{
 block 0 (va0: i64, vb0: i64) {{
+  vc = i64.const 16392
+  vone = i32.const 1
+  vold = i32.atomic.rmw.add vc vone
   br 1()
   }}
 block 1 () {{
