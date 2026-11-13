@@ -6606,13 +6606,6 @@ impl PowerboxProgram {
                     .into(),
             );
         }
-        if folds_to_oracle(&module) {
-            return Err(
-                "PowerboxProgram: module folds off the JIT (the JIT declines it, or it \
-                        serves); use run_powerbox"
-                    .into(),
-            );
-        }
         let win = module.memory.map_or(0, |mc| 1u64 << mc.size_log2);
         let inst = Instance {
             module: Arc::new(module),
@@ -6626,6 +6619,13 @@ impl PowerboxProgram {
         let mut host = Box::new(Host::new());
         let cc = CapCtx::Raw(&mut *host as *mut Host);
         inst.grant_caps(&mut host, win);
+        if folds_to_oracle(&inst.module, &host) {
+            return Err(
+                "PowerboxProgram: module folds off the JIT (the JIT declines it, it serves, or \
+                        it uses setjmp and can drive the Jit); use run_powerbox"
+                    .into(),
+            );
+        }
         let mut fuel = temen_jit::FuelCell::fixed(0);
         let mut cm = Box::new(
             CompiledModule::compile(
@@ -7074,6 +7074,11 @@ fn module_serves(m: &Module) -> bool {
 /// - or the module statically serves without being serve-qualified or nesting (the oracle's serve
 ///   arm has the fiber-park machinery).
 ///
+/// - or the module uses `setjmp` and can drive the §22 `Jit` over `host` (#2877): the JIT refuses a
+///   unit that would run beside the instance's checkpoint table on another stack, a refusal the
+///   guest would only see mid-run (`Jit.compile`'s `-EINVAL`), where the interpreters admit the
+///   unit; so the run leaves the JIT before it starts and every engine answers alike.
+///
 /// A module that could page a child no longer folds: the JIT pages a child itself (#2164).
 ///
 /// Fold **down the ladder, not straight to the tree-walker** (owner decision 2026-08-13, #891):
@@ -7081,11 +7086,13 @@ fn module_serves(m: &Module) -> bool {
 /// the bytecode engine runs what it admits (bit-exact to the oracle) and transparently falls
 /// back to the tree-walker for the rest, so a legitimate short-circuit (a shape bytecode also
 /// declines) collapses the ladder by construction rather than by caller assumption.
-fn folds_to_oracle(m: &temen_ir::Module) -> bool {
+pub(crate) fn folds_to_oracle(m: &temen_ir::Module, host: &Host) -> bool {
     !temen_jit::admits(m)
         || (module_serves(m)
             && !temen_interp::bytecode::serve_qualifies(&m.funcs)
             && !module_nests(m))
+        || (m.funcs.iter().any(temen_ir::Func::uses_setjmp)
+            && jit_proc::drives_jit(&jit_proc::host_calls(m), host))
 }
 
 /// Fold an interpreter result (`TreeWalk`/`Bytecode`) into an [`Outcome`]: a clean return, an
@@ -9207,12 +9214,12 @@ impl Instance {
         // (the cap thunk's serve loop, #2166). Everything else `folds_to_oracle` catches — op-14
         // offer mints, park-capable servers — leaves the JIT down the ladder: bytecode first, whose
         // compile gate falls the rest through to the tree-walker.
-        let backend = if matches!(backend, Backend::Jit) && folds_to_oracle(m) {
+        let mut host = self.powerbox_host(config, win, extra_caps);
+        let backend = if matches!(backend, Backend::Jit) && folds_to_oracle(m, &host) {
             Backend::Bytecode
         } else {
             backend
         };
-        let mut host = self.powerbox_host(config, win, extra_caps);
         // #2254: the bytecode engine runs every vCPU of a run on one thread. A module it declines
         // runs on the tree-walker's pool and still reports 1, which costs parallelism, not
         // correctness. Before `host_setup`, so an embedder's hook can say otherwise.
@@ -9691,7 +9698,7 @@ fn run_capture_on(
     // §3.6 behavioral parity (reactor path): the same routing as `Instance::run_with_caps` —
     // now by construction (`folds_to_oracle`, one definition). This path once hand-copied the
     // composition and silently dropped a clause of it (#897).
-    let backend = if matches!(backend, Backend::Jit) && folds_to_oracle(m) {
+    let backend = if matches!(backend, Backend::Jit) && folds_to_oracle(m, host) {
         Backend::Bytecode
     } else {
         backend
@@ -10100,7 +10107,10 @@ block 0 (vaddr: i64) {
     fn a_module_that_could_page_a_child_runs_on_the_jit() {
         let m = demand_spawn_module();
         assert!(m.declares_pager(), "the fixture declares a pager export");
-        assert!(!folds_to_oracle(&m), "the JIT pages its children itself");
+        assert!(
+            !folds_to_oracle(&m, &Host::new()),
+            "the JIT pages its children itself"
+        );
     }
 
     /// #744 — a parent that serves its own children: an op-17 spawn and a `svc.wait`, with an export
@@ -10135,7 +10145,10 @@ block 0 (va: i64, vb: i64) {
         let m = temen_text::parse_module(src).expect("parse");
         temen_verify::verify_module(&m).expect("verify");
         assert!(!m.declares_pager(), "an `exec` export is not a pager");
-        assert!(!folds_to_oracle(&m), "and the JIT runs the parent itself");
+        assert!(
+            !folds_to_oracle(&m, &Host::new()),
+            "and the JIT runs the parent itself"
+        );
     }
 
     /// #744 — `svc_parity.rs`'s shape: a parent that calls a serving child through a
@@ -10180,7 +10193,7 @@ block 0 (va: i64, vb: i64) {
 "#;
         let m = temen_text::parse_module(src).expect("parse");
         temen_verify::verify_module(&m).expect("verify");
-        assert!(!folds_to_oracle(&m), "the JIT runs it");
+        assert!(!folds_to_oracle(&m, &Host::new()), "the JIT runs it");
     }
 
     /// #2553 — a module the Cranelift JIT declines folds: the routing asks the JIT's own check
@@ -10209,7 +10222,59 @@ block 0 (va: i64, vb: i64) {
             let m = temen_text::parse_module(&src).expect("parse");
             temen_verify::verify_module(&m).expect("verify");
             assert!(!temen_jit::admits(&m), "self-op {op}: the JIT declines it");
-            assert!(folds_to_oracle(&m), "self-op {op}: so a JIT run folds");
+            assert!(
+                folds_to_oracle(&m, &Host::new()),
+                "self-op {op}: so a JIT run folds"
+            );
+        }
+    }
+
+    /// #2877 — a module whose code takes `setjmp` checkpoints folds when the JIT's one-stack rule
+    /// refuses it: beside fibers or threads, or serving an interface (`temen_jit::admits`, on unix
+    /// where the JIT has `setjmp`; elsewhere it declines `setjmp` outright), or when it can drive
+    /// the §22 `Jit`, whose units the rule would refuse mid-run. Without `setjmp`, none of these
+    /// folds it.
+    #[test]
+    fn a_module_with_setjmp_folds_where_the_one_stack_rule_refuses_it() {
+        let module = |body: &str, head: &str| {
+            let src = format!(
+                "memory 16\n{head}func 0 (i32) -> (i64) {{\nblock 0 (vh: i32) {{\n{body}  \
+                 vr = i64.const 0\n  return vr\n  }}\n}}\nfunc 1 (i64, i64) -> (i64) {{\n\
+                 block 0 (va: i64, vb: i64) {{\n  return va\n  }}\n}}\n"
+            );
+            let m = temen_text::parse_module(&src).unwrap_or_else(|e| panic!("{e:?}\n{src}"));
+            temen_verify::verify_module(&m).unwrap_or_else(|e| panic!("{e:?}\n{src}"));
+            m
+        };
+        let sj = "  vb = i64.const 48000\n  vs = setjmp vb\n";
+        let serves = "type 0 func (i64, i64) -> (i64)\ntype 1 interface { f: 0 }\n\
+                      export 0 interface \"svc\" 1 { f: 1 }\n";
+        let spawns = "  vz = i64.const 0\n  vt = thread.spawn 1 vz vz\n";
+        let jit_call = "  vl = i64.const 0\n  vc = call.cap 11 0 (i64, i64) -> (i64) vh (vl, vl)\n";
+        let mut jit_host = Host::new();
+        let jit_m = module(&format!("{sj}{jit_call}"), "");
+        crate::grant_jit_fibers(&mut jit_host, &jit_m, 0);
+        for (name, m, host, folds) in [
+            ("setjmp alone", module(sj, ""), Host::new(), false),
+            ("setjmp, serving", module(sj, serves), Host::new(), true),
+            (
+                "setjmp, spawning",
+                module(&format!("{sj}{spawns}"), ""),
+                Host::new(),
+                true,
+            ),
+            ("setjmp, driving the Jit", jit_m, jit_host, true),
+            ("serving, no setjmp", module("", serves), Host::new(), false),
+            (
+                "spawning, no setjmp",
+                module(spawns, ""),
+                Host::new(),
+                false,
+            ),
+        ] {
+            // Off unix the JIT has no `setjmp` at all, so every module with one folds.
+            let folds = folds || (!cfg!(unix) && name.starts_with("setjmp"));
+            assert_eq!(folds_to_oracle(&m, &host), folds, "{name}");
         }
     }
 }

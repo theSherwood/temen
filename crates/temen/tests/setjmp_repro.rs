@@ -714,4 +714,32 @@ block 0 () {
         ),
         "the JIT declines it"
     );
+    // A routed run asks the same rule before it starts (`temen_jit::admits`), so `Backend::Jit`
+    // folds to the interpreters and answers what they answer, rather than ending in the compile's
+    // error. (A routed run passes its entry no arguments, so this one takes none.)
+    let nullary = src
+        .replace(
+            "func (i64) -> (i64) {\nblock 0 (v0: i64) {",
+            "func () -> (i64) {\nblock 0 () {",
+        )
+        .replace("  v4 = i64.add v3 v0\n  return v4\n", "  return v3\n");
+    let m = parse_module(&nullary).expect("parse");
+    verify_module(&m).expect("verify");
+    assert!(!temen_jit::admits(&m), "the router sees the refusal");
+    let routed = |backend| {
+        temen_run::instantiate(m.clone())
+            .expect("instantiates")
+            .run(backend, &temen_run::RunConfig::default())
+            .map(|r| r.outcome)
+    };
+    let tree = routed(temen_run::Backend::TreeWalk);
+    assert!(
+        matches!(&tree, Ok(temen_run::Outcome::Returned(v)) if v == &[Value::I64(0)]),
+        "{tree:?}"
+    );
+    assert_eq!(
+        routed(temen_run::Backend::Jit),
+        tree,
+        "a routed JIT run folds"
+    );
 }

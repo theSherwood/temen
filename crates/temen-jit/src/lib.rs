@@ -4076,12 +4076,6 @@ impl CompiledModule {
         // (the `setjmp_rt` cfg); elsewhere `ensure_supported` has already rejected the ops.
         #[cfg(setjmp_rt)]
         let uses_setjmp = module_uses_setjmp(m);
-        // Fail-closed (#2877): the instance's checkpoint table is one stack ordered by the frame
-        // pointers of the one native stack its guarded calls start on, so a module whose code can run
-        // beside it on another stack is declined, and the interpreters cover it
-        // ([`setjmp_rt::admits`], asked again by `define_extra` for every unit).
-        #[cfg(setjmp_rt)]
-        setjmp_rt::admits(uses_setjmp, &m.funcs, !m.impl_exports.is_empty())?;
         #[cfg(setjmp_rt)]
         let setjmp_runtime: Option<Box<setjmp_rt::SetjmpRuntime>> = if uses_setjmp {
             Some(Box::new(setjmp_rt::SetjmpRuntime::new()))
@@ -9179,6 +9173,12 @@ fn supported(m: &IrModule) -> Result<(), JitError> {
             "window too large for the reference JIT",
         ));
     }
+    // #2877 — the instance's checkpoint table is one stack ordered by the frame pointers of the one
+    // native stack its guarded calls start on, so a module whose code can run beside it on another
+    // stack is declined here, where a router asks ([`admits`]) and folds it to the interpreters,
+    // which keep each checkpoint with its frame. `define_extra` asks the same rule of every unit.
+    #[cfg(setjmp_rt)]
+    setjmp_rt::admits(module_uses_setjmp(m), &m.funcs, !m.impl_exports.is_empty())?;
     Ok(())
 }
 

@@ -812,3 +812,42 @@ block 0 (vexit: i32) {
 
 #[cfg(unix)] // the JIT's `setjmp` is unix-only (`setjmp_rt`); elsewhere it declines `setjmp`
 on_every_executor!(a_held_domain_with_setjmp_and_no_interface_takes_no_call);
+
+/// #2877 — a held module that uses `setjmp` and serves an interface. The JIT declines it before it
+/// runs (`temen_jit::admits`: its handlers' guarded calls would not nest on the one checkpoint
+/// table), so `hold` on `Executor::Jit` holds it on the interpreters, which answer its calls as
+/// every other executor does. It used to end in the JIT's compile error as `ThreadFault`.
+fn a_held_module_with_setjmp_that_serves_answers_its_calls(on: Executor) {
+    bounded(move || {
+        let m = module(
+            r#"memory 17
+type 0 func () -> (i64)
+type 1 interface { seven: 0 }
+export 0 interface "svc" 1 { seven: 1 }
+func (i32) -> (i64) {
+block 0 (vexit: i32) {
+  vb = i64.const 40000
+  vs = setjmp vb
+  vr = i64.extend_i32_u vs
+  vone = i64.const 1
+  vt = i64.add vr vone
+  return vt
+  }
+}
+func () -> (i64) {
+block 0 () {
+  v7 = i64.const 7
+  return v7
+  }
+}
+"#,
+        );
+        let (host, exit) = host_for(&m);
+        let started = temen_run::hold(on, m, 0, &[Value::I32(exit)], u64::MAX, host);
+        let (d, results) = started.unwrap_or_else(|(t, _)| panic!("the entry ends in {t:?}"));
+        assert_eq!(results, vec![Value::I64(1)], "start answers the entry");
+        assert_eq!(call(&d, 0, &[]), Reply::Results(vec![7]));
+    });
+}
+
+on_every_executor!(a_held_module_with_setjmp_that_serves_answers_its_calls);

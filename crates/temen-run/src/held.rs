@@ -25,7 +25,8 @@ use crate::{jit_proc, CAP_REVOKED};
 /// this answers the handle and the entry's results; if it ends first, the trap that ended it and the
 /// powerbox. A durable domain cannot be held yet: it is refused with `ThreadFault`. The interpreted
 /// executors hold it through [`HeldDomain::start`], which holds a module the bytecode engine declines
-/// on the tree-walker; `Executor::Jit` holds it on the Cranelift JIT. The JIT declines a module that
+/// on the tree-walker; `Executor::Jit` holds it on the Cranelift JIT, unless a JIT run of it would fold
+/// to the interpreters (`folds_to_oracle`), which then hold it. The JIT declines a module that
 /// can serve its offers in a serve loop (`svc.poll`, `svc.wait`): a thread of it parked in `svc.wait`
 /// takes its calls first, which the JIT's do not reach yet (#2895), so the tree-walker holds it
 /// (INVARIANTS #9).
@@ -37,7 +38,9 @@ pub fn hold(
     fuel: u64,
     host: Host,
 ) -> Result<(HeldDomain, Vec<Value>), (Trap, Box<Host>)> {
-    let jit = on == Executor::Jit && !jit_proc::serves(&jit_proc::host_calls(&m), &host);
+    let jit = on == Executor::Jit
+        && !crate::folds_to_oracle(&m, &host)
+        && !jit_proc::serves(&jit_proc::host_calls(&m), &host);
     if jit {
         hold_jit(m, entry, args, fuel, host)
     } else {
