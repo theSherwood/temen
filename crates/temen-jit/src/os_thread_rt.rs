@@ -157,7 +157,7 @@ pub(crate) struct Done {
 }
 
 impl Done {
-    fn new(result: Option<(i64, i64)>) -> std::sync::Arc<Done> {
+    pub(crate) fn new(result: Option<(i64, i64)>) -> std::sync::Arc<Done> {
         std::sync::Arc::new(Done {
             state: Mutex::new(result),
             cv: Condvar::new(),

@@ -5929,8 +5929,12 @@ impl CompiledModule {
         // start the domain afresh for the next run, as a fresh compile's.
         drop(kill_wake);
         #[cfg(fiber_rt)]
-        if let Some(d) = &(*this).domain {
-            d.end_run();
+        match (&(*this).domain, &(*this)._nursery) {
+            (Some(d), _) => d.end_run(),
+            // #3024 — a nursery with no domain keeps a child table of its own (a module with install
+            // room only): its handles are the run's too. Its children are joined and harvested.
+            (None, Some(n)) => n.end_run(),
+            (None, None) => {}
         }
         // #3020 — and its fibers end with it: their stacks and charges go, and no later run's handle
         // can name one. A debugger may still ask for a parked one's backtrace, taken now.
@@ -14165,5 +14169,63 @@ fn int_cc(op: temen_ir::CmpOp) -> IntCC {
         GtU => IntCC::UnsignedGreaterThan,
         GeS => IntCC::SignedGreaterThanOrEqual,
         GeU => IntCC::UnsignedGreaterThanOrEqual,
+    }
+}
+
+#[cfg(all(test, fiber_rt))]
+mod reused_nursery_tests {
+    use super::*;
+    use crate::os_thread_rt::{lock, ChildEntry};
+
+    /// #3024 — a module with install room and no `Instantiator` of its own gets a nursery with no
+    /// domain, whose child table is its own (a unit it installs spawns through it). A run's handles
+    /// retire with the run, as a fresh compile's table starts empty: one run that leaves every slot
+    /// held does not refuse the next run's first spawn.
+    #[test]
+    fn a_nursery_with_no_domain_starts_each_run_with_an_empty_table() {
+        let m = temen_text::parse_module(
+            "memory 16\nfunc () -> (i64) {\nblock 0 () {\n  v0 = i64.const 7\n  return v0\n  }\n}\n",
+        )
+        .expect("parse");
+        let mut cm = CompiledModule::compile(
+            &m,
+            0,
+            INERT_CAP_THUNK,
+            core::ptr::null_mut(),
+            temen_ir::DEFAULT_RESERVED_LOG2,
+            None,
+            None,
+            None,
+            None,
+            None,
+            4, // install room
+        )
+        .expect("compile");
+        assert!(
+            cm.domain.is_none(),
+            "no domain: the module has no thread, fiber or nest op"
+        );
+        let children = std::sync::Arc::clone(
+            cm._nursery
+                .as_ref()
+                .expect("install room makes a nursery")
+                .children(),
+        );
+        let fresh = lock(&children.table).generations();
+        // A run that left every slot held, as a unit's unjoined children would.
+        {
+            let mut t = lock(&children.table);
+            while t
+                .issue(ChildEntry::Thread(os_thread_rt::Done::new(None)))
+                .is_ok()
+            {}
+        }
+        let (out, _) = cm.run(&[], None, None).expect("run");
+        assert_eq!(out, JitOutcome::Returned(vec![7]));
+        assert_eq!(
+            lock(&children.table).generations(),
+            fresh,
+            "the next run starts on a fresh table"
+        );
     }
 }

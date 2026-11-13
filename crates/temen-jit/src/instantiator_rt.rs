@@ -1012,6 +1012,19 @@ impl Nursery {
         self.child_exec.wake_locked(crate::child_exec::Wake::All);
     }
 
+    /// The child table this nursery files its children in.
+    #[cfg(test)]
+    pub(crate) fn children(&self) -> &ChildTable {
+        &self.children
+    }
+
+    /// #3024 — the run has ended, for a nursery whose child table is its own (no domain shares
+    /// it, so [`crate::os_thread_rt::Domain::end_run`] does not reach it): the run's handles retire
+    /// with it, as a fresh compile's table starts empty.
+    pub(crate) fn end_run(&self) {
+        *lock(&self.children.table) = temen_ir::handles::Table::default();
+    }
+
     /// #3024 — a run starts: its pool, which the last run's teardown shut down, serves it.
     pub(crate) fn open(&self) {
         self.child_exec.open();
