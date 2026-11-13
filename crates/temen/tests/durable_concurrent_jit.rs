@@ -1596,3 +1596,148 @@ fn recycled_context_artifact_canonical_re_freeze_through_the_codec() {
         "canonical re-freeze of a restored recycled-context domain is byte-identical",
     );
 }
+
+// #2953: the root spawns a child, waits until the child has stored its flag (so the child has ended
+// before anything else happens), signals, runs a K-loop and stores its total. It never joins the
+// child, which completes unjoined: its join result rides a freeze as `completed_result`.
+const SRC_UNJOINED_DONE: &str = r#"
+func (i32, i32) -> (i64) {
+block 0 (v0: i32, v1: i32) {
+  v2 = i64.const 7
+  v3 = thread.spawn 1 v2 v2
+  br 1(v1)
+}
+block 1 (vh1: i32) {
+  va = i64.const 65544
+  vf = i64.atomic.load va
+  vone = i64.const 1
+  vlt = i64.lt_u vf vone
+  br_if vlt 1(vh1) 2(vh1)
+}
+block 2 (vh2: i32) {
+  v4 = i32.const 0
+  v5 = call.cap 13 0 (i32) -> (i64) vh2 (v4)
+  v6 = i64.const 0
+  br 3(v6)
+}
+block 3 (v8: i64) {
+  v9 = i64.const 1
+  v10 = i64.add v8 v9
+  v11 = i64.const 100000000
+  v12 = i64.lt_s v10 v11
+  br_if v12 3(v10) 4(v10)
+}
+block 4 (v14: i64) {
+  v17 = i64.const 65536
+  i64.store v17 v14
+  return v14
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (v0: i64, v1: i64) {
+  va = i64.const 65544
+  vone = i64.const 1
+  i64.atomic.store va vone
+  v2 = i64.const 1000
+  v3 = i64.add v1 v2
+  return v3
+  }
+}
+"#;
+
+/// #2953 — one compile, three durable runs: an uninterrupted run, a run that freezes, and the thaw of
+/// that freeze. The freeze's residue is its own run's alone: an uninterrupted run's unjoined
+/// completed child used to stay in the domain, its handle still live, and the next freeze emitted it
+/// beside its own, a phantom child for the thaw to re-attach. The thaw's seed (the table and residue `set_durable` installs before its run,
+/// #2619) survives the reset the earlier run's end did. The freeze is requested from the root's own signal, before its `call.cap` returns,
+/// so it always lands (#1748).
+#[test]
+fn a_reused_compile_runs_then_freezes_then_thaws() {
+    use temen_jit::CompiledModule;
+    let inst = instrument(SRC_UNJOINED_DONE);
+    const ORACLE: i64 = K;
+
+    // The signal freezes the run through whatever controller the run is armed with: none on the
+    // uninterrupted runs.
+    let armed: Arc<Mutex<Option<Arc<FreezeController>>>> = Arc::new(Mutex::new(None));
+    let at_signal = Arc::clone(&armed);
+    let mut host = Host::new();
+    host.set_durable(true);
+    let clk = host.grant_clock();
+    let hf = host.grant_host_proc(HostProcGrant::new(
+        ProcHandler::Sync(Box::new(move |_op, _args, out, _mem, _| {
+            if let Some(fc) = &*at_signal.lock().unwrap() {
+                fc.request_freeze();
+            }
+            put_results(out, &[0])
+        })),
+        temen_interp::CapState::Stateless,
+    ));
+    let host = Mutex::new(host);
+    let cc = CapCtx::Locked(&host);
+    let mut cm = match CompiledModule::compile(
+        &inst,
+        0,
+        cc.thunk(),
+        cc.ptr(),
+        SIZE_LOG2,
+        None,
+        None,
+        None,
+        None,
+        None,
+        0,
+    ) {
+        Ok(cm) => cm,
+        Err(JitError::Unsupported(_)) => return,
+        Err(e) => panic!("compile: {e:?}"),
+    };
+    let args = [clk as i64, hf as i64];
+    let fresh = DurableResidue {
+        root_sp: Some(TEST_ARENA.frame_base(0)),
+        ..Default::default()
+    };
+
+    // Run 1: uninterrupted. Its child completes on its own OS thread, unjoined.
+    cm.set_freeze_controller(None);
+    cm.set_durable(fresh);
+    let (out, win) = cm
+        .run(&args, Some(&init_durable_window(WINDOW, TEST_ARENA)), Some(WINDOW))
+        .expect("run 1");
+    assert!(matches!(out, JitOutcome::Returned(_)), "run 1: {out:?}");
+    assert_eq!(le_i64(&win, OFF_ROOT), ORACLE, "run 1's result");
+    assert!(cm.take_durable_residue().vcpus.is_empty(), "run 1 froze nothing");
+
+    // Run 2: frozen at the root's signal; durable still, as run 1's `set_durable` left the module,
+    // with nothing to seed.
+    let fc = FreezeController::new();
+    *armed.lock().unwrap() = Some(Arc::clone(&fc));
+    cm.set_freeze_controller(Some(fc));
+    let (_, snap) = cm
+        .run(&args, Some(&init_durable_window(WINDOW, TEST_ARENA)), Some(WINDOW))
+        .expect("run 2");
+    *armed.lock().unwrap() = None;
+    assert_eq!(read_state(&snap, TEST_ARENA), STATE_UNWINDING, "run 2 froze");
+    let residue = cm.take_durable_residue();
+    assert_eq!(
+        residue.vcpus.len(),
+        1,
+        "run 2's residue holds its own child alone: {:?}",
+        residue.vcpus
+    );
+    assert_eq!(
+        residue.vcpus[0].completed_result,
+        Some(1007),
+        "its child completed before the freeze"
+    );
+
+    // Run 3: the thaw, on the same compile.
+    let mut twin = snap;
+    begin_thaw(&mut twin, TEST_ARENA, 0);
+    cm.set_freeze_controller(None);
+    cm.set_durable(residue);
+    let (out, fin) = cm.run(&args, Some(&twin), Some(WINDOW)).expect("thaw");
+    assert!(matches!(out, JitOutcome::Returned(_)), "thaw: {out:?}");
+    assert_eq!(read_state(&fin, TEST_ARENA), STATE_NORMAL, "thaw back to NORMAL");
+    assert_eq!(le_i64(&fin, OFF_ROOT), ORACLE, "the thaw reproduces the result");
+}
