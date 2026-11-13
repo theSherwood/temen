@@ -89,3 +89,57 @@ fn a_jit_session_meters_the_default_fuel_across_prompts_and_compaction() {
         "the recompacted code charges the same cell"
     );
 }
+
+/// `func 0 (mode, h)`: mode 0 makes a fiber, resumes it once (it suspends) and answers its handle;
+/// mode 1 resumes `h`, making nothing, and answers what the resume did.
+const LEAVES_A_FIBER: &str = "\
+memory 16
+func (i64, i64) -> (i64) {
+block 0 (vm: i64, vh: i64) {
+  vz = i64.const 0
+  vis0 = i64.eq vm vz
+  br_if vis0 1() 2(vh)
+}
+block 1 () {
+  v0 = ref.func 1
+  v1 = i64.const 4096
+  v2 = cont.new v0 v1
+  v3 = i64.const 10
+  v4, v5 = cont.resume v2 v3
+  return v2
+}
+block 2 (vh2: i64) {
+  v7 = i64.const 7
+  v8, v9 = cont.resume vh2 v7
+  return v9
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (a: i64, b: i64) {
+  x = suspend b
+  c = i64.const 100
+  r = i64.add x c
+  return r
+  }
+}
+";
+
+/// #3020 — a [`JitSession`]'s prompts are runs of one compile: a prompt cannot resume a fiber an
+/// earlier prompt left suspended. It traps `FiberFault`, as a fresh session's would.
+#[test]
+fn a_jit_session_prompt_cannot_resume_an_earlier_prompts_fiber() {
+    let base = load(LEAVES_A_FIBER);
+    let mut host = Host::new();
+    let jit = grant_jit(&mut host, &base, 0);
+    let domain = host.resolve_jit_domain(jit).expect("domain");
+    let mut session =
+        JitSession::new(&base, 0, DEFAULT_RESERVED_LOG2, 0, domain, 0, host).expect("session");
+    let JitOutcome::Returned(v) = session.run_prompt(&[0, 0]).expect("prompt 1") else {
+        panic!("prompt 1 returns its fiber's handle")
+    };
+    let out = session.run_prompt(&[1, v[0]]).expect("prompt 2");
+    assert!(
+        matches!(out, JitOutcome::Trapped(temen_jit::TrapKind::FiberFault)),
+        "prompt 2 resumed prompt 1's fiber: {out:?}"
+    );
+}
