@@ -877,7 +877,7 @@ pub(crate) struct Domain {
     /// code's ([`Self::fresh`]), which spawns nothing.
     node: Option<std::sync::Arc<dyn crate::BudgetNode>>,
     /// #2488 — the contexts this run's ended vCPUs left, for the next spawn to reuse
-    /// ([`Self::take_vcpu_ctx`]). Emptied when a run starts ([`Self::set_env`]): each points at its
+    /// ([`Self::take_vcpu_ctx`]). Emptied when the run ends ([`Self::end_run`]): each points at its
     /// run's end. Boxed, since code holds each context's address while the list grows.
     #[allow(clippy::vec_box)]
     vcpu_ctxs: Mutex<Vec<Box<VcpuCtx>>>,
@@ -1338,7 +1338,6 @@ impl Domain {
         durable: bool,
         shadow: temen_ir::durable_abi::ShadowArena,
     ) {
-        lock(&self.vcpu_ctxs).clear();
         *lock(&self.env) = Some(Env {
             mem_base,
             fn_table_base,
@@ -1352,6 +1351,79 @@ impl Domain {
             shadow,
         });
         *lock(&self.fiber_table) = fiber_table;
+    }
+
+    /// #2953 — end a run of the domain's instance: everything the run left starts fresh for the next
+    /// one, so a reused `CompiledModule`'s run answers as a fresh compile's first run does. The run's
+    /// handles retire with it: an unjoined vCPU's or §14 child's ended with the domain
+    /// ([`Self::begin_teardown`]), as the oracle discards a finished run's vCPUs.
+    ///
+    /// Called once the run's vCPUs are joined ([`Self::join_all`]), its §14 children harvested, its
+    /// freeze residue taken and its kill and freeze wakes retired, so no guest code of the run can
+    /// reach the domain. Through `&self`: a host may still reach [`Self::park`] (a wake by
+    /// [`crate::CompiledModule::park_hub`]'s address, an [`outside_waker`]), so nothing it reads is
+    /// written. At the run's end, not the next one's start: a thaw seeds the table before its run
+    /// ([`crate::CompiledModule::set_durable`], #2619).
+    ///
+    /// One destructure names every field: each is per-run, and reset below, or configuration the
+    /// instance keeps (`_`). A field added to the domain does not compile until it is one or the
+    /// other.
+    pub(crate) fn end_run(&self) {
+        let Domain {
+            env,
+            fiber_table,
+            threads,
+            pending_spawns,
+            frozen_vcpus,
+            completed_children,
+            frozen_fibers,
+            children,
+            cur_task,
+            next_task,
+            trap_capture,
+            quiesce,
+            parked,
+            killing,
+            lanes,
+            vcpu_ctxs,
+            // Configuration, kept: the futex table and wakers hosts reach between runs (every
+            // waiter left at teardown), the child executor and lane chain its compile or embedder
+            // installed, and what the domain is (its hub, its budget node).
+            park: _,
+            quiesce_cv: _,
+            child_exec: _,
+            lane_cv: _,
+            wakers: _,
+            lane_chain: _,
+            hub: _,
+            node: _,
+        } = self;
+        debug_assert_eq!(self.hub, 0, "only a run's own domain ends a run");
+        *lock(env) = None;
+        *lock(fiber_table) = None;
+        {
+            let mut t = lock(threads);
+            debug_assert!(t.live == 1 && t.joins.is_empty(), "a vCPU outlived its run");
+            *t = Threads {
+                live: 1,
+                joins: Vec::new(),
+            };
+        }
+        lock(pending_spawns).clear();
+        lock(frozen_vcpus).clear();
+        lock(completed_children).clear();
+        lock(frozen_fibers).clear();
+        // The table's nursery link is the instance's; its handles are the run's.
+        *lock(&children.table) = temen_ir::handles::Table::default();
+        *lock(cur_task) = 0;
+        *lock(next_task) = 1;
+        *lock(trap_capture) = None;
+        *lock(quiesce) = 0;
+        debug_assert_eq!(parked.load(Ordering::Acquire), 0, "a park outlived its run");
+        parked.store(0, Ordering::Release);
+        killing.store(0, Ordering::Release);
+        lock(lanes).clear();
+        lock(vcpu_ctxs).clear();
     }
 
     /// The domain-shared fiber table (for a spawned vCPU to build its `FiberRuntime` over).
