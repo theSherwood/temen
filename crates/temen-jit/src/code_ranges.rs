@@ -38,7 +38,6 @@ use std::sync::{Mutex, MutexGuard};
 /// How many JIT modules may be live at once. Each holds an [`ARENA`] reservation, so this is a
 /// terabyte of code VA: the OS's own limits (Linux's map count, Windows's commit charge for each
 /// arena) bind long before it.
-#[cfg(not(loom))]
 const SLOTS: usize = 4096;
 
 /// The size of each module's code arena.
@@ -141,16 +140,19 @@ impl<const N: usize> Table<N> {
     }
 }
 
-#[cfg(not(loom))]
 pub(crate) use live::*;
 
-#[cfg(not(loom))]
 mod live {
     use super::{Table, ARENA, SLOTS};
     use cranelift_jit::{ArenaMemoryProvider, JITBuilder, JITModule};
     use cranelift_module::{DataDescription, Module};
 
+    #[cfg(not(loom))]
     static TABLE: Table<SLOTS> = Table::new();
+    // A `--cfg loom` build runs only the loom models, which build tables of their own; this one is
+    // never touched there (loom's atomics exist only inside a model).
+    #[cfg(loom)]
+    static TABLE: std::sync::LazyLock<Table<SLOTS>> = std::sync::LazyLock::new(Table::new);
 
     /// Whether `pc` is in JIT-emitted code. For the fault handlers (`trap_shim.c`, the Windows VEH):
     /// loads only, no lock, no allocation, no panic.
