@@ -780,3 +780,160 @@ fn a_call_starts_no_thread_on_executor_2() {
         );
     });
 }
+
+/// #3000 — a held domain whose own activation calls the domain: its child hands the parent the live
+/// offer over itself (`keep(me)`, a `cap` the call grants into the parent), and `outer()` then calls
+/// `inner()` through it. `inner()` waits on a word nobody sets; `peek()` answers whether it has
+/// started, and runs only once it has parked, since the calls run one at a time. `join_child()`
+/// joins the child.
+fn self_caller() -> String {
+    let child = SpawnRec {
+        grants_ptr: 16640,
+        grants_n: 1,
+        ..SpawnRec::default()
+    };
+    format!(
+        r#"memory 17
+data 16684 "exec"
+{rec}type 0 func () -> (i64)
+type 1 func (cap) -> (i64)
+type 2 func () -> ()
+type 3 interface {{ keep: 1, inner: 0, outer: 0, peek: 0, boom: 2, join_child: 0 }}
+export 0 interface "svc" 3 {{ keep: 1, inner: 2, outer: 3, peek: 4, boom: 5, join_child: 6 }}
+
+func (i32, i32, i32) -> (i64) {{
+block 0 (vi: i32, vm: i32, vb: i32) {{
+  vsi = i64.const 16444
+  i32.store vsi vi
+  vma = i64.const {module_at}
+  i32.store vma vm
+  vba = i64.const {budget_at}
+  i32.store vba vb
+  vgh = i32.const {tag}
+{grant}  vrp = i64.const 17408
+  vch = call.cap 6 17 (i64) -> (i32) vi (vrp)
+  vsc = i64.const 16440
+  i32.store vsc vch
+  vr = i64.const 1
+  return vr
+  }}
+}}
+
+func (cap) -> (i64) {{
+block 0 (vme: cap) {{
+  va = i64.const 16500
+  i32.store va vme
+  vr = i64.const 1
+  return vr
+  }}
+}}
+
+func () -> (i64) {{
+block 0 () {{
+  vs = i64.const 16600
+  vone = i32.const 1
+  i32.store vs vone
+  vc = i64.const 16424
+  vexp = i32.const 0
+  vto = i64.const -1
+  vst = i32.atomic.wait vc vexp vto
+  vr = i64.const 5
+  return vr
+  }}
+}}
+
+func () -> (i64) {{
+block 0 () {{
+  va = i64.const 16500
+  vme = i32.load va
+  vr = call.cap 268435456 1 () -> (i64) vme ()
+  return vr
+  }}
+}}
+
+func () -> (i64) {{
+block 0 () {{
+  vs = i64.const 16600
+  vv = i32.load vs
+  vr = i64.extend_i32_s vv
+  return vr
+  }}
+}}
+
+func () -> () {{
+block 0 () {{
+  unreachable
+  }}
+}}
+
+func () -> (i64) {{
+block 0 () {{
+  vsi = i64.const 16444
+  vi = i32.load vsi
+  vsc = i64.const 16440
+  vch = i32.load vsc
+  vst, vv = call.cap 6 1 (i32) -> (i64, i64) vi (vch)
+  return vv
+  }}
+}}
+"#,
+        rec = rec::segment(17408, &child),
+        grant = rec::grant("ge", 16640, 16684, 4, "vgh"),
+        module_at = 17408 + SpawnRec::MODULE_AT,
+        budget_at = 17408 + SpawnRec::BUDGET_AT,
+        tag = GRANT_SERVE_LIVE_TAG as i32,
+    )
+}
+
+/// The child [`self_caller`] spawns: it resolves `"exec"` and hands it to its parent, `keep(exec)`.
+const GIVER: &str = r#"memory 15
+data 16384 "exec"
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vnp = i64.const 16384
+  vl = i64.const 4
+  vexec = self.resolve vnp vl
+  vr = call.cap 268435456 0 (cap) -> (i64) vexec (vexec)
+  return vr
+  }
+}
+"#;
+
+/// #3000 — an activation's own call into its domain that parks, when the domain then ends: the
+/// embedder's `outer()` calls `inner()` through the offer over the domain itself, `inner()` parks
+/// for good, and the domain is finished. Both calls answer the end, and the run ends.
+fn a_nested_self_call_parked_at_the_end(on: Executor) {
+    bounded(move || {
+        let m = module(&self_caller());
+        let (host, args) = child_host(&m, GIVER);
+        let (d, _) = hold(on, m, 0, &args, host);
+        let d = Arc::new(d);
+        assert_eq!(call(&d, 5, &[]), Reply::Results(vec![1]), "the child gave");
+        let outer = std::thread::spawn({
+            let d = Arc::clone(&d);
+            move || call(&d, 2, &[])
+        });
+        let mut seen = Reply::Results(vec![0]);
+        for _ in 0..100_000 {
+            seen = call(&d, 3, &[]);
+            if seen == Reply::Results(vec![1]) {
+                break;
+            }
+            std::thread::yield_now();
+        }
+        assert_eq!(seen, Reply::Results(vec![1]), "inner() started and parked");
+        assert_eq!(
+            call(&d, 4, &[]),
+            Reply::Failed(CAP_REVOKED),
+            "boom() ends it"
+        );
+        let outer = outer.join().expect("the outer call");
+        assert_eq!(
+            outer,
+            Reply::Failed(CAP_REVOKED),
+            "the outer call answers the end"
+        );
+    });
+}
+
+on_every_executor!(a_nested_self_call_parked_at_the_end);
