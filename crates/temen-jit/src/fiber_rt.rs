@@ -794,7 +794,7 @@ impl SharedFiberTable {
 
     /// #2878 — whether the next slot a thaw seeds owns a context inside the arena, as `create`
     /// requires of a durable fiber ([`ShadowContexts::fiber_fits`]): the snapshot that names how many
-    /// fibers to seed is untrusted (DURABILITY.md §5), and each resume raw-stores into the context.
+    /// fibers to seed is untrusted (DURABILITY.md §4), and each resume raw-stores into the context.
     fn seed_fits(&self) -> bool {
         let t = self.lock();
         t.contexts.fiber_fits(self.shadow, t.slots.len())
@@ -1833,7 +1833,7 @@ pub(crate) unsafe fn seed_frozen_fibers(
     let mut seed = seed.to_vec();
     seed.sort_by_key(|f| f.slot);
     for (expected, f) in seed.iter().enumerate() {
-        // #2878 — the residue is untrusted (DURABILITY.md §5): a slot whose context would lie past
+        // #2878 — the residue is untrusted (DURABILITY.md §4): a slot whose context would lie past
         // the arena is not seeded, as `cont.new` refuses one, and the rewound `cont.resume` that
         // names it fails closed. The oracle's thaw stops at the same slot.
         if !r.table.seed_fits() {

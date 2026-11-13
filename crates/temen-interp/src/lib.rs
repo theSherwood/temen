@@ -2966,7 +2966,7 @@ fn seed_domain(s: &mut Sched, sched: &Arc<Scheduler>, mut root: Box<VCpu>, resid
         let mut seed: Vec<FrozenFiber> = thaw_fibers;
         seed.sort_by_key(|f| f.slot);
         for (expected, ff) in seed.into_iter().enumerate() {
-            // #2878 — the residue is untrusted (DURABILITY.md §5): a slot whose context would lie
+            // #2878 — the residue is untrusted (DURABILITY.md §4): a slot whose context would lie
             // past the arena is not seeded, as `cont.new` refuses one ([`ShadowContexts::fiber_fits`]),
             // and the rewound `cont.resume` that names it fails closed.
             if !root.domain.registry.seed_fits(arena) {
@@ -3167,7 +3167,7 @@ fn seed_thread(
         }
     };
     let cid = claim_task(s, ff.task);
-    // #2878 — the residue is untrusted (DURABILITY.md §5): a thread whose join slot, context or entry
+    // #2878 — the residue is untrusted (DURABILITY.md §4): a thread whose join slot, context or entry
     // no spawn could have made ends `ThreadFault` without running, as one the pools refuse does. The
     // entry is a function of the spawn signature; the context one a vCPU may hold.
     let slot_ok = !ff.joinable || ff.slot < temen_ir::handles::SLOTS;

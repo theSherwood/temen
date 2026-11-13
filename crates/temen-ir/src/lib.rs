@@ -750,7 +750,7 @@ pub mod durable_abi {
         /// #2878 — the context a thawed vCPU's restored shadow-SP `sp` lies in, when it is one a vCPU
         /// may hold ([`Self::pool`]): the checked inverse of [`ShadowArena::region_base`]. `None`
         /// below the arena, past the pool, or for an arena with no regions. A thaw residue is
-        /// untrusted (DURABILITY.md §5), and the context names the region a runtime writes.
+        /// untrusted (DURABILITY.md §4), and the context names the region a runtime writes.
         pub fn vcpu_of_sp(arena: ShadowArena, sp: u64) -> Option<usize> {
             let off = sp.checked_sub(arena.base)?;
             let ctx = usize::try_from(off.checked_div(arena.stride)?).ok()?;

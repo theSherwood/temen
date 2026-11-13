@@ -842,7 +842,7 @@ fn jit_durable_fiber_past_the_arena_faults_like_the_oracle() {
     assert_eq!(created(&jsnap), 10, "the JIT ran the same ten fibers");
 }
 
-/// #2878 — a thaw residue is untrusted (DURABILITY.md §5), so a seed is bounded by the arena as
+/// #2878 — a thaw residue is untrusted (DURABILITY.md §4), so a seed is bounded by the arena as
 /// `cont.new` is: an interp-frozen one-fiber artifact whose residue is padded to eleven fibers, one
 /// more than `TEST_ARENA`'s ten fiber contexts hold. Both engines seed the ten that fit and stop at
 /// the eleventh (slot 10, context 11), whose resume would write past the arena; the root's rewind

@@ -2720,7 +2720,7 @@ impl Domain {
     ///
     /// `entry` resolves a vCPU's recorded `func` to the code its `thread.spawn` would run
     /// ([`crate::CompiledModule::thawed_spawn_entry`]). Every value the residue holds is untrusted
-    /// (DURABILITY.md §5, #2878): a running vCPU whose context, entry or join slot is not one a spawn
+    /// (DURABILITY.md §4, #2878): a running vCPU whose context, entry or join slot is not one a spawn
     /// could have made ends `ThreadFault` without running, as one the pools refuse does.
     pub(crate) unsafe fn thaw_reattach_and_run(
         &self,

@@ -1356,7 +1356,7 @@ fn the_embedder_jit_path_refuses_residue_it_cannot_recreate_and_keeps_it() {
     assert_eq!(h.child_generations(), &[1], "its child table too");
 }
 
-/// #2878 — a thaw residue is untrusted (DURABILITY.md §5), and a re-attached vCPU's context names the
+/// #2878 — a thaw residue is untrusted (DURABILITY.md §4), and a re-attached vCPU's context names the
 /// region the runtime writes its shadow-SP and thaw words into, its entry the code it runs, and its
 /// slot the join-table entry it fills. An interpreter freeze of [`SRC`] is thawed with one field of
 /// its frozen child replaced by a value no spawn could have made. Each engine ends the child
