@@ -18528,9 +18528,15 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     let cdomain = Arc::clone(domain);
                     // The domain's one fuel budget (INVARIANTS #6): an activation draws its caller's, but
                     // a thread it spawns is its domain's (#2695).
-                    let child_fuel = answers
+                    let mut child_fuel = answers
                         .as_ref()
                         .map_or_else(|| fuel.for_thread(), |a| a.home.for_thread());
+                    // Fuel unification (#2977): a stack's first entry costs one, a thread's as the
+                    // root's (`drive_over_cell`) and as the JIT's child prologue charges it. Paid on
+                    // the child's fuel as the spawn completes, so a freeze after the spawn has paid it
+                    // and a thaw, which re-creates the thread through `seed_thread`, pays nothing.
+                    // Out of fuel ends the run, as a thread's own `OutOfFuel` does.
+                    child_fuel.burn()?;
                     let parent_id = *id; // the spawning vCPU's task — the child's `parent_task`
                     let csched = sched.clone();
                     // A debugged run shares one breakpoint/watchpoint set across all threads
