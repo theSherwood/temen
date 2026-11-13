@@ -491,6 +491,7 @@ block 0 (va: i64, vb: i64) {
             entry: 0,
             args: &[],
             init_mem: &[],
+            init: None,
             reserved_log2: temen_ir::DEFAULT_RESERVED_LOG2,
             fuel: u64::MAX,
             snapshot_cap: None,
