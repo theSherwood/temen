@@ -1944,7 +1944,7 @@ pub fn compile_and_run_capture_reserved_with_host_prots(
         None, // no budget node
         0,    // one-shot path: natural table size
     )?;
-    cm.restore = (!init_prots.is_empty()).then(|| WindowRestore {
+    cm.seed.restore = (!init_prots.is_empty()).then(|| WindowRestore {
         prots: init_prots.to_vec(),
         tail: Vec::new(),
     });
@@ -2465,7 +2465,7 @@ pub fn compile_and_run_durable(
             None, // node
             0,
         )?;
-        cm.restore = (!run.init_prots.is_empty()).then(|| WindowRestore {
+        cm.seed.restore = (!run.init_prots.is_empty()).then(|| WindowRestore {
             prots: run.init_prots,
             tail: Vec::new(),
         });
@@ -3292,6 +3292,26 @@ impl Drop for RunFibers {
     }
 }
 
+/// #3024 — what the embedder hands the next run of a module to resume from, which that run takes
+/// whole as it starts ([`CompiledModule::run_code_raw`]): a run that ends before it runs anything (a
+/// window the OS refuses) drops it with itself, and no later run finds an earlier thaw's.
+#[derive(Default)]
+struct RunSeed {
+    /// The thaw's window ([`CompiledModule::set_restore`]); `None` builds a fresh instance's.
+    restore: Option<WindowRestore>,
+    /// Durable thaw (slice 3.3.3): frozen fibers re-created in the run's table before the root
+    /// re-enters under `REWINDING`.
+    fibers: Vec<FrozenFiber>,
+    /// Durable thaw (slice 3.3): spawned vCPUs re-attached and run before the root re-enters.
+    vcpus: Vec<FrozenVCpu>,
+    /// Durable thaw: the root's restored shadow-SP extent; the empty one when `None`.
+    root_sp: Option<u64>,
+    /// #2043 — the domain's child table as its freeze left it (#2619); `None` leaves it fresh.
+    children: Option<Vec<u32>>,
+    /// #1361 step 4 — the captured detached children a thaw re-launches before the root re-enters.
+    detached: Vec<DetachedSeed>,
+}
+
 pub struct CompiledModule {
     /// The padded function table `call.dyn` dispatches through. Its address is threaded as
     /// a runtime argument (not baked), but running code reads it — its slots never move, and it is
@@ -3394,9 +3414,8 @@ pub struct CompiledModule {
     /// Initialized data segments, owned so a run can seed a fresh window (the module may
     /// outlive the borrowed `IrModule`).
     data: Vec<Data>,
-    /// The thaw's window the next run restores ([`WindowRestore`], the durable-restore step,
-    /// DURABILITY.md §12.3); `None` (the common path) builds a fresh instance's window.
-    restore: Option<WindowRestore>,
+    /// #3024 — the next run's seed: a thaw's window and residue, taken whole as the run starts.
+    seed: RunSeed,
     /// #2427 — the pages a durable run's capture read past its declared window, by byte offset
     /// ([`Self::take_tail_out`]).
     tail_out: Vec<(u64, Vec<u8>)>,
@@ -3407,9 +3426,6 @@ pub struct CompiledModule {
     /// The module-declared shadow arena (INVARIANTS.md #16) — [`ShadowArena::EMPTY`] for a module
     /// that declared none, which a durable run refuses at entry rather than placing by default.
     shadow: temen_ir::durable_abi::ShadowArena,
-    /// Durable **thaw** seed (slice 3.3.3): frozen fibers to re-create in the table before a
-    /// `REWINDING` run, so a thaw `cont.resume` re-enters them. Empty for a freeze / ordinary run.
-    frozen_seed: Vec<FrozenFiber>,
     /// Durable **freeze** residue (slice 3.3.3): the fibers the freeze driver flattened this run,
     /// read back by the durable entry point. Empty unless a freeze flattened fibers.
     frozen_out: Vec<FrozenFiber>,
@@ -3426,17 +3442,9 @@ pub struct CompiledModule {
     /// #2043 — the domain's child-handle table's counters at the freeze (see
     /// [`DurableResidue::children`]). Empty on a non-freeze run.
     frozen_children_out: Vec<u32>,
-    /// Durable **thaw** seed (slice 3.3): the spawned vCPUs to re-attach + run before the root re-enters
-    /// under `REWINDING`. Empty for a freeze / ordinary run.
-    frozen_vcpu_seed: Vec<FrozenVCpu>,
     /// #1361 step 4 — the durable **detached** children a freeze reached, after teardown (see
     /// [`DetachedHarvest`]); taken by the embedder. Empty unless a freeze caught one.
     detached_out: Vec<DetachedHarvest>,
-    /// #1361 step 4 — the captured detached children a **thaw** re-launches before the root re-enters.
-    detached_seed: Vec<DetachedSeed>,
-    /// Durable **thaw** input (slice 3.3): the root vCPU's restored shadow-SP extent (from the
-    /// artifact), set as the active word before the root rewinds. The empty root extent (`ShadowArena::frame_base(0)`) otherwise.
-    thaw_root_sp: u64,
     /// Async freeze controller (Phase-4 Slice A, 4A.3): if set, the run publishes its live window base
     /// here before the guarded call and retires it after, so a controller thread's `request_freeze`
     /// can write `UNWINDING` into the running window. `None` for every non-interruptible run.
@@ -4651,19 +4659,15 @@ impl CompiledModule {
             null_guard: temen_ir::module_null_guard(),
             mem_size_log2: m.memory.map(|mc| mc.size_log2),
             data: m.data.clone(),
-            restore: None,
+            seed: RunSeed::default(),
             tail_out: Vec::new(),
             durable: false,
             shadow,
-            frozen_seed: Vec::new(),
             frozen_out: Vec::new(),
             frozen_vcpus_out: Vec::new(),
             frozen_root_sp_out: 0,
             frozen_children_out: Vec::new(),
-            frozen_vcpu_seed: Vec::new(),
             detached_out: Vec::new(),
-            detached_seed: Vec::new(),
-            thaw_root_sp: shadow.frame_base(0), // §12.8 4A.5: empty root extent
             freeze_ctl: None,
             held_tail: None,
             window_ready: None,
@@ -4939,19 +4943,15 @@ impl CompiledModule {
             null_guard: self.null_guard,
             mem_size_log2: self.mem_size_log2,
             data: self.data.clone(),
-            restore: None,
+            seed: RunSeed::default(),
             tail_out: Vec::new(),
             durable: false,
             shadow: self.shadow,
-            frozen_seed: Vec::new(),
             frozen_out: Vec::new(),
             frozen_vcpus_out: Vec::new(),
             frozen_root_sp_out: 0,
             frozen_children_out: Vec::new(),
-            frozen_vcpu_seed: Vec::new(),
             detached_out: Vec::new(),
-            detached_seed: Vec::new(),
-            thaw_root_sp: self.shadow.frame_base(0),
             freeze_ctl: None,
             held_tail: None,
             window_ready: None,
@@ -5021,19 +5021,13 @@ impl CompiledModule {
     /// `seed` is the thaw seed: the residue to re-create before a `REWINDING` run (empty for a freeze
     /// or an ordinary durable run). The freeze residue comes back via [`Self::take_durable_residue`].
     pub fn set_durable(&mut self, seed: DurableResidue) {
-        self.frozen_seed = seed.fibers;
-        self.frozen_vcpu_seed = seed.vcpus;
-        if let Some(sp) = seed.root_sp {
-            self.thaw_root_sp = sp;
-        }
-        // #2043 — the domain's child table as its freeze left it, before the thaw pins its records
-        // back: a spent handle stays spent, and the next spawn takes the handle the uninterrupted
-        // run would have (#2619).
-        #[cfg(fiber_rt)]
-        if let Some(d) = &self.domain {
-            *os_thread_rt::lock(&d.children().table) =
-                temen_ir::handles::Table::from_generations(&seed.children);
-        }
+        self.seed.fibers = seed.fibers;
+        self.seed.vcpus = seed.vcpus;
+        self.seed.root_sp = seed.root_sp;
+        // #2043 — the domain's child table as its freeze left it, which the run installs before the
+        // thaw pins its records back: a spent handle stays spent, and the next spawn takes the handle
+        // the uninterrupted run would have (#2619).
+        self.seed.children = Some(seed.children);
         self.durable = true;
     }
 
@@ -5058,7 +5052,7 @@ impl CompiledModule {
     /// #1361 step 4 — the detached children the next (thaw) run re-creates, each at its recorded join
     /// slot, before the root re-enters under `REWINDING`.
     pub fn set_detached_seed(&mut self, seed: Vec<DetachedSeed>) {
-        self.detached_seed = seed;
+        self.seed.detached = seed;
     }
 
     /// Run an **incrementally defined** function (a trampoline pointer returned by
@@ -5230,7 +5224,7 @@ impl CompiledModule {
     /// `None` (the default) builds a fresh instance's window, `init_mem` its low bytes and its data
     /// segments laid over them.
     pub fn set_restore(&mut self, restore: Option<WindowRestore>) {
-        self.restore = restore;
+        self.seed.restore = restore;
     }
 
     pub fn handler_tramp(&self, func: u32) -> Option<(*const u8, usize, usize)> {
@@ -5326,6 +5320,15 @@ impl CompiledModule {
     /// protection (#2305, #2286): a window missing one would let the guest write or read where the
     /// interpreter traps.
     fn seed_window(&self, init_mem: Option<&[u8]>) -> Option<(mem::GuestWindow, Vec<[u64; 2]>)> {
+        self.seed_window_restoring(init_mem, self.seed.restore.as_ref())
+    }
+
+    /// [`Self::seed_window`] restoring `restore`, a run's own seed (#3024).
+    fn seed_window_restoring(
+        &self,
+        init_mem: Option<&[u8]>,
+        restore: Option<&WindowRestore>,
+    ) -> Option<(mem::GuestWindow, Vec<[u64; 2]>)> {
         let mut window = mem::GuestWindow::try_new(self.win_mapped, self.win_reserved)?;
         // Escape-oracle: seed the window's low bytes so a divergent read/store is observable.
         if let Some(init) = init_mem {
@@ -5338,7 +5341,7 @@ impl CompiledModule {
         // guest write to const data faults into the guard, §4/§5). The verifier already bounds every
         // segment to `[0, size)`. Done while fully RW.
         let mut ro: Vec<[u64; 2]> = Vec::new();
-        if let (None, Some(size_log2)) = (&self.restore, self.mem_size_log2) {
+        if let (None, Some(size_log2)) = (restore, self.mem_size_log2) {
             let size = 1u64 << size_log2;
             let rw = window.rw_mut();
             for d in &self.data {
@@ -5371,7 +5374,7 @@ impl CompiledModule {
         // live data at or above the guard, so nothing legitimate is covered. A window smaller than
         // the guard skips, matching the interpreter's fit check. The snapshot paths re-assert RW
         // (`restore_rw`/`read_low`) before any host read.
-        let restored = self.restore.as_ref().is_none_or(|r| {
+        let restored = restore.is_none_or(|r| {
             window.apply_prots(
                 &r.prots,
                 self.win_mapped as u64,
@@ -5423,6 +5426,9 @@ impl CompiledModule {
         {
             (*this).parked_backtraces = (0, Vec::new());
         }
+        // #3024 — the run takes its seed whole, before anything can end it: a run that ends before it
+        // runs anything drops the seed with itself, and no later run finds it.
+        let seed = std::mem::take(&mut (*this).seed);
         if args.len() < n_params {
             return Err(JitError::Malformed);
         }
@@ -5461,7 +5467,8 @@ impl CompiledModule {
             // no room for the reservation, or a commit or protection the window's seeding needs
             // refused. Nothing ran, so a snapshot is the window it was handed, unchanged (a session
             // keeps its state).
-            let Some((window, ro)) = t.seed_window(init_mem) else {
+            let Some((window, ro)) = t.seed_window_restoring(init_mem, seed.restore.as_ref())
+            else {
                 t.last_trap_backtrace = Vec::new();
                 t.last_trap_fiber = None;
                 let image = snapshot_cap
@@ -5510,6 +5517,13 @@ impl CompiledModule {
         // §12: the root vCPU (`main`) runs on this thread under the §5 detect-and-kill guard; any spawned
         // vCPUs run on their own OS threads via the instance's `Domain`. Seed its per-run `Env` now
         // that the window / fn-table / trap-cell / call-trampoline are all known.
+        // #2043 — a thaw's child table as its freeze left it (#2619), before anything of the run
+        // issues a handle; past every early return, so a run that never started installs nothing.
+        #[cfg(fiber_rt)]
+        if let (Some(gens), Some(d)) = (&seed.children, &(*this).domain) {
+            *os_thread_rt::lock(&d.children().table) =
+                temen_ir::handles::Table::from_generations(gens);
+        }
         // #3020 — and its fiber table and root runtime, which end with it.
         #[cfg(fiber_rt)]
         let mut run_fibers = (*this).begin_fibers();
@@ -5564,21 +5578,20 @@ impl CompiledModule {
             // Durable **thaw** (slice 3.3.3): re-create the frozen fibers in the run-shared table
             // before the root re-enters under REWINDING, so a thaw `cont.resume` resolves + re-enters
             // them. Done before `set_current` (and the run), while the window/table/trap cell are set.
-            let seed = std::mem::take(&mut t.frozen_seed);
             if let Some(f) = run_fibers.as_mut() {
                 if let Some(rt) = f.root.as_mut() {
                     rt.set_root_entry_sp(entry_sp);
                     // Arm the durable fiber-switch swap for the root vCPU (DURABILITY.md §12.8): the
                     // window base is known now. (Spawned vCPUs are multi-vCPU durability, Phase 3.2.)
                     rt.set_durable_env(mem_base as u64, durable);
-                    if durable && !seed.is_empty() {
+                    if durable && !seed.fibers.is_empty() {
                         // A thaw re-seed that the OS refuses (I1) writes a `FiberFault` to the trap cell
                         // and returns false; the post-run trap read below reports it. We still publish
                         // the runtime and fall through — the guest re-entry simply won't resolve the
                         // missing fibers — rather than abort the host.
                         seed_faulted = !fiber_rt::seed_frozen_fibers(
                             &mut **rt as *mut fiber_rt::FiberRuntime,
-                            &seed,
+                            &seed.fibers,
                             mem_base as u64,
                             fn_table_ptr as u64,
                             &vm as *const VmCtx as u64, // the fibers are this instance's
@@ -5601,11 +5614,10 @@ impl CompiledModule {
         // so the root's re-executed `thread.join` resolves; the root's active shadow-SP is then set to
         // its restored extent. Done after the fiber seed (the table is live) and `set_env`.
         #[cfg(fiber_rt)]
-        if (*this).durable && !(*this).frozen_vcpu_seed.is_empty() {
-            let seed = std::mem::take(&mut (*this).frozen_vcpu_seed);
-            let root_sp = (*this).thaw_root_sp;
+        if (*this).durable && !seed.vcpus.is_empty() {
+            let root_sp = seed.root_sp.unwrap_or((*this).shadow.frame_base(0));
             if let Some(d) = &(*this).domain {
-                d.thaw_reattach_and_run(&seed, root_sp);
+                d.thaw_reattach_and_run(&seed.vcpus, root_sp);
             }
         }
 
@@ -5614,10 +5626,9 @@ impl CompiledModule {
         // completed one (#2041) as its outcome. The root's rewound `join` then parks on, or reloads,
         // each exactly as before the cut.
         #[cfg(fiber_rt)]
-        if (*this).durable && !(*this).detached_seed.is_empty() {
-            let seed = std::mem::take(&mut (*this).detached_seed);
+        if (*this).durable && !seed.detached.is_empty() {
             if let Some(n) = &(*this)._nursery {
-                for d in seed {
+                for d in seed.detached {
                     n.relaunch_detached(d);
                 }
             }
@@ -8931,18 +8942,14 @@ fn compile_child_windowed(
         null_guard: temen_ir::module_null_guard(),
         mem_size_log2: Some(mapped_log2),
         data: Vec::new(), // a child's data segments are materialized into its window by the spawner
-        restore: None,
+        seed: RunSeed::default(),
         tail_out: Vec::new(),
         durable: false,
-        frozen_seed: Vec::new(),
         frozen_out: Vec::new(),
         frozen_vcpus_out: Vec::new(),
         frozen_root_sp_out: 0,
         frozen_children_out: Vec::new(),
-        frozen_vcpu_seed: Vec::new(),
         detached_out: Vec::new(),
-        detached_seed: Vec::new(),
-        thaw_root_sp: shadow.frame_base(0),
         shadow,
         freeze_ctl: None,
         held_tail: None,
