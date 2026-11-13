@@ -10684,6 +10684,49 @@ mod stalled_tests {
 }
 
 #[cfg(test)]
+mod over_tests {
+    use super::*;
+
+    /// A settle once the run is over advances no task. Built as the end leaves it: the root parked
+    /// on a futex wait whose deadline has passed, then its thread saw the end and left with its VM,
+    /// its wait still filed. The settle a later timed wake makes timed it out into the empty slot
+    /// before this, and the write into a VM with no registers panicked inside the JIT's thunk,
+    /// which aborts the process.
+    #[test]
+    fn a_settle_once_the_run_is_over_advances_no_task() {
+        use super::super::{FutexKey, FutexSite};
+        let m = temen_text::parse_module(
+            "memory 16\nfunc () -> (i64) {\nblock 0 () {\n  vz = i64.const 0\n  return vz\n  }\n}\n",
+        )
+        .expect("parse");
+        let co = CoopRun::new_parallel(&m, 0, &[], u64::MAX, Host::new(), &[], 16, None, false)
+            .expect("in executor 2's subset")
+            .expect("opens");
+        let CoopExec::Threads(threads) = &co.exec else {
+            panic!("executor 2's run");
+        };
+        let run = threads.run.as_ref().expect("open");
+        let mut g = run.state.lock_unpoisoned();
+        g.core.tasks[0].state = TaskState::BlockedWait {
+            addr: 0,
+            site: FutexSite::Anon(0),
+            deadline: Some(0),
+            dst: 0,
+        };
+        g.core.tasks.park_wait(0, FutexKey::Anon(1, 0));
+        let _left = std::mem::take(&mut *g.core.tasks[0].vm);
+        g.over = Some(Ok(Vec::new()));
+        run.settle(&mut g);
+        assert!(
+            matches!(g.core.tasks[0].state, TaskState::BlockedWait { .. }),
+            "no rule advanced the task"
+        );
+        run.wake(&mut g);
+        drop(g);
+    }
+}
+
+#[cfg(test)]
 mod tasks_tests {
     use super::*;
 
@@ -19785,8 +19828,17 @@ impl ThreadRun {
     /// lock, or by a thread left awake to look: a futex stop that moved only futex task state skips
     /// it ([`Applied::Futex`]), and the park that would leave no thread awake settles first
     /// ([`Self::park`]). So the run cannot go idle unseen.
+    ///
+    /// #3027 — once the run is over its verdict is in, and no rule advances a task again: a thread that saw
+    /// the end has left with its task's VM (a native task's result cell with it), so a task this
+    /// settle timed out, woke or answered would be written where nothing holds it. Each leaver sees
+    /// the end under this lock ([`Self::await_runnable`]), the lock every settle runs under, so no
+    /// settle after the end runs beside one that has not seen it.
     fn settle(&self, g: &mut Threads) {
         debug_assert_eq!(g.awake, g.awake_by_parks(), "the awake count is the parks'");
+        if g.over.is_some() {
+            return;
+        }
         // #2982 — read before anything here looks, so a ring after this is the next stop's to see.
         g.seen = Some(self.rings());
         let core = &mut g.core;
@@ -19819,9 +19871,6 @@ impl ThreadRun {
             &mut core.released,
         );
         interrupt_parks(&mut core.tasks, &core.domains);
-        if g.over.is_some() {
-            return;
-        }
         if self.door.as_ref().is_some_and(|d| d.stopped()) {
             self.end(g, Err(Trap::OutOfFuel));
             return;
