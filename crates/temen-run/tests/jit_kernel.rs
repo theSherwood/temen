@@ -860,17 +860,20 @@ fn instance_run(
 /// each instanced as an embedder instances it ([`instance_run`]) under the same limits, so a reading
 /// of the run's own budget (its fuel included) compares across them; each JIT route asserts its
 /// route and must end within [`PROMPT`]. `oracle` false leaves the oracle out, for a program whose
-/// threads only overlap where they run at once (the oracle's cooperative scheduler runs one).
+/// threads only overlap where they run at once (the oracle's cooperative scheduler runs one). `fuel`
+/// is the run's fuel grant ([`METERED`] for a row that reads it; `None` for one whose end must not
+/// race a budget).
 fn by_instance(
     make: fn(i32) -> temen_ir::Module,
     grant: fn(&mut Host) -> i32,
     oracle: bool,
+    fuel: Option<u64>,
 ) -> Vec<(&'static str, Answer)> {
     use temen_run::Backend;
-    let cfg = |keep: bool| temen_run::RunConfig {
+    let cfg = move |keep: bool| temen_run::RunConfig {
         jit_code: keep.then(temen_run::JitCodeCache::default),
         limits: temen_run::Limits {
-            fuel: Some(50_000_000),
+            fuel,
             mem: Some(CEILING_MEM),
             maps: Some(CEILING_MAPS),
             ..temen_run::Limits::default()
@@ -899,14 +902,18 @@ fn by_instance(
     lanes
 }
 
+/// The fuel a row that reads the run's budget is granted ([`by_instance`]).
+const METERED: Option<u64> = Some(50_000_000);
+
 /// Every lane of [`by_instance`] answers `want`.
 fn all_answer(
     make: fn(i32) -> temen_ir::Module,
     grant: fn(&mut Host) -> i32,
     oracle: bool,
+    fuel: Option<u64>,
     want: Answer,
 ) {
-    for (route, answer) in by_instance(make, grant, oracle) {
+    for (route, answer) in by_instance(make, grant, oracle, fuel) {
         assert_eq!(answer, want, "{route}");
     }
 }
@@ -1236,10 +1243,9 @@ const ALIAS_A: u64 = 1 << 20;
 /// [`ALIAS_A`] and at the next granule (`B`). A spawned vCPU sets a ready word, notifies it, and
 /// waits at the first word of alias A for a `0` there, with no timeout. The root waits for the ready
 /// word, then notifies the same word through alias B until a notify reports the one waiter woken,
-/// at most `1 << 20` times, and returns `100 +` the joined waiter's answer (`0`, woken) `+` both
-/// maps' answers; `-1` if no notify ever woke it (the words were keyed apart). The overlap is by
-/// construction: the root notifies until it wakes the waiter, and the waiter's one wait cannot end
-/// otherwise.
+/// and returns `100 +` the joined waiter's answer (`0`, woken) `+` both maps' answers. The overlap
+/// is by construction: the root notifies until it wakes the waiter, and the waiter's one wait cannot
+/// end otherwise. Words keyed apart never wake it: the harness's bound ([`PROMPT`]) fails the row.
 fn aliased(handle: i32) -> temen_ir::Module {
     let g = temen_interp::host_region_granularity();
     let b = ALIAS_A + g;
@@ -1268,20 +1274,9 @@ block 1 (vh1: i32, vms1: i64, vi: i64) {{
   vbw = i64.const {b}
   vone = i32.const 1
   vn = atomic.notify vbw vone
-  vinc = i64.const 1
-  vj = i64.add vi vinc
-  vlim = i64.const 1048576
-  vout = i64.ge_u vj vlim
-  br_if vn 4(vh1, vms1) 2(vh1, vms1, vj, vout)
+  br_if vn 2(vh1, vms1) 1(vh1, vms1, vi)
 }}
-block 2 (vh4: i32, vms4: i64, vj4: i64, vout4: i32) {{
-  br_if vout4 3() 1(vh4, vms4, vj4)
-}}
-block 3 () {{
-  vneg = i64.const -1
-  return vneg
-}}
-block 4 (vh3: i32, vms3: i64) {{
+block 2 (vh3: i32, vms3: i64) {{
   vst, vv = thread.join vh3
   vbase = i64.const 100
   vsum = i64.add vbase vv
@@ -1413,6 +1408,7 @@ fn a_stream_write_answers_as_the_oracle_on_both_routes() {
         make,
         |h| h.grant_stream(temen_interp::StreamRole::Out),
         true,
+        METERED,
         Ok(vec![5]),
     );
 }
@@ -1429,7 +1425,7 @@ fn a_clock_read_answers_as_the_oracle_on_both_routes() {
   vr = i64.sub vt1 vt0"
         ))
     }
-    all_answer(make, Host::grant_clock, true, Ok(vec![1]));
+    all_answer(make, Host::grant_clock, true, METERED, Ok(vec![1]));
 }
 
 /// #2958 slice 4, condition 5 — a `Budget` node under the run's own: its room of fuel, `mem` and
@@ -1457,7 +1453,7 @@ fn a_budget_read_and_split_answer_as_the_oracle_on_both_routes() {
   vr = i64.add vr1 vsm"
         ))
     }
-    let lanes = by_instance(make, |h| h.grant_budget(-1, -1, -1), true);
+    let lanes = by_instance(make, |h| h.grant_budget(-1, -1, -1), true, METERED);
     let want = lanes[0].1.clone();
     assert!(want.as_ref().is_ok_and(|v| v[0] > 0), "{want:?}");
     for (route, answer) in lanes {
@@ -1486,7 +1482,7 @@ fn the_address_space_mints_answer_as_the_oracle_on_both_routes() {
         h.set_region_factory(temen_run::new_shared_region);
         h.grant_memory()
     }
-    let lanes = by_instance(make, grant, true);
+    let lanes = by_instance(make, grant, true, METERED);
     let want = lanes[0].1.clone();
     assert!(
         want.as_ref().is_ok_and(|v| v[0] > 0),
@@ -1516,7 +1512,7 @@ fn self_reflection_answers_as_the_oracle_on_both_routes() {
   vr = i64.add vt1 vp1"
         ))
     }
-    let lanes = by_instance(make, Host::grant_clock, true);
+    let lanes = by_instance(make, Host::grant_clock, true, METERED);
     let want = lanes[0].1.clone();
     assert!(want.is_ok(), "{want:?}");
     for (route, answer) in lanes {
@@ -1563,18 +1559,21 @@ fn an_exit_beside_a_parked_sibling_ends_the_run_on_every_route() {
         |h| exits_beside("wait", h),
         Host::grant_exit,
         true,
+        METERED,
         Err("Exit(7)".into()),
     );
 }
 
 #[test]
 fn an_exit_beside_a_spinning_sibling_ends_the_run_on_every_route() {
-    // On the JIT routes the sibling spins on a thread of its own; the oracle, which runs one task at
-    // a time, gives the answer they must match.
+    // On the JIT routes the sibling spins on a thread of its own until the exit ends it; the oracle,
+    // which runs one task at a time, gives the answer they must match.
     all_answer(
         |h| exits_beside("spin", h),
         Host::grant_exit,
         true,
+        // Unmetered: the sibling spins until the root's exit ends it, with no budget to run out of.
+        None,
         Err("Exit(7)".into()),
     );
 }
@@ -1604,7 +1603,7 @@ block 0 (va0: i64, vb0: i64) {{
 "
         ))
     }
-    all_answer(make, Host::grant_exit, true, Err("Exit(7)".into()));
+    all_answer(make, Host::grant_exit, true, METERED, Err("Exit(7)".into()));
 }
 
 /// #2958 slice 4, condition 6 — `Exit` from the root while a sibling is inside a host call: an
@@ -1616,6 +1615,8 @@ block 0 (va0: i64, vb0: i64) {{
 /// (Not on the oracle, which runs one task at a time: its call would wait for a root that cannot run.)
 #[test]
 fn an_exit_beside_a_sibling_inside_a_host_call_ends_the_run_on_both_routes() {
+    static HOST_CALL_LEFT: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
     fn make(h: i32) -> temen_ir::Module {
         module(&format!(
             "memory 16
@@ -1666,11 +1667,11 @@ block 0 (va0: i64, vb0: i64) {{
                 let mem = mem.ok_or(Trap::Malformed)?;
                 mem.write_bytes(16384, &1u32.to_le_bytes())
                     .ok_or(Trap::MemoryFault)?;
-                // The root marks its exit next; a bound keeps a wrong program from hanging the test.
-                for _ in 0..1u64 << 32 {
-                    if mem.read_bytes(16388, 4).is_some_and(|b| b != [0; 4]) {
-                        break;
-                    }
+                // The root marks its exit next. A run that never does is a failing row: the test's
+                // end lets the call go ([`HOST_CALL_LEFT`]).
+                while !mem.read_bytes(16388, 4).is_some_and(|b| b != [0; 4])
+                    && !HOST_CALL_LEFT.load(std::sync::atomic::Ordering::Relaxed)
+                {
                     std::hint::spin_loop();
                 }
                 put_results(out, &[0])
@@ -1678,7 +1679,15 @@ block 0 (va0: i64, vb0: i64) {{
             CapState::Stateless,
         ))
     }
-    all_answer(make, grant, false, Err("Exit(7)".into()));
+    // However the row ends, the procedure it leaves spinning stops.
+    struct Left;
+    impl Drop for Left {
+        fn drop(&mut self) {
+            HOST_CALL_LEFT.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    let _left = Left;
+    all_answer(make, grant, false, METERED, Err("Exit(7)".into()));
 }
 
 /// #2958 slice 4 — the calls the kernel route declines, inline, each with the clause that names what
@@ -1723,6 +1732,8 @@ fn each_declined_call_names_its_clause() {
         (call(0, 0), blocking_stdin(), "stream parks"),
         (call(0, 0), pipe(), "stream parks"),
         (call(0, 1), pipe(), "stream parks"),
+        // A close of a pipe end wakes the other end's parks.
+        (call(0, 2), pipe(), "stream parks"),
         (call(0, 3), Host::new(), "stream parks"),
         // An op no interface has: `Clock` has only op 0.
         (call(2, 1), Host::new(), "cap"),
@@ -1750,4 +1761,251 @@ fn each_declined_call_names_its_clause() {
     assert!(wrong.is_empty(), "{wrong:#?}");
     // And what it admits beside them: a stream read with a non-blocking stdin and no pipe.
     assert!(jit_kernel::admit(&call(0, 0), &Host::new(), false).is_ok());
+}
+
+/// #2958 slice 4 — a threaded root over the mmap-capable fs (`fs::host_fs_mmap`, handle `fs`): open a
+/// file, size it to a page, mint its region and map it at 1 MiB, truncate the file to nothing, then
+/// wait not-equal on a word of the alias. The page under the alias has lost its backing: the read
+/// faults, a guest `MemoryFault`, never a fault in host code.
+#[cfg(unix)]
+fn truncated(fs: i32) -> temen_ir::Module {
+    let page = temen_interp::host_page_size();
+    rooted(&format!(
+        "  vp = i64.const 16384
+  vch = i32.const 102
+  i32.store8 vp vch
+  vfs = i32.const {fs}
+  vl1 = i64.const 1
+  vfl = i64.const 19
+  vfd = call.cap 13 0 (i64, i64, i64) -> (i64) vfs(vp, vl1, vfl)
+  vpg = i64.const {page}
+  vt1 = call.cap 13 7 (i64, i64) -> (i64) vfs(vfd, vpg)
+  vz = i64.const 0
+  vrg = call.cap 13 13 (i64, i64, i64) -> (i64) vfs(vfd, vz, vpg)
+  vrh = i32.wrap_i64 vrg
+  vat = i64.const 1048576
+  vrw = i64.const 3
+  vm = call.cap 4 0 (i64, i64, i64, i64) -> (i64) vrh(vat, vz, vpg, vrw)
+  vt0 = call.cap 13 7 (i64, i64) -> (i64) vfs(vfd, vz)
+  vx = i32.const 1
+  vto = i64.const 0
+  vw = i32.atomic.wait vat vx vto
+  vr = i64.extend_i32_u vw"
+    ))
+}
+
+/// The mmap-capable fs over a directory of this test's own.
+#[cfg(unix)]
+fn grant_mmap_fs(h: &mut Host) -> i32 {
+    let dir = std::env::temp_dir().join(format!("temen_jit_kernel_mmap_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("a directory");
+    temen_run::fs::host_fs_mmap(dir).install(h, 1 << 16)
+}
+
+/// #2958 slice 4 review, finding 1 — the guarded read of a §13 alias is the recoverable load: a
+/// wait on an alias whose file was truncated is `MemoryFault` on the kernel route, as on today's,
+/// where it faulted in host code under the page-map lock. (The oracle reads the backing in host
+/// code and dies of SIGBUS: #3028, so it is left out.)
+#[cfg(unix)]
+#[test]
+fn a_wait_on_an_alias_of_a_truncated_file_faults_as_today() {
+    all_answer(
+        truncated,
+        grant_mmap_fs,
+        false,
+        METERED,
+        Err("MemoryFault".into()),
+    );
+}
+
+/// #2958 slice 4 review, finding 3 — a grouped import reaches every op its remap names, and the
+/// kernel route decides each: a `{ write, read }` interface over a `Stream` is declined when its
+/// `read` would park on a blocking stdin, though its first op, `write`, would not.
+#[test]
+fn a_grouped_import_is_decided_on_every_op_it_reaches() {
+    let m = module(
+        "memory 16
+type 0 func (i64, i64) -> (i64)
+type 1 interface { write: 0, read: 0 }
+import 0 interface \"stdio\" 1
+func 0 () -> (i64) {
+block 0 () {
+  vq = i64.const 16400
+  vone = i32.const 1
+  vk = atomic.notify vq vone
+  v0 = i64.const 16384
+  v1 = i64.const 4
+  v2 = call.import 0.read (v0, v1)
+  return v2
+  }
+}
+",
+    );
+    let bound = |block: bool| {
+        let mut host = Host::new();
+        let h = host.grant_stream(temen_interp::StreamRole::In);
+        host.stdin_block = block;
+        host.set_import_bindings(vec![temen_interp::BoundImport::required(
+            temen_ir::cap_id::STREAM,
+            1,
+            h,
+        )]);
+        host.set_import_remap(0, std::sync::Arc::from(vec![1u32, 0]));
+        host
+    };
+    assert_eq!(
+        jit_kernel::admit(&m, &bound(true), false).err(),
+        Some("stream parks")
+    );
+    assert!(jit_kernel::admit(&m, &bound(false), false).is_ok());
+}
+
+/// #2958 slice 4 review — the race on an aliased page, as slice 3's race on a private one is built:
+/// a spawned vCPU waits not-equal on the first word of an alias at 1 MiB in a loop; the root, which
+/// waits for its start word, then unmaps the alias and maps the region there again (`remap`, or maps
+/// it over the live alias, replacing it) until the run ends. A wait that meets the page unmapped
+/// faults, which ends the run `MemoryFault`; the host never faults. Not on the oracle, whose root
+/// would run its loop alone.
+fn alias_race(handle: i32, remap: bool) -> temen_ir::Module {
+    let g = temen_interp::host_region_granularity();
+    let unmap = match remap {
+        true => "vu = call.cap 4 1 (i64, i64) -> (i64) vc(va, vl)",
+        false => "vu = i64.const 0",
+    };
+    module(&format!(
+        "memory 16
+func () -> (i64) {{
+block 0 () {{
+  vc = i32.const {handle}
+  va = i64.const {ALIAS_A}
+  vro = i64.const 0
+  vl = i64.const {g}
+  vp = i64.const 3
+  vm = call.cap 4 0 (i64, i64, i64, i64) -> (i64) vc(va, vro, vl, vp)
+  vz = i64.const 0
+  vh = thread.spawn 1 vz vz
+  br 1()
+}}
+block 1 () {{
+  vsw = i64.const 49152
+  vs = i32.atomic.load vsw
+  vgo = i32.eqz vs
+  br_if vgo 1() 2()
+}}
+block 2 () {{
+  vc = i32.const {handle}
+  va = i64.const {ALIAS_A}
+  vro = i64.const 0
+  vl = i64.const {g}
+  vp = i64.const 3
+  {unmap}
+  vm = call.cap 4 0 (i64, i64, i64, i64) -> (i64) vc(va, vro, vl, vp)
+  br 2()
+  }}
+}}
+func (i64, i64) -> (i64) {{
+block 0 (vn: i64, vz: i64) {{
+  vsw = i64.const 49152
+  vs1 = i32.const 1
+  i32.atomic.store vsw vs1
+  br 1()
+}}
+block 1 () {{
+  va = i64.const {ALIAS_A}
+  vx = i32.const 1
+  vto = i64.const 0
+  vk = i32.atomic.wait va vx vto
+  br 1()
+  }}
+}}
+"
+    ))
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn a_wait_racing_an_unmap_of_its_alias_faults_the_guest_never_the_host() {
+    let spinners = std::sync::atomic::AtomicBool::new(false);
+    std::thread::scope(|s| {
+        let _stop = Spinners(&spinners);
+        spin(s, &spinners);
+        all_answer(
+            |h| alias_race(h, true),
+            grant_region,
+            false,
+            None,
+            Err("MemoryFault".into()),
+        );
+    });
+}
+
+/// The same race with each map replacing the live alias, for a bounded count. Whether a wait meets
+/// the page between the old alias's drop and the new one's map is the race's: each route ends either
+/// returning or `MemoryFault`, and the host never faults.
+#[cfg(any(unix, windows))]
+#[test]
+fn a_wait_racing_a_map_over_its_alias_never_faults_the_host() {
+    fn replacing(handle: i32) -> temen_ir::Module {
+        let src = temen_text::print_module(&alias_race(handle, false));
+        module(&src.replacen(
+            "  br 2()\n",
+            "  vdw = i64.const 49160\n  vcnt = i64.atomic.load vdw\n  vone = i64.const 1\n  vnext = i64.add vcnt vone\n  i64.atomic.store vdw vnext\n  vlim = i64.const 20000\n  vend = i64.ge_u vnext vlim\n  br_if vend 3() 2()\n}\nblock 3 () {\n  vr = i64.const 0\n  return vr\n",
+            1,
+        ))
+    }
+    let spinners = std::sync::atomic::AtomicBool::new(false);
+    std::thread::scope(|s| {
+        let _stop = Spinners(&spinners);
+        spin(s, &spinners);
+        for (route, answer) in by_instance(replacing, grant_region, false, None) {
+            assert!(
+                matches!(&answer, Ok(v) if v == &[0]) || answer == Err("MemoryFault".into()),
+                "{route}: {answer:?}"
+            );
+        }
+    });
+}
+
+/// #2958 slice 4, condition 5 — a `Budget` read of fuel after the run's cells have drawn more than
+/// once (a loop long enough to need a refill). A guest's read bounds fuel by the budgets below the
+/// run's node, never by the run's own grant, whose room differs by engine (each draws on its own
+/// schedule; INVARIANTS #3): so a node with no fuel ceiling of its own reads unbounded, `-1`, on
+/// every route, however its run's cells drew.
+#[test]
+fn a_budget_read_of_fuel_after_a_refill_answers_alike_on_every_route() {
+    fn make(h: i32) -> temen_ir::Module {
+        module(&format!(
+            "memory 16
+func () -> (i64) {{
+block 0 () {{
+  vq = i64.const 16400
+  vone = i32.const 1
+  vk = atomic.notify vq vone
+  vz = i64.const 0
+  br 1(vz)
+}}
+block 1 (vi: i64) {{
+  vinc = i64.const 1
+  vj = i64.add vi vinc
+  vlim = i64.const 3000000
+  vdone = i64.ge_u vj vlim
+  br_if vdone 2() 1(vj)
+}}
+block 2 () {{
+  vc = i32.const {h}
+  vf0 = i64.const 0
+  vr = call.cap 14 1 (i64) -> (i64) vc(vf0)
+  return vr
+  }}
+}}
+"
+        ))
+    }
+    all_answer(
+        make,
+        |h| h.grant_budget(-1, -1, -1),
+        true,
+        METERED,
+        Ok(vec![-1]),
+    );
 }

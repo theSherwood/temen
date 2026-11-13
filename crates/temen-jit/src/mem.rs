@@ -615,12 +615,15 @@ pub(crate) unsafe fn try_access(w: &crate::Window, a: &mut Access) -> bool {
                 probe(*dst, *len);
                 core::ptr::write_bytes(*dst, *val, *len);
             }
+            // The word is guest memory other vCPUs write with atomics: read it as one.
             Access::Load { src, width, out } => {
+                use core::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, AtomicU8, Ordering};
+                let p = *src as *mut u8;
                 *out = match width {
-                    1 => core::ptr::read_volatile(*src) as u64,
-                    2 => core::ptr::read_volatile(*src as *const u16) as u64,
-                    4 => core::ptr::read_volatile(*src as *const u32) as u64,
-                    _ => core::ptr::read_volatile(*src as *const u64),
+                    1 => u64::from(AtomicU8::from_ptr(p).load(Ordering::SeqCst)),
+                    2 => u64::from(AtomicU16::from_ptr(p.cast()).load(Ordering::SeqCst)),
+                    4 => u64::from(AtomicU32::from_ptr(p.cast()).load(Ordering::SeqCst)),
+                    _ => AtomicU64::from_ptr(p.cast()).load(Ordering::SeqCst),
                 };
             }
         }
@@ -636,12 +639,29 @@ pub(crate) unsafe fn try_access(w: &crate::Window, a: &mut Access) -> bool {
 /// # Safety
 /// As [`try_access`].
 pub(crate) unsafe fn try_load(w: &crate::Window, p: *const u8, width: u32) -> Option<u64> {
+    try_load_in(w.base, w.reserved as usize, p, width)
+}
+
+/// #2958 slice 4 — [`try_load`] for host code that holds a window by its base and its `reserved`
+/// bytes: the `width`-byte word (aligned, 1, 2, 4 or 8) at `p`, loaded atomically (sequentially
+/// consistent), or `None` if the load faulted on the window. The kernel route's guarded read of a
+/// §13 alias, whose backing (a host file) can shrink under the mapping.
+///
+/// # Safety
+/// `p` lies in the window `[base, base + reserved)`, and the caller runs on a thread whose guarded
+/// call installed the fault handler; a load that does not fault needs neither.
+pub unsafe fn try_load_in(base: *mut u8, reserved: usize, p: *const u8, width: u32) -> Option<u64> {
     let mut a = Access::Load {
         src: p,
         width,
         out: 0,
     };
-    try_access(w, &mut a).then_some(match a {
+    let w = crate::Window {
+        base,
+        reserved: reserved as u64,
+        ..crate::Window::NONE
+    };
+    try_access(&w, &mut a).then_some(match a {
         Access::Load { out, .. } => out,
         _ => 0,
     })

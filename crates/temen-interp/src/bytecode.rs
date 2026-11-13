@@ -8806,12 +8806,14 @@ struct LeafStart {
 /// every route that asks ([`image_parks`], [`native_scope`]). Ops past 2 are not asked: they may park
 /// anyhow.
 fn stream_op_parks(host: &Host, op: u32) -> bool {
-    let holds_pipe = || {
-        host.table
-            .iter()
-            .any(|s| matches!(s.entry, Some(super::Binding::PipeEnd { .. })))
-    };
-    (op == 0 && (host.stdin_block || holds_pipe())) || (op == 1 && holds_pipe())
+    (op == 0 && (host.stdin_block || holds_pipe(host))) || (op == 1 && holds_pipe(host))
+}
+
+/// Whether `host` holds a pipe end, where a stream op parks or wakes another's park.
+fn holds_pipe(host: &Host) -> bool {
+    host.table
+        .iter()
+        .any(|s| matches!(s.entry, Some(super::Binding::PipeEnd { .. })))
 }
 
 /// #1954 — how a call on host procedure `handle` can park with no personality installed: a declared
@@ -8967,11 +8969,20 @@ pub fn native_scope(m: &Module, host: &Host) -> Result<(), &'static str> {
     if m.imports.len() != host.import_bindings.len() {
         return Err("imports");
     }
-    for b in &host.import_bindings {
+    for (slot, b) in host.import_bindings.iter().enumerate() {
         if b.rebindable || !b.bound {
             return Err("imports");
         }
-        kernel_op(host, b.type_id, b.op, Some(b.handle))?;
+        // Every op the slot reaches: a grouped binding's remap (consumer op → the target's op,
+        // [`Host::import_target`]), or the one bound op.
+        match host.import_remaps.get(slot).and_then(|r| r.as_deref()) {
+            Some(ops) => {
+                for &op in ops {
+                    kernel_op(host, b.type_id, op, Some(b.handle))?;
+                }
+            }
+            None => kernel_op(host, b.type_id, b.op, Some(b.handle))?,
+        }
     }
     for i in m
         .funcs
@@ -8979,13 +8990,114 @@ pub fn native_scope(m: &Module, host: &Host) -> Result<(), &'static str> {
         .flat_map(|f| &f.blocks)
         .flat_map(|b| &b.insts)
     {
-        match i {
-            Inst::CapCall(c) => kernel_op(host, c.type_id, c.op, None)?,
-            Inst::CallImportDyn(_) => return Err("imports"),
-            _ => {}
-        }
+        kernel_inst(host, i)?;
     }
     Ok(())
+}
+
+/// #2958 slice 4 — whether a kernel task can run instruction `i` under `host`, as far as it reaches
+/// the host: every instruction kind is named here, with no wildcard arm, so a kind added to the IR
+/// is decided before it compiles. A `call.import` is decided through its binding ([`native_scope`]);
+/// the kinds that reach no host state, or only the §12 rules and the window, pass.
+fn kernel_inst(host: &Host, i: &Inst) -> Result<(), &'static str> {
+    match i {
+        Inst::CapCall(c) => kernel_op(host, c.type_id, c.op, None),
+        // A `call.import`, and a `call.sym` (a flat import dispatch, op 0, once bound), are decided
+        // through their binding.
+        Inst::CallImport { .. } | Inst::CallSym { .. } => Ok(()),
+        // What a dynamic dispatch or an attach reaches is chosen mid-run; a data or function symbol
+        // names what only a link resolves.
+        Inst::CallImportDyn { .. }
+        | Inst::ImportAttach { .. }
+        | Inst::DataSym { .. }
+        | Inst::RefSym { .. } => Err("imports"),
+        // §3.5 reflection over the domain's own table, answered in the dispatch.
+        Inst::ExportHandle { .. } | Inst::CapSelfTypeId { .. } | Inst::CapSelfCovers { .. } => {
+            Ok(())
+        }
+        Inst::ConstI32 { .. }
+        | Inst::ConstI64 { .. }
+        | Inst::IntBin { .. }
+        | Inst::IntCmp { .. }
+        | Inst::IntBinImm { .. }
+        | Inst::IntCmpImm { .. }
+        | Inst::IntUn { .. }
+        | Inst::Eqz { .. }
+        | Inst::Convert { .. }
+        | Inst::Select { .. }
+        | Inst::ConstF32 { .. }
+        | Inst::ConstF64 { .. }
+        | Inst::FBin { .. }
+        | Inst::FUn { .. }
+        | Inst::Fma { .. }
+        | Inst::FCmp { .. }
+        | Inst::FToISat { .. }
+        | Inst::FToITrap { .. }
+        | Inst::IToFConv { .. }
+        | Inst::Cast { .. }
+        | Inst::Load { .. }
+        | Inst::Store { .. }
+        | Inst::MemCopy { .. }
+        | Inst::MemMove { .. }
+        | Inst::MemFill { .. }
+        | Inst::AtomicLoad { .. }
+        | Inst::AtomicStore { .. }
+        | Inst::AtomicRmw { .. }
+        | Inst::AtomicCmpxchg { .. }
+        | Inst::Call { .. }
+        | Inst::RefFunc { .. }
+        | Inst::CallIndirect { .. }
+        | Inst::DataSelf { .. }
+        | Inst::DataTop
+        | Inst::VcpuTlsGet
+        | Inst::VcpuTlsSet { .. }
+        | Inst::DurableShadowBase
+        | Inst::ContNew { .. }
+        | Inst::ContResume { .. }
+        | Inst::Suspend { .. }
+        | Inst::SetJmp { .. }
+        | Inst::LongJmp { .. }
+        | Inst::GcRoots { .. }
+        | Inst::ThreadSpawn { .. }
+        | Inst::ThreadJoin { .. }
+        | Inst::MemoryWait { .. }
+        | Inst::MemoryNotify { .. }
+        | Inst::AtomicFence { .. }
+        | Inst::ConstV128 { .. }
+        | Inst::V128Load { .. }
+        | Inst::V128Store { .. }
+        | Inst::Splat { .. }
+        | Inst::ExtractLane { .. }
+        | Inst::ReplaceLane { .. }
+        | Inst::VIntBin { .. }
+        | Inst::VIntCmp { .. }
+        | Inst::VFloatCmp { .. }
+        | Inst::VShift { .. }
+        | Inst::VIntUn { .. }
+        | Inst::VSatBin { .. }
+        | Inst::VWiden { .. }
+        | Inst::VNarrow { .. }
+        | Inst::VConvert { .. }
+        | Inst::VPMinMax { .. }
+        | Inst::VPopcnt { .. }
+        | Inst::VAvgr { .. }
+        | Inst::VDot { .. }
+        | Inst::VDotI8 { .. }
+        | Inst::VExtMul { .. }
+        | Inst::VExtAddPairwise { .. }
+        | Inst::VQ15MulrSat { .. }
+        | Inst::VFma { .. }
+        | Inst::VAnyTrue { .. }
+        | Inst::VAllTrue { .. }
+        | Inst::VBitmask { .. }
+        | Inst::VFloatBin { .. }
+        | Inst::VFloatUn { .. }
+        | Inst::VBitBin { .. }
+        | Inst::VNot { .. }
+        | Inst::Bitselect { .. }
+        | Inst::Shuffle { .. }
+        | Inst::Swizzle { .. } => Ok(()),
+    }
 }
 
 /// #2958 slice 4 — whether a kernel task can make a call on `(type_id, op)` under `host`: the call
@@ -8994,8 +9106,8 @@ pub fn native_scope(m: &Module, host: &Host) -> Result<(), &'static str> {
 /// an operand. **Default-deny**: what this does not list, the kernel route declines, and `Err` names
 /// the clause and so what removes it (#2958's plan, section B):
 ///
-/// - **`stream parks`**: a stream op that can park ([`stream_op_parks`]; any op past `close`), or
-///   `self.pipe`, which
+/// - **`stream parks`**: a stream op that can park ([`stream_op_parks`]; any op past `close`), a
+///   `close` while a pipe end is held (it wakes the other end's parks), or `self.pipe`, which
 ///   mints a pipe end mid-run and so makes that check stale (slice 5);
 /// - **`host-proc parks`**: a host procedure that may park ([`host_proc_parks`]), or the offload
 ///   exerciser `Blocking` (slice 5);
@@ -9013,7 +9125,9 @@ fn kernel_op(host: &Host, type_id: u32, op: u32, handle: Option<i32>) -> Result<
     use temen_ir::cap_id::*;
     use temen_ir::{CAP_DYN_TYPE_ID, CAP_SELF_TYPE_ID};
     match (type_id, op) {
-        (STREAM, 0..=2) if stream_op_parks(host, op) => Err("stream parks"),
+        (STREAM, 0..=1) if stream_op_parks(host, op) => Err("stream parks"),
+        // A `close` of a pipe end wakes the other end's parks, which are the rules'.
+        (STREAM, 2) if holds_pipe(host) => Err("stream parks"),
         (STREAM, 0..=2) | (EXIT, 0) | (CLOCK, 0) | (ADDRESS_SPACE, 0..=5) | (BUDGET, 0..=3) => {
             Ok(())
         }

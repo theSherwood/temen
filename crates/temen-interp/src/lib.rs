@@ -21673,15 +21673,16 @@ pub type CapPageMap = Arc<CapPages>;
 /// call. A futex key takes `pages`, lets it go, then takes `regions`.
 pub struct CapPages {
     pages: Mutex<BTreeMap<u64, temen_ir::PageState>>,
-    /// The backing identity of each §13 region a page of the window aliases, by the host's region
-    /// id: the backing allocation's address, the identity every engine keys a region word on
-    /// ([`FutexKey::Region`]). Written once an alias is in, before its pages are marked, so a reader
-    /// that sees a `Backed` page finds its region here. An id names one backing for as long as a page
-    /// aliases it (a region is not closed while mapped, #2358), and a map of a reused id writes its
-    /// new backing's identity before any page names it. Entries are not removed: a host's region ids
-    /// are slots it reuses ([`Host::hold_region`]), so this holds at most one entry per slot, as many
-    /// as the regions the domain has held at once.
-    regions: Mutex<BTreeMap<u32, u64>>,
+    /// Each §13 region a page of the window aliases, by the host's region id: a weak hold on its
+    /// backing, whose allocation's address is the identity every engine keys a region word on
+    /// ([`FutexKey::Region`]), as the interpreter's window holds its regions. The hold keeps the
+    /// allocation, and so the identity, from being reused by a later region while an entry names it,
+    /// so a waiter parked on a region that was unmapped and closed meets no new one at its address.
+    /// Written once an alias is in, before its pages are marked, so a reader that sees a `Backed`
+    /// page finds its region here; a map of a reused id writes its new backing before any page names
+    /// it. Entries are not removed: a host's region ids are slots it reuses ([`Host::hold_region`]),
+    /// so this holds at most one entry per slot, as many as the regions the domain has held at once.
+    regions: Mutex<BTreeMap<u32, std::sync::Weak<dyn SharedBacking>>>,
     /// A page of the window has been a §13 alias: set before the first `Backed` entry is written, and
     /// never cleared. A futex key reads the map only once it is set, so a window with no alias keys
     /// every word with no lock (`Mem`'s `has_regions` rule).
@@ -21704,9 +21705,12 @@ impl CapPages {
 
     /// A copy, for a fork twin's window, which aliases what this one does.
     pub fn fork(&self) -> CapPages {
+        // One lock at a time ([`CapPages`]): each copy is taken under its own.
+        let pages = self.lock().clone();
+        let regions = self.regions.lock_unpoisoned().clone();
         CapPages {
-            pages: Mutex::new(self.lock().clone()),
-            regions: Mutex::new(self.regions.lock_unpoisoned().clone()),
+            pages: Mutex::new(pages),
+            regions: Mutex::new(regions),
             aliased: std::sync::atomic::AtomicBool::new(self.aliased()),
         }
     }
@@ -21716,17 +21720,21 @@ impl CapPages {
         self.aliased.load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    /// Record that `region`, whose backing's identity is `ident`, is about to be aliased into the
-    /// window: before the alias's pages are marked `Backed`, once its mapping is in.
-    pub fn record_region(&self, region: u32, ident: u64) {
+    /// Record that `region`, over `backing`, is about to be aliased into the window: before the
+    /// alias's pages are marked `Backed`, once its mapping is in.
+    pub fn record_region(&self, region: u32, backing: &RegionBacking) {
         self.aliased
             .store(true, std::sync::atomic::Ordering::SeqCst);
-        self.regions.lock_unpoisoned().insert(region, ident);
+        (self.regions.lock_unpoisoned()).insert(region, Arc::downgrade(backing));
     }
 
-    /// The backing identity of `region`, `None` for one the window never aliased.
+    /// The backing identity of `region` ([`CapPages::regions`]), `None` for one the window never
+    /// aliased.
     pub fn region_ident(&self, region: u32) -> Option<u64> {
-        self.regions.lock_unpoisoned().get(&region).copied()
+        let regions = self.regions.lock_unpoisoned();
+        regions
+            .get(&region)
+            .map(|b| std::sync::Weak::as_ptr(b) as *const u8 as u64)
     }
 }
 

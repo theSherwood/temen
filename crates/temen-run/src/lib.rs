@@ -591,6 +591,10 @@ unsafe fn cap_thunk_impl(
     // so it mints them, through the one mint ([`Host::mint_pipe`]). Any other JIT run leaves the op
     // to the host's `-EINVAL`, as every tier that can't park does.
     if serves && type_id == temen_ir::CAP_SELF_TYPE_ID && op == temen_interp::CAP_SELF_PIPE {
+        // #2958 slice 4 — a pipe minted mid-run is one `native_scope` could not see (`stream parks`).
+        if kernel_backstop(vm) {
+            return;
+        }
         let r = host.mint_pipe(arg_slots.first().copied().unwrap_or(0) as u64, gm);
         if n_results != 0 {
             *results = r;
@@ -858,11 +862,10 @@ pub unsafe extern "C" fn cap_thunk_locked(
         // CALLS.md 5c.1b — a **locked-domain caller** takes the parked transport too, with this
         // domain's guard released before it blocks (#2139): blocking on a sibling's reply while
         // holding it would deadlock (A holds A waiting B; B blocked on A's lock).
+        // A punted call's job may still run and post its answer: that answer lands in this domain's
+        // completions, which no caller claims, and the domain's end (this trap) ends the run, so
+        // nothing waits on it.
         if (live.is_some() || pending_id.is_some()) && kernel_backstop(vm) {
-            // A punted call is withdrawn, so no completion waits for a caller that left.
-            if let Some(id) = pending_id {
-                guard.completions().withdraw(id);
-            }
             return;
         }
         if let Some(target) = live {
@@ -5058,6 +5061,25 @@ impl temen_interp::FutexWindow for MprotectWindow {
         if !self.word_readable(&map, base) {
             return None;
         }
+        // #2958 slice 4 — a §13 alias is readable in the map and mapped in hardware, but its backing
+        // can still shrink under it (a host file the guest truncated through its fs capability), so
+        // its load is the recoverable one: a fault answers `None`, the guest's `MemoryFault`, as
+        // today's route answers it. Every caller on a native window is a vCPU's thread inside its
+        // guarded call, whose fault handler recovers it (a unit test that calls this outside one
+        // never faults: its backings keep their length).
+        if matches!(map.get(&(base / self.page)), Some(PageState::Backed { .. })) {
+            // SAFETY: the word lies in the reservation, and the caller is inside a guarded call.
+            let word = unsafe {
+                temen_jit::try_load_in(
+                    self.base,
+                    self.reserved as usize,
+                    self.base.add(base as usize),
+                    width,
+                )
+            };
+            drop(map);
+            return word;
+        }
         // SAFETY: `[base, base + width)` is inside the reservation, aligned, and on a page the map
         // says is readable, which the hardware keeps readable while this holds the map's lock (the
         // contract above). The word is guest memory other vCPUs write with atomics: read it as one.
@@ -5179,17 +5201,17 @@ impl MprotectWindow {
     /// Mirror a §13 alias in the software page state: each page of `pages` is committed (RW or RO,
     /// for in-call §7 borrow checks) and names the bytes of `region` it aliases, from `region_off`
     /// on — what a freeze records in place of the page's bytes (#2025). Called once the alias's
-    /// mapping is in, never for a refused one. #2958 slice 4 — `region`'s backing identity, `ident`,
-    /// is recorded first ([`temen_interp::CapPages::record_region`]), so a reader that sees a page
-    /// `Backed` finds the region it keys a futex word on.
+    /// mapping is in, never for a refused one. #2958 slice 4 — `region`'s backing is recorded first
+    /// ([`temen_interp::CapPages::record_region`]), so a reader that sees a page `Backed` finds the
+    /// region it keys a futex word on.
     fn mark_backed(
         &self,
         pages: std::ops::RangeInclusive<u64>,
-        (region, ident): (u32, u64),
+        (region, backing): (u32, &RegionBacking),
         region_off: u64,
         writable: bool,
     ) {
-        self.prot.record_region(region, ident);
+        self.prot.record_region(region, backing);
         let first = *pages.start();
         for page in pages {
             let off = region_off + (page - first) * self.page;
@@ -5678,8 +5700,8 @@ impl GuestMem for MprotectWindow {
         region: u32,
         backing: RegionBacking,
     ) -> i64 {
-        // #2958 slice 4 — the backing's identity, the one every engine keys a region word on.
-        let ident = Arc::as_ptr(&backing) as *const u8 as u64;
+        // #2958 slice 4 — the backing, which the page map keys a region word on.
+        let aliased = backing.clone();
         #[cfg(unix)]
         {
             const PROT_READ: i32 = 1;
@@ -5734,7 +5756,7 @@ impl GuestMem for MprotectWindow {
                     _ => EINVAL,
                 };
             }
-            self.mark_backed(pages, (region, ident), region_off, writable);
+            self.mark_backed(pages, (region, &aliased), region_off, writable);
             0
         }
         // §13 windows (issue #1): real shared mappings via **placeholder reservations**. The JIT
@@ -5831,7 +5853,7 @@ impl GuestMem for MprotectWindow {
                         if i > 0 {
                             self.mark_backed(
                                 first..=first + i * per - 1,
-                                (region, ident),
+                                (region, &aliased),
                                 region_off,
                                 writable,
                             );
@@ -5843,12 +5865,12 @@ impl GuestMem for MprotectWindow {
                     }
                 }
             }
-            self.mark_backed(pages, (region, ident), region_off, writable);
+            self.mark_backed(pages, (region, &aliased), region_off, writable);
             0
         }
         #[cfg(not(any(unix, windows)))]
         {
-            let _ = (win_off, region_off, len, prot, region, backing);
+            let _ = (win_off, region_off, len, prot, region, backing, aliased);
             EINVAL
         }
     }

@@ -295,3 +295,30 @@ fn a_read_racing_an_unmap_or_a_protect_never_faults_the_host() {
         "{answered} read, {refused} refused"
     );
 }
+
+/// #2958 slice 4 review, finding 4 — a region's identity is held as the interpreter holds it, by a
+/// weak hold on its backing: once an alias of region 7 is unmapped and the region dropped, no region
+/// made after it has its identity while the page map still names it, so a waiter that parked on the
+/// old region meets no new one at its address.
+#[test]
+fn a_dropped_regions_identity_is_not_reused_while_the_map_names_it() {
+    let page = temen_interp::host_page_size();
+    let (prefix, reserved) = (8 * page, 32 * page);
+    let r = Reservation::new(reserved as usize, prefix as usize);
+    let map = temen_interp::CapPageMap::default();
+    let mut w = MprotectWindow::new_shared(r.base, prefix, reserved, map.clone());
+    let at = 16 * page;
+    let old = temen_run::new_shared_region(page as usize).expect("a region");
+    assert_eq!(w.map_region(at, 0, page, 3, 7, old.clone()), 0);
+    let ident = map.region_ident(7).expect("recorded");
+    assert_eq!(ident, std::sync::Arc::as_ptr(&old) as *const u8 as u64);
+    assert_eq!(w.unmap(at, page), 0);
+    drop(old);
+    let later: Vec<_> = (0..64)
+        .map(|_| temen_run::new_shared_region(page as usize).expect("a region"))
+        .collect();
+    for b in &later {
+        assert_ne!(std::sync::Arc::as_ptr(b) as *const u8 as u64, ident);
+    }
+    assert_eq!(map.region_ident(7), Some(ident), "the entry still names it");
+}
