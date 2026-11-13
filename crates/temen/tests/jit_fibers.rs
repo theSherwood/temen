@@ -283,13 +283,9 @@ fn fiber_uses_data_stack_and_memory() {
 /// W5 JIT/DWARF Stage 4c — the fiber-rooted backtrace. A fiber entry `func 1` calls helper `func 2`,
 /// which `suspend`s; the root resumes the fiber once and **returns without completing it**, leaving it
 /// parked. The host then walks the suspended fiber's control stack and symbolizes its guest frames.
-#[test]
-fn fiber_backtrace_walks_a_suspended_fibers_guest_stack() {
-    use temen_ir::DEFAULT_RESERVED_LOG2;
-    use temen_jit::{CompiledModule, JitOutcome, INERT_CAP_THUNK};
-
-    // `func 1` (entry) calls `func 2` (helper) at fib.c:5; the helper `suspend`s at fib.c:9.
-    let src = r#"
+/// A `-g` module whose root resumes a fiber through a helper and returns its suspended value,
+/// leaving it parked (see [`fiber_backtrace_walks_a_suspended_fibers_guest_stack`]).
+const PARKS_A_FIBER_WITH_DEBUG_INFO: &str = r#"
 func () -> (i64) {
 block 0 () {
   v0 = ref.func 1
@@ -319,6 +315,14 @@ debug.file 0 "fib.c"
 debug.loc 1 0 0 0 5 3
 debug.loc 2 0 0 0 9 3
 "#;
+
+#[test]
+fn fiber_backtrace_walks_a_suspended_fibers_guest_stack() {
+    use temen_ir::DEFAULT_RESERVED_LOG2;
+    use temen_jit::{CompiledModule, JitOutcome, INERT_CAP_THUNK};
+
+    // `func 1` (entry) calls `func 2` (helper) at fib.c:5; the helper `suspend`s at fib.c:9.
+    let src = PARKS_A_FIBER_WITH_DEBUG_INFO;
     let m = parse_module(src).expect("parse");
     verify_module(&m).expect("verify");
     let mut cm = CompiledModule::compile(
@@ -472,5 +476,51 @@ fn recycled_slot_generation_guard_agrees() {
         \x20 return v2\n\
           }\n\
         }\n",
+    );
+}
+
+/// #3020 — a parked fiber's backtrace is its run's: a run takes its fibers' backtraces as it ends
+/// only when asked, and the next run's start retires them, whatever that run does. A run that does
+/// not ask leaves none, and a handle reads as the live table reads it (a guest tag above the
+/// generation is ignored).
+#[test]
+fn fiber_backtrace_reaches_the_last_run_s_fibers_alone() {
+    use temen_ir::DEFAULT_RESERVED_LOG2;
+    use temen_jit::{CompiledModule, INERT_CAP_THUNK};
+    let m = parse_module(PARKS_A_FIBER_WITH_DEBUG_INFO).expect("parse");
+    verify_module(&m).expect("verify");
+    let mut cm = CompiledModule::compile(
+        &m,
+        0,
+        INERT_CAP_THUNK,
+        core::ptr::null_mut(),
+        DEFAULT_RESERVED_LOG2,
+        None,
+        None,
+        None,
+        None,
+        None,
+        0,
+    )
+    .expect("compile");
+    let _ = cm.run(&[], None, None).expect("run 1");
+    assert!(cm.fiber_backtrace(0).is_empty(), "nothing taken unasked");
+
+    cm.keep_parked_backtraces(true);
+    let _ = cm.run(&[], None, None).expect("run 2");
+    let bt = cm.fiber_backtrace(0);
+    assert_eq!(bt.len(), 2, "run 2's parked fiber: {bt:?}");
+    let tagged = (0x5a_i64 << 56) | 0;
+    assert_eq!(
+        cm.fiber_backtrace(tagged),
+        bt,
+        "a tag above the generation is ignored"
+    );
+
+    cm.keep_parked_backtraces(false);
+    let _ = cm.run(&[], None, None).expect("run 3");
+    assert!(
+        cm.fiber_backtrace(0).is_empty(),
+        "run 3 retired run 2's backtraces and took none"
     );
 }
