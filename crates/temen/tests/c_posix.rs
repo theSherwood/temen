@@ -7231,7 +7231,6 @@ int main(void) {{\n\
             ih,
             &[],
             temen_ir::default_reserved_log2(),
-            None,
             true,
         )
     } else {

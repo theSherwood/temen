@@ -67,6 +67,7 @@ fn kernel(m: &Module, entry: u32) -> Lane<'_> {
             entry,
             args,
             init_mem: &[],
+        init: None,
             reserved_log2: RESERVED,
             fuel: u64::MAX,
             snapshot_cap: None,
@@ -93,7 +94,6 @@ fn x2_interp(m: &Module) -> Lane<'_> {
             Host::new(),
             &[],
             RESERVED,
-            None,
             false,
         )
         .expect("subset")

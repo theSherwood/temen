@@ -7,9 +7,10 @@
 //! there with its frames on its stack. Everything [`admit`] declines runs on the JIT's own thread
 //! runtime, unchanged: `jit_cap_run` and `jit_run` ask it first, and nothing else chooses.
 //!
-//! The window is the JIT's (guard-paged, reserved by [`KernelRun::new`]), handed to the kernel as a
-//! shared region: the kernel seeds it and keys its futexes on it, then the JIT protects it. (One page
-//! map, the JIT's, replaces the kernel's `Mem` over it in #2958 slice 3.)
+//! The window is the JIT's, started as the JIT's own runs start one (`seed_window`, then the
+//! host's page map over it), and it has one page map: the domain `Host`'s, which its capability
+//! calls check and the kernel's rules read it through ([`temen_interp::FutexWindow`], #2958 slice 3).
+//! The kernel builds no window of its own over it.
 //!
 //! **Fuel.** Each vCPU charges a fuel cell of its own that draws from its task's budget node
 //! ([`EmittedCall::fuel_node`]), as today's JIT's vCPUs draw from their domain's: the node is the
@@ -20,9 +21,9 @@
 use std::sync::Arc;
 use temen_interp::bytecode::{
     CallEntry, CoopEvent, CoopRun, EmittedCall, EmittedTarget, NativeStop, NativeTier, Opener,
-    ProgramEmit, ThreadPlatform, ThreadTier,
+    ProgramEmit, ThreadPlatform, ThreadTier, TierWindow,
 };
-use temen_interp::{Host, Trap, Value};
+use temen_interp::{Host, ShadowArena, Trap, Value};
 use temen_ir::Module;
 use temen_jit::kernel_rt::{KernelPark, KernelRun, VcpuEntry};
 use temen_jit::{CompiledModule, FuelCell, JitOutcome, TrapKind};
@@ -32,8 +33,10 @@ pub struct Admitted<'m>(&'m Module);
 
 /// Whether `m`, started from `init` under `host`, runs its vCPUs as the kernel's tasks:
 /// `temen_interp::bytecode::native_scope`, plus the start's own clauses:
-/// - **`restored`**: a window started from a captured layout, not a fresh seed (the JIT re-applies
-///   its page map; the kernel's `Mem` would seed over it). One page map (#2958 slice 3) removes it.
+/// - **`region start`**: a window started from a captured layout that aliases a §13 region: a
+///   native window keys a futex word on its own backing, so a word on an alias would not
+///   rendezvous with the region's other mappings (the phase that brings §13 regions onto this
+///   route, as `native_scope`'s `cap` clause declines their ops).
 /// - **`kept code`**: the embedder keeps the run's compile for later runs (a `JitCodeCache`,
 ///   #2389), whose shared code the kernel route does not instance yet (#2981).
 ///
@@ -45,8 +48,8 @@ pub fn admit<'m>(
     kept_code: bool,
 ) -> Result<Admitted<'m>, &'static str> {
     temen_interp::bytecode::native_scope(m, host)?;
-    if init.is_some_and(|l| !l.is_seed()) {
-        return Err("restored");
+    if init.is_some_and(temen_interp::MemLayout::aliases_regions) {
+        return Err("region start");
     }
     if kept_code {
         return Err("kept code");
@@ -68,6 +71,17 @@ pub struct KernelEnd {
 }
 
 impl KernelEnd {
+    /// A run the OS would not give its window to (#2305, #2286): it ends as one the process cannot
+    /// hold, before its first instruction.
+    fn refused() -> KernelEnd {
+        KernelEnd {
+            result: Err(Trap::ThreadFault),
+            snapshot: None,
+            asked: false,
+            vcpus: 0,
+        }
+    }
+
     /// The end as the JIT's own runs report it: its outcome, and the window's bytes it copied back.
     /// A snapshot the OS refused (a page it would not make readable again) ends the run as a window
     /// it cannot hold does, `ThreadFault`, as the JIT's own snapshot does (#2286).
@@ -103,6 +117,7 @@ pub fn run_fresh(
         entry,
         args,
         init_mem: &[],
+        init: None,
         reserved_log2: temen_ir::DEFAULT_RESERVED_LOG2,
         fuel: temen_interp::DEFAULT_FUEL,
         snapshot_cap: None,
@@ -157,6 +172,9 @@ pub struct Start<'a> {
     pub args: &'a [i64],
     /// The window's low bytes before the data segments land (argv and env).
     pub init_mem: &'a [u8],
+    /// The layout the window starts from, in place of `init_mem` and the data segments: a thaw's, or
+    /// a fresh image's (`jit_cap_run`'s). `None` for a fresh run.
+    pub init: Option<&'a temen_interp::MemLayout>,
     pub reserved_log2: u8,
     /// The fuel the run's activation is granted ([`temen_interp::DEFAULT_FUEL`] by default).
     pub fuel: u64,
@@ -199,16 +217,43 @@ pub fn run(
         None,
         0,
     )?;
-    let kr = Arc::new(
-        KernelRun::new(cm, armed).ok_or(temen_jit::JitError::Unsupported("kernel window"))?,
-    );
+    // The JIT's own window start, as a fresh run or a thaw of today's route starts it: the window
+    // seeded and protected (`seed_window`), then the host's page map started over it with the
+    // read-only pages and any pre-map (`start_window_view`). That page map is the window's one: the
+    // `Host`'s capability calls check it, and the kernel's rules read the window through it.
+    let layout = start.init;
+    if let Some(l) = layout {
+        host.reset_cap_pages(l.page_map());
+    }
+    let mut cm = cm;
+    cm.set_restore(layout.and_then(crate::jit_restore));
+    let init_mem = layout.map_or(start.init_mem, |l| l.bytes());
+    let (kr, ro) = match KernelRun::new(cm, armed, init_mem) {
+        Some(Some(started)) => started,
+        Some(None) => return Ok(KernelEnd::refused()),
+        None => return Err(temen_jit::JitError::Unsupported("kernel window")),
+    };
+    let kr = Arc::new(kr);
     let (base, reserved) = kr.window();
-    // SAFETY: `kr` owns the reservation and is dropped at the end of this function, after the run
-    // (whose threads have all gone by then) and its host's tier are dropped; `back`'s strong count is
-    // checked to be 1 before then, and the window is kept mapped if it is not, so no clone of the
-    // region outlives its memory.
-    let back = Arc::new(unsafe { temen_interp::Region::shared(base, reserved) });
-    let back_held = Arc::clone(&back);
+    // SAFETY: `[base, base + reserved)` is the window `kr` owns, which the reader keeps.
+    let keep: Arc<dyn std::any::Any + Send + Sync> = Arc::clone(&kr) as _;
+    let Some((read, runs)) = (unsafe {
+        crate::start_window_view(
+            host,
+            base,
+            kr.mapped(),
+            reserved,
+            &ro,
+            ShadowArena::EMPTY,
+            keep,
+        )
+    }) else {
+        return Err(temen_jit::JitError::Unsupported("kernel window pre-map"));
+    };
+    let tier_window = TierWindow {
+        read,
+        charge: crate::jit_root_window(m, layout, start.reserved_log2),
+    };
     let vcpus = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let state: Arc<dyn std::any::Any + Send + Sync> = Arc::new(TierState {
         kr: Arc::clone(&kr),
@@ -225,7 +270,10 @@ pub fn run(
             modules: None,
             leaf: Some(Arc::new(|offer| offer.module == 0)),
             run: tier_run,
-            native: Some(NativeTier { state }),
+            native: Some(NativeTier {
+                state,
+                window: Some(tier_window),
+            }),
         }),
         // The root runs on the caller's thread, as the JIT's own runtime runs it.
         opener: Opener::RunsRoot,
@@ -260,9 +308,8 @@ pub fn run(
         &vals,
         start.fuel,
         std::mem::take(host),
-        start.init_mem,
+        &[], // the window is the tier's, started above
         reserved.trailing_zeros() as u8,
-        Some(back),
         false,
     );
     let mut co = match opened {
@@ -286,23 +333,13 @@ pub fn run(
             });
         }
     };
-    // The kernel seeded the window; nothing has run. A protection the OS refuses ends the run as a
-    // window it cannot hold does (`ThreadFault`), with its host given back. #2995 — the host's page
-    // map learns the read-only pages the protection made, as the JIT's own window start teaches it
-    // (`window_aliases`), so a capability's borrow of one is refused (`-EFAULT`) rather than written
-    // through into a page the hardware protects.
-    let protected = kr.protect().is_some_and(|ro| {
-        // SAFETY: `[base, base + reserved)` is the window `kr` owns, live for the run.
-        unsafe { crate::seed_kernel_window(&mut co.host_mut(), base, kr.mapped(), reserved, &ro) }
-    });
-    let result = if protected {
-        match co.run() {
-            CoopEvent::Done(vals) => Ok(vals.iter().map(|v| value_slot(*v)).collect()),
-            CoopEvent::Trapped(t) => Err(t),
-            _ => Err(Trap::Malformed),
-        }
-    } else {
-        Err(Trap::ThreadFault)
+    // The activation charged the window's bound; it holds what its start made of it, as on the
+    // JIT's own runtime (`window_aliases`).
+    co.host_mut().start_window(runs);
+    let result = match co.run() {
+        CoopEvent::Done(vals) => Ok(vals.iter().map(|v| value_slot(*v)).collect()),
+        CoopEvent::Trapped(t) => Err(t),
+        _ => Err(Trap::Malformed),
     };
     *host = std::mem::take(&mut *co.host_mut());
     host.set_thread_platform(ThreadPlatform::OS);
@@ -311,13 +348,9 @@ pub fn run(
     drop(_kill);
     // Every thread has counted itself out, so no guest code runs: the window holds what the run
     // left in it.
+    // The window is unmapped as the last holder of `kr` drops it, the reader's included (a thread
+    // that has counted itself out may still hold the run, and with it both, for a moment).
     let snapshot = start.snapshot_cap.and_then(|cap| kr.snapshot(cap));
-    // Nothing the run handed back may still reach the window, which `kr` unmaps as its last holder
-    // drops it (a thread that has counted itself out may still hold the run for a moment).
-    if Arc::strong_count(&back_held) != 1 {
-        debug_assert!(false, "a clone of the JIT window outlived its run");
-        std::mem::forget(kr); // keep it mapped
-    }
     Ok(KernelEnd {
         result,
         snapshot,
@@ -388,8 +421,8 @@ fn tier_run(call: &mut EmittedCall<'_>) -> Result<(), Trap> {
     let (tls, host, end) = (call.tls, call.host_cell(), call.end);
     let ran = {
         let mut hook = Hook(call);
-        // SAFETY: `host` is the task's domain's live host cell, what `cap_thunk_locked` takes; the
-        // kernel seeded the window and `run` protected it before any task ran.
+        // SAFETY: `host` is the task's domain's live host cell, what `cap_thunk_locked` takes; `run`
+        // started the window before any task ran.
         unsafe {
             kr.run_vcpu(
                 entry,

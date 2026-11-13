@@ -5937,7 +5937,7 @@ fn frames_to_pcs(frames: &[Frame]) -> Vec<IrPc> {
 /// offsets — in the same or different domains) rendezvous. The Linux distinction, exactly: a private
 /// page keys on its virtual address (`FUTEX_PRIVATE`), a shared page on its backing identity + offset.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
-enum FutexKey {
+pub enum FutexKey {
     /// A normal (anonymous) window page — keyed by `(backing identity, backing-absolute address)`.
     /// The address alone is **not** a sound identity across domains (#1283): every window starts at 0
     /// of its own backing, and all of a run's domains share one `wait_waiters`, so two detached
@@ -5963,7 +5963,7 @@ enum FutexKey {
 /// parks on the site rather than the key. A page remapped under a parked waiter leaves its site as it
 /// was, as the key would be.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum FutexSite {
+pub enum FutexSite {
     Anon(u64),
     Region(u32, u64),
 }
@@ -21625,6 +21625,34 @@ pub trait GuestMem {
     fn shadow(&self) -> ShadowArena {
         ShadowArena::EMPTY
     }
+}
+
+/// #2958 slice 3 — what the §12 futex rules read of a domain's window: an interpreter's [`Mem`], or a
+/// native tier's own window read through the page map its `Host` keeps (the Cranelift JIT's
+/// `MprotectWindow`). One reader for the rule's compare and for the no-wake fast path, so a window
+/// whose pages can lose host access under a read has one place that guards it. No defaults: each
+/// implementation answers every question, as the confinement path must.
+pub trait FutexWindow {
+    /// A `memory.wait` of `width` bytes at guest `addr`: the confined base (the word's address in the
+    /// window), naturally aligned and on a page a load may read; `Err(MemoryFault)` otherwise.
+    fn prepare_wait(&self, addr: u64, width: u32) -> Result<u64, Trap>;
+    /// A `memory.notify` at guest `addr`: the confined base; `Err(MemoryFault)` outside the window.
+    fn confine_for_notify(&self, addr: u64) -> Result<u64, Trap>;
+    /// **The guarded read**: the `width`-byte word at confined, aligned `base`, loaded atomically
+    /// (sequentially consistent), or `None` where the load would fault. A host-side read of a guest
+    /// word goes through here and nowhere else: it never faults the host, and a value it answers to a
+    /// guest racing its own page op is one the guest could have read.
+    fn wait_word(&self, base: u64, width: u32) -> Option<u64>;
+    /// Where a wait at confined `base` parks ([`FutexSite`]).
+    fn futex_site(&self, base: u64) -> FutexSite;
+    /// The rendezvous key of `site` ([`FutexKey`]): what a waiter files under and a notifier wakes,
+    /// and what the no-wake count's stripe is a function of.
+    fn site_key(&self, site: FutexSite) -> FutexKey;
+}
+
+/// The rendezvous key of confined `base` in `w` (#1731): its site's key.
+fn futex_key_of(w: &dyn FutexWindow, base: u64) -> FutexKey {
+    w.site_key(w.futex_site(base))
 }
 
 /// §4/§7 a JIT cap-path window **page map**: host page index → its state (absent ⇒ region default).
@@ -39475,6 +39503,27 @@ fn sparse_prots(
             CapturedProt::Rw | CapturedProt::Backed { .. } => None,
         }
     })
+}
+
+/// The interpreter's window: its own checks, unchanged. Its `wait_word` reads without a second check:
+/// an interpreted window never loses host access (an unmap is a page-map change and a zero fill), so
+/// a read racing one answers zero or the old value, as the compare under the run's lock always has.
+impl FutexWindow for Mem {
+    fn prepare_wait(&self, addr: u64, width: u32) -> Result<u64, Trap> {
+        Mem::prepare_wait(self, addr, if width == 8 { IntTy::I64 } else { IntTy::I32 })
+    }
+    fn confine_for_notify(&self, addr: u64) -> Result<u64, Trap> {
+        Mem::confine_for_notify(self, addr)
+    }
+    fn wait_word(&self, base: u64, width: u32) -> Option<u64> {
+        Some(self.atomic_value(base, width))
+    }
+    fn futex_site(&self, base: u64) -> FutexSite {
+        Mem::futex_site(self, base)
+    }
+    fn site_key(&self, site: FutexSite) -> FutexKey {
+        Mem::site_key(self, site)
+    }
 }
 
 impl GuestMem for Mem {

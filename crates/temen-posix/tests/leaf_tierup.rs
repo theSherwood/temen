@@ -285,7 +285,7 @@ fn run_tree(exec: Exec, guest_text: &str, command: &str, leaf: bool) -> (Ending,
                 }),
                 ..ThreadPlatform::OS
             });
-            CoopRun::new_parallel(&guest, 0, &[], u64::MAX, host, &[], reserved, None, true)
+            CoopRun::new_parallel(&guest, 0, &[], u64::MAX, host, &[], reserved, true)
         }
     };
     let mut run = run

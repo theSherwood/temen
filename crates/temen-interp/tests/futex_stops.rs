@@ -330,10 +330,9 @@ fn pumped(
         setup(&mut host);
         let reserved = temen_ir::default_reserved_log2();
         let args = [Value::I32(FOREVER)];
-        let mut run =
-            CoopRun::new_parallel(&m, 0, &args, u64::MAX, host, &[], reserved, None, true)
-                .expect("executor 2 runs it")
-                .expect("the run opens");
+        let mut run = CoopRun::new_parallel(&m, 0, &args, u64::MAX, host, &[], reserved, true)
+            .expect("executor 2 runs it")
+            .expect("the run opens");
         let _ = tx.send(run.run());
         if pump.recv().is_ok() {
             let _ = tx.send(run.run());

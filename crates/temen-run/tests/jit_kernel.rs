@@ -239,6 +239,7 @@ fn fueled(m: &temen_ir::Module, budget: u64) -> [(Result<Vec<i64>, Trap>, u64); 
         entry: 0,
         args: &[],
         init_mem: &[],
+        init: None,
         reserved_log2: temen_ir::DEFAULT_RESERVED_LOG2,
         fuel: budget,
         snapshot_cap: None,
@@ -374,31 +375,97 @@ block 1 (vi: i64) {
     }
 }
 
-/// A program outside the scope (here a page op, which would move the JIT's page map past the
-/// kernel's) is declined by its clause before anything is taken from its host.
-#[test]
-fn a_page_op_is_declined_by_its_clause() {
-    let src = "memory 16
-func () -> (i64) {
-block 0 () {
+/// #2958 slice 3 — the root makes `page` (`map`, `unmap` or `protect` with its operands) through
+/// the address-space capability (handle 0), then a spawned vCPU makes `op` at `addr` (as
+/// [`op_in_thread`]) on the page it changed, and the root returns what the vCPU's op answered.
+fn page_then(handle: i32, page: &str, op: &str, addr: u64) -> String {
+    let (cap_op, args, sig) = match page {
+        "map" => (
+            0,
+            format!("i64.const {addr}\n  vl = i64.const 4096\n  vp = i64.const 3"),
+            3,
+        ),
+        "unmap" => (1, format!("i64.const {addr}\n  vl = i64.const 4096"), 2),
+        "protect_none" => (
+            2,
+            format!("i64.const {addr}\n  vl = i64.const 4096\n  vp = i64.const 0"),
+            3,
+        ),
+        _ => (
+            2,
+            format!("i64.const {addr}\n  vl = i64.const 4096\n  vp = i64.const 1"),
+            3,
+        ),
+    };
+    let (params, operands) = match sig {
+        3 => ("i64, i64, i64", "va, vl, vp"),
+        _ => ("i64, i64", "va, vl"),
+    };
+    let thread = op_in_thread(op, addr);
+    let child = &thread[thread
+        .find("func (i64, i64)")
+        .expect("the thread's function")..];
+    format!(
+        "memory 16
+func () -> (i64) {{
+block 0 () {{
+  vc = i32.const {handle}
+  va = {args}
+  vpr = call.cap 5 {cap_op} ({params}) -> (i64) vc({operands})
   vz = i64.const 0
   vh = thread.spawn 1 vz vz
-  vc = i32.const 0
-  va = i64.const 65536
-  vl = i64.const 4096
-  vp = i64.const 3
-  vr = call.cap 5 0 (i64, i64, i64) -> (i64) vc(va, vl, vp)
-  return vr
-  }
+  vst, vv = thread.join vh
+  return vv
+  }}
+}}
+{child}"
+    )
 }
-func (i64, i64) -> (i64) {
-block 0 (va: i64, vb: i64) {
-  return va
-  }
-}
-";
-    let m = module(src);
-    assert_eq!(jit_kernel::run_fresh(&m, 0, &[], None).err(), Some("cap"));
+
+/// #2958 slice 3 — a guest's `map`, `unmap` and `protect` come into the kernel's scope (the `cap`
+/// clause's page-op part is gone), and a wait or a notify on the page each changed answers as the
+/// oracle's and today's JIT's do, on both routes: the kernel reads the window through the one page
+/// map its page ops write.
+/// The [`page_then`] cases: a page op, a futex op on its page, the page, and the answer every route
+/// gives. A page of the declared window (64 KiB), above the NULL guard, and one of the reserved tail.
+const PAGE_CASES: [(&str, &str, u64, Result<i64, &str>); 10] = [
+    // A tail page `map`ped read-write: a wait reads its 0 and times out (2); a notify wakes none.
+    ("map", "wait", 1 << 20, Ok(2)),
+    ("map", "notify", 1 << 20, Ok(0)),
+    // An `unmap`ped page: a wait faults; a notify reads no memory and wakes none.
+    ("unmap", "wait", 32768, Err("MemoryFault")),
+    ("unmap", "notify", 32768, Ok(0)),
+    // A page `protect`ed to nothing: likewise.
+    ("protect_none", "wait", 32768, Err("MemoryFault")),
+    ("protect_none", "notify", 32768, Ok(0)),
+    // A page `protect`ed read-only: a wait reads it.
+    ("protect_ro", "wait", 32768, Ok(2)),
+    ("protect_ro", "notify", 32768, Ok(0)),
+    // An `unmap` of a tail page never mapped: a wait there still faults.
+    ("unmap", "wait", 1 << 20, Err("MemoryFault")),
+    ("unmap", "notify", 1 << 20, Ok(0)),
+];
+
+/// #2958 slice 3 — a guest's `map`, `unmap` and `protect` come into the kernel's scope (the `cap`
+/// clause's page-op part is gone), and a wait or a notify on the page each changed answers as the
+/// oracle's and today's JIT's do: the kernel reads the window through the one page map its page ops
+/// write.
+#[test]
+fn a_page_op_then_a_futex_op_on_its_page_answers_as_the_oracle_on_both_routes() {
+    fn case<const N: usize>(handle: i32) -> temen_ir::Module {
+        let (page, op, addr, _) = PAGE_CASES[N];
+        module(&page_then(handle, page, op, addr))
+    }
+    macro_rules! each {
+        ($($n:literal)*) => {[$((case::<$n> as fn(i32) -> temen_ir::Module, $n)),*]};
+    }
+    for (make, n) in each!(0 1 2 3 4 5 6 7 8 9) {
+        let (page, op, addr, want) = PAGE_CASES[n];
+        let want: Answer = want.map(|v| vec![v]).map_err(str::to_string);
+        for (route, got) in granted(make, Host::grant_memory) {
+            assert_eq!(got, want, "{route}: {page} then {op} at {addr:#x}");
+        }
+    }
 }
 
 /// Eight threads counting 1,000 each, joined and summed.
@@ -661,21 +728,45 @@ fn bounded<T: Send + 'static>(what: &str, f: impl FnOnce() -> T + Send + 'static
 /// hung on it. Both routes now refuse the borrow as the oracle does.
 #[test]
 fn a_host_procedures_write_into_a_readonly_page_is_refused_on_both_routes() {
+    let want: Answer = Ok(vec![-14]);
+    for (route, got) in granted(ro_write, grant_writer) {
+        assert_eq!(got, want, "{route}");
+    }
+}
+
+/// How a run ended, as the three routes all spell it: its results, or the trap's name.
+type Answer = Result<Vec<i64>, String>;
+
+/// Run the program `make(handle)` makes on the oracle, the kernel route (asserting it ran there) and
+/// today's route, each over a host `grant` granted one capability, `handle`, beside what that route's
+/// host holds. Each JIT route runs on a thread of its own and must end within [`PROMPT`].
+fn granted(
+    make: fn(i32) -> temen_ir::Module,
+    grant: fn(&mut Host) -> i32,
+) -> [(&'static str, Answer); 3] {
     use temen_interp::Value;
-    // The oracle.
+    let values = |v: Vec<Value>| -> Vec<i64> {
+        v.into_iter()
+            .map(|x| match x {
+                Value::I64(n) => n,
+                other => panic!("{other:?}"),
+            })
+            .collect()
+    };
     let mut host = Host::new();
-    let m = ro_write(grant_writer(&mut host));
-    let oracle = temen_interp::run_with_host(&m, 0, &[], &mut 1_000_000, &mut host);
-    assert_eq!(oracle, Ok(vec![Value::I64(-14)]), "the oracle refuses it");
-    // The kernel route, asserting it ran there.
-    let kernel = bounded("the kernel route", || {
+    let m = make(grant(&mut host));
+    let oracle = temen_interp::run_with_host(&m, 0, &[], &mut 1_000_000, &mut host)
+        .map(values)
+        .map_err(|t| format!("{t:?}"));
+    let kernel = bounded("the kernel route", move || {
         let mut host = Host::new();
-        let m = ro_write(grant_writer(&mut host));
+        let m = make(grant(&mut host));
         let admitted = jit_kernel::admit(&m, &host, None, false).expect("in the kernel's scope");
         let start = jit_kernel::Start {
             entry: 0,
             args: &[],
             init_mem: &[],
+            init: None,
             reserved_log2: temen_ir::DEFAULT_RESERVED_LOG2,
             fuel: u64::MAX,
             snapshot_cap: None,
@@ -683,36 +774,43 @@ fn a_host_procedures_write_into_a_readonly_page_is_refused_on_both_routes() {
         };
         let end = jit_kernel::run(admitted, start, &mut host).expect("compiles");
         assert!(end.vcpus >= 1, "it ran as kernel tasks");
-        end.result
+        end.result.map_err(|t| format!("{t:?}"))
     });
-    assert_eq!(kernel, Ok(vec![-14]), "the kernel route");
     // Today's route: a run that keeps its code is declined by the kernel (`kept code`), so it runs on
     // the JIT's own runtime, whose window start seeds the host's page map (`window_aliases`).
-    let today = bounded("today's route", || {
+    let today = bounded("today's route", move || {
         let handle = std::cell::Cell::new(0);
-        let probe = temen_run::instantiate(ro_write(0)).expect("instantiate");
         let cfg = temen_run::RunConfig {
             jit_code: Some(temen_run::JitCodeCache::default()),
             ..temen_run::RunConfig::default()
         };
-        // The powerbox grants its own handles first: learn the procedure's, then run the program
-        // that names it.
-        let mut learn = |h: &mut Host| handle.set(grant_writer(h));
-        // (Its own call, through handle 0, is refused: only the handle is wanted.)
+        // The powerbox grants its own handles first: learn the one `grant` adds, then run the
+        // program that names it. (The probe's own run is not wanted.)
+        let mut learn = |h: &mut Host| handle.set(grant(h));
+        let probe = temen_run::instantiate(make(0)).expect("instantiate");
         let _ =
             probe.run_with_caps_and_host(temen_run::Backend::TreeWalk, &cfg, &[], Some(&mut learn));
-        let mut grant = |h: &mut Host| {
-            grant_writer(h);
+        let mut again = |h: &mut Host| {
+            grant(h);
         };
-        temen_run::instantiate(ro_write(handle.get()))
+        let ran = temen_run::instantiate(make(handle.get()))
             .expect("instantiate")
-            .run_with_caps_and_host(temen_run::Backend::Jit, &cfg, &[], Some(&mut grant))
-            .expect("runs")
-            .outcome
+            .run_with_caps_and_host(temen_run::Backend::Jit, &cfg, &[], Some(&mut again));
+        match ran {
+            Ok(r) => match r.outcome {
+                temen_run::Outcome::Returned(v) => Ok(values(v)),
+                o => panic!("{o:?}"),
+            },
+            // "guest trapped (MemoryFault) — …": the trap's name.
+            Err(e) => Err(e
+                .split_once('(')
+                .and_then(|(_, rest)| rest.split_once(')'))
+                .map_or(e.clone(), |(name, _)| name.to_string())),
+        }
     });
-    assert_eq!(
-        today,
-        temen_run::Outcome::Returned(vec![Value::I64(-14)]),
-        "today's route"
-    );
+    [
+        ("the oracle", oracle),
+        ("the kernel route", kernel),
+        ("today's route", today),
+    ]
 }
