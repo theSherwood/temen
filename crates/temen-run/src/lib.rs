@@ -5182,9 +5182,10 @@ impl MprotectWindow {
     /// Mirror a §13 alias in the software page state: each page of `pages` is committed (RW or RO,
     /// for in-call §7 borrow checks) and names the bytes of `region` it aliases, from `region_off`
     /// on — what a freeze records in place of the page's bytes (#2025). Called once the alias's
-    /// mapping is in, never for a refused one. #2958 slice 4 — `region`'s backing is recorded first
-    /// ([`temen_interp::CapPages::record_region`]), so a reader that sees a page `Backed` finds the
-    /// region it keys a futex word on.
+    /// mapping is in, never for a refused one, under the map's lock `map`, which the caller held
+    /// across the mapping. #2958 slice 4 — the caller has recorded `region`'s backing
+    /// ([`temen_interp::CapPages::record_region`]) before, so a reader that sees a page `Backed`
+    /// finds the region it keys a futex word on.
     fn mark_backed(
         &self,
         map: &mut BTreeMap<u64, PageState>,
@@ -5271,25 +5272,33 @@ impl MprotectWindow {
 
     /// **The one way a page op changes the window's hardware** (#2958 slice 3), and the contract
     /// every host-side reader of the window rests on: **a page readable in the page map is readable
-    /// in hardware.** The page op's `revoke` first takes from the map whatever access the op takes
-    /// away, then `hw` changes each run of `runs` (page indices) in hardware, then `grant` gives each
-    /// of their pages its new state in the map, once the hardware has it. So the map is never ahead of
-    /// the hardware: a reader that checks the map and loads under one hold of the map's lock
-    /// ([`temen_interp::FutexWindow::wait_word`]) either sees the page revoked, or loads before the
-    /// revoking call, which waits for its lock to write the map first (the lock's release orders
-    /// the load before the call). A grant the reader misses answers a fault the guest raced itself
-    /// into. Host code that borrows guest memory under the `Host` lock trusts the map the same way.
-    /// A hardware call the OS refuses (`ENOMEM` past `vm.max_map_count`, #2268) stops the op with
-    /// the map granting no more than the hardware may: `-ENOMEM`, and no grant.
+    /// in hardware for as long as the reader holds the map's lock.** Every change to the window's
+    /// hardware keeps it in one of two ways: it revokes the page in the map before it changes the
+    /// hardware and grants the new state only once the hardware has it, or it holds the map's lock
+    /// across the hardware change and the map's update, so no reader sees the two apart. A reader
+    /// that checks the map and loads under one hold of the lock
+    /// ([`temen_interp::FutexWindow::wait_word`]) therefore never loads a page the hardware lacks.
+    /// A grant the reader misses answers a fault the guest raced itself into. Host code that borrows
+    /// guest memory under the `Host` lock trusts the map the same way, since every page op runs
+    /// under that lock too.
     ///
-    /// Every hardware change of a page op goes through here: [`GuestMem::map`], `unmap`, `protect`,
-    /// and the §13 alias drop ([`MprotectWindow::drop_aliases`]). The other calls that change the
-    /// window's hardware, each named with why it keeps the contract: a §13 `map_region` (on unix
-    /// it holds the map's lock across its replacement; on windows it revokes each granule in the
-    /// map first), a demand-paged child's `supply`
-    /// (grants only, hardware first), and outside this type the window's start
-    /// (`CompiledModule::seed_window`, before any reader), a snapshot's `restore_rw` (grants, after
-    /// every vCPU has gone), and a fork's copy (a new window).
+    /// Here the page op's `revoke` first takes from the map whatever access the op takes away, then
+    /// `hw` changes each run of `runs` (page indices) in hardware, then `grant` gives each of their
+    /// pages its new state in the map. A hardware call the OS refuses (`ENOMEM` past
+    /// `vm.max_map_count`, #2268) stops the op with the map granting no more than the hardware may:
+    /// `-ENOMEM`, and no grant.
+    ///
+    /// Each change to the window's hardware, and how it keeps the contract:
+    /// - [`GuestMem::map`], `unmap`, `protect` and the §13 alias drop
+    ///   ([`MprotectWindow::drop_aliases`]): here, revoke first;
+    /// - a §13 `map_region` on unix: holds the lock across its `MAP_FIXED` replacement, which is
+    ///   not atomic to a concurrent reader on every OS (macOS);
+    /// - a §13 `map_region` on windows: revokes each granule first, then grants once every view
+    ///   is in;
+    /// - a demand-paged child's `supply`: grants only, hardware first;
+    /// - outside this type, the window's start (`CompiledModule::seed_window`, before any reader),
+    ///   a snapshot's `restore_rw` (grants, after every vCPU has gone), and a fork's copy (a new
+    ///   window).
     fn reprotect(
         &mut self,
         runs: &[(u64, u64)],
@@ -5681,9 +5690,6 @@ impl GuestMem for MprotectWindow {
         region: u32,
         backing: RegionBacking,
     ) -> i64 {
-        // #2958 slice 4 — the backing's identity, which the page map keys a region word on: recorded
-        // first, so the identity lock is never taken under the page map's.
-        self.prot.record_region(region, &backing);
         #[cfg(unix)]
         {
             const PROT_READ: i32 = 1;
@@ -5720,6 +5726,11 @@ impl GuestMem for MprotectWindow {
             // reader runs outside the `Host` lock this call holds; the guest's own loads that race
             // it fault into the guest. A refused `mmap` leaves the window, and so its map, as they
             // were.
+            // #2958 slice 4 — the backing's identity, which the page map keys a region word on, is
+            // recorded once the call is valid and before the map's lock is taken, so the identity
+            // lock is never taken under it. (A refused `mmap` leaves the entry, which keys nothing
+            // until a page of the region is `Backed`.)
+            self.prot.record_region(region, &backing);
             let mut map = self.prot.lock();
             // SAFETY: `[base+start, +plen) ⊆` the reserved window (validated by `prot_pages`).
             // `MAP_FIXED` replaces those reserved pages with a shared mapping of the region fd at
@@ -5794,6 +5805,8 @@ impl GuestMem for MprotectWindow {
             } else {
                 PAGE_READONLY
             };
+            // The backing's identity, recorded as on unix: once valid, outside the map's lock.
+            self.prot.record_region(region, &backing);
             // SAFETY: GetCurrentProcess returns the current-process pseudo-handle; always safe.
             let proc = unsafe { GetCurrentProcess() };
             // Map one allocation granule at a time so each free-to-placeholder targets a single,

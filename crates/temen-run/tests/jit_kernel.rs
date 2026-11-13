@@ -2041,11 +2041,15 @@ fn a_wait_racing_a_map_over_its_alias_never_faults_the_host() {
     std::thread::scope(|s| {
         let _stop = Spinners(&spinners);
         spin(s, &spinners);
-        for (route, answer) in by_instance(replacing, grant_region, false, None) {
-            assert!(
-                matches!(&answer, Ok(v) if v == &[0]) || answer == Err("MemoryFault".into()),
-                "{route}: {answer:?}"
-            );
+        // Many runs in one execution: the swap's window is narrow, and a host fault ends the
+        // process (#3003's tripwire), so this is the one place a reader meeting it shows.
+        for run in 0..10 {
+            for (route, answer) in by_instance(replacing, grant_region, false, None) {
+                assert!(
+                    matches!(&answer, Ok(v) if v == &[0]) || answer == Err("MemoryFault".into()),
+                    "run {run}, {route}: {answer:?}"
+                );
+            }
         }
     });
 }
