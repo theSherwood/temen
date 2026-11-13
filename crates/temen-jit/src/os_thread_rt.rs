@@ -3970,6 +3970,40 @@ mod tests {
         assert!(!dom.try_child_start(), "past the ceiling");
         assert_eq!(dom.live_vcpus(), MAX_VCPUS, "a refusal takes no slot");
     }
+
+    /// #2953 — a run's end leaves the domain as a fresh one: the handles it issued retire, a slot's
+    /// next handle is the one a fresh table issues, and the next spawn is task 1 again.
+    #[test]
+    fn a_run_s_end_leaves_the_domain_fresh() {
+        let fresh = Domain::new(None);
+        let first = lock(&fresh.children.table)
+            .issue(ChildEntry::Thread(Done::new(None)))
+            .expect("a fresh table issues");
+
+        let dom = Domain::new(None);
+        for _ in 0..temen_ir::handles::SLOTS {
+            lock(&dom.children.table)
+                .issue(ChildEntry::Thread(Done::new(None)))
+                .expect("room for every slot");
+            dom.take_task();
+        }
+        assert!(
+            lock(&dom.children.table)
+                .issue(ChildEntry::Thread(Done::new(None)))
+                .is_err(),
+            "the run filled the table"
+        );
+        dom.end_run();
+        assert_eq!(
+            lock(&dom.children.table)
+                .issue(ChildEntry::Thread(Done::new(None)))
+                .ok(),
+            Some(first),
+            "the next run's first handle is a fresh table's"
+        );
+        assert_eq!(dom.take_task(), 1, "the next run's first spawn is task 1");
+        assert_eq!(dom.live_vcpus(), 1, "the root alone is live");
+    }
 }
 
 #[cfg(all(test, loom))]
