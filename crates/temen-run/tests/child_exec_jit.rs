@@ -977,3 +977,95 @@ fn a_grandchild_is_gated_on_the_roots_lane_on_the_jit() {
         assert_eq!(run_jit(&p, &c, &g, 1), want, "run {run}: no overlap");
     }
 }
+
+// ---- #3024 — one compile, many runs ----
+
+/// One compile of `p`, its host and child modules `a`, `b` (lane cap `cap`), run `runs` times; each
+/// run's answer, in order. On a thread of its own, with every run bounded: a run that hangs fails
+/// the test after 30 s, saying which run, rather than stalling the suite.
+fn reused_jit(
+    p: &temen_ir::Module,
+    a: &temen_ir::Module,
+    b: &temen_ir::Module,
+    cap: i64,
+    runs: usize,
+) -> Vec<i64> {
+    let (p, a, b) = (p.clone(), a.clone(), b.clone());
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let (host, h) = host(&a, &b, cap);
+        let mut host = Box::new(host);
+        let hp = &mut *host as *mut Host;
+        let mut cm = temen_jit::CompiledModule::compile(
+            &p,
+            0,
+            temen_run::cap_thunk,
+            hp as *mut c_void,
+            temen_ir::DEFAULT_RESERVED_LOG2,
+            Some(temen_run::module_resolver),
+            None,
+            None,
+            None,
+            None,
+            0,
+        )
+        .expect("jit compile");
+        cm.set_grant_child_hooks(Some(grant_hooks(hp)));
+        let args: Vec<i64> = h.iter().map(|&x| x as i64).collect();
+        for _ in 0..runs {
+            let (jo, _) = cm.run(&args, None, None).expect("jit run");
+            let r = match jo {
+                JitOutcome::Returned(ref v) => v.first().copied().unwrap_or(-1),
+                ref o => panic!("jit ended abnormally: {o:?}"),
+            };
+            if tx.send(r).is_err() {
+                return;
+            }
+        }
+        drop(cm);
+        drop(host);
+    });
+    (1..=runs)
+        .map(|run| {
+            rx.recv_timeout(std::time::Duration::from_secs(30))
+                .unwrap_or_else(|e| panic!("run {run} of one compile did not end: {e:?}"))
+        })
+        .collect()
+}
+
+/// #3024 — a later run of one compile spawns and joins detached children as its first did: the
+/// executor its teardown shut down serves the next run.
+#[test]
+fn a_reused_compile_spawns_and_joins_children_on_every_run() {
+    let p = module(&parent("", TAIL_SUM));
+    let a = module(TRIVIAL);
+    let b = module(TRIVIAL);
+    assert_eq!(reused_jit(&p, &a, &b, -1, 3), vec![0, 0, 0]);
+}
+
+/// #3024 — a child that parks on a later run parks: it is not poisoned by the last run's teardown.
+/// Under a lane cap of 1, A parks and B wakes it (`1001`, the first run's answer).
+#[test]
+fn a_reused_compile_s_child_parks_on_every_run() {
+    let p = module(&parent("", TAIL_SUM));
+    let a = module(&waiter(-1));
+    let b = module(NOTIFIER);
+    assert_eq!(reused_jit(&p, &a, &b, 1, 3), vec![1001, 1001, 1001]);
+}
+
+/// #3024 — sequential: spawn A, join it, then spawn B and join it; `1000·A + B`. On a later run the
+/// pool's worker, which left when the task table emptied after A, must be replaced for B.
+#[test]
+fn a_reused_compile_spawns_a_child_after_joining_one_on_every_run() {
+    let between = "vja_st, vja = call.cap 6 1 (i32) -> (i64, i64) v0 (vca)";
+    let tail = "vjb_st, vjb = call.cap 6 1 (i32) -> (i64, i64) v0 (vcb)
+  vk = i64.const 1000
+  vm = i64.mul vja vk
+  vr = i64.add vm vjb
+  return vr";
+    let p = module(&parent(between, tail));
+    let a = module(TRIVIAL);
+    let b = module(TRIVIAL);
+    assert_eq!(run_interp(&p, &a, &b, -1), 0, "the oracle");
+    assert_eq!(reused_jit(&p, &a, &b, -1, 3), vec![0, 0, 0]);
+}
