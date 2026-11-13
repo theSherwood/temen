@@ -5043,7 +5043,21 @@ impl temen_interp::FutexWindow for MprotectWindow {
         drop(map);
         Some(word)
     }
+    /// Every word's site is its address: no page of a native window is a §13 alias (`jit_kernel`'s
+    /// `region start` and `native_scope`'s `cap` keep every source of one out), so a key on the
+    /// window's own backing is the word's canonical one. A debug build checks it, so a change that
+    /// lets an alias in fails in tests instead of keying a word apart from the region's waiters.
     fn futex_site(&self, base: u64) -> temen_interp::FutexSite {
+        debug_assert!(
+            !matches!(
+                self.prot
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get(&(base / self.page)),
+                Some(PageState::Backed { .. })
+            ),
+            "a native window's page is a §13 alias"
+        );
         temen_interp::FutexSite::Anon(base)
     }
     /// The canonical backing key: the window's reservation (its base, unique while the run holds it)
@@ -9119,7 +9133,7 @@ impl Instance {
         let fuel = config.limits.fuel();
         let reserved_log2 = temen_ir::default_reserved_log2();
         let run = if config.parallel {
-            CoopRun::new_parallel(m, 0, &[], fuel, host, init_mem, reserved_log2, true)
+            CoopRun::new_parallel(m, 0, &[], fuel, host, init_mem, reserved_log2, None, true)
         } else {
             host.set_workers(1); // #2254: the cooperative driver runs every vCPU on one thread
             CoopRun::new_reserved(m, 0, &[], fuel, host, None, init_mem, reserved_log2)

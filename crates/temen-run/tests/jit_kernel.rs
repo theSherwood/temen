@@ -1082,3 +1082,57 @@ block 0 () {{
         "from a fresh start, the wait times out"
     );
 }
+
+/// #2958 slice 3 — no page of a native window is a §13 alias: a root host an embedder staged a
+/// pre-map on (`Host::stage_premap`, the op-17 pre-map) is declined (`region start`), so its
+/// futex words are keyed with the region's other mappings on today's route, as before. (The
+/// interpreters apply an op-17 pre-map to a spawned child's window only, so no oracle answers a root
+/// one.) (A captured layout that aliases a region reaches the same clause: `jit_cap_run`
+/// stages its §13 pages as the host's pre-map, `Host::reset_cap_pages`.)
+#[cfg(unix)]
+#[test]
+fn a_root_with_a_region_premapped_is_declined_and_answers_on_todays_route() {
+    let off = 1u64 << 20;
+    let staged = || {
+        let mut parent = Host::new();
+        parent.set_region_factory(temen_run::new_shared_region);
+        let len = temen_interp::host_region_granularity() as usize;
+        let backing = temen_run::new_shared_region(len).expect("a region");
+        let region = parent.grant_shared_region_backed(backing);
+        let mut root = Host::new();
+        assert!(parent.stage_premap(region, off, &mut root), "staged");
+        root
+    };
+    // A not-equal wait on the pre-mapped page: the region reads zero.
+    let src = format!(
+        "memory 16
+func () -> (i64) {{
+block 0 () {{
+  va = i64.const {off}
+  vx = i32.const 1
+  vto = i64.const 0
+  vk = i32.atomic.wait va vx vto
+  vr = i64.extend_i32_u vk
+  return vr
+  }}
+}}
+"
+    );
+    let m = module(&src);
+    let root = staged();
+    assert_eq!(
+        jit_kernel::admit(&m, &root, None, false).err(),
+        Some("region start"),
+        "the kernel route declines it"
+    );
+    let mut root = root;
+    let init = temen_interp::MemLayout::image(Vec::new());
+    let r = temen_ir::DEFAULT_RESERVED_LOG2;
+    let (today, _) =
+        temen_run::jit_cap_run(&m, 0, &[], &init, r, 0, &mut root, None).expect("today's route");
+    assert_eq!(
+        result(today),
+        Ok(vec![1]),
+        "today's route answers not-equal"
+    );
+}

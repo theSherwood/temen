@@ -341,7 +341,7 @@ fn run_leaf_root(m: &Module, take: Option<bool>) -> (Result<Vec<Value>, Trap>, L
     });
     let declared = m.memory.expect("a window").size_log2;
     let mut run =
-        bytecode::CoopRun::new_parallel(m, 0, &[], 50_000_000, host, &[], declared, false)
+        bytecode::CoopRun::new_parallel(m, 0, &[], 50_000_000, host, &[], declared, None, false)
             .expect("in subset")
             .expect("it starts");
     let end = match run.run() {

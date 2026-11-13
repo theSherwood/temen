@@ -976,9 +976,10 @@ fn run_leaf(
                 ..ThreadPlatform::OS
             });
             let declared = m.memory.expect("a window").size_log2;
-            let run = bytecode::CoopRun::new_parallel(m, 0, &[], FUEL, host, &[], declared, true)
-                .expect("in subset")
-                .expect("entry in range");
+            let run =
+                bytecode::CoopRun::new_parallel(m, 0, &[], FUEL, host, &[], declared, None, true)
+                    .expect("in subset")
+                    .expect("entry in range");
             let ran = drive_leaf(run, requests);
             Ran {
                 tierups: THREAD_TIERUPS.load(Ordering::SeqCst),

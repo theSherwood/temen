@@ -16898,9 +16898,20 @@ impl CoopRun {
         host: Host,
         init_mem: &[u8],
         reserved_log2: u8,
+        back: Option<std::sync::Arc<super::Region>>,
         pump: bool,
     ) -> Option<Result<CoopRun, Trap>> {
-        match Self::open_parallel(m, entry, args, fuel, host, init_mem, reserved_log2, pump) {
+        match Self::open_parallel(
+            m,
+            entry,
+            args,
+            fuel,
+            host,
+            init_mem,
+            reserved_log2,
+            back,
+            pump,
+        ) {
             Ok(run) => Some(Ok(run)),
             Err(refused) => refused.0.map(Err),
         }
@@ -16919,10 +16930,11 @@ impl CoopRun {
         host: Host,
         init_mem: &[u8],
         reserved_log2: u8,
+        back: Option<std::sync::Arc<super::Region>>,
         pump: bool,
     ) -> Result<CoopRun, Box<(Option<Trap>, Host)>> {
         let (source, table, mem) =
-            match parallel_domain(m, entry, &host, reserved_log2, None, init_mem) {
+            match parallel_domain(m, entry, &host, reserved_log2, back, init_mem) {
                 Some(Ok(start)) => start,
                 Some(Err(t)) => return Err(Box::new((Some(t), host))),
                 None => return Err(Box::new((None, host))),

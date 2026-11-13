@@ -365,6 +365,7 @@ fn a_wake_hands_the_pumping_thread_control_back_while_the_run_goes_on() {
                 host,
                 &[],
                 temen_ir::default_reserved_log2(),
+                None,
                 true,
             )
             .expect("the parallel driver runs this module")

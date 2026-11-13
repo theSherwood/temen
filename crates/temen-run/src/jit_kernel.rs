@@ -33,10 +33,13 @@ pub struct Admitted<'m>(&'m Module);
 
 /// Whether `m`, started from `init` under `host`, runs its vCPUs as the kernel's tasks:
 /// `temen_interp::bytecode::native_scope`, plus the start's own clauses:
-/// - **`region start`**: a window started from a captured layout that aliases a §13 region: a
-///   native window keys a futex word on its own backing, so a word on an alias would not
-///   rendezvous with the region's other mappings (the phase that brings §13 regions onto this
-///   route, as `native_scope`'s `cap` clause declines their ops).
+/// - **`region start`**: a window that would start with a §13 region aliased into it: a captured
+///   layout that aliases one, or a host with a pre-map to apply (an op-17 pre-map an embedder
+///   staged, or a thaw's §13 pages, `Host::has_premap`). A native window keys a futex word on its
+///   own backing, so a word on an alias would not rendezvous with the region's other mappings. With
+///   this clause and `native_scope`'s `cap` (which declines every op that maps a region), no page of
+///   a native window is ever an alias. The phase that brings §13 regions onto this route removes
+///   both.
 /// - **`kept code`**: the embedder keeps the run's compile for later runs (a `JitCodeCache`,
 ///   #2389), whose shared code the kernel route does not instance yet (#2981).
 ///
@@ -48,7 +51,7 @@ pub fn admit<'m>(
     kept_code: bool,
 ) -> Result<Admitted<'m>, &'static str> {
     temen_interp::bytecode::native_scope(m, host)?;
-    if init.is_some_and(temen_interp::MemLayout::aliases_regions) {
+    if host.has_premap() || init.is_some_and(temen_interp::MemLayout::aliases_regions) {
         return Err("region start");
     }
     if kept_code {
@@ -310,6 +313,7 @@ pub fn run(
         std::mem::take(host),
         &[], // the window is the tier's, started above
         reserved.trailing_zeros() as u8,
+        None,
         false,
     );
     let mut co = match opened {
