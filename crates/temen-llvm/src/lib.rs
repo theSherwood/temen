@@ -15787,44 +15787,95 @@ fn lower_int_intrinsic(
         return Ok(Some(ctx.vec_pack(lanes[0], lanes[1], ValType::I32)));
     }
     let ty = int_ty(val_type(args[0].get_type(types).as_ref())?)?;
-    // A **narrow** (< i32) operand sits in an i32 container whose high bits are unspecified — e.g. a
-    // non-canonical `add i8 x, -1` (the narrow `bin` path doesn't mask power-of-two widths). min/max
-    // selects via an i32 compare, so — exactly like `ICmp` (§3b narrow-int hazard) — the operands must
-    // first be canonically extended: sign- for signed min/max, zero- for unsigned. Without this,
-    // `umin.i8(add i8 x,-1, y)` compares dirty containers and picks the wrong operand (a silent
-    // miscompile — found via Embench `qrduino`). The `Select` then runs on the canonical values, so the
-    // chosen result is canonical too.
-    let narrow = int_bits(args[0].get_type(types).as_ref()).filter(|&w| w < 32);
+    // A **narrow** operand (`i1`–`i31` in an `i32`, `i33`–`i63` in an `i64`) sits zero-extended in
+    // its container (§3b), and these ops read the container. min/max selects via a container
+    // compare, so — exactly like `ICmp` (§3b narrow-int hazard) — the operands are first extended
+    // canonically: sign- for signed min/max, zero- for unsigned. Without this,
+    // `umin.i8(add i8 x,-1, y)` compared dirty containers and picked the wrong operand (a silent
+    // miscompile — found via Embench `qrduino`), and `smax.i48(-20, 5)` picked `-20` (#3016). A
+    // signed pick is sign-filled, so it is made canonical again.
+    let cw = if ty == IntTy::I64 { 64 } else { 32 };
+    let width = int_bits(args[0].get_type(types).as_ref()).unwrap_or(cw);
+    let narrow = width < cw;
     let cmp_select = |ctx: &mut BlockCtx, op: CmpOp, signed: bool| -> Result<ValIdx, Error> {
         let mut a = ctx.operand(args[0])?;
         let mut b = ctx.operand(args[1])?;
-        if let Some(w) = narrow {
-            a = emit_ext(ctx, a, w, 32, signed);
-            b = emit_ext(ctx, b, w, 32, signed);
+        if narrow {
+            a = emit_ext(ctx, a, width, cw, signed);
+            b = emit_ext(ctx, b, width, cw, signed);
         }
         let cond = ctx.push(Inst::IntCmp { ty, op, a, b });
-        Ok(ctx.push(Inst::Select { cond, a, b }))
+        let r = ctx.push(Inst::Select { cond, a, b });
+        Ok(if signed { canonical(ctx, r, width) } else { r })
     };
-    let unop = |ctx: &mut BlockCtx, op: IntUnOp| -> Result<ValIdx, Error> {
-        let a = ctx.operand(args[0])?;
-        Ok(ctx.push(Inst::IntUn { ty, op, a }))
+    let k = |ctx: &mut BlockCtx, n: i64| {
+        if ty == IntTy::I64 {
+            ctx.const_i64(n)
+        } else {
+            ctx.push(Inst::ConstI32(n as i32))
+        }
     };
     let idx = match base {
         "llvm.smax" => cmp_select(ctx, CmpOp::GtS, true)?,
         "llvm.smin" => cmp_select(ctx, CmpOp::LtS, true)?,
         "llvm.umax" => cmp_select(ctx, CmpOp::GtU, false)?,
         "llvm.umin" => cmp_select(ctx, CmpOp::LtU, false)?,
-        "llvm.ctlz" => unop(ctx, IntUnOp::Clz)?,
-        "llvm.cttz" => unop(ctx, IntUnOp::Ctz)?,
-        "llvm.ctpop" => unop(ctx, IntUnOp::Popcnt)?,
-        // abs(x) = select(x < 0, 0 - x, x).
-        "llvm.abs" => {
-            let x = ctx.operand(args[0])?;
-            let zero = ctx.push(if ty == IntTy::I64 {
-                Inst::ConstI64(0)
-            } else {
-                Inst::ConstI32(0)
+        // The container's bit counts, at the operand's width: a narrow value's leading zeros
+        // include the container's high bits, which come off, and a narrow zero's trailing zeros
+        // stop at a bit set at the width (#3016: `ctlz.i16(1)` was 31, `cttz.i16(0)` 32). A
+        // popcount needs neither.
+        "llvm.ctlz" => {
+            let a = ctx.operand(args[0])?;
+            let r = ctx.push(Inst::IntUn {
+                ty,
+                op: IntUnOp::Clz,
+                a,
             });
+            if narrow {
+                let high = k(ctx, (cw - width) as i64);
+                ctx.push(Inst::IntBin {
+                    ty,
+                    op: BinOp::Sub,
+                    a: r,
+                    b: high,
+                })
+            } else {
+                r
+            }
+        }
+        "llvm.cttz" => {
+            let mut a = ctx.operand(args[0])?;
+            if narrow {
+                let stop = k(ctx, 1i64 << width);
+                a = ctx.push(Inst::IntBin {
+                    ty,
+                    op: BinOp::Or,
+                    a,
+                    b: stop,
+                });
+            }
+            ctx.push(Inst::IntUn {
+                ty,
+                op: IntUnOp::Ctz,
+                a,
+            })
+        }
+        "llvm.ctpop" => {
+            let a = ctx.operand(args[0])?;
+            ctx.push(Inst::IntUn {
+                ty,
+                op: IntUnOp::Popcnt,
+                a,
+            })
+        }
+        // abs(x) = select(x < 0, 0 - x, x), with a narrow `x` sign-extended first and the result
+        // made canonical again (#3016: `abs.i16(-20)` was 65516).
+        "llvm.abs" => {
+            let mut x = ctx.operand(args[0])?;
+            if narrow {
+                x = emit_ext(ctx, x, width, cw, true);
+            }
+            let zero = k(ctx, 0);
             let cond = ctx.push(Inst::IntCmp {
                 ty,
                 op: CmpOp::LtS,
@@ -15837,7 +15888,8 @@ fn lower_int_intrinsic(
                 a: zero,
                 b: x,
             });
-            ctx.push(Inst::Select { cond, a: neg, b: x })
+            let r = ctx.push(Inst::Select { cond, a: neg, b: x });
+            canonical(ctx, r, width)
         }
         // `llvm.fshl(a, b, s)` / `fshr`: funnel shift. The **rotate idiom** (the two value operands
         // identical — what clang emits for `(x<<n)|(x>>(w-n))`, e.g. SHA-256's `ROTRIGHT`) lowers to
@@ -15957,12 +16009,8 @@ fn lower_int_intrinsic(
                     })
                 };
                 // A narrow funnel/rotate result lives in a wider container; mask off bits ≥ `w` so the
-                // value stays canonical (`mask_to` is a no-op at `w == 32`; `w == 64` fills its i64).
-                if w <= 32 {
-                    mask_to(ctx, r, w)
-                } else {
-                    r
-                }
+                // value stays canonical.
+                canonical(ctx, r, w)
             }
         }
         // `llvm.bswap` — reverse the value's bytes inline (no Temen op): each source byte `i` is
@@ -16087,7 +16135,12 @@ fn lower_int_intrinsic(
                     }
                     _ => unreachable!(),
                 };
-                return Ok(Some(idx));
+                // A signed clamp is sign-filled: canonical again (#3016).
+                return Ok(Some(if signed {
+                    canonical(ctx, idx, bits)
+                } else {
+                    idx
+                }));
             }
             if bits != 32 && bits != 64 {
                 return unsup(format!("`{name}` (only i8/i16/i32/i64 saturating)"));
@@ -16461,11 +16514,12 @@ fn lower_vector_reduce(
     let vty = vec_op.get_type(types);
     let signed = matches!(kind, "smax" | "smin");
     // The fold runs in the lane scalar type: `i32` for i8/i16/i32 lanes (narrow lanes widen, §3b —
-    // the result is consumed truncated to the lane width, and modular add/mul stays exact), `i64`
-    // for i64 lanes. A signed min/max needs sign-extended narrow lanes so the `i32` compare orders
-    // them correctly; every other reduce is bit-identical under zero-extension. The lanes come from a
-    // 128-bit `v128` directly, or — for a **wide** (>128-bit) vector (`<8 x i64>` in Postgres'
-    // `pg_popcount_avx512`) — every lane of every `v128` chunk plus the scalar tail.
+    // modular add/mul stays exact in the low bits, and the result is made canonical at the lane
+    // width: a carry or a signed pick's sign fill would otherwise reach its unsigned readers,
+    // #3016), `i64` for i64 lanes. A signed min/max needs sign-extended narrow lanes so the `i32`
+    // compare orders them correctly; every other reduce is bit-identical under zero-extension. The
+    // lanes come from a 128-bit `v128` directly, or — for a **wide** (>128-bit) vector (`<8 x i64>`
+    // in Postgres' `pg_popcount_avx512`) — every lane of every `v128` chunk plus the scalar tail.
     let (lane_ty, lanes): (IntTy, Vec<ValIdx>) = if let Some(layout) = wide_vec_layout(vty.as_ref())
     {
         if layout.shape.is_float() {
@@ -16535,7 +16589,8 @@ fn lower_vector_reduce(
         "umin" => fold_minmax(ctx, CmpOp::LtU),
         other => return unsup(format!("vector.reduce.{other}")),
     };
-    Ok(Some(r))
+    let lane_bits = vec_int_lane_bits(vty.as_ref()).unwrap_or(64);
+    Ok(Some(canonical(ctx, r, lane_bits)))
 }
 
 /// Emit an inline byte-reverse of `v` (`ty`-wide, `nbytes` bytes): OR together, for each source byte
@@ -21387,13 +21442,15 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
             let op = icmp_op(x.predicate);
             let mut a = ctx.operand(&x.operand0)?;
             let mut b = ctx.operand(&x.operand1)?;
-            // A **narrow** (< i32) operand sits in an i32 container whose high bits are unspecified
-            // (e.g. a zero-extended `i16` load of a *signed* value) — the i32 compare needs it
-            // canonically extended: sign-extended for a signed predicate, zero-extended otherwise.
-            // Without this, `icmp slt i16 (zext-loaded), 0` is always false (§3b narrow-int hazard).
+            // A **narrow** operand (`i1`–`i31` in an `i32`, `i33`–`i63` in an `i64`) sits
+            // zero-extended in its container (e.g. a zero-extending `i16` load of a *signed*
+            // value) — the container compare needs it canonically extended: sign-extended for a
+            // signed predicate, zero-extended otherwise. Without this,
+            // `icmp slt i16 (zext-loaded), 0` is always false (§3b narrow-int hazard), and so was
+            // `icmp slt i48` until #3016.
             // (i32/i64/pointer operands are already full-width.)
             if let Some(w) = int_bits(x.operand0.get_type(types).as_ref()) {
-                if w < 32 {
+                if w < 64 && w != 32 {
                     let signed = matches!(
                         x.predicate,
                         IntPredicate::SLT
@@ -21401,8 +21458,9 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
                             | IntPredicate::SGT
                             | IntPredicate::SGE
                     );
-                    a = emit_ext(ctx, a, w, 32, signed);
-                    b = emit_ext(ctx, b, w, 32, signed);
+                    let cw = if w < 32 { 32 } else { 64 };
+                    a = emit_ext(ctx, a, w, cw, signed);
+                    b = emit_ext(ctx, b, w, cw, signed);
                 }
             }
             (&x.dest, ctx.push(Inst::IntCmp { ty, op, a, b }))
@@ -23036,27 +23094,34 @@ fn bin<'d>(
     // `qrduino`). 32-/64-bit ops are exact in their container, so nothing to do.
     let r = match width {
         Some(w)
-            if w < 64
-                && matches!(
-                    op,
-                    BinOp::Add
-                        | BinOp::Sub
-                        | BinOp::Mul
-                        | BinOp::Shl
-                        | BinOp::ShrS
-                        | BinOp::DivS
-                        | BinOp::RemS
-                ) =>
+            if matches!(
+                op,
+                BinOp::Add
+                    | BinOp::Sub
+                    | BinOp::Mul
+                    | BinOp::Shl
+                    | BinOp::ShrS
+                    | BinOp::DivS
+                    | BinOp::RemS
+            ) =>
         {
-            if w <= 32 {
-                mask_to(ctx, r, w)
-            } else {
-                mask_to_i64(ctx, r, w)
-            }
+            canonical(ctx, r, w)
         }
         _ => r,
     };
     Ok((dest, r))
+}
+
+/// A narrow `iN` value in its canonical form (§3b): its low `n` bits, zero-extended in its
+/// container, `i1`–`i31` in an `i32` and `i33`–`i63` in an `i64`; the identity at 32 and 64. Every
+/// producer whose result can carry bits at or above `n` (a carry, a sign fill) ends with it, so an
+/// unsigned consumer reads the container as it is and a signed one sign-extends it first (#3016).
+fn canonical(ctx: &mut BlockCtx, v: ValIdx, n: u32) -> ValIdx {
+    match n {
+        0..=31 => mask_to(ctx, v, n),
+        33..=63 => mask_to_i64(ctx, v, n),
+        _ => v,
+    }
 }
 
 /// Mask an `i64`-container value to its low `n` bits (`n` in `33..=63`) — the canonical form of an
@@ -23146,7 +23211,9 @@ fn fp_binop<'d>(
     fbin(ctx, dest, ty, op, o0, o1)
 }
 
-/// Emit a (saturating) float→int conversion, returning its result index.
+/// Emit a (saturating) float→int conversion, returning its result index. It converts at the
+/// container's width, so a narrow result (`fptosi float -20.0 to i16`, sign-filled) is masked to
+/// its canonical form (§3b, #3016).
 fn ftoi(
     ctx: &mut BlockCtx,
     operand: &Operand,
@@ -23156,14 +23223,20 @@ fn ftoi(
 ) -> Result<ValIdx, Error> {
     let src = float_ty(val_type(operand.get_type(types).as_ref())?)?;
     let dst = int_ty(val_type(to_type.as_ref())?)?;
+    let bits = int_bits(to_type.as_ref())
+        .ok_or_else(|| Error::Unsupported("float conversion to a non-integer".into()))?;
     let a = ctx.operand(operand)?;
-    Ok(ctx.push(Inst::FToISat {
+    let r = ctx.push(Inst::FToISat {
         op: ftoi_op(src, dst, signed),
         a,
-    }))
+    });
+    Ok(canonical(ctx, r, bits))
 }
 
-/// Emit an int→float conversion, returning its result index.
+/// Emit an int→float conversion, returning its result index. It converts the container, where a
+/// narrow source (`i1`–`i31` in an `i32`, `i33`–`i63` in an `i64`) is zero-extended (§3b), so a
+/// signed conversion sign-extends it first: as held, `sitofp i16 -20` is `65516.0`, which put
+/// every glyph that reaches below the baseline outside its box (#3016).
 fn itof(
     ctx: &mut BlockCtx,
     operand: &Operand,
@@ -23173,7 +23246,11 @@ fn itof(
 ) -> Result<ValIdx, Error> {
     let src = int_ty(val_type(operand.get_type(types).as_ref())?)?;
     let dst = float_ty(val_type(to_type.as_ref())?)?;
-    let a = ctx.operand(operand)?;
+    let mut a = ctx.operand(operand)?;
+    let bits = int_bits(operand.get_type(types).as_ref()).unwrap_or(64);
+    if signed && bits < 64 && bits != 32 {
+        a = emit_ext(ctx, a, bits, if bits < 32 { 32 } else { 64 }, true);
+    }
     Ok(ctx.push(Inst::IToFConv {
         op: itof_op(src, dst, signed),
         a,
@@ -23442,24 +23519,23 @@ fn src_bits(op: &Operand, types: &Types) -> Result<u32, Error> {
 }
 
 /// Lower a `trunc from→to`. Narrow values are carried in their `i32`/`i64` container; truncation
-/// drops the high bits, so we mask to `to` bits (within `i32`) or `wrap` (`i64`→`i32`).
+/// drops the high bits: a `wrap` from an `i64` container to an `i32` one, then the canonical form
+/// of `to` bits, which an `i33`–`i63` result needs as much as an `i8` one (#3016).
 fn emit_trunc(ctx: &mut BlockCtx, v: ValIdx, from: u32, to: u32) -> ValIdx {
-    if from <= 32 {
-        // i32 container → i32 container: mask to the low `to` bits.
-        mask_to(ctx, v, to)
-    } else if to <= 32 {
-        let w = ctx.push(Inst::Convert {
+    let v = if from > 32 && to <= 32 {
+        ctx.push(Inst::Convert {
             op: ConvOp::WrapI64,
             a: v,
-        });
-        mask_to(ctx, w, to)
+        })
     } else {
-        v // i64 → i64 (no-op)
-    }
+        v
+    };
+    canonical(ctx, v, to)
 }
 
-/// Lower a `zext`/`sext from→to`. Produces a value whose low `to` bits are the (zero- or sign-)
-/// extended result, in the destination container.
+/// Lower a `zext`/`sext from→to`, giving the extended value in `to`'s canonical form (§3b). A
+/// sign-extension fills the container with the sign, so a narrow `to` (`sext i8 to i16`, `sext i16
+/// to i48`) is masked back to its width (#3016); every other caller extends to the container.
 fn emit_ext(ctx: &mut BlockCtx, v: ValIdx, from: u32, to: u32, signed: bool) -> ValIdx {
     // A non-power-of-two source wider than 32 bits (e.g. an `i56` niche field) sits in an `i64`;
     // extend it **in i64** (the i32 helpers below don't apply). The widening target is always i64.
@@ -23472,12 +23548,13 @@ fn emit_ext(ctx: &mut BlockCtx, v: ValIdx, from: u32, to: u32, signed: bool) -> 
                 a: v,
                 b: sh,
             });
-            ctx.push(Inst::IntBin {
+            let r = ctx.push(Inst::IntBin {
                 ty: IntTy::I64,
                 op: BinOp::ShrS,
                 a: l,
                 b: sh,
-            })
+            });
+            canonical(ctx, r, to)
         } else {
             let m = ctx.const_i64(((1u64 << from) - 1) as i64);
             ctx.push(Inst::IntBin {
@@ -23497,12 +23574,17 @@ fn emit_ext(ctx: &mut BlockCtx, v: ValIdx, from: u32, to: u32, signed: bool) -> 
         mask_to(ctx, v, from)
     };
     if to <= 32 {
-        i32v
+        if signed {
+            canonical(ctx, i32v, to)
+        } else {
+            i32v
+        }
     } else if signed {
-        ctx.push(Inst::Convert {
+        let r = ctx.push(Inst::Convert {
             op: ConvOp::ExtendI32S,
             a: i32v,
-        })
+        });
+        canonical(ctx, r, to)
     } else {
         ctx.push(Inst::Convert {
             op: ConvOp::ExtendI32U,
