@@ -1805,7 +1805,7 @@ fn grant_mmap_fs(h: &mut Host) -> i32 {
 /// #2958 slice 4 review, finding 1 — the guarded read of a §13 alias is the recoverable load: a
 /// wait on an alias whose file was truncated is `MemoryFault` on the kernel route, as on today's,
 /// where it faulted in host code under the page-map lock. (The oracle reads the backing in host
-/// code and dies of SIGBUS: #3028, so it is left out.)
+/// code and dies of SIGBUS: #3005, so it is left out until that is fixed.)
 #[cfg(unix)]
 #[test]
 fn a_wait_on_an_alias_of_a_truncated_file_faults_as_today() {
