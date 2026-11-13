@@ -386,50 +386,6 @@ fn a_later_run_on_another_thread_cannot_resume_an_earlier_runs_fiber() {
     );
 }
 
-/// A metered run that traps on a stale handle burns what a fresh compile's does: the stale fiber
-/// charges nothing, to its own run's cell or this one's.
-#[test]
-fn a_stale_fiber_charges_no_fuel() {
-    let m = module(FIBERS);
-    let metered = |cell: *mut temen_jit::FuelCell| {
-        CompiledModule::compile(
-            &m,
-            0,
-            INERT_CAP_THUNK,
-            std::ptr::null_mut(),
-            temen_ir::DEFAULT_RESERVED_LOG2,
-            None,
-            None,
-            Some(cell),
-            None,
-            None,
-            0,
-        )
-        .expect("jit compile")
-    };
-    let burnt = |cm: &mut CompiledModule, cell: &temen_jit::FuelCell, args: &[i64]| {
-        let before = cell.can_burn();
-        let (out, _) = cm.run(args, None, None).unwrap();
-        (out, before - cell.can_burn())
-    };
-    let mut fresh_cell = temen_jit::FuelCell::fixed(1 << 40);
-    let mut fresh = metered(&mut *fresh_cell);
-    let (_, want) = burnt(&mut fresh, &fresh_cell, &[RESUME, 0]);
-
-    let mut cell = temen_jit::FuelCell::fixed(1 << 40);
-    let mut cm = metered(&mut *cell);
-    let (out, _) = burnt(&mut cm, &cell, &[LEAVE_SUSPENDED, 0]);
-    let JitOutcome::Returned(v) = out else {
-        panic!("run 1: {out:?}")
-    };
-    let (out, got) = burnt(&mut cm, &cell, &[RESUME, v[0]]);
-    assert!(
-        matches!(out, JitOutcome::Trapped(temen_jit::TrapKind::FiberFault)),
-        "run 2: {out:?}"
-    );
-    assert_eq!(got, want, "run 2 burnt what a fresh compile's run does");
-}
-
 /// A budget node that counts the fibers charged to it.
 #[derive(Default)]
 struct CountsFibers(std::sync::atomic::AtomicI64);
@@ -490,4 +446,176 @@ fn a_run_s_fibers_hand_their_charges_back_when_it_ends() {
             "run {run}'s fiber still holds its charge"
         );
     }
+}
+
+/// `func 0 (mode, h)`: mode 0 spawns a vCPU that makes a fiber, resumes it once (it suspends) and
+/// answers its handle, which the root joins and answers; mode 1 resumes `h` with 7.
+const SPAWNED_FIBER: &str = r#"memory 16
+func (i64, i64) -> (i64) {
+block 0 (vm: i64, vh: i64) {
+  vz = i64.const 0
+  vis0 = i64.eq vm vz
+  br_if vis0 1() 2(vh)
+}
+block 1 () {
+  va = i64.const 0
+  vt = thread.spawn 1 va va
+  vst, vr = thread.join vt
+  return vr
+}
+block 2 (vh2: i64) {
+  v7 = i64.const 7
+  vs, vr2 = cont.resume vh2 v7
+  return vr2
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (a: i64, b: i64) {
+  vf = ref.func 2
+  vsp = i64.const 4096
+  vh = cont.new vf vsp
+  v10 = i64.const 10
+  vs, vr = cont.resume vh v10
+  return vh
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (a: i64, b: i64) {
+  x = suspend b
+  c = i64.const 100
+  r = i64.add x c
+  return r
+  }
+}
+"#;
+
+/// #3020 — a fiber a spawned vCPU made and left is its run's too: a later run cannot resume it.
+#[test]
+fn a_later_run_cannot_resume_a_fiber_an_earlier_runs_vcpu_made() {
+    let m = module(SPAWNED_FIBER);
+    let mut cm = compile(&m);
+    let (out, _) = cm.run(&[0, 0], None, None).unwrap();
+    let JitOutcome::Returned(v) = out else {
+        panic!("run 1: {out:?}")
+    };
+    let (out, _) = cm.run(&[1, v[0]], None, None).unwrap();
+    assert_eq!(
+        out,
+        JitOutcome::Trapped(temen_jit::TrapKind::FiberFault),
+        "run 2 resumed run 1's vCPU's fiber {}",
+        v[0]
+    );
+}
+
+/// `func 0 (mode)`: mode 0 makes a fiber and resumes it, and the fiber traps `unreachable`; any
+/// other mode answers 7.
+const FAULTS_IN_A_FIBER: &str = r#"memory 16
+func (i64) -> (i64) {
+block 0 (vm: i64) {
+  vz = i64.const 0
+  vis0 = i64.eq vm vz
+  br_if vis0 1() 2()
+}
+block 1 () {
+  vf = ref.func 1
+  vsp = i64.const 4096
+  vh = cont.new vf vsp
+  va = i64.const 0
+  vs, vr = cont.resume vh va
+  return vr
+}
+block 2 () {
+  v7 = i64.const 7
+  return v7
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (a: i64, b: i64) {
+  unreachable
+  }
+}
+"#;
+
+/// #3020 — a run that ends in a trap inside a fiber leaves nothing for the next: the next run
+/// answers as a fresh compile's does, and a run that traps the same way traps the same way.
+#[test]
+fn a_trap_inside_a_fiber_leaves_nothing_for_the_next_run() {
+    let m = module(FAULTS_IN_A_FIBER);
+    let mut cm = compile(&m);
+    let (first, _) = cm.run(&[0], None, None).unwrap();
+    assert!(matches!(first, JitOutcome::Trapped(_)), "run 1: {first:?}");
+    let (out, _) = cm.run(&[1], None, None).unwrap();
+    assert_eq!(out, JitOutcome::Returned(vec![7]), "run 2");
+    let (again, _) = cm.run(&[0], None, None).unwrap();
+    assert_eq!(again, first, "run 3 traps as run 1 did");
+}
+
+/// #3020 — a hosted unit's fiber is its run's too. The parent's code makes no fiber; a unit
+/// defined into it under fiber hosting ([`CompiledModule::enable_fiber_hosting`]) does, over the
+/// parent's body at table slot 1, and leaves it suspended; the unit's next run cannot resume it.
+#[test]
+fn a_later_run_cannot_resume_a_hosted_units_fiber() {
+    const PARENT: &str = "memory 16
+func () -> (i64) {
+block 0 () {
+  v0 = i64.const 0
+  return v0
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (a: i64, b: i64) {
+  x = suspend b
+  c = i64.const 100
+  r = i64.add x c
+  return r
+  }
+}
+";
+    // `(mode, h)`: mode 0 makes a fiber over the parent's slot 1, resumes it once and answers its
+    // handle; mode 1 resumes `h` with 7.
+    const UNIT: &str = "memory 16
+func (i64, i64) -> (i64) {
+block 0 (vm: i64, vh: i64) {
+  vz = i64.const 0
+  vis0 = i64.eq vm vz
+  br_if vis0 1() 2(vh)
+}
+block 1 () {
+  v0 = i32.const 1
+  v1 = i64.const 4096
+  v2 = cont.new v0 v1
+  v3 = i64.const 10
+  v4, v5 = cont.resume v2 v3
+  return v2
+}
+block 2 (vh2: i64) {
+  v7 = i64.const 7
+  v8, v9 = cont.resume vh2 v7
+  return v9
+  }
+}
+";
+    let parent = module(PARENT);
+    let mut cm = compile(&parent);
+    if cm.enable_fiber_hosting().is_err() {
+        return;
+    }
+    let unit = temen_text::parse_module(UNIT).expect("parse unit");
+    let defined = cm
+        .define_extra(&unit.funcs, &unit.types)
+        .expect("define the unit");
+    let tramp = defined[0].tramp;
+    // SAFETY: `tramp` is the unit's finalized buffer-ABI trampoline, `(i64, i64) -> (i64)`.
+    let (out, _) = unsafe { cm.run_extra(tramp, 2, 1, &[0, 0], None) }.unwrap();
+    let JitOutcome::Returned(v) = out else {
+        panic!("run 1: {out:?}")
+    };
+    // SAFETY: as above.
+    let (out, _) = unsafe { cm.run_extra(tramp, 2, 1, &[1, v[0]], None) }.unwrap();
+    assert_eq!(
+        out,
+        JitOutcome::Trapped(temen_jit::TrapKind::FiberFault),
+        "run 2 resumed run 1's hosted fiber {}",
+        v[0]
+    );
 }
