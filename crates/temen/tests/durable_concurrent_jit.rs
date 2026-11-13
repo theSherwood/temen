@@ -1702,11 +1702,18 @@ fn a_reused_compile_runs_then_freezes_then_thaws() {
     cm.set_freeze_controller(None);
     cm.set_durable(fresh);
     let (out, win) = cm
-        .run(&args, Some(&init_durable_window(WINDOW, TEST_ARENA)), Some(WINDOW))
+        .run(
+            &args,
+            Some(&init_durable_window(WINDOW, TEST_ARENA)),
+            Some(WINDOW),
+        )
         .expect("run 1");
     assert!(matches!(out, JitOutcome::Returned(_)), "run 1: {out:?}");
     assert_eq!(le_i64(&win, OFF_ROOT), ORACLE, "run 1's result");
-    assert!(cm.take_durable_residue().vcpus.is_empty(), "run 1 froze nothing");
+    assert!(
+        cm.take_durable_residue().vcpus.is_empty(),
+        "run 1 froze nothing"
+    );
 
     // Run 2: frozen at the root's signal; durable still, as run 1's `set_durable` left the module,
     // with nothing to seed.
@@ -1714,10 +1721,18 @@ fn a_reused_compile_runs_then_freezes_then_thaws() {
     *armed.lock().unwrap() = Some(Arc::clone(&fc));
     cm.set_freeze_controller(Some(fc));
     let (_, snap) = cm
-        .run(&args, Some(&init_durable_window(WINDOW, TEST_ARENA)), Some(WINDOW))
+        .run(
+            &args,
+            Some(&init_durable_window(WINDOW, TEST_ARENA)),
+            Some(WINDOW),
+        )
         .expect("run 2");
     *armed.lock().unwrap() = None;
-    assert_eq!(read_state(&snap, TEST_ARENA), STATE_UNWINDING, "run 2 froze");
+    assert_eq!(
+        read_state(&snap, TEST_ARENA),
+        STATE_UNWINDING,
+        "run 2 froze"
+    );
     let residue = cm.take_durable_residue();
     assert_eq!(
         residue.vcpus.len(),
@@ -1738,6 +1753,14 @@ fn a_reused_compile_runs_then_freezes_then_thaws() {
     cm.set_durable(residue);
     let (out, fin) = cm.run(&args, Some(&twin), Some(WINDOW)).expect("thaw");
     assert!(matches!(out, JitOutcome::Returned(_)), "thaw: {out:?}");
-    assert_eq!(read_state(&fin, TEST_ARENA), STATE_NORMAL, "thaw back to NORMAL");
-    assert_eq!(le_i64(&fin, OFF_ROOT), ORACLE, "the thaw reproduces the result");
+    assert_eq!(
+        read_state(&fin, TEST_ARENA),
+        STATE_NORMAL,
+        "thaw back to NORMAL"
+    );
+    assert_eq!(
+        le_i64(&fin, OFF_ROOT),
+        ORACLE,
+        "the thaw reproduces the result"
+    );
 }
