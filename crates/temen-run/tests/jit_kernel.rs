@@ -28,20 +28,21 @@ fn result(o: JitOutcome) -> Result<Vec<i64>, Trap> {
     }
 }
 
-/// Today's JIT's answer.
+/// Today's JIT's answer, within `PROMPT` ([`bounded`]).
 fn today(m: &temen_ir::Module) -> Result<Vec<i64>, Trap> {
-    result(compile_and_run(m, 0, &[]).expect("jit"))
+    let m = m.clone();
+    result(bounded("today's route", move || {
+        compile_and_run(&m, 0, &[]).expect("jit")
+    }))
 }
 
-/// The kernel route's answer, checked to have run its vCPUs as kernel tasks, in under `PROMPT`.
+/// The kernel route's answer, checked to have run its vCPUs as kernel tasks, within `PROMPT`: a run
+/// that hangs fails the test ([`bounded`]).
 fn kernel(m: &temen_ir::Module) -> Result<Vec<i64>, Trap> {
-    let t0 = Instant::now();
-    let (o, vcpus) = jit_kernel::run_fresh(m, 0, &[], None).expect("in the kernel's scope");
-    assert!(
-        t0.elapsed() < PROMPT,
-        "it ended promptly: {:?}",
-        t0.elapsed()
-    );
+    let m = m.clone();
+    let (o, vcpus) = bounded("the kernel route", move || {
+        jit_kernel::run_fresh(&m, 0, &[], None).expect("in the kernel's scope")
+    });
     assert!(vcpus >= 1, "it ran as kernel tasks");
     result(o)
 }
@@ -662,7 +663,11 @@ fn the_kill_door_ends_vcpus_that_only_take_the_futex_fast_paths() {
             *at.lock().unwrap() = Some(Instant::now());
             k.fire();
         });
-        let (o, vcpus) = jit_kernel::run_fresh(&m, 0, &[], Some(&kill)).expect("in scope");
+        // Bounded: a kill that never lands fails the test instead of hanging it.
+        let door = std::sync::Arc::clone(&kill);
+        let (o, vcpus) = bounded("the killed run", move || {
+            jit_kernel::run_fresh(&m, 0, &[], Some(&door)).expect("in scope")
+        });
         let took = fired.lock().unwrap().expect("the kill fired").elapsed();
         watchdog.join().unwrap();
         eprintln!("kill of a {op} loop on the kernel route: {took:?}");
@@ -827,16 +832,18 @@ fn instance_run(
         grant(h);
     };
     let inst = temen_run::instantiate(make(handle.get())).expect("instantiate");
-    if backend == temen_run::Backend::Jit {
-        let kernel = cfg.jit_code.is_none();
-        assert_eq!(
-            inst.kernel_route(cfg).is_ok(),
-            kernel,
-            "the JIT run's route: {:?}",
-            inst.kernel_route(cfg)
-        );
-    }
-    match inst.run_with_caps_and_host(backend, cfg, &[], Some(&mut again)) {
+    let before = jit_kernel::kernel_runs();
+    let ran = inst.run_with_caps_and_host(backend, cfg, &[], Some(&mut again));
+    // The route the run itself took: a JIT run without kept code must be the kernel's, any other
+    // not (`jit_run` falls back to the JIT's own runtime when the kernel declines).
+    let kernel = backend == temen_run::Backend::Jit && cfg.jit_code.is_none();
+    assert_eq!(
+        jit_kernel::kernel_runs() - before,
+        u64::from(kernel),
+        "the run's route (the kernel's: {kernel}; admit says {:?})",
+        inst.kernel_route(cfg)
+    );
+    match ran {
         Ok(r) => match r.outcome {
             temen_run::Outcome::Returned(v) => Ok(v
                 .into_iter()
@@ -1045,22 +1052,26 @@ fn futex_ops_racing_page_ops_never_fault_the_host() {
                 _ => NOTIFY_TURNS,
             };
             for _ in 0..30 {
-                let mut host = Host::new();
-                let m = racing(host.grant_memory(), op, protect, turns);
-                let admitted = jit_kernel::admit(&m, &host, false).expect("in scope");
-                let start = jit_kernel::Start {
-                    entry: 0,
-                    args: &[],
-                    init_mem: &[],
-                    init: None,
-                    reserved_log2: temen_ir::DEFAULT_RESERVED_LOG2,
-                    fuel: u64::MAX,
-                    snapshot_cap: None,
-                    kill: None,
-                };
-                let end = jit_kernel::run(admitted, start, &mut host).expect("compiles");
-                assert!(end.vcpus >= 1, "it ran as kernel tasks");
-                match (op, end.result) {
+                // Bounded: a run that hangs fails the test.
+                let (vcpus, result) = bounded("the race", move || {
+                    let mut host = Host::new();
+                    let m = racing(host.grant_memory(), op, protect, turns);
+                    let admitted = jit_kernel::admit(&m, &host, false).expect("in scope");
+                    let start = jit_kernel::Start {
+                        entry: 0,
+                        args: &[],
+                        init_mem: &[],
+                        init: None,
+                        reserved_log2: temen_ir::DEFAULT_RESERVED_LOG2,
+                        fuel: u64::MAX,
+                        snapshot_cap: None,
+                        kill: None,
+                    };
+                    let end = jit_kernel::run(admitted, start, &mut host).expect("compiles");
+                    (end.vcpus, end.result)
+                });
+                assert!(vcpus >= 1, "it ran as kernel tasks");
+                match (op, result) {
                     ("wait", Err(Trap::MemoryFault)) => {}
                     ("wait", r) => panic!(
                         "wait (protect: {protect}): the root made {WAIT_TURNS} page-op cycles \
@@ -1302,9 +1313,8 @@ block 0 (vn: i64, vz: i64) {{
     ))
 }
 
-/// A host granted a fresh one-granule region (and the factory a guest's own mint would use).
+/// A host granted a fresh one-granule anonymous region.
 fn grant_region(h: &mut Host) -> i32 {
-    h.set_region_factory(temen_run::new_shared_region);
     let len = temen_interp::host_region_granularity() as usize;
     h.grant_shared_region_backed(temen_run::new_shared_region(len).expect("a region"))
 }
@@ -1461,33 +1471,22 @@ fn a_budget_read_and_split_answer_as_the_oracle_on_both_routes() {
     }
 }
 
-/// #2958 slice 4 — the `AddressSpace` mints: `sub` (op 4) mints a child space over a sub-range, and
-/// `create_region` (op 5) a §13 region; the handles each mints, alike on every route.
+/// #2958 slice 4 — the `AddressSpace` `sub` mint (op 4): a child space over a sub-range, its handle
+/// alike on every route. (`create_region`, op 5, under a region factory is declined, `file region`:
+/// [`each_declined_call_names_its_clause`].)
 #[test]
-fn the_address_space_mints_answer_as_the_oracle_on_both_routes() {
+fn the_address_space_sub_mint_answers_as_the_oracle_on_both_routes() {
     fn make(h: i32) -> temen_ir::Module {
         rooted(&format!(
             "  vc = i32.const {h}
   voff = i64.const 32768
   vlog = i64.const 12
-  vsub = call.cap 5 4 (i64, i64) -> (i64) vc(voff, vlog)
-  vlen = i64.const 65536
-  vreg = call.cap 5 5 (i64) -> (i64) vc(vlen)
-  vk1 = i64.const 1000000
-  vhi = i64.mul vsub vk1
-  vr = i64.add vhi vreg"
+  vr = call.cap 5 4 (i64, i64) -> (i64) vc(voff, vlog)"
         ))
     }
-    fn grant(h: &mut Host) -> i32 {
-        h.set_region_factory(temen_run::new_shared_region);
-        h.grant_memory()
-    }
-    let lanes = by_instance(make, grant, true, METERED);
+    let lanes = by_instance(make, Host::grant_memory, true, METERED);
     let want = lanes[0].1.clone();
-    assert!(
-        want.as_ref().is_ok_and(|v| v[0] > 0),
-        "both minted: {want:?}"
-    );
+    assert!(want.as_ref().is_ok_and(|v| v[0] > 0), "minted: {want:?}");
     for (route, answer) in lanes {
         assert_eq!(answer, want, "{route}");
     }
@@ -1572,7 +1571,8 @@ fn an_exit_beside_a_spinning_sibling_ends_the_run_on_every_route() {
         |h| exits_beside("spin", h),
         Host::grant_exit,
         true,
-        // Unmetered: the sibling spins until the root's exit ends it, with no budget to run out of.
+        // No fuel limit of the row's own: the run's default fuel (`DEFAULT_FUEL`), far more than the
+        // sibling spins before the root's exit ends it.
         None,
         Err("Exit(7)".into()),
     );
@@ -1720,6 +1720,43 @@ fn each_declined_call_names_its_clause() {
         h.grant_blocking(Duration::ZERO, None);
         h
     };
+    // A live-callee offer shaped as a `Stream` (read, write, close), over a callee with nothing in it.
+    let live_impl = || {
+        use temen_ir::{FuncType, ValType};
+        let mut h = Host::new();
+        let rw = FuncType {
+            params: vec![ValType::I64, ValType::I64],
+            results: vec![ValType::I64],
+        };
+        let close = FuncType {
+            params: vec![],
+            results: vec![],
+        };
+        let names: Vec<String> = ["read", "write", "close"].map(String::from).into();
+        let callee = std::sync::Arc::new(std::sync::Mutex::new(Host::new()));
+        h.wire_live_impl(&callee, 0, &names, &[rw.clone(), rw, close])
+            .expect("wired");
+        h
+    };
+    let factory = || {
+        let mut h = Host::new();
+        h.set_region_factory(temen_run::new_shared_region);
+        h
+    };
+    let minting = || {
+        use temen_interp::{put_results, CapState, HostProcGrant, ProcHandler};
+        let mut h = Host::new();
+        h.grant_host_proc(HostProcGrant::new(
+            ProcHandler::Minting(Box::new(|_, _, out, _, _| put_results(out, &[0]))),
+            CapState::Stateless,
+        ));
+        h
+    };
+    let outside_written = || {
+        let mut h = Host::new();
+        h.grant_shared_region_backed(std::sync::Arc::new(OutsideWritten));
+        h
+    };
     // A host procedure its embedder answers later: a call parks.
     let host_answered = || {
         let mut h = Host::new();
@@ -1749,6 +1786,21 @@ fn each_declined_call_names_its_clause() {
         (call(11, 0), Host::new(), "jit cap"),
         (call(16, 0), Host::new(), "cap"),
         (call(0x1000_0000, 0), Host::new(), "serving"),
+        // A live callee's offer under a built-in's id: a call on it is the callee's to serve.
+        (call(0, 1), live_impl(), "serving"),
+        // The `self` ops `kernel_op` names `serving` for (9, 10): the bytecode compile declines
+        // them first, so `serving` is the second line of defence. The `process` ops (11, 12, 14)
+        // reach the kernel's own clause.
+        (call(selfop, 9), Host::new(), "bytecode"),
+        (call(selfop, 10), Host::new(), "bytecode"),
+        (call(selfop, 11), Host::new(), "process"),
+        (call(selfop, 12), Host::new(), "process"),
+        (call(selfop, 14), Host::new(), "process"),
+        // The three ways into `file region`: a guest mint under a region factory, a host procedure
+        // that may mint a backing, and a held region something outside the VM writes.
+        (call(5, 5), factory(), "file region"),
+        (call(0, 1), minting(), "file region"),
+        (call(0, 1), outside_written(), "file region"),
     ];
     let wrong: Vec<String> = rows
         .iter()
@@ -1835,19 +1887,17 @@ fn grant_mmap_fs(h: &mut Host) -> i32 {
     temen_run::fs::host_fs_mmap(dir).install(h, 1 << 16)
 }
 
-/// #2958 slice 4 review, finding 1 — the guarded read of a §13 alias is the recoverable load: a
-/// wait on an alias whose file was truncated is `MemoryFault` on the kernel route, as on today's,
-/// where it faulted in host code under the page-map lock. (The oracle reads the backing in host
-/// code and dies of SIGBUS: #3005, so it is left out until that is fixed.)
+/// #2958 slice 4 review, finding 1 — a file's alias can lose its pages under a host read (#3005),
+/// so the kernel route declines a run over the mmap-capable fs (a minting host procedure), `file
+/// region`, and the run takes today's route.
 #[cfg(unix)]
 #[test]
-fn a_wait_on_an_alias_of_a_truncated_file_faults_as_today() {
-    all_answer(
-        truncated,
-        grant_mmap_fs,
-        false,
-        METERED,
-        Err("MemoryFault".into()),
+fn a_wait_on_an_alias_of_a_truncated_file_is_declined() {
+    let mut host = Host::new();
+    let fs = grant_mmap_fs(&mut host);
+    assert_eq!(
+        jit_kernel::admit(&truncated(fs), &host, false).err(),
+        Some("file region")
     );
 }
 
@@ -2089,4 +2139,62 @@ block 2 (vr2: i32) {
         jit_kernel::run_fresh(&m, 0, &[], None).err(),
         Some("the JIT's compile")
     );
+}
+
+/// #2958 slice 4 — an import is decided on the op its binding reaches, as an inline call on it is
+/// ([`each_declined_call_names_its_clause`]): `self.fuel.remaining` (`fuel`, or the bytecode
+/// compile's refusal first) and a region post's `signal` (`region signal`) are declined through an
+/// import as they are inline.
+#[test]
+fn an_import_is_declined_by_its_targets_clause() {
+    let m = module(
+        "import 0 \"target\" (i64) -> (i64)
+memory 16
+func () -> (i64) {
+block 0 () {
+  vq = i64.const 16400
+  vone = i32.const 1
+  vk = atomic.notify vq vone
+  vz = i64.const 0
+  vr = call.import 0 (vz)
+  return vr
+  }
+}
+",
+    );
+    let bound = |type_id: u32, op: u32| {
+        let mut host = Host::new();
+        host.set_import_bindings(vec![temen_interp::BoundImport::required(type_id, op, 0)]);
+        host
+    };
+    let rows = [
+        (temen_ir::CAP_SELF_TYPE_ID, 13, "fuel"),
+        (temen_ir::cap_id::SHARED_REGION, 7, "region signal"),
+    ];
+    for (type_id, op, clause) in rows {
+        assert_eq!(
+            jit_kernel::admit(&m, &bound(type_id, op), false).err(),
+            Some(clause),
+            "({type_id}, {op})"
+        );
+    }
+}
+
+/// A pure-Rust backing written from outside the VM, as a host file is: `file region`.
+struct OutsideWritten;
+
+impl temen_interp::SharedBacking for OutsideWritten {
+    fn size(&self) -> u64 {
+        temen_interp::host_region_granularity()
+    }
+    fn read_byte(&self, _off: u64) -> u8 {
+        0
+    }
+    fn write_byte(&self, _off: u64, _b: u8) {}
+    fn atomic(&self, _off: u64, _width: u32, _f: &mut dyn FnMut(u64) -> Option<u64>) -> u64 {
+        0
+    }
+    fn outside_writers(&self) -> bool {
+        true
+    }
 }

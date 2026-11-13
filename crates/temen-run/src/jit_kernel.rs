@@ -178,6 +178,19 @@ pub struct Start<'a> {
     pub kill: Option<&'a Arc<temen_jit::Interrupt>>,
 }
 
+std::thread_local! {
+    /// How many kernel runs this thread has opened ([`kernel_runs`]).
+    static RUNS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Test-facing: how many runs this thread has taken the kernel route for. The kernel runs its root on
+/// the caller's thread, so a test reads, before and after an embedder's run, which route that run
+/// took (`jit_run` falls back to the JIT's own runtime when [`admit`] declines, and says nothing).
+#[doc(hidden)]
+pub fn kernel_runs() -> u64 {
+    RUNS.with(std::cell::Cell::get)
+}
+
 /// Run the admitted program as `start` says, its vCPUs as the kernel's tasks, under `host`. `Err` is
 /// the JIT's compile refusing it, with nothing run and `host` as it was.
 pub fn run(
@@ -186,6 +199,7 @@ pub fn run(
     host: &mut Host,
 ) -> Result<KernelEnd, temen_jit::JitError> {
     let m = admitted.0;
+    RUNS.with(|r| r.set(r.get() + 1));
     let f = m
         .funcs
         .get(start.entry as usize)

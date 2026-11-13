@@ -8966,6 +8966,19 @@ pub fn native_scope(m: &Module, host: &Host) -> Result<(), &'static str> {
     if host.signal_arm_pair().is_some() {
         return Err("signals");
     }
+    // A live callee's offer (`Host::wire_live_impl`) may sit under any interface's id, a built-in's
+    // included, so the call table below cannot see it: a call through it is the callee's serve
+    // loop's (#2791, #2792).
+    if host
+        .table
+        .iter()
+        .any(|s| matches!(s.entry, Some(super::Binding::LiveImpl(_))))
+    {
+        return Err("serving");
+    }
+    if file_region(host) {
+        return Err("file region");
+    }
     if m.imports.len() != host.import_bindings.len() {
         return Err("imports");
     }
@@ -8995,10 +9008,27 @@ pub fn native_scope(m: &Module, host: &Host) -> Result<(), &'static str> {
     Ok(())
 }
 
+/// #2958 slice 4 — the `file region` clause: whether the run could map a region whose pages can
+/// shrink under it, so that a host read of an aliased word (a futex wait's) would fault in host
+/// code (#3005). It covers three ways in: a host procedure that may mint a backing
+/// ([`super::ProcHandler::Minting`], which can mint any kind, a file's included); a region the host
+/// holds at admission that something outside the VM writes ([`super::SharedBacking::outside_writers`]);
+/// and, decided per call in [`kernel_op`], an `AddressSpace` `create_region` (op 5) under a region
+/// factory ([`Host::set_region_factory`]). What is left is a host-granted anonymous region the guest
+/// maps. #3005's fix, which makes every host read of such a page recoverable, lifts this clause.
+fn file_region(host: &Host) -> bool {
+    host.host_procs
+        .iter()
+        .any(|p| matches!(p.handler, super::ProcHandler::Minting(_)))
+        || host.regions.iter().flatten().any(|r| r.outside_writers())
+}
+
 /// #2958 slice 4 — whether a kernel task can run instruction `i` under `host`, as far as it reaches
 /// the host: every instruction kind is named here, with no wildcard arm, so a kind added to the IR
 /// is decided before it compiles. A `call.import` is decided through its binding ([`native_scope`]);
-/// the kinds that reach no host state, or only the §12 rules and the window, pass.
+/// the kinds that reach no host state, or only the §12 rules and the window, pass. The kinds
+/// declined whole before this scan pass here: fiber ops (`fibers`) and `gc.roots` in
+/// [`native_scope`], and `setjmp`/`longjmp`, which the JIT's compile refuses.
 fn kernel_inst(host: &Host, i: &Inst) -> Result<(), &'static str> {
     match i {
         Inst::CapCall(c) => kernel_op(host, c.type_id, c.op, None),
@@ -9128,6 +9158,8 @@ fn kernel_op(host: &Host, type_id: u32, op: u32, handle: Option<i32>) -> Result<
         (STREAM, 0..=1) if stream_op_parks(host, op) => Err("stream parks"),
         // A `close` of a pipe end wakes the other end's parks, which are the rules'.
         (STREAM, 2) if holds_pipe(host) => Err("stream parks"),
+        // A guest mint under a region factory: [`file_region`].
+        (ADDRESS_SPACE, 5) if host.region_factory.is_some() => Err("file region"),
         (STREAM, 0..=2) | (EXIT, 0) | (CLOCK, 0) | (ADDRESS_SPACE, 0..=5) | (BUDGET, 0..=3) => {
             Ok(())
         }

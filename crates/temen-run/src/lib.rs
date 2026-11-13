@@ -5061,25 +5061,6 @@ impl temen_interp::FutexWindow for MprotectWindow {
         if !self.word_readable(&map, base) {
             return None;
         }
-        // #2958 slice 4 — a §13 alias is readable in the map and mapped in hardware, but its backing
-        // can still shrink under it (a host file the guest truncated through its fs capability), so
-        // its load is the recoverable one: a fault answers `None`, the guest's `MemoryFault`, as
-        // today's route answers it. Every caller on a native window is a vCPU's thread inside its
-        // guarded call, whose fault handler recovers it (a unit test that calls this outside one
-        // never faults: its backings keep their length).
-        if matches!(map.get(&(base / self.page)), Some(PageState::Backed { .. })) {
-            // SAFETY: the word lies in the reservation, and the caller is inside a guarded call.
-            let word = unsafe {
-                temen_jit::try_load_in(
-                    self.base,
-                    self.reserved as usize,
-                    self.base.add(base as usize),
-                    width,
-                )
-            };
-            drop(map);
-            return word;
-        }
         // SAFETY: `[base, base + width)` is inside the reservation, aligned, and on a page the map
         // says is readable, which the hardware keeps readable while this holds the map's lock (the
         // contract above). The word is guest memory other vCPUs write with atomics: read it as one.

@@ -299,7 +299,8 @@ fn a_read_racing_an_unmap_or_a_protect_never_faults_the_host() {
 /// #2958 slice 4 review, finding 4 — a region's identity is held as the interpreter holds it, by a
 /// weak hold on its backing: once an alias of region 7 is unmapped and the region dropped, no region
 /// made after it has its identity while the page map still names it, so a waiter that parked on the
-/// old region meets no new one at its address.
+/// old region meets no new one at its address. This pins only the half that holds: once the host
+/// reuses the region's id slot the old identity can recur (#3036, parity on every engine).
 #[test]
 fn a_dropped_regions_identity_is_not_reused_while_the_map_names_it() {
     let page = temen_interp::host_page_size();
