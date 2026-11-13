@@ -1967,19 +1967,30 @@ fn child_task(
     payer: Option<NodeRef>,
 ) -> Result<(VTask, SharedSlots), Trap> {
     let table = build_table_for(prog.progs.len(), jit_table_log2, module);
-    let vt = entry_task(prog, module as usize, 0, args, payer)?;
+    let vt = entry_task(prog, module as usize, 0, args, payer, None)?;
     Ok((vt, table))
 }
 
 /// A new vCPU's task, entered at `func` of `module` (`unit`, that module's program) with `args`, its
-/// frames homed there: a thread's, a §14/§5 child's or an exec'd image's first frame. `Malformed` for a function `unit` does not have.
+/// frames homed there: the root's, a thread's, a §14/§5 child's or an exec'd image's first frame.
+/// `Malformed` for a function `unit` does not have.
+///
+/// `charge`: the fuel its entry is charged to. Fuel unification (INVARIANTS #9): a stack's first entry
+/// costs one, as a call's does and as the JIT's entry prologue charges it, so the root's and a
+/// thread's entries are paid here, as the task is made. `None` for a durable thaw's root, which
+/// continues an already-charged run, and for a child's or an exec'd image's entry, which the rule
+/// does not reach yet (#3012).
 fn entry_task(
     unit: &Compiled,
     module: usize,
     func: usize,
     args: &[Value],
     payer: Option<NodeRef>,
+    charge: Option<&mut Fuel>,
 ) -> Result<VTask, Trap> {
+    if let Some(fuel) = charge {
+        fuel.burn()?;
+    }
     let mut vt = VTask::new(unit, func, args, payer)?;
     vt.active.module = module;
     vt.active.home = module;
@@ -1990,6 +2001,10 @@ fn entry_task(
 /// its own functions, CONSOLIDATION.md §11) entered with `(arg0, arg1)`. The driver seeds its `vcpu.tls`
 /// word with the dense vCPU id it numbers the thread by (§12; a root's is 0). `Malformed` for a module
 /// or function the run's source does not have.
+///
+/// Its entry is paid from `fuel`, the fuel of the domain it runs in, as the spawn completes
+/// ([`entry_task`], #2977): a freeze after the spawn has paid it, and a thaw re-creates no thread
+/// through here. Out of fuel traps the spawner, which ends the run as the thread's own trap would.
 fn thread_task(
     source: &ModuleSource,
     module: usize,
@@ -1997,6 +2012,7 @@ fn thread_task(
     arg0: i64,
     arg1: i64,
     payer: Option<NodeRef>,
+    fuel: &mut Fuel,
 ) -> Result<VTask, Trap> {
     let cm = source.get(module).ok_or(Trap::Malformed)?;
     entry_task(
@@ -2005,6 +2021,7 @@ fn thread_task(
         func as usize,
         &[Value::I64(arg0), Value::I64(arg1)],
         payer,
+        Some(fuel),
     )
 }
 
@@ -6269,7 +6286,8 @@ fn dbg_spawn(
     let env = tasks[ti].domain; // a thread runs in its spawner's domain (shares its window)
     let (vt, live) = {
         let mut host = envs[env].host.lock_unpoisoned();
-        let mut vt = thread_task(source, module, func, arg0, arg1, Some(host.own_node()))?;
+        let (payer, fuel) = (Some(host.own_node()), &mut envs[env].fuel);
+        let mut vt = thread_task(source, module, func, arg0, arg1, payer, fuel)?;
         if tasks.live_count() >= super::MAX_VCPUS {
             return Err(Trap::ThreadFault); // thread bomb
         }
@@ -9293,8 +9311,8 @@ fn exec_image_build(
     let cunit = source.get(cm).ok_or(super::EINVAL)?;
     let child_table = build_table_for(cunit.progs.len(), child_host.jit_table_log2(), cm as u32);
     let payer = Some(child_host.own_node());
-    let mut new_vt =
-        entry_task(&cunit, cm, entry as usize, &child_args, payer).map_err(|_| super::EINVAL)?;
+    let mut new_vt = entry_task(&cunit, cm, entry as usize, &child_args, payer, None)
+        .map_err(|_| super::EINVAL)?;
     if let Some(leaf) = leaf {
         new_vt.active.tier_up_leaf(leaf);
     }
@@ -14352,15 +14370,13 @@ impl SchedCore {
     ) -> Result<SchedCore, Trap> {
         let mut h = host.lock_unpoisoned();
         reapply_installs(&h, source, &table)?;
-        // Fuel unification (safepoint-anchored): charge one fuel for *entering the top-level entry
-        // function*, mirroring the per-callee-entry charge at `Op::Call`/`CallIndirect`/`TailCall*` and
-        // the JIT's entry-prologue charge, so the tree-walker, bytecode, and JIT engines burn identically.
-        // Gated exactly as the tree-walker's `drive` (`super::drive_arc`): a durable **thaw** re-enters to
-        // continue an already-charged run (the root re-enters under `REWINDING`), so it must not re-charge.
-        if !thaws(&h, mem.as_ref()) {
-            fuel.burn()?;
-        }
-        let root_vt = VTask::new(&source.primary(), entry as usize, args, Some(h.own_node()))?;
+        // Fuel unification: the root's entry is paid as its task is made, as a thread's is
+        // ([`entry_task`]). Gated exactly as the tree-walker's `drive` (`super::drive_arc`): a durable
+        // **thaw** re-enters to continue an already-charged run (the root re-enters under
+        // `REWINDING`), so it must not re-charge.
+        let charge = (!thaws(&h, mem.as_ref())).then_some(&mut fuel);
+        let root = &source.primary();
+        let root_vt = entry_task(root, 0, entry as usize, args, Some(h.own_node()), charge)?;
         let tasks: Tasks = std::iter::once(TaskSlot::new(root_vt, 0, LiveVcpu::none())).collect();
         wire_kill(&h);
         // #1122/#1146/#1262 — the run's bell ([`SchedCore::bell`]): wire the root's personality
@@ -15888,10 +15904,11 @@ impl SchedCore {
                 dst,
                 module,
             }) => {
-                let node = domains[tasks[ti].domain].host.lock_unpoisoned().own_node();
+                let e = &mut domains[tasks[ti].domain];
+                let node = e.host.lock_unpoisoned().own_node();
                 let payer = Some(node.clone());
-                let mut child = match thread_task(source, module as usize, func, arg0, arg1, payer)
-                {
+                let (m, fuel) = (module as usize, &mut e.fuel);
+                let mut child = match thread_task(source, m, func, arg0, arg1, payer, fuel) {
                     Ok(vt) => vt,
                     Err(t) => {
                         complete(tasks, domains, ti, Err(t));
