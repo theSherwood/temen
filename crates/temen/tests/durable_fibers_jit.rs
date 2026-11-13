@@ -867,10 +867,7 @@ fn a_thaw_seed_past_the_arena_is_not_seeded_on_either_engine() {
     let real = thost.frozen_fibers().to_vec();
     assert_eq!(real.len(), 1, "the artifact carried one frozen fiber");
     let padded: Vec<InterpFrozen> = (0..11)
-        .map(|slot| InterpFrozen {
-            slot,
-            ..real[0].clone()
-        })
+        .map(|slot| InterpFrozen { slot, ..real[0] })
         .collect();
     assert_eq!(TEST_ARENA.ctx_ceiling(), 10, "contexts 1..=10 hold fibers");
 
