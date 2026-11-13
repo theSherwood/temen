@@ -101,6 +101,33 @@ block 0 (vi: i64, vj: i64) {
 }
 "#;
 
+/// #3029 — `func 0 (k)`: spawn `func 1` and return 7, joining nothing. `func 1` spawns `func 2` and
+/// returns; `func 2` adds `k` at 16384. `func 1` can still be running when the run's end begins.
+const SPAWNS_IN_TEARDOWN: &str = r#"memory 16
+func (i64) -> (i64) {
+block 0 (vk: i64) {
+  vh = thread.spawn 1 vk vk
+  vr = i64.const 7
+  return vr
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vk: i64, vj: i64) {
+  vh = thread.spawn 2 vk vk
+  vz = i64.const 0
+  return vz
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vk: i64, vj: i64) {
+  va = i64.const 16384
+  vold = i64.atomic.rmw.add va vk
+  vz = i64.const 0
+  return vz
+  }
+}
+"#;
+
 fn module(src: &str) -> temen_ir::Module {
     let m = temen_text::parse_module(src).expect("parse");
     temen_verify::verify_module(&m).expect("verify");
@@ -181,4 +208,24 @@ fn k_parked_threads_on_one_compile() {
 #[test]
 fn a_joined_thread_has_the_same_handle_and_id_on_every_run() {
     every_run_answers_the_oracle(JOINED, &[], 5);
+}
+
+/// #3029 — a vCPU still running when its run's end begins cannot leave one behind: a spawn into a
+/// domain whose vCPUs are being joined is refused. Before, the orphan ran on after its run's window
+/// and context were gone, and wrote into the next run's window, mapped again at the same address
+/// (in debug, `end_run` caught it: "a vCPU outlived its run"). Each run's window holds its own
+/// write, or none: never an earlier run's.
+#[test]
+fn a_vcpu_spawned_during_teardown_does_not_outlive_its_run() {
+    let m = module(SPAWNS_IN_TEARDOWN);
+    let mut cm = compile(&m);
+    for run in 1..=2000i64 {
+        let (out, window) = cm.run(&[run], None, Some(1 << 15)).expect("jit run");
+        assert_eq!(out, JitOutcome::Returned(vec![7]), "run {run}");
+        let word = i64::from_le_bytes(window[16384..16392].try_into().unwrap());
+        assert!(
+            word == 0 || word == run,
+            "run {run}'s window holds {word}: an earlier run's vCPU wrote it"
+        );
+    }
 }

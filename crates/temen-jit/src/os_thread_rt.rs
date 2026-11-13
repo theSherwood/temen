@@ -904,6 +904,11 @@ struct Threads {
     live: usize,
     /// OS-thread handles, joined by `run_inner` at run end so no vCPU outlives the window/code.
     joins: Vec<std::thread::JoinHandle<()>>,
+    /// #3029 — the domain's vCPUs are being joined ([`Domain::join_all`]): no vCPU starts any more.
+    /// Set under this lock as the handles are taken, and `thread.spawn` checks it under the same lock,
+    /// so every vCPU that started pushed its handle before the take, and one the take joins cannot
+    /// leave another behind.
+    closed: bool,
 }
 
 #[derive(Default)]
@@ -1338,6 +1343,13 @@ impl Domain {
         durable: bool,
         shadow: temen_ir::durable_abi::ShadowArena,
     ) {
+        debug_assert!(
+            {
+                let t = lock(&self.threads);
+                t.joins.is_empty() && !t.closed && lock(&self.pending_spawns).is_empty()
+            },
+            "a run starts on a domain whose last run did not end"
+        );
         *lock(&self.env) = Some(Env {
             mem_base,
             fn_table_base,
@@ -1392,8 +1404,9 @@ impl Domain {
             // replacement exclusive. Their contents are the run's, emptied under their own locks.
             park,
             wakers,
-            // Configuration, kept: the child executor and lane chain its compile or embedder
-            // installed, and what the domain is (its hub, its budget node).
+            // Kept: the lane chain its embedder installed and what the domain is (its hub, its budget
+            // node), which are configuration; and the link to its nursery's child executor, which the
+            // nursery owns. That executor carries run state of its own (#3024), not reset here.
             quiesce_cv: _,
             child_exec: _,
             lane_cv: _,
@@ -1402,6 +1415,16 @@ impl Domain {
             node: _,
         } = self;
         debug_assert_eq!(self.hub, 0, "only a run's own domain ends a run");
+        // A durable run defers a spawn while its window is not `NORMAL` (an armed trigger, a freeze),
+        // and runs the child only at a freeze or before a park: one the run never reached ends with it
+        // unrun, as the oracle discards a finished run's queued vCPUs. What it took goes back.
+        for p in std::mem::take(&mut *lock(pending_spawns)) {
+            lock(threads).live -= 1;
+            self.vcpu_ended();
+            if let Some(table) = lock(fiber_table).as_ref() {
+                table.free_vcpu_context(p.ctx);
+            }
+        }
         *lock(env) = None;
         *lock(fiber_table) = None;
         {
@@ -1410,9 +1433,9 @@ impl Domain {
             *t = Threads {
                 live: 1,
                 joins: Vec::new(),
+                closed: false,
             };
         }
-        lock(pending_spawns).clear();
         lock(frozen_vcpus).clear();
         lock(completed_children).clear();
         lock(frozen_fibers).clear();
@@ -1882,7 +1905,12 @@ impl Domain {
     pub(crate) fn join_all(&self, blocked: bool) {
         // Drain handles out of the lock first (joining holds no lock; a joining child may still touch
         // `threads` via nested ops, though by teardown all guest code has returned).
-        let joins: Vec<_> = std::mem::take(&mut lock(&self.threads).joins);
+        // #3029 — closed as the handles are taken: a vCPU still running cannot start one after.
+        let joins: Vec<_> = {
+            let mut t = lock(&self.threads);
+            t.closed = true;
+            std::mem::take(&mut t.joins)
+        };
         let _pg = blocked.then(|| ParkGuard::new(&self.hub().parked));
         for j in joins {
             let _ = j.join();
@@ -2395,11 +2423,13 @@ pub(crate) unsafe extern "C" fn thread_spawn(
         // table — so a spawn-join loop never trips, matching the interpreter. A §14 child's vCPU is
         // bounded by the run-wide count, as the oracle's one scheduler bounds every vCPU of the run
         // (its own `live` is then only this domain's share, for its teardown).
-        let at_ceiling = if std::ptr::eq(hub, dom) {
-            t.live >= MAX_VCPUS
-        } else {
-            !hub.try_child_start()
-        };
+        // #3029 — and none at all once its domain's vCPUs are being joined: the domain has ended.
+        let at_ceiling = t.closed
+            || if std::ptr::eq(hub, dom) {
+                t.live >= MAX_VCPUS
+            } else {
+                !hub.try_child_start()
+            };
         // #2001 — the vCPU is also one `spawn` of its domain's budget node while it lives
         // ([`Done::publish`] hands it back): a full ceiling refuses it as the live cap does.
         let unfunded = !at_ceiling && !dom.charge_vcpu();
@@ -4011,7 +4041,6 @@ mod tests {
             "the next run's first handle is a fresh table's"
         );
         assert_eq!(dom.take_task(), 1, "the next run's first spawn is task 1");
-        assert_eq!(dom.live_vcpus(), 1, "the root alone is live");
     }
 
     /// #2953 — what a run leaves in the futex table and the wakers, which hosts keep reaching

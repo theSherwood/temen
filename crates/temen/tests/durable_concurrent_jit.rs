@@ -1597,9 +1597,9 @@ fn recycled_context_artifact_canonical_re_freeze_through_the_codec() {
     );
 }
 
-// #2953: the root spawns a child, waits until the child has stored its flag (so the child has ended
-// before anything else happens), signals, runs a K-loop and stores its total. It never joins the
-// child, which completes unjoined: its join result rides a freeze as `completed_result`.
+// #2953: the root spawns a child, waits until the child has stored its flag (the child's last store
+// before it returns), signals, runs a K-loop and stores its total. It never joins the child, which
+// completes unjoined: its join result rides a freeze as `completed_result`.
 const SRC_UNJOINED_DONE: &str = r#"
 func (i32, i32) -> (i64) {
 block 0 (v0: i32, v1: i32) {
