@@ -229,3 +229,265 @@ fn a_vcpu_spawned_during_teardown_does_not_outlive_its_run() {
         );
     }
 }
+
+// ---- #3020 — a run's fibers end with it ----
+
+/// `func 0 (mode, h)`:
+/// - mode 0: make a fiber and resume it once (it stores its argument, 10, at 16384 and suspends);
+///   answer `(handle, status, value)`.
+/// - mode 1: resume `h` with 7, making nothing (were it a fiber, it would store 7 at 16392 and
+///   return 107); answer `(h, status, value)`.
+/// - mode 2: make a fiber and never resume it; answer `(handle, 0, 0)`.
+const FIBERS: &str = r#"memory 16
+func (i64, i64) -> (i64, i64, i64) {
+block 0 (vm: i64, vh: i64) {
+  vz = i64.const 0
+  vis0 = i64.eq vm vz
+  br_if vis0 1() 2(vm, vh)
+}
+block 1 () {
+  v0 = ref.func 1
+  v1 = i64.const 4096
+  v2 = cont.new v0 v1
+  v3 = i64.const 10
+  v4, v5 = cont.resume v2 v3
+  v6 = i64.extend_i32_u v4
+  return v2 v6 v5
+}
+block 2 (vm2: i64, vh2: i64) {
+  vone = i64.const 1
+  vis1 = i64.eq vm2 vone
+  br_if vis1 3(vh2) 4()
+}
+block 3 (vh3: i64) {
+  v7 = i64.const 7
+  v8, v9 = cont.resume vh3 v7
+  v10 = i64.extend_i32_u v8
+  return vh3 v10 v9
+}
+block 4 () {
+  w0 = ref.func 1
+  w1 = i64.const 4096
+  w2 = cont.new w0 w1
+  wz = i64.const 0
+  return w2 wz wz
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (a: i64, b: i64) {
+  p = i64.const 16384
+  i64.store p b
+  x = suspend b
+  q = i64.const 16392
+  i64.store q x
+  c = i64.const 100
+  r = i64.add x c
+  return r
+  }
+}
+"#;
+
+/// Make a fiber.
+const LEAVE_SUSPENDED: i64 = 0;
+/// Resume a handle, making nothing.
+const RESUME: i64 = 1;
+/// Make a fiber and never start it.
+const LEAVE_UNSTARTED: i64 = 2;
+
+/// The two words a fiber of [`FIBERS`] writes.
+fn fiber_words(window: &[u8]) -> (i64, i64) {
+    let word = |o: usize| i64::from_le_bytes(window[o..o + 8].try_into().unwrap());
+    (word(16384), word(16392))
+}
+
+/// What the oracle answers for a run that resumes a handle it never made: a trap.
+fn oracle_resume_traps(m: &temen_ir::Module) -> temen_interp::Trap {
+    let mut fuel = u64::MAX;
+    let r = temen_interp::run(m, 0, &[Value::I64(RESUME), Value::I64(0)], &mut fuel);
+    r.expect_err("the oracle's resume of a handle no fiber has traps")
+}
+
+/// Run 1 leaves a fiber (`first`); run 2, on the same compile, resumes its handle. Run 2 answers
+/// the oracle's trap, as a fresh compile's does, and its window holds nothing the fiber would write.
+fn a_later_run_cannot_resume(first: i64) {
+    let m = module(FIBERS);
+    let want = oracle_resume_traps(&m);
+    assert_eq!(
+        temen_jit::TrapKind::FiberFault.code(),
+        want.code(),
+        "the oracle's trap is FiberFault's"
+    );
+    let mut fresh = compile(&m);
+    let (out, _) = fresh.run(&[RESUME, 0], None, Some(1 << 15)).unwrap();
+    assert!(
+        matches!(out, JitOutcome::Trapped(temen_jit::TrapKind::FiberFault)),
+        "a fresh compile: {out:?}"
+    );
+
+    let mut cm = compile(&m);
+    let (out, _) = cm.run(&[first, 0], None, Some(1 << 15)).unwrap();
+    let JitOutcome::Returned(v) = out else {
+        panic!("run 1: {out:?}")
+    };
+    let (out, window) = cm.run(&[RESUME, v[0]], None, Some(1 << 15)).unwrap();
+    assert!(
+        matches!(out, JitOutcome::Trapped(temen_jit::TrapKind::FiberFault)),
+        "run 2 resumed run 1's fiber {}: {out:?}",
+        v[0]
+    );
+    assert_eq!(fiber_words(&window), (0, 0), "run 1's fiber ran in run 2");
+}
+
+#[test]
+fn a_later_run_cannot_start_an_earlier_runs_fiber() {
+    a_later_run_cannot_resume(LEAVE_UNSTARTED);
+}
+
+#[test]
+fn a_later_run_cannot_resume_an_earlier_runs_suspended_fiber() {
+    a_later_run_cannot_resume(LEAVE_SUSPENDED);
+}
+
+/// The compile moved to another thread, so run 2's stack is not run 1's.
+struct OnAnotherThread(CompiledModule);
+// SAFETY: one thread uses the module at a time: the spawning thread hands it over and waits.
+unsafe impl Send for OnAnotherThread {}
+
+/// The SIGSEGV shape: run 2 on another thread, deeper in its stack. Run 1's fiber held run 1's
+/// context, a local of a stack run 2 is not on.
+#[test]
+fn a_later_run_on_another_thread_cannot_resume_an_earlier_runs_fiber() {
+    let m = module(FIBERS);
+    let mut cm = compile(&m);
+    let (out, _) = cm.run(&[LEAVE_SUSPENDED, 0], None, None).unwrap();
+    let JitOutcome::Returned(v) = out else {
+        panic!("run 1: {out:?}")
+    };
+    let h = v[0];
+    let moved = OnAnotherThread(cm);
+    let out = std::thread::spawn(move || {
+        let mut moved = moved;
+        fn deeper(n: u32, cm: &mut CompiledModule, h: i64) -> JitOutcome {
+            let pad = [n as u8; 4096];
+            let out = match n {
+                0 => cm.run(&[RESUME, h], None, None).unwrap().0,
+                _ => deeper(n - 1, cm, h),
+            };
+            std::hint::black_box(&pad);
+            out
+        }
+        deeper(8, &mut moved.0, h)
+    })
+    .join()
+    .expect("run 2's thread");
+    assert!(
+        matches!(out, JitOutcome::Trapped(temen_jit::TrapKind::FiberFault)),
+        "run 2: {out:?}"
+    );
+}
+
+/// A metered run that traps on a stale handle burns what a fresh compile's does: the stale fiber
+/// charges nothing, to its own run's cell or this one's.
+#[test]
+fn a_stale_fiber_charges_no_fuel() {
+    let m = module(FIBERS);
+    let metered = |cell: *mut temen_jit::FuelCell| {
+        CompiledModule::compile(
+            &m,
+            0,
+            INERT_CAP_THUNK,
+            std::ptr::null_mut(),
+            temen_ir::DEFAULT_RESERVED_LOG2,
+            None,
+            None,
+            Some(cell),
+            None,
+            None,
+            0,
+        )
+        .expect("jit compile")
+    };
+    let burnt = |cm: &mut CompiledModule, cell: &temen_jit::FuelCell, args: &[i64]| {
+        let before = cell.can_burn();
+        let (out, _) = cm.run(args, None, None).unwrap();
+        (out, before - cell.can_burn())
+    };
+    let mut fresh_cell = temen_jit::FuelCell::fixed(1 << 40);
+    let mut fresh = metered(&mut *fresh_cell);
+    let (_, want) = burnt(&mut fresh, &fresh_cell, &[RESUME, 0]);
+
+    let mut cell = temen_jit::FuelCell::fixed(1 << 40);
+    let mut cm = metered(&mut *cell);
+    let (out, _) = burnt(&mut cm, &cell, &[LEAVE_SUSPENDED, 0]);
+    let JitOutcome::Returned(v) = out else {
+        panic!("run 1: {out:?}")
+    };
+    let (out, got) = burnt(&mut cm, &cell, &[RESUME, v[0]]);
+    assert!(
+        matches!(out, JitOutcome::Trapped(temen_jit::TrapKind::FiberFault)),
+        "run 2: {out:?}"
+    );
+    assert_eq!(got, want, "run 2 burnt what a fresh compile's run does");
+}
+
+/// A budget node that counts the fibers charged to it.
+#[derive(Default)]
+struct CountsFibers(std::sync::atomic::AtomicI64);
+
+impl temen_jit::BudgetNode for CountsFibers {
+    fn draw(&self) -> Option<u64> {
+        Some(u64::MAX)
+    }
+    fn give_back(&self, _unspent: u64) {}
+    fn room(&self) -> i64 {
+        i64::MAX
+    }
+    fn charge_vcpu(&self) -> bool {
+        true
+    }
+    fn rebuild_vcpu(&self) -> bool {
+        true
+    }
+    fn vcpu_ended(&self) {}
+    fn charge_fiber(&self) -> bool {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        true
+    }
+    fn force_fiber(&self) {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+    fn fiber_ended(&self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Runs that each leave a fiber suspended leave their budget node where it started: each run's
+/// fibers hand their charge back as it ends.
+#[test]
+fn a_run_s_fibers_hand_their_charges_back_when_it_ends() {
+    let m = module(FIBERS);
+    let node = std::sync::Arc::new(CountsFibers::default());
+    let mut cm = CompiledModule::compile(
+        &m,
+        0,
+        INERT_CAP_THUNK,
+        std::ptr::null_mut(),
+        temen_ir::DEFAULT_RESERVED_LOG2,
+        None,
+        None,
+        None,
+        None,
+        Some(node.clone()),
+        0,
+    )
+    .expect("jit compile");
+    for run in 1..=5 {
+        let (out, _) = cm.run(&[LEAVE_SUSPENDED, 0], None, None).unwrap();
+        assert!(matches!(out, JitOutcome::Returned(_)), "run {run}: {out:?}");
+        assert_eq!(
+            node.0.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "run {run}'s fiber still holds its charge"
+        );
+    }
+}
