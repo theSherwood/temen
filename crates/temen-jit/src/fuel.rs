@@ -152,6 +152,39 @@ impl FuelCell {
     }
 }
 
+/// #3000 — a cell several contexts may charge, owned by all of them: it goes with the last. Compiled
+/// code charges it through [`Self::get`], whose address never moves, so sharing it costs the charge
+/// path nothing.
+#[cfg(fiber_rt)]
+pub(crate) struct SharedCell(core::ptr::NonNull<FuelCell>);
+
+// SAFETY: the cell is a `FuelCell`, whose shared state is behind its lock, and whose `left` compiled
+// code charges through the raw pointer, as it does any cell.
+#[cfg(fiber_rt)]
+unsafe impl Send for SharedCell {}
+#[cfg(fiber_rt)]
+unsafe impl Sync for SharedCell {}
+
+#[cfg(fiber_rt)]
+impl SharedCell {
+    pub(crate) fn new(cell: Box<FuelCell>) -> Arc<SharedCell> {
+        Arc::new(SharedCell(core::ptr::NonNull::from(Box::leak(cell))))
+    }
+
+    /// The cell, live while this is.
+    pub(crate) fn get(&self) -> *mut FuelCell {
+        self.0.as_ptr()
+    }
+}
+
+#[cfg(fiber_rt)]
+impl Drop for SharedCell {
+    fn drop(&mut self) {
+        // SAFETY: made from a `Box` by `new`, and dropped once, with the last owner.
+        drop(unsafe { Box::from_raw(self.0.as_ptr()) });
+    }
+}
+
 impl Drop for FuelCell {
     fn drop(&mut self) {
         let src = self.src.get_mut().unwrap_or_else(|e| e.into_inner());

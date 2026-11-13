@@ -937,3 +937,42 @@ fn a_nested_self_call_parked_at_the_end(on: Executor) {
 }
 
 on_every_executor!(a_nested_self_call_parked_at_the_end);
+
+/// The child [`self_caller`] spawns for the guest's own end: it hands its parent `"exec"`, waits
+/// until `inner()` has parked (`peek()` answers 1), and ends the domain itself with `boom()`.
+const GIVER_THEN_BOOM: &str = r#"memory 15
+data 16384 "exec"
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vnp = i64.const 16384
+  vl = i64.const 4
+  vexec = self.resolve vnp vl
+  vr = call.cap 268435456 0 (cap) -> (i64) vexec (vexec)
+  br 1(vexec)
+}
+block 1 (we: i32) {
+  vp = call.cap 268435456 3 () -> (i64) we ()
+  vone = i64.const 1
+  vgo = i64.ne vp vone
+  br_if vgo 1(we) 2(we)
+}
+block 2 (xe: i32) {
+  call.cap 268435456 4 () -> () xe ()
+  vz = i64.const 0
+  return vz
+  }
+}
+"#;
+
+/// #3000 — the same, reached by the guest alone: the embedder makes one call, `outer()`, and the
+/// domain's own child ends the domain once `inner()` has parked. The call answers the end.
+fn a_nested_self_call_parked_when_the_guest_ends_its_domain(on: Executor) {
+    bounded(move || {
+        let m = module(&self_caller());
+        let (host, args) = child_host(&m, GIVER_THEN_BOOM);
+        let (d, _) = hold(on, m, 0, &args, host);
+        assert_eq!(call(&d, 2, &[]), Reply::Failed(CAP_REVOKED));
+    });
+}
+
+on_every_executor!(a_nested_self_call_parked_when_the_guest_ends_its_domain);
