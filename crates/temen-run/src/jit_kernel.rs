@@ -207,6 +207,8 @@ pub fn run(
     // The compiled instance's cell, which no vCPU charges (each has its own, `tier_run`): it only
     // arms the compile's fuel checks, and lives as long as the code (`KernelRun::new`).
     let mut armed = metered.then(|| FuelCell::fixed(0));
+    // Every kernel run is concurrent (`native_scope`'s `no §12 op`), so its calls take the locked
+    // thunk alone (#2958 condition 3, met by routing in phase 1).
     let cm = CompiledModule::compile(
         m,
         start.entry,

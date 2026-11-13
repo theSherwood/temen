@@ -369,6 +369,13 @@ impl VmCtx {
             .then(|| unsafe { &*(&**state as *const (dyn Any + Send + Sync)).cast::<T>() })
     }
 
+    /// #2958 — whether this is a kernel vCPU's context: a task of executor 2's run
+    /// (`kernel_rt::KernelRun::run_vcpu`), whose §12 ops and parks are the kernel's, never this
+    /// crate's own thread runtime's.
+    pub fn on_kernel(&self) -> bool {
+        self.kernel.is_some()
+    }
+
     /// The code that ended this context's domain, or `None` while it runs.
     pub fn ended(&self) -> Option<i64> {
         match self.end().load(Ordering::Relaxed) {

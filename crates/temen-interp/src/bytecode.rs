@@ -8746,10 +8746,19 @@ fn offer_leaf(
     digest: [u8; 32],
     entry: u32,
 ) -> Option<LeafStart> {
-    let parks = match image_parks(host, m, census) {
-        Parks::Never => false,
-        Parks::Suspendably => true,
-        Parks::Otherwise => return None,
+    // #2958 slice 4 — on a native tier every park is the kernel's, and the kernel's admission
+    // decided this image before the tier existed ([`NativeTier`]'s contract): `image_parks` asks
+    // whether its host can suspend emitted frames where it parks, which a native tier always does.
+    let parks = match parks_natively(host) {
+        true => {
+            debug_assert_eq!(native_scope(m, host), Ok(()), "a native tier's image");
+            true
+        }
+        false => match image_parks(host, m, census) {
+            Parks::Never => false,
+            Parks::Suspendably => true,
+            Parks::Otherwise => return None,
+        },
     };
     let paged = image_pages(host, census);
     let offer = LeafOffer {
@@ -8772,6 +8781,34 @@ struct LeafStart {
     paged: bool,
     /// Its host suspends its emitted frames where a call parks ([`LeafOffer::parks`]).
     parks: bool,
+}
+
+/// #1954 — whether a stream op `op` can park under `host`: a read on a pipe end or a blocking stdin,
+/// a write on a pipe end. One rule for an inline `call.cap` and an import bound to the same op, on
+/// every route that asks ([`image_parks`], [`native_scope`]). Ops past 2 are not asked: they may park
+/// anyhow.
+fn stream_op_parks(host: &Host, op: u32) -> bool {
+    let holds_pipe = || {
+        host.table
+            .iter()
+            .any(|s| matches!(s.entry, Some(super::Binding::PipeEnd { .. })))
+    };
+    (op == 0 && (host.stdin_block || holds_pipe())) || (op == 1 && holds_pipe())
+}
+
+/// #1954 — how a call on host procedure `handle` can park with no personality installed: a declared
+/// host-completed cap parks on its embedder ([`super::OpParks::OnHost`]); one that answers in the call
+/// (an in-memory file system) cannot park, since only a personality's request parks such a call; any
+/// other may. `None` is an inline call, whose handle is an operand: it parks as any of the host's
+/// could ([`Host::host_procs_park`]; #1414 S4-3b). One rule for [`image_parks`] and [`native_scope`].
+fn host_proc_parks(host: &Host, handle: Option<i32>) -> super::OpParks {
+    use super::OpParks;
+    match handle {
+        None => host.host_procs_park(),
+        Some(h) if host.parks_on_host(h) => OpParks::OnHost,
+        Some(h) if host.host_proc_is_sync(h) => OpParks::Never,
+        Some(_) => OpParks::Otherwise,
+    }
 }
 
 /// #1896 — how a process running image `m` can **park**: block in an op until another process, or
@@ -8798,30 +8835,23 @@ fn image_parks(host: &Host, m: &Module, census: &ImageCensus) -> Parks {
     use super::OpParks;
     use temen_ir::cap_id::{ADDRESS_SPACE, EXIT, HOST_PROC, STREAM};
     let source = host.signal_poll().map(|(_, s)| s);
-    let holds_pipe = host
-        .table
-        .iter()
-        .any(|s| matches!(s.entry, Some(super::Binding::PipeEnd { .. })));
-    // A stream op parks on a pipe end, or (a read) on a blocking stdin; ops past 2 may park anyhow.
-    // One rule for an inline `call.cap` and an import bound to the same op (#1954).
-    let stream_op_parks =
-        |op: u32| (op == 0 && (holds_pipe || host.stdin_block)) || (op == 1 && holds_pipe);
+    let stream_op_parks = |op: u32| stream_op_parks(host, op);
     let import_parks = |(import, b): (&temen_ir::Import, &super::BoundImport)| match b.type_id {
         _ if b.rebindable => OpParks::Otherwise,
         // #1954: an exit ends the process, and a stream op's parking is decided below, with the
         // inline ones'.
         ADDRESS_SPACE | EXIT => OpParks::Never,
         STREAM if b.op <= 2 => OpParks::Never,
-        HOST_PROC => source
-            .as_ref()
-            .and_then(|s| s.import_parks(&import.name))
-            .or_else(|| host.parks_on_host(b.handle).then_some(OpParks::OnHost))
-            // #1954: without a personality, a handler that answers synchronously (an in-memory
-            // file system) has no way to park: only a personality's request parks such a call.
-            .or_else(|| {
-                (source.is_none() && host.host_proc_is_sync(b.handle)).then_some(OpParks::Never)
-            })
-            .unwrap_or(OpParks::Otherwise),
+        HOST_PROC => match source.as_ref() {
+            None => host_proc_parks(host, Some(b.handle)),
+            // A personality answers for the ops bound to it; any other may park on its request.
+            Some(s) => s
+                .import_parks(&import.name)
+                .unwrap_or(match host.parks_on_host(b.handle) {
+                    true => OpParks::OnHost,
+                    false => OpParks::Otherwise,
+                }),
+        },
         _ => OpParks::Otherwise,
     };
     let import_streams = m
@@ -8840,7 +8870,7 @@ fn image_parks(host: &Host, m: &Module, census: &ImageCensus) -> Parks {
     if census.host_call {
         parks.push(match source {
             Some(_) => OpParks::Otherwise,
-            None => host.host_procs_park(),
+            None => host_proc_parks(host, None),
         });
     }
     if m.imports.len() != host.import_bindings.len()
@@ -8881,17 +8911,15 @@ fn image_parks(host: &Host, m: &Module, census: &ImageCensus) -> Parks {
 ///   or for good if no consumer needs it);
 /// - **`signals`**: delivery into native code is the engine's safepoint redirect, not executor 2's
 ///   interrupt (a later phase);
-/// - **`imports`**: an import may bind anything, a parking op or a page op included (slice 4);
-/// - **`cap`**: a `call.cap` other than a host procedure or an address-space op (`map`, `unmap`,
-///   `protect`, `page_size`, through the one page map since #2958 slice 3): a stream, a region (its
-///   futex key on a native window, a later phase), a child or a serve point (#2791, #2792), a §22
-///   `Jit` op (one dispatch table, a later phase);
-/// - **`host-proc parks`**: a host procedure that may park, which needs the engine's own park
-///   (slice 5).
+/// - **`imports`**: an import the host leaves unbound or may rebind (`import.attach` may retarget it to
+///   anything mid-run), a binding count that differs from the module's imports, or a
+///   `call.import.dyn`: what the call reaches is not known at admission (removed with the last
+///   clause that names a call target the kernel cannot serve);
+/// - every other clause is [`kernel_op`]'s, which decides an inline `call.cap` and a bound import's
+///   target alike.
 ///
 /// A held run never reaches this: its embedder runs it on the engine's own runtime (#2935).
 pub fn native_scope(m: &Module, host: &Host) -> Result<(), &'static str> {
-    use temen_ir::cap_id::{ADDRESS_SPACE, HOST_PROC};
     if !m
         .funcs
         .iter()
@@ -8918,28 +8946,75 @@ pub fn native_scope(m: &Module, host: &Host) -> Result<(), &'static str> {
     if host.signal_arm_pair().is_some() {
         return Err("signals");
     }
-    if !m.imports.is_empty() {
+    if m.imports.len() != host.import_bindings.len() {
         return Err("imports");
     }
-    let mut host_call = false;
+    for b in &host.import_bindings {
+        if b.rebindable || !b.bound {
+            return Err("imports");
+        }
+        kernel_op(host, b.type_id, b.op, Some(b.handle))?;
+    }
     for i in m
         .funcs
         .iter()
         .flat_map(|f| &f.blocks)
         .flat_map(|b| &b.insts)
     {
-        if let Inst::CapCall(c) = i {
-            match c.type_id {
-                HOST_PROC => host_call = true,
-                ADDRESS_SPACE if c.op <= 3 => {}
-                _ => return Err("cap"),
-            }
+        match i {
+            Inst::CapCall(c) => kernel_op(host, c.type_id, c.op, None)?,
+            Inst::CallImportDyn(_) => return Err("imports"),
+            _ => {}
         }
     }
-    if host_call && host.host_procs_park() != super::OpParks::Never {
-        return Err("host-proc parks");
-    }
     Ok(())
+}
+
+/// #2958 slice 4 — whether a kernel task can make a call on `(type_id, op)` under `host`: the call
+/// answers in the dispatch, under the domain's `Host` lock, without parking and without the engine's
+/// own runtime. `handle` is a bound import's target; `None` is an inline `call.cap`, whose handle is
+/// an operand. **Default-deny**: what this does not list, the kernel route declines, and `Err` names
+/// the clause and so what removes it (#2958's plan, section B):
+///
+/// - **`stream parks`**: a stream op that can park ([`stream_op_parks`]), or `self.pipe`, which
+///   mints a pipe end mid-run and so makes that check stale (slice 5);
+/// - **`host-proc parks`**: a host procedure that may park ([`host_proc_parks`]), or the offload
+///   exerciser `Blocking` (slice 5);
+/// - **`region signal`**: a post's `signal`, a wake of a region word, which needs the rules after
+///   the `Host` lock is let go (slice 5);
+/// - **`fuel`**: `self.fuel.remaining`, whose parity on a native task is slice 6's;
+/// - **`process`**: `clone_caller`, `reap`, `exec` (a later phase; #2958 amendment 5);
+/// - **`serving`**: a service point or a call through a guest interface (#2791, #2792);
+/// - **`§14 children`**: `Instantiator`, `Module`, `ModuleLoader` (a later phase);
+/// - **`jit cap`**: §22 `Jit` and its code handles: two dispatch tables (a later phase);
+/// - **`cap`**: anything else, `FreezeAuthority` (a `CapFault` on every engine, with no consumer)
+///   and an op no interface has.
+fn kernel_op(host: &Host, type_id: u32, op: u32, handle: Option<i32>) -> Result<(), &'static str> {
+    use super::OpParks;
+    use temen_ir::cap_id::*;
+    use temen_ir::{CAP_DYN_TYPE_ID, CAP_SELF_TYPE_ID};
+    match (type_id, op) {
+        (STREAM, 0..=2) if stream_op_parks(host, op) => Err("stream parks"),
+        (STREAM, 0..=2) | (EXIT, 0) | (CLOCK, 0) | (ADDRESS_SPACE, 0..=5) | (BUDGET, 0..=3) => {
+            Ok(())
+        }
+        (SHARED_REGION, 0..=3 | 5 | 6) => Ok(()),
+        (SHARED_REGION, 7) => Err("region signal"),
+        (HOST_PROC, _) => match host_proc_parks(host, handle) {
+            OpParks::Never => Ok(()),
+            _ => Err("host-proc parks"),
+        },
+        (BLOCKING, _) => Err("host-proc parks"),
+        (CAP_SELF_TYPE_ID, 0..=8 | 17..=19) => Ok(()),
+        (CAP_SELF_TYPE_ID, 13) => Err("fuel"),
+        (CAP_SELF_TYPE_ID, 16) => Err("stream parks"),
+        (CAP_SELF_TYPE_ID, 9 | 10) => Err("serving"),
+        (CAP_SELF_TYPE_ID, 11 | 12 | 14) => Err("process"),
+        (INSTANTIATOR | MODULE | MODULE_LOADER, _) => Err("§14 children"),
+        (JIT | JIT_CODE, _) => Err("jit cap"),
+        (t, _) if (GUEST_IMPL_BASE..CAP_DYN_TYPE_ID).contains(&t) => Err("serving"),
+        _ => Err("cap"),
+    }
 }
 
 /// #2958 — whether `host`'s emitted tier makes the §12 thread ops itself ([`ThreadTier::native`]),
@@ -18291,6 +18366,10 @@ pub struct ThreadTier {
 /// #2958 — what a native tier needs from the run beyond [`ThreadTier`]. Its code polls the run's
 /// own end word ([`EmittedCall::end`]) as its domain's end, and raises it first-wins as it traps: a
 /// set word then means only that the run is ending, and the verdict is [`ThreadRun::conclude`]'s.
+///
+/// **Contract:** a host carries a native tier only for a run of a module [`native_scope`] admitted
+/// under that host. The root's leaf offer then skips the leaf tiers' own rule ([`offer_leaf`]), and
+/// an exec'd image never meets the tier: `exec` is declined (`process`).
 #[derive(Clone)]
 pub struct NativeTier {
     /// The tier's own run state, for its [`ThreadTier::run`] to find ([`EmittedCall::native`]).

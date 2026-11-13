@@ -633,6 +633,11 @@ unsafe fn cap_thunk_impl(
                 None if !stdin_park => return,
                 None => temen_interp::ParkTransients::default(),
             };
+            // #2958 slice 4 — a kernel task's call that leaves a park, a wake or a request to serve
+            // is one `native_scope` declines: the backstop ([`kernel_backstop`]).
+            if kernel_backstop(vm) {
+                return;
+            }
             // #1936 — a post's signal: its word's waiters wake by the key a §13 `map` gave it.
             if let Some((backing, off)) = parks.wake_region.as_ref().and_then(|w| w.os_key()) {
                 temen_jit::notify_region(vm, backing, off);
@@ -723,6 +728,20 @@ fn import_dispatch(host: &Host, packed: u32) -> Option<(u32, u32, i32)> {
     host.import_target(packed).ok()
 }
 
+/// #2958 slice 4 — the kernel route's backstop: on a kernel task's context, a call whose dispatch
+/// left something only the JIT's own runtime acts on (a park, a punted call's wait, a live callee, a
+/// region wake, a service point, `Jit.invoke`) traps the domain `Malformed`, in every build. Each is
+/// a call `native_scope` declines, and each host fact it reads at admission (the pipe ends held, a
+/// blocking stdin, the import bindings, the signal source, how the host procedures park) changes
+/// mid-run only through a call it declines too: so reaching this is a bug in that predicate, and it
+/// fails closed instead of reaching a runtime the task is not on. `true` when it trapped.
+fn kernel_backstop(vm: &temen_jit::VmCtx) -> bool {
+    if vm.on_kernel() {
+        vm.raise(Trap::Malformed.code());
+    }
+    vm.on_kernel()
+}
+
 /// **Multi-threaded `call.cap` thunk** (DESIGN.md §22 threaded *compile*): the same dispatch as
 /// [`cap_thunk`], but serialized through a per-domain [`Mutex<Host>`] so a guest whose worker
 /// threads make concurrent `call.cap`s (notably `Jit.compile`, which mutates the `Host` unit
@@ -772,6 +791,9 @@ pub unsafe extern "C" fn cap_thunk_locked(
     // §3.6, #2166: a service point — the one serve loop, root or child. It re-enters guest code,
     // so it takes the lock only in short scopes, never across a handler.
     if type_id == temen_ir::CAP_SELF_TYPE_ID && matches!(op, 9 | 10) {
+        if kernel_backstop(vm) {
+            return;
+        }
         serve_locked(
             m,
             op == 10,
@@ -787,6 +809,9 @@ pub unsafe extern "C" fn cap_thunk_locked(
     }
     // `Jit.invoke` (iface 11 op 1) re-enters guest code → never hold the lock across it.
     if type_id == cap_id::JIT && op == 1 {
+        if kernel_backstop(vm) {
+            return;
+        }
         let arg_slots = if n_args == 0 {
             &[][..]
         } else {
@@ -829,6 +854,13 @@ pub unsafe extern "C" fn cap_thunk_locked(
         // CALLS.md 5c.1b — a **locked-domain caller** takes the parked transport too, with this
         // domain's guard released before it blocks (#2139): blocking on a sibling's reply while
         // holding it would deadlock (A holds A waiting B; B blocked on A's lock).
+        if (live.is_some() || pending_id.is_some()) && kernel_backstop(vm) {
+            // A punted call is withdrawn, so no completion waits for a caller that left.
+            if let Some(id) = pending_id {
+                guard.completions().withdraw(id);
+            }
+            return;
+        }
         if let Some(target) = live {
             let fast = guard.handoff();
             drop(guard);
@@ -9362,6 +9394,27 @@ impl Instance {
     /// Run the powerbox entry on the tree-walker **and** the JIT under identical capabilities + `config`
     /// and assert they agree (the §18 interp == jit oracle), returning the shared outcome + output.
     /// `Err` on divergence, a guest trap, or compile failure.
+    /// One of [`Instance::run_diff`]'s two hosts, for a window of `win` bytes.
+    fn diff_host(&self, config: &RunConfig, win: u64) -> Host {
+        let mut h = Host::new();
+        h.stdin = config.stdin.clone();
+        config.limits.grant(&mut h);
+        h.set_handoff(config.handoff);
+        self.grant_caps(&mut h, win);
+        h
+    }
+
+    /// #2958 — test-facing: whether [`Instance::run_diff`]'s JIT lane runs this instance's vCPUs as
+    /// the kernel's tasks under `config` (`jit_kernel::admit`), or the clause that keeps it on the
+    /// JIT's own runtime.
+    #[doc(hidden)]
+    pub fn kernel_route(&self, config: &RunConfig) -> Result<(), &'static str> {
+        let owned = self.window_override(config);
+        let m = owned.as_ref().unwrap_or(&self.module);
+        let host = self.diff_host(config, m.memory.map_or(0, |mc| 1u64 << mc.size_log2));
+        jit_kernel::admit(m, &host, None, config.jit_code.is_some()).map(|_| ())
+    }
+
     pub fn run_diff(&self, config: &RunConfig) -> Result<Run, String> {
         let owned = self.window_override(config);
         let m = owned.as_ref().unwrap_or(&self.module);
@@ -9369,16 +9422,8 @@ impl Instance {
         let init_mem = config.init_mem()?;
 
         // Two hosts, granted identically (grants are deterministic, so the handle vectors match).
-        let mut hi = Host::new();
-        let mut hj = Host::new();
-        hi.stdin = config.stdin.clone();
-        hj.stdin = config.stdin.clone();
-        config.limits.grant(&mut hi);
-        config.limits.grant(&mut hj);
-        hi.set_handoff(config.handoff);
-        hj.set_handoff(config.handoff);
-        self.grant_caps(&mut hi, win);
-        self.grant_caps(&mut hj, win);
+        let mut hi = self.diff_host(config, win);
+        let mut hj = self.diff_host(config, win);
 
         let mut fuel = config.limits.fuel();
         let interp = run_interp(
