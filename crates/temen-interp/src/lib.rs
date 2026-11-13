@@ -26599,6 +26599,9 @@ pub struct Host {
     /// guest's page ops ([`ShadowArena::fences`]), as the interpreters' `Mem` fences its own.
     /// [`ShadowArena::EMPTY`], fencing nothing, for a window no engine started so.
     cap_shadow: ShadowArena,
+    /// #2958 slice 3 — the window takes no §13 region alias: a native tier reads it with every word
+    /// keyed on its own backing ([`Host::refuse_cap_window_aliases`]). Cleared as a window starts.
+    cap_no_alias: bool,
     /// Guest-driven `Jit` unit tables (iface 11), indexed by the id a [`Binding::JitTable`] carries.
     /// Append-only for the life of the `Host` (units are never removed — `release` only revokes
     /// the *handle*; code reclaim is a DESIGN.md §22 follow-up), so unit `Arc`s and native pointers stay
@@ -27368,6 +27371,7 @@ impl Host {
             exec_replace: None,
             cap_pages: None,
             cap_shadow: ShadowArena::EMPTY,
+            cap_no_alias: false,
             jit_tables: Vec::new(),
             jit_validator: None,
             module_validator: None,
@@ -29194,6 +29198,19 @@ impl Host {
         self.cap_shadow
     }
 
+    /// #2958 slice 3 — the window [`Host::cap_window_pages`] names takes no §13 region alias from
+    /// here on: the Cranelift JIT's kernel route sets it as the window starts, since its rules key
+    /// every word of the window on the window's own backing. A `map_region` of the window is refused
+    /// (`-EINVAL`), whatever path asks for it. Until the next window starts.
+    pub fn refuse_cap_window_aliases(&mut self) {
+        self.cap_no_alias = true;
+    }
+
+    /// Whether the window takes no §13 region alias ([`Host::refuse_cap_window_aliases`]).
+    pub fn cap_window_refuses_aliases(&self) -> bool {
+        self.cap_no_alias
+    }
+
     /// #2268 — the page map of JIT window `base` as the window starts, before its guest runs: what
     /// [`Host::reset_cap_pages`] staged for it (a thaw's), else a fresh one, never an earlier window's,
     /// whose address this one may reuse. Its first `call.cap` finds it ([`Host::cap_window_pages`]).
@@ -29204,6 +29221,7 @@ impl Host {
         }
         let pages = self.cap_window_pages(base);
         self.cap_shadow = shadow;
+        self.cap_no_alias = false;
         pages
     }
 

@@ -1136,3 +1136,58 @@ block 0 () {{
         "today's route answers not-equal"
     );
 }
+
+/// #2958 slice 3 — a kernel-route window takes no §13 region alias, by any path: a host procedure
+/// that maps a region into the window it is handed (`GuestMem::map_region`, a public interface) is
+/// refused (`-EINVAL`) there, before anything changes, and a wait at that address faults as on any
+/// unmapped page. Today's route maps it, and its wait reads the region. (The window carries the
+/// refusal, `Host::refuse_cap_window_aliases`; the admission clauses keep the region-mapping
+/// programs they can see on today's route.)
+#[cfg(unix)]
+#[test]
+fn a_host_procedure_cannot_map_a_region_into_a_kernel_route_window() {
+    const AT: u64 = 1 << 20;
+    // The root calls the procedure, then (with `wait`) waits not-equal at the address it mapped.
+    fn program(handle: i32, wait: bool) -> temen_ir::Module {
+        let tail = match wait {
+            true => {
+                "va = i64.const 1048576\n  vx = i32.const 1\n  vto = i64.const 0\n  vk = i32.atomic.wait va vx vto\n  vr = i64.extend_i32_u vk"
+            }
+            false => "vr = i64.add vm vz",
+        };
+        module(&format!(
+            "memory 16
+func () -> (i64) {{
+block 0 () {{
+  vq = i64.const 16400
+  vone = i32.const 1
+  vn = atomic.notify vq vone
+  vp = i32.const {handle}
+  vz = i64.const 0
+  vm = call.cap 13 0 (i64) -> (i64) vp(vz)
+  {tail}
+  return vr
+  }}
+}}
+"
+        ))
+    }
+    fn maps(h: &mut Host) -> i32 {
+        use temen_interp::{put_results, CapState, HostProcGrant, ProcHandler};
+        h.grant_host_proc(HostProcGrant::new(
+            ProcHandler::Sync(Box::new(|_op, _args, out, mem, _minter| {
+                let len = temen_interp::host_region_granularity();
+                let backing = temen_run::new_shared_region(len as usize).expect("a region");
+                let rc = mem.map_or(-1, |m| m.map_region(AT, 0, len, 3, 0, backing));
+                put_results(out, &[rc])
+            })),
+            CapState::Stateless,
+        ))
+    }
+    let [_, (_, kernel), (_, today)] = granted(|h| program(h, false), maps);
+    assert_eq!(kernel, Ok(vec![-22]), "the kernel route refuses the alias");
+    assert_eq!(today, Ok(vec![0]), "today's route maps it");
+    let [_, (_, kernel), (_, today)] = granted(|h| program(h, true), maps);
+    assert_eq!(kernel, Err("MemoryFault".into()), "the page stays unmapped");
+    assert_eq!(today, Ok(vec![1]), "today's route reads the region");
+}

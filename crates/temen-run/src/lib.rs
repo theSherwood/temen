@@ -4204,8 +4204,13 @@ pub(crate) unsafe fn start_window_view(
     keep: Arc<dyn std::any::Any + Send + Sync>,
 ) -> Option<(Arc<dyn temen_interp::FutexWindow + Send + Sync>, u64)> {
     let wm = window_view(host, base, mapped, reserved, ro, shadow)?;
+    // From here on, no path maps a region into the window: the rules key every word of it on its own
+    // backing (the reader's `futex_site`).
+    host.refuse_cap_window_aliases();
     #[cfg(any(unix, windows))]
     {
+        let mut wm = wm;
+        wm.no_alias = true;
         let runs = wm.window_runs();
         Some((Arc::new(KernelWindow(wm, keep)), runs))
     }
@@ -4640,6 +4645,9 @@ pub struct MprotectWindow {
     /// page too), so the table, not the hardware, gates its accesses there; host code still trusts
     /// this map. `None` for any other window.
     table: Option<Arc<[std::sync::atomic::AtomicU8]>>,
+    /// #2958 slice 3 — the window takes no §13 region alias ([`Host::refuse_cap_window_aliases`]):
+    /// [`GuestMem::map_region`] refuses, so no page of it is ever `Backed`.
+    no_alias: bool,
 }
 
 #[cfg(any(unix, windows))]
@@ -4756,6 +4764,7 @@ impl MprotectWindow {
             null_guard: 0,
             shadow: temen_interp::ShadowArena::EMPTY,
             table: None,
+            no_alias: false,
         }
     }
 
@@ -4803,6 +4812,8 @@ impl MprotectWindow {
         // #2426: and the runtime-private pages of a durable module's window, as its start recorded
         // them.
         self.set_shadow(host.cap_window_shadow());
+        // #2958 slice 3: and whether it takes a §13 region alias at all.
+        self.no_alias = host.cap_window_refuses_aliases();
     }
 
     /// #2426: install the shadow arena the window's module declared (see the `shadow` field).
@@ -5634,6 +5645,12 @@ impl GuestMem for MprotectWindow {
         region: u32,
         backing: RegionBacking,
     ) -> i64 {
+        // #2958 slice 3: a window the kernel route reads keys every word on its own backing, so a
+        // region alias there would fault a wait and mis-key a notify. The one way a `Backed` entry
+        // is written, refused before anything changes ([`Host::refuse_cap_window_aliases`]).
+        if self.no_alias {
+            return EINVAL;
+        }
         #[cfg(unix)]
         {
             const PROT_READ: i32 = 1;
