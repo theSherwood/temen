@@ -999,6 +999,29 @@ jobs:
           # keep leak detection off and check UB/use-after-return/red-zones only (matches the asan lane).
           ASAN_OPTIONS: "detect_leaks=0"
 
+  asan-held:
+    # AddressSanitizer over the held JIT domain's lifetimes (#3000, #2993): an activation's fuel cell,
+    # the pool an uncarried activation runs on, and the run's teardown. The bugs there are reads and
+    # lock writes of freed heap, which a plain debug build does not see: `held_domain`'s JIT cases
+    # passed there while ASan reported a heap-use-after-free in 25 of 30 runs.
+    name: ASan (held JIT domains)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2 # nightly
+        with: { components: rust-src }
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: cargo test -p temen-run --test held_domain (ASan, temen-jit asan feature)
+        run: cargo test -p temen-run --features temen-jit/asan -Z build-std --target x86_64-unknown-linux-gnu --test held_domain
+        env:
+          # As the asan lane: -Zsanitizer=address replaces the workflow-global `-D warnings`, which
+          # -Z build-std's recompiled std would trip.
+          RUSTFLAGS: "-Zsanitizer=address"
+          # The fiber scheduler leaks values on a dropped-suspended fiber's stack (documented).
+          ASAN_OPTIONS: "detect_leaks=0"
+
   browser-real:
     name: real-browser (Chromium via Playwright)
     # Pinned, not `ubuntu-latest`: that moved to Ubuntu 26.04 between 2026-10-29 and 2026-11-02, and

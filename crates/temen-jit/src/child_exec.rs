@@ -1431,6 +1431,8 @@ pub struct HeldSite {
     root: *const VmCtx,
     /// The main thread's `vcpu.tls` word at rest.
     tls: i64,
+    /// #2993 — the site made its pool: its run has no nursery, whose teardown would join it.
+    own_exec: bool,
     /// Activations in flight: the rest waits for them before the domain's window and code go.
     inflight: AtomicUsize,
     /// The domain no longer takes calls: its rest has ended, or is ending.
@@ -1491,12 +1493,17 @@ impl HeldSite {
         domain: &Domain,
         tls: i64,
     ) -> Arc<HeldSite> {
+        // #2993 — the run's pool, its nursery's: the one its teardown joins. Only a run with no
+        // nursery, which spawns nothing, has none, and the site makes one, which its rest joins.
         let hub = domain.hub();
-        let exec = hub.child_exec().unwrap_or_else(|| {
-            let e = ChildExec::new(hub as *const Domain as usize);
-            hub.set_child_exec(Arc::clone(&e));
-            e
-        });
+        let (exec, own_exec) = match cc._nursery.as_deref() {
+            Some(n) => (Arc::clone(n.exec()), false),
+            None => {
+                let e = ChildExec::new(hub as *const Domain as usize);
+                hub.set_child_exec(Arc::clone(&e));
+                (e, true)
+            }
+        };
         let window = Arc::new(Window {
             tls: std::sync::atomic::AtomicI64::new(tls),
             ring: Box::new(|| {}),
@@ -1528,6 +1535,7 @@ impl HeldSite {
             },
             root: root as *const VmCtx,
             tls,
+            own_exec,
             inflight: AtomicUsize::new(0),
             closed: std::sync::atomic::AtomicBool::new(false),
             end_asked: Mutex::new(false),
@@ -1583,6 +1591,11 @@ impl HeldSite {
         }
         drop(g);
         self.site.set_open(false);
+        // #2993 — every pool a run uses is joined before its window, code and root context go: the
+        // nursery's by its teardown, and one the site made here.
+        if self.own_exec {
+            self.site.exec.shutdown_and_join(true);
+        }
     }
 
     /// End the domain ([`Self::rest`]): its embedder lets it go.
@@ -3392,6 +3405,11 @@ impl ChildExec {
                 }
             }
             self.wake_parked(&mut g, Wake::All);
+            // A runnable task a worker passed over, for want of its window's gate or an open
+            // window, runs now regardless, to unwind (`pick`): its worker looks again. Without
+            // this, a worker asleep since that pick slept on, and the join below waited for good
+            // (an uncarried activation of a held domain whose window had closed, #3000).
+            self.cv.notify_all();
             // No worker could be spawned for a filed task (thread refusal): drive it here, this
             // thread a free worker until the queue is done.
             if g.workers.is_empty() && !g.tasks.is_empty() {

@@ -736,6 +736,12 @@ impl Nursery {
         self.children.set_nursery(self);
     }
 
+    /// #2993 — the run's pool, which every task of the run runs on, a held site's activations
+    /// included, and which [`Self::join_children`] drives to quiescence at teardown.
+    pub(crate) fn exec(&self) -> &std::sync::Arc<crate::child_exec::ChildExec> {
+        &self.child_exec
+    }
+
     /// temen#2168 — compile the run's detached children into `cache`, the embedder's: called at run
     /// entry, before any spawn site can fire.
     pub(crate) fn set_child_code(&self, cache: crate::ChildCodeCache) {

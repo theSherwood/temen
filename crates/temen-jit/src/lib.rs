@@ -6300,6 +6300,24 @@ impl CompiledModule {
         // run entry's `set_env`; the address is stable now, which is all the context needs.
         let domain = Box::new(os_thread_rt::Domain::new(self.node.clone()));
         self.instance.sched = &*domain as *const os_thread_rt::Domain as *const core::ffi::c_void;
+        // #2993 — the run has one pool: the nursery the compile stood up for its install room
+        // (#1726), made before there was a domain, is made again over this one, as a nesting
+        // module's is, so its children share the domain's futex, wakes and pool, and a held site
+        // finds that pool rather than making a second one no teardown joins. No spawn can have
+        // happened yet: the run has not begun.
+        if self._nursery.is_some() {
+            let n = nursery_over(
+                self.cap_thunk,
+                self.instance.cap_ctx,
+                self.resolve_module,
+                self.instance.epoch as usize,
+                Some(&domain),
+                self.shadow,
+            );
+            self.instance.nursery =
+                &*n as *const instantiator_rt::Nursery as *const core::ffi::c_void;
+            self._nursery = Some(n);
+        }
         self.threads = true;
         self.spawns = true;
         self.domain = Some(domain);

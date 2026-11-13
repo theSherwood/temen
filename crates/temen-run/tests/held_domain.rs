@@ -976,3 +976,251 @@ fn a_nested_self_call_parked_when_the_guest_ends_its_domain(on: Executor) {
 }
 
 on_every_executor!(a_nested_self_call_parked_when_the_guest_ends_its_domain);
+
+/// #2993 — a held domain whose module names no `Instantiator`, thread or fiber op, so its run's
+/// only nursery is the one its install room needs (#1726), and whose child comes from a §22 unit
+/// it installs. Its entry takes an `Instantiator`, the child's `Module`, a budget and a `Jit`; it
+/// compiles and installs four units, `spawn(inst, rec)`, `join(inst, child)`, `wait(word, _)` (a
+/// futex wait on a word nobody sets) and `kill(inst, child)`, and spawns the child through the
+/// first, granting it `"exec"`, the live offer over the domain. Its ops:
+///
+/// - `ping()` answers 1; `join()` joins the child and answers its result; `kill()` kills it.
+/// - `wait()` marks 16600 and waits for good, through the `wait` unit; `peek()` answers the mark.
+/// - `boom()` traps.
+fn unit_spawner() -> String {
+    const SPAWN: &str = "memory 17\nfunc (i64, i64) -> (i64) {\nblock 0 (vi: i64, vr: i64) {\n  vi32 = i32.wrap_i64 vi\n  vch = call.cap 6 17 (i64) -> (i32) vi32 (vr)\n  vc64 = i64.extend_i32_u vch\n  return vc64\n  }\n}\n";
+    const JOIN: &str = "memory 17\nfunc (i64, i64) -> (i64) {\nblock 0 (vi: i64, vc: i64) {\n  vi32 = i32.wrap_i64 vi\n  vc32 = i32.wrap_i64 vc\n  vst, vv = call.cap 6 1 (i32) -> (i64, i64) vi32 (vc32)\n  return vv\n  }\n}\n";
+    const WAIT: &str = "memory 17\nfunc (i64, i64) -> (i64) {\nblock 0 (va: i64, vb: i64) {\n  vexp = i32.const 0\n  vto = i64.const -1\n  vst = i32.atomic.wait va vexp vto\n  vr = i64.extend_i32_s vst\n  return vr\n  }\n}\n";
+    const KILL: &str = "memory 17\nfunc (i64, i64) -> (i64) {\nblock 0 (vi: i64, vc: i64) {\n  vi32 = i32.wrap_i64 vi\n  vc32 = i32.wrap_i64 vc\n  vr = call.cap 6 12 (i32) -> (i32) vi32 (vc32)\n  vr64 = i64.extend_i32_s vr\n  return vr64\n  }\n}\n";
+    let units: Vec<Vec<u8>> = [SPAWN, JOIN, WAIT, KILL]
+        .iter()
+        .map(|u| temen_encode::encode_module(&module(u)))
+        .collect();
+    let child = SpawnRec {
+        grants_ptr: 16640,
+        grants_n: 1,
+        ..SpawnRec::default()
+    };
+    // Each unit's bytes at 20480 + 1024 i, its installed slot at 16800 + 8 i.
+    let data: String = (units.iter().enumerate())
+        .map(|(i, u)| {
+            let bytes: String = u.iter().map(|b| format!("\\x{b:02x}")).collect();
+            format!("data {} \"{bytes}\"\n", 20480 + 1024 * i)
+        })
+        .collect();
+    let install: String = (units.iter().enumerate())
+        .map(|(i, u)| {
+            format!(
+                "  vu{i} = i64.const {at}\n  vn{i} = i64.const {len}\n  \
+                 vk{i} = call.cap 11 0 (i64, i64) -> (i64) vjit (vu{i}, vn{i})\n  \
+                 vc{i} = call.cap 11 3 (i64) -> (i64) vjit (vk{i})\n  \
+                 vs{i} = i64.const {slot}\n  i64.store vs{i} vc{i}\n",
+                at = 20480 + 1024 * i,
+                len = u.len(),
+                slot = 16800 + 8 * i,
+            )
+        })
+        .collect();
+    // Call unit `i` on `(a, b)`, two registers, into `r`; registers prefixed `p`.
+    let unit = |i: usize, p: &str, a: &str, b: &str, r: &str| {
+        format!(
+            "  {p}sa = i64.const {slot}\n  {p}c = i64.load {p}sa\n  {p}cs = i32.wrap_i64 {p}c\n  \
+             {r} = call.dyn (i64, i64) -> (i64) {p}cs ({a}, {b})\n",
+            slot = 16800 + 8 * i,
+        )
+    };
+    // The `Instantiator` and the child, as `i64`s, into `vi` and `vch`.
+    let handles =
+        "  vsi = i64.const 16444\n  vi32 = i32.load vsi\n  vi = i64.extend_i32_u vi32\n  \
+                   vsc = i64.const 16440\n  vch32 = i32.load vsc\n  vch = i64.extend_i32_u vch32\n";
+    format!(
+        r#"memory 17
+data 16684 "exec"
+{data}{rec}type 0 func () -> (i64)
+type 1 func () -> ()
+type 2 interface {{ ping: 0, join: 0, wait: 0, kill: 0, peek: 0, boom: 1 }}
+export 0 interface "svc" 2 {{ ping: 1, join: 2, wait: 3, kill: 4, peek: 5, boom: 6 }}
+
+func (i32, i32, i32, i32) -> (i64) {{
+block 0 (vinst: i32, vm: i32, vb: i32, vjit: i32) {{
+  vsi = i64.const 16444
+  i32.store vsi vinst
+  vma = i64.const {module_at}
+  i32.store vma vm
+  vba = i64.const {budget_at}
+  i32.store vba vb
+  vgh = i32.const {tag}
+{grant}{install}  vi = i64.extend_i32_u vinst
+  vrec = i64.const 17408
+{spawn}  vch32 = i32.wrap_i64 vch
+  vsc = i64.const 16440
+  i32.store vsc vch32
+  vr = i64.const 1
+  return vr
+  }}
+}}
+
+func () -> (i64) {{
+block 0 () {{
+  vr = i64.const 1
+  return vr
+  }}
+}}
+
+func () -> (i64) {{
+block 0 () {{
+{handles}{join}  return vr
+  }}
+}}
+
+func () -> (i64) {{
+block 0 () {{
+  vs = i64.const 16600
+  vone = i32.const 1
+  i32.store vs vone
+  vw = i64.const 16424
+  vz = i64.const 0
+{wait}  return vr
+  }}
+}}
+
+func () -> (i64) {{
+block 0 () {{
+{handles}{kill}  return vr
+  }}
+}}
+
+func () -> (i64) {{
+block 0 () {{
+  vs = i64.const 16600
+  vv = i32.load vs
+  vr = i64.extend_i32_s vv
+  return vr
+  }}
+}}
+
+func () -> () {{
+block 0 () {{
+  unreachable
+  }}
+}}
+"#,
+        rec = rec::segment(17408, &child),
+        grant = rec::grant("ge", 16640, 16684, 4, "vgh"),
+        spawn = unit(0, "p", "vi", "vrec", "vch"),
+        join = unit(1, "p", "vi", "vch", "vr"),
+        wait = unit(2, "p", "vw", "vz", "vr"),
+        kill = unit(3, "p", "vi", "vch", "vr"),
+        module_at = 17408 + SpawnRec::MODULE_AT,
+        budget_at = 17408 + SpawnRec::BUDGET_AT,
+        tag = GRANT_SERVE_LIVE_TAG as i32,
+    )
+}
+
+/// A child for [`unit_spawner`] that calls `op` on its parent through `"exec"` and returns the
+/// answer plus 40.
+fn unit_child(op: u32) -> String {
+    format!(
+        r#"memory 15
+data 16384 "exec"
+func (i64) -> (i64) {{
+block 0 (v0: i64) {{
+  vnp = i64.const 16384
+  vl = i64.const 4
+  vexec = self.resolve vnp vl
+  vr = call.cap 268435456 {op} () -> (i64) vexec ()
+  vk = i64.const 40
+  vr2 = i64.add vr vk
+  return vr2
+  }}
+}}
+"#
+    )
+}
+
+/// Hold [`unit_spawner`] on `on`, its child calling `op`.
+fn hold_unit_spawner(on: Executor, op: u32) -> HeldDomain {
+    let m = module(&unit_spawner());
+    let mut host = Host::new();
+    host.set_self_module(&m);
+    let jit = temen_run::grant_jit(&mut host, &m, 0);
+    host.set_jit_quota(4, 1 << 20);
+    let args = [
+        Value::I32(host.grant_instantiator()),
+        Value::I32(host.grant_module(&module(&unit_child(op)))),
+        Value::I32(host.grant_budget(-1, 1 << 20, -1)),
+        Value::I32(jit),
+    ];
+    hold(on, m, 0, &args, host).0
+}
+
+/// Wait, within a bound, until the child's `wait()` has started: `peek()` answers 1.
+fn until_the_child_waits(d: &HeldDomain) {
+    let mut seen = Reply::Results(vec![0]);
+    for _ in 0..1_000_000 {
+        seen = call(d, 4, &[]);
+        if seen != Reply::Results(vec![0]) {
+            break;
+        }
+        std::thread::yield_now();
+    }
+    assert_eq!(seen, Reply::Results(vec![1]), "the child's wait() started");
+}
+
+/// #2993 — a child that an installed unit spawned calls its held parent and is answered. Before,
+/// the install room's nursery was made before the run's domain, so the child had no `sched`, and
+/// its call aborted a debug build.
+fn a_child_an_installed_unit_spawned_calls_its_held_parent(on: Executor) {
+    bounded(move || {
+        let d = hold_unit_spawner(on, 0);
+        assert_eq!(call(&d, 1, &[]), Reply::Results(vec![41]));
+    });
+}
+
+/// #2993 — the domain ends while that child's call is parked in it: the call unwinds, and the
+/// domain's end returns. Before, the child was a task of a second pool that the domain's end never
+/// woke, so the rest waited for its activation for good.
+fn a_unit_childs_call_parked_at_its_parents_end_unwinds(on: Executor) {
+    bounded(move || {
+        let d = hold_unit_spawner(on, 2);
+        until_the_child_waits(&d);
+        assert_eq!(
+            call(&d, 5, &[]),
+            Reply::Failed(CAP_REVOKED),
+            "boom() ends it"
+        );
+        drop(d);
+    });
+}
+
+/// #2993 — the child is killed while its call is parked in its held parent: the call's activation
+/// runs on in the pool, and the parent's end waits for it before the run's window, code and root
+/// context go.
+fn a_killed_unit_childs_parked_call_ends_before_its_parent(on: Executor) {
+    bounded(move || {
+        let d = hold_unit_spawner(on, 2);
+        until_the_child_waits(&d);
+        assert!(matches!(call(&d, 3, &[]), Reply::Results(_)), "kill()");
+        assert!(matches!(call(&d, 1, &[]), Reply::Results(_)), "join()");
+        drop(d);
+    });
+}
+
+/// On the JIT alone: the interpreters end the domain with `IndirectCallType` when an activation
+/// calls a unit its entry installed (#3030).
+mod unit_children {
+    #[test]
+    fn a_child_an_installed_unit_spawned_calls_its_held_parent() {
+        super::a_child_an_installed_unit_spawned_calls_its_held_parent(temen_interp::Executor::Jit);
+    }
+
+    #[test]
+    fn a_unit_childs_call_parked_at_its_parents_end_unwinds() {
+        super::a_unit_childs_call_parked_at_its_parents_end_unwinds(temen_interp::Executor::Jit);
+    }
+
+    #[test]
+    fn a_killed_unit_childs_parked_call_ends_before_its_parent() {
+        super::a_killed_unit_childs_parked_call_ends_before_its_parent(temen_interp::Executor::Jit);
+    }
+}
