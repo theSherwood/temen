@@ -11,7 +11,7 @@
 //! meters fuel.
 //!
 //! `SPIKE_SECTIONS` picks sections, comma-separated: `compute`, `spawn`, `park` (the default three),
-//! `k1000`, `nowake`, `pairs`, `always` (#2985). `SPIKE_K` picks the park section's K values (`0,100,1000` by
+//! `k1000`, `nowake`, `alias` (#2958 slice 4), `pairs`, `always` (#2985). `SPIKE_K` picks the park section's K values (`0,100,1000` by
 //! default), `SPIKE_LANES` its lanes.
 
 use std::time::{Duration, Instant};
@@ -56,12 +56,12 @@ fn today<'a>(m: &'a Module, entry: u32, host: Host, locked: bool) -> Lane<'a> {
     })
 }
 
-/// The kernel route over a fresh host, unmetered (no fuel checks compiled, as today's lane). Its
-/// compile is inside the timed run, so the per-iteration rows subtract it and the run-at-`n` column
-/// carries it: [`setup`] reports the compile apart.
-fn kernel(m: &Module, entry: u32) -> Lane<'_> {
+/// The kernel route over a fresh host `host` makes, unmetered (no fuel checks compiled, as today's
+/// lane). Its compile is inside the timed run, so the per-iteration rows subtract it and the
+/// run-at-`n` column carries it: [`setup`] reports the compile apart.
+fn kernel(m: &Module, entry: u32, host: fn() -> Host) -> Lane<'_> {
     Box::new(move |args| {
-        let mut h = Host::new();
+        let mut h = host();
         let admitted = jit_kernel::admit(m, &h, false).expect("in the kernel's scope");
         let start = jit_kernel::Start {
             entry,
@@ -302,7 +302,56 @@ pub fn run(reps: usize) {
             ("today-lock", today(&m, 0, crate::dispatch_host().0, true)),
         ];
         let range = (1_000, 2_000_000);
-        per_iter("hostproc", &mut lanes, args, range, 1.0, reps, 1.0, "ns");
+        per_iter(
+            "hostproc",
+            &mut lanes,
+            args.clone(),
+            range,
+            1.0,
+            reps,
+            1.0,
+            "ns",
+        );
+        // #2958 slice 4 — the same procedure on the kernel route: a twin with one §12 op before the
+        // loop, which the kernel admits, called inline and through a `call.import` bound to it.
+        println!("\nsynchronous call.cap on the kernel route (ns per call):");
+        let notified = k.ir.replacen(
+            "block 0 (v0: i32, v1: i64) {\n",
+            "block 0 (v0: i32, v1: i64) {\n  vq = i64.const 16400\n  vqo = i32.const 1\n  vqk = atomic.notify vq vqo\n",
+            1,
+        );
+        let imported = format!(
+            "import 0 \"inc\" (i64) -> (i64)\n{}",
+            notified.replacen(
+                "call.cap 13 0 (i64) -> (i64) v9(v12)",
+                "call.import 0 (v12)",
+                1
+            )
+        );
+        fn import_host() -> Host {
+            let (mut h, handle) = crate::dispatch_host();
+            h.set_import_bindings(vec![temen_interp::BoundImport::required(
+                temen_ir::cap_id::HOST_PROC,
+                0,
+                handle,
+            )]);
+            h
+        }
+        for (name, ir, host) in [
+            (
+                "hostproc",
+                &notified,
+                (|| crate::dispatch_host().0) as fn() -> Host,
+            ),
+            ("hostimport", &imported, import_host),
+        ] {
+            let m = parse(ir);
+            let mut lanes = [
+                ("today-lock", today(&m, 0, host(), true)),
+                ("kernel", kernel(&m, 0, host)),
+            ];
+            per_iter(name, &mut lanes, args.clone(), range, 1.0, reps, 1.0, "ns");
+        }
     }
     if on("spawn") {
         println!("\nspawn and join (bench --threads, ms per run; spawn + work + join):");
@@ -318,7 +367,7 @@ pub fn run(reps: usize) {
             let want = (nw as i64) * (steps as i64);
             let mut lanes = [
                 ("today", today(&m, entry, Host::new(), true)),
-                ("kernel", kernel(&m, entry)),
+                ("kernel", kernel(&m, entry, Host::new)),
             ];
             let mut ms: Vec<Vec<f64>> = vec![Vec::new(); lanes.len()];
             for _ in 0..reps {
@@ -345,6 +394,10 @@ pub fn run(reps: usize) {
     }
     if on("nowake") {
         run_nowake(reps);
+    }
+    #[cfg(any(unix, windows))]
+    if on("alias") {
+        run_nowake_alias(reps);
     }
     if on("pairs") {
         run_pairs(reps);
@@ -381,7 +434,7 @@ fn run_always(reps: usize) {
     let lanes = |m| {
         let all: Vec<(&str, Lane<'_>)> = vec![
             ("today", today(m, 0, Host::new(), true)),
-            ("kernel", kernel(m, 0)),
+            ("kernel", kernel(m, 0, Host::new)),
             ("x2-interp", x2_interp(m)),
         ];
         (all.into_iter())
@@ -497,7 +550,7 @@ fn run_park(reps: usize) {
     for k in ks {
         let lanes = vec![
             ("today", today(&m, 0, Host::new(), true)),
-            ("kernel", kernel(&m, 0)),
+            ("kernel", kernel(&m, 0, Host::new)),
             ("x2-interp", x2_interp(&m)),
         ];
         let mut lanes: Vec<_> = lanes
@@ -530,7 +583,7 @@ fn run_k1000(reps: usize) {
     let m = parse(pingpong_ir());
     let mut lanes = [
         ("today", today(&m, 0, Host::new(), true)),
-        ("kernel", kernel(&m, 0)),
+        ("kernel", kernel(&m, 0, Host::new)),
     ];
     let args = |n| vec![n, 1_000];
     per_iter(
@@ -562,7 +615,7 @@ fn run_nowake(reps: usize) {
             // fast paths as the kernel's native ones (#2958 slice 2).
             let mut lanes = [
                 ("today", today(&m, 0, Host::new(), true)),
-                ("kernel", kernel(&m, 0)),
+                ("kernel", kernel(&m, 0, Host::new)),
                 ("x2-interp", x2_interp(&m)),
             ];
             let label = format!("{what}, K = {k}");
@@ -571,6 +624,54 @@ fn run_nowake(reps: usize) {
                 &mut lanes,
                 args,
                 (1_000, long),
+                1.0,
+                reps,
+                1.0,
+                "ns",
+            );
+        }
+    }
+}
+
+/// #2958 slice 4 — the no-wake costs in a window that holds a §13 alias: [`run_nowake`]'s program,
+/// which first maps one granule of a region into its reservation (past the words it uses). A
+/// notify's key then reads the page map once the window was ever aliased (`CapPages::aliased`).
+#[cfg(any(unix, windows))]
+fn run_nowake_alias(reps: usize) {
+    println!("\nno wake, a §13 alias in the window (ns per op):");
+    fn host() -> Host {
+        let mut h = Host::new();
+        let len = temen_interp::host_region_granularity() as usize;
+        h.grant_shared_region_backed(temen_run::new_shared_region(len).expect("a region"));
+        h
+    }
+    let handle = {
+        let mut h = Host::new();
+        let len = temen_interp::host_region_granularity() as usize;
+        h.grant_shared_region_backed(temen_run::new_shared_region(len).expect("a region"))
+    };
+    let gran = temen_interp::host_region_granularity();
+    let ir = crate::kernel_spike_ir::NOWAKE_IR.replacen(
+        "block 0 (vn: i64, vk: i64, vm: i64) {\n",
+        &format!(
+            "block 0 (vn: i64, vk: i64, vm: i64) {{\n  vrc = i32.const {handle}\n  vra = i64.const 1048576\n  vro = i64.const 0\n  vrl = i64.const {gran}\n  vrp = i64.const 3\n  vrm = call.cap 4 0 (i64, i64, i64, i64) -> (i64) vrc(vra, vro, vrl, vrp)\n"
+        ),
+        1,
+    );
+    let m = parse(&ir);
+    for (mode, what) in [(0i64, "notify, none"), (1, "wait, not-equal")] {
+        for k in [0i64, 100] {
+            let args = move |n| vec![n, k, mode];
+            let mut lanes = [
+                ("today", today(&m, 0, host(), true)),
+                ("kernel", kernel(&m, 0, host)),
+            ];
+            let label = format!("{what}, K = {k}");
+            per_iter(
+                &label,
+                &mut lanes,
+                args,
+                (1_000, 2_001_000),
                 1.0,
                 reps,
                 1.0,
@@ -590,7 +691,7 @@ fn run_pairs(reps: usize) {
     for p in [1i64, 2, 4] {
         let mut lanes = [
             ("today", today(&m, 0, Host::new(), true)),
-            ("kernel", kernel(&m, 0)),
+            ("kernel", kernel(&m, 0, Host::new)),
         ];
         let args = move |n| vec![n, p];
         per_iter(
