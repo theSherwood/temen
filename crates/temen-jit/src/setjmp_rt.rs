@@ -178,11 +178,10 @@ pub(crate) unsafe extern "C" fn rt_setjmp_slot(
     buf: u64,
 ) -> *mut c_void {
     let token = TOKEN.fetch_add(1, Ordering::Relaxed);
-    // Before the lock: a store past the backed extent faults out of this frame.
-    let Some(word) = crate::mem::guest_word(vm, buf, true) else {
+    // Before the lock, and recoverable (#2996): a faulting store raises `MemoryFault` and returns.
+    if !crate::mem::guest_store_u64(vm, buf, token) {
         return SCRATCH.with(|s| s.as_ptr());
-    };
-    word.cast::<u64>().write_unaligned(token);
+    }
     let Some(rt) = runtime(vm) else {
         vm.raise(TrapKind::SetjmpFault as i64);
         return SCRATCH.with(|s| s.as_ptr());
@@ -216,10 +215,9 @@ pub(crate) unsafe extern "C" fn rt_setjmp_leave(vm: &crate::VmCtx, fp: u64) {
 /// # Safety
 /// As [`rt_setjmp_slot`].
 pub(crate) unsafe extern "C" fn rt_longjmp(vm: &crate::VmCtx, fp: u64, buf: u64, val: c_int) {
-    let Some(word) = crate::mem::guest_word(vm, buf, false) else {
+    let Some(token) = crate::mem::guest_load_u64(vm, buf) else {
         return;
     };
-    let token = word.cast::<u64>().read_unaligned();
     let env = runtime(vm).and_then(|rt| {
         let mut st = rt.lock();
         let i = st.floor
@@ -240,38 +238,120 @@ pub(crate) unsafe extern "C" fn rt_longjmp(vm: &crate::VmCtx, fp: u64, buf: u64,
 }
 
 /// The checkpoints of one guarded call into JIT code (`mem::run_guarded_range`, the one entry every
-/// run, nested `invoke_extra` and fiber resume takes): on entry it raises the table's floor, so a
-/// `longjmp` cannot reach a checkpoint an enclosing call took (that would jump over the host frames
-/// between them); on drop — after a normal return or a fault, which skips every frame's exit — it
-/// drops the checkpoints the call took and restores the floor. A no-op for a module without `setjmp`.
+/// run, nested `invoke_extra`, serve handler and fiber residency takes): on entry it raises the
+/// table's floor to the checkpoints live then, so a `longjmp` cannot reach a checkpoint an enclosing
+/// call took (that would jump over the host frames between them); on drop — after a normal return or
+/// a fault, which skips every frame's exit — it drops every checkpoint from the floor **it set** up,
+/// and restores the floor it found. A no-op for a module without `setjmp`.
+///
+/// **Scopes on one table nest strictly** (enter A, enter B, exit B, exit A), which is what makes the
+/// floor a stack. What guarantees it, per way an instance's code is entered:
+/// - a plain run: the run's one thread, on which each nested `invoke_extra` or serve handler is a
+///   call inside the outer bracket;
+/// - fibers and threads: a module that mixes them with `setjmp` is declined at compile time
+///   (`CompiledModule::compile`), so no second stack or thread ever enters this table;
+/// - a held or served domain: its activations run one at a time under the window's gate, inside the
+///   resting root's own bracket, and each residency of an activation's fiber is a bracket of its own
+///   that closes before the fiber parks and the gate is handed on.
+///
+/// So a suspended fiber's checkpoints die when its residency's bracket closes: a `longjmp` to one
+/// after it resumes traps `SetjmpFault`, never reaches a frame. Should scopes ever overlap without
+/// nesting, the drop still truncates to the floor this scope set, so no checkpoint of a call that
+/// ended stays reachable (debug builds assert the nesting).
 pub(crate) struct Scope<'a> {
     rt: Option<&'a SetjmpRuntime>,
-    floor: usize,
+    /// The floor this scope set: the table's live count at entry.
+    mine: usize,
+    /// The floor it found, which it restores.
+    outer: usize,
 }
 
-impl Scope<'_> {
+impl<'a> Scope<'a> {
     /// # Safety
     /// `vm` is null or a live context whose `setjmp` field is null or its instance's live table, and
     /// both outlive the scope.
     pub(crate) unsafe fn enter(vm: *const crate::VmCtx) -> Self {
-        let rt = vm.as_ref().and_then(|vm| runtime(vm));
-        let floor = rt.map_or(0, |rt| {
+        Self::on(vm.as_ref().and_then(|vm| runtime(vm)))
+    }
+
+    fn on(rt: Option<&'a SetjmpRuntime>) -> Self {
+        let (mine, outer) = rt.map_or((0, 0), |rt| {
             let mut st = rt.lock();
             let outer = st.floor;
             st.floor = st.live;
-            outer
+            (st.live, outer)
         });
-        Scope { rt, floor }
+        Scope { rt, mine, outer }
     }
 }
 
 impl Drop for Scope<'_> {
     fn drop(&mut self) {
         if let Some(rt) = self.rt {
-            let mut st = rt.lock();
-            let mine = st.floor;
-            st.truncate(mine);
-            st.floor = self.floor;
+            let nested = {
+                let mut st = rt.lock();
+                let nested = st.floor == self.mine;
+                st.live = st.live.min(self.mine);
+                st.floor = self.outer;
+                nested
+            };
+            debug_assert!(nested, "setjmp scopes overlap without nesting");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The live checkpoints' tokens.
+    fn reachable(rt: &SetjmpRuntime) -> Vec<u64> {
+        let st = rt.lock();
+        st.live()[st.floor..].iter().map(|c| c.token).collect()
+    }
+
+    /// Two scopes that overlap without nesting (enter A, enter B, exit A, exit B): A's exit drops what
+    /// A took, B's what B took, and once both have ended no checkpoint of either stays reachable. The
+    /// drop used to truncate to the table's current floor (B's), keep A's dead checkpoints and restore
+    /// floor 0 above them.
+    #[test]
+    fn overlapping_scopes_leave_no_dead_checkpoint_reachable() {
+        let rt = SetjmpRuntime::new();
+        let a = Scope::on(Some(&rt));
+        rt.lock().push(1, 2000); // A's checkpoint
+        let b = Scope::on(Some(&rt));
+        rt.lock().push(2, 1000); // B's checkpoint
+                                 // Out of order: A's exit. Debug builds flag the overlap; the table must stay sound either way.
+        let ended_a = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(a)));
+        assert_eq!(ended_a.is_err(), cfg!(debug_assertions));
+        assert!(
+            !reachable(&rt).contains(&1),
+            "A ended, its checkpoint is reachable: {:?}",
+            reachable(&rt)
+        );
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(b)));
+        assert_eq!(reachable(&rt), Vec::<u64>::new());
+        assert_eq!(rt.lock().live, 0);
+    }
+
+    /// Nested scopes: the inner one drops only its own checkpoints and hands the outer one's back.
+    #[test]
+    fn a_nested_scope_drops_only_its_own_checkpoints() {
+        let rt = SetjmpRuntime::new();
+        let outer = Scope::on(Some(&rt));
+        rt.lock().push(1, 2000);
+        {
+            let _inner = Scope::on(Some(&rt));
+            assert_eq!(
+                reachable(&rt),
+                Vec::<u64>::new(),
+                "the floor hides the outer's"
+            );
+            rt.lock().push(2, 1000);
+            assert_eq!(reachable(&rt), vec![2]);
+        }
+        assert_eq!(reachable(&rt), vec![1]);
+        drop(outer);
+        assert_eq!(reachable(&rt), Vec::<u64>::new());
     }
 }

@@ -602,6 +602,21 @@ fn a_setjmp_into_the_null_guard_faults_on_every_engine() {
     assert_every_engine(&src, 1, Err(temen_ir::trap_code::MEMORY_FAULT));
 }
 
+/// A `jmp_buf` in a read-only data segment faults at the `setjmp`'s token store on every engine: the
+/// JIT's host-side store goes through the recoverable window access (#2996), so the fault is the
+/// guest's `MemoryFault`, not a host fault.
+#[test]
+fn a_setjmp_into_a_readonly_page_faults_on_every_engine() {
+    let src = RETURNED
+        .replacen(
+            "memory 16\n",
+            "memory 16\ndata ro 16384 \"0123456789abcdef\"\n",
+            1,
+        )
+        .replace("v1 = i64.const 48000", "v1 = i64.const 16384");
+    assert_every_engine(&src, 1, Err(temen_ir::trap_code::MEMORY_FAULT));
+}
+
 /// One compiled module run twice over one window: the first run takes a checkpoint (its token stays
 /// in the buffer) and returns; the second `longjmp`s with that token. The first run's activation is
 /// long gone — the JIT's table outlives runs, so it must drop a run's checkpoints when the run ends.
