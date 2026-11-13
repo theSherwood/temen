@@ -515,6 +515,14 @@ impl SharedFiberTable {
         }
     }
 
+    /// #3020 — room for `slots` slots up front: a run of a compile that held `slots` at once last time
+    /// holds as many again, so its table need not regrow to them. A size hint, no state.
+    pub(crate) fn reserve(&self, slots: usize) {
+        let mut t = self.lock();
+        t.slots.reserve(slots);
+        t.charges.reserve(slots);
+    }
+
     fn lock(&self) -> MutexGuard<'_, TableState> {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }

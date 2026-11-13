@@ -3461,6 +3461,11 @@ pub struct CompiledModule {
     /// with what the guest left.
     #[cfg(fiber_rt)]
     keep_parked_backtraces: bool,
+    /// #3020 — how many fiber slots the last run's table held at its peak: the next run's table
+    /// reserves as many, so a run that makes as many fibers again does not regrow to them. A size
+    /// hint; no fiber or handle carries over.
+    #[cfg(fiber_rt)]
+    fiber_slots_hint: usize,
     /// #3020 — those backtraces, from the last run: each fiber's handle, the table's slot count its
     /// handles are read against, and its frames.
     #[cfg(fiber_rt)]
@@ -3612,6 +3617,7 @@ impl CompiledModule {
                 self.shadow,
                 self.node.clone(),
             ));
+            table.reserve(self.fiber_slots_hint);
             let root = self.fiber_cfg.map(|(type_id, mask)| {
                 let mut rt = Box::new(fiber_rt::FiberRuntime::new(
                     Arc::clone(&table),
@@ -4667,6 +4673,8 @@ impl CompiledModule {
             #[cfg(fiber_rt)]
             keep_parked_backtraces: false,
             #[cfg(fiber_rt)]
+            fiber_slots_hint: 0,
+            #[cfg(fiber_rt)]
             parked_backtraces: (0, Vec::new()),
             #[cfg(fiber_rt)]
             domain,
@@ -4952,6 +4960,8 @@ impl CompiledModule {
             rest: None,
             #[cfg(fiber_rt)]
             keep_parked_backtraces: false,
+            #[cfg(fiber_rt)]
+            fiber_slots_hint: 0,
             #[cfg(fiber_rt)]
             parked_backtraces: (0, Vec::new()),
             #[cfg(fiber_rt)]
@@ -5918,6 +5928,7 @@ impl CompiledModule {
         #[cfg(fiber_rt)]
         if let Some(f) = run_fibers.take() {
             (*this).parked_backtraces = (*this).parked_backtraces_of(&f.table);
+            (*this).fiber_slots_hint = f.table.slot_count();
             drop(f);
         }
         // Snapshot the in-window bytes when asked (the escape-oracle; a reactor's state). #2176: a run
@@ -8927,6 +8938,7 @@ fn compile_child_windowed(
         #[cfg(fiber_rt)]
         rest: None,
         keep_parked_backtraces: false,
+        fiber_slots_hint: 0,
         parked_backtraces: (0, Vec::new()),
         domain: None,
         _nursery: None,
