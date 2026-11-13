@@ -937,12 +937,15 @@ fn spin<'s, 'e>(s: &'s std::thread::Scope<'s, 'e>, stop: &'e std::sync::atomic::
 }
 
 /// The race test: under busy threads, a vCPU's futex ops on a page the root keeps unmapping or
-/// protecting never fault the host, and each run ends with the vCPU's count (every op answered, at
-/// least one made) or a guest `MemoryFault` (a wait that found the page gone), never anything else.
-/// The ops overlap the page ops by construction ([`racing`]), so a wait shape must fault in some run.
+/// protecting never fault the host. The ops overlap the page ops by construction ([`racing`]):
+/// - a wait shape's root cycles until a wait meets the page revoked and its `MemoryFault` ends the
+///   run (microseconds idle, a few scheduler slices under load), under a bound of `WAIT_TURNS`
+///   cycles, tens of seconds, that a run reaches only if the two threads never raced at all;
+/// - a notify never faults: its run ends with the vCPU's count (every op answered, at least one).
 #[test]
 fn futex_ops_racing_page_ops_never_fault_the_host() {
-    const TURNS: u32 = 400;
+    const NOTIFY_TURNS: u32 = 400;
+    const WAIT_TURNS: u32 = 2_000_000;
     let stop = std::sync::atomic::AtomicBool::new(false);
     std::thread::scope(|s| {
         let _stop = Spinners(&stop);
@@ -953,10 +956,13 @@ fn futex_ops_racing_page_ops_never_fault_the_host() {
             ("notify", false),
             ("notify", true),
         ] {
-            let mut faulted = 0;
+            let turns = match op {
+                "wait" => WAIT_TURNS,
+                _ => NOTIFY_TURNS,
+            };
             for _ in 0..30 {
                 let mut host = Host::new();
-                let m = racing(host.grant_memory(), op, protect, TURNS);
+                let m = racing(host.grant_memory(), op, protect, turns);
                 let admitted = jit_kernel::admit(&m, &host, None, false).expect("in scope");
                 let start = jit_kernel::Start {
                     entry: 0,
@@ -970,20 +976,18 @@ fn futex_ops_racing_page_ops_never_fault_the_host() {
                 };
                 let end = jit_kernel::run(admitted, start, &mut host).expect("compiles");
                 assert!(end.vcpus >= 1, "it ran as kernel tasks");
-                match end.result {
-                    Ok(v) => assert!(v[0] >= 1, "{op}: every op answered, at least one: {v:?}"),
-                    Err(Trap::MemoryFault) => faulted += 1,
-                    Err(t) => panic!("{op} (protect: {protect}): {t:?}"),
+                match (op, end.result) {
+                    ("wait", Err(Trap::MemoryFault)) => {}
+                    ("wait", r) => panic!(
+                        "wait (protect: {protect}): the root made {WAIT_TURNS} page-op cycles \
+                         and no wait met the page revoked (the two never raced): {r:?}"
+                    ),
+                    // A notify reads no memory: it never faults.
+                    (_, Ok(v)) => {
+                        assert!(v[0] >= 1, "notify: every op answered, at least one: {v:?}")
+                    }
+                    (_, r) => panic!("notify (protect: {protect}): {r:?}"),
                 }
-            }
-            eprintln!("{op} (protect: {protect}): {faulted} of 30 runs faulted");
-            match op {
-                // A notify reads no memory: it never faults.
-                "notify" => assert_eq!(faulted, 0, "{op}: a notify never faults"),
-                _ => assert!(
-                    faulted > 0,
-                    "{op} (protect: {protect}): the wait raced the page op"
-                ),
             }
         }
     });
