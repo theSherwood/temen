@@ -1386,14 +1386,17 @@ impl Domain {
             killing,
             lanes,
             vcpu_ctxs,
-            // Configuration, kept: the futex table and wakers hosts reach between runs (every
-            // waiter left at teardown), the child executor and lane chain its compile or embedder
+            // The futex table and the wakers are kept, not replaced: hosts outside the run reach
+            // them between runs (`CompiledModule::park_hub`'s users wake the futex table by the
+            // domain's address; an `outside_waker` holds it weakly), so no join can make a
+            // replacement exclusive. Their contents are the run's, emptied under their own locks.
+            park,
+            wakers,
+            // Configuration, kept: the child executor and lane chain its compile or embedder
             // installed, and what the domain is (its hub, its budget node).
-            park: _,
             quiesce_cv: _,
             child_exec: _,
             lane_cv: _,
-            wakers: _,
             lane_chain: _,
             hub: _,
             node: _,
@@ -1424,6 +1427,10 @@ impl Domain {
         killing.store(0, Ordering::Release);
         lock(lanes).clear();
         lock(vcpu_ctxs).clear();
+        // A vCPU's waiter leaves at teardown; a fiber's event-parked one can stay queued, and a
+        // later run's `notify` would count it.
+        lock(&park.futex).clear();
+        wakers.clear();
     }
 
     /// The domain-shared fiber table (for a spawned vCPU to build its `FiberRuntime` over).
@@ -4005,6 +4012,31 @@ mod tests {
         );
         assert_eq!(dom.take_task(), 1, "the next run's first spawn is task 1");
         assert_eq!(dom.live_vcpus(), 1, "the root alone is live");
+    }
+
+    /// #2953 — what a run leaves in the futex table and the wakers, which hosts keep reaching
+    /// between runs, is emptied too: a queued waiter, a waker registration.
+    #[test]
+    fn a_run_s_end_empties_its_parks() {
+        let dom = Domain::new(None);
+        let key = FutexKey::Host(1);
+        lock(&dom.park.futex)
+            .entry(key)
+            .or_default()
+            .waiters
+            .push(wait_cell_new(false));
+        let fired = std::sync::Arc::new(AtomicBool::new(false));
+        let f = std::sync::Arc::clone(&fired);
+        let _left = dom
+            .wakers
+            .add(Box::new(move || f.store(true, Ordering::SeqCst)));
+        dom.end_run();
+        assert!(
+            lock(&dom.park.futex).is_empty(),
+            "no waiter outlives its run"
+        );
+        dom.wakers.fire();
+        assert!(!fired.load(Ordering::SeqCst), "no waker outlives its run");
     }
 }
 
