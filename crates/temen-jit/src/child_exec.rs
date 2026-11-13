@@ -2009,8 +2009,9 @@ pub(crate) struct ChildExec {
     /// `shutdown_and_join` waits here for the last task to finish.
     quiescent: Condvar,
     /// The run's `Domain` (`0` = none): live/parked accounting for the 1:1 vCPUs' deadlock
-    /// predicate, and the futex broadcast a finished child issues.
-    dom: usize,
+    /// predicate, and the futex broadcast a finished child issues. #2993 — set once, before any task,
+    /// when the run's domain is made after its nursery ([`Self::join_domain`]).
+    dom: AtomicUsize,
     /// #1991 — the most workers the pool holds: the host's driver's (`GrantChildHooks::workers`),
     /// the cores until the run's hooks say.
     workers: AtomicUsize,
@@ -2092,7 +2093,7 @@ impl ChildExec {
             }),
             cv: Condvar::new(),
             quiescent: Condvar::new(),
-            dom,
+            dom: AtomicUsize::new(dom),
             workers: AtomicUsize::new(cores()),
         })
     }
@@ -2108,9 +2109,20 @@ impl ChildExec {
     }
 
     fn domain(&self) -> Option<&Domain> {
+        let dom = self.dom.load(Ordering::Acquire);
         // SAFETY: a nonzero `dom` is the run's live `Domain`, which outlives the nursery (and so
         // this executor and every task).
-        (self.dom != 0).then(|| unsafe { &*(self.dom as *const Domain) })
+        (dom != 0).then(|| unsafe { &*(dom as *const Domain) })
+    }
+
+    /// #2993 — the run's domain, `dom`, made after this executor's nursery: its accounting and wakes
+    /// are the domain's from now. Once, before the run, so before any task.
+    pub(crate) fn join_domain(&self, dom: &Domain) {
+        let was = self
+            .dom
+            .swap(dom as *const Domain as usize, Ordering::AcqRel);
+        debug_assert_eq!(was, 0, "an executor joins one domain");
+        debug_assert!(lock(&self.state).tasks.is_empty());
     }
 
     /// File a task and make it runnable. Its `done` cell is filled when it finishes. Returns its id,

@@ -6301,22 +6301,14 @@ impl CompiledModule {
         let domain = Box::new(os_thread_rt::Domain::new(self.node.clone()));
         self.instance.sched = &*domain as *const os_thread_rt::Domain as *const core::ffi::c_void;
         // #2993 — the run has one pool: the nursery the compile stood up for its install room
-        // (#1726), made before there was a domain, is made again over this one, as a nesting
-        // module's is, so its children share the domain's futex, wakes and pool, and a held site
-        // finds that pool rather than making a second one no teardown joins. No spawn can have
+        // (#1726), made before there was a domain, joins this one, as a nesting module's does at
+        // its making, so its children share the domain's futex, wakes and pool, and a held site
+        // finds that pool rather than making a second one no teardown joins. It stays the nursery
+        // the embedder configured (its grant hooks, its child-code cache); no spawn can have
         // happened yet: the run has not begun.
-        if self._nursery.is_some() {
-            let n = nursery_over(
-                self.cap_thunk,
-                self.instance.cap_ctx,
-                self.resolve_module,
-                self.instance.epoch as usize,
-                Some(&domain),
-                self.shadow,
-            );
-            self.instance.nursery =
-                &*n as *const instantiator_rt::Nursery as *const core::ffi::c_void;
-            self._nursery = Some(n);
+        if let Some(n) = self._nursery.as_deref_mut() {
+            n.join_domain(&domain);
+            n.adopt();
         }
         self.threads = true;
         self.spawns = true;
@@ -10514,17 +10506,19 @@ fn nursery_over(
     domain: Option<&os_thread_rt::Domain>,
     shadow: temen_ir::durable_abi::ShadowArena,
 ) -> Box<instantiator_rt::Nursery> {
-    let n = Box::new(instantiator_rt::Nursery::new(
+    let mut n = Box::new(instantiator_rt::Nursery::new(
         cap_thunk,
         cap_ctx,
         resolve_module,
         epoch_addr,
-        domain.map_or(0, |d| d as *const os_thread_rt::Domain as usize),
+        0,    // no domain until it joins one, below
         None, // the run's own child executor
         shadow,
-        // #2043 D1 — the domain's one child table, its threads' and its §14 children's.
-        domain.map_or_else(Default::default, |d| std::sync::Arc::clone(d.children())),
+        Default::default(),
     ));
+    if let Some(d) = domain {
+        n.join_domain(d);
+    }
     n.adopt();
     n
 }

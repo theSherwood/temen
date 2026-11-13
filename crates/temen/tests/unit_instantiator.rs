@@ -22,7 +22,7 @@ mod rec;
 use temen_interp::{Host, MemLayout, Trap, Value};
 use temen_ir::{SpawnRec, DEFAULT_RESERVED_LOG2};
 use temen_jit::{JitOutcome, TrapKind};
-use temen_run::{grant_jit, jit_cap_run};
+use temen_run::{grant_jit, grant_jit_threads, jit_cap_run};
 use temen_text::parse_module;
 use temen_verify::verify_module;
 
@@ -116,11 +116,16 @@ fn guest(route: &str) -> temen_ir::Module {
 /// A fresh host with the `Jit`, an `Instantiator` over the whole window, a `"budget"` for the unit's
 /// children and the `"kid"` module, the guest registered as the running module, and the unit naming
 /// `module` compiled into it — deterministic, so every engine sees the same handles
-/// `[jit, code, instantiator]`.
-fn setup(guest: &temen_ir::Module, module: &str) -> (Host, [i32; 3]) {
+/// `[jit, code, instantiator]`. With `threads`, the `Jit` hosts threads (`grant_jit_threads`).
+fn setup(guest: &temen_ir::Module, module: &str, threads: bool) -> (Host, [i32; 3]) {
     let mut host = Host::new();
     host.set_self_module(&std::sync::Arc::new(guest.clone()));
-    let jit = grant_jit(&mut host, guest, 4);
+    let grant = if threads {
+        grant_jit_threads
+    } else {
+        grant_jit
+    };
+    let jit = grant(&mut host, guest, 4);
     let inst = host.grant_instantiator();
     let budget = host.grant_budget(-1, 1 << 20, -1);
     host.register_cap_name("budget", budget);
@@ -144,8 +149,8 @@ fn interp(r: Result<Vec<Value>, Trap>) -> Outcome {
     }
 }
 
-fn cranelift(m: &temen_ir::Module, module: &str) -> Outcome {
-    let (mut host, h) = setup(m, module);
+fn cranelift(m: &temen_ir::Module, module: &str, threads: bool) -> Outcome {
+    let (mut host, h) = setup(m, module, threads);
     let slots: Vec<i64> = h.iter().map(|&x| x as i64).collect();
     let (out, _) = jit_cap_run(
         m,
@@ -169,9 +174,14 @@ fn cranelift(m: &temen_ir::Module, module: &str) -> Outcome {
 /// tree-walk oracle, the four bytecode drivers ([`drivers::ALL`]) and Cranelift. A failure names
 /// every engine that disagreed.
 fn on_every_engine(route: &str, module: &str, want: Outcome) {
+    on_every_engine_with(route, module, false, want);
+}
+
+/// [`on_every_engine`], the `Jit` hosting threads when `threads`.
+fn on_every_engine_with(route: &str, module: &str, threads: bool, want: Outcome) {
     let m = guest(route);
     let powerbox = || {
-        let (host, h) = setup(&m, module);
+        let (host, h) = setup(&m, module, threads);
         (host, h.map(Value::I32).to_vec())
     };
     let mut got: Vec<(String, Outcome)> = drivers::ALL
@@ -182,7 +192,7 @@ fn on_every_engine(route: &str, module: &str, want: Outcome) {
             (format!("{d:?}"), o)
         })
         .collect();
-    got.push(("Cranelift".into(), cranelift(&m, module)));
+    got.push(("Cranelift".into(), cranelift(&m, module, threads)));
     let wrong: Vec<_> = got.iter().filter(|(_, o)| *o != want).collect();
     assert!(
         wrong.is_empty(),
@@ -207,4 +217,12 @@ fn an_installed_units_minus_one_names_no_module() {
 #[test]
 fn an_invoked_unit_has_no_instantiator() {
     on_every_engine(INVOKE, NAMES_KID, Outcome::CapFault);
+}
+
+/// #2993 — the same, the `Jit` hosting threads: the run's thread domain is made after the compile's
+/// nursery, which the embedder has configured by then (its grant hooks), and a granted spawn still
+/// spawns.
+#[test]
+fn an_installed_unit_spawns_a_granted_module_when_the_jit_hosts_threads() {
+    on_every_engine_with(INSTALL, NAMES_KID, true, Outcome::Returned(42));
 }

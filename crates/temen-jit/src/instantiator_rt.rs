@@ -686,19 +686,8 @@ impl Nursery {
             epoch_addr,
             futex_sched,
             children,
-            child_exec: child_exec.unwrap_or_else(|| {
-                let e = crate::child_exec::ChildExec::new(futex_sched);
-                // D66 — the domain wakes parked tasks with its other parked waiters (a `notify`, a
-                // vCPU exit, the kill path, teardown), so it needs a ref. SAFETY: a nonzero
-                // `futex_sched` is the run's live `Domain`, which outlives this nursery.
-                if futex_sched != 0 {
-                    unsafe {
-                        (*(futex_sched as *const crate::os_thread_rt::Domain))
-                            .set_child_exec(std::sync::Arc::clone(&e))
-                    };
-                }
-                e
-            }),
+            // A run's own executor joins its domain with the nursery ([`Self::join_domain`]).
+            child_exec: child_exec.unwrap_or_else(|| crate::child_exec::ChildExec::new(0)),
             ancestors: Vec::new(),
             kids: Mutex::new(Vec::new()),
             unclaimed: Mutex::new(Vec::new()),
@@ -734,6 +723,20 @@ impl Nursery {
     /// `thread.join` of one of its children joins it through it.
     pub(crate) fn adopt(&self) {
         self.children.set_nursery(self);
+    }
+
+    /// The run's thread domain, `d`, for a run's own nursery, before the run: its children compile
+    /// their futex ops against it and share its child table (#2043), and its executor is the
+    /// domain's (D66: the domain wakes parked tasks with its other parked waiters, a `notify`, a
+    /// vCPU exit, the kill path, teardown). #2993 — whether the domain was made before the nursery
+    /// (a module that nests) or after it (the install room's, once a run hosts threads), so the
+    /// nursery and what its embedder set on it stay as they are. Then [`Self::adopt`].
+    pub(crate) fn join_domain(&mut self, d: &crate::os_thread_rt::Domain) {
+        debug_assert_eq!(self.futex_sched, 0, "a nursery joins one domain");
+        self.futex_sched = d as *const crate::os_thread_rt::Domain as usize;
+        self.children = std::sync::Arc::clone(d.children());
+        self.child_exec.join_domain(d);
+        d.set_child_exec(std::sync::Arc::clone(&self.child_exec));
     }
 
     /// #2993 — the run's pool, which every task of the run runs on, a held site's activations
