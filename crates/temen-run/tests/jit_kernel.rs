@@ -1759,6 +1759,39 @@ fn each_declined_call_names_its_clause() {
         })
         .collect();
     assert!(wrong.is_empty(), "{wrong:#?}");
+    // The kinds `native_scope` decides before the calls: a fiber (`fibers`) and a `gc.roots`
+    // (`gc.roots`), which the instruction scan passes because these clauses already declined them.
+    let fiber = module(
+        "memory 16
+func () -> (i64) {
+block 0 () {
+  vq = i64.const 16400
+  vone = i32.const 1
+  vk = atomic.notify vq vone
+  vf = ref.func 1
+  vz = i64.const 0
+  vc = cont.new vf vz
+  return vc
+  }
+}
+func (i64) -> (i64) {
+block 0 (va: i64) {
+  return va
+  }
+}
+",
+    );
+    assert_eq!(
+        jit_kernel::admit(&fiber, &Host::new(), false).err(),
+        Some("fibers")
+    );
+    let roots = rooted(
+        "  vlo = i64.const 0\n  vhi = i64.const -1\n  vmask = i64.const -1\n  vbuf = i64.const 32768\n  vcap = i64.const 8\n  vr = gc.roots vlo vhi vmask vbuf vcap",
+    );
+    assert_eq!(
+        jit_kernel::admit(&roots, &Host::new(), false).err(),
+        Some("gc.roots")
+    );
     // And what it admits beside them: a stream read with a non-blocking stdin and no pipe.
     assert!(jit_kernel::admit(&call(0, 0), &Host::new(), false).is_ok());
 }
@@ -1941,7 +1974,8 @@ fn a_wait_racing_an_unmap_of_its_alias_faults_the_guest_never_the_host() {
 
 /// The same race with each map replacing the live alias, for a bounded count. Whether a wait meets
 /// the page between the old alias's drop and the new one's map is the race's: each route ends either
-/// returning or `MemoryFault`, and the host never faults.
+/// returning or `MemoryFault`. The row still fails when the host faults (the test process dies) or
+/// the run hangs (the harness's [`PROMPT`]).
 #[cfg(any(unix, windows))]
 #[test]
 fn a_wait_racing_a_map_over_its_alias_never_faults_the_host() {
@@ -1970,7 +2004,8 @@ fn a_wait_racing_a_map_over_its_alias_never_faults_the_host() {
 /// once (a loop long enough to need a refill). A guest's read bounds fuel by the budgets below the
 /// run's node, never by the run's own grant, whose room differs by engine (each draws on its own
 /// schedule; INVARIANTS #3): so a node with no fuel ceiling of its own reads unbounded, `-1`, on
-/// every route, however its run's cells drew.
+/// every route, however its run's cells drew. The equality is by that rule, not a measured parity of
+/// the engines' draws.
 #[test]
 fn a_budget_read_of_fuel_after_a_refill_answers_alike_on_every_route() {
     fn make(h: i32) -> temen_ir::Module {
@@ -2007,5 +2042,51 @@ block 2 () {{
         true,
         METERED,
         Ok(vec![-1]),
+    );
+}
+
+/// #2958 slice 4 — `setjmp` and `longjmp` beside threads: no `native_scope` clause names them, and
+/// the JIT's compile refuses the program on both of its routes (`Unsupported`), so neither runs it
+/// and the embedder's JIT run fails as it did before. The oracle runs it: a spawned vCPU sets a jump
+/// buffer, jumps back to it with `5`, and returns what the second return of `setjmp` gave.
+#[test]
+fn setjmp_beside_threads_is_the_jits_compile_to_refuse_on_both_routes() {
+    let src = "memory 16
+func () -> (i64) {
+block 0 () {
+  vz = i64.const 0
+  vh = thread.spawn 1 vz vz
+  vst, vv = thread.join vh
+  return vv
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (va: i64, vb: i64) {
+  vbuf = i64.const 16384
+  vr = setjmp vbuf
+  vfirst = i32.eqz vr
+  br_if vfirst 1() 2(vr)
+}
+block 1 () {
+  vb1 = i64.const 16384
+  vfive = i32.const 5
+  longjmp vb1 vfive
+  unreachable
+}
+block 2 (vr2: i32) {
+  vx = i64.extend_i32_u vr2
+  return vx
+  }
+}
+";
+    let m = module(src);
+    assert_eq!(oracle(&m), Ok(vec![5]));
+    assert!(matches!(
+        compile_and_run(&m, 0, &[]),
+        Err(temen_jit::JitError::Unsupported(_))
+    ));
+    assert_eq!(
+        jit_kernel::run_fresh(&m, 0, &[], None).err(),
+        Some("the JIT's compile")
     );
 }
