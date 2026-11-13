@@ -934,7 +934,9 @@ fn all_answer(
 fn racing(handle: i32, op: &str, protect: bool, turns: u32) -> temen_ir::Module {
     let op = match op {
         "wait" => "vx = i32.const 1\n  vto = i64.const 0\n  vk = i32.atomic.wait va vx vto",
-        _ => "vx = i32.const 1\n  vk = atomic.notify va vx",
+        "notify" => "vx = i32.const 1\n  vk = atomic.notify va vx",
+        // Any other op is the IR itself, over the racing word's address `va`.
+        other => other,
     };
     let (take, give) = match protect {
         true => (
@@ -1004,6 +1006,52 @@ block 2 (vr: i64) {{
 }}
 "
     ))
+}
+
+/// #2958 slice 4 review — a host copy of guest memory races a page op on its buffer: a vCPU writes
+/// eight bytes from page 8 to a captured stdout (`Stream.write`) in a loop while the root unmaps and
+/// maps that page (or protects it to nothing and back), on both JIT routes ([`racing`]). Every host
+/// copy of guest memory and every page op is made under the domain's `Host` lock, so a write meets
+/// the page whole or refused (its errno), and the run ends with the vCPU's count; a guest
+/// `MemoryFault` is the guest's own answer. The host never faults, which would end the process.
+#[cfg(any(unix, windows))]
+#[test]
+fn a_stream_write_racing_page_ops_on_its_buffer_never_faults_the_host() {
+    /// The stream's handle in the high half, the address space's in the low.
+    fn grant(h: &mut Host) -> i32 {
+        let stream = h.grant_stream(temen_interp::StreamRole::Out);
+        let space = h.grant_memory();
+        assert!((0..1 << 15).contains(&stream) && (0..1 << 16).contains(&space));
+        stream << 16 | space
+    }
+    fn write(handles: i32) -> String {
+        format!(
+            "vsh = i32.const {}\n  vwl = i64.const 8\n  vk = call.cap 0 1 (i64, i64) -> (i64) vsh(va, vwl)",
+            handles >> 16
+        )
+    }
+    fn unmapping(handles: i32) -> temen_ir::Module {
+        racing(handles & 0xFFFF, &write(handles), false, 400)
+    }
+    fn protecting(handles: i32) -> temen_ir::Module {
+        racing(handles & 0xFFFF, &write(handles), true, 400)
+    }
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    std::thread::scope(|s| {
+        let _stop = Spinners(&stop);
+        spin(s, &stop);
+        for make in [unmapping as fn(i32) -> temen_ir::Module, protecting] {
+            for run in 0..10 {
+                for (route, answer) in by_instance(make, grant, false, None) {
+                    assert!(
+                        matches!(&answer, Ok(v) if v[0] >= 1)
+                            || answer == Err("MemoryFault".into()),
+                        "run {run}, {route}: {answer:?}"
+                    );
+                }
+            }
+        }
+    });
 }
 
 /// Busy threads for the length of a scope, so threads are descheduled at arbitrary points: set to

@@ -5278,9 +5278,10 @@ impl MprotectWindow {
     /// across the hardware change and the map's update, so no reader sees the two apart. A reader
     /// that checks the map and loads under one hold of the lock
     /// ([`temen_interp::FutexWindow::wait_word`]) therefore never loads a page the hardware lacks.
-    /// A grant the reader misses answers a fault the guest raced itself into. Host code that borrows
-    /// guest memory under the `Host` lock trusts the map the same way, since every page op runs
-    /// under that lock too.
+    /// A grant the reader misses answers a fault the guest raced itself into. **Every host copy of
+    /// guest memory and every page op is made under the domain's `Host` lock; `wait_word` is the
+    /// exception and takes the page-map lock** (pinned by `jit_kernel.rs`'s
+    /// `a_stream_write_racing_page_ops_on_its_buffer_never_faults_the_host`).
     ///
     /// Here the page op's `revoke` first takes from the map whatever access the op takes away, then
     /// `hw` changes each run of `runs` (page indices) in hardware, then `grant` gives each of their
