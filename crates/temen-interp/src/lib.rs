@@ -3141,7 +3141,7 @@ fn mint_task(s: &mut Sched) -> TaskId {
 /// thaw did not re-create leaves the thread out: that parent's rewound join then fails closed.
 ///
 /// Per-piece rebuild (none of "top `n`, densely" holds with recycling):
-///   • context — *derived* from the restored shadow-SP (`ShadowArena::ctx_of_sp`), since the region
+///   • context — *derived* from the restored shadow-SP (`ShadowContexts::vcpu_of_sp`), since the region
 ///     rides in the absolute shadow-SP; added to the parent registry's occupancy mask so a post-thaw
 ///     spawn lands in a genuinely-free context.
 ///   • task id — *preserved* when free ([`claim_task`]).
@@ -3167,6 +3167,20 @@ fn seed_thread(
         }
     };
     let cid = claim_task(s, ff.task);
+    // #2878 — the residue is untrusted (DURABILITY.md §5): a thread whose join slot, context or entry
+    // no spawn could have made ends `ThreadFault` without running, as one the pools refuse does. The
+    // entry is a function of the spawn signature; the context one a vCPU may hold.
+    let slot_ok = !ff.joinable || ff.slot < temen_ir::handles::SLOTS;
+    let entry_ok = usize::try_from(ff.func)
+        .ok()
+        .and_then(|f| p.domain.funcs.get(f))
+        .is_some_and(|f| f.params == [ValType::I64, ValType::I64] && f.results == [ValType::I64]);
+    let ctx = ShadowContexts::vcpu_of_sp(p.arena(), ff.shadow_sp).filter(|_| entry_ok);
+    if !slot_ok {
+        s.results
+            .insert(cid, Outcome::ended(Err(Trap::ThreadFault)));
+        return;
+    }
     // #2043 — a detached thread runs on with no handle naming it, as it did before the freeze.
     let mut c = p.domain.children.lock_unpoisoned();
     if ff.joinable {
@@ -3182,6 +3196,11 @@ fn seed_thread(
             .insert(cid, Outcome::ended(Ok(vec![Value::I64(r)])));
         return;
     }
+    let Some(ctx) = ctx else {
+        s.results
+            .insert(cid, Outcome::ended(Err(Trap::ThreadFault)));
+        return;
+    };
     // #2001 — the thread handed its `spawn` back when it unwound for the freeze, and lived before
     // it: charged again past any ceiling. #2318 — never past the process's pools: a thread they
     // have no room for is one the process cannot hold, so it ends with `ThreadFault`, which its
@@ -3193,7 +3212,6 @@ fn seed_thread(
     };
     live_ids.insert(ff.task as TaskId, cid);
     s.live += 1;
-    let ctx = p.arena().ctx_of_sp(ff.shadow_sp);
     p.domain.registry.seed_vcpu_contexts(p.arena(), 1 << ctx);
     // It joins its domain, as its spawn did ([`Domain`]).
     let mut child = Box::new(VCpu::new(

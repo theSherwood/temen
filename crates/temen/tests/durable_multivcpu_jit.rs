@@ -1355,3 +1355,131 @@ fn the_embedder_jit_path_refuses_residue_it_cannot_recreate_and_keeps_it() {
     );
     assert_eq!(h.child_generations(), &[1], "its child table too");
 }
+
+/// #2878 — a thaw residue is untrusted (DURABILITY.md §5), and a re-attached vCPU's context names the
+/// region the runtime writes its shadow-SP and thaw words into, its entry the code it runs, and its
+/// slot the join-table entry it fills. An interpreter freeze of [`SRC`] is thawed with one field of
+/// its frozen child replaced by a value no spawn could have made. Each engine ends the child
+/// `ThreadFault` without running it, so the root's join meets it as a thread that died, and both
+/// engines answer the same, process alive. Before, the JIT wrote past the arena (or anywhere) and
+/// the interpreters panicked on the arithmetic or the slot.
+#[test]
+fn a_thawed_vcpu_no_spawn_could_have_made_ends_thread_fault_on_both_engines() {
+    let inst = instrument();
+    let (ivcpus, iroot_sp, ichildren, isnap) = {
+        let mut h = Host::new();
+        h.set_durable(true);
+        h.clock_ns = 42;
+        let clk = h.grant_clock();
+        let mut win = init_durable_window(WINDOW, TEST_ARENA);
+        write_state(&mut win, TEST_ARENA, STATE_UNWINDING);
+        let mut fuel = 1_000_000u64;
+        let (r, snap) = run_capture_reserved_with_host(
+            &inst,
+            0,
+            &[Value::I32(clk)],
+            &mut fuel,
+            &win,
+            SIZE_LOG2,
+            &mut h,
+        );
+        assert!(r.is_ok(), "interp freeze placeholder: {r:?}");
+        (
+            h.frozen_vcpus().to_vec(),
+            h.frozen_root_sp().expect("root extent recorded"),
+            h.child_generations().to_vec(),
+            snap,
+        )
+    };
+    assert_eq!(ivcpus.len(), 1, "interp captured the spawned child");
+    let real = ivcpus[0].clone();
+    type Bend = fn(&mut temen_interp::FrozenVCpu);
+    let cases: [(&str, Bend); 6] = [
+        ("shadow-SP past the arena", |v| {
+            v.shadow_sp = TEST_ARENA.end + 64
+        }),
+        ("shadow-SP below the arena", |v| v.shadow_sp = 16),
+        ("shadow-SP in the root's region", |v| {
+            v.shadow_sp = TEST_ARENA.base + 8
+        }),
+        ("an entry past the table", |v| v.func = 99),
+        ("an entry of another signature", |v| v.func = 0),
+        ("a join slot past the table", |v| {
+            v.slot = temen_ir::handles::SLOTS
+        }),
+    ];
+    for (name, bend) in cases {
+        let mut v = real.clone();
+        bend(&mut v);
+        let mut twin = isnap.clone();
+        begin_thaw(&mut twin, TEST_ARENA, 0);
+
+        let mut ihost = Host::new();
+        ihost.set_durable(true);
+        ihost.clock_ns = 44;
+        let iclk = ihost.grant_clock();
+        ihost.set_frozen_vcpus(vec![v.clone()]);
+        ihost.set_frozen_root_sp(iroot_sp);
+        ihost.set_child_generations(ichildren.clone());
+        let mut fuel = 1_000_000u64;
+        let (ires, _) = run_capture_reserved_with_host(
+            &inst,
+            0,
+            &[Value::I32(iclk)],
+            &mut fuel,
+            &twin,
+            SIZE_LOG2,
+            &mut ihost,
+        );
+
+        let mut thost = Host::new();
+        thost.set_durable(true);
+        thost.clock_ns = 44;
+        let tclk = thost.grant_clock();
+        let seed = JitVCpu {
+            task: v.task,
+            parent_task: v.parent_task,
+            slot: v.slot,
+            joinable: v.joinable,
+            func: v.func,
+            args: v.args.clone(),
+            shadow_sp: v.shadow_sp,
+            completed_result: None,
+        };
+        let (jout, ..) = compile_and_run_durable(
+            &inst,
+            0,
+            &[tclk as i64],
+            &twin,
+            SIZE_LOG2,
+            temen_run::cap_thunk,
+            &mut thost as *mut Host as *mut c_void,
+            DurableRun {
+                seed: DurableResidue {
+                    vcpus: vec![seed],
+                    root_sp: Some(iroot_sp),
+                    children: ichildren.clone(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap_or_else(|e| panic!("{name}: JIT thaw: {e:?}"));
+        let jit = match jout {
+            JitOutcome::Returned(rs) => Ok(rs.into_iter().map(Value::I64).collect()),
+            JitOutcome::Trapped(k) => Err(k.code()),
+            other => panic!("{name}: JIT thaw: {other:?}"),
+        };
+        let ires = ires.map_err(|t| t.code());
+        assert_eq!(ires, jit, "{name}: the engines agree");
+        // A refused child ends `ThreadFault`, which its join carries to the root; one whose join slot
+        // no handle can name is not filed, so the root's join finds nothing there and the root reads
+        // its own clock (42) plus nothing.
+        let want = if v.slot >= temen_ir::handles::SLOTS {
+            Ok(vec![Value::I64(42)])
+        } else {
+            Err(temen_ir::trap_code::THREAD_FAULT)
+        };
+        assert_eq!(ires, want, "{name}");
+    }
+}

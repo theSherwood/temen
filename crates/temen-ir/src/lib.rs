@@ -642,13 +642,6 @@ pub mod durable_abi {
             self.contexts().saturating_sub(1)
         }
 
-        /// The context whose region contains shadow-SP `sp` — the inverse of
-        /// [`Self::region_base`], for a runtime recovering a frozen fiber's context from its
-        /// saved SP.
-        pub const fn ctx_of_sp(self, sp: u64) -> usize {
-            ((sp - self.base) / self.stride) as usize
-        }
-
         /// #2518 — window offset of the arena's `i32` **freeze** word (`NORMAL`/`UNWINDING`/`ARMED`):
         /// the stop-the-world broadcast every poll reads and a freeze request rings. A thaw's
         /// `REWINDING` is per-context ([`Self::thaw_state_off`]). `None` for an arena with no regions
@@ -752,6 +745,16 @@ pub mod durable_abi {
         /// they held at the freeze (with recycling, a sparse set). Bits outside the pool are ignored.
         pub fn seed(&mut self, arena: ShadowArena, mask: u64) {
             self.0 |= mask & Self::pool(arena);
+        }
+
+        /// #2878 — the context a thawed vCPU's restored shadow-SP `sp` lies in, when it is one a vCPU
+        /// may hold ([`Self::pool`]): the checked inverse of [`ShadowArena::region_base`]. `None`
+        /// below the arena, past the pool, or for an arena with no regions. A thaw residue is
+        /// untrusted (DURABILITY.md §5), and the context names the region a runtime writes.
+        pub fn vcpu_of_sp(arena: ShadowArena, sp: u64) -> Option<usize> {
+            let off = sp.checked_sub(arena.base)?;
+            let ctx = usize::try_from(off.checked_div(arena.stride)?).ok()?;
+            (1..=Self::ceiling(arena)).contains(&ctx).then_some(ctx)
         }
 
         /// Whether a durable fiber in registry slot `slot` may take its context `slot + 1`: the

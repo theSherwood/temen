@@ -5489,7 +5489,7 @@ impl CompiledModule {
             let seed = std::mem::take(&mut (*this).frozen_vcpu_seed);
             let root_sp = (*this).thaw_root_sp;
             if let Some(d) = &(*this).domain {
-                d.thaw_reattach_and_run(&seed, root_sp);
+                d.thaw_reattach_and_run(&seed, root_sp, &|f| (*this).thawed_spawn_entry(f));
             }
         }
 
@@ -6426,6 +6426,19 @@ impl CompiledModule {
     /// recompaction compiles the fresh module against, so the fresh code meters as the old did.
     pub fn fuel_cell(&self) -> Option<*mut FuelCell> {
         (!self.instance.fuel.is_null()).then_some(self.instance.fuel)
+    }
+
+    /// #2878 — the code a thawed vCPU's recorded `func` names, as its `thread.spawn` resolved it: a
+    /// slot of this module's function table holding a function of the spawn signature. `None` for
+    /// anything else: the residue that records it is untrusted, and the vCPU runs this code.
+    #[cfg(fiber_rt)]
+    pub(crate) fn thawed_spawn_entry(&self, func: i32) -> Option<u64> {
+        let slot = usize::try_from(func)
+            .ok()
+            .filter(|&s| s < self.fn_table.len())?;
+        let ty = self.interned_type_id(&fiber_func_type())?;
+        let r = self.fn_table.record(slot);
+        (r.type_id() == ty).then(|| r.code())
     }
 
     /// The stable type id `ty` was interned under, or `None` if no unit this module compiled

@@ -2717,7 +2717,17 @@ impl Domain {
     /// # Safety
     /// Called from `run_inner` after `set_env`, before the root's guarded call, on a durable thaw run;
     /// the env's window / fault range / call-trampoline are the live run's, the reserve committed RW.
-    pub(crate) unsafe fn thaw_reattach_and_run(&self, seed: &[crate::FrozenVCpu], root_sp: u64) {
+    ///
+    /// `entry` resolves a vCPU's recorded `func` to the code its `thread.spawn` would run
+    /// ([`crate::CompiledModule::thawed_spawn_entry`]). Every value the residue holds is untrusted
+    /// (DURABILITY.md §5, #2878): a running vCPU whose context, entry or join slot is not one a spawn
+    /// could have made ends `ThreadFault` without running, as one the pools refuse does.
+    pub(crate) unsafe fn thaw_reattach_and_run(
+        &self,
+        seed: &[crate::FrozenVCpu],
+        root_sp: u64,
+        entry: &dyn Fn(i32) -> Option<u64>,
+    ) {
         if seed.is_empty() {
             return;
         }
@@ -2757,15 +2767,28 @@ impl Domain {
             // it: charged again. #2318 — never past the process's pools: one they have no room for is
             // a vCPU the process cannot hold, so it is not re-run either, and its join answers
             // `ThreadFault`, as a re-spawn the OS refuses does (below).
+            // #2878 — checked before anything is charged or pinned.
+            let slot_ok = !v.joinable || v.slot < temen_ir::handles::SLOTS;
+            let start = v
+                .completed_result
+                .is_none()
+                .then(|| {
+                    temen_ir::durable_abi::ShadowContexts::vcpu_of_sp(self.shadow(), v.shadow_sp)
+                        .zip(entry(v.func))
+                })
+                .flatten()
+                .filter(|_| slot_ok);
             let ended = match v.completed_result {
+                Some(_) if !slot_ok => Some((0, TrapKind::ThreadFault as i64)),
                 Some(r) => Some((r, 0)),
+                None if start.is_none() => Some((0, TrapKind::ThreadFault as i64)),
                 None if self.node.as_ref().is_some_and(|n| !n.rebuild_vcpu()) => {
                     Some((0, TrapKind::ThreadFault as i64))
                 }
                 None => None,
             };
             let done = Done::new(ended);
-            if v.joinable {
+            if v.joinable && slot_ok {
                 lock(&self.children.table)
                     .pin(v.slot, ChildEntry::Thread(std::sync::Arc::clone(&done)));
             }
@@ -2779,14 +2802,16 @@ impl Domain {
             if !std::ptr::eq(self.hub(), self) {
                 lock(&self.hub().threads).live += 1;
             }
-            let entry = slot_record(env.fn_table_base as *const _, v.func as u32 as usize);
+            let Some((ctx, code)) = start else {
+                unreachable!("a vCPU with no checked start ended above")
+            };
             runs.push(Run {
                 task: v.task as u64,
                 parent: v.parent_task as u64,
                 slot: v.slot,
                 func_idx: v.func as u32,
-                ctx: self.shadow().ctx_of_sp(v.shadow_sp),
-                code: entry.code(),
+                ctx,
+                code,
                 arg0: v.args.first().copied().unwrap_or(0) as u64,
                 arg1: v.args.get(1).copied().unwrap_or(0) as u64,
                 shadow_sp: v.shadow_sp,
