@@ -201,6 +201,7 @@ static void temen_handler(int sig, siginfo_t *info, void *uc) {
     if (sig == SIGILL) {
         if (g_armed && !temen_host_fault(sig, uc, (uintptr_t)info->si_addr)) {
             g_armed = 0;
+            g_trying = 0; /* a try open on the frames this abandons goes with them (#2996) */
             temen_capture_frame(uc);
             siglongjmp(g_buf, 1);
         }
@@ -209,6 +210,7 @@ static void temen_handler(int sig, siginfo_t *info, void *uc) {
     }
     if (g_armed && addr >= g_lo && addr < g_hi && !temen_host_fault(sig, uc, addr)) {
         g_armed = 0;
+        g_trying = 0; /* as for SIGILL, above */
         temen_capture_frame(uc); /* stash the faulting frame before the stack unwinds (§5 W3) */
         siglongjmp(g_buf, 1);  /* back to temen_run_guarded; does not return */
     }

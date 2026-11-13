@@ -1412,6 +1412,8 @@ mod pal {
                     // §5 W3: capture the trap-time backtrace from the faulting context *before*
                     // `resume_at_landing` below rewrites it.
                     capture_trap_frame(&*ep.ContextRecord);
+                    // A try open on the frames this abandons is abandoned with them (#2996).
+                    TRY.with(|g| g.set(None));
                     // Resume as the trampoline returning 1 (the unix siglongjmp analogue). The
                     // abandoned JIT frames hold no Rust destructors.
                     resume_at_landing(&mut *ep.ContextRecord, &*f.jb);
@@ -1430,6 +1432,7 @@ mod pal {
                 .filter(|_| !host_fault(&*ep.ContextRecord, pc))
             {
                 capture_trap_frame(&*ep.ContextRecord);
+                TRY.with(|g| g.set(None)); // as for an access violation, above
                 resume_at_landing(&mut *ep.ContextRecord, &*f.jb);
                 return EXCEPTION_CONTINUE_EXECUTION;
             }
@@ -1469,14 +1472,32 @@ mod pal {
             _pad: 0,
             xmm: [[0; 2]; 10],
         };
+        /// What the trampoline's `Entry`-shaped [`try_entry`] calls.
+        struct TryCall {
+            f: unsafe extern "C" fn(*mut c_void),
+            arg: *mut c_void,
+        }
+        /// The trampoline calls an [`Entry`]; this one calls `f(arg)` from the `TryCall` its first
+        /// argument points at. Its frame holds nothing to drop: a fault leaves it by the landing.
+        extern "C" fn try_entry(
+            a: *const i64,
+            _r: *mut i64,
+            _m: *mut u8,
+            _t: *const c_void,
+            _tc: *mut i64,
+        ) {
+            // SAFETY: `a` is the `TryCall` on `try_call`'s frame, live for the call.
+            unsafe {
+                let call = &*(a as *const TryCall);
+                (call.f)(call.arg)
+            }
+        }
+        let call = TryCall { f, arg };
         let jb_ptr: *mut JmpBuf = &mut jb;
         TRY.with(|g| g.set(Some(Frame { jb: jb_ptr, lo, hi })));
-        // The trampoline calls an `Entry`-shaped function; `f` takes its one argument in the first
-        // register, which is where the trampoline puts `a`.
-        let entry: Entry = core::mem::transmute(f);
         let tripped = temen_win_guarded_call(
-            entry,
-            arg as *const i64,
+            try_entry,
+            &call as *const TryCall as *const i64,
             core::ptr::null_mut(),
             core::ptr::null_mut(),
             core::ptr::null(),

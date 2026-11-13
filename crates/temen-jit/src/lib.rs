@@ -2608,7 +2608,8 @@ struct OwnedJit {
 }
 
 impl OwnedJit {
-    fn new((m, slot): (JITModule, code_ranges::CodeSlot)) -> OwnedJit {
+    fn new(new: code_ranges::NewModule) -> OwnedJit {
+        let (m, slot) = new.into_parts();
         OwnedJit {
             lazy: None,
             arena: Arc::new(Arena::new(m, slot)),
@@ -3865,7 +3866,7 @@ impl CompiledModule {
             page_miss: None, // only a §14 child is demand-paged (#2164)
         };
         let claims = fast_claims(fast_resolver, &m.funcs, &m.types);
-        let (mut module, slot) = new_jit_module(imports, &claims)?;
+        let mut module = new_jit_module(imports, &claims)?;
 
         // Declare every function (natural ABI) up front so calls can reference any of them, and
         // everything else the code calls (#2482).
@@ -4458,7 +4459,7 @@ impl CompiledModule {
             MODULE_COMPILES.fetch_add(1, Ordering::Relaxed);
         }
         let module = match entries {
-            None => Arc::new(OwnedJit::new((module, slot))),
+            None => Arc::new(OwnedJit::new(module)),
             Some(e) => {
                 let starts = e
                     .copies
@@ -4489,6 +4490,7 @@ impl CompiledModule {
                     #[cfg(test)]
                     fault: lazy::FAULT.with(|f| f.get()),
                 };
+                let (module, slot) = module.into_parts();
                 let arena = Arc::new(Arena::new(module, slot));
                 let service = lazy::Service::start(
                     code,
@@ -7234,7 +7236,7 @@ fn host_import(
 fn new_jit_module(
     imports: Imports,
     claims: &FastClaims,
-) -> Result<(JITModule, code_ranges::CodeSlot), JitError> {
+) -> Result<code_ranges::NewModule, JitError> {
     let mut builder = JITBuilder::with_isa(jit_isa()?, cranelift_module::default_libcall_names());
     for f in HostFn::ALL {
         if let Some(addr) = f.addr(&imports) {
@@ -8578,7 +8580,7 @@ fn compile_child_windowed(
         page_miss,
         ..Imports::NONE
     };
-    let (mut module, slot) = new_jit_module(imports, &FastClaims::new())?;
+    let mut module = new_jit_module(imports, &FastClaims::new())?;
     let ids: Vec<FuncId> = declare_all_funcs(&mut module, funcs)?;
     // Nested child: its `call.cap`s go to the coroutine thunk, never a fast path.
     let callees = Callees::new(&mut module, &ids, funcs, types, &FastClaims::new())?;
@@ -8854,7 +8856,7 @@ fn compile_child_windowed(
         func_names: std::collections::HashMap::new(),
         var_locs: Vec::new(),
         debug_types: Vec::new(),
-        module: Arc::new(OwnedJit::new((module, slot))),
+        module: Arc::new(OwnedJit::new(module)),
     })
 }
 

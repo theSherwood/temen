@@ -35,10 +35,13 @@ use std::sync::atomic::{fence, AtomicUsize, Ordering};
 #[cfg(not(loom))]
 use std::sync::{Mutex, MutexGuard};
 
-/// How many JIT modules may be live at once. Each holds an [`ARENA`] reservation, so this is a
-/// terabyte of code VA: the OS's own limits (Linux's map count, Windows's commit charge for each
-/// arena) bind long before it.
-const SLOTS: usize = 4096;
+/// How many JIT modules may be live at once: 2^16, so the OS's own limit binds first. On default
+/// Linux a process holds at most 65,530 mappings (`vm.max_map_count`), and each arena is at least
+/// one; on Windows each arena charges 256 MiB of commit. A raised map count, or macOS, can reach
+/// the table first; what should bound live code arenas in any case is the spawning guest's
+/// accounting (#3006). Costs ~1.6 MB of untouched BSS; the claim scan stops at the first free
+/// slot, and the handler's scan, which runs only on a fault, stops at the high-water mark.
+const SLOTS: usize = 1 << 16;
 
 /// The size of each module's code arena.
 pub(crate) const ARENA: usize = 256 << 20;
@@ -192,17 +195,72 @@ mod live {
     /// process (the suites catch that loudly), and the range's top runs past the reservation into
     /// whatever is mapped next, where a host fault would be unwound as the guest's (nothing catches
     /// that). So: the probe must be page-aligned, which a header ahead of it would almost always
-    /// break, and is checked here; and a cranelift-jit upgrade must re-run `code_ranges`' tests,
+    /// break, and is checked in [`arena_base`]; and a cranelift-jit upgrade must re-run `code_ranges`' tests,
     /// which check the range against the OS's own record of the reservation where one is cheap
     /// (Windows' `VirtualQuery`).
-    pub(crate) fn arena_module(
-        mut builder: JITBuilder,
-    ) -> Result<(JITModule, CodeSlot), crate::JitError> {
-        let backend = |e: cranelift_module::ModuleError| crate::JitError::Backend(e.to_string());
+    pub(crate) fn arena_module(mut builder: JITBuilder) -> Result<NewModule, crate::JitError> {
         let arena = ArenaMemoryProvider::new_with_size(ARENA)
             .map_err(|e| crate::JitError::Backend(format!("JIT code arena: {e}")))?;
         builder.memory_provider(Box::new(arena));
-        let mut module = JITModule::new(builder);
+        let mut new = NewModule {
+            module: Some(JITModule::new(builder)),
+            slot: None,
+        };
+        let base = arena_base(&mut new)?;
+        let slot = TABLE
+            .claim(base, base + ARENA)
+            .ok_or(crate::JitError::Unsupported("too many live JIT modules"))?;
+        new.slot = Some(CodeSlot(slot));
+        Ok(new)
+    }
+
+    /// A module being compiled: its code arena, in the table, until it is handed to its owner
+    /// ([`NewModule::into_parts`], then `OwnedJit`, which frees it when its code is done). Dropped
+    /// before then — a compile that failed or declined — it gives the whole arena back: a
+    /// `JITModule` frees nothing when it drops, and cranelift's arena frees its reservation on drop
+    /// only while nothing in it is finalized, which the probe ([`arena_base`]) always is.
+    pub(crate) struct NewModule {
+        module: Option<JITModule>,
+        slot: Option<CodeSlot>,
+    }
+
+    impl NewModule {
+        /// The module and its slot, for the owner that frees them.
+        pub(crate) fn into_parts(mut self) -> (JITModule, CodeSlot) {
+            let module = self.module.take().expect("a module until handed over");
+            let slot = self.slot.take().expect("a slot until handed over");
+            (module, slot)
+        }
+    }
+
+    impl std::ops::Deref for NewModule {
+        type Target = JITModule;
+        fn deref(&self) -> &JITModule {
+            self.module.as_ref().expect("a module until handed over")
+        }
+    }
+
+    impl std::ops::DerefMut for NewModule {
+        fn deref_mut(&mut self) -> &mut JITModule {
+            self.module.as_mut().expect("a module until handed over")
+        }
+    }
+
+    impl Drop for NewModule {
+        fn drop(&mut self) {
+            // Out of the table first, then the pages back (`Arena::drop`'s order).
+            drop(self.slot.take());
+            if let Some(m) = self.module.take() {
+                // SAFETY: a module is handed over before any of its code is published to run, so
+                // nothing from one dropped here ever ran or will.
+                unsafe { m.free_memory() };
+            }
+        }
+    }
+
+    /// The base of `module`'s arena reservation, from its first allocation (see [`arena_module`]).
+    fn arena_base(module: &mut JITModule) -> Result<usize, crate::JitError> {
+        let backend = |e: cranelift_module::ModuleError| crate::JitError::Backend(e.to_string());
         let probe = module
             .declare_anonymous_data(false, false)
             .map_err(backend)?;
@@ -213,15 +271,12 @@ mod live {
         let base = module.get_finalized_data(probe).0 as usize;
         if !base.is_multiple_of(crate::mem::page_size()) {
             // Not the reservation's base: decline rather than register a range that is not the
-            // arena's (see above). The module's memory is leaked; nothing from it ever ran.
+            // arena's (see above).
             return Err(crate::JitError::Unsupported(
                 "the JIT code arena's base could not be found",
             ));
         }
-        let slot = TABLE
-            .claim(base, base + ARENA)
-            .ok_or(crate::JitError::Unsupported("too many live JIT modules"))?;
-        Ok((module, CodeSlot(slot)))
+        Ok(base)
     }
 
     /// A test's stand-in for emitted code: the page at `f`, in the table until the slot drops.
@@ -262,8 +317,9 @@ mod live {
         /// which is released with the slot.
         #[test]
         fn a_modules_code_is_in_its_registered_range() {
-            let (m, slot) = crate::new_jit_module(crate::Imports::NONE, &crate::FastClaims::new())
+            let new = crate::new_jit_module(crate::Imports::NONE, &crate::FastClaims::new())
                 .expect("module");
+            let (m, slot) = new.into_parts();
             let (lo, hi) = TABLE.read(slot.0).expect("published");
             assert_eq!(hi - lo, ARENA);
             let here = crate::fuel::refill_trampoline();
@@ -277,6 +333,25 @@ mod live {
             unsafe { m.free_memory() };
         }
 
+        /// A module dropped before it is handed over (a compile that failed or declined) gives its
+        /// slot back, and its arena with it (`NewModule::drop`; the arena's own drop would not free
+        /// it, since the probe is finalized). The unmap itself is not asserted: tests run in
+        /// parallel, and another test's mapping can take the freed range at once.
+        #[test]
+        fn a_module_that_never_ran_gives_its_arena_back() {
+            let new = crate::new_jit_module(crate::Imports::NONE, &crate::FastClaims::new())
+                .expect("module");
+            let base = new
+                .slot
+                .as_ref()
+                .and_then(|s| TABLE.read(s.0))
+                .expect("published")
+                .0;
+            assert!(pc_is_jit(base));
+            drop(new);
+            assert!(!pc_is_jit(base), "the slot is released");
+        }
+
         /// The probe's layout assumption, checked against the OS's own record of the reservation:
         /// the registered range is exactly one whole allocation, starting at its base. Windows only:
         /// `VirtualQuery` names a reservation's `AllocationBase`. Linux and macOS keep no such record
@@ -288,7 +363,8 @@ mod live {
         fn the_registered_range_is_the_arenas_reservation() {
             use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION};
             let (m, slot) = crate::new_jit_module(crate::Imports::NONE, &crate::FastClaims::new())
-                .expect("module");
+                .expect("module")
+                .into_parts();
             let (lo, hi) = TABLE.read(slot.0).expect("published");
             let query = |at: usize| {
                 // SAFETY: `VirtualQuery` only reads the process's address-space bookkeeping.

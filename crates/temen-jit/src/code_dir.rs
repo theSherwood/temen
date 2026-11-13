@@ -562,9 +562,8 @@ mod tests {
 
     #[test]
     fn code_fits_only_a_link_that_binds_all_it_names() {
-        let (module, _slot) =
-            crate::new_jit_module(crate::Imports::NONE, &crate::FastClaims::new())
-                .expect("a module");
+        let module = crate::new_jit_module(crate::Imports::NONE, &crate::FastClaims::new())
+            .expect("a module");
         let ids: Vec<FuncId> = (0..2).map(FuncId::from_u32).collect();
         let bound = crate::Imports {
             cap_thunk: crate::INERT_CAP_THUNK as *const u8,

@@ -223,8 +223,7 @@ fn compile_refill_trampoline() -> Result<(crate::OwnedJit, usize), crate::JitErr
     use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
     use cranelift_module::{Linkage, Module};
     let backend = |e: cranelift_module::ModuleError| crate::JitError::Backend(e.to_string());
-    let (mut module, slot) =
-        crate::new_jit_module(crate::Imports::NONE, &crate::FastClaims::new())?;
+    let mut module = crate::new_jit_module(crate::Imports::NONE, &crate::FastClaims::new())?;
     let mut sig = Signature::new(CallConv::PreserveAll);
     sig.params.push(AbiParam::new(I64)); // the cell
     let id = module
@@ -246,7 +245,7 @@ fn compile_refill_trampoline() -> Result<(crate::OwnedJit, usize), crate::JitErr
     crate::define_verified(&mut module, id, &mut ctx)?;
     module.finalize_definitions().map_err(backend)?;
     let code = module.get_finalized_function(id) as usize;
-    Ok((crate::OwnedJit::new((module, slot)), code))
+    Ok((crate::OwnedJit::new(module), code))
 }
 
 /// `fuel.remaining` (self op 13) on a metered compile: [`FuelCell::can_burn`], `i64::MAX` unmetered.
