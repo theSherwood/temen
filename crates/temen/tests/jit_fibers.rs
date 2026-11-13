@@ -510,7 +510,7 @@ fn fiber_backtrace_reaches_the_last_run_s_fibers_alone() {
     let _ = cm.run(&[], None, None).expect("run 2");
     let bt = cm.fiber_backtrace(0);
     assert_eq!(bt.len(), 2, "run 2's parked fiber: {bt:?}");
-    let tagged = (0x5a_i64 << 56) | 0;
+    let tagged = 0x5a_i64 << 56; // handle 0, a guest tag in the top byte
     assert_eq!(
         cm.fiber_backtrace(tagged),
         bt,
