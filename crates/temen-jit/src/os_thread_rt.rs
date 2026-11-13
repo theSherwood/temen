@@ -778,7 +778,8 @@ pub(crate) struct Domain {
     env: Mutex<Option<Env>>,
     /// The **domain-shared fiber table** (D57 3b-ii) every spawned vCPU's `FiberRuntime` is built
     /// over — one handle namespace + one fiber ceiling for the whole domain (the root vCPU's
-    /// runtime shares the same `Arc`, held by the `CompiledModule`). `None` for fiber-free modules.
+    /// runtime shares the same `Arc`). The run's own (#3020): set by `set_env`, cleared by
+    /// [`Domain::end_run`]. `None` for fiber-free modules.
     /// `std::sync::Arc`/`Mutex<Option<…>>` like `env` (set once on the setup thread, read at spawns).
     fiber_table: Mutex<Option<std::sync::Arc<SharedFiberTable>>>,
     threads: Mutex<Threads>,
@@ -2164,7 +2165,7 @@ fn run_child(a: SpawnArgs) {
     mem::install_guard();
     // A vCPU that uses `cont.*` gets its own fiber *execution context* over the **domain-shared**
     // fiber table (D57 3b-ii: one handle namespace + quota; the table outlives every vCPU — it is
-    // held by the `CompiledModule` and the `Domain`, both joined-after). SAFETY: `a.dom` is the
+    // the run's, held by the run and the `Domain` until after every vCPU is joined, #3020). SAFETY: `a.dom` is the
     // run's live `Domain` (joined at run end).
     let mut frt = env.fiber_cfg.map(|(tid, mask)| {
         let table = unsafe { (*a.dom).fiber_table() }

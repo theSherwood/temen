@@ -3490,7 +3490,7 @@ pub struct CompiledModule {
     /// every spawned vCPU's are built over — one handle namespace + one fiber ceiling per domain.
     /// #3020 — each run builds its own ([`Self::begin_fibers`]).
     #[cfg(fiber_rt)]
-    fiber_table: bool,
+    builds_fiber_table: bool,
     /// #2113 — the run's own budget node ([`Self::compile`]'s `node`), which the fiber table and
     /// thread domain the hosting enablers stand up later charge too.
     #[cfg(fiber_rt)]
@@ -3513,8 +3513,8 @@ pub struct CompiledModule {
     /// #1825 — whether a §22 hosting entry stood a runtime up after the compile
     /// ([`Self::enable_fiber_hosting`], [`Self::enable_thread_hosting`]): one [`Self::instance`] does
     /// not make, so the code cannot be shared. Every runtime the compile itself stands up (the thread
-    /// domain, the fiber table and runtime, the §14 nursery, the `setjmp` table) an instance makes
-    /// anew (temen#2389). A §14 child's runtimes are its task's and its nursery its spawn's
+    /// domain, the §14 nursery, the `setjmp` table) an instance makes anew (temen#2389); the fiber
+    /// table and root runtime each run makes (#3020). A §14 child's runtimes are its task's and its nursery its spawn's
     /// (temen#2168).
     hosted: bool,
     /// temen#2168 — whether the code's own `Instantiator` sites spawn through its instance's nursery
@@ -3606,7 +3606,7 @@ impl CompiledModule {
     /// runtime over it if the module runs `cont.*` itself.
     #[cfg(fiber_rt)]
     fn begin_fibers(&self) -> Option<RunFibers> {
-        self.fiber_table.then(|| {
+        self.builds_fiber_table.then(|| {
             let table = Arc::new(fiber_rt::SharedFiberTable::new(
                 temen_ir::MAX_FIBERS,
                 self.shadow,
@@ -4104,7 +4104,7 @@ impl CompiledModule {
         // durable shadow-SP swap).
         // #3020 — each run builds the table, and the root runtime below ([`Self::begin_fibers`]).
         #[cfg(fiber_rt)]
-        let fiber_table = uses_fibers || uses_threads;
+        let builds_fiber_table = uses_fibers || uses_threads;
         // The *root* vCPU's fiber runtime is built only when the module actually uses `cont.*` — a
         // fiber-free module (even a threaded one) never resumes a fiber, so it needs no execution
         // context, and the durable shadow-SP word it does use is driven by the instrumented IR
@@ -4687,7 +4687,7 @@ impl CompiledModule {
                 None
             },
             #[cfg(fiber_rt)]
-            fiber_table,
+            builds_fiber_table,
             #[cfg(fiber_rt)]
             node,
             src_ranges,
@@ -4870,7 +4870,7 @@ impl CompiledModule {
             addrs.sched = &**d as *const os_thread_rt::Domain as *const core::ffi::c_void;
         }
         #[cfg(fiber_rt)]
-        let fiber_table = self.fiber_table;
+        let builds_fiber_table = self.builds_fiber_table;
         #[cfg(fiber_rt)]
         let nursery = self.makes_nursery().then(|| {
             nursery_over(
@@ -4969,7 +4969,7 @@ impl CompiledModule {
             #[cfg(fiber_rt)]
             fiber_cfg: self.fiber_cfg,
             #[cfg(fiber_rt)]
-            fiber_table,
+            builds_fiber_table,
             #[cfg(fiber_rt)]
             node,
             src_ranges: self.src_ranges.clone(),
@@ -6286,7 +6286,7 @@ impl CompiledModule {
         let fiber_mask = self.fn_table_mask;
         // Domain-shared handle namespace, which each run builds (#3020); a thread-only parent's
         // runs already do.
-        self.fiber_table = true;
+        self.builds_fiber_table = true;
         // The generic call-trampoline (calls any Tail-ABI `(i64, i64) -> i64` entry from Rust). A
         // thread-only parent already built it (`compile`, `uses_threads` arm); else build it now,
         // incrementally like a submitted unit — a fresh function, a second `finalize_definitions`.
@@ -6354,12 +6354,10 @@ impl CompiledModule {
             return Ok(()); // already hosting threads (parent used thread.*, or a nesting Domain exists)
         }
         // The domain-shared fiber table (D57 3b-ii): every spawned vCPU builds its `FiberRuntime` /
-        // durable vCPU-context over it. `compile` creates it for *any* threaded module (even a
-        // fiber-free one — the durable-context allocator needs it), so create it here too. Reuse an
-        // existing table if a fiber-hosting parent already built one (unified handle namespace). The
-        // `Domain` reads it via `set_env`'s `fiber_table.clone()` at run time, so populating the field
-        // is all that's needed here.
-        self.fiber_table = true;
+        // durable vCPU-context over it. A run of *any* threaded module builds one (even a fiber-free
+        // one — the durable-context allocator needs it), so this module's runs do too (#3020: each
+        // run builds its own, and hands it to the `Domain` through `set_env`).
+        self.builds_fiber_table = true;
         // The generic call-trampoline (calls any Tail-ABI `(i64, i64) -> i64` entry from Rust). Spawned
         // vCPUs call their entry through it; a fiber-hosting parent already built it, else build it now
         // incrementally like a submitted unit — a fresh function, a second `finalize_definitions`
@@ -6394,7 +6392,7 @@ impl CompiledModule {
         self.domain = Some(domain);
         self.hosted = true;
         self.call_tramp = Some(tramp);
-        // `fiber_table` set above; `fiber_cfg` left as-is (None ⇒ pure-thread host, matching a
+        // `builds_fiber_table` set above; `fiber_cfg` left as-is (None ⇒ pure-thread host, matching a
         // fiber-free threaded module — spawned vCPUs then build no per-vCPU fiber runtime).
         Ok(())
     }
@@ -8939,7 +8937,7 @@ fn compile_child_windowed(
         resolve_module: None,
         call_tramp,
         fiber_cfg,
-        fiber_table: false,
+        builds_fiber_table: false,
         node: None,
         src_ranges: Vec::new(),
         src_files: Vec::new(),
