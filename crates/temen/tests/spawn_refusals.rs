@@ -431,7 +431,7 @@ const TAIL: u64 = 1 << 20;
 /// not there faults. The host reads each one: the record and payload by `try_access`, the grant list
 /// through the host's checked window view, under the Host lock that a fault taken by the hardware
 /// would have leaked. JIT only: the interpreters read the spawner's window without its page
-/// protections and see zeros there (ISSUE_PLACEHOLDER).
+/// protections and see zeros there (#2408).
 #[test]
 fn a_record_payload_or_grant_list_on_an_absent_page_faults_on_the_jit() {
     let record = parent(
