@@ -13,8 +13,8 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use temen_durable::{
-    begin_thaw, init_durable_window, read_state, transform_module_assume_confined, STATE_NORMAL,
-    STATE_UNWINDING,
+    arm_freeze_after, begin_thaw, init_durable_window, read_state,
+    transform_module_assume_confined, STATE_NORMAL, STATE_UNWINDING,
 };
 use temen_interp::put_results;
 use temen_interp::{Host, HostProcGrant, ProcHandler};
@@ -1763,4 +1763,95 @@ fn a_reused_compile_runs_then_freezes_then_thaws() {
         ORACLE,
         "the thaw reproduces the result"
     );
+}
+
+/// #2953 — the root spawns a child and returns at once, joining nothing.
+const SRC_SPAWN_AND_RETURN: &str = r#"
+func () -> (i64) {
+block 0 () {
+  v0 = i64.const 7
+  v1 = thread.spawn 1 v0 v0
+  return v0
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (v0: i64, v1: i64) {
+  return v1
+  }
+}
+"#;
+
+/// A budget node that counts the vCPUs charged to it.
+#[derive(Default)]
+struct CountsVcpus(std::sync::atomic::AtomicI64);
+
+impl temen_jit::BudgetNode for CountsVcpus {
+    fn draw(&self) -> Option<u64> {
+        Some(u64::MAX)
+    }
+    fn give_back(&self, _unspent: u64) {}
+    fn room(&self) -> i64 {
+        i64::MAX
+    }
+    fn charge_vcpu(&self) -> bool {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        true
+    }
+    fn rebuild_vcpu(&self) -> bool {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        true
+    }
+    fn vcpu_ended(&self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+    fn charge_fiber(&self) -> bool {
+        true
+    }
+    fn force_fiber(&self) {}
+    fn fiber_ended(&self) {}
+}
+
+/// #2953 — a durable run armed to freeze defers every spawn while its trigger has not fired, and
+/// runs a deferred child only at the freeze or before a park. A run whose root spawns and returns
+/// before either ends with its child unrun, as the oracle discards a finished run's queued vCPU; what
+/// the deferred spawn took (a live slot, a budget charge, a shadow context) goes back as the run
+/// ends, so the next run of the compile starts as a fresh compile's does.
+#[test]
+fn an_armed_run_s_unrun_deferred_spawn_gives_back_what_it_took() {
+    use temen_jit::CompiledModule;
+    let inst = instrument(SRC_SPAWN_AND_RETURN);
+    let node = Arc::new(CountsVcpus::default());
+    let mut host = Host::new();
+    let mut cm = match CompiledModule::compile(
+        &inst,
+        0,
+        temen_run::cap_thunk,
+        &mut host as *mut Host as *mut std::ffi::c_void,
+        SIZE_LOG2,
+        None,
+        None,
+        None,
+        None,
+        Some(node.clone()),
+        0,
+    ) {
+        Ok(cm) => cm,
+        Err(JitError::Unsupported(_)) => return,
+        Err(e) => panic!("compile: {e:?}"),
+    };
+    for run in 1..=3 {
+        let mut win = init_durable_window(WINDOW, TEST_ARENA);
+        arm_freeze_after(&mut win, TEST_ARENA, 1_000_000);
+        cm.set_durable(DurableResidue {
+            root_sp: Some(TEST_ARENA.frame_base(0)),
+            ..Default::default()
+        });
+        let (out, _) = cm.run(&[], Some(&win), Some(WINDOW)).expect("armed run");
+        assert_eq!(out, JitOutcome::Returned(vec![7]), "run {run}");
+        assert_eq!(
+            node.0.load(Ordering::SeqCst),
+            0,
+            "run {run}'s unrun child still holds its vCPU charge"
+        );
+    }
 }
