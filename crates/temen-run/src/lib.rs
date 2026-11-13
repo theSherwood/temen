@@ -4000,10 +4000,11 @@ pub unsafe extern "C" fn grant_detached_child_build(
     out: *mut temen_jit::GrantChild,
     vm: &temen_jit::VmCtx,
 ) -> i32 {
-    let Some(grants) = read_grant_records(mem_base, mem_size, grants_ptr, grants_n, vm) else {
+    let parent = &mut *(ctx as *mut Host);
+    let _ = (mem_base, mem_size); // the window is `vm`'s (#2996: read through the host's view)
+    let Some(grants) = read_grant_records(parent, grants_ptr, grants_n, vm) else {
         return 0;
     };
-    let parent = &mut *(ctx as *mut Host);
     let lease = temen_interp::Lease {
         budget,
         bytes,
@@ -4213,10 +4214,11 @@ pub unsafe extern "C" fn grant_list_check(
     grants_n: u64,
     vm: &temen_jit::VmCtx,
 ) -> i32 {
-    let Some(grants) = read_grant_records(mem_base, mem_size, grants_ptr, grants_n, vm) else {
+    let parent = &mut *(ctx as *mut Host);
+    let _ = (mem_base, mem_size); // the window is `vm`'s (#2996: read through the host's view)
+    let Some(grants) = read_grant_records(parent, grants_ptr, grants_n, vm) else {
         return 0;
     };
-    let parent = &*(ctx as *mut Host);
     match parent.check_grant_list(&grants) {
         Ok(()) => 1,
         Err(t) => {
@@ -4329,27 +4331,30 @@ pub unsafe extern "C" fn child_end_signal(post: *mut c_void) {
     }
 }
 
-/// The by-name builders' grant list: [`temen_interp::read_grant_records`] over the parent's window
-/// `[mem_base, mem_base + mem_size)`. `None` with the parse's trap raised on `vm`.
+/// The by-name builders' grant list: [`temen_interp::read_grant_records`] over the parent's window,
+/// `vm`'s. `None` with the parse's trap raised on `vm`.
 ///
-/// # Safety
-/// `[mem_base, mem_base + mem_size)` is the parent's window (its reserved span: a read of an
-/// uncommitted page faults through the SIGSEGV guard, like a guest access).
-unsafe fn read_grant_records(
-    mem_base: *mut u8,
-    mem_size: u64,
+/// #2996 — read through `host`'s view of the window, which checks each record against the page map
+/// every protection change goes through, as every other host access under the Host lock does: a
+/// record on a page the guest cannot read is its `MemoryFault`, as on the interpreters, and never a
+/// hardware fault taken with the Host lock held.
+fn read_grant_records(
+    host: &mut Host,
     grants_ptr: u64,
     grants_n: u64,
     vm: &temen_jit::VmCtx,
 ) -> Option<Vec<(String, i32)>> {
-    let read = |off: u64, len: usize| -> Result<Vec<u8>, Trap> {
-        match off.checked_add(len as u64) {
-            // SAFETY: `[off, off + len)` lies inside the window, per the bound just checked.
-            Some(end) if end <= mem_size => {
-                Ok(unsafe { std::slice::from_raw_parts(mem_base.add(off as usize), len) }.to_vec())
-            }
-            _ => Err(Trap::MemoryFault),
-        }
+    #[cfg(any(unix, windows))]
+    let read = {
+        let w = vm.window();
+        let view = MprotectWindow::of(host, w.base, w.mapped, w.reserved);
+        move |off: u64, len: usize| view.read_bytes(off, len as u64).ok_or(Trap::MemoryFault)
+    };
+    // No window backend on any other target (nor a JIT to call this).
+    #[cfg(not(any(unix, windows)))]
+    let read = {
+        let _ = host;
+        |_: u64, _: usize| Err::<Vec<u8>, _>(Trap::MemoryFault)
     };
     temen_interp::read_grant_records(grants_ptr, grants_n, read)
         .map_err(|t| vm.raise(t.code()))

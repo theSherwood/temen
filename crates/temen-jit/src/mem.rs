@@ -367,7 +367,7 @@ impl GuestWindow {
 /// child may run in several windows at once — the plain-child cache), so its `Jit.invoke` derives the
 /// range from the window the thunk was handed.
 pub(crate) fn fault_range_of(base: *mut u8, reserved: usize) -> (usize, usize) {
-    let page = pal::page_size();
+    let page = page_size();
     let lo = base as usize;
     (lo, lo + round_up(reserved, page) + trailing_guard())
 }
@@ -517,9 +517,16 @@ pub(crate) unsafe extern "C" fn mem_copy(vm: &crate::VmCtx, dst: u64, src: u64, 
     if w.pages != 0 && !(pages_admit(vm, src, len, false) && pages_admit(vm, dst, len, true)) {
         return;
     }
-    probe(s, len);
-    probe(d, len);
-    core::ptr::copy(s, d, len as usize);
+    if !try_access(
+        w,
+        &mut Access::Copy {
+            dst: d,
+            src: s,
+            len: len as usize,
+        },
+    ) {
+        fault(vm);
+    }
 }
 
 /// #2534 — `mem.fill` (D62) for compiled code: set the `len` bytes at window offset `dst` of `vm`'s
@@ -538,8 +545,16 @@ pub(crate) unsafe extern "C" fn mem_fill(vm: &crate::VmCtx, dst: u64, val: u64, 
     if w.pages != 0 && !pages_admit(vm, dst, len, true) {
         return;
     }
-    probe(d, len);
-    core::ptr::write_bytes(d, val as u8, len as usize);
+    if !try_access(
+        w,
+        &mut Access::Fill {
+            dst: d,
+            val: val as u8,
+            len: len as usize,
+        },
+    ) {
+        fault(vm);
+    }
 }
 
 /// A bulk op's span past the reservation: the `MemoryFault` a guest access there is. Out of line, so
@@ -552,9 +567,96 @@ fn fault(vm: &crate::VmCtx) {
 
 /// I21 — read the first and last byte of the `len ≥ 1` bytes at `p`, so a span past the backed
 /// extent faults before a bulk op writes any of it, and a self-copy (which `memmove` may skip) too.
-unsafe fn probe(p: *mut u8, len: u64) {
+unsafe fn probe(p: *const u8, len: usize) {
     core::ptr::read_volatile(p);
-    core::ptr::read_volatile(p.add(len as usize - 1));
+    core::ptr::read_volatile(p.add(len - 1));
+}
+
+/// #2996 — a host function's access to a guest window, where only the hardware knows whether each
+/// page is there (the guest's own unmap or protect, the null guard, the uncommitted tail, a racing
+/// vCPU's unmap). Run by [`try_access`], under a recovery point of its own.
+pub(crate) enum Access {
+    /// Copy `len ≥ 1` bytes, overlap-safe; the ends of both spans are read first (I21), so a span
+    /// past the backed extent faults before any byte is written.
+    Copy {
+        dst: *mut u8,
+        src: *const u8,
+        len: usize,
+    },
+    /// Set `len ≥ 1` bytes to `val`; the span's ends are read first (I21).
+    Fill { dst: *mut u8, val: u8, len: usize },
+    /// Load the `width`-byte word (1, 2, 4 or 8, aligned) at `src` into `out`.
+    Load {
+        src: *const u8,
+        width: u32,
+        out: u64,
+    },
+}
+
+/// Run `a` on window `w`. `false` if it faulted on the window: the access did not complete (a copy
+/// or fill may have written part of its span, as a guest's bulk op does), and the caller raises the
+/// guest's `MemoryFault` and returns normally. No caller frame is skipped, so whatever the caller
+/// holds — a lock, a lane, an allocation — is released as on any return. A fault outside the window's
+/// fault range is not recovered: it is a host bug.
+///
+/// # Safety
+/// Each pointer `a` names lies in `w`'s reservation, or (a copy's other side) in host memory valid
+/// for the access.
+pub(crate) unsafe fn try_access(w: &crate::Window, a: &mut Access) -> bool {
+    unsafe extern "C" fn run(a: *mut c_void) {
+        // A frame with nothing to drop: a fault leaves it by the recovery point's jump.
+        match &mut *(a as *mut Access) {
+            Access::Copy { dst, src, len } => {
+                probe(*src, *len);
+                probe(*dst, *len);
+                core::ptr::copy(*src, *dst, *len);
+            }
+            Access::Fill { dst, val, len } => {
+                probe(*dst, *len);
+                core::ptr::write_bytes(*dst, *val, *len);
+            }
+            Access::Load { src, width, out } => {
+                *out = match width {
+                    1 => core::ptr::read_volatile(*src) as u64,
+                    2 => core::ptr::read_volatile(*src as *const u16) as u64,
+                    4 => core::ptr::read_volatile(*src as *const u32) as u64,
+                    _ => core::ptr::read_volatile(*src as *const u64),
+                };
+            }
+        }
+    }
+    // No `install_guard`: every caller is a host function called from inside a guarded call, which
+    // installed the handler.
+    let (lo, hi) = fault_range_of(w.base, w.reserved as usize);
+    pal::try_call(run, a as *mut Access as *mut c_void, lo, hi)
+}
+
+/// [`Access::Load`] of the `width`-byte word at `p` in window `w`: `None` if it faulted.
+///
+/// # Safety
+/// As [`try_access`].
+pub(crate) unsafe fn try_load(w: &crate::Window, p: *const u8, width: u32) -> Option<u64> {
+    let mut a = Access::Load {
+        src: p,
+        width,
+        out: 0,
+    };
+    try_access(w, &mut a).then_some(match a {
+        Access::Load { out, .. } => out,
+        _ => 0,
+    })
+}
+
+/// #2996 — whether a guarded fault whose pc is not JIT code is fatal. In a build with debug
+/// assertions it is: the tripwire that finds a host function no one converted to [`try_access`]
+/// (CI and the fuzz lanes build that way). In a release build it is unwound as a guest fault, as
+/// before.
+pub(crate) const FAULT_STRICT: bool = cfg!(debug_assertions);
+
+#[cfg(unix)]
+#[no_mangle]
+extern "C" fn temen_fault_strict() -> i32 {
+    FAULT_STRICT as i32
 }
 
 /// #2164 — whether a demand-paged child may read (or, when `write`, write) the `len` bytes at window
@@ -614,7 +716,7 @@ pub(crate) fn page_size() -> usize {
 /// accesses near a checked base skip their own check (`trusted_reach ≤ guard_size`, DESIGN.md
 /// D61/D67): it reads its reach from here, so the guard cannot shrink under it.
 pub(crate) fn trailing_guard() -> usize {
-    pal::page_size()
+    page_size()
 }
 
 /// Windows-only: make `[base, base+len)` committed read/write across this window's **placeholder**
@@ -674,6 +776,26 @@ mod pal {
         ) -> i32;
         fn temen_take_trap_frame(pc: *mut usize, rets: *mut usize, max: i32) -> i32;
         fn temen_take_trap_fiber() -> i64;
+        fn temen_try_call(
+            f: unsafe extern "C" fn(*mut c_void),
+            arg: *mut c_void,
+            lo: usize,
+            hi: usize,
+        ) -> i32;
+    }
+
+    /// Run `f(arg)` with a fault in `[lo, hi)` recovered to here (#2996, `trap_shim.c`); `false` if
+    /// one was.
+    ///
+    /// # Safety
+    /// `f(arg)` is sound to call, and its frame holds nothing to drop.
+    pub(super) unsafe fn try_call(
+        f: unsafe extern "C" fn(*mut c_void),
+        arg: *mut c_void,
+        lo: usize,
+        hi: usize,
+    ) -> bool {
+        temen_try_call(f, arg, lo, hi) != 0
     }
 
     /// Read and clear the trap stack the SIGSEGV/SIGBUS handler captured at the most recent caught
@@ -1188,6 +1310,8 @@ mod pal {
     thread_local! {
         // The active guarded call's window range + saved registers (None ⇒ no guarded call).
         static GUARD: Cell<Option<Frame>> = const { Cell::new(None) };
+        // #2996 — the active host access's window range + saved registers (`try_call`).
+        static TRY: Cell<Option<Frame>> = const { Cell::new(None) };
         // §5 W3 trap-time backtrace: the faulting `(pc, frame-pointer-chain return addresses)` the VEH
         // captures from the access-violation `CONTEXT` *before* it overwrites that context with the
         // recovery one. Read + cleared by `take_trap_frame`. A fixed buffer (no allocation in the VEH).
@@ -1273,11 +1397,23 @@ mod pal {
         if rec.ExceptionCode == STATUS_ACCESS_VIOLATION {
             // ExceptionInformation[1] is the faulting address for an access violation.
             let addr = rec.ExceptionInformation[1];
+            // #2996 — a host access to the window that may fault: back to its own landing, the
+            // guarded call's state untouched.
+            if let Some(f) = TRY
+                .with(|g| g.get())
+                .filter(|f| addr >= f.lo && addr < f.hi)
+            {
+                TRY.with(|g| g.set(None));
+                resume_at_landing(&mut *ep.ContextRecord, &*f.jb);
+                return EXCEPTION_CONTINUE_EXECUTION;
+            }
             if let Some(f) = GUARD.with(|g| g.get()) {
-                if addr >= f.lo && addr < f.hi {
+                if addr >= f.lo && addr < f.hi && !host_fault(&*ep.ContextRecord, addr) {
                     // §5 W3: capture the trap-time backtrace from the faulting context *before*
                     // `resume_at_landing` below rewrites it.
                     capture_trap_frame(&*ep.ContextRecord);
+                    // A try open on the frames this abandons is abandoned with them (#2996).
+                    TRY.with(|g| g.set(None));
                     // Resume as the trampoline returning 1 (the unix siglongjmp analogue). The
                     // abandoned JIT frames hold no Rust destructors.
                     resume_at_landing(&mut *ep.ContextRecord, &*f.jb);
@@ -1290,13 +1426,86 @@ mod pal {
             // the instruction itself), so unlike an access violation the [lo,hi) test does not apply:
             // an illegal instruction inside an armed guarded guest call is our emitted memory-fault
             // trap. Recover exactly like a guarded access violation (unwind to `run_guarded`).
-            if let Some(f) = GUARD.with(|g| g.get()) {
+            let pc = (*ep.ContextRecord).Rip as usize;
+            if let Some(f) = GUARD
+                .with(|g| g.get())
+                .filter(|_| !host_fault(&*ep.ContextRecord, pc))
+            {
                 capture_trap_frame(&*ep.ContextRecord);
+                TRY.with(|g| g.set(None)); // as for an access violation, above
                 resume_at_landing(&mut *ep.ContextRecord, &*f.jb);
                 return EXCEPTION_CONTINUE_EXECUTION;
             }
         }
         EXCEPTION_CONTINUE_SEARCH
+    }
+
+    /// #2996 — whether the guarded fault in `ctx` is a host bug to die of: its pc is not JIT code and
+    /// the build is strict ([`super::FAULT_STRICT`]). Reported here; the VEH then lets the exception
+    /// go on to the process's unhandled-exception path.
+    fn host_fault(ctx: &CONTEXT, addr: usize) -> bool {
+        let pc = ctx.Rip as usize;
+        if crate::code_ranges::pc_is_jit(pc) || !super::FAULT_STRICT {
+            return false;
+        }
+        use std::io::Write;
+        let _ = writeln!(
+            std::io::stderr(),
+            "temen-jit: host code faulted on guest memory inside a guarded call: pc={pc:#x} addr={addr:#x}"
+        );
+        true
+    }
+
+    /// Run `f(arg)` with an access violation in `[lo, hi)` recovered to here (#2996): the VEH resumes
+    /// at the guarded-call trampoline's landing, so the trampoline returns 1. `false` if one was.
+    ///
+    /// # Safety
+    /// `f(arg)` is sound to call, and its frame holds nothing to drop.
+    pub(super) unsafe fn try_call(
+        f: unsafe extern "C" fn(*mut c_void),
+        arg: *mut c_void,
+        lo: usize,
+        hi: usize,
+    ) -> bool {
+        let mut jb = JmpBuf {
+            gpr: [0; 9],
+            _pad: 0,
+            xmm: [[0; 2]; 10],
+        };
+        /// What the trampoline's `Entry`-shaped [`try_entry`] calls.
+        struct TryCall {
+            f: unsafe extern "C" fn(*mut c_void),
+            arg: *mut c_void,
+        }
+        /// The trampoline calls an [`Entry`]; this one calls `f(arg)` from the `TryCall` its first
+        /// argument points at. Its frame holds nothing to drop: a fault leaves it by the landing.
+        extern "C" fn try_entry(
+            a: *const i64,
+            _r: *mut i64,
+            _m: *mut u8,
+            _t: *const c_void,
+            _tc: *mut i64,
+        ) {
+            // SAFETY: `a` is the `TryCall` on `try_call`'s frame, live for the call.
+            unsafe {
+                let call = &*(a as *const TryCall);
+                (call.f)(call.arg)
+            }
+        }
+        let call = TryCall { f, arg };
+        let jb_ptr: *mut JmpBuf = &mut jb;
+        TRY.with(|g| g.set(Some(Frame { jb: jb_ptr, lo, hi })));
+        let tripped = temen_win_guarded_call(
+            try_entry,
+            &call as *const TryCall as *const i64,
+            core::ptr::null_mut(),
+            core::ptr::null_mut(),
+            core::ptr::null(),
+            core::ptr::null_mut(),
+            jb_ptr,
+        ) != 0;
+        TRY.with(|g| g.set(None));
+        !tripped
     }
 
     static INSTALL: Once = Once::new();
@@ -1466,6 +1675,14 @@ mod pal {
     pub(super) fn take_trap_frame() -> Option<(usize, Vec<usize>, i64)> {
         None
     }
+    pub(super) unsafe fn try_call(
+        _f: unsafe extern "C" fn(*mut c_void),
+        _arg: *mut c_void,
+        _lo: usize,
+        _hi: usize,
+    ) -> bool {
+        false
+    }
 }
 
 // ============================ PAL conformance test ============================================
@@ -1558,6 +1775,9 @@ mod tests {
         f: extern "C" fn(*const i64, *mut i64, *mut u8, *const c_void, *mut i64),
     ) -> bool {
         let vm = crate::VmCtx::new(crate::InstanceAddrs::NONE, crate::Window::NONE);
+        // #2996 — these probes stand in for emitted code, so the handler takes their faults as the
+        // guest's only once their code is in the table, as emitted code's is.
+        let _code = crate::code_ranges::test_code(f as usize);
         // SAFETY: `f` honours the Entry ABI; `mem_base` is this window's base.
         unsafe {
             run_guarded(
