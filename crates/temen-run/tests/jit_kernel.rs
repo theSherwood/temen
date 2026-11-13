@@ -834,10 +834,12 @@ fn granted(
     ]
 }
 
-/// #2958 slice 3 — the race on the kernel route: a spawned vCPU loops `op` (a not-equal wait, the
-/// no-wake fast path's, or a notify) on a word of page 8 while the root, through the address-space
-/// capability `handle`, unmaps and maps that page, or protects it to nothing and back, `turns` times
-/// each. The root then joins the vCPU and answers how many ops it made.
+/// #2958 slice 3 — the race on the kernel route, overlapping by construction: a spawned vCPU sets a
+/// start word, then loops `op` (a not-equal wait, the no-wake fast path's, or a notify) on a word
+/// of page 8 until it reads a done word, and returns how many ops it made. The root, holding the
+/// address-space capability `handle`, waits for the start word, unmaps and maps page 8 (or protects
+/// it to nothing and back) `turns` times, sets the done word and joins. The start and done words
+/// are on page 12, which no page op touches.
 fn racing(handle: i32, op: &str, protect: bool, turns: u32) -> temen_ir::Module {
     let op = match op {
         "wait" => "vx = i32.const 1\n  vto = i64.const 0\n  vk = i32.atomic.wait va vx vto",
@@ -858,11 +860,17 @@ fn racing(handle: i32, op: &str, protect: bool, turns: u32) -> temen_ir::Module 
 func () -> (i64) {{
 block 0 () {{
   vz = i64.const 0
-  vn = i64.const {turns}
-  vh = thread.spawn 1 vn vz
-  br 1(vh, vz)
+  vh = thread.spawn 1 vz vz
+  br 1(vh)
 }}
-block 1 (vh1: i32, vi: i64) {{
+block 1 (vh0: i32) {{
+  vsw = i64.const 49152
+  vs = i32.atomic.load vsw
+  vgo = i32.eqz vs
+  vz0 = i64.const 0
+  br_if vgo 1(vh0) 2(vh0, vz0)
+}}
+block 2 (vh1: i32, vi: i64) {{
   vc = i32.const {handle}
   va = i64.const 32768
   vl = i64.const 4096
@@ -872,25 +880,32 @@ block 1 (vh1: i32, vi: i64) {{
   vj = i64.add vi vone
   vlim = i64.const {turns}
   vdone = i64.ge_u vj vlim
-  br_if vdone 2(vh1) 1(vh1, vj)
+  br_if vdone 3(vh1) 2(vh1, vj)
 }}
-block 2 (vh2: i32) {{
-  vs, vv = thread.join vh2
+block 3 (vh2: i32) {{
+  vdw = i64.const 49156
+  vd1 = i32.const 1
+  i32.atomic.store vdw vd1
+  vst, vv = thread.join vh2
   return vv
   }}
 }}
 func (i64, i64) -> (i64) {{
 block 0 (vn: i64, vz: i64) {{
-  br 1(vn, vz)
+  vsw = i64.const 49152
+  vs1 = i32.const 1
+  i32.atomic.store vsw vs1
+  br 1(vz)
 }}
-block 1 (vi: i64, vdone: i64) {{
+block 1 (vdone: i64) {{
   va = i64.const 32772
   {op}
   vone = i64.const 1
-  vj = i64.sub vi vone
   vd = i64.add vdone vone
-  vend = i64.eqz vj
-  br_if vend 2(vd) 1(vj, vd)
+  vdw = i64.const 49156
+  vfin = i32.atomic.load vdw
+  vend = i32.eqz vfin
+  br_if vend 1(vd) 2(vd)
 }}
 block 2 (vr: i64) {{
   return vr
@@ -900,29 +915,45 @@ block 2 (vr: i64) {{
     ))
 }
 
+/// Busy threads for the length of a scope, so threads are descheduled at arbitrary points: set to
+/// stop as this drops, however the scope ends, so a failed assertion fails the test instead of
+/// leaving the scope joining spinners that never stop.
+struct Spinners<'a>(&'a std::sync::atomic::AtomicBool);
+
+impl Drop for Spinners<'_> {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+fn spin<'s, 'e>(s: &'s std::thread::Scope<'s, 'e>, stop: &'e std::sync::atomic::AtomicBool) {
+    for _ in 0..2 {
+        s.spawn(move || {
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                std::hint::spin_loop();
+            }
+        });
+    }
+}
+
 /// The race test: under busy threads, a vCPU's futex ops on a page the root keeps unmapping or
-/// protecting never fault the host, and each run ends with the vCPU's count (every op answered) or a
-/// guest `MemoryFault` (a wait that found the page gone), never anything else. Both shapes of ending
-/// must happen across the runs for the wait, or the test did not race.
+/// protecting never fault the host, and each run ends with the vCPU's count (every op answered, at
+/// least one made) or a guest `MemoryFault` (a wait that found the page gone), never anything else.
+/// The ops overlap the page ops by construction ([`racing`]), so a wait shape must fault in some run.
 #[test]
 fn futex_ops_racing_page_ops_never_fault_the_host() {
     const TURNS: u32 = 400;
     let stop = std::sync::atomic::AtomicBool::new(false);
     std::thread::scope(|s| {
-        for _ in 0..2 {
-            s.spawn(|| {
-                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                    std::hint::spin_loop();
-                }
-            });
-        }
+        let _stop = Spinners(&stop);
+        spin(s, &stop);
         for (op, protect) in [
             ("wait", false),
             ("wait", true),
             ("notify", false),
             ("notify", true),
         ] {
-            let (mut done, mut faulted) = (0, 0);
+            let mut faulted = 0;
             for _ in 0..30 {
                 let mut host = Host::new();
                 let m = racing(host.grant_memory(), op, protect, TURNS);
@@ -940,14 +971,12 @@ fn futex_ops_racing_page_ops_never_fault_the_host() {
                 let end = jit_kernel::run(admitted, start, &mut host).expect("compiles");
                 assert!(end.vcpus >= 1, "it ran as kernel tasks");
                 match end.result {
-                    Ok(v) => {
-                        assert_eq!(v, vec![i64::from(TURNS)], "{op}: every op answered");
-                        done += 1;
-                    }
+                    Ok(v) => assert!(v[0] >= 1, "{op}: every op answered, at least one: {v:?}"),
                     Err(Trap::MemoryFault) => faulted += 1,
                     Err(t) => panic!("{op} (protect: {protect}): {t:?}"),
                 }
             }
+            eprintln!("{op} (protect: {protect}): {faulted} of 30 runs faulted");
             match op {
                 // A notify reads no memory: it never faults.
                 "notify" => assert_eq!(faulted, 0, "{op}: a notify never faults"),
@@ -956,9 +985,7 @@ fn futex_ops_racing_page_ops_never_fault_the_host() {
                     "{op} (protect: {protect}): the wait raced the page op"
                 ),
             }
-            let _ = done;
         }
-        stop.store(true, std::sync::atomic::Ordering::Relaxed);
     });
 }
 

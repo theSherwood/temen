@@ -29177,7 +29177,9 @@ impl Host {
             _ => {
                 let m = Arc::new(Mutex::new(BTreeMap::new()));
                 self.cap_pages = Some((base, Arc::clone(&m)));
+                // The shadow and the alias refusal are the window's, as its page map is.
                 self.cap_shadow = ShadowArena::EMPTY;
+                self.cap_no_alias = false;
                 m
             }
         }

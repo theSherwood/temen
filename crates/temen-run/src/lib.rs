@@ -4138,7 +4138,7 @@ unsafe fn window_aliases(
     ro: &[[u64; 2]],
     shadow: temen_interp::ShadowArena,
 ) -> i32 {
-    match window_view(host, base, mapped, reserved, ro, shadow) {
+    match window_view(host, base, mapped, reserved, ro, shadow, false) {
         Some(wm) => {
             host.start_window(wm.window_runs());
             1
@@ -4148,8 +4148,9 @@ unsafe fn window_aliases(
 }
 
 /// [`window_aliases`] but its charge: the view of `host`'s fresh window that every host-side path
-/// takes, its page map started. `None` when a pre-map was refused, or on a target with no window
-/// backend.
+/// takes, its page map started. With `no_alias`, the window takes no §13 region alias from its start
+/// on ([`Host::refuse_cap_window_aliases`]): a pre-map is refused with the rest. `None` when a
+/// pre-map was refused, or on a target with no window backend.
 ///
 /// # Safety
 /// `[base, base+reserved)` is `host`'s live reservation.
@@ -4161,9 +4162,13 @@ unsafe fn window_view(
     reserved: u64,
     ro: &[[u64; 2]],
     shadow: temen_interp::ShadowArena,
+    no_alias: bool,
 ) -> Option<MprotectWindow> {
     install_region_hook(host, base, reserved);
     host.start_window_pages(base as usize, shadow);
+    if no_alias {
+        host.refuse_cap_window_aliases();
+    }
     let mut wm = MprotectWindow::of(host, base, mapped, reserved);
     wm.seed_readonly(ro);
     // §2.2 / #2164 — a demand-paged child's window starts unmapped, as on the interpreters:
@@ -4181,6 +4186,7 @@ unsafe fn window_view(
     _reserved: u64,
     _ro: &[[u64; 2]],
     _shadow: temen_interp::ShadowArena,
+    _no_alias: bool,
 ) -> Option<std::convert::Infallible> {
     None
 }
@@ -4203,14 +4209,11 @@ pub(crate) unsafe fn start_window_view(
     shadow: temen_interp::ShadowArena,
     keep: Arc<dyn std::any::Any + Send + Sync>,
 ) -> Option<(Arc<dyn temen_interp::FutexWindow + Send + Sync>, u64)> {
-    let wm = window_view(host, base, mapped, reserved, ro, shadow)?;
-    // From here on, no path maps a region into the window: the rules key every word of it on its own
-    // backing (the reader's `futex_site`).
-    host.refuse_cap_window_aliases();
+    // From its start on, no path maps a region into the window, a pre-map included: the rules key
+    // every word of it on its own backing (the reader's `futex_site`).
+    let wm = window_view(host, base, mapped, reserved, ro, shadow, true)?;
     #[cfg(any(unix, windows))]
     {
-        let mut wm = wm;
-        wm.no_alias = true;
         let runs = wm.window_runs();
         Some((Arc::new(KernelWindow(wm, keep)), runs))
     }
@@ -5030,9 +5033,8 @@ impl temen_interp::FutexWindow for MprotectWindow {
         if !matches!(width, 4 | 8) || !base.is_multiple_of(u64::from(width)) {
             return None;
         }
-        if base.checked_add(u64::from(width))? > self.reserved {
-            return None;
-        }
+        // The one bound of the window's futex face (temen-mask's).
+        let base = self.confine(base, width).ok()?;
         let map = self.prot.lock().unwrap_or_else(|e| e.into_inner());
         if !self.word_readable(&map, base) {
             return None;
@@ -5680,9 +5682,10 @@ impl GuestMem for MprotectWindow {
             } else {
                 libc::PROT_READ
             };
-            // The map first loses the write a read-only alias takes away ([`Self::reprotect`]'s
-            // contract); a `MAP_FIXED` replacement leaves every page readable throughout.
-            self.narrow(pages.clone(), prot, |w, page| w.set_prot(page, prot, false));
+            // No revoke first: a `MAP_FIXED` replacement is atomic, so every page stays readable
+            // throughout ([`Self::reprotect`]'s contract for the lock-free reader), and no host
+            // writer runs outside the `Host` lock this call holds. A refused `mmap` leaves the
+            // window, and so its map, as they were.
             // SAFETY: `[base+start, +plen) ⊆` the reserved window (validated by `prot_pages`).
             // `MAP_FIXED` replaces those reserved pages with a shared mapping of the region fd at
             // `region_off`; the fd outlives the run (held by the Host's backing).
@@ -5758,17 +5761,19 @@ impl GuestMem for MprotectWindow {
             };
             // SAFETY: GetCurrentProcess returns the current-process pseudo-handle; always safe.
             let proc = unsafe { GetCurrentProcess() };
-            // Freeing a granule to a placeholder leaves it inaccessible until its view lands, so the
-            // map loses every page's access first ([`Self::reprotect`]'s contract) and each gains its
-            // alias once its view is in.
-            for page in pages.clone() {
-                self.set_prot(page, 0, false);
-            }
             // Map one allocation granule at a time so each free-to-placeholder targets a single,
             // self-contained sub-range (committed prefix granule *or* placeholder tail granule).
             for i in 0..(len / gran) {
                 let addr = unsafe { self.base.add((win_off + i * gran) as usize) };
                 let roff = region_off + i * gran;
+                // Freeing the granule to a placeholder leaves it inaccessible until its view lands,
+                // so its pages lose their access in the map first ([`Self::reprotect`]'s contract),
+                // and gain the alias once every view is in. A granule after a failing one is left as
+                // it was.
+                let first = *pages.start() + i * (gran / self.page);
+                for page in first..first + gran / self.page {
+                    self.set_prot(page, 0, false);
+                }
                 // SAFETY: `[addr, addr+gran) ⊆` the reserved window (validated by `prot_pages`).
                 // Free-to-placeholder decommits whatever is there (committed or placeholder) leaving
                 // an exact placeholder; `MapViewOfFile3(MEM_REPLACE_PLACEHOLDER)` then aliases the

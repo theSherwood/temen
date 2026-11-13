@@ -55,6 +55,15 @@ impl Drop for Reservation {
     }
 }
 
+/// Sets its flag as it drops.
+struct Stop<'a>(&'a std::sync::atomic::AtomicBool);
+
+impl Drop for Stop<'_> {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// A small deterministic generator (xorshift64*), so a failure names its seed.
 struct Rng(u64);
 
@@ -174,6 +183,9 @@ fn a_read_racing_an_unmap_or_a_protect_never_faults_the_host() {
     let stop = std::sync::atomic::AtomicBool::new(false);
     let (mut answered, mut refused) = (0u64, 0u64);
     std::thread::scope(|s| {
+        // Every thread below stops as this drops, however the scope ends: a failed assertion fails
+        // the test instead of leaving the scope joining threads that never stop.
+        let _stop = Stop(&stop);
         // Busy threads, so the readers and the page op are descheduled at arbitrary points.
         let busy: Vec<_> = (0..2)
             .map(|_| {
