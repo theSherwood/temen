@@ -1972,7 +1972,8 @@ struct ExecState {
     /// finds nothing due corrects.
     next_due: Option<Instant>,
     /// Run teardown began: a park now poisons the task (it unwinds through its trailing guard),
-    /// and workers exit once no task remains.
+    /// and workers exit once no task remains. #3024 — closed from a run's teardown until the next
+    /// run of its module opens the pool again ([`ChildExec::open`]).
     shutdown: bool,
     /// #2742 — each serving vCPU's window with a handler started or open, by key.
     windows: HashMap<usize, WindowCount>,
@@ -2092,6 +2093,18 @@ impl ChildExec {
 
     /// File a task and make it runnable. Its `done` cell is filled when it finishes. Returns its id,
     /// which [`Self::kill`] takes.
+    /// #3024 — a run of the pool's module starts: the pool its last run's teardown shut down serves
+    /// this one. Called before anything of the run can file a task; that teardown joined every
+    /// task and worker, so the pool is empty.
+    pub(crate) fn open(&self) {
+        let mut g = lock(&self.state);
+        debug_assert!(
+            g.tasks.is_empty() && g.workers.is_empty() && g.free_workers == 0,
+            "a run opens a pool its last run left busy"
+        );
+        g.shutdown = false;
+    }
+
     pub(crate) fn spawn(self: &Arc<Self>, mut task: ChildTask) -> u64 {
         // #1469 — a child compiled with thread ops gets its own domain over its window (the thread
         // thunks find it through `os_thread_rt::CURRENT_DOMAIN`, set for each residency below).

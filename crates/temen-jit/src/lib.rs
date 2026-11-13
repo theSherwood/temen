@@ -5426,6 +5426,12 @@ impl CompiledModule {
         if args.len() < n_params {
             return Err(JitError::Malformed);
         }
+        // #3024 — every entry of a run comes here first (`run`, `run_raw`, `run_twin`, `run_extra`;
+        // a held run is a `run_raw`): its pool opens before anything of the run can file a task.
+        #[cfg(fiber_rt)]
+        if let Some(n) = &(*this)._nursery {
+            n.open();
+        }
         // §4 (DURABILITY.md): a durable run's §14 nursery must know it — its `instantiate` /
         // `coro_spawn` thunks fail closed there (this JIT child runner cannot yet run a durable
         // child; the interpreter is the reference for durable nesting). Set here, the common

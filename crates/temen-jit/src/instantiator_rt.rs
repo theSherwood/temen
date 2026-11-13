@@ -1012,6 +1012,11 @@ impl Nursery {
         self.child_exec.wake_locked(crate::child_exec::Wake::All);
     }
 
+    /// #3024 — a run starts: its pool, which the last run's teardown shut down, serves it.
+    pub(crate) fn open(&self) {
+        self.child_exec.open();
+    }
+
     pub(crate) fn join_children(&self, froze: bool) -> Vec<crate::DetachedHarvest> {
         // D66 — drive the executor to quiescence: parked tasks are poisoned so they unwind, and
         // unless this is a freeze every running task ends with the run; then the workers are joined.
