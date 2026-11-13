@@ -1435,7 +1435,7 @@ fn a_clock_read_answers_as_the_oracle_on_both_routes() {
 /// #2958 slice 4, condition 5 — a `Budget` node under the run's own: its room of fuel, `mem` and
 /// `maps`, read before any thread is spawned, so no other vCPU runs; then a `split` and its child's
 /// `mem` room. Every route reads the same, the run's fuel included: its fuel cell draws from the same
-/// node in the same chunks (#2977 differs only per spawned thread, and this spawns none).
+/// node in the same chunks.
 #[test]
 fn a_budget_read_and_split_answer_as_the_oracle_on_both_routes() {
     fn make(h: i32) -> temen_ir::Module {
