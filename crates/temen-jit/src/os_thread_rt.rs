@@ -37,7 +37,7 @@
 //! at every loop back-edge and on entry to a function that tail-calls (`emit_domain_poll`), and
 //! unwinds from there. Each vCPU runs on a context of its own, so that it charges a fuel cell of its
 //! own; the contexts share the end (#2488). A §14 child's domain has an end of its own, which the
-//! parent's teardown raises (`ChildExec::shutdown_and_join`). A
+//! parent's teardown raises (`ChildExec::end_tasks`). A
 //! durable **freeze** is *not* teardown: the root unwinds under `UNWINDING` and parked siblings
 //! return through the freeze re-issue machinery instead (the sentinel is skipped).
 
