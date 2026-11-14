@@ -987,6 +987,7 @@ dependencies = [
  "temen-durable",
  "temen-encode",
  "temen-exec",
+ "temen-fiber",
  "temen-fs",
  "temen-interp",
  "temen-ir",

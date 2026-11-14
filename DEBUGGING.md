@@ -1715,6 +1715,11 @@ DWARF variable locations) finally land — they are stages here, not separate wo
     calls a helper that `suspend`s; the root resumes once and returns, leaving it parked; the
     backtrace is exactly `[helper @ fib.c:9 (innermost), entry @ fib.c:5]`, and a module with no
     created fiber yields an empty walk. *Effort (whole stage): med–high.*
+    #3020: a fiber lives no longer than the run that made it, so the walk is answered between runs,
+    for the fibers the last run left suspended, and only on request:
+    `CompiledModule::keep_parked_backtraces(true)` has each run take them as it ends. The work
+    scales with what the guest left, so a run does none of it by default. A handle is read as the
+    live table reads it: slot masked, generation masked, any guest tag ignored.
 - [ ] **Stage 5 — DAP-over-JIT (optional; editor parity at native speed).** Either drive the JIT
   under `temen-dap` (breakpoints via software `int3` patching or single-step over DWARF line
   boundaries) so VS Code debugs native-speed code, **or** keep the interpreter as the DAP stepping

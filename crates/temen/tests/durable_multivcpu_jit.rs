@@ -1531,7 +1531,7 @@ fn a_vcpu_thaw_residue_on_a_module_with_no_arena_writes_no_control_words() {
         shadow_sp: 16448 + 4096,
         completed_result: None,
     }]);
-    eprintln!("plain {plain:?}\nseeded {seeded:?}");
+
     assert_eq!(
         format!("{seeded:?}"),
         format!("{plain:?}"),
