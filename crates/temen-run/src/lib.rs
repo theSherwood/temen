@@ -7074,10 +7074,13 @@ fn module_serves(m: &Module) -> bool {
 /// - or the module statically serves without being serve-qualified or nesting (the oracle's serve
 ///   arm has the fiber-park machinery).
 ///
-/// - or the module uses `setjmp` and can drive the §22 `Jit` over `host` (#2877): the JIT refuses a
-///   unit that would run beside the instance's checkpoint table on another stack, a refusal the
-///   guest would only see mid-run (`Jit.compile`'s `-EINVAL`), where the interpreters admit the
-///   unit; so the run leaves the JIT before it starts and every engine answers alike.
+/// - or the module uses `setjmp` and can drive the §22 `Jit` over a `host` that lets its units run
+///   fibers or threads (#2877): the JIT refuses a unit that would run beside the instance's
+///   checkpoint table on another stack, a refusal the guest would only see mid-run (`Jit.compile`'s
+///   `-EINVAL`), where the interpreters admit the unit; so the run leaves the JIT before it starts
+///   and every engine answers alike. Without that hosting `define_extra` refuses such a unit
+///   anyway, on every module, so the JIT keeps the run. Not covered: a `gc.roots`-only unit, which
+///   the rule refuses on any host (#3054, with the other refusals no fold can see).
 ///
 /// A module that could page a child no longer folds: the JIT pages a child itself (#2164).
 ///
@@ -7092,6 +7095,7 @@ pub(crate) fn folds_to_oracle(m: &temen_ir::Module, host: &Host) -> bool {
             && !temen_interp::bytecode::serve_qualifies(&m.funcs)
             && !module_nests(m))
         || (m.funcs.iter().any(temen_ir::Func::uses_setjmp)
+            && (host.jit_hosts_fibers() || host.jit_hosts_threads())
             && jit_proc::drives_jit(&jit_proc::host_calls(m), host))
 }
 
@@ -10251,9 +10255,14 @@ block 0 (va: i64, vb: i64) {
                       export 0 interface \"svc\" 1 { f: 1 }\n";
         let spawns = "  vz = i64.const 0\n  vt = thread.spawn 1 vz vz\n";
         let jit_call = "  vl = i64.const 0\n  vc = call.cap 11 0 (i64, i64) -> (i64) vh (vl, vl)\n";
-        let mut jit_host = Host::new();
-        let jit_m = module(&format!("{sj}{jit_call}"), "");
-        crate::grant_jit_fibers(&mut jit_host, &jit_m, 0);
+        // The Jit cap, granted on a real host: plain, or letting units run fibers or threads.
+        let granted = |m: &temen_ir::Module, grant: fn(&mut Host, &temen_ir::Module, u8) -> i32| {
+            let mut h = Host::new();
+            grant(&mut h, m, 0);
+            h
+        };
+        let sj_jit = module(&format!("{sj}{jit_call}"), "");
+        let jit_only = module(jit_call, "");
         for (name, m, host, folds) in [
             ("setjmp alone", module(sj, ""), Host::new(), false),
             ("setjmp, serving", module(sj, serves), Host::new(), true),
@@ -10263,7 +10272,30 @@ block 0 (va: i64, vb: i64) {
                 Host::new(),
                 true,
             ),
-            ("setjmp, driving the Jit", jit_m, jit_host, true),
+            (
+                "setjmp, the Jit, plain grant",
+                sj_jit.clone(),
+                granted(&sj_jit, crate::grant_jit),
+                false,
+            ),
+            (
+                "setjmp, the Jit, fiber-hosting grant",
+                sj_jit.clone(),
+                granted(&sj_jit, crate::grant_jit_fibers),
+                true,
+            ),
+            (
+                "setjmp, the Jit, thread-hosting grant",
+                sj_jit.clone(),
+                granted(&sj_jit, crate::grant_jit_threads),
+                true,
+            ),
+            (
+                "the Jit without setjmp, fiber-hosting grant",
+                jit_only.clone(),
+                granted(&jit_only, crate::grant_jit_fibers),
+                false,
+            ),
             ("serving, no setjmp", module("", serves), Host::new(), false),
             (
                 "spawning, no setjmp",

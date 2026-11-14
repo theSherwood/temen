@@ -22,8 +22,6 @@
 //!   words) faults, and the interpreter's `setjmp` writes its token into the window at `buf`. So every
 //!   offset here, `buf` included, lives in the usable high window `[40000, 65528)`.
 
-#![cfg(unix)]
-
 use temen_interp::{run, Value};
 use temen_jit::{compile_and_run, JitOutcome};
 use temen_text::parse_module;
@@ -158,6 +156,9 @@ fn assert_jit_matches_oracle(module: impl Fn(usize) -> String, ns: &[usize], inp
         let src = module(n);
         let m = parse_module(&src).unwrap_or_else(|e| panic!("parse n={n}: {e:?}\n{src}"));
         verify_module(&m).unwrap_or_else(|e| panic!("verify n={n}: {e:?}"));
+        if !jit_has_setjmp(&m) {
+            continue;
+        }
         for &x in inputs {
             let mut fuel = 100_000_000u64;
             let want: Vec<i64> = match run(&m, 0, &[Value::I64(x)], &mut fuel) {
@@ -379,12 +380,27 @@ fn on_every_engine(src: &str, x: i64) -> [Ended; 3] {
     let mut fuel = 1_000_000u64;
     let byte = temen_interp::bytecode::compile_and_run(&m, 0, &[Value::I64(x)], &mut fuel)
         .map(|r| r.map(wide).map_err(|t| t.code()));
-    let jit = match compile_and_run(&m, 0, &[x]) {
-        Ok(JitOutcome::Returned(vs)) => Some(Ok(vs)),
-        Ok(JitOutcome::Trapped(k)) => Some(Err(k.code())),
-        other => panic!("jit: {other:?}"),
+    // The JIT's `setjmp` is unix-only (`setjmp_rt`); elsewhere it declines every module with one, so
+    // a routed run folds to the interpreters, whose answer the row already holds.
+    let jit = if jit_has_setjmp(&m) {
+        match compile_and_run(&m, 0, &[x]) {
+            Ok(JitOutcome::Returned(vs)) => Some(Ok(vs)),
+            Ok(JitOutcome::Trapped(k)) => Some(Err(k.code())),
+            other => panic!("jit: {other:?}"),
+        }
+    } else {
+        tree.clone()
     };
     [tree, byte, jit]
+}
+
+/// Whether this target's JIT runs `setjmp` (`setjmp_rt`: unix). Off unix it must decline `m`.
+fn jit_has_setjmp(m: &temen_ir::Module) -> bool {
+    if cfg!(unix) {
+        return true;
+    }
+    assert!(!temen_jit::admits(m), "the JIT declines setjmp here");
+    false
 }
 
 /// Every engine ends `src(x)` as `want`.
@@ -438,6 +454,7 @@ block 0 (v0: i64) {
 #[test]
 fn a_longjmp_to_a_returned_activation_traps_on_every_engine() {
     assert_every_engine(RETURNED, 0, Err(MALFORMED));
+    assert_every_engine(RETURNED, 1, Ok(vec![0]));
 }
 
 /// #2877 — the same program, optimized: the inliner must not move func 1's checkpoint into the
@@ -638,8 +655,9 @@ fn a_setjmp_into_a_readonly_page_faults_on_every_engine() {
 /// One compiled module run twice over one window: the first run (`x = 0`) takes a checkpoint (its
 /// token stays in the buffer) and then ends as `first_end` says; the second (`x = 1`) `longjmp`s with
 /// that token. The first run's activation is long gone — the JIT's table outlives runs, so it must
-/// drop a run's checkpoints when the run ends. The first run's outcome and the second's.
-fn rerun(first_end: &str) -> (JitOutcome, JitOutcome) {
+/// drop a run's checkpoints when the run ends. The first run's outcome and the second's; `None` where
+/// the JIT has no `setjmp` (it declines the module, [`jit_has_setjmp`]).
+fn rerun(first_end: &str) -> Option<(JitOutcome, JitOutcome)> {
     let src = format!(
         "memory 16
 func (i64) -> (i64) {{
@@ -664,6 +682,9 @@ block 2 (v7: i64) {{
     );
     let m = parse_module(&src).expect("parse");
     verify_module(&m).expect("verify");
+    if !jit_has_setjmp(&m) {
+        return None;
+    }
     let mut host = temen_interp::Host::new();
     let mut cm = temen_jit::CompiledModule::compile(
         &m,
@@ -684,13 +705,15 @@ block 2 (v7: i64) {{
     let token = u64::from_le_bytes(window[48000..48008].try_into().expect("the window"));
     assert_ne!(token, 0, "the first run's setjmp wrote its token");
     let (second, _) = cm.run(&[1], Some(&window), None).expect("second run");
-    (first, second)
+    Some((first, second))
 }
 
 /// The first run returns: its exit drops the checkpoint (`rt_setjmp_leave`).
 #[test]
 fn a_jit_rerun_cannot_reach_an_earlier_runs_checkpoint() {
-    let (first, second) = rerun("return v6");
+    let Some((first, second)) = rerun("return v6") else {
+        return;
+    };
     assert!(
         matches!(first, JitOutcome::Returned(ref v) if v == &[0]),
         "{first:?}"
@@ -707,7 +730,10 @@ fn a_jit_rerun_cannot_reach_an_earlier_runs_checkpoint() {
 /// the first run's dead frame.
 #[test]
 fn a_jit_rerun_cannot_reach_a_checkpoint_a_faulted_run_held() {
-    let (first, second) = rerun("v9 = i64.const 64\n  v10 = i64.load v9\n  return v10");
+    let Some((first, second)) = rerun("v9 = i64.const 64\n  v10 = i64.load v9\n  return v10")
+    else {
+        return;
+    };
     assert!(
         matches!(first, JitOutcome::Trapped(k) if k.code() == temen_ir::trap_code::MEMORY_FAULT),
         "{first:?}"

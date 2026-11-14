@@ -2817,11 +2817,11 @@ impl Domain {
     /// active shadow-SP + state word are set to the root's extent + `REWINDING` so the root rewinds
     /// from the right point.
     ///
-    /// The children run *before* the root (rather than the interp's root-parks-on-join dispatch): a
-    /// thaw runs to completion with no re-snapshot, and the §12.6 equivalence holds because a
-    /// `REWINDING` vCPU **reloads** its recorded side effects (it never re-issues them), so the
-    /// serialization order doesn't change the result. Scope mirrors the interp's: flat root-spawned
-    /// children, no nested spawns, no child-owned fibers.
+    /// Each re-attached vCPU is re-spawned on an OS thread of its own and rewinds concurrently with its
+    /// siblings and with the root, which re-enters after this returns (§12.8 concurrent-thaw stage 2),
+    /// as a fresh concurrent durable run's vCPUs run. The §12.6 equivalence holds because a
+    /// `REWINDING` vCPU **reloads** its recorded side effects (it never re-issues them), so the order
+    /// the threads run in does not change the result.
     ///
     /// # Safety
     /// Called from `run_inner` after `set_env`, before the root's guarded call, on a durable thaw run;
@@ -2837,7 +2837,9 @@ impl Domain {
         root_sp: u64,
         entry: &dyn Fn(i32) -> Option<u64>,
     ) {
-        if seed.is_empty() {
+        // A module with no arena has no thaw words and no root region to rewind from: nothing below
+        // may write one (INVARIANTS #16; the stores at the end are at the root region's offsets).
+        if seed.is_empty() || !self.shadow().region_fits(0) {
             return;
         }
         let env = self.env();

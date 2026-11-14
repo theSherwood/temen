@@ -1483,3 +1483,58 @@ fn a_thawed_vcpu_no_spawn_could_have_made_ends_thread_fault_on_both_engines() {
         assert_eq!(ires, want, "{name}");
     }
 }
+
+/// #2878 — a thaw residue naming a vCPU, handed to a durable run of a threaded module that declares
+/// no shadow arena: there are no thaw words and no root region, so the runtime writes none (it used
+/// to store the root's shadow-SP and thaw word at window offsets 0 and 8, in the NULL guard, outside
+/// any guarded call) and the run answers as an ordinary one does.
+#[test]
+fn a_vcpu_thaw_residue_on_a_module_with_no_arena_writes_no_control_words() {
+    let mut m = temen_text::parse_module(SRC).expect("parse");
+    m.memory = Some(Memory {
+        size_log2: SIZE_LOG2,
+        shadow: None,
+    });
+    temen_verify::verify_module(&m).expect("verify");
+    let run = |seed: Vec<JitVCpu>| {
+        let mut h = Host::new();
+        h.set_durable(true);
+        h.clock_ns = 42;
+        let clk = h.grant_clock();
+        compile_and_run_durable(
+            &m,
+            0,
+            &[clk as i64],
+            &vec![0u8; WINDOW],
+            SIZE_LOG2,
+            temen_run::cap_thunk,
+            &mut h as *mut Host as *mut c_void,
+            DurableRun {
+                seed: DurableResidue {
+                    vcpus: seed,
+                    root_sp: Some(16448 + 64),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .map(|(o, ..)| o)
+    };
+    let plain = run(Vec::new());
+    let seeded = run(vec![JitVCpu {
+        task: 2,
+        parent_task: 1,
+        slot: 0,
+        joinable: true,
+        func: 1,
+        args: vec![0, 0],
+        shadow_sp: 16448 + 4096,
+        completed_result: None,
+    }]);
+    eprintln!("plain {plain:?}\nseeded {seeded:?}");
+    assert_eq!(
+        format!("{seeded:?}"),
+        format!("{plain:?}"),
+        "the residue changes nothing"
+    );
+}

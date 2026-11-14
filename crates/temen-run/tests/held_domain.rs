@@ -807,6 +807,10 @@ block 0 (vexit: i32) {
         // this module runs on the interpreters, which must answer the same.
         let started = temen_run::hold(on, m, 0, &[Value::I32(exit)], u64::MAX, host);
         let (d, results) = started.unwrap_or_else(|(t, _)| panic!("the entry ends in {t:?}"));
+        // Where the JIT has `setjmp`, it holds the module itself: nothing folds it.
+        if cfg!(unix) {
+            assert_eq!(d.executor(), on, "the domain runs where it was started");
+        }
         assert_eq!(results, vec![Value::I64(1)], "start answers the entry");
         assert_eq!(call(&d, 0, &[]), Reply::Failed(EINVAL), "no op to call");
     });
