@@ -1670,3 +1670,77 @@ fn jit_half(
         );
     }
 }
+
+/// #2877 — the refusal the owner accepted (no fold): on an instance whose code takes `setjmp`
+/// checkpoints, the JIT's `Jit.compile` refuses a unit that would run beside the checkpoint table on
+/// another stack (a fiber unit here, on a fiber-hosting grant) with `-EINVAL`, and the instance runs
+/// on: a plain unit submitted after it compiles and runs. The interpreters admit the fiber unit.
+/// #2939 lifts the refusal; until then it is a row of #3054. The guest answers
+/// `1000 * (first compile refused) + the plain unit's result`.
+#[test]
+fn a_setjmp_instance_refuses_a_fiber_unit_on_the_jit_and_runs_on() {
+    let fiber_unit = blob(
+        "memory 16
+func () -> (i64) {
+block 0 () {
+  v0 = ref.func 1
+  v1 = i64.const 32768
+  v2 = cont.new v0 v1
+  v3 = i64.const 0
+  v4, v5 = cont.resume v2 v3
+  return v5
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (va: i64, vb: i64) {
+  v6 = suspend vb
+  return v6
+  }
+}
+",
+    );
+    let plain_unit = blob(
+        "memory 16\nfunc () -> (i64) {\nblock 0 () {\n  v0 = i64.const 42\n  return v0\n  }\n}\n",
+    );
+    let mut both = fiber_unit.clone();
+    both.extend_from_slice(&plain_unit);
+    let guest = format!(
+        "memory 16
+func (i32) -> (i64) {{
+block 0 (vh: i32) {{
+  vb = i64.const 40000
+  vs = setjmp vb
+  v1 = i64.const 20480
+  v2 = i64.const {l1}
+  vf = call.cap 11 0 (i64, i64) -> (i64) vh (v1, v2)
+  v3 = i64.const {o2}
+  v4 = i64.const {l2}
+  vp = call.cap 11 0 (i64, i64) -> (i64) vh (v3, v4)
+  vr = call.cap 11 1 (i64) -> (i64) vh (vp)
+  vz = i64.const 0
+  vneg = i64.lt_s vf vz
+  vn = i64.extend_i32_u vneg
+  vk = i64.const 1000
+  vm = i64.mul vn vk
+  vt = i64.add vm vr
+  return vt
+  }}
+}}
+",
+        l1 = fiber_unit.len(),
+        o2 = BLOB_OFF + fiber_unit.len(),
+        l2 = plain_unit.len(),
+    );
+    let (ires, _) = run_interp(&guest, &both, &[], grant_jit_fibers, 0);
+    assert_eq!(
+        ires,
+        Ok(vec![Value::I64(42)]),
+        "the interpreters admit the fiber unit, then run the plain one"
+    );
+    jit_half(&guest, &both, grant_jit_fibers, 0, |jout| {
+        assert!(
+            matches!(jout, JitOutcome::Returned(ref v) if v == &[1042]),
+            "the JIT refuses the fiber unit (-EINVAL) and runs the plain one: {jout:?}"
+        )
+    });
+}

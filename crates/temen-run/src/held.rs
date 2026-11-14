@@ -39,7 +39,7 @@ pub fn hold(
     host: Host,
 ) -> Result<(HeldDomain, Vec<Value>), (Trap, Box<Host>)> {
     let jit = on == Executor::Jit
-        && !crate::folds_to_oracle(&m, &host)
+        && !crate::folds_to_oracle(&m)
         && !jit_proc::serves(&jit_proc::host_calls(&m), &host);
     if jit {
         hold_jit(m, entry, args, fuel, host)
