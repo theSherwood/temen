@@ -21689,6 +21689,11 @@ pub struct CapPages {
     /// never cleared. A futex key reads the map only once it is set, so a window with no alias keys
     /// every word with no lock (`Mem`'s `has_regions` rule).
     aliased: std::sync::atomic::AtomicBool,
+    /// How many guarded reads of the window (`MprotectWindow::wait_word`) found a page the map
+    /// calls readable and recovered a fault on it: a page that vanished under the read. Zero unless
+    /// a backing shrank outside the VM, so a test can tell a recovered read from a guest's own
+    /// `MemoryFault`, which never counts here.
+    recovered: std::sync::atomic::AtomicU64,
 }
 
 impl CapPages {
@@ -21715,7 +21720,20 @@ impl CapPages {
             pages: Mutex::new(pages),
             regions: Mutex::new(regions),
             aliased: std::sync::atomic::AtomicBool::new(self.aliased()),
+            recovered: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    /// Count a guarded read that recovered a fault on a page the map called readable
+    /// ([`CapPages::recovered`]).
+    pub fn note_recovered(&self) {
+        self.recovered
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// How many guarded reads of this window recovered a fault on a page the map called readable.
+    pub fn recovered(&self) -> u64 {
+        self.recovered.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Whether a page of the window has ever been a §13 alias ([`CapPages::aliased`]).
@@ -29271,6 +29289,13 @@ impl Host {
                 m
             }
         }
+    }
+
+    /// Test-facing: [`CapPages::recovered`] of the window the host last named, whatever its base (a
+    /// run's window is gone once it ends, and its page map stays here).
+    #[doc(hidden)]
+    pub fn cap_pages_recovered(&self) -> u64 {
+        self.cap_pages.as_ref().map_or(0, |(_, m)| m.recovered())
     }
 
     /// #2319 — the page map [`Host::cap_window_pages`] hands out for JIT window `base`, if this host

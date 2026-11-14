@@ -208,6 +208,12 @@ fn the_guarded_read_refuses_exactly_what_the_model_refuses() {
                     want,
                     "seed {seed}: a {width}-byte read at {addr:#x}"
                 );
+                // Every refusal is the map check's: no read faulted and was recovered.
+                assert_eq!(
+                    map.recovered(),
+                    0,
+                    "seed {seed}: a recovered read at {addr:#x}"
+                );
                 if let Some(v) = got {
                     // SAFETY: the model, and so the read just made, says the word is readable.
                     let raw = unsafe {
@@ -289,11 +295,14 @@ fn a_read_racing_an_unmap_or_a_protect_never_faults_the_host() {
             refused += none;
         }
     });
-    // Both answers happened: the reads raced the page ops, and none faulted the process.
+    // Both answers happened: the reads raced the page ops, and none faulted the process. The
+    // refusals are all the map check's: a read meeting a page op's hardware change midway would be
+    // recovered (`wait_word`'s load installs the fault handler), and counted.
     assert!(
         answered > 0 && refused > 0,
         "{answered} read, {refused} refused"
     );
+    assert_eq!(pages.recovered(), 0, "a read recovered a fault");
 }
 
 /// #2958 slice 4 review, finding 4 — a region's identity is held as the interpreter holds it, by a

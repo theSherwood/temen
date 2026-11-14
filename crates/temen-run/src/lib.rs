@@ -5049,13 +5049,22 @@ impl temen_interp::FutexWindow for MprotectWindow {
     fn confine_for_notify(&self, addr: u64) -> Result<u64, Trap> {
         self.confine(addr, 1)
     }
-    /// The guarded read: the check and the load under one hold of the map's lock, which every change
-    /// to the window's hardware takes ([`MprotectWindow::reprotect`]'s contract). The map check
-    /// decides the guest's answer. The load is the recoverable one today's route makes
-    /// ([`temen_jit::try_load_in`]), for every page whatever its state: a page that vanishes under
-    /// it anyway (a file a trusted host procedure mapped directly, then truncated) answers
-    /// `MemoryFault`, never a fault in host code. The lock is a leaf: nothing else is taken while
-    /// it is held.
+    /// The guarded read: the map check and the load under one hold of the map's lock. Two
+    /// mechanisms, for two hazards:
+    /// - **The lock** keeps the read off the transient hardware states of the VM's own page ops:
+    ///   every page op and `map_region` either revokes the page in the map before it changes the
+    ///   hardware or holds the lock across the change ([`MprotectWindow::reprotect`]'s contract).
+    ///   Without it, a wait racing a unix map over a live alias (not atomic on macOS) would answer
+    ///   `MemoryFault` for a page readable before and after.
+    /// - **The recoverable load** ([`temen_jit::try_load_in`], today's route's, for every page)
+    ///   covers what no lock of the VM's can: a backing that shrinks outside it (a file a trusted
+    ///   host procedure mapped directly, then truncated). The read answers `MemoryFault` and counts
+    ///   ([`temen_interp::CapPages::recovered`]); on unix it never faults in host code. (Windows'
+    ///   handler does not recover `STATUS_IN_PAGE_ERROR`, but no file region reaches a window there:
+    ///   [`new_file_region`] is unix-only.)
+    ///
+    /// The map check decides the guest's answer. The lock is a leaf: nothing else is taken while it
+    /// is held.
     fn wait_word(&self, base: u64, width: u32) -> Option<u64> {
         // A naturally aligned word of at most 8 bytes lies on one page.
         if !matches!(width, 4 | 8) || !base.is_multiple_of(u64::from(width)) {
@@ -5067,10 +5076,7 @@ impl temen_interp::FutexWindow for MprotectWindow {
         if !self.word_readable(&map, base) {
             return None;
         }
-        // SAFETY: `[base, base + width)` is inside the reservation, aligned, on a page the map says
-        // is readable. The load is atomic (other vCPUs write the word with atomics) and
-        // recoverable: every native caller is a vCPU's thread inside its guarded call, whose fault
-        // handler recovers it; a load that does not fault (a unit test's, outside one) needs none.
+        // SAFETY: `[self.base, + reserved)` is the window's live reservation (the type's contract).
         let word = unsafe {
             temen_jit::try_load_in(
                 self.base,
@@ -5079,6 +5085,9 @@ impl temen_interp::FutexWindow for MprotectWindow {
                 width,
             )
         };
+        if word.is_none() {
+            self.prot.note_recovered();
+        }
         drop(map);
         word
     }
@@ -5276,13 +5285,16 @@ impl MprotectWindow {
 
     /// **The one way a page op changes the window's hardware** (#2958 slice 3), and the contract
     /// every host-side reader of the window rests on: **a page readable in the page map is readable
-    /// in hardware for as long as the reader holds the map's lock.** Every change to the window's
-    /// hardware keeps it in one of two ways: it revokes the page in the map before it changes the
-    /// hardware and grants the new state only once the hardware has it, or it holds the map's lock
-    /// across the hardware change and the map's update, so no reader sees the two apart. A reader
-    /// that checks the map and loads under one hold of the lock
-    /// ([`temen_interp::FutexWindow::wait_word`]) therefore never loads a page the hardware lacks.
-    /// A grant the reader misses answers a fault the guest raced itself into. **Every host copy of
+    /// in hardware for as long as the reader holds the map's lock**, for every change the VM makes
+    /// to the window's hardware while a reader can run. Each keeps it in one of two ways: it
+    /// revokes the page in the map before it changes the hardware and grants the new state only once
+    /// the hardware has it, or it holds the map's lock across the hardware change and the map's
+    /// update. (The changes made before any reader exists or after every vCPU has gone are listed
+    /// below.) So a reader that checks the map and loads under one hold of the lock
+    /// ([`temen_interp::FutexWindow::wait_word`]) meets no transient state of the VM's own page
+    /// ops. What the contract cannot cover is a backing that shrinks outside the VM (a host file
+    /// truncated under a mapping): `wait_word`'s load is recoverable for that, and counts what it
+    /// recovers. A grant the reader misses answers a fault the guest raced itself into. **Every host copy of
     /// guest memory and every page op is made under the domain's `Host` lock; `wait_word` is the
     /// exception and takes the page-map lock** (pinned by `jit_kernel.rs`'s
     /// `a_stream_write_racing_page_ops_on_its_buffer_never_faults_the_host`).
@@ -5729,8 +5741,8 @@ impl GuestMem for MprotectWindow {
             // never meets the replacement midway: a `MAP_FIXED` over a live mapping is not atomic to
             // a concurrent reader on every OS (macOS faults one, #2958 slice 4). No other host
             // reader runs outside the `Host` lock this call holds; the guest's own loads that race
-            // it fault into the guest, on macOS and Windows only (#3050). A refused `mmap` leaves the window, and so its map, as they
-            // were.
+            // it fault into the guest, on macOS and Windows only (#3050). A refused `mmap` leaves
+            // the window, and so its map, as they were.
             // #2958 slice 4 — the backing's identity, which the page map keys a region word on, is
             // recorded once the call is valid and before the map's lock is taken, so the identity
             // lock is never taken under it. (A refused `mmap` leaves the entry, which keys nothing

@@ -634,23 +634,25 @@ pub(crate) unsafe fn try_access(w: &crate::Window, a: &mut Access) -> bool {
     pal::try_call(run, a as *mut Access as *mut c_void, lo, hi)
 }
 
-/// [`Access::Load`] of the `width`-byte word at `p` in window `w`: `None` if it faulted.
+/// The recoverable load: the `width`-byte word at `p` in the window `[base, base + reserved)`,
+/// loaded atomically (sequentially consistent, since other vCPUs write guest words with atomics),
+/// or `None` if the load faulted on the window. It installs the process's fault handler itself, so
+/// it recovers on any thread. A width other than 1, 2, 4 or 8, a word not aligned to its width, or
+/// one not wholly inside the window is refused (`None`) without a load. Today's route's futex read
+/// and the kernel route's guarded read (`wait_word`) both load through this.
 ///
 /// # Safety
-/// As [`try_access`].
-pub(crate) unsafe fn try_load(w: &crate::Window, p: *const u8, width: u32) -> Option<u64> {
-    try_load_in(w.base, w.reserved as usize, p, width)
-}
-
-/// #2958 slice 4 — [`try_load`] for host code that holds a window by its base and its `reserved`
-/// bytes: the `width`-byte word (aligned, 1, 2, 4 or 8) at `p`, loaded atomically (sequentially
-/// consistent), or `None` if the load faulted on the window. The kernel route's guarded read of a
-/// §13 alias, whose backing (a host file) can shrink under the mapping.
-///
-/// # Safety
-/// `p` lies in the window `[base, base + reserved)`, and the caller runs on a thread whose guarded
-/// call installed the fault handler; a load that does not fault needs neither.
+/// `[base, base + reserved)` is a live window reservation (mapped or not, page by page) for the
+/// length of the call.
 pub unsafe fn try_load_in(base: *mut u8, reserved: usize, p: *const u8, width: u32) -> Option<u64> {
+    let (at, lo) = (p as usize, base as usize);
+    let fits = at
+        .checked_add(width as usize)
+        .is_some_and(|end| at >= lo && end <= lo + reserved);
+    if !matches!(width, 1 | 2 | 4 | 8) || !at.is_multiple_of(width as usize) || !fits {
+        return None;
+    }
+    pal::install_guard();
     let mut a = Access::Load {
         src: p,
         width,

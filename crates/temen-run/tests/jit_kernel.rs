@@ -866,7 +866,7 @@ fn instance_run(
 /// #2958 slice 4 — `make(handle)` on the oracle (the tree-walker), the kernel route and today's route,
 /// each instanced as an embedder instances it ([`instance_run`]) under the same limits, so a reading
 /// of the run's own budget (its fuel included) compares across them; each JIT route asserts its
-/// route and must end within [`PROMPT`]. `oracle` false leaves the oracle out, for a program whose
+/// route, and every lane must end within [`PROMPT`]. `oracle` false leaves the oracle out, for a program whose
 /// threads only overlap where they run at once (the oracle's cooperative scheduler runs one). `fuel`
 /// is the run's fuel grant ([`METERED`] for a row that reads it; `None` for one whose end must not
 /// race a budget).
@@ -1086,6 +1086,10 @@ fn spin<'s, 'e>(s: &'s std::thread::Scope<'s, 'e>, stop: &'e std::sync::atomic::
 ///   raced at all would cycle on, and the harness's bound ([`PROMPT`], far fewer than
 ///   `WAIT_TURNS` cycles) fails it; `WAIT_TURNS` only caps the program;
 /// - a notify never faults: its run ends with the vCPU's count (every op answered, at least one).
+///
+/// Every run also asserts its window recovered no read ([`temen_interp::CapPages::recovered`]): a
+/// wait meeting the page midway through a page op's hardware change would be recovered to the
+/// same `MemoryFault`, so the count is what still tells a broken contract from the map check.
 #[test]
 fn futex_ops_racing_page_ops_never_fault_the_host() {
     const NOTIFY_TURNS: u32 = 400;
@@ -1106,7 +1110,7 @@ fn futex_ops_racing_page_ops_never_fault_the_host() {
             };
             for _ in 0..30 {
                 // Bounded: a run that hangs fails the test.
-                let (vcpus, result) = bounded("the race", move || {
+                let (vcpus, result, recovered) = bounded("the race", move || {
                     let mut host = Host::new();
                     let m = racing(host.grant_memory(), op, protect, turns);
                     let admitted = jit_kernel::admit(&m, &host, false).expect("in scope");
@@ -1121,9 +1125,15 @@ fn futex_ops_racing_page_ops_never_fault_the_host() {
                         kill: None,
                     };
                     let end = jit_kernel::run(admitted, start, &mut host).expect("compiles");
-                    (end.vcpus, end.result)
+                    (end.vcpus, end.result, host.cap_pages_recovered())
                 });
                 assert!(vcpus >= 1, "it ran as kernel tasks");
+                // A wait's `MemoryFault` is the map check's, never a recovered read: the guarded
+                // read keeps off the page ops' hardware changes ([`CapPages::recovered`]).
+                assert_eq!(
+                    recovered, 0,
+                    "{op} (protect: {protect}): a read recovered a fault"
+                );
                 match (op, result) {
                     ("wait", Err(Trap::MemoryFault)) => {}
                     ("wait", r) => panic!(
@@ -1445,18 +1455,39 @@ block 0 () {{
 #[cfg(unix)]
 #[test]
 fn a_wait_on_a_file_alias_a_procedure_mapped_and_truncated_faults_the_guest() {
+    // The root calls the procedure; a refused map returns its answer (never a fault), so a pass is
+    // the wait's own. Then it waits not-equal on the alias.
     fn program(handle: i32) -> temen_ir::Module {
-        rooted(&format!(
-            "  vp = i32.const {handle}
+        module(&format!(
+            "memory 16
+func () -> (i64) {{
+block 0 () {{
+  vq = i64.const 16400
+  vone = i32.const 1
+  vk = atomic.notify vq vone
+  vp = i32.const {handle}
   vz = i64.const 0
   vm = call.cap 13 0 (i64) -> (i64) vp(vz)
+  vok = i64.eqz vm
+  br_if vok 1() 2(vm)
+  }}
+block 1 () {{
   va = i64.const 1048576
   vx = i32.const 1
   vto = i64.const 0
   vw = i32.atomic.wait va vx vto
-  vr = i64.extend_i32_u vw"
+  vr = i64.extend_i32_u vw
+  return vr
+  }}
+block 2 (vrc: i64) {{
+  return vrc
+  }}
+}}
+"
         ))
     }
+    // No panic in the handler, which runs inside the JIT's `extern "C"` thunk: each failure is an
+    // answer the row then reports. The file is unlinked as soon as it is open.
     fn maps_and_truncates(h: &mut Host) -> i32 {
         use temen_interp::{put_results, CapState, HostProcGrant, ProcHandler};
         h.grant_host_proc(HostProcGrant::new(
@@ -1465,19 +1496,27 @@ fn a_wait_on_a_file_alias_a_procedure_mapped_and_truncated_faults_the_guest() {
                 let n = FILES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let path = std::env::temp_dir()
                     .join(format!("temen_jit_kernel_trunc_{}_{n}", std::process::id()));
-                let file = std::fs::OpenOptions::new()
+                let opened = std::fs::OpenOptions::new()
                     .read(true)
                     .write(true)
                     .create(true)
                     .truncate(true)
-                    .open(&path)
-                    .expect("a file");
-                let len = temen_interp::host_region_granularity();
-                file.set_len(len).expect("sized");
-                let backing = temen_run::new_file_region(&file, len as usize).expect("a region");
-                let rc = mem.map_or(-1, |m| m.map_region(1 << 20, 0, len, 3, 0, backing));
-                file.set_len(0).expect("truncated");
+                    .open(&path);
                 let _ = std::fs::remove_file(&path);
+                let Ok(file) = opened else {
+                    return put_results(out, &[-1001]);
+                };
+                let len = temen_interp::host_region_granularity();
+                if file.set_len(len).is_err() {
+                    return put_results(out, &[-1002]);
+                }
+                let Ok(backing) = temen_run::new_file_region(&file, len as usize) else {
+                    return put_results(out, &[-1003]);
+                };
+                let rc = mem.map_or(-1004, |m| m.map_region(1 << 20, 0, len, 3, 0, backing));
+                if rc == 0 && file.set_len(0).is_err() {
+                    return put_results(out, &[-1005]);
+                }
                 put_results(out, &[rc])
             })),
             CapState::Stateless,
@@ -1489,6 +1528,31 @@ fn a_wait_on_a_file_alias_a_procedure_mapped_and_truncated_faults_the_guest() {
         false,
         METERED,
         Err("MemoryFault".into()),
+    );
+    // And the answer is the recovered read's, which the window counts: the map called the page
+    // readable, and the load faulted on the vanished backing.
+    let (result, recovered) = bounded("the kernel run", || {
+        let mut host = Host::new();
+        let m = program(maps_and_truncates(&mut host));
+        let admitted = jit_kernel::admit(&m, &host, false).expect("in scope");
+        let start = jit_kernel::Start {
+            entry: 0,
+            args: &[],
+            init_mem: &[],
+            init: None,
+            reserved_log2: temen_ir::DEFAULT_RESERVED_LOG2,
+            fuel: temen_interp::DEFAULT_FUEL,
+            snapshot_cap: None,
+            kill: None,
+        };
+        let end = jit_kernel::run(admitted, start, &mut host).expect("compiles");
+        (end.result, host.cap_pages_recovered())
+    });
+    assert_eq!(result, Err(Trap::MemoryFault));
+    // At least one: the no-wake fast path's compare and the rules' each read the word.
+    assert!(
+        recovered >= 1,
+        "the wait's read was the recovered one: {recovered}"
     );
 }
 
@@ -1847,6 +1911,24 @@ fn each_declined_call_names_its_clause() {
             .expect("wired");
         h
     };
+    // A host holding a module's own offer (`Binding::Offer`), as a re-grant or an earlier run's
+    // `export.handle` leaves one.
+    let offered = || {
+        let mut h = Host::new();
+        let impls = module(
+            "func (i64, i64) -> (i64) {
+block 0 (va: i64, vb: i64) {
+  vs = i64.add va vb
+  return vs
+  }
+}
+",
+        );
+        let funcs: std::sync::Arc<[temen_ir::Func]> = impls.funcs.into();
+        h.wire_offer_func(&funcs, &std::sync::Arc::from(Vec::new()), &[0])
+            .expect("an offer");
+        h
+    };
     let factory = || {
         let mut h = Host::new();
         h.set_region_factory(temen_run::new_shared_region);
@@ -1905,6 +1987,11 @@ fn each_declined_call_names_its_clause() {
         (call(selfop, 11), Host::new(), "process"),
         (call(selfop, 12), Host::new(), "process"),
         (call(selfop, 14), Host::new(), "process"),
+        // `export.handle`'s packed self op, inline: it mints an offer of the module's own impl.
+        (call(selfop, 8), Host::new(), "serving"),
+        (call(selfop, 8 | 1 << 8), Host::new(), "serving"),
+        // A guest offer the host holds at admission, which may sit under a built-in's id.
+        (call(0, 1), offered(), "serving"),
         // The three ways into `file region`: a guest mint under a region factory, a host procedure
         // that may mint a backing, and a held region something outside the VM writes.
         (call(5, 5), factory(), "file region"),
@@ -1953,8 +2040,15 @@ block 0 (va: i64) {
         jit_kernel::admit(&roots, &Host::new(), false).err(),
         Some("gc.roots")
     );
-    // And what it admits beside them: a stream read with a non-blocking stdin and no pipe.
+    // And what it admits beside them: a stream read with a non-blocking stdin and no pipe, and the
+    // packed `type_id` and `covers` of a self interface past the first, as their typed forms are.
     assert!(jit_kernel::admit(&call(0, 0), &Host::new(), false).is_ok());
+    for op in [6 | 1 << 8, 7 | 1 << 8] {
+        assert!(
+            jit_kernel::admit(&call(selfop, op), &Host::new(), false).is_ok(),
+            "self op {op:#x}"
+        );
+    }
 }
 
 /// #2958 slice 4 — a threaded root over the mmap-capable fs (`fs::host_fs_mmap`, handle `fs`): open a
@@ -2057,7 +2151,10 @@ block 0 () {
 /// waits for its start word, then unmaps the alias and maps the region there again (`remap`, or maps
 /// it over the live alias, replacing it) until the run ends. A wait that meets the page unmapped
 /// faults, which ends the run `MemoryFault`; the host never faults. Not on the oracle, whose root
-/// would run its loop alone.
+/// would run its loop alone. These rows run as an embedder runs, so they cannot read the window's
+/// count of recovered reads: a broken page-map contract would be recovered to the same
+/// `MemoryFault` and pass here. `futex_ops_racing_page_ops_never_fault_the_host` and
+/// `futex_window.rs`'s race assert that count stays zero.
 fn alias_race(handle: i32, remap: bool) -> temen_ir::Module {
     let g = temen_interp::host_region_granularity();
     let unmap = match remap {
@@ -2284,6 +2381,7 @@ block 0 () {
     };
     let rows = [
         (temen_ir::CAP_SELF_TYPE_ID, 13, "fuel"),
+        (temen_ir::CAP_SELF_TYPE_ID, 8, "serving"),
         (temen_ir::CAP_SELF_TYPE_ID, 9, "serving"),
         (temen_ir::CAP_SELF_TYPE_ID, 10, "serving"),
         (temen_ir::cap_id::SHARED_REGION, 7, "region signal"),

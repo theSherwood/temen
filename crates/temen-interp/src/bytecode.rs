@@ -8931,9 +8931,10 @@ fn image_parks(host: &Host, m: &Module, census: &ImageCensus) -> Parks {
 ///   or for good if no consumer needs it);
 /// - **`signals`**: delivery into native code is the engine's safepoint redirect, not executor 2's
 ///   interrupt (a later phase);
-/// - **`serving`**: the host holds a live callee's offer (`Binding::LiveImpl`), which may sit under
-///   any interface's id, a built-in's included, so [`kernel_op`]'s table cannot see a call through
-///   it (#2791, #2792);
+/// - **`serving`**: the host holds a guest's offer (a live callee's, `Binding::LiveImpl`, or a
+///   module's own, `Binding::Offer`), which may sit under any interface's id, a built-in's
+///   included, so [`kernel_op`]'s table cannot see a call through it; and `export.handle`, which
+///   mints one (both [`kernel_op`]'s; #2791, #2792);
 /// - **`file region`**: the host holds a minting procedure or an outside-written backing
 ///   ([`file_region`]; #3005's fix);
 /// - **`imports`**: an import the host leaves unbound or may rebind (`import.attach` may retarget it to
@@ -8971,14 +8972,16 @@ pub fn native_scope(m: &Module, host: &Host) -> Result<(), &'static str> {
     if host.signal_arm_pair().is_some() {
         return Err("signals");
     }
-    // A live callee's offer (`Host::wire_live_impl`) may sit under any interface's id, a built-in's
-    // included, so the call table below cannot see it: a call through it is the callee's serve
-    // loop's (#2791, #2792).
-    if host
-        .table
-        .iter()
-        .any(|s| matches!(s.entry, Some(super::Binding::LiveImpl(_))))
-    {
+    // A guest's offer, a live callee's (`Host::wire_live_impl`) or a module's own (`export.handle`,
+    // `Host::adopt_offer` on a re-grant, or one an earlier run on this host reified), may sit under
+    // any interface's id, a built-in's included, so the call table below cannot see it: a call
+    // through it is a guest interface's (#2791, #2792).
+    if host.table.iter().any(|s| {
+        matches!(
+            s.entry,
+            Some(super::Binding::LiveImpl(_) | super::Binding::Offer(_))
+        )
+    }) {
         return Err("serving");
     }
     if file_region(host) {
@@ -9051,13 +9054,18 @@ fn kernel_inst(host: &Host, i: &Inst) -> Result<(), &'static str> {
         | Inst::ImportAttach { .. }
         | Inst::DataSym { .. }
         | Inst::RefSym { .. } => Err("imports"),
-        // `export.handle` mints an offer of the module's own impl under its interface's interned id,
-        // which is a built-in's (`Stream`, `Exit`) when the shapes match: a `call.cap` on it would
-        // pass `kernel_op` as that built-in's op and run the guest's impl, a call through a guest
-        // interface.
-        Inst::ExportHandle { .. } => Err("serving"),
-        // §3.5 reflection over the domain's own table, answered in the dispatch.
-        Inst::CapSelfTypeId { .. } | Inst::CapSelfCovers { .. } => Ok(()),
+        // The typed `self` extensions are the packed self ops the bytecode compile and the JIT
+        // lower them to, decided in the one table: `type_id` (6) and `covers` (7) pass,
+        // `export.handle` (8) is `serving`.
+        Inst::CapSelfTypeId { ty } => {
+            kernel_op(host, temen_ir::CAP_SELF_TYPE_ID, 6 | ty << 8, None)
+        }
+        Inst::CapSelfCovers { ty, .. } => {
+            kernel_op(host, temen_ir::CAP_SELF_TYPE_ID, 7 | ty << 8, None)
+        }
+        Inst::ExportHandle { export } => {
+            kernel_op(host, temen_ir::CAP_SELF_TYPE_ID, 8 | export << 8, None)
+        }
         Inst::ConstI32 { .. }
         | Inst::ConstI64 { .. }
         | Inst::IntBin { .. }
@@ -9160,7 +9168,8 @@ fn kernel_inst(host: &Host, i: &Inst) -> Result<(), &'static str> {
 /// - **`file region`**: `create_region` while a region factory is set ([`file_region`]; #3005's
 ///   fix);
 /// - **`process`**: `clone_caller`, `reap`, `exec` (a later phase; #2958 amendment 5);
-/// - **`serving`**: a service point or a call through a guest interface (#2791, #2792);
+/// - **`serving`**: a service point, a call through a guest interface, or `export.handle` (self
+///   op 8, packed), which mints an offer of the module's own impl (#2791, #2792);
 /// - **`§14 children`**: `Instantiator`, `Module`, `ModuleLoader` (a later phase);
 /// - **`jit cap`**: §22 `Jit` and its code handles: two dispatch tables (a later phase);
 /// - **`cap`**: `FreezeAuthority` (a `CapFault` on every engine, with no consumer) and an op no
@@ -9187,11 +9196,21 @@ fn kernel_op(host: &Host, type_id: u32, op: u32, handle: Option<i32>) -> Result<
             _ => Err("host-proc parks"),
         },
         (BLOCKING, _) => Err("host-proc parks"),
-        (CAP_SELF_TYPE_ID, 0..=8 | 17..=19) => Ok(()),
-        (CAP_SELF_TYPE_ID, 13) => Err("fuel"),
-        (CAP_SELF_TYPE_ID, 16) => Err("stream parks"),
-        (CAP_SELF_TYPE_ID, 9 | 10) => Err("serving"),
-        (CAP_SELF_TYPE_ID, 11 | 12 | 14) => Err("process"),
+        // The `self` ops: plain below 6 and at 17–19; from 6 on, packed as `selfop | idx << 8`
+        // (the host's dispatch), so decided on the low byte.
+        (CAP_SELF_TYPE_ID, 0..=5 | 17..=19) => Ok(()),
+        (CAP_SELF_TYPE_ID, op) => match op & 0xFF {
+            // `type_id` and `covers` of a self interface.
+            6 | 7 => Ok(()),
+            // `export.handle` mints an offer of the module's own impl under its interface's
+            // interned id, which is a built-in's (`Stream`, `Exit`) when the shapes match: a call on
+            // it would pass this table as that built-in's op and run the guest's impl.
+            8 | 9 | 10 => Err("serving"),
+            11 | 12 | 14 => Err("process"),
+            13 => Err("fuel"),
+            16 => Err("stream parks"),
+            _ => Err("cap"),
+        },
         (INSTANTIATOR | MODULE | MODULE_LOADER, _) => Err("§14 children"),
         (JIT | JIT_CODE, _) => Err("jit cap"),
         (t, _) if (GUEST_IMPL_BASE..CAP_DYN_TYPE_ID).contains(&t) => Err("serving"),
