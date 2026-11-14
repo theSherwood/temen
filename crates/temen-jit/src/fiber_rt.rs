@@ -318,9 +318,11 @@ const FAULTED: u64 = u64::MAX - 1;
 pub(crate) fn active_depth() -> usize {
     let rt = current();
     // SAFETY: `current()` is this thread's live runtime; the read is momentary.
-    (!rt.is_null())
-        .then(|| unsafe { (*rt).active_slots.len() })
-        .unwrap_or(0)
+    if rt.is_null() {
+        0
+    } else {
+        unsafe { (*rt).active_slots.len() }
+    }
 }
 
 /// #3020 — a guarded call that started at resume depth `depth` faulted: its recovery jumped out of
