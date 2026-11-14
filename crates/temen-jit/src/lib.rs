@@ -5577,12 +5577,13 @@ impl CompiledModule {
         // parks on the real futex and a sibling's re-issued `notify` wakes it; a wait with no possible
         // notifier left fails closed via `futex_wait`'s shared deadlock detection (no thaw-specific path).
 
-        // Durable **multi-vCPU thaw** (slice 3.3, thaw side): re-attach + run the spawned children a
-        // freeze flattened, *before* the root re-enters — the JIT's single-worker thaw (the root's
-        // rewind skips its prologue `thread.spawn`, so the runtime reconstructs the children). Each
-        // child rewinds from its restored extent, runs forward to completion, and publishes its result
-        // so the root's re-executed `thread.join` resolves; the root's active shadow-SP is then set to
-        // its restored extent. Done after the fiber seed (the table is live) and `set_env`.
+        // Durable **multi-vCPU thaw** (slice 3.3, thaw side): re-attach the spawned vCPUs a freeze
+        // flattened before the root re-enters (the root's rewind skips its prologue `thread.spawn`, so
+        // the runtime reconstructs them). Each live one is re-spawned on its own OS thread and rewinds
+        // from its restored extent concurrently with the root; a completed one is filed with its
+        // result. The root's shadow-SP and thaw word are then set to its restored extent
+        // (`Domain::thaw_reattach_and_run`). Done after the fiber seed (the table is live) and
+        // `set_env`.
         #[cfg(fiber_rt)]
         if (*this).durable && !(*this).frozen_vcpu_seed.is_empty() {
             let seed = std::mem::take(&mut (*this).frozen_vcpu_seed);

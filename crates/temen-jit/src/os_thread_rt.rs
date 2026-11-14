@@ -2982,8 +2982,8 @@ impl Domain {
                 }
             }
         }
-        // The root rewinds first on its re-entry: point the active shadow-SP at its restored extent and
-        // re-arm REWINDING (the last child flipped the word to NORMAL when its rewind completed).
+        // The root rewinds on its re-entry: point its shadow-SP word at its restored extent and arm its
+        // own (context 0) thaw word REWINDING; each re-spawned vCPU rewinds against its own context's.
         // §12.8 4A.5: the root's extent goes into context 0's own region word. The thread that runs the
         // root seeds its own shadow-base register to that region (`run_inner` before its guarded call,
         // a child task's residency, #2010), so nothing here touches the calling thread's.

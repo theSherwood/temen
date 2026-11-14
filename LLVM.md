@@ -2242,9 +2242,11 @@ Picking a target is really picking the *gap* it drives to completion. Current st
   writes into the guest `jmp_buf`'s first 8 bytes (#1062 — a memcpy'd buffer carries its identity) and
   lives exactly as long as the activation that took it; a `longjmp` to anything else — a returned
   activation, a sibling reusing its depth, another fiber's, an earlier run's — traps `Malformed`. Gated to
-  the `setjmp_rt` targets (unix among `fiber_rt`); a module mixing `setjmp` with fibers/threads is
-  fail-closed-declined (the interpreters keep each checkpoint with its own frame, so they cover it — a
-  table per native stack is the follow-on). Tests: `setjmp_longjmp_round_trip`, `setjmp_longjmp_loop_and_deep_nesting`,
+  the `setjmp_rt` targets (unix among `fiber_rt`); a module mixing `setjmp` with fibers/threads, or
+  serving an interface, is fail-closed-declined, and a §22 unit using fibers/threads submitted to an
+  instance that takes `setjmp` checkpoints is refused at `Jit.compile` (`setjmp_rt::admits`; the
+  interpreters keep each checkpoint with its own frame, so they cover both — a table per native stack,
+  #2939, is the follow-on). Tests: `setjmp_longjmp_round_trip`, `setjmp_longjmp_loop_and_deep_nesting`,
   plus returns-twice stress (`setjmp_value_live_across`, `setjmp_nested_buffers`) — **all three engines ==
   native libc** (the JIT lane now asserts agreement, not a decline). Perf (`examples/onramp_perf.rs`): the
   non-`setjmp` baseline rows are unmoved (gated; byte-identical IR); the JIT runs `setjmp_happy` ~3× and
@@ -2882,9 +2884,10 @@ are baked **directly** as the call targets (not via a Rust thunk, whose frame wo
 `longjmp` time), mirroring the `call.cap`/fiber-thunk "call-to-baked-host-address" template. Gated to
 the `setjmp_rt` cfg (= `fiber_rt && unix`; built in `build.rs`) — Windows `setjmp` is SEH-coupled, a
 follow-on, and there the JIT keeps declining and the interpreters cover it. A §14 JIT child using
-`setjmp`, and any module mixing `setjmp` with fibers/threads, are **fail-closed-declined** (no per-child
-/ per-stack `setjmp` table yet — the table's frame-pointer order holds only for one native stack; the
-interpreters keep each checkpoint with its own frame, so they cover it). The
+`setjmp`, any module mixing `setjmp` with fibers/threads or serving an interface, are
+**fail-closed-declined**, and a fiber/thread unit submitted to a `setjmp` instance is refused at
+`Jit.compile` (no per-child / per-stack `setjmp` table yet — the table's frame-pointer order holds only
+for one native stack; the interpreters keep each checkpoint with its own frame, so they cover it; #2939). The
 returns-twice hazard held up: clang's `-O2` setjmp-crossing spills + Cranelift's caller-saved spills
 across the `SetJmp` call site mean live values arrive as loads/stores, not long-lived SSA, and the
 guest's data-stack values ride in window memory (preserved across `_longjmp`). Validated by the on-ramp

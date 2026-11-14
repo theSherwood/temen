@@ -1484,14 +1484,16 @@ fn a_thawed_vcpu_no_spawn_could_have_made_ends_thread_fault_on_both_engines() {
     }
 }
 
-/// #2878 — a thaw residue naming a vCPU, handed to the JIT's durable run of a threaded module that
-/// declares no shadow arena. There are no thaw words and no root region, so the JIT writes none (it
-/// used to store the root's shadow-SP and thaw word at window offsets 0 and 8, in the NULL guard,
-/// outside any guarded call): every run leaves the window the unseeded run leaves. It still files
-/// each record at its slot: a completed child's join reloads its result, and a live one, which no
-/// context can hold, is refused `ThreadFault`. The root spawns nothing; it joins slot 0 and answers
-/// `status * 1000 + value`. (Only the JIT takes a residue an arena-less module could not have
-/// frozen; the interpreters re-create vCPUs only on a thaw of an instrumented window.)
+/// #2878 — a thaw residue naming a vCPU, handed to a durable run of a threaded module that declares
+/// no shadow arena. There are no thaw words and no root region, so the JIT writes none (it used to
+/// store the root's shadow-SP and thaw word at window offsets 0 and 8, in the NULL guard, outside any
+/// guarded call): every run leaves the window the unseeded run leaves. Both engines still file each
+/// record at its slot, so a completed child's join reloads its result: that is what pins the filing.
+/// A live one, which no context can hold, is refused `ThreadFault`; a slot nothing filled answers the
+/// same, so the live case pins only that the engines agree. The root spawns nothing (an arena-less
+/// durable run has no context to spawn into); it joins slot 0 and answers `status * 1000 + value`.
+/// The record's parent is the root (task 0): a record whose parent the thaw did not re-create is
+/// dropped by the interpreters and not by the JIT (#3034's `parent_task` item).
 #[test]
 fn a_vcpu_thaw_residue_on_a_module_with_no_arena_is_filed_and_writes_no_control_words() {
     let src = "memory 17
@@ -1515,7 +1517,7 @@ block 0 (va: i64, vb: i64) {
     temen_verify::verify_module(&m).expect("verify");
     let record = |completed: Option<i64>| temen_interp::FrozenVCpu {
         task: 2,
-        parent_task: 1,
+        parent_task: 0,
         slot: 0,
         joinable: true,
         func: 1,
@@ -1563,7 +1565,34 @@ block 0 (va: i64, vb: i64) {
         };
         (r, win)
     };
+    let interp = |seed: Vec<temen_interp::FrozenVCpu>| {
+        let mut h = Host::new();
+        h.set_durable(true);
+        h.set_frozen_vcpus(seed);
+        let mut fuel = 1_000_000u64;
+        let (r, win) = run_capture_reserved_with_host(
+            &m,
+            0,
+            &[],
+            &mut fuel,
+            &vec![0u8; WINDOW],
+            SIZE_LOG2,
+            &mut h,
+        );
+        let r = r
+            .map(|v| {
+                v.iter()
+                    .map(|x| match x {
+                        Value::I64(x) => *x,
+                        other => panic!("{other:?}"),
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .map_err(|t| t.code());
+        (r, win)
+    };
     let (plain, plain_win) = jit(vec![]);
+    let (iplain, iplain_win) = interp(vec![]);
     assert_eq!(
         plain_win.len(),
         WINDOW,
@@ -1571,12 +1600,19 @@ block 0 (va: i64, vb: i64) {
     );
     let no_thread = Err(temen_ir::trap_code::THREAD_FAULT);
     assert_eq!(plain, no_thread, "the root joins a slot nothing filled");
+    assert_eq!(iplain, no_thread, "the interpreters: the same");
     for (name, seed, want) in [
         ("a completed child", record(Some(5)), Ok(vec![5])),
         ("a live child", record(None), no_thread),
     ] {
-        let (got, win) = jit(vec![seed]);
-        assert_eq!(got, want, "{name}");
-        assert!(win == plain_win, "{name}: the run wrote control words");
+        let (got, win) = jit(vec![seed.clone()]);
+        assert_eq!(got, want, "{name}: JIT");
+        assert!(win == plain_win, "{name}: the JIT wrote control words");
+        let (igot, iwin) = interp(vec![seed]);
+        assert_eq!(igot, want, "{name}: the interpreters");
+        assert!(
+            iwin == iplain_win,
+            "{name}: the interpreters wrote control words"
+        );
     }
 }

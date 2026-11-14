@@ -1594,8 +1594,7 @@ block 0 (vsp: i64, varg: i64) {
 /// would cross the host frames of the `call.cap` that runs the unit, so every engine refuses it. On
 /// the JIT the invoke's guarded call floors the table (`setjmp_rt::Scope`), so the unit finds no
 /// checkpoint; on the interpreters the unit runs as a computation of its own.
-/// This is the direct API (`jit_cap_run`); a routed run of a module that uses `setjmp` and can
-/// drive the `Jit` folds to the interpreters before it starts.
+/// This is the direct API (`jit_cap_run`); nothing folds a routed run of it, which stays on the JIT.
 #[test]
 fn an_invoked_unit_cannot_longjmp_to_its_invokers_checkpoint() {
     let b = blob(
