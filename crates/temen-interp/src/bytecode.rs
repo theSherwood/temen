@@ -9202,10 +9202,11 @@ fn kernel_op(host: &Host, type_id: u32, op: u32, handle: Option<i32>) -> Result<
         (CAP_SELF_TYPE_ID, op) => match op & 0xFF {
             // `type_id` and `covers` of a self interface.
             6 | 7 => Ok(()),
-            // `export.handle` mints an offer of the module's own impl under its interface's
+            // `export.handle` (8) mints an offer of the module's own impl under its interface's
             // interned id, which is a built-in's (`Stream`, `Exit`) when the shapes match: a call on
-            // it would pass this table as that built-in's op and run the guest's impl.
-            8 | 9 | 10 => Err("serving"),
+            // it would pass this table as that built-in's op and run the guest's impl. 9 and 10 are
+            // service points.
+            8..=10 => Err("serving"),
             11 | 12 | 14 => Err("process"),
             13 => Err("fuel"),
             16 => Err("stream parks"),
