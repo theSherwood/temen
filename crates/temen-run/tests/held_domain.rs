@@ -803,7 +803,10 @@ block 0 (vexit: i32) {
 ",
         );
         let (host, exit) = host_for(&m);
-        let (d, results) = hold(on, m, 0, &[Value::I32(exit)], host);
+        // Not the `hold` helper: off unix the JIT declines `setjmp`, so an `Executor::Jit` hold of
+        // this module runs on the interpreters, which must answer the same.
+        let started = temen_run::hold(on, m, 0, &[Value::I32(exit)], u64::MAX, host);
+        let (d, results) = started.unwrap_or_else(|(t, _)| panic!("the entry ends in {t:?}"));
         assert_eq!(results, vec![Value::I64(1)], "start answers the entry");
         assert_eq!(call(&d, 0, &[]), Reply::Failed(EINVAL), "no op to call");
     });
