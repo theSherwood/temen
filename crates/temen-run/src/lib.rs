@@ -740,9 +740,9 @@ fn import_dispatch(host: &Host, packed: u32) -> Option<(u32, u32, i32)> {
 /// left something only the JIT's own runtime acts on (a park, a punted call's wait, a live callee, a
 /// region wake, a service point, `Jit.invoke`) traps the domain `Malformed`, in every build. Each is
 /// a call `native_scope` declines, and each host fact it reads at admission (the pipe ends held, a
-/// blocking stdin, the import bindings, the signal source, how the host procedures park, the live
-/// callees' offers (`serving`), and the minting procedures and outside-written backings held
-/// (`file region`)) changes
+/// blocking stdin, the import bindings, the signal source, how the host procedures park, the guest
+/// offers held, a live callee's or a module's own (`serving`), and the minting procedures and
+/// outside-written backings held (`file region`)) changes
 /// mid-run only through a call it declines too: so reaching this is a bug in that predicate, and it
 /// fails closed instead of reaching a runtime the task is not on. `true` when it trapped.
 fn kernel_backstop(vm: &temen_jit::VmCtx) -> bool {
@@ -5063,8 +5063,10 @@ impl temen_interp::FutexWindow for MprotectWindow {
     ///   handler does not recover `STATUS_IN_PAGE_ERROR`, but no file region reaches a window there:
     ///   [`new_file_region`] is unix-only.)
     ///
-    /// The map check decides the guest's answer. The lock is a leaf: nothing else is taken while it
-    /// is held.
+    /// The map check decides the guest's answer for every page the VM's own ops left unreadable; a
+    /// page it calls readable that faults anyway (a backing shrunk outside the VM) is the recovered
+    /// load's `MemoryFault`. The lock is a leaf: no other lock is taken while it is held, but the
+    /// process's fault handler is installed under it on its first call (a `Once`).
     fn wait_word(&self, base: u64, width: u32) -> Option<u64> {
         // A naturally aligned word of at most 8 bytes lies on one page.
         if !matches!(width, 4 | 8) || !base.is_multiple_of(u64::from(width)) {

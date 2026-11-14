@@ -651,8 +651,8 @@ pub(crate) unsafe fn try_access(w: &crate::Window, a: &mut Access) -> bool {
             }
         }
     }
-    // No `install_guard`: every caller is a host function called from inside a guarded call, which
-    // installed the handler.
+    // No `install_guard` here: a caller inside a guarded call has the handler, and `try_load_in`
+    // installs it for a caller that may not be.
     let (lo, hi) = fault_range_of(w.base, w.reserved as usize);
     pal::try_call(run, a as *mut Access as *mut c_void, lo, hi)
 }

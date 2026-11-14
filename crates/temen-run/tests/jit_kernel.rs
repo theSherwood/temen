@@ -236,16 +236,7 @@ fn fueled(m: &temen_ir::Module, budget: u64) -> [(Result<Vec<i64>, Trap>, u64); 
     .expect("jit");
     let mut host = Host::new();
     let admitted = jit_kernel::admit(m, &host, false).expect("in the kernel's scope");
-    let start = jit_kernel::Start {
-        entry: 0,
-        args: &[],
-        init_mem: &[],
-        init: None,
-        reserved_log2: temen_ir::DEFAULT_RESERVED_LOG2,
-        fuel: budget,
-        snapshot_cap: None,
-        kill: None,
-    };
+    let start = fresh_start(budget);
     let end = jit_kernel::run(admitted, start, &mut host).expect("compiles");
     assert!(end.vcpus >= 1, "it ran as kernel tasks");
     let kernel = result(end.outcome().0);
@@ -778,16 +769,7 @@ fn granted(
         ceilings(&mut host);
         let m = make(grant(&mut host));
         let admitted = jit_kernel::admit(&m, &host, false).expect("in the kernel's scope");
-        let start = jit_kernel::Start {
-            entry: 0,
-            args: &[],
-            init_mem: &[],
-            init: None,
-            reserved_log2: temen_ir::DEFAULT_RESERVED_LOG2,
-            fuel: u64::MAX,
-            snapshot_cap: None,
-            kill: None,
-        };
+        let start = fresh_start(u64::MAX);
         let end = jit_kernel::run(admitted, start, &mut host).expect("compiles");
         assert!(end.vcpus >= 1, "it ran as kernel tasks");
         end.result.map_err(|t| format!("{t:?}"))
@@ -1087,9 +1069,10 @@ fn spin<'s, 'e>(s: &'s std::thread::Scope<'s, 'e>, stop: &'e std::sync::atomic::
 ///   `WAIT_TURNS` cycles) fails it; `WAIT_TURNS` only caps the program;
 /// - a notify never faults: its run ends with the vCPU's count (every op answered, at least one).
 ///
-/// Every run also asserts its window recovered no read ([`temen_interp::CapPages::recovered`]): a
-/// wait meeting the page midway through a page op's hardware change would be recovered to the
-/// same `MemoryFault`, so the count is what still tells a broken contract from the map check.
+/// Every wait run also asserts its window recovered no read
+/// ([`temen_interp::CapPages::recovered`]): a wait meeting the page midway through a page op's
+/// hardware change would be recovered to the same `MemoryFault`, so the count is what still tells
+/// a broken contract from the map check. (A notify reads no word, so its runs leave it out.)
 #[test]
 fn futex_ops_racing_page_ops_never_fault_the_host() {
     const NOTIFY_TURNS: u32 = 400;
@@ -1114,26 +1097,17 @@ fn futex_ops_racing_page_ops_never_fault_the_host() {
                     let mut host = Host::new();
                     let m = racing(host.grant_memory(), op, protect, turns);
                     let admitted = jit_kernel::admit(&m, &host, false).expect("in scope");
-                    let start = jit_kernel::Start {
-                        entry: 0,
-                        args: &[],
-                        init_mem: &[],
-                        init: None,
-                        reserved_log2: temen_ir::DEFAULT_RESERVED_LOG2,
-                        fuel: u64::MAX,
-                        snapshot_cap: None,
-                        kill: None,
-                    };
+                    let start = fresh_start(u64::MAX);
                     let end = jit_kernel::run(admitted, start, &mut host).expect("compiles");
                     (end.vcpus, end.result, host.cap_pages_recovered())
                 });
                 assert!(vcpus >= 1, "it ran as kernel tasks");
                 // A wait's `MemoryFault` is the map check's, never a recovered read: the guarded
-                // read keeps off the page ops' hardware changes ([`CapPages::recovered`]).
-                assert_eq!(
-                    recovered, 0,
-                    "{op} (protect: {protect}): a read recovered a fault"
-                );
+                // read keeps off the page ops' hardware changes ([`CapPages::recovered`]). (A
+                // notify reads no word, so the count says nothing for it.)
+                if op == "wait" {
+                    assert_eq!(recovered, 0, "wait (protect: {protect}): a recovered read");
+                }
                 match (op, result) {
                     ("wait", Err(Trap::MemoryFault)) => {}
                     ("wait", r) => panic!(
@@ -1535,16 +1509,7 @@ block 2 (vrc: i64) {{
         let mut host = Host::new();
         let m = program(maps_and_truncates(&mut host));
         let admitted = jit_kernel::admit(&m, &host, false).expect("in scope");
-        let start = jit_kernel::Start {
-            entry: 0,
-            args: &[],
-            init_mem: &[],
-            init: None,
-            reserved_log2: temen_ir::DEFAULT_RESERVED_LOG2,
-            fuel: temen_interp::DEFAULT_FUEL,
-            snapshot_cap: None,
-            kill: None,
-        };
+        let start = fresh_start(temen_interp::DEFAULT_FUEL);
         let end = jit_kernel::run(admitted, start, &mut host).expect("compiles");
         (end.result, host.cap_pages_recovered())
     });
@@ -1554,6 +1519,20 @@ block 2 (vrc: i64) {{
         recovered >= 1,
         "the wait's read was the recovered one: {recovered}"
     );
+}
+
+/// A fresh run's start at entry 0 with `fuel`: no arguments, no initial memory, no kill door.
+fn fresh_start(fuel: u64) -> jit_kernel::Start<'static> {
+    jit_kernel::Start {
+        entry: 0,
+        args: &[],
+        init_mem: &[],
+        init: None,
+        reserved_log2: temen_ir::DEFAULT_RESERVED_LOG2,
+        fuel,
+        snapshot_cap: None,
+        kill: None,
+    }
 }
 
 /// A root that makes one §12 op (so the kernel admits it), then `body`, returning `vr`.
@@ -2153,8 +2132,12 @@ block 0 () {
 /// faults, which ends the run `MemoryFault`; the host never faults. Not on the oracle, whose root
 /// would run its loop alone. These rows run as an embedder runs, so they cannot read the window's
 /// count of recovered reads: a broken page-map contract would be recovered to the same
-/// `MemoryFault` and pass here. `futex_ops_racing_page_ops_never_fault_the_host` and
-/// `futex_window.rs`'s race assert that count stays zero.
+/// `MemoryFault` and pass here. The count is asserted where the window is in reach: for the
+/// revoke-first arm (unmap, map, protect of a private page) by
+/// `futex_ops_racing_page_ops_never_fault_the_host` and `futex_window.rs`'s
+/// `a_read_racing_an_unmap_or_a_protect_never_faults_the_host`; for this race's arm, a map over a
+/// live alias under the page map's lock, by `futex_window.rs`'s
+/// `a_read_racing_a_map_over_its_alias_meets_the_page_whole`.
 fn alias_race(handle: i32, remap: bool) -> temen_ir::Module {
     let g = temen_interp::host_region_granularity();
     let unmap = match remap {
@@ -2467,16 +2450,7 @@ fn held_after(m: &temen_ir::Module) -> [(i64, i64); 2] {
     let mut host = Host::new();
     let node = host.own_node();
     let admitted = jit_kernel::admit(m, &host, false).expect("in the kernel's scope");
-    let start = jit_kernel::Start {
-        entry: 0,
-        args: &[],
-        init_mem: &[],
-        init: None,
-        reserved_log2: temen_ir::DEFAULT_RESERVED_LOG2,
-        fuel: temen_interp::DEFAULT_FUEL,
-        snapshot_cap: None,
-        kill: None,
-    };
+    let start = fresh_start(temen_interp::DEFAULT_FUEL);
     let end = jit_kernel::run(admitted, start, &mut host).expect("compiles");
     assert_eq!(end.vcpus, 13, "every vCPU ran as a kernel task");
     assert_eq!(result(end.outcome().0), Ok(vec![7]), "kernel route");

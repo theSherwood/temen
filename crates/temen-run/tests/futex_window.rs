@@ -4,11 +4,13 @@
 //! - **The guarded read against a model.** Random page ops and §13 region maps, then random
 //!   addresses and widths: the read is refused exactly when a byte lies outside the reservation, the
 //!   address is misaligned, the page is below the NULL guard, or the page is not readable, and
-//!   otherwise answers the word. A read the model refuses that the window admitted would fault this
-//!   process. And the keys (#2958 slice 4): two aliases of one region byte key alike, and a word on
+//!   otherwise answers the word. A read the model refuses that the window admitted would be
+//!   recovered, and counted (`CapPages::recovered`), which the test asserts never happens. And the
+//!   keys (#2958 slice 4): two aliases of one region byte key alike, and a word on
 //!   an alias and a private word at the same offset key apart.
-//! - **The race.** Threads read words of a page while another unmaps, maps and protects it, for as
-//!   long as it takes: the process never faults, and each read answers a value or a refusal.
+//! - **The races.** Threads read words of a page while another unmaps, maps and protects it: each
+//!   read answers a value or a refusal, and none is recovered. And threads read a §13 alias while
+//!   another maps the region over it again: every read answers, and none is recovered.
 #![cfg(unix)]
 
 use temen_interp::{FutexWindow, GuestMem};
@@ -331,4 +333,70 @@ fn a_dropped_regions_identity_is_not_reused_while_the_map_names_it() {
         assert_ne!(std::sync::Arc::as_ptr(b) as *const u8 as u64, ident);
     }
     assert_eq!(map.region_ident(7), Some(ident), "the entry still names it");
+}
+
+/// #2958 slice 4 review — the race on `map_region`'s arm of the contract: readers make the guarded
+/// read of a §13 alias while a writer maps the region over the live alias, again and again. Unix
+/// `map_region` holds the page map's lock across its `MAP_FIXED` replacement and the marking, so
+/// every read meets the page whole: none is refused, and none is recovered. Linux's `MAP_FIXED` is
+/// atomic to a concurrent access, so this row bites where it is not (macOS): there, without the
+/// lock, a read would meet the replacement midway and be recovered as a `MemoryFault`. Bounded by
+/// the writer's count of maps.
+#[test]
+fn a_read_racing_a_map_over_its_alias_meets_the_page_whole() {
+    let page = temen_interp::host_page_size();
+    let g = temen_interp::host_region_granularity();
+    let (prefix, reserved) = (8 * page, 32 * page);
+    let r = Reservation::new(reserved as usize, prefix as usize);
+    let pages = temen_interp::CapPageMap::default();
+    let at = 16 * page;
+    assert!(at.is_multiple_of(g) && at + g <= reserved);
+    let region = temen_run::new_shared_region(g as usize).expect("a region");
+    let mut w = MprotectWindow::new_shared(r.base, prefix, reserved, pages.clone());
+    assert_eq!(w.map_region(at, 0, g, 3, 7, region.clone()), 0);
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    let (mut answered, mut refused) = (0u64, 0u64);
+    std::thread::scope(|s| {
+        let _stop = Stop(&stop);
+        let busy: Vec<_> = (0..2)
+            .map(|_| {
+                s.spawn(|| {
+                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        std::hint::spin_loop();
+                    }
+                })
+            })
+            .collect();
+        let readers: Vec<_> = (0..3)
+            .map(|i| {
+                let (base, pages, stop) = (r.base as usize, pages.clone(), &stop);
+                s.spawn(move || {
+                    let w = MprotectWindow::new_shared(base as *mut u8, prefix, reserved, pages);
+                    let (mut some, mut none) = (0u64, 0u64);
+                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        match w.wait_word(at + 8 * i, 4) {
+                            Some(_) => some += 1,
+                            None => none += 1,
+                        }
+                    }
+                    (some, none)
+                })
+            })
+            .collect();
+        for i in 0..20_000 {
+            assert_eq!(w.map_region(at, 0, g, 3, 7, region.clone()), 0, "map {i}");
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        for b in busy {
+            b.join().expect("busy");
+        }
+        for t in readers {
+            let (some, none) = t.join().expect("a reader");
+            answered += some;
+            refused += none;
+        }
+    });
+    assert!(answered > 0, "the readers read");
+    assert_eq!(refused, 0, "a read met the replacement midway");
+    assert_eq!(pages.recovered(), 0, "a read recovered a fault");
 }

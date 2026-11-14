@@ -8933,8 +8933,8 @@ fn image_parks(host: &Host, m: &Module, census: &ImageCensus) -> Parks {
 ///   interrupt (a later phase);
 /// - **`serving`**: the host holds a guest's offer (a live callee's, `Binding::LiveImpl`, or a
 ///   module's own, `Binding::Offer`), which may sit under any interface's id, a built-in's
-///   included, so [`kernel_op`]'s table cannot see a call through it; and `export.handle`, which
-///   mints one (both [`kernel_op`]'s; #2791, #2792);
+///   included, so [`kernel_op`]'s table cannot see a call through it (this function's own scan);
+///   and `export.handle`, which mints one ([`kernel_op`]'s self op 8; #2791, #2792);
 /// - **`file region`**: the host holds a minting procedure or an outside-written backing
 ///   ([`file_region`]; #3005's fix);
 /// - **`imports`**: an import the host leaves unbound or may rebind (`import.attach` may retarget it to
@@ -8972,8 +8972,9 @@ pub fn native_scope(m: &Module, host: &Host) -> Result<(), &'static str> {
     if host.signal_arm_pair().is_some() {
         return Err("signals");
     }
-    // A guest's offer, a live callee's (`Host::wire_live_impl`) or a module's own (`export.handle`,
-    // `Host::adopt_offer` on a re-grant, or one an earlier run on this host reified), may sit under
+    // A guest's offer, a live callee's (`Host::wire_live_impl`) or a module's own (an embedder's
+    // `Host::wire_offer_func` or `wire_offer_proc`, `export.handle`, `Host::adopt_offer` on a
+    // re-grant, or one an earlier run on this host reified), may sit under
     // any interface's id, a built-in's included, so the call table below cannot see it: a call
     // through it is a guest interface's (#2791, #2792).
     if host.table.iter().any(|s| {
