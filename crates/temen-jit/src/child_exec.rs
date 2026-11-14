@@ -3343,8 +3343,10 @@ impl ChildExec {
             }
         }
         // #2112 — the child's domain has ended: its fibers' charges go back before its parent can
-        // learn of the end, as its window's do in `teardown`.
-        task.rt.table().release_charges();
+        // learn of the end, as its window's do in `teardown`. #3020 — and its fibers go, stacks and
+        // all, as a run's do: its vCPUs are joined, its handlers drained and its root done, so none
+        // is running, and one parked on an event holds its own slot from its own stack.
+        task.rt.table().end();
         // #1936 — and its powerbox hears of it, unless its root already ended (`settle`).
         let end = if captured { None } else { task.end() };
         if let Some(t) = task.teardown.take() {
