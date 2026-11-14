@@ -3542,6 +3542,17 @@ pub struct CompiledModule {
 }
 
 impl CompiledModule {
+    /// #3024 — how many child nurseries and claim-ended children this module's §14 nursery still
+    /// holds (`(0, 0)` with no nursery): none between runs. For the tests of a reused compile.
+    #[doc(hidden)]
+    pub fn nursery_held(&self) -> (usize, usize) {
+        #[cfg(fiber_rt)]
+        if let Some(n) = &self._nursery {
+            return n.held();
+        }
+        (0, 0)
+    }
+
     /// #2594 — whether this code compiles its functions at their first calls ([`lazy`]), which the
     /// module's size and `TEMEN_JIT_LAZY` decide: for the tests of that path.
     #[doc(hidden)]

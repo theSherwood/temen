@@ -981,7 +981,8 @@ fn a_grandchild_is_gated_on_the_roots_lane_on_the_jit() {
 // ---- #3024 — one compile, many runs ----
 
 /// One compile of `p`, its host and child modules `a`, `b` (lane cap `cap`), run `runs` times; each
-/// run's answer, in order. On a thread of its own, with every run bounded: a run that hangs fails
+/// run's answer, in order, checking after each that the nursery holds nothing of it. On a thread of
+/// its own, with every run bounded: a run that hangs fails
 /// the test after 30 s, saying which run, rather than stalling the suite.
 fn reused_jit(
     p: &temen_ir::Module,
@@ -1012,13 +1013,13 @@ fn reused_jit(
         .expect("jit compile");
         cm.set_grant_child_hooks(Some(grant_hooks(hp)));
         let args: Vec<i64> = h.iter().map(|&x| x as i64).collect();
-        for _ in 0..runs {
+        for run in 1..=runs {
             let (jo, _) = cm.run(&args, None, None).expect("jit run");
             let r = match jo {
                 JitOutcome::Returned(ref v) => v.first().copied().unwrap_or(-1),
-                ref o => panic!("jit ended abnormally: {o:?}"),
+                ref o => panic!("run {run} of one compile ended abnormally: {o:?}"),
             };
-            if tx.send(r).is_err() {
+            if tx.send((r, cm.nursery_held())).is_err() {
                 return;
             }
         }
@@ -1027,8 +1028,16 @@ fn reused_jit(
     });
     (1..=runs)
         .map(|run| {
-            rx.recv_timeout(std::time::Duration::from_secs(30))
-                .unwrap_or_else(|e| panic!("run {run} of one compile did not end: {e:?}"))
+            let (r, held) = rx
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .unwrap_or_else(|e| panic!("run {run} of one compile did not end: {e:?}"));
+            // #3024 — the nursery keeps nothing of a run's children past it.
+            assert_eq!(
+                held,
+                (0, 0),
+                "run {run} left (kids, unclaimed) in the nursery"
+            );
+            r
         })
         .collect()
 }
@@ -1041,6 +1050,16 @@ fn a_reused_compile_spawns_and_joins_children_on_every_run() {
     let a = module(TRIVIAL);
     let b = module(TRIVIAL);
     assert_eq!(reused_jit(&p, &a, &b, -1, 3), vec![0, 0, 0]);
+}
+
+/// #3024 — children a run leaves unjoined end with it, and the nursery keeps nothing of them for
+/// the next run: no child nursery, no claim-ended child (the harness checks after every run).
+#[test]
+fn a_reused_compile_keeps_nothing_of_a_run_s_unjoined_children() {
+    let p = module(&parent("", TAIL_LEAVE));
+    let a = module(TRIVIAL);
+    let b = module(TRIVIAL);
+    assert_eq!(reused_jit(&p, &a, &b, -1, 3), vec![7, 7, 7]);
 }
 
 /// #3024 — a child that parks on a later run parks: it is not poisoned by the last run's teardown.

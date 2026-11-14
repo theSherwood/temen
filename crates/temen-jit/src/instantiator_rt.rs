@@ -1041,7 +1041,19 @@ impl Nursery {
             Vec::new()
         };
         self.release_retained();
+        // #3024 — what this nursery kept for the run's children goes with the run: each child has
+        // ended, its retained ref is released, and a freeze's harvest is taken. The nursery outlives
+        // the run on a reused compile, so a later run would otherwise find every earlier run's child
+        // nurseries still held.
+        lock(&self.kids).clear();
+        lock(&self.unclaimed).clear();
         harvest
+    }
+
+    /// #3024 — how many child nurseries and claim-ended children this nursery holds: none between
+    /// runs.
+    pub(crate) fn held(&self) -> (usize, usize) {
+        (lock(&self.kids).len(), lock(&self.unclaimed).len())
     }
 
     /// CALLS.md 5c.0 — release each child's nursery-retained shared-powerbox ref (minted live-impls
