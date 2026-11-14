@@ -107,6 +107,14 @@ extern "C" {
     fn temen_set_current_fiber(handle: i64) -> i64;
 }
 
+/// #3047 — a root computation starts on this thread: no fiber runs on it. A fault inside a fiber
+/// jumps past the resume that would restore the trap-attribution thread-local, so without this a
+/// later run's root trap on the same thread was attributed to that fiber.
+pub(crate) fn enter_root() {
+    // SAFETY: a thread-local store in `trap_capture.c`.
+    unsafe { temen_set_current_fiber(-1) };
+}
+
 /// Max concurrently-allocated fibers per run ([`temen_ir::MAX_FIBERS`]): an anti-bomb ceiling so a
 /// fiber-bomb traps (`FiberFault`) instead of exhausting host memory. `1 << 24` (~16.7M): the ceiling
 /// equals the fiber-handle index width ([`FIBER_GEN_SHIFT`]) now the arena removed the
@@ -519,8 +527,9 @@ impl SharedFiberTable {
     /// holds as many again, so its table need not regrow to them. A size hint, no state.
     pub(crate) fn reserve(&self, slots: usize) {
         let mut t = self.lock();
-        t.slots.reserve(slots);
-        t.charges.reserve(slots);
+        // A hint stays a hint: a reservation the allocator refuses is skipped, not an abort.
+        let _ = t.slots.try_reserve(slots);
+        let _ = t.charges.try_reserve(slots);
     }
 
     fn lock(&self) -> MutexGuard<'_, TableState> {
@@ -633,10 +642,17 @@ impl SharedFiberTable {
     /// #2112 — this table's domain has ended: each fiber still live hands its charge back now, not
     /// when the last reference to the table goes, so whoever learns of the end (a joining parent)
     /// finds the budget whole. Its slots stay as they are.
+    /// Its one caller is a run's end on an unwind (`RunFibers::drop`), where a fiber may still be in
+    /// use; every other end of a table is [`Self::end`], which refunds the charges too.
     pub(crate) fn release_charges(&self) {
         for c in self.lock().charges.iter_mut() {
             *c = FiberCharge::none();
         }
+    }
+
+    /// How many slots the table holds, which a handle's slot is masked to.
+    pub(crate) fn slot_count(&self) -> usize {
+        self.lock().slots.len()
     }
 
     /// #3020 — this table's run has ended, and nothing runs on any of its fibers: every fiber goes,
@@ -645,21 +661,26 @@ impl SharedFiberTable {
     /// a frame on its own stack, which no unwinding ever drops, so waiting for the last reference
     /// would keep the stack for the life of the process. The slots go too, so a table something
     /// still holds (a closed held site's) names no fiber.
-    /// How many slots the table holds, which a handle's slot is masked to.
-    pub(crate) fn slot_count(&self) -> usize {
-        self.lock().slots.len()
-    }
-
-    pub(crate) fn end(&self) {
+    ///
+    /// `trapped`: the run ended in a trap. A fault's recovery jumps past the resume that would mark
+    /// the faulting fiber parked, so its slot is left running though nothing runs on it; with no
+    /// trap, a running slot is a fiber something is still on, which must never be.
+    pub(crate) fn end(&self, trapped: bool) {
         let slots = {
             let mut t = self.lock();
-            for c in t.charges.iter_mut() {
-                *c = FiberCharge::none();
-            }
+            // Slot and charge share an index: both go, so a table something still holds stays
+            // consistent. Clearing the charges hands each back.
+            t.charges.clear();
             t.free.clear();
             std::mem::take(&mut t.slots)
         };
         for s in slots {
+            // Nothing runs on a fiber once its run has ended, unless the run faulted: a fault's
+            // recovery leaves the faulting fiber's slot `RUNNING`, and no stack is in use under it.
+            debug_assert!(
+                trapped || s.running_on.load(Ordering::Acquire) == NOT_RUNNING,
+                "a fiber ran past its run's end"
+            );
             drop(s.fiber.lock().unwrap_or_else(|e| e.into_inner()).take());
         }
     }

@@ -316,6 +316,40 @@ debug.loc 1 0 0 0 5 3
 debug.loc 2 0 0 0 9 3
 "#;
 
+/// [`PARKS_A_FIBER_WITH_DEBUG_INFO`] with two fibers parked: handles 0 and 1.
+const PARKS_TWO_FIBERS_WITH_DEBUG_INFO: &str = r#"
+func () -> (i64) {
+block 0 () {
+  v0 = ref.func 1
+  v1 = i64.const 4096
+  v2 = cont.new v0 v1
+  v3 = i64.const 5
+  v4, v5 = cont.resume v2 v3
+  v6 = cont.new v0 v1
+  v7, v8 = cont.resume v6 v3
+  return v5
+  }
+}
+
+func (i64, i64) -> (i64) {
+block 0 (v0: i64, v1: i64) {
+  v2 = call 2(v0, v1)
+  return v2
+  }
+}
+
+func (i64, i64) -> (i64) {
+block 0 (v0: i64, v1: i64) {
+  v2 = suspend v1
+  return v2
+  }
+}
+
+debug.file 0 "fib.c"
+debug.loc 1 0 0 0 5 3
+debug.loc 2 0 0 0 9 3
+"#;
+
 #[test]
 fn fiber_backtrace_walks_a_suspended_fibers_guest_stack() {
     use temen_ir::DEFAULT_RESERVED_LOG2;
@@ -487,7 +521,7 @@ fn recycled_slot_generation_guard_agrees() {
 fn fiber_backtrace_reaches_the_last_run_s_fibers_alone() {
     use temen_ir::DEFAULT_RESERVED_LOG2;
     use temen_jit::{CompiledModule, INERT_CAP_THUNK};
-    let m = parse_module(PARKS_A_FIBER_WITH_DEBUG_INFO).expect("parse");
+    let m = parse_module(PARKS_TWO_FIBERS_WITH_DEBUG_INFO).expect("parse");
     verify_module(&m).expect("verify");
     let mut cm = CompiledModule::compile(
         &m,
@@ -508,13 +542,20 @@ fn fiber_backtrace_reaches_the_last_run_s_fibers_alone() {
 
     cm.keep_parked_backtraces(true);
     let _ = cm.run(&[], None, None).expect("run 2");
-    let bt = cm.fiber_backtrace(0);
-    assert_eq!(bt.len(), 2, "run 2's parked fiber: {bt:?}");
-    let tagged = 0x5a_i64 << 56; // handle 0, a guest tag in the top byte
+    let bt = cm.fiber_backtrace(1);
+    assert_eq!(bt.len(), 2, "run 2's second parked fiber: {bt:?}");
+    // Handle 1 with a guest tag in the top byte: the slot is read masked to the table (two
+    // slots), the generation masked, as a live table reads them.
+    let tagged = (0x5a_i64 << 56) | 1;
     assert_eq!(
         cm.fiber_backtrace(tagged),
         bt,
         "a tag above the generation is ignored"
+    );
+    assert_eq!(
+        cm.fiber_backtrace(0).len(),
+        2,
+        "and the first fiber is its own"
     );
 
     cm.keep_parked_backtraces(false);

@@ -3256,6 +3256,8 @@ struct RunFibers {
     root: Option<Box<fiber_rt::FiberRuntime>>,
     /// While the root's runtime is published to this thread, what it replaced.
     prev: Option<*mut fiber_rt::FiberRuntime>,
+    /// The run ended in a trap ([`fiber_rt::SharedFiberTable::end`]'s `trapped`).
+    trapped: bool,
 }
 
 #[cfg(fiber_rt)]
@@ -3287,7 +3289,7 @@ impl Drop for RunFibers {
         if std::thread::panicking() {
             self.table.release_charges();
         } else {
-            self.table.end();
+            self.table.end(self.trapped);
         }
     }
 }
@@ -3633,6 +3635,7 @@ impl CompiledModule {
                 table,
                 root,
                 prev: None,
+                trapped: false,
             }
         })
     }
@@ -5633,6 +5636,9 @@ impl CompiledModule {
         // A fork twin's register is the parent's at the fork (POSIX: the child's thread state is
         // a copy of the forking thread's).
         vcpu_tls::seed(twin_tls.unwrap_or(0));
+        // #3047 — and its root runs on no fiber, whatever the last run on this thread left.
+        #[cfg(fiber_rt)]
+        fiber_rt::enter_root();
         // §12.8 4A.5: seed the durable shadow-base register to the root's region (context 0 =
         // `DURABLE_SHADOW_BASE`), so the root's instrumented code addresses its own per-context
         // shadow-SP word.
@@ -5926,7 +5932,10 @@ impl CompiledModule {
         // #3020 — and its fibers end with it: their stacks and charges go, and no later run's handle
         // can name one. A debugger may still ask for a parked one's backtrace, taken now.
         #[cfg(fiber_rt)]
-        if let Some(f) = run_fibers.take() {
+        if let Some(mut f) = run_fibers.take() {
+            f.trapped = vm
+                .ended()
+                .is_some_and(|e| TrapKind::from_code(e as u32).is_some());
             (*this).parked_backtraces = (*this).parked_backtraces_of(&f.table);
             (*this).fiber_slots_hint = f.table.slot_count();
             drop(f);
