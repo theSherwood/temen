@@ -786,7 +786,6 @@ fn a_call_starts_no_thread_on_executor_2() {
 /// are calls of its served handlers and it has none. On the JIT no activation ever runs on another
 /// thread over the instance's `setjmp` table. (A module that uses `setjmp` and serves is declined
 /// at the JIT's compile.)
-#[cfg(unix)] // the JIT's `setjmp` is unix-only (`setjmp_rt`); elsewhere it declines `setjmp`
 fn a_held_domain_with_setjmp_and_no_interface_takes_no_call(on: Executor) {
     bounded(move || {
         let m = module(
@@ -810,7 +809,6 @@ block 0 (vexit: i32) {
     });
 }
 
-#[cfg(unix)] // the JIT's `setjmp` is unix-only (`setjmp_rt`); elsewhere it declines `setjmp`
 on_every_executor!(a_held_domain_with_setjmp_and_no_interface_takes_no_call);
 
 /// #2877 — a held module that uses `setjmp` and serves an interface. The JIT declines it before it

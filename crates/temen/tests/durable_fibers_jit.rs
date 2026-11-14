@@ -842,14 +842,23 @@ fn jit_durable_fiber_past_the_arena_faults_like_the_oracle() {
     assert_eq!(created(&jsnap), 10, "the JIT ran the same ten fibers");
 }
 
+/// [`FIBER_SRC`] with its second resume naming handle 10, a fiber it never made.
+fn past_src() -> String {
+    FIBER_SRC.replace(
+        " v7, v8 = cont.resume v2 v6\n",
+        " vten = i64.const 10\n v7, v8 = cont.resume vten v6\n",
+    )
+}
+
 /// #2878 — a thaw residue is untrusted (DURABILITY.md §4), so a seed is bounded by the arena as
 /// `cont.new` is: an interp-frozen one-fiber artifact whose residue is padded to eleven fibers, one
 /// more than `TEST_ARENA`'s ten fiber contexts hold. Both engines seed the ten that fit and stop at
-/// the eleventh (slot 10, context 11), whose resume would write past the arena; the root's rewind
-/// names only fiber 0, so both run on to the uninterrupted answer.
+/// the eleventh (slot 10, context 11). The root's second resume names handle 10 ([`past_src`]):
+/// unseeded, it is no fiber, so both engines trap `FiberFault`, as the uninterrupted run does.
+/// Before, the JIT seeded slot 10 and its resume wrote the context's words past the arena.
 #[test]
 fn a_thaw_seed_past_the_arena_is_not_seeded_on_either_engine() {
-    let m = parse_module(FIBER_SRC).expect("parse");
+    let m = parse_module(&past_src()).expect("parse");
     let inst = transform_module(&m).expect("transform");
     verify_module(&inst).expect("verify");
     let mut ihost = Host::new();
@@ -890,7 +899,7 @@ fn a_thaw_seed_past_the_arena_is_not_seeded_on_either_engine() {
     )
     .expect("JIT thaw");
     assert!(
-        matches!(jout, JitOutcome::Returned(ref s) if s == &[107]),
+        matches!(jout, JitOutcome::Trapped(temen_jit::TrapKind::FiberFault)),
         "JIT thaw: {jout:?}"
     );
 
@@ -906,5 +915,5 @@ fn a_thaw_seed_past_the_arena_is_not_seeded_on_either_engine() {
         WINDOW_LOG2,
         &mut thost,
     );
-    assert_eq!(tres, Ok(vec![Value::I64(107)]), "oracle thaw");
+    assert_eq!(tres, Err(temen_interp::Trap::FiberFault), "oracle thaw");
 }

@@ -120,6 +120,40 @@ const COMPILE_INVOKE: &str = "memory 16\nfunc (i32, i32, i32) -> (i32) {\nblock 
 /// `(i64,i64)->(i64)` suspends its arg, then on the next resume adds 100 and returns.
 const COMPILE_INVOKE_0ARG: &str = "memory 16\nfunc (i32) -> (i64) {\nblock 0 (v0: i32) {\n  v1 = i64.const 20480\n  v2 = i64.const BLOBLEN\n  v3 = call.cap 11 0 (i64, i64) -> (i64) v0 (v1, v2)\n  v4 = call.cap 11 1 (i64) -> (i64) v0 (v3)\n  return v4\n  }\n}\nfunc (i64, i64) -> (i64) {\nblock 0 (v0: i64, v1: i64) {\n  v2 = suspend v1\n  v3 = i64.const 100\n  v4 = i64.add v2 v3\n  return v4\n  }\n}\n";
 
+/// The tree-walker's half of [`run_both`]: its result and final window.
+fn run_interp(
+    guest_src: &str,
+    blob_bytes: &[u8],
+    user_args: &[i64],
+    grant: fn(&mut Host, &temen_ir::Module, u8) -> i32,
+    table_log2: u8,
+) -> (Result<Vec<Value>, temen_interp::Trap>, Vec<u8>) {
+    let (m, init) = guest(guest_src, blob_bytes);
+    let mut host_i = Host::new();
+    let h_i = grant(&mut host_i, &m, table_log2);
+    let mut iargs = vec![Value::I32(h_i)];
+    iargs.extend(user_args.iter().map(|&a| Value::I32(a as i32)));
+    let mut fuel = 50_000_000u64;
+    run_capture_reserved_with_host(
+        &m,
+        0,
+        &iargs,
+        &mut fuel,
+        &init,
+        DEFAULT_RESERVED_LOG2,
+        &mut host_i,
+    )
+}
+
+/// `guest_src` parsed and verified, and its window image with `blob_bytes` at `BLOB_OFF`.
+fn guest(guest_src: &str, blob_bytes: &[u8]) -> (temen_ir::Module, Vec<u8>) {
+    let m = parse_module(guest_src).expect("parse guest");
+    verify_module(&m).expect("verify guest");
+    let mut init = vec![0u8; BLOB_OFF + blob_bytes.len()];
+    init[BLOB_OFF..].copy_from_slice(blob_bytes);
+    (m, init)
+}
+
 /// How `guest_src`, with `blob_bytes` at `BLOB_OFF` and its `Jit` handle first among `user_args`,
 /// ends on the tree-walker and on the JIT, each over a host `grant` mints the handle on with a
 /// `2^table_log2`-slot install table: the interpreter's result and final window, then the JIT's.
@@ -135,30 +169,13 @@ fn run_both(
     JitOutcome,
     Vec<u8>,
 ) {
-    let m = parse_module(guest_src).expect("parse guest");
-    verify_module(&m).expect("verify guest");
-    let mut init = vec![0u8; BLOB_OFF + blob_bytes.len()];
-    init[BLOB_OFF..].copy_from_slice(blob_bytes);
-
-    let mut host_i = Host::new();
-    let h_i = grant(&mut host_i, &m, table_log2);
-    let mut iargs = vec![Value::I32(h_i)];
-    iargs.extend(user_args.iter().map(|&a| Value::I32(a as i32)));
-    let mut fuel = 50_000_000u64;
-    let (ires, imem) = run_capture_reserved_with_host(
-        &m,
-        0,
-        &iargs,
-        &mut fuel,
-        &init,
-        DEFAULT_RESERVED_LOG2,
-        &mut host_i,
-    );
-
+    let (ires, imem) = run_interp(guest_src, blob_bytes, user_args, grant, table_log2);
+    let (m, init) = guest(guest_src, blob_bytes);
     let mut host_j = Host::new();
     let h_j = grant(&mut host_j, &m, table_log2);
     assert_eq!(
-        h_i, h_j,
+        grant(&mut Host::new(), &m, table_log2),
+        h_j,
         "identical powerbox setup must mint identical handles"
     );
     let mut jargs = vec![h_j as i64];
@@ -1473,7 +1490,6 @@ fn a_park_seam_fails_the_serve_qualification() {
 /// give the oracle's answer; the JIT must never `_longjmp` from the fiber's stack into the entry's, so
 /// it refuses the unit (`setjmp_rt::admits`): a split by tier, as for a threaded unit under a
 /// fibers-only grant.
-#[cfg(unix)] // the JIT's `setjmp` is unix-only (`setjmp_rt`); elsewhere it declines `setjmp`
 #[test]
 fn a_submitted_unit_cannot_longjmp_out_of_its_fiber() {
     let b = blob(
@@ -1507,22 +1523,23 @@ block 2 (vr: i32) {
         "  v2 = i32.const 5\n  longjmp v1 v2\n  unreachable\n",
     );
     let guest = with_len(&base, b.len());
-    let (ires, _, jout, _) = run_both(&guest, &b, &[], grant_jit_fibers, 0);
+    let (ires, _) = run_interp(&guest, &b, &[], grant_jit_fibers, 0);
     assert_eq!(
         ires,
         Err(temen_interp::Trap::Malformed),
         "the interpreters keep each checkpoint with its frame: the fiber's `longjmp` finds none"
     );
-    assert!(
+    jit_half(&guest, &b, grant_jit_fibers, 0, |jout| {
+        assert!(
         matches!(jout, JitOutcome::Trapped(TrapKind::CapFault)),
         "the JIT refuses the unit at its compile, and the invoke of the refused handle faults: {jout:?}"
-    );
+    )
+    });
 }
 
 /// #2877 (audit finding 1, threads) — as [`a_submitted_unit_cannot_longjmp_out_of_its_fiber`], over
 /// a thread-hosting grant: an installed unit's entry takes a checkpoint and spawns a vCPU that
 /// `longjmp`s to it from its own thread.
-#[cfg(unix)] // the JIT's `setjmp` is unix-only (`setjmp_rt`); elsewhere it declines `setjmp`
 #[test]
 fn a_submitted_unit_cannot_longjmp_out_of_its_thread() {
     let unit = "memory 16
@@ -1559,14 +1576,97 @@ block 0 (vsp: i64, varg: i64) {
     // The base takes the thread-hosting grant and has a `setjmp` table (its func 1, never called).
     let guest_src = "memory 16\nfunc (i32) -> (i32) {\nblock 0 (v0: i32) {\n  v1 = i64.const 20480\n  v2 = i64.const BLOBLEN\n  v3 = call.cap 11 0 (i64, i64) -> (i64) v0 (v1, v2)\n  v4 = call.cap 11 3 (i64) -> (i64) v0 (v3)\n  v5 = i32.wrap_i64 v4\n  v6 = call.dyn () -> (i32) v5 ()\n  return v6\n  }\n}\nfunc (i64) -> (i64) {\nblock 0 (v0: i64) {\n  v1 = setjmp v0\n  v2 = i64.extend_i32_u v1\n  return v2\n  }\n}\n";
     let guest = with_len(guest_src, b.len());
-    let (ires, _, jout, _) = run_both(&guest, &b, &[], grant_jit_threads, 4);
+    let (ires, _) = run_interp(&guest, &b, &[], grant_jit_threads, 4);
     assert_eq!(
         ires,
         Err(temen_interp::Trap::Malformed),
         "the spawned vCPU's `longjmp` finds no checkpoint of its own"
     );
-    assert!(
+    jit_half(&guest, &b, grant_jit_threads, 4, |jout| {
+        assert!(
         matches!(jout, JitOutcome::Trapped(TrapKind::CapFault)),
         "the JIT refuses the unit at its compile, and the dispatch of the refused handle faults: {jout:?}"
+    )
+    });
+}
+
+/// #2877 — the floor: a `Jit.invoke`d unit `longjmp`s to a checkpoint its invoker took. The jump
+/// would cross the host frames of the `call.cap` that runs the unit, so every engine refuses it. On
+/// the JIT the invoke's guarded call floors the table (`setjmp_rt::Scope`), so the unit finds no
+/// checkpoint; on the interpreters the unit runs as a computation of its own.
+/// This is the direct API (`jit_cap_run`); a routed run of a module that uses `setjmp` and can
+/// drive the `Jit` folds to the interpreters before it starts.
+#[test]
+fn an_invoked_unit_cannot_longjmp_to_its_invokers_checkpoint() {
+    let b = blob(
+        "memory 16
+func () -> (i64) {
+block 0 () {
+  vb = i64.const 40000
+  v5 = i32.const 5
+  longjmp vb v5
+  unreachable
+  }
+}
+",
     );
+    let guest = with_len(
+        "memory 16
+func (i32) -> (i64) {
+block 0 (vh: i32) {
+  vb = i64.const 40000
+  vs = setjmp vb
+  vz = i32.const 0
+  vc = i32.eq vs vz
+  br_if vc 1(vh) 2(vs)
+  }
+block 1 (vh1: i32) {
+  v1 = i64.const 20480
+  v2 = i64.const BLOBLEN
+  v3 = call.cap 11 0 (i64, i64) -> (i64) vh1 (v1, v2)
+  v4 = call.cap 11 1 (i64) -> (i64) vh1 (v3)
+  return v4
+  }
+block 2 (vr: i32) {
+  vw = i64.extend_i32_u vr
+  vk = i64.const 1000
+  vx = i64.add vw vk
+  return vx
+  }
+}
+",
+        b.len(),
+    );
+    let (ires, _) = run_interp(&guest, &b, &[], grant_jit, 0);
+    assert_eq!(
+        ires,
+        Err(temen_interp::Trap::Malformed),
+        "the interpreters: the invoked unit's computation holds no checkpoint"
+    );
+    jit_half(&guest, &b, grant_jit, 0, |jout| {
+        assert!(
+            matches!(jout, JitOutcome::Trapped(k) if k.code() == temen_ir::trap_code::MALFORMED),
+            "the unit reached its invoker's checkpoint across the invoke's host frames: {jout:?}"
+        )
+    });
+}
+
+/// The JIT's half of a `setjmp` row: where the JIT has `setjmp` (`setjmp_rt`, unix), its outcome
+/// goes to `check`; elsewhere it declines the module outright, so a routed run folds before it
+/// starts and the interpreters' half is the whole answer.
+fn jit_half(
+    guest_src: &str,
+    blob_bytes: &[u8],
+    grant: fn(&mut Host, &temen_ir::Module, u8) -> i32,
+    table_log2: u8,
+    check: impl FnOnce(JitOutcome),
+) {
+    if cfg!(unix) {
+        check(run_both(guest_src, blob_bytes, &[], grant, table_log2).2);
+    } else {
+        assert!(
+            !temen_jit::admits(&guest(guest_src, blob_bytes).0),
+            "the JIT declines `setjmp` here"
+        );
+    }
 }

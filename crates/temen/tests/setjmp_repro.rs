@@ -635,32 +635,34 @@ fn a_setjmp_into_a_readonly_page_faults_on_every_engine() {
     assert_every_engine(&src, 1, Err(temen_ir::trap_code::MEMORY_FAULT));
 }
 
-/// One compiled module run twice over one window: the first run takes a checkpoint (its token stays
-/// in the buffer) and returns; the second `longjmp`s with that token. The first run's activation is
-/// long gone — the JIT's table outlives runs, so it must drop a run's checkpoints when the run ends.
-#[test]
-fn a_jit_rerun_cannot_reach_an_earlier_runs_checkpoint() {
-    let src = "memory 16
-func (i64) -> (i64) {
-block 0 (v0: i64) {
+/// One compiled module run twice over one window: the first run (`x = 0`) takes a checkpoint (its
+/// token stays in the buffer) and then ends as `first_end` says; the second (`x = 1`) `longjmp`s with
+/// that token. The first run's activation is long gone — the JIT's table outlives runs, so it must
+/// drop a run's checkpoints when the run ends. The first run's outcome and the second's.
+fn rerun(first_end: &str) -> (JitOutcome, JitOutcome) {
+    let src = format!(
+        "memory 16
+func (i64) -> (i64) {{
+block 0 (v0: i64) {{
   v1 = i64.const 48000
   v2 = i64.const 0
   v3 = i64.eq v0 v2
   br_if v3 1(v1) 2(v1)
-  }
-block 1 (v4: i64) {
+  }}
+block 1 (v4: i64) {{
   v5 = setjmp v4
   v6 = i64.extend_i32_u v5
-  return v6
-  }
-block 2 (v7: i64) {
+  {first_end}
+  }}
+block 2 (v7: i64) {{
   v8 = i32.const 7
   longjmp v7 v8
   unreachable
-  }
-}
-";
-    let m = parse_module(src).expect("parse");
+  }}
+}}
+"
+    );
+    let m = parse_module(&src).expect("parse");
     verify_module(&m).expect("verify");
     let mut host = temen_interp::Host::new();
     let mut cm = temen_jit::CompiledModule::compile(
@@ -677,16 +679,95 @@ block 2 (v7: i64) {
         0,
     )
     .expect("compile");
-    let (first, window) = cm.run(&[0], None, None).expect("first run");
+    // The first run's window, captured whole, is the second's: the token is in the buffer.
+    let (first, window) = cm.run(&[0], None, Some(1 << 16)).expect("first run");
+    let token = u64::from_le_bytes(window[48000..48008].try_into().expect("the window"));
+    assert_ne!(token, 0, "the first run's setjmp wrote its token");
+    let (second, _) = cm.run(&[1], Some(&window), None).expect("second run");
+    (first, second)
+}
+
+/// The first run returns: its exit drops the checkpoint (`rt_setjmp_leave`).
+#[test]
+fn a_jit_rerun_cannot_reach_an_earlier_runs_checkpoint() {
+    let (first, second) = rerun("return v6");
     assert!(
         matches!(first, JitOutcome::Returned(ref v) if v == &[0]),
         "{first:?}"
     );
-    let (second, _) = cm.run(&[1], Some(&window), None).expect("second run");
     assert!(
         matches!(second, JitOutcome::Trapped(k) if k.code() == MALFORMED),
         "the second run reached the first's checkpoint: {second:?}"
     );
+}
+
+/// The first run faults holding its checkpoint: a hardware fault (a load in the NULL guard) unwinds
+/// the whole guarded call, so no frame's exit runs to drop it. The guarded call's scope does
+/// (`setjmp_rt::Scope`, which every run enters). Without it the second run's `longjmp` would land in
+/// the first run's dead frame.
+#[test]
+fn a_jit_rerun_cannot_reach_a_checkpoint_a_faulted_run_held() {
+    let (first, second) = rerun("v9 = i64.const 64\n  v10 = i64.load v9\n  return v10");
+    assert!(
+        matches!(first, JitOutcome::Trapped(k) if k.code() == temen_ir::trap_code::MEMORY_FAULT),
+        "{first:?}"
+    );
+    assert!(
+        matches!(second, JitOutcome::Trapped(k) if k.code() == MALFORMED),
+        "the second run reached the trapped run's checkpoint: {second:?}"
+    );
+}
+
+/// #2877 — a tail call ends the activation that made it, so it drops the checkpoints that activation
+/// took, as a return does. Func 1 takes a checkpoint and tail-calls func 2 (`return_call`, or
+/// `return_call.dyn` when `x = 1`), which `longjmp`s to it: the checkpoint's activation is gone, so
+/// every engine traps. On the JIT that is the `rt_setjmp_leave` before each tail call; on the
+/// bytecode engine the `leave` bit on `TailCall` / `TailCallIndirect`.
+const TAIL_CALLED_AWAY: &str = "memory 16
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  v1 = i64.const 48000
+  v2 = call 1(v1, v0)
+  return v2
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (v0: i64, v1: i64) {
+  v2 = setjmp v0
+  v3 = i32.const 0
+  v4 = i32.eq v2 v3
+  br_if v4 1(v0, v1) 4(v2)
+  }
+block 1 (v5: i64, v6: i64) {
+  v7 = i64.const 0
+  v8 = i64.eq v6 v7
+  br_if v8 2(v5) 3(v5)
+  }
+block 2 (v9: i64) {
+  return_call 2(v9)
+  }
+block 3 (v10: i64) {
+  v11 = i32.const 2
+  return_call.dyn (i64) -> (i64) v11 (v10)
+  }
+block 4 (v12: i32) {
+  v13 = i64.extend_i32_u v12
+  return v13
+  }
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  v1 = i32.const 7
+  longjmp v0 v1
+  unreachable
+  }
+}
+";
+
+#[test]
+fn a_longjmp_to_a_checkpoint_its_activation_tail_called_away_traps_on_every_engine() {
+    assert_every_engine(TAIL_CALLED_AWAY, 0, Err(MALFORMED));
+    assert_every_engine(TAIL_CALLED_AWAY, 1, Err(MALFORMED));
 }
 
 /// #2877 — a module that uses `setjmp` and serves an interface is declined by the JIT before it

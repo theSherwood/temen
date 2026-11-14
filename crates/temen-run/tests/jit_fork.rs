@@ -787,7 +787,6 @@ fn the_runs_fuel_stops_a_spinning_twin_on_every_engine() {
 /// fork it, and the twin's frames carry their checkpoints with them: its `longjmp` lands in its own
 /// copy of `_start`, which exits `50 + 7`, and the parent exits with the twin's status. On a refusal
 /// the parent exits `100 + errno`.
-#[cfg(unix)] // the JIT's `setjmp` is unix-only (`setjmp_rt`); elsewhere it declines `setjmp`
 const FORK_AFTER_SETJMP: &str = "\
 func () -> () {
 block 0 () {
@@ -840,7 +839,6 @@ block 6 () {
 export 0 func \"_start\" 0
 ";
 
-#[cfg(unix)] // the JIT's `setjmp` is unix-only (`setjmp_rt`); elsewhere it declines `setjmp`
 #[test]
 fn a_twin_longjmps_to_a_checkpoint_taken_before_the_fork_only_where_it_forks() {
     for backend in [Backend::TreeWalk, Backend::Bytecode] {
@@ -850,9 +848,12 @@ fn a_twin_longjmps_to_a_checkpoint_taken_before_the_fork_only_where_it_forks() {
             "{backend:?}: the twin resumes its own copy of the checkpoint"
         );
     }
+    // Where the JIT has no `setjmp` (not unix) it declines the module, so the run folds to the
+    // interpreters, which fork it.
+    let jit = if cfg!(unix) { 100 + 38 } else { 57 };
     assert_eq!(
         run_on(FORK_AFTER_SETJMP, true, Backend::Jit, &RunConfig::default()),
-        Outcome::Exited(100 + 38),
-        "the JIT answers -ENOSYS: no twin runs"
+        Outcome::Exited(jit),
+        "the JIT answers -ENOSYS (no twin runs), or folds where it has no setjmp"
     );
 }
