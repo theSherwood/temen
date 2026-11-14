@@ -1,12 +1,16 @@
 //! #2958 slice 3 — `MprotectWindow`'s futex face (`temen_interp::FutexWindow`), the host code that
 //! reads a guest word at a guest-chosen address on the kernel route, tested as its own unit:
 //!
-//! - **The guarded read against a model.** Random page ops, then random addresses and widths: the
-//!   read is refused exactly when a byte lies outside the reservation, the address is misaligned,
-//!   the page is below the NULL guard, or the page is not readable, and otherwise answers the word.
-//!   A read the model refuses that the window admitted would fault this process.
-//! - **The race.** Threads read words of a page while another unmaps, maps and protects it, for as
-//!   long as it takes: the process never faults, and each read answers a value or a refusal.
+//! - **The guarded read against a model.** Random page ops and §13 region maps, then random
+//!   addresses and widths: the read is refused exactly when a byte lies outside the reservation, the
+//!   address is misaligned, the page is below the NULL guard, or the page is not readable, and
+//!   otherwise answers the word. A read the model refuses that the window admitted would be
+//!   recovered, and counted (`CapPages::recovered`), which the test asserts never happens. And the
+//!   keys (#2958 slice 4): two aliases of one region byte key alike, and a word on
+//!   an alias and a private word at the same offset key apart.
+//! - **The races.** Threads read words of a page while another unmaps, maps and protects it: each
+//!   read answers a value or a refusal, and none is recovered. And threads read a §13 alias while
+//!   another maps the region over it again: every read answers, and none is recovered.
 #![cfg(unix)]
 
 use temen_interp::{FutexWindow, GuestMem};
@@ -94,7 +98,14 @@ fn the_guarded_read_refuses_exactly_what_the_model_refuses() {
     let reserved = pages * page;
     for seed in 1..=64u64 {
         let r = Reservation::new(reserved as usize, (prefix * page) as usize);
-        let mut w = MprotectWindow::new(r.base, prefix * page, reserved);
+        let map = temen_interp::CapPageMap::default();
+        let mut w = MprotectWindow::new_shared(r.base, prefix * page, reserved, map.clone());
+        // A region of two pages, which a map aliases one page of at a time.
+        let region = temen_run::new_shared_region((2 * page) as usize).expect("a region");
+        // Which region page each window page aliases, if any.
+        let mut alias: Vec<Option<u64>> = vec![None; pages as usize];
+        // A region map has succeeded: the window's `aliased` is set from then on, never cleared.
+        let mut ever = false;
         w.set_null_guard(guard * page);
         // The NULL guard is the window start's to protect (`seed_window`), not a page op's.
         // SAFETY: the guard's pages lie inside the reservation.
@@ -115,22 +126,69 @@ fn the_guarded_read_refuses_exactly_what_the_model_refuses() {
             let n = 1 + rng.below(3).min(pages - first - 1);
             let (off, len) = (first * page, n * page);
             let prot = [0, 1, 3][rng.below(3) as usize];
-            let (rc, readable) = match rng.below(4) {
+            let rp = rng.below(2);
+            let which = rng.below(5);
+            let (rc, readable) = match which {
                 0 => (w.map(off, len, prot), prot & 1 != 0),
                 1 => (w.unmap(off, len), false),
                 2 => (w.protect(off, len, prot), prot & 1 != 0),
+                3 => (
+                    w.map_region(off, rp * page, page, 3, 7, region.clone()),
+                    true,
+                ),
                 _ => (1, false),
             };
+            // A region map aliases one page.
+            let n = if which == 3 { 1 } else { n };
             if rc == 0 {
-                for m in &mut model[first as usize..(first + n) as usize] {
-                    *m = if readable {
+                for p in first..first + n {
+                    model[p as usize] = if readable {
                         Model::Readable
                     } else {
                         Model::Not
                     };
+                    // A region map makes the page an alias; a protect that leaves access keeps one;
+                    // any other op ends one.
+                    alias[p as usize] = match which {
+                        3 => Some(rp),
+                        2 if readable => alias[p as usize],
+                        _ => None,
+                    };
                 }
+                ever |= which == 3;
             } else if rc < 0 {
                 assert!(first < guard, "seed {seed}: only the guard refuses: {rc}");
+                // A refused op changes nothing, a region map's record of its region included.
+                if which == 3 && !ever {
+                    assert!(
+                        !map.aliased(),
+                        "seed {seed}: a refused map records no alias"
+                    );
+                    assert_eq!(map.region_ident(7), None, "seed {seed}");
+                }
+            }
+            // The keys: at one offset, the words of two readable pages key alike exactly when they
+            // are one page or alias one region page.
+            let o = 4 * rng.below(page / 4);
+            let readable: Vec<u64> = (0..pages)
+                .filter(|&p| matches!(model[p as usize], Model::Readable))
+                .collect();
+            let key = |p: u64| {
+                let base = w.prepare_wait(p * page + o, 4).expect("readable");
+                w.site_key(w.futex_site(base))
+            };
+            for &p in &readable {
+                for &q in &readable {
+                    let same = p == q
+                        || matches!((alias[p as usize], alias[q as usize]), (Some(a), Some(b)) if a == b);
+                    assert_eq!(
+                        key(p) == key(q),
+                        same,
+                        "seed {seed}: pages {p} and {q} at {o:#x}, aliases {:?} and {:?}",
+                        alias[p as usize],
+                        alias[q as usize]
+                    );
+                }
             }
             // Reads at random addresses and widths, including past the reservation.
             for _ in 0..16 {
@@ -151,6 +209,12 @@ fn the_guarded_read_refuses_exactly_what_the_model_refuses() {
                     got.is_some(),
                     want,
                     "seed {seed}: a {width}-byte read at {addr:#x}"
+                );
+                // Every refusal is the map check's: no read faulted and was recovered.
+                assert_eq!(
+                    map.recovered(),
+                    0,
+                    "seed {seed}: a recovered read at {addr:#x}"
                 );
                 if let Some(v) = got {
                     // SAFETY: the model, and so the read just made, says the word is readable.
@@ -233,9 +297,106 @@ fn a_read_racing_an_unmap_or_a_protect_never_faults_the_host() {
             refused += none;
         }
     });
-    // Both answers happened: the reads raced the page ops, and none faulted the process.
+    // Both answers happened: the reads raced the page ops, and none faulted the process. The
+    // refusals are all the map check's: a read meeting a page op's hardware change midway would be
+    // recovered (`wait_word`'s load installs the fault handler), and counted.
     assert!(
         answered > 0 && refused > 0,
         "{answered} read, {refused} refused"
     );
+    assert_eq!(pages.recovered(), 0, "a read recovered a fault");
+}
+
+/// #2958 slice 4 review, finding 4 — a region's identity is held as the interpreter holds it, by a
+/// weak hold on its backing: once an alias of region 7 is unmapped and the region dropped, no region
+/// made after it has its identity while the page map still names it, so a waiter that parked on the
+/// old region meets no new one at its address. This pins only the half that holds: once the host
+/// reuses the region's id slot the old identity can recur (#3036, parity on every engine).
+#[test]
+fn a_dropped_regions_identity_is_not_reused_while_the_map_names_it() {
+    let page = temen_interp::host_page_size();
+    let (prefix, reserved) = (8 * page, 32 * page);
+    let r = Reservation::new(reserved as usize, prefix as usize);
+    let map = temen_interp::CapPageMap::default();
+    let mut w = MprotectWindow::new_shared(r.base, prefix, reserved, map.clone());
+    let at = 16 * page;
+    let old = temen_run::new_shared_region(page as usize).expect("a region");
+    assert_eq!(w.map_region(at, 0, page, 3, 7, old.clone()), 0);
+    let ident = map.region_ident(7).expect("recorded");
+    assert_eq!(ident, std::sync::Arc::as_ptr(&old) as *const u8 as u64);
+    assert_eq!(w.unmap(at, page), 0);
+    drop(old);
+    let later: Vec<_> = (0..64)
+        .map(|_| temen_run::new_shared_region(page as usize).expect("a region"))
+        .collect();
+    for b in &later {
+        assert_ne!(std::sync::Arc::as_ptr(b) as *const u8 as u64, ident);
+    }
+    assert_eq!(map.region_ident(7), Some(ident), "the entry still names it");
+}
+
+/// #2958 slice 4 review — the race on `map_region`'s arm of the contract: readers make the guarded
+/// read of a §13 alias while a writer maps the region over the live alias, again and again. Unix
+/// `map_region` holds the page map's lock across its `MAP_FIXED` replacement and the marking, so
+/// every read meets the page whole: none is refused, and none is recovered. Linux's `MAP_FIXED` is
+/// atomic to a concurrent access, so this row bites where it is not (macOS): there, without the
+/// lock, a read would meet the replacement midway and be recovered as a `MemoryFault`. Bounded by
+/// the writer's count of maps.
+#[test]
+fn a_read_racing_a_map_over_its_alias_meets_the_page_whole() {
+    let page = temen_interp::host_page_size();
+    let g = temen_interp::host_region_granularity();
+    let (prefix, reserved) = (8 * page, 32 * page);
+    let r = Reservation::new(reserved as usize, prefix as usize);
+    let pages = temen_interp::CapPageMap::default();
+    let at = 16 * page;
+    assert!(at.is_multiple_of(g) && at + g <= reserved);
+    let region = temen_run::new_shared_region(g as usize).expect("a region");
+    let mut w = MprotectWindow::new_shared(r.base, prefix, reserved, pages.clone());
+    assert_eq!(w.map_region(at, 0, g, 3, 7, region.clone()), 0);
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    let (mut answered, mut refused) = (0u64, 0u64);
+    std::thread::scope(|s| {
+        let _stop = Stop(&stop);
+        let busy: Vec<_> = (0..2)
+            .map(|_| {
+                s.spawn(|| {
+                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        std::hint::spin_loop();
+                    }
+                })
+            })
+            .collect();
+        let readers: Vec<_> = (0..3)
+            .map(|i| {
+                let (base, pages, stop) = (r.base as usize, pages.clone(), &stop);
+                s.spawn(move || {
+                    let w = MprotectWindow::new_shared(base as *mut u8, prefix, reserved, pages);
+                    let (mut some, mut none) = (0u64, 0u64);
+                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        match w.wait_word(at + 8 * i, 4) {
+                            Some(_) => some += 1,
+                            None => none += 1,
+                        }
+                    }
+                    (some, none)
+                })
+            })
+            .collect();
+        for i in 0..20_000 {
+            assert_eq!(w.map_region(at, 0, g, 3, 7, region.clone()), 0, "map {i}");
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        for b in busy {
+            b.join().expect("busy");
+        }
+        for t in readers {
+            let (some, none) = t.join().expect("a reader");
+            answered += some;
+            refused += none;
+        }
+    });
+    assert!(answered > 0, "the readers read");
+    assert_eq!(refused, 0, "a read met the replacement midway");
+    assert_eq!(pages.recovered(), 0, "a read recovered a fault");
 }

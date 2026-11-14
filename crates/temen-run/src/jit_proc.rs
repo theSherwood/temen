@@ -410,11 +410,7 @@ impl Tree {
             return EAGAIN;
         };
         let pid = st.next_pid;
-        let pages = host
-            .cap_window_pages(point.window_base())
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
+        let pages = host.cap_window_pages(point.window_base()).lock().clone();
         // The window first: refusing it has registered nothing, so its number is not burned.
         let Some(window) = point.twin(&pages, 0) else {
             return EAGAIN;

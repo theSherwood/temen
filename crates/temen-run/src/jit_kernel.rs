@@ -31,29 +31,20 @@ use temen_jit::{CompiledModule, FuelCell, JitOutcome, TrapKind};
 /// A program [`admit`] admitted: only a [`run`] of it takes the kernel's route.
 pub struct Admitted<'m>(&'m Module);
 
-/// Whether `m`, started from `init` under `host`, runs its vCPUs as the kernel's tasks:
-/// `temen_interp::bytecode::native_scope`, plus the start's own clauses:
-/// - **`region start`**: a window that would start with a §13 region aliased into it: a captured
-///   layout that aliases one, or a host with a pre-map to apply (an op-17 pre-map an embedder
-///   staged, or a thaw's §13 pages, `Host::has_premap`). A native window keys a futex word on its
-///   own backing, so a word on an alias would not rendezvous with the region's other mappings. With
-///   this clause and `native_scope`'s `cap` (which declines every op that maps a region), no page of
-///   a native window is ever an alias. The phase that brings §13 regions onto this route removes
-///   both.
+/// Whether `m`, under `host`, runs its vCPUs as the kernel's tasks:
+/// `temen_interp::bytecode::native_scope`, plus the start's own clause:
 /// - **`kept code`**: the embedder keeps the run's compile for later runs (a `JitCodeCache`,
 ///   #2389), whose shared code the kernel route does not instance yet (#2981).
 ///
-/// `Err` names the clause that keeps it on the JIT's own runtime, with nothing taken from `host`.
+/// A window that starts with a §13 region aliased into it (a restored layout's, a pre-map) is
+/// admitted: its words key on their region (#2958 slice 4). `Err` names the clause that keeps it on the JIT's own runtime, with nothing taken from
+/// `host`.
 pub fn admit<'m>(
     m: &'m Module,
     host: &Host,
-    init: Option<&temen_interp::MemLayout>,
     kept_code: bool,
 ) -> Result<Admitted<'m>, &'static str> {
     temen_interp::bytecode::native_scope(m, host)?;
-    if host.has_premap() || init.is_some_and(temen_interp::MemLayout::aliases_regions) {
-        return Err("region start");
-    }
     if kept_code {
         return Err("kept code");
     }
@@ -115,7 +106,7 @@ pub fn run_fresh(
     kill: Option<&Arc<temen_jit::Interrupt>>,
 ) -> Result<(JitOutcome, u64), &'static str> {
     let mut host = Host::new();
-    let admitted = admit(m, &host, None, false)?;
+    let admitted = admit(m, &host, false)?;
     let start = Start {
         entry,
         args,
@@ -187,6 +178,21 @@ pub struct Start<'a> {
     pub kill: Option<&'a Arc<temen_jit::Interrupt>>,
 }
 
+std::thread_local! {
+    /// How many kernel runs this thread has opened ([`kernel_runs`]).
+    static RUNS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Test-facing: how many runs this thread has taken the kernel route for. The kernel runs its root on
+/// the caller's thread, so a test reads, before and after an embedder's run, which route that run
+/// took (`jit_run` falls back to the JIT's own runtime when [`admit`] declines, and says nothing).
+/// Correct only while the run's root runs on the caller's thread: a change that moves it elsewhere
+/// must move this count with it.
+#[doc(hidden)]
+pub fn kernel_runs() -> u64 {
+    RUNS.with(std::cell::Cell::get)
+}
+
 /// Run the admitted program as `start` says, its vCPUs as the kernel's tasks, under `host`. `Err` is
 /// the JIT's compile refusing it, with nothing run and `host` as it was.
 pub fn run(
@@ -195,6 +201,7 @@ pub fn run(
     host: &mut Host,
 ) -> Result<KernelEnd, temen_jit::JitError> {
     let m = admitted.0;
+    RUNS.with(|r| r.set(r.get() + 1));
     let f = m
         .funcs
         .get(start.entry as usize)
@@ -207,6 +214,8 @@ pub fn run(
     // The compiled instance's cell, which no vCPU charges (each has its own, `tier_run`): it only
     // arms the compile's fuel checks, and lives as long as the code (`KernelRun::new`).
     let mut armed = metered.then(|| FuelCell::fixed(0));
+    // Every kernel run is concurrent (`native_scope`'s `no §12 op`), so its calls take the locked
+    // thunk alone (#2958 condition 3, met by routing in phase 1).
     let cm = CompiledModule::compile(
         m,
         start.entry,
@@ -460,37 +469,33 @@ impl KernelPark for Hook<'_, '_> {
 mod tests {
     use super::*;
 
-    /// A program whose root does not run whole on the JIT: an import its host does not bind keeps
-    /// the root interpreted (`image_parks`), so its call to a function the tier emits tiers up as an
-    /// interpreted call.
-    const INTERPRETED_ROOT: &str = r#"import 0 "vm_page_size" () -> (i64)
-memory 16
+    /// A program `native_scope` declines (`jit cap`): a §22 `Jit.invoke`, which only the JIT's own
+    /// runtime serves, beside a §12 op.
+    const SERVES: &str = r#"memory 16
 func () -> (i64) {
 block 0 () {
-  vz = i64.const 0
-  vh = thread.spawn 1 vz vz
-  vst, vv = thread.join vh
-  vr = call 1(vz, vv)
-  return vr
-  }
-}
-func (i64, i64) -> (i64) {
-block 0 (va: i64, vb: i64) {
-  vone = i64.const 1
-  vr = i64.add vb vone
-  return vr
+  vq = i64.const 16400
+  vone = i32.const 1
+  vk = atomic.notify vq vone
+  vz = i32.const 0
+  vc = i64.const 0
+  vn = call.cap 11 1 (i64) -> (i64) vz (vc)
+  return vn
   }
 }
 "#;
 
-    /// The JIT's tier traps an interpreted call (`CallEntry::Call`): what makes every vCPU of an
-    /// admitted program native. `admit` declines this one (`imports`); run past it, it traps.
+    /// Run past `admit`, a declined program meets the kernel route's two guards: the native tier's
+    /// root offer asserts `native_scope` (`NativeTier`'s contract) in a build with debug assertions,
+    /// and in any other the call's thunk traps the domain `Malformed` (`kernel_backstop`) instead of
+    /// reaching the JIT's own runtime.
     #[test]
-    fn an_interpreted_call_traps_on_the_jits_tier_and_admit_keeps_it_away() {
-        let m = temen_text::parse_module(INTERPRETED_ROOT).expect("parse");
+    #[cfg_attr(debug_assertions, should_panic(expected = "a native tier's image"))]
+    fn a_declined_program_run_past_admit_meets_the_offers_assertion_or_the_backstop() {
+        let m = temen_text::parse_module(SERVES).expect("parse");
         temen_verify::verify_module(&m).expect("verify");
         let mut host = Host::new();
-        assert_eq!(admit(&m, &host, None, false).err(), Some("imports"));
+        assert_eq!(admit(&m, &host, false).err(), Some("jit cap"));
         let start = Start {
             entry: 0,
             args: &[],

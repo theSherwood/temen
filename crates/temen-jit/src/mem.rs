@@ -696,33 +696,55 @@ pub(crate) unsafe fn try_access(w: &crate::Window, a: &mut Access) -> bool {
                 probe(*dst, *len);
                 core::ptr::write_bytes(*dst, *val, *len);
             }
+            // The word is guest memory other vCPUs write with atomics: read it as one.
             Access::Load { src, width, out } => {
+                use core::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, AtomicU8, Ordering};
+                let p = *src as *mut u8;
                 *out = match width {
-                    1 => core::ptr::read_volatile(*src) as u64,
-                    2 => core::ptr::read_volatile(*src as *const u16) as u64,
-                    4 => core::ptr::read_volatile(*src as *const u32) as u64,
-                    _ => core::ptr::read_volatile(*src as *const u64),
+                    1 => u64::from(AtomicU8::from_ptr(p).load(Ordering::SeqCst)),
+                    2 => u64::from(AtomicU16::from_ptr(p.cast()).load(Ordering::SeqCst)),
+                    4 => u64::from(AtomicU32::from_ptr(p.cast()).load(Ordering::SeqCst)),
+                    _ => AtomicU64::from_ptr(p.cast()).load(Ordering::SeqCst),
                 };
             }
         }
     }
-    // No `install_guard`: every caller is a host function called from inside a guarded call, which
-    // installed the handler.
+    // No `install_guard` here: a caller inside a guarded call has the handler, and `try_load_in`
+    // installs it for a caller that may not be.
     let (lo, hi) = fault_range_of(w.base, w.reserved as usize);
     pal::try_call(run, a as *mut Access as *mut c_void, lo, hi)
 }
 
-/// [`Access::Load`] of the `width`-byte word at `p` in window `w`: `None` if it faulted.
+/// The recoverable load: the `width`-byte word at `p` in the window `[base, base + reserved)`,
+/// loaded atomically (sequentially consistent, since other vCPUs write guest words with atomics),
+/// or `None` if the load faulted on the window. It installs the process's fault handler itself, so
+/// it recovers on any thread. A width other than 1, 2, 4 or 8, a word not aligned to its width, or
+/// one not wholly inside the window is refused (`None`) without a load. Today's route's futex read
+/// and the kernel route's guarded read (`wait_word`) both load through this.
 ///
 /// # Safety
-/// As [`try_access`].
-pub(crate) unsafe fn try_load(w: &crate::Window, p: *const u8, width: u32) -> Option<u64> {
+/// `[base, base + reserved)` is a live window reservation (mapped or not, page by page) for the
+/// length of the call.
+pub unsafe fn try_load_in(base: *mut u8, reserved: usize, p: *const u8, width: u32) -> Option<u64> {
+    let (at, lo) = (p as usize, base as usize);
+    let fits = at
+        .checked_add(width as usize)
+        .is_some_and(|end| at >= lo && end <= lo + reserved);
+    if !matches!(width, 1 | 2 | 4 | 8) || !at.is_multiple_of(width as usize) || !fits {
+        return None;
+    }
+    pal::install_guard();
     let mut a = Access::Load {
         src: p,
         width,
         out: 0,
     };
-    try_access(w, &mut a).then_some(match a {
+    let w = crate::Window {
+        base,
+        reserved: reserved as u64,
+        ..crate::Window::NONE
+    };
+    try_access(&w, &mut a).then_some(match a {
         Access::Load { out, .. } => out,
         _ => 0,
     })
