@@ -3283,11 +3283,7 @@ impl ChildExec {
         // learn of the end, as its window's do in `teardown`. #3020 — and its fibers go, stacks and
         // all, as a run's do: its vCPUs are joined, its handlers drained and its root done, so none
         // is running, and one parked on an event holds its own slot from its own stack.
-        task.rt.table().end(
-            task.vm
-                .ended()
-                .is_some_and(|e| crate::TrapKind::from_code(e as u32).is_some()),
-        );
+        task.rt.table().end();
         // #1936 — and its powerbox hears of it, unless its root already ended (`settle`).
         let end = if captured { None } else { task.end() };
         if let Some(t) = task.teardown.take() {

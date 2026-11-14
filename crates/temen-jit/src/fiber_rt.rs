@@ -308,6 +308,38 @@ pub(crate) type FiberCallTramp = extern "C" fn(
 /// Sentinel for [`FiberSlot::running_on`]: no vCPU is running this fiber.
 const NOT_RUNNING: u64 = u64::MAX;
 
+/// #3020 — [`FiberSlot::running_on`] of a fiber a fault abandoned: a guard's recovery jumped out of
+/// it, past the resume that would have marked it parked ([`abandon_after_fault`]). Nothing runs on
+/// it, and nothing will: its slot stays `RUNNING`, so no claim takes it.
+const FAULTED: u64 = u64::MAX - 1;
+
+/// #3020 — how many resumes are live on this thread's runtime: a guarded call records it as it
+/// starts, so a fault's recovery can tell the fibers it abandoned from those it returns into.
+pub(crate) fn active_depth() -> usize {
+    let rt = current();
+    // SAFETY: `current()` is this thread's live runtime; the read is momentary.
+    (!rt.is_null())
+        .then(|| unsafe { (*rt).active_slots.len() })
+        .unwrap_or(0)
+}
+
+/// #3020 — a guarded call that started at resume depth `depth` faulted: its recovery jumped out of
+/// every fiber resumed inside it, past each resume's return. Mark each abandoned ([`FAULTED`]) and
+/// drop it from this thread's live resumes, so the table's end knows nothing is on it.
+pub(crate) fn abandon_after_fault(depth: usize) {
+    let rt = current();
+    if rt.is_null() {
+        return;
+    }
+    // SAFETY: `current()` is this thread's live runtime, and this thread runs no guest code now.
+    let rt = unsafe { &mut *rt };
+    while rt.active_slots.len() > depth {
+        if let Some(s) = rt.active_slots.pop() {
+            s.running_on.store(FAULTED, Ordering::Release);
+        }
+    }
+}
+
 /// §3.6 slice 5a — the third `cont.resume` status (beside suspended = 0 / returned = 1),
 /// matching the interpreter's `FIBER_PARKED`: the fiber hit an event park (`memory.wait`) and
 /// was set aside — the fiber parked, not the vCPU. The resumer proceeds; re-resuming while
@@ -661,11 +693,7 @@ impl SharedFiberTable {
     /// a frame on its own stack, which no unwinding ever drops, so waiting for the last reference
     /// would keep the stack for the life of the process. The slots go too, so a table something
     /// still holds (a closed held site's) names no fiber.
-    ///
-    /// `trapped`: the run ended in a trap. A fault's recovery jumps past the resume that would mark
-    /// the faulting fiber parked, so its slot is left running though nothing runs on it; with no
-    /// trap, a running slot is a fiber something is still on, which must never be.
-    pub(crate) fn end(&self, trapped: bool) {
+    pub(crate) fn end(&self) {
         let slots = {
             let mut t = self.lock();
             // Slot and charge share an index: both go, so a table something still holds stays
@@ -675,10 +703,9 @@ impl SharedFiberTable {
             std::mem::take(&mut t.slots)
         };
         for s in slots {
-            // Nothing runs on a fiber once its run has ended, unless the run faulted: a fault's
-            // recovery leaves the faulting fiber's slot `RUNNING`, and no stack is in use under it.
+            // Nothing runs on a fiber once its run has ended: each is parked, or a fault abandoned it.
             debug_assert!(
-                trapped || s.running_on.load(Ordering::Acquire) == NOT_RUNNING,
+                matches!(s.running_on.load(Ordering::Acquire), NOT_RUNNING | FAULTED),
                 "a fiber ran past its run's end"
             );
             drop(s.fiber.lock().unwrap_or_else(|e| e.into_inner()).take());

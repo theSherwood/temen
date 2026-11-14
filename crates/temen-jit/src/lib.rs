@@ -3256,8 +3256,6 @@ struct RunFibers {
     root: Option<Box<fiber_rt::FiberRuntime>>,
     /// While the root's runtime is published to this thread, what it replaced.
     prev: Option<*mut fiber_rt::FiberRuntime>,
-    /// The run ended in a trap ([`fiber_rt::SharedFiberTable::end`]'s `trapped`).
-    trapped: bool,
 }
 
 #[cfg(fiber_rt)]
@@ -3289,7 +3287,7 @@ impl Drop for RunFibers {
         if std::thread::panicking() {
             self.table.release_charges();
         } else {
-            self.table.end(self.trapped);
+            self.table.end();
         }
     }
 }
@@ -3635,7 +3633,6 @@ impl CompiledModule {
                 table,
                 root,
                 prev: None,
-                trapped: false,
             }
         })
     }
@@ -5932,10 +5929,7 @@ impl CompiledModule {
         // #3020 — and its fibers end with it: their stacks and charges go, and no later run's handle
         // can name one. A debugger may still ask for a parked one's backtrace, taken now.
         #[cfg(fiber_rt)]
-        if let Some(mut f) = run_fibers.take() {
-            f.trapped = vm
-                .ended()
-                .is_some_and(|e| TrapKind::from_code(e as u32).is_some());
+        if let Some(f) = run_fibers.take() {
             (*this).parked_backtraces = (*this).parked_backtraces_of(&f.table);
             (*this).fiber_slots_hint = f.table.slot_count();
             drop(f);

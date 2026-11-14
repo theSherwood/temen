@@ -400,16 +400,32 @@ pub(crate) unsafe fn run_guarded(
     let (lo, hi) = window.fault_range();
     let f: Entry = std::mem::transmute(code);
     // The entry ABI spells the context pointer as the trap cell it starts with (`VmCtx` field 0).
-    pal::run_guarded(
-        f,
-        args,
-        results,
-        mem_base,
-        fn_table,
-        vmctx as *mut i64,
-        lo,
-        hi,
-    )
+    guarded(|| {
+        pal::run_guarded(
+            f,
+            args,
+            results,
+            mem_base,
+            fn_table,
+            vmctx as *mut i64,
+            lo,
+            hi,
+        )
+    })
+}
+
+/// #3020 — `call` a guarded entry. A fault's recovery jumps out of every fiber the entry resumed on
+/// this thread, past each resume's return: those are marked abandoned, so their table's end knows
+/// nothing is on them, and the fibers the call itself runs inside are left as they are.
+fn guarded(call: impl FnOnce() -> bool) -> bool {
+    #[cfg(fiber_rt)]
+    let depth = crate::fiber_rt::active_depth();
+    let faulted = call();
+    #[cfg(fiber_rt)]
+    if faulted {
+        crate::fiber_rt::abandon_after_fault(depth);
+    }
+    faulted
 }
 
 /// Install the guard on the calling (worker) thread. Idempotent; the handler is process-wide but its
@@ -476,16 +492,18 @@ pub(crate) unsafe fn run_guarded_range(
     hi: usize,
 ) -> bool {
     let f: Entry = std::mem::transmute(code);
-    pal::run_guarded(
-        f,
-        args,
-        results,
-        mem_base,
-        fn_table,
-        vmctx as *mut i64,
-        lo,
-        hi,
-    )
+    guarded(|| {
+        pal::run_guarded(
+            f,
+            args,
+            results,
+            mem_base,
+            fn_table,
+            vmctx as *mut i64,
+            lo,
+            hi,
+        )
+    })
 }
 
 /// The trap code a caught guard fault reports.
