@@ -183,7 +183,7 @@ pub(crate) struct Child {
 /// #1361 step 4, #2010 — a freeze reached a child's parent: ring a durable child's doorbell, then
 /// its own children's, if the ring found it live or it already unwound for this freeze. The whole
 /// live subtree is rung before the run's teardown begins, so a grandchild parked under a word nobody
-/// rang yet is never poisoned there (`ChildExec::shutdown_and_join`). A child that already returned
+/// rang yet is never poisoned there (`ChildExec::end_tasks`). A child that already returned
 /// rings nothing: its children run on, as the oracle's do. Called with no table's lock held, as
 /// [`DurableCell::ring`] asks.
 fn ring_child(done: &ChildDone, kid: Option<&std::sync::Arc<Nursery>>) {
@@ -686,19 +686,8 @@ impl Nursery {
             epoch_addr,
             futex_sched,
             children,
-            child_exec: child_exec.unwrap_or_else(|| {
-                let e = crate::child_exec::ChildExec::new(futex_sched);
-                // D66 — the domain wakes parked tasks with its other parked waiters (a `notify`, a
-                // vCPU exit, the kill path, teardown), so it needs a ref. SAFETY: a nonzero
-                // `futex_sched` is the run's live `Domain`, which outlives this nursery.
-                if futex_sched != 0 {
-                    unsafe {
-                        (*(futex_sched as *const crate::os_thread_rt::Domain))
-                            .set_child_exec(std::sync::Arc::clone(&e))
-                    };
-                }
-                e
-            }),
+            // A run's own executor joins its domain with the nursery ([`Self::join_domain`]).
+            child_exec: child_exec.unwrap_or_else(crate::child_exec::ChildExec::new),
             ancestors: Vec::new(),
             kids: Mutex::new(Vec::new()),
             unclaimed: Mutex::new(Vec::new()),
@@ -734,6 +723,26 @@ impl Nursery {
     /// `thread.join` of one of its children joins it through it.
     pub(crate) fn adopt(&self) {
         self.children.set_nursery(self);
+    }
+
+    /// The run's thread domain, `d`, for a run's own nursery, before the run: its children compile
+    /// their futex ops against it and share its child table (#2043), and its executor is the
+    /// domain's (D66: the domain wakes parked tasks with its other parked waiters, a `notify`, a
+    /// vCPU exit, the kill path, teardown). #2993 — whether the domain was made before the nursery
+    /// (a module that nests) or after it (the install room's, once a run hosts threads), so the
+    /// nursery and what its embedder set on it stay as they are. Then [`Self::adopt`].
+    pub(crate) fn join_domain(&mut self, d: &crate::os_thread_rt::Domain) {
+        debug_assert_eq!(self.futex_sched, 0, "a nursery joins one domain");
+        self.futex_sched = d as *const crate::os_thread_rt::Domain as usize;
+        self.children = std::sync::Arc::clone(d.children());
+        self.child_exec.join_domain(d);
+        d.set_child_exec(std::sync::Arc::clone(&self.child_exec));
+    }
+
+    /// #2993 — the run's pool, which every task of the run runs on, a held site's activations
+    /// included, and which [`Self::join_children`] drives to quiescence at teardown.
+    pub(crate) fn exec(&self) -> &std::sync::Arc<crate::child_exec::ChildExec> {
+        &self.child_exec
     }
 
     /// temen#2168 — compile the run's detached children into `cache`, the embedder's: called at run
@@ -998,13 +1007,6 @@ impl Nursery {
         }
     }
 
-    /// S1c — join every child task. Called at run **teardown**, before the parent window is freed, so
-    /// no child outlives the memory it copies to/from. A child still running ends with the run, as the
-    /// oracle ends a child domain (DESIGN §23, D66): unless the run froze, the end raised on its
-    /// context stops it at its next poll, and the join waits for that.
-    ///
-    /// #1361 step 4 — a frozen run's teardown then takes the harvest: every unjoined durable detached
-    /// child, with its powerbox handed over (see [`crate::DetachedHarvest`]). Empty unless `froze`.
     /// #2757 — re-offer every parked child task, for a store that may end any of their parks (a
     /// kill of the run). A run with a thread domain reaches them through it instead
     /// (`Domain::wake_run`), which has this executor.
@@ -1025,16 +1027,24 @@ impl Nursery {
         *lock(&self.children.table) = temen_ir::handles::Table::default();
     }
 
-    /// #3024 — a run starts: its pool, which the last run's teardown shut down, serves it.
-    pub(crate) fn open(&self) {
-        self.child_exec.open();
+    /// Run teardown, first: every child task ends with the run, as the oracle ends a child domain
+    /// (DESIGN §23, D66). Unless the run froze, the end raised on each one's context stops it at its
+    /// next poll; a parked one is poisoned, and one filed from now on is ended as it is filed
+    /// (`ChildExec::end_tasks`). Before the run's vCPUs are joined: one may be running a child's work
+    /// on its own thread, which only this end reaches. The pool is the whole run's, so every
+    /// descendant's task ends too (#1956).
+    pub(crate) fn end_children(&self, froze: bool) {
+        self.child_exec.end_tasks(!froze);
     }
 
+    /// S1c — join every child task, once the run's vCPUs are joined ([`Self::end_children`] ended
+    /// them): no vCPU is left to file another, so this join is the pool's only one. Before the parent
+    /// window is freed, so no child outlives the memory it copies to/from.
+    ///
+    /// #1361 step 4 — a frozen run's teardown then takes the harvest: every unjoined durable detached
+    /// child, with its powerbox handed over (see [`crate::DetachedHarvest`]). Empty unless `froze`.
     pub(crate) fn join_children(&self, froze: bool) -> Vec<crate::DetachedHarvest> {
-        // D66 — drive the executor to quiescence: parked tasks are poisoned so they unwind, and
-        // unless this is a freeze every running task ends with the run; then the workers are joined.
-        // It is the whole run's, so every descendant's task has ended too (#1956).
-        self.child_exec.shutdown_and_join(!froze);
+        self.child_exec.join();
         let harvest = if froze {
             self.take_detached_harvest()
         } else {

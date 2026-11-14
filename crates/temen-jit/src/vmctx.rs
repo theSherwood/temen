@@ -133,6 +133,13 @@ pub struct VmCtx {
     /// ([`crate::kernel_rt`]): set by `KernelRun::run_vcpu` for its guarded call, `None` on every
     /// other context. Never read by compiled code, so it sits past every field the code loads.
     pub(crate) kernel: Option<core::ptr::NonNull<dyn crate::kernel_rt::KernelPark>>,
+    /// #3000 — the owner of the cell `fuel` names, on a held domain's activation: shared with every
+    /// activation that charges the same cell, so the cell lives until the last context charging it
+    /// goes ([`crate::child_exec::HeldSite::activate`]). `None` on every other context, whose cell
+    /// is its run's or its vCPU's. Never read by compiled code, so it sits past every field the code
+    /// loads.
+    #[cfg(fiber_rt)]
+    pub(crate) cell: Option<std::sync::Arc<crate::fuel::SharedCell>>,
 }
 
 /// The per-instance addresses a [`VmCtx`] is filled from — everything but the trap cell, which each
@@ -255,6 +262,8 @@ impl VmCtx {
             owned_handlers: Some(owned_handlers),
             thunk_state: std::sync::OnceLock::new(),
             kernel: None,
+            #[cfg(fiber_rt)]
+            cell: None,
         }
     }
 
@@ -303,6 +312,8 @@ impl VmCtx {
             owned_handlers: None,
             thunk_state: std::sync::OnceLock::new(),
             kernel: None,
+            #[cfg(fiber_rt)]
+            cell: None,
         }
     }
 
