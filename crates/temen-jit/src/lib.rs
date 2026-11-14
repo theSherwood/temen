@@ -272,6 +272,10 @@ pub use mem::{win_commit_rw, win_protect};
 #[cfg(all(unix, fiber_rt))]
 pub use mem::walk_trap_frame_chain;
 
+// #2958 slice 4 — the recoverable load host code outside this crate reads a guest word through
+// (the kernel route's `wait_word`). See `mem::try_load_in`.
+pub use mem::try_load_in;
+
 /// Whether this build's JIT lowers the §12 fiber/thread/futex ops (`cont.*`, `thread.*`,
 /// `atomic.wait`/`notify`) instead of bailing [`JitError::Unsupported`]. True on the targets where
 /// `temen-fiber` provides a real stack switch — the `fiber_rt` cfg derived in `build.rs`, kept in

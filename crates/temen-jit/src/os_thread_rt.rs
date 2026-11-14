@@ -3185,7 +3185,8 @@ fn width_mask(width: u32) -> u64 {
 /// # Safety
 /// `phys` is a span of `width` bytes in `vm`'s window reservation.
 unsafe fn read_phys(vm: &crate::VmCtx, phys: u64, width: u32) -> Option<u64> {
-    crate::mem::try_load(vm.window(), phys as *const u8, width)
+    let w = vm.window();
+    crate::mem::try_load_in(w.base, w.reserved as usize, phys as *const u8, width)
 }
 
 /// `<ty>.atomic.wait` thunk: if the `width`-byte value at confined `phys` still equals `expected`, park

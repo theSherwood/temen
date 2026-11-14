@@ -3462,6 +3462,38 @@ fn c_guest_thread_local() {
     );
 }
 
+/// #2958 slice 4 — the three threaded C demos (#2958 amendment 8) run their vCPUs as the kernel's
+/// tasks on the JIT: their imports (`write`, `vm_map`, `vm_page_size`, `exit`) and their inline
+/// reflection call are calls the kernel serves in the dispatch. `run_diff` holds the JIT lane to the
+/// oracle; this pins that lane's route.
+#[test]
+#[cfg(all(unix, target_arch = "x86_64"))]
+fn c_guest_thread_demos_take_the_kernel_route() {
+    let demos: [(&str, &[u8]); 3] = [
+        (
+            include_str!("../../temen-run/demos/work_stealing/work_stealing.c"),
+            b"256\n",
+        ),
+        (
+            include_str!("../../temen-run/demos/malloc_threads/malloc_threads.c"),
+            b"0\n",
+        ),
+        (
+            include_str!("../../temen-run/demos/thread_local/thread_local.c"),
+            b"10010007\n110010008\n210010009\n5\nroot\n",
+        ),
+    ];
+    for (src, want) in demos {
+        let ir = c_to_ir(src);
+        let m = parse_module(&ir).expect("parse IR");
+        let inst = temen_run::instantiate(m).expect("instantiate");
+        let config = temen_run::RunConfig::default();
+        assert_eq!(inst.kernel_route(&config), Ok(()), "the JIT lane's route");
+        let run = inst.run_diff(&config).expect("interp = JIT");
+        assert_eq!(run.stdout, want);
+    }
+}
+
 /// §7 slice 3b — a brand-new host capability reached as a plain `extern`, no frontend special-case.
 /// chibicc's builtins are `__vm_*`, but the host policy keys are `vm_*`, so `vm_page_size` is *not*
 /// a recognized builtin: it flows through the GENERIC undefined-extern → `call.import` path, with

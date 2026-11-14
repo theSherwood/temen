@@ -366,7 +366,7 @@ fn jit_capture_overlays_runtime_protect_over_the_default() {
     // covered without a Memory-cap-using guest. Page 0 maps to host page 0 on any host page size.
     let mut h = Host::new();
     let map = h.cap_window_pages(0);
-    map.lock().unwrap().insert(0, temen_ir::PageState::Unmapped);
+    map.lock().insert(0, temen_ir::PageState::Unmapped);
     let caps = h
         .capture_window_layout(WINDOW as u64, 0, vec![0; WINDOW], Vec::new())
         .dense_prots();

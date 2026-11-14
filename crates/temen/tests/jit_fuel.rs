@@ -565,7 +565,7 @@ fn on_the_kernel_route(src: &str, budget: u64) -> (Ended, u64) {
     let m = parse_module(src).expect("parse");
     verify_module(&m).expect("verify");
     let mut host = temen_interp::Host::new();
-    let admitted = jit_kernel::admit(&m, &host, None, false).expect("in the kernel's scope");
+    let admitted = jit_kernel::admit(&m, &host, false).expect("in the kernel's scope");
     let start = jit_kernel::Start {
         entry: 0,
         args: &[],
