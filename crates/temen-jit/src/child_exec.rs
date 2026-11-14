@@ -3441,6 +3441,11 @@ impl ChildExec {
     /// until every task has ended, then join the workers. Nothing but a task of the pool can file
     /// meanwhile, and a task filing holds the table non-empty, so no worker has returned while a
     /// task is left: each one filed has a worker or the one this thread lends.
+    ///
+    /// Then the pool is at rest, and it starts a reused compile's next run as a fresh one does
+    /// (#3024): the run's `shutdown`, `end_domain` and `joining` are cleared, as `Domain::end_run`
+    /// resets the domain. That is sound because nothing of the run can file after this, its one
+    /// join: its vCPUs are joined, no task is left, and a held site has taken no call since its rest.
     pub(crate) fn join(self: &Arc<Self>) {
         let workers = {
             let mut g = lock(&self.state);
@@ -3466,6 +3471,12 @@ impl ChildExec {
         for w in workers {
             let _ = w.join();
         }
+        // At rest, and nothing of this run can file again: the next run's tasks run until it ends.
+        let mut g = lock(&self.state);
+        debug_assert!(g.tasks.is_empty() && g.live_workers == 0);
+        g.shutdown = false;
+        g.end_domain = false;
+        g.joining = false;
     }
 }
 
@@ -3615,6 +3626,30 @@ mod tests {
         assert!(exec.find_worker(&mut g, id), "the task gets a worker");
         assert_eq!(g.live_workers, 1);
         drop(g);
+        join_bounded(&exec);
+    }
+
+    /// #3024 — the pool's one join leaves it at rest: a reused compile's next run files a task that
+    /// runs, as a fresh pool's does. Before, the run's end stayed set, and the next run's every task
+    /// was ended as it was filed.
+    #[test]
+    fn a_joined_pool_starts_the_next_run_at_rest() {
+        let exec = ChildExec::new();
+        exec.end_tasks(true);
+        join_bounded(&exec);
+        {
+            let g = super::lock(&exec.state);
+            // A park of the next run's would be poisoned under `shutdown`, and its workers would
+            // return mid-run under `joining`.
+            assert!(
+                !(g.shutdown || g.end_domain || g.joining),
+                "the run's end is cleared"
+            );
+        }
+        let vm = Arc::new(VmCtx::new(InstanceAddrs::NONE, crate::Window::NONE));
+        let id = super::lock(&exec.state).enter(entry(&vm));
+        assert_eq!(vm.ended(), None, "task {id} of the next run runs");
+        exec.end_tasks(true);
         join_bounded(&exec);
     }
 
