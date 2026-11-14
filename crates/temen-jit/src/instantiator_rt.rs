@@ -183,7 +183,7 @@ pub(crate) struct Child {
 /// #1361 step 4, #2010 — a freeze reached a child's parent: ring a durable child's doorbell, then
 /// its own children's, if the ring found it live or it already unwound for this freeze. The whole
 /// live subtree is rung before the run's teardown begins, so a grandchild parked under a word nobody
-/// rang yet is never poisoned there (`ChildExec::shutdown_and_join`). A child that already returned
+/// rang yet is never poisoned there (`ChildExec::end_tasks`). A child that already returned
 /// rings nothing: its children run on, as the oracle's do. Called with no table's lock held, as
 /// [`DurableCell::ring`] asks.
 fn ring_child(done: &ChildDone, kid: Option<&std::sync::Arc<Nursery>>) {
@@ -587,6 +587,11 @@ pub(crate) struct Nursery {
     /// ([`crate::GrantChildHooks::build_detached`] / [`crate::BudgetMemTaker`]; 0 = none ⇒ a spawn is an
     /// inert `CapFault`, like the other grant ops without hooks).
     grant_build_detached: std::sync::atomic::AtomicUsize,
+    /// D66 — the run's own lane, `(domain id, cap)`, from its grant hooks
+    /// (`GrantChildHooks::parent_domain`): installed on the run's domain by [`Self::join_domain`]
+    /// when the domain is made after the hooks were set (`CompiledModule::set_grant_child_hooks`
+    /// installs it on one made before).
+    run_lane: Mutex<Option<(u64, i64)>>,
     grant_budget_mem_take: std::sync::atomic::AtomicUsize,
     /// #2864 — [`crate::GrantListCheck`]: a spawn's grant list, checked before it is admitted.
     grant_check_grants: std::sync::atomic::AtomicUsize,
@@ -687,7 +692,7 @@ impl Nursery {
             futex_sched,
             children,
             // A run's own executor joins its domain with the nursery ([`Self::join_domain`]).
-            child_exec: child_exec.unwrap_or_else(|| crate::child_exec::ChildExec::new(0)),
+            child_exec: child_exec.unwrap_or_else(crate::child_exec::ChildExec::new),
             ancestors: Vec::new(),
             kids: Mutex::new(Vec::new()),
             unclaimed: Mutex::new(Vec::new()),
@@ -695,6 +700,7 @@ impl Nursery {
             durable: AtomicBool::new(false),
             shadow,
             grant_build_detached: std::sync::atomic::AtomicUsize::new(0),
+            run_lane: Mutex::new(None),
             grant_budget_mem_take: std::sync::atomic::AtomicUsize::new(0),
             grant_check_grants: std::sync::atomic::AtomicUsize::new(0),
             grant_budget_mem_give: std::sync::atomic::AtomicUsize::new(0),
@@ -737,6 +743,9 @@ impl Nursery {
         self.children = std::sync::Arc::clone(d.children());
         self.child_exec.join_domain(d);
         d.set_child_exec(std::sync::Arc::clone(&self.child_exec));
+        if let Some((id, cap)) = *self.run_lane.lock().unwrap_or_else(|e| e.into_inner()) {
+            d.set_lane_chain(id, cap);
+        }
     }
 
     /// #2993 — the run's pool, which every task of the run runs on, a held site's activations
@@ -799,6 +808,8 @@ impl Nursery {
             None => (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
         };
         self.grant_build_detached.store(bd, Ordering::Release);
+        *self.run_lane.lock().unwrap_or_else(|e| e.into_inner()) =
+            hooks.map(|h| (h.parent_domain, h.parent_lane_cap));
         self.grant_budget_mem_take.store(mt, Ordering::Release);
         self.grant_check_grants.store(
             hooks.map_or(0, |h| h.check_grants as usize),
@@ -1007,13 +1018,6 @@ impl Nursery {
         }
     }
 
-    /// S1c — join every child task. Called at run **teardown**, before the parent window is freed, so
-    /// no child outlives the memory it copies to/from. A child still running ends with the run, as the
-    /// oracle ends a child domain (DESIGN §23, D66): unless the run froze, the end raised on its
-    /// context stops it at its next poll, and the join waits for that.
-    ///
-    /// #1361 step 4 — a frozen run's teardown then takes the harvest: every unjoined durable detached
-    /// child, with its powerbox handed over (see [`crate::DetachedHarvest`]). Empty unless `froze`.
     /// #2757 — re-offer every parked child task, for a store that may end any of their parks (a
     /// kill of the run). A run with a thread domain reaches them through it instead
     /// (`Domain::wake_run`), which has this executor.
@@ -1021,17 +1025,24 @@ impl Nursery {
         self.child_exec.wake_locked(crate::child_exec::Wake::All);
     }
 
-    /// #2993 — drive the run's pool to quiescence once more, after the last vCPU is joined: a task one
-    /// of them filed after [`Self::join_children`] ends, and the worker it got is joined.
-    pub(crate) fn join_late(&self, froze: bool) {
-        self.child_exec.shutdown_and_join(!froze);
+    /// Run teardown, first: every child task ends with the run, as the oracle ends a child domain
+    /// (DESIGN §23, D66). Unless the run froze, the end raised on each one's context stops it at its
+    /// next poll; a parked one is poisoned, and one filed from now on is ended as it is filed
+    /// (`ChildExec::end_tasks`). Before the run's vCPUs are joined: one may be running a child's work
+    /// on its own thread, which only this end reaches. The pool is the whole run's, so every
+    /// descendant's task ends too (#1956).
+    pub(crate) fn end_children(&self, froze: bool) {
+        self.child_exec.end_tasks(!froze);
     }
 
+    /// S1c — join every child task, once the run's vCPUs are joined ([`Self::end_children`] ended
+    /// them): no vCPU is left to file another, so this join is the pool's only one. Before the parent
+    /// window is freed, so no child outlives the memory it copies to/from.
+    ///
+    /// #1361 step 4 — a frozen run's teardown then takes the harvest: every unjoined durable detached
+    /// child, with its powerbox handed over (see [`crate::DetachedHarvest`]). Empty unless `froze`.
     pub(crate) fn join_children(&self, froze: bool) -> Vec<crate::DetachedHarvest> {
-        // D66 — drive the executor to quiescence: parked tasks are poisoned so they unwind, and
-        // unless this is a freeze every running task ends with the run; then the workers are joined.
-        // It is the whole run's, so every descendant's task has ended too (#1956).
-        self.child_exec.shutdown_and_join(!froze);
+        self.child_exec.join();
         let harvest = if froze {
             self.take_detached_harvest()
         } else {

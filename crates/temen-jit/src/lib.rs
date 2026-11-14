@@ -208,6 +208,19 @@ pub fn in_guest_fiber() -> bool {
         false
     }
 }
+/// #3018 — the §14 pool's worker threads alive in this process, each counted from its spawn until
+/// its thread function returns: what a test that asks whether a run's teardown left a worker behind
+/// reads. Every run's pool counts, so read it with no other run in flight.
+pub fn pool_workers_live() -> usize {
+    #[cfg(fiber_rt)]
+    {
+        child_exec::live_workers()
+    }
+    #[cfg(not(fiber_rt))]
+    {
+        0
+    }
+}
 pub use vcpu_tls::serve_handlers;
 
 // #1768 — the per-instance context compiled code reaches through its threaded context pointer.
@@ -5691,11 +5704,14 @@ impl CompiledModule {
         // residue (incl. any fiber unwound mid-resume-chain during the root run, slice 3.2) is
         // accumulated in the runtime by each fiber's `Complete` arm; drain it after driving — then the
         // deferred children run (`drive_frozen_spawns`).
+        // A durable run's freeze, as the root's unwind left the state word: what the rest of this
+        // teardown asks, every time it asks.
         #[cfg(fiber_rt)]
-        if (*this).durable
+        let froze = (*this).durable
             && !faulted
-            && fiber_rt::window_is_unwinding(mem_base as u64, (*this).shadow)
-        {
+            && fiber_rt::window_is_unwinding(mem_base as u64, (*this).shadow);
+        #[cfg(fiber_rt)]
+        if froze {
             if let Some(rt) = (*this).fiber_rt.as_mut() {
                 let rt = &mut **rt as *mut fiber_rt::FiberRuntime;
                 fiber_rt::freeze_drive(rt, &vm as *const VmCtx as u64);
@@ -5742,14 +5758,18 @@ impl CompiledModule {
         if let Some(p) = prev_rt {
             fiber_rt::set_current(p);
         }
-        // S1c: join every async §14 child OS thread before freeing the window — a child copies to/from
-        // the parent window, so none may outlive it (mirrors the vCPU `join_all` just below).
+        // #3018 — every §14 child task ends with the run, before its vCPUs are joined: a vCPU may be
+        // running a child's work on its own thread (a handler it runs inline, an activation it
+        // carries), and that work stops on the end this raises on the child's context, not the
+        // run's. A task filed from now on is ended as it is filed. The pool is joined once the
+        // vCPUs are, below. This order rests on reading, and no test pins it: a handler's context
+        // is a vCPU context of its callee domain (`VmCtx::vcpu`), sharing that domain's end, so it
+        // is ended here before any vCPU is waited on, whoever runs it. Pinning it would take a hub
+        // vCPU holding a live offer onto a serving §14 child, which no route makes today (offers
+        // flow from parent to child).
         #[cfg(fiber_rt)]
         if let Some(n) = &(*this)._nursery {
-            let froze = (*this).durable
-                && !faulted
-                && fiber_rt::window_is_unwinding(mem_base as u64, (*this).shadow);
-            (*this).detached_out = n.join_children(froze);
+            n.end_children(froze);
         }
         // A caught guard fault is detect-and-kill (§5): the root's `MemoryFault` ends its domain,
         // unless a sibling's end came first (#2499).
@@ -5768,19 +5788,13 @@ impl CompiledModule {
             // returns promptly instead of hanging on a parked daemon. A durable **freeze** is not
             // teardown: the root unwound under `UNWINDING` and parked siblings return through the
             // freeze re-issue machinery (the sentinel is skipped so their residue is recorded).
-            let freezing = (*this).durable
-                && !faulted
-                && fiber_rt::window_is_unwinding(mem_base as u64, (*this).shadow);
-            d.begin_teardown(freezing);
+            d.begin_teardown(froze);
             d.join_all(true);
             // §12.8 4A.5 stage (ii): concurrent durable children self-unwound into their own regions
             // and recorded their `FrozenVCpu` residue before their OS threads ended; `join_all` is the
             // coordinator-wait (every child finished). Collect that residue now — after the join, so the
             // snapshot below captures a fully-quiesced window. No-op off the concurrent path.
-            if (*this).durable
-                && !faulted
-                && fiber_rt::window_is_unwinding(mem_base as u64, (*this).shadow)
-            {
+            if froze {
                 (*this).frozen_vcpus_out.extend(d.take_frozen_vcpus());
                 // §12.8 4A.5 follow-up A: carry completed concurrent children's join results, so a
                 // `thread.join` of a child that finished before the freeze point resolves on thaw.
@@ -5790,33 +5804,26 @@ impl CompiledModule {
                 // §12.8 4A.5 follow-up B: a concurrent child that owns fibers flattened them in its own
                 // `run_child` `freeze_drive`, recorded during `join_all` — drain after the join.
                 (*this).frozen_out.extend(d.take_frozen_fibers());
-                // #2043 — and the domain's child table, which the records name their slots in: after
-                // the join and the nursery's harvest, nothing changes it.
-                (*this).frozen_children_out = d.children().generations();
             }
         }
-        // #2993 — the pool again, now that no vCPU is left: one still running when the nursery joined
-        // it above could file a task there since (a spawn, a handler it promoted), on a worker that
-        // join never took, which would outlive the domain. Such a task runs guest code in its own
-        // window and powerbox until this join raises the end on it; a child it files lands on this
-        // pool too, and this join waits for it. Nothing can file once this join returns, by
-        // construction: only a vCPU, a pool task or a held call files, `join_all` above joined every
-        // vCPU, this join leaves no task, and a held site has taken no call since its rest. So this
-        // join is the last, and no refusal is needed.
+        // S1c — join every §14 child task before freeing the window: a child copies to and from the
+        // parent window, so none may outlive it. Once, and last of the run's joins: `join_all` above
+        // joined every vCPU, so only a task of the pool can file another meanwhile, which this join
+        // waits for too (it was ended at filing), and a held site has taken no call since its rest.
         #[cfg(fiber_rt)]
         if let Some(n) = &(*this)._nursery {
-            let froze = (*this).durable
-                && !faulted
-                && fiber_rt::window_is_unwinding(mem_base as u64, (*this).shadow);
-            n.join_late(froze);
+            (*this).detached_out = n.join_children(froze);
+        }
+        // #2043 — and the domain's child table, which the freeze records name their slots in: after
+        // the vCPUs' join and the nursery's harvest, nothing changes it.
+        #[cfg(fiber_rt)]
+        if let (true, Some(d)) = (froze, &(*this).domain) {
+            (*this).frozen_children_out = d.children().generations();
         }
         // #1684 — every fiber slot nobody flattened rides too (a fresh one, a free one), so the thaw
         // rebuilds the table slot for slot. After `join_all`: no vCPU can still create a fiber.
         #[cfg(fiber_rt)]
-        if (*this).durable
-            && !faulted
-            && fiber_rt::window_is_unwinding(mem_base as u64, (*this).shadow)
-        {
+        if froze {
             if let Some(rt) = (*this).fiber_rt.as_ref() {
                 let flattened: Vec<usize> = (*this).frozen_out.iter().map(|f| f.slot).collect();
                 let rest = rt.table().unflattened_for_freeze(&flattened);

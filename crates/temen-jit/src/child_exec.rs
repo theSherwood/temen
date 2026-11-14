@@ -1477,7 +1477,8 @@ impl Drop for InFlight<'_> {
 impl HeldSite {
     /// The site of a domain whose root `root` returned and now rests: its module `cc`, its window at
     /// `mem_base`, its fiber table `table` and thread domain `domain`, and `tls`, the main thread's
-    /// word at rest. The run's pool, made now if the run has none, keeps an activation that parks.
+    /// word at rest. The run's pool, its nursery's (`cc` has one: `set_rest` refuses a module with
+    /// none), keeps an activation that parks.
     ///
     /// # Safety
     /// Called on the root's thread, after its entry returned and before its teardown; every pointer
@@ -1985,6 +1986,9 @@ struct ExecState {
     runnable: VecDeque<u64>,
     next_id: u64,
     workers: Vec<std::thread::JoinHandle<()>>,
+    /// Workers not yet returned, of those in `workers` (a returned one's handle waits there for the
+    /// join): what [`ChildExec::find_worker`] holds against the pool's cap.
+    live_workers: usize,
     /// Workers not running a task: waiting for one, back from one, or spawned and not yet started.
     /// A task queued while none is free adds one, up to the pool's cap (#1991).
     free_workers: usize,
@@ -1992,11 +1996,31 @@ struct ExecState {
     /// fires the tasks due. A task woken before its deadline may leave it early, which a firing that
     /// finds nothing due corrects.
     next_due: Option<Instant>,
-    /// Run teardown began: a park now poisons the task (it unwinds through its trailing guard),
-    /// and workers exit once no task remains.
+    /// The run is ending ([`ChildExec::end_tasks`]): a park now poisons the task (it unwinds through
+    /// its trailing guard), and a task filed now is ended as it is filed, as one filed before was.
     shutdown: bool,
+    /// With `shutdown`: the run ends, rather than freezes (`end_tasks`'s `end_domain`).
+    end_domain: bool,
+    /// The pool is being joined ([`ChildExec::join`]): workers exit once no task remains.
+    joining: bool,
     /// #2742 — each serving vCPU's window with a handler started or open, by key.
     windows: HashMap<usize, WindowCount>,
+}
+
+impl ExecState {
+    /// File `entry` in the table, under its next id: the one way a task joins the pool, a child's
+    /// ([`ChildExec::spawn`]) or a handler's ([`ChildExec::admit`]). Once the run is ending
+    /// ([`ChildExec::end_tasks`]), it ends as it is filed, as one filed before did: whoever files it
+    /// (a vCPU, a pool task, a held call) may have passed every check of the end before it got here.
+    fn enter(&mut self, mut entry: Entry) -> u64 {
+        let id = self.next_id;
+        self.next_id += 1;
+        if self.shutdown {
+            entry.end(self.end_domain);
+        }
+        self.tasks.insert(id, entry);
+        id
+    }
 }
 
 /// The executor (one per run, owned by the nursery). Workers are OS threads spawned on demand.
@@ -2004,7 +2028,7 @@ pub(crate) struct ChildExec {
     state: Mutex<ExecState>,
     /// Workers wait here for runnable tasks.
     cv: Condvar,
-    /// `shutdown_and_join` waits here for the last task to finish.
+    /// [`ChildExec::join`] waits here for the last task to finish.
     quiescent: Condvar,
     /// The run's `Domain` (`0` = none): live/parked accounting for the 1:1 vCPUs' deadlock
     /// predicate, and the futex broadcast a finished child issues. #2993 — set once, before any task,
@@ -2077,21 +2101,24 @@ pub(crate) fn quantum_end() {
 }
 
 impl ChildExec {
-    pub(crate) fn new(dom: usize) -> Arc<ChildExec> {
+    pub(crate) fn new() -> Arc<ChildExec> {
         Arc::new(ChildExec {
             state: Mutex::new(ExecState {
                 tasks: HashMap::new(),
                 runnable: VecDeque::new(),
                 next_id: 1,
                 workers: Vec::new(),
+                live_workers: 0,
                 free_workers: 0,
                 next_due: None,
                 shutdown: false,
+                end_domain: false,
+                joining: false,
                 windows: HashMap::new(),
             }),
             cv: Condvar::new(),
             quiescent: Condvar::new(),
-            dom: AtomicUsize::new(dom),
+            dom: AtomicUsize::new(0),
             workers: AtomicUsize::new(cores()),
         })
     }
@@ -2188,29 +2215,25 @@ impl ChildExec {
             }
         }
         let mut g = lock(&self.state);
-        let id = g.next_id;
-        g.next_id += 1;
         // #2757 — a durable child's freeze doorbell wakes this task. Registered under this lock,
         // before the task is runnable, so before it can park.
-        if let Some(d) = task.done.durable.as_ref() {
-            d.set_waker(self.waker(id));
-        }
+        let done = Arc::clone(&task.done);
         let dom = task.dom.clone();
         let vm = Arc::clone(&task.vm);
-        g.tasks.insert(
-            id,
-            Entry {
-                task: Some(Box::new(Task::Child(task))),
-                parked: false,
-                deadline: None,
-                counted: false,
-                woken: false,
-                killed: false,
-                dom,
-                vm,
-                carrier: None,
-            },
-        );
+        let id = g.enter(Entry {
+            task: Some(Box::new(Task::Child(task))),
+            parked: false,
+            deadline: None,
+            counted: false,
+            woken: false,
+            killed: false,
+            dom,
+            vm,
+            carrier: None,
+        });
+        if let Some(d) = done.durable.as_ref() {
+            d.set_waker(self.waker(id));
+        }
         g.runnable.push_back(id);
         self.find_worker(&mut g, id);
         id
@@ -2285,8 +2308,6 @@ impl ChildExec {
     /// Its entry holds no task: its caller files it.
     fn admit(&self, g: &mut ExecState, h: &HandlerTask) -> u64 {
         h.window.pooled.fetch_add(1, Ordering::AcqRel);
-        let id = g.next_id;
-        g.next_id += 1;
         // #2845 — one whose domain has ended meanwhile (it parked on a caller's thread while a trap
         // or the root's end and its drain ran) is drained on arrival: its window never opens again,
         // and the domain's drain, which takes this lock after it records the end, may have run
@@ -2306,21 +2327,17 @@ impl ChildExec {
                 d.handler_started();
             }
         }
-        g.tasks.insert(
-            id,
-            Entry {
-                task: None,
-                parked: false,
-                deadline: None,
-                counted: false,
-                woken: false,
-                killed: false,
-                dom: None,
-                vm: Arc::clone(&h.vm),
-                carrier: h.carrier.clone(),
-            },
-        );
-        id
+        g.enter(Entry {
+            task: None,
+            parked: false,
+            deadline: None,
+            counted: false,
+            woken: false,
+            killed: false,
+            dom: None,
+            vm: Arc::clone(&h.vm),
+            carrier: h.carrier.clone(),
+        })
     }
 
     /// #2742 — a woken handler of window `key`, taken out of the queue for the serve op, which holds
@@ -2510,21 +2527,27 @@ impl ChildExec {
         let want = (g.tasks.get(&id))
             .and_then(|e| e.task.as_ref())
             .map_or(1, |t| self.ceiling(t.chain(), tasks));
-        if g.workers.len() >= want {
+        if g.live_workers >= want {
             return false;
         }
         let me = Arc::clone(self);
         let worker = g.workers.len() as u64 + 1;
+        LIVE_WORKERS.fetch_add(1, Ordering::SeqCst);
         let h = std::thread::Builder::new()
             .name("temen-child".into())
-            .spawn(move || me.worker_loop(worker));
+            .spawn(move || {
+                let _live = LiveWorker;
+                me.worker_loop(worker)
+            });
         // An `Err` is the OS refusing a thread: the existing workers (if any) still drain the
         // queue; with none, the task waits for a later spawn's worker or runs at shutdown on the
         // joining thread.
         let Ok(h) = h else {
+            LIVE_WORKERS.fetch_sub(1, Ordering::SeqCst);
             return false;
         };
         g.workers.push(h);
+        g.live_workers += 1;
         g.free_workers += 1;
         true
     }
@@ -2756,8 +2779,9 @@ impl ChildExec {
                     if let Some(id) = self.pick(&mut g) {
                         break id;
                     }
-                    if g.shutdown && g.tasks.is_empty() {
+                    if g.joining && g.tasks.is_empty() {
                         g.free_workers -= 1;
+                        g.live_workers -= 1;
                         return;
                     }
                     // Idle: wake for the earliest parked deadline, if a parked task carries one;
@@ -3375,10 +3399,16 @@ impl ChildExec {
         }
     }
 
-    /// Run teardown (`Nursery::join_children`): poison every parked task so it unwinds, let the
-    /// runnable ones finish, wait for quiescence, join the workers. One parked forever would have
-    /// hung the join, and unwinds through its trailing guard instead — the interpreter's teardown
-    /// sweep. A task that parks after this began is poisoned too (`worker_loop`).
+    /// Run teardown, first half (`Nursery::end_children`): the run is ending, and every task with
+    /// it. Each parked task is poisoned so it unwinds, its trailing guard the interpreter's teardown
+    /// sweep, and one parked forever would have hung the join. A task that parks from now on is
+    /// poisoned too (`file`), and one filed from now on is ended as it is filed ([`Entry::end`]),
+    /// whoever files it: a vCPU still running, a pool task, a held call.
+    ///
+    /// Before the run's vCPUs are joined, because one of them may be running a task's work on its
+    /// own thread (a handler it runs inline, [`Self::run_here`], or an activation it carries): that
+    /// work polls its callee domain's end, which only this raises. [`Self::join`] waits for the tasks
+    /// once the vCPUs are gone.
     ///
     /// `end_domain` — the run is ending (not freezing): every task ends with it, running or not yet
     /// started, as the oracle ends a child domain with the run (DESIGN §23, D66).
@@ -3390,46 +3420,36 @@ impl ChildExec {
     /// rides, where a poisoned one would end in a trap and leave no image: its futex wait is woken
     /// (#1937), and its join is left for the joined child's end to re-offer (#2010,
     /// [`ChildTask::at_teardown`]).
-    pub(crate) fn shutdown_and_join(self: &Arc<Self>, end_domain: bool) {
+    pub(crate) fn end_tasks(self: &Arc<Self>, end_domain: bool) {
+        let mut g = lock(&self.state);
+        g.shutdown = true;
+        g.end_domain = end_domain;
+        for e in g.tasks.values_mut() {
+            e.end(end_domain);
+        }
+        self.wake_parked(&mut g, Wake::All);
+        // A runnable task a worker passed over, for want of its window's gate or an open window,
+        // runs now regardless, to unwind (`pick`): its worker looks again. Without this, a worker
+        // asleep since that pick slept on, and the join waited for good (an uncarried activation of
+        // a held domain whose window had closed, #3000).
+        self.cv.notify_all();
+    }
+
+    /// Run teardown, second half (`Nursery::join_children`), once the run's vCPUs are joined: wait
+    /// until every task has ended, then join the workers. Nothing but a task of the pool can file
+    /// meanwhile, and a task filing holds the table non-empty, so no worker has returned while a
+    /// task is left: each one filed has a worker or the one this thread lends.
+    pub(crate) fn join(self: &Arc<Self>) {
         let workers = {
             let mut g = lock(&self.state);
-            g.shutdown = true;
-            for e in g.tasks.values_mut() {
-                let spared = e
-                    .task
-                    .as_ref()
-                    .is_some_and(|t| t.at_teardown() != AtTeardown::Poison);
-                let poisoned = if e.parked && !spared {
-                    if let Some(t) = &e.task {
-                        t.vm().raise(crate::DOMAIN_DONE_CODE as i64);
-                    }
-                    true
-                } else if end_domain && !spared {
-                    // As `kill` ends a task: its next poll ends it, and so does a host-side wait it
-                    // re-checks (a serve loop's park).
-                    e.vm.raise(crate::DOMAIN_DONE_CODE as i64);
-                    true
-                } else {
-                    false
-                };
-                // #1469 — the child's own parked vCPUs share the poisoned cell; a spared child's
-                // re-check the word the freeze rang (#2010).
-                if poisoned || spared {
-                    if let Some(d) = &e.dom {
-                        d.wake_own_parked();
-                    }
-                }
-            }
-            self.wake_parked(&mut g, Wake::All);
-            // A runnable task a worker passed over, for want of its window's gate or an open
-            // window, runs now regardless, to unwind (`pick`): its worker looks again. Without
-            // this, a worker asleep since that pick slept on, and the join below waited for good
-            // (an uncarried activation of a held domain whose window had closed, #3000).
+            debug_assert!(g.shutdown, "a pool is ended before it is joined");
+            g.joining = true;
             self.cv.notify_all();
             // No worker could be spawned for a filed task (thread refusal): drive it here, this
             // thread a free worker until the queue is done.
-            if g.workers.is_empty() && !g.tasks.is_empty() {
+            if g.live_workers == 0 && !g.tasks.is_empty() {
                 g.free_workers += 1;
+                g.live_workers += 1;
                 drop(g);
                 self.clone().worker_loop(0);
                 g = lock(&self.state);
@@ -3443,6 +3463,57 @@ impl ChildExec {
         };
         for w in workers {
             let _ = w.join();
+        }
+    }
+}
+
+/// #3018 — the pool's worker threads alive in this process, each counted from its spawn until its
+/// thread function returns: what a test that asks whether a run's teardown left a worker behind
+/// reads ([`crate::pool_workers_live`]).
+static LIVE_WORKERS: AtomicUsize = AtomicUsize::new(0);
+
+/// A worker thread's share of [`LIVE_WORKERS`], given back as its thread function returns.
+struct LiveWorker;
+
+impl Drop for LiveWorker {
+    fn drop(&mut self) {
+        LIVE_WORKERS.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// The pool's worker threads alive in this process ([`LIVE_WORKERS`]).
+pub(crate) fn live_workers() -> usize {
+    LIVE_WORKERS.load(Ordering::SeqCst)
+}
+
+impl Entry {
+    /// The run is ending (`end_domain`) or freezing: this task ends with it ([`ChildExec::end_tasks`]),
+    /// when it is swept or when it is filed after. A parked one is poisoned, unless a freeze spares
+    /// it; a running or runnable one has the end raised when the run ends. Its own parked vCPUs
+    /// share the poisoned cell, and a spared child's re-check the word the freeze rang (#1469,
+    /// #2010).
+    fn end(&mut self, end_domain: bool) {
+        let spared = self
+            .task
+            .as_ref()
+            .is_some_and(|t| t.at_teardown() != AtTeardown::Poison);
+        let poisoned = if self.parked && !spared {
+            if let Some(t) = &self.task {
+                t.vm().raise(crate::DOMAIN_DONE_CODE as i64);
+            }
+            true
+        } else if end_domain && !spared {
+            // As `kill` ends a task: its next poll ends it, and so does a host-side wait it
+            // re-checks (a serve loop's park).
+            self.vm.raise(crate::DOMAIN_DONE_CODE as i64);
+            true
+        } else {
+            false
+        };
+        if poisoned || spared {
+            if let Some(d) = &self.dom {
+                d.wake_own_parked();
+            }
         }
     }
 }
@@ -3486,6 +3557,83 @@ mod tests {
     use super::{activation_ctx, CarriedBy, Carrier, ChildExec, Entry, HeldCaller, Wake};
     use crate::{FuelCell, InstanceAddrs, VmCtx};
     use std::sync::Arc;
+    use std::time::Duration;
+
+    /// An entry of the pool's table for a task that never runs: filed, never picked (it holds no
+    /// task), and gone when the test clears the table.
+    fn entry(vm: &Arc<VmCtx>) -> Entry {
+        Entry {
+            task: None,
+            parked: false,
+            deadline: None,
+            counted: false,
+            woken: false,
+            killed: false,
+            dom: None,
+            vm: Arc::clone(vm),
+            carrier: None,
+        }
+    }
+
+    /// Clear `exec`'s table and join its workers, failing rather than hanging if one never returns.
+    fn join_bounded(exec: &Arc<ChildExec>) {
+        {
+            let mut g = super::lock(&exec.state);
+            g.tasks.clear();
+            g.runnable.clear();
+            g.shutdown = true;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let joiner = Arc::clone(exec);
+        std::thread::spawn(move || {
+            joiner.join();
+            let _ = tx.send(());
+        });
+        rx.recv_timeout(Duration::from_secs(30))
+            .expect("the pool's join returns once its table is empty");
+    }
+
+    /// #3018 — a worker that has returned holds no place of the pool's cap. Its handle waits in the
+    /// pool for the join, and the cap used to count handles: a task filed once the one worker of a
+    /// pool of one had returned got none, and the join waited for it for good.
+    #[test]
+    fn a_task_filed_after_its_pools_worker_returned_gets_a_worker() {
+        let exec = ChildExec::new();
+        exec.set_workers(1);
+        let vm = Arc::new(VmCtx::new(InstanceAddrs::NONE, crate::Window::NONE));
+        let mut g = super::lock(&exec.state);
+        // A worker that ran the pool's task and returned: joined by nobody yet, alive no more.
+        let returned = std::thread::spawn(|| {});
+        while !returned.is_finished() {
+            std::thread::yield_now();
+        }
+        g.workers.push(returned);
+        let id = g.enter(entry(&vm));
+        g.runnable.push_back(id);
+        assert!(exec.find_worker(&mut g, id), "the task gets a worker");
+        assert_eq!(g.live_workers, 1);
+        drop(g);
+        join_bounded(&exec);
+    }
+
+    /// #3018 — once the run is ending, a task filed ends as it is filed, as the end's sweep ended the
+    /// ones filed before: its filer may have passed every check of the end before it filed. Under a
+    /// freeze nothing is raised, as the sweep raises nothing on a task that has not parked.
+    #[test]
+    fn a_task_filed_once_the_run_is_ending_ends_with_it() {
+        for (end_domain, ended) in [(true, Some(crate::DOMAIN_DONE_CODE as i64)), (false, None)] {
+            let exec = ChildExec::new();
+            exec.end_tasks(end_domain);
+            let vm = Arc::new(VmCtx::new(InstanceAddrs::NONE, crate::Window::NONE));
+            let id = super::lock(&exec.state).enter(entry(&vm));
+            assert_eq!(
+                vm.ended(),
+                ended,
+                "filed as task {id}, end_domain {end_domain}"
+            );
+            join_bounded(&exec);
+        }
+    }
 
     /// #3000 — a wake queues each task it wakes once, though a carried task's wake wakes its
     /// carrier, another task of the pool, from inside it. Before, the outer wake went on to its
@@ -3498,7 +3646,7 @@ mod tests {
     #[test]
     fn a_wake_queues_a_carrier_its_carried_task_woke_once() {
         const N: u64 = 64;
-        let exec = ChildExec::new(0);
+        let exec = ChildExec::new();
         let vm = Arc::new(VmCtx::new(InstanceAddrs::NONE, crate::Window::NONE));
         let mut g = super::lock(&exec.state);
         for id in 1..=N {

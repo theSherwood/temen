@@ -141,6 +141,9 @@ fn run_held(
             let mut cm = jit_proc::compile_image(cc, m, entry, None, jit, Some(fuel_cell), None)?;
             cm.enable_thread_hosting()?;
             let own = cc.with_host(|h| h.own_cell().map(|c| Arc::downgrade(&c)));
+            // `set_rest` refuses a module with no nursery, which `compile_image` never makes: every
+            // module it compiles has install room (#1726). Were it refused, the hold would end as a
+            // failed run (`Trap::ThreadFault`, `hold_jit`), not decline to the interpreters.
             cm.set_rest(Some(Box::new(
                 move |site: &Arc<HeldSite>, results: &[i64]| {
                     let cell = own.unwrap_or_default();

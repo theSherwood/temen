@@ -1,10 +1,10 @@
 //! #2993 (review A) — a run's pool is joined before the run returns, even for a task filed into it
-//! after its first join at teardown. One test in this binary: it counts the process's pool workers.
-#![cfg(target_os = "linux")]
+//! while its teardown runs. One test in this binary: it counts the process's pool workers.
 
 #[path = "../../temen-interp/tests/support/rec.rs"]
 mod rec;
 
+use std::time::Duration;
 use temen_interp::Host;
 use temen_ir::{Module, SpawnRec};
 use temen_jit::JitOutcome;
@@ -18,24 +18,37 @@ fn parse(src: &str) -> Module {
     m
 }
 
-/// The process's pool workers alive now (`ChildExec`'s threads are named `temen-child`).
-fn pool_workers() -> usize {
-    std::fs::read_dir("/proc/self/task")
-        .expect("/proc/self/task")
-        .filter_map(|e| std::fs::read_to_string(e.ok()?.path().join("comm")).ok())
-        .filter(|c| c.trim() == "temen-child")
-        .count()
+/// Run `f` on a thread of its own, failing rather than hanging if it never returns.
+fn bounded(f: impl FnOnce() + Send + 'static) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let t = std::thread::spawn(move || {
+        f();
+        let _ = tx.send(());
+    });
+    match rx.recv_timeout(Duration::from_secs(120)) {
+        Ok(()) => t.join().expect("the runs"),
+        // A panic drops the sender: report it as itself.
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            std::panic::resume_unwind(t.join().expect_err("the runs panicked"))
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => panic!("a run's teardown hung"),
+    }
 }
 
 /// #2993 (review A) — the root's spawned thread spawns and joins long-running §14 children in a loop
-/// while the root returns: a spawn of the thread's may land after the root's teardown has joined the
-/// run's pool, and must not get a worker that outlives the run. Its pool is joined again once the
-/// last vCPU is (`Nursery::join_late`); before, a stray worker read the freed `Domain` (a host
-/// SIGSEGV in 7 of 10 runs on main, ASan: heap-use-after-free in `Domain::hub`). Here, at each run's
-/// return, no worker of a pool is left: the binary runs this one test, so every `temen-child` thread
-/// would be this run's.
+/// while the root returns: a spawn of the thread's may land while the root's teardown runs, and must
+/// not get a worker that outlives the run. The pool is ended before the vCPUs are joined, a task
+/// filed after is ended as it is filed, and the pool is joined once the last vCPU is (#3018).
+/// Before, a stray worker read the freed `Domain` (a host SIGSEGV in 7 of 10 runs on main, ASan:
+/// heap-use-after-free in `Domain::hub`). Here, at each run's return, no worker of a pool is alive.
+/// `pool_workers_live` counts the whole process's, so the assert is sound only because this binary
+/// runs this one test: a test added here must start no pool.
 #[test]
 fn a_child_a_thread_spawns_as_its_root_returns_ends_with_the_run() {
+    bounded(three_runs);
+}
+
+fn three_runs() {
     let child = SpawnRec {
         size_log2: CHILD_LOG2.into(),
         ..SpawnRec::default()
@@ -146,7 +159,7 @@ block 3 (yn: i64) {
             "{jo:?}"
         );
         assert_eq!(
-            pool_workers(),
+            temen_jit::pool_workers_live(),
             0,
             "every worker of the run's pool is joined before it returns"
         );
