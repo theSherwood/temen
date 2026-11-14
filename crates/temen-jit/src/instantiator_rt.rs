@@ -1014,6 +1014,19 @@ impl Nursery {
         self.child_exec.wake_locked(crate::child_exec::Wake::All);
     }
 
+    /// The child table this nursery files its children in.
+    #[cfg(test)]
+    pub(crate) fn children(&self) -> &ChildTable {
+        &self.children
+    }
+
+    /// #3024 — the run has ended, for a nursery whose child table is its own (no domain shares
+    /// it, so [`crate::os_thread_rt::Domain::end_run`] does not reach it): the run's handles retire
+    /// with it, as a fresh compile's table starts empty.
+    pub(crate) fn end_run(&self) {
+        *lock(&self.children.table) = temen_ir::handles::Table::default();
+    }
+
     /// Run teardown, first: every child task ends with the run, as the oracle ends a child domain
     /// (DESIGN §23, D66). Unless the run froze, the end raised on each one's context stops it at its
     /// next poll; a parked one is poisoned, and one filed from now on is ended as it is filed
@@ -1038,7 +1051,28 @@ impl Nursery {
             Vec::new()
         };
         self.release_retained();
+        // #3024 — what this nursery kept for the run's children goes with the run: each child has
+        // ended, its retained ref is released, and a freeze's harvest is taken. The nursery outlives
+        // the run on a reused compile, so a later run would otherwise find every earlier run's child
+        // nurseries still held.
+        self.kids.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.unclaimed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         harvest
+    }
+
+    /// #3024 — how many child nurseries and claim-ended children this nursery holds: none between
+    /// runs.
+    pub(crate) fn held(&self) -> (usize, usize) {
+        (
+            self.kids.lock().unwrap_or_else(|e| e.into_inner()).len(),
+            self.unclaimed
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .len(),
+        )
     }
 
     /// CALLS.md 5c.0 — release each child's nursery-retained shared-powerbox ref (minted live-impls

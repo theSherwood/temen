@@ -619,3 +619,62 @@ block 2 (vh2: i64) {
         v[0]
     );
 }
+
+// ---- #3024 — a run's seed is its own ----
+
+/// `func 0 (v)`: store `v` at 16384 and answer 7.
+const STORES: &str = "memory 16
+func (i64) -> (i64) {
+block 0 (v: i64) {
+  va = i64.const 16384
+  i64.store va v
+  vr = i64.const 7
+  return vr
+  }
+}
+";
+
+/// A thaw's window whose page 4 (16384) is read-only, as the run it was frozen from left it.
+fn read_only_at_16384() -> temen_jit::WindowRestore {
+    let mut prots = vec![temen_jit::WindowProt::Rw; 16];
+    prots[16384 / temen_jit::DURABLE_SNAPSHOT_PAGE] = temen_jit::WindowProt::Ro;
+    temen_jit::WindowRestore {
+        prots,
+        tail: Vec::new(),
+    }
+}
+
+/// #3024 — what an embedder hands the next run to resume from is that run's alone: the run takes
+/// it as it starts, so a run that ends before it runs anything (here, too few arguments) drops it,
+/// and a run after the one that used it starts fresh. Before, the seed stayed on the module for
+/// every later run.
+#[test]
+fn a_run_s_seed_reaches_that_run_alone() {
+    let m = module(STORES);
+    let mut cm = compile(&m);
+    let image = vec![0u8; 1 << 16];
+
+    // The run that takes it uses it: the page is read-only.
+    cm.set_restore(Some(read_only_at_16384()));
+    let (out, _) = cm.run(&[1], Some(&image), None).unwrap();
+    assert_eq!(
+        out,
+        JitOutcome::Trapped(temen_jit::TrapKind::MemoryFault),
+        "the seeded run restores the read-only page"
+    );
+    let (out, _) = cm.run(&[1], None, None).unwrap();
+    assert_eq!(out, JitOutcome::Returned(vec![7]), "the next run is fresh");
+
+    // A run that never starts drops it.
+    cm.set_restore(Some(read_only_at_16384()));
+    assert!(matches!(
+        cm.run(&[], None, None),
+        Err(temen_jit::JitError::Malformed)
+    ));
+    let (out, _) = cm.run(&[1], None, None).unwrap();
+    assert_eq!(
+        out,
+        JitOutcome::Returned(vec![7]),
+        "a run that never started left its seed behind"
+    );
+}

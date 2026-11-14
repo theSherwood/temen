@@ -163,24 +163,6 @@ pub fn specialize_module(module: &Module, opts: &SpecializeOpts) -> Result<Modul
 /// own via [`grant_jit`] + the compile `table_reserve_log2`.
 const CLI_JIT_TABLE_LOG2: u8 = 10;
 
-/// PROCESS.md S1b/S1c — a teardown guard for the canonical-key futex region registry: forgets every
-/// mapping in `[base, base+reserved)` when dropped (the recorder closure that owns it is held for the
-/// run and released at teardown), so a reused window virtual address never inherits a stale identity.
-/// It runs *after* the window's reservation is released, which is the race #1608 is open on.
-struct WindowRegionPurge {
-    base: u64,
-    reserved: u64,
-    /// This run's registry owner id (#1608). Without it the purge — which runs after the reservation
-    /// is released, over its whole range — erased entries belonging to whichever runs had since
-    /// been handed those addresses, losing their futex wakeups.
-    owner: u64,
-}
-impl Drop for WindowRegionPurge {
-    fn drop(&mut self) {
-        temen_jit::region_canon_forget_window(self.base, self.reserved, self.owner);
-    }
-}
-
 /// The host trampoline bridging the JIT's [`temen_jit::CapThunk`] ABI (§9) to the reference
 /// [`Host`]'s capability dispatch — the host code a real embedder supplies. One shared copy. The
 /// powerbox (`vm.cap_ctx`, a live `*mut Host`) and the window are the calling context's (#2534);
@@ -509,9 +491,10 @@ unsafe fn cap_thunk_impl(
     live: &mut Option<LiveTarget>,
 ) {
     let host = &mut *(ctx as *mut Host);
-    // PROCESS.md S1b/S1c — the canonical-key futex region recorder, installed on the root thread's first
-    // `call.cap` (before any `map`/spawn), so no vCPU races the install.
-    install_region_hook(host, mem_base, mem_reserved);
+    // PROCESS.md S1b/S1c — the canonical-key futex region recorder for this window: installed on the
+    // root thread's first `call.cap` of the window (before any `map`/spawn, so no vCPU races it), and
+    // again when the host's next window is another (#3059).
+    install_region_hook(host, mem_base);
     // The JIT passes a null args/results pointer when the count is 0; `from_raw_parts` requires a
     // non-null (aligned) pointer even for an empty slice, so use `&[]` in that case (UB otherwise).
     let arg_slots = if n_args == 0 {
@@ -4060,39 +4043,31 @@ pub unsafe extern "C" fn grant_detached_child_build(
 }
 
 /// PROCESS.md S1b/S1c — install the **canonical-key futex** region recorder on `host` over the window
-/// at `mem_base`, once (idempotent; a no-op for a null base or a host that already has one). The JIT
+/// at `mem_base`, unless one already records for that window (a no-op for a null base). The JIT
 /// futex thunk has no region map, so a §13 `map` must record which absolute pages alias which region
 /// bytes into the JIT registry (`temen_jit::region_canon_record`) and `unmap` must forget them. The
 /// `Host` dispatch owns the backing (hence its `os_fd`), but only the cap trampoline — and the op-17
 /// pre-map apply, which runs before the child's first `call.cap` — know the window's base. The interp
 /// needs none: it canonicalizes via its own `PageProt::Backed`.
-fn install_region_hook(host: &mut Host, mem_base: *mut u8, mem_reserved: u64) {
-    if mem_base.is_null() || host.has_region_hook() {
+///
+/// #3059 — a recorder serves one window. A host reused across runs gets a fresh one for each run's
+/// window, so it never records at an earlier window's base. A recycled base needs no new recorder:
+/// the earlier window forgot its entries as it was released, and the recorder records only a base.
+fn install_region_hook(host: &mut Host, mem_base: *mut u8) {
+    let base = mem_base as u64;
+    if mem_base.is_null() || host.region_hook_window() == Some(base) {
         return;
     }
-    let base = mem_base as u64;
-    // #1608 — one registry owner id per window, taken here and shared by every record this hook makes
-    // and by the teardown purge. Window virtual addresses are recycled between runs, so an absolute
-    // page is not on its own enough to say whose entry it is.
-    let owner = temen_jit::region_canon_new_owner();
-    // Purge this owner's entries in this window at teardown (when the hook `Arc` — held for the run —
-    // drops), so a later run reusing the virtual address never inherits a stale region identity. This
-    // still runs *after* the reservation is released; `owner` is what keeps that harmless.
-    let purge = WindowRegionPurge {
+    host.set_region_hook(Some((
         base,
-        reserved: mem_reserved,
-        owner,
-    };
-    host.set_region_hook(Some(std::sync::Arc::new(
-        move |win_off: u64, len: u64, mapped: Option<(u64, u64)>| {
-            let _keep = &purge; // the closure owns the teardown guard
-            match mapped {
+        std::sync::Arc::new(
+            move |win_off: u64, len: u64, mapped: Option<(u64, u64)>| match mapped {
                 Some((region_off, backing)) => {
-                    temen_jit::region_canon_record(base + win_off, len, backing, region_off, owner)
+                    temen_jit::region_canon_record(base + win_off, len, backing, region_off)
                 }
-                None => temen_jit::region_canon_forget_window(base + win_off, len, owner),
-            }
-        },
+                None => temen_jit::region_canon_forget_window(base + win_off, len),
+            },
+        ),
     )));
 }
 
@@ -4204,7 +4179,7 @@ unsafe fn window_view(
     ro: &[[u64; 2]],
     shadow: temen_interp::ShadowArena,
 ) -> Option<MprotectWindow> {
-    install_region_hook(host, base, reserved);
+    install_region_hook(host, base);
     host.start_window_pages(base as usize, shadow);
     let mut wm = MprotectWindow::of(host, base, mapped, reserved);
     wm.seed_readonly(ro);
