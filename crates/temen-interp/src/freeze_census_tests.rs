@@ -505,7 +505,20 @@ fn a_thread_a_thaw_re_creates_joins_its_parents_domain() {
         unreachable!()
     };
     f.root.lock_unpoisoned().set_lane_cap(1);
-    let funcs = returns_at_once();
+    // A thaw re-creates only a thread a spawn could have made (#2878): an entry of the spawn
+    // signature, in a context of the window's arena.
+    let funcs: Arc<[Func]> = Arc::from(vec![Func {
+        params: vec![ValType::I64, ValType::I64],
+        results: vec![ValType::I64],
+        blocks: vec![temen_ir::Block {
+            parent: 0,
+            captures: vec![],
+            params: vec![ValType::I64, ValType::I64],
+            insts: vec![],
+            term: Terminator::Return(vec![0]),
+        }],
+    }]);
+    let arena = ShadowArena::new(16448, 65536);
     let dt = Arc::new(DomainTable::new(&funcs, 0));
     let mut domain = Domain::root(Arc::clone(&f.root), funcs, Arc::from(Vec::new()), dt);
     domain.kill = Some(Arc::new(AtomicBool::new(false)));
@@ -517,7 +530,7 @@ fn a_thread_a_thaw_re_creates_joins_its_parents_domain() {
         Arc::new(domain),
         0,
         &[],
-        None,
+        Some(Mem::with_reservation(17, 17, Some(arena))),
         Fuel::fixed(0),
         0,
         1,
@@ -533,7 +546,7 @@ fn a_thread_a_thaw_re_creates_joins_its_parents_domain() {
         joinable: true,
         func: 0,
         args: vec![0, 0],
-        shadow_sp: ShadowArena::EMPTY.frame_base(1),
+        shadow_sp: arena.frame_base(arena.ctx_ceiling()),
         completed_result: None,
     };
     seed_thread(

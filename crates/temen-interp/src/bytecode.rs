@@ -632,18 +632,25 @@ enum Op {
         cap: u32,
         dst: u32,
     },
+    /// `leave` (on this op and the two tail calls): the function takes `setjmp` checkpoints, so its
+    /// exit drops this activation's (#2877, [`Vm::leave_setjmps`]). Static, so no other exit pays.
     Ret {
         srcs: Box<[u32]>,
+        leave: bool,
     },
     /// `return_call`: a direct tail call — reuse the current activation window (no stack growth),
     /// staying in the caller's module; on return the callee returns to *this* activation's caller.
     TailCall {
         callee: u32,
         args: Box<[u32]>,
+        leave: bool,
     },
     /// `return_call.dyn`: an indirect tail call — resolve through the runtime dispatch table
     /// (possibly cross-module), then reuse the current window like [`Op::TailCall`].
-    TailCallIndirect(Box<IndirectCall>),
+    TailCallIndirect {
+        call: Box<IndirectCall>,
+        leave: bool,
+    },
     Unreachable,
     /// A `CapFault` trap: an `Instantiator` call that isn't a live op at its contracted shape
     /// (`temen_ir::served_contract`), which the oracle refuses after the handle resolves (a
@@ -2601,6 +2608,8 @@ fn compile_func(f: &Func, view: &ModuleView<'_>, fuse: bool) -> Option<Program> 
     let discard = nslots;
     nslots += 1;
     let mut block_pc = vec![0u32; f.blocks.len()];
+    // #2877 — a function that takes `setjmp` checkpoints drops them at each exit.
+    let leave = f.takes_checkpoints();
     // One op per instruction and one per terminator, less any compare a branch fuses: sized once
     // rather than grown (#2586).
     let nops = f.blocks.iter().map(|b| b.insts.len() + 1).sum();
@@ -2782,6 +2791,7 @@ fn compile_func(f: &Func, view: &ModuleView<'_>, fuse: bool) -> Option<Program> 
             }
             Terminator::Return(vs) => ops.push(Op::Ret {
                 srcs: vs.iter().map(|v| g(*v)).collect(),
+                leave,
             }),
             Terminator::Unreachable => ops.push(Op::Unreachable),
             // Tail calls reuse the current activation window (no stack growth): a direct tail call
@@ -2789,15 +2799,17 @@ fn compile_func(f: &Func, view: &ModuleView<'_>, fuse: bool) -> Option<Program> 
             Terminator::ReturnCall { func, args } => ops.push(Op::TailCall {
                 callee: *func,
                 args: args.iter().map(|a| g(*a)).collect(),
+                leave,
             }),
-            Terminator::ReturnCallIndirect { ty, idx, args } => {
-                ops.push(Op::TailCallIndirect(Box::new(IndirectCall {
+            Terminator::ReturnCallIndirect { ty, idx, args } => ops.push(Op::TailCallIndirect {
+                call: Box::new(IndirectCall {
                     idx: g(*idx),
                     args: args.iter().map(|a| g(*a)).collect(),
                     want_params: view.sig(*ty).params.clone().into(),
                     want_results: view.sig(*ty).results.clone().into(),
-                })))
-            }
+                }),
+                leave,
+            }),
         }
         // Exactly one terminator op was pushed above (fused `BrIfCmp` or a plain terminator); pair it
         // with the terminator source entry so `src` stays the same length as `ops`.
@@ -21376,7 +21388,7 @@ fn teardown_domains(
 /// the cursor back into `self`, and hands this struct to the caller to park / hash / resume — exactly
 /// what `park_suspended(frames)` does for the tree-walker today.
 /// #1062 — the monotonic **`setjmp` token** source for the bytecode engine (its own counter; a run
-/// uses one engine tier, and `setjmp_points` is per-`Vm`, so it never collides with the tree-walk
+/// uses one engine tier, and the checkpoints are per-`Vm`, so it never collides with the tree-walk
 /// counter). Each `setjmp` writes a fresh token into the guest `jmp_buf`'s opaque first 8 bytes and
 /// keys its checkpoint by that token, so a guest that *copies* the `jmp_buf` (bash's `COPY_PROCENV`
 /// memcpy of `top_level`, on every `bash -c`) carries the checkpoint identity with the bytes —
@@ -21385,12 +21397,14 @@ fn teardown_domains(
 /// matters — the exact value and any cross-thread interleaving of this counter cannot affect a run.
 static BYTE_SETJMP_TOKEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
-/// A `<setjmp.h>` checkpoint (see [`Vm::setjmp_points`]): everything needed to re-enter a `setjmp`
+/// A `<setjmp.h>` checkpoint (see [`VmRare::setjmps`]): everything needed to re-enter a `setjmp`
 /// activation. `longjmp` truncates [`Vm::stack`] to `depth` (the intervening activations discarded —
 /// C has no cleanups), restores the `(module, cur, base, pc)` cursor and the activation's register
 /// window, and sets the `dst` register to the long-jump value.
 #[derive(Clone)]
 struct ByteSetJmp {
+    /// The token the `setjmp` wrote into the guest `jmp_buf` (#1062), which names this checkpoint.
+    token: u64,
     /// `Vm::stack` length at `setjmp` (the `setjmp` activation is the current one, not yet pushed).
     depth: usize,
     module: usize,
@@ -21499,14 +21513,16 @@ struct Vm {
 /// stays off it.
 #[derive(Clone, Default)]
 struct VmRare {
-    /// `<setjmp.h>` checkpoints — `setjmp` records its activation's resume point here, keyed by a
+    /// `<setjmp.h>` checkpoints — `setjmp` records its activation's resume point here, named by a
     /// per-`setjmp` **token** it writes into the guest `jmp_buf`'s opaque first 8 bytes (#1062);
     /// `longjmp` reads the token back from the (possibly-copied) buffer and looks it up, and
     /// restores the activation's register window ([`ByteSetJmp::window`]).
     /// Token-keying (vs the old address key) is what lets a guest *copy* a `jmp_buf` — bash's
-    /// `COPY_PROCENV` memcpy of `top_level` — carry the checkpoint identity with the bytes; bounded
-    /// by pruning checkpoints whose `setjmp` activation has returned (`SetJmp` op).
-    setjmp_points: std::collections::BTreeMap<u64, ByteSetJmp>,
+    /// `COPY_PROCENV` memcpy of `top_level` — carry the checkpoint identity with the bytes.
+    /// #2877 — a checkpoint lives exactly as long as its activation: its exit (`Ret`, a tail call) or a
+    /// `longjmp` past it drops it ([`Vm::leave_setjmps`]). Each is taken in the current, deepest live
+    /// activation, so the live ones are a stack ordered by `depth`, outermost first.
+    setjmps: Vec<ByteSetJmp>,
     /// §3.6 serve-loop core, #2742: on a handler fiber, the ticket of the dispatch it answers, which
     /// its return replies to ([`return_from_fiber`]). A serve op inside it refuses (#2160).
     dispatch: Option<u64>,
@@ -21775,6 +21791,19 @@ impl Vm {
     /// [`VmRare`], made on first use.
     fn rare(&mut self) -> &mut VmRare {
         self.rare.get_or_insert_default()
+    }
+
+    /// #2877 — the activations from stack depth `depth` up are exiting (a return or tail call of the
+    /// current one, or a `longjmp` past them): their `setjmp` checkpoints die with them. Out of line:
+    /// only a function that takes checkpoints calls it at its exits.
+    #[cold]
+    #[inline(never)]
+    fn leave_setjmps(&mut self, depth: usize) {
+        if let Some(r) = self.rare.as_deref_mut() {
+            while r.setjmps.last().is_some_and(|p| p.depth >= depth) {
+                r.setjmps.pop();
+            }
+        }
     }
 
     /// #2742 — the ticket of the dispatch this handler fiber answers; `None` off a handler.
@@ -22604,8 +22633,8 @@ impl Vm {
                     pc = *target as usize;
                 }
                 // `<setjmp.h>` `setjmp`: checkpoint the resume point (the op after this, in this
-                // activation) and its register window, keyed by the guest `jmp_buf` address, and
-                // return 0.
+                // activation) and its register window, named by a token written into the guest
+                // `jmp_buf`, and return 0.
                 Op::SetJmp { buf, dst } => {
                     // #1062 — key the checkpoint by a fresh TOKEN written into the guest `jmp_buf`'s
                     // opaque first 8 bytes (not the buffer address), so a guest that memcpy-copies
@@ -22621,26 +22650,20 @@ impl Vm {
                         StoreOp::I64,
                         token,
                     )?;
-                    // Bound the token map (address-keying was bounded by overwrite; tokens are not):
-                    // drop checkpoints whose `setjmp` activation has returned — a `longjmp` to one
-                    // would trap regardless. A copied-but-live checkpoint sits at a still-live
-                    // activation (`depth <= stack.len()`) and is retained.
+                    // #2877 — a checkpoint deeper than this activation is dead (its exit dropped it).
                     let live = self.stack.len();
+                    self.leave_setjmps(live + 1);
                     let window = self.regs[base..base + c.prog(cur).nslots as usize].into();
-                    let points = &mut self.rare().setjmp_points;
-                    points.retain(|_, p| p.depth <= live);
-                    points.insert(
+                    self.rare().setjmps.push(ByteSetJmp {
                         token,
-                        ByteSetJmp {
-                            depth: live,
-                            module,
-                            cur,
-                            base,
-                            pc: pc + 1,
-                            dst: *dst,
-                            window,
-                        },
-                    );
+                        depth: live,
+                        module,
+                        cur,
+                        base,
+                        pc: pc + 1,
+                        dst: *dst,
+                        window,
+                    });
                     r!(*dst) = Reg::from_i32(0);
                     pc += 1;
                 }
@@ -22658,13 +22681,16 @@ impl Vm {
                         .ok_or(Trap::Malformed)?
                         .load_scalar(buf_addr, 0, LoadOp::I64)?
                         .i64() as u64;
+                    // #2877 — only a live activation's checkpoint is in the list, so a token that
+                    // names none (never `setjmp`'d, or its activation already returned) misses.
                     let point = (self.rare.as_ref())
-                        .and_then(|r| r.setjmp_points.get(&token))
+                        .and_then(|r| r.setjmps.iter().rev().find(|p| p.token == token))
                         .ok_or(Trap::Malformed)?
                         .clone();
                     if point.depth > self.stack.len() {
-                        return Err(Trap::Malformed); // the setjmp activation already returned
+                        return Err(Trap::Malformed); // unreachable: its exit dropped it
                     }
+                    self.leave_setjmps(point.depth + 1);
                     if let Some(&(.., entered)) = self.stack.get(point.depth) {
                         self.entered = entered;
                     }
@@ -22773,7 +22799,7 @@ impl Vm {
                     base = nb;
                     pc = 0;
                 }
-                Op::Ret { srcs } => {
+                Op::Ret { srcs, leave } => {
                     // #1146 — if this returns from an injected async signal handler (its guard entry
                     // records the stack depth at injection, which equals the current depth when the
                     // handler's own `Ret` fires), restore the personality's block-during-handler mask
@@ -22785,6 +22811,9 @@ impl Vm {
                         if let Some((_, source)) = &signal_poll {
                             source.handler_returned();
                         }
+                    }
+                    if *leave {
+                        self.leave_setjmps(self.stack.len());
                     }
                     match self.stack.pop() {
                         None => {
@@ -22820,7 +22849,11 @@ impl Vm {
                 // Tail calls reuse the *current* window (`base` unchanged) instead of pushing a
                 // return entry, so the callee returns to this activation's caller. Args may alias the
                 // destination prefix, so gather into `scratch` then scatter (like edge copies).
-                Op::TailCall { callee, args } => {
+                Op::TailCall {
+                    callee,
+                    args,
+                    leave,
+                } => {
                     safepoint!(); // fuel unification: function-entry safepoint
                     let callee = *callee as usize;
                     #[cfg(feature = "callprof")]
@@ -22829,6 +22862,9 @@ impl Vm {
                     }
                     self.count_call(module, cur);
                     self.entered = self.work;
+                    if *leave {
+                        self.leave_setjmps(self.stack.len());
+                    }
                     self.grow_regs(base + c.prog(callee).nslots as usize)?;
                     self.scratch.clear();
                     for a in args.iter() {
@@ -22841,7 +22877,7 @@ impl Vm {
                     enter!();
                     pc = 0;
                 }
-                Op::TailCallIndirect(call) => {
+                Op::TailCallIndirect { call, leave } => {
                     let IndirectCall {
                         idx,
                         args,
@@ -22862,6 +22898,9 @@ impl Vm {
                     }
                     self.count_call(module, cur);
                     self.entered = self.work;
+                    if *leave {
+                        self.leave_setjmps(self.stack.len());
+                    }
                     self.grow_regs(base + tm.prog(tfunc).nslots as usize)?;
                     self.scratch.clear();
                     for a in args.iter() {

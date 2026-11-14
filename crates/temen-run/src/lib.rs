@@ -7119,7 +7119,7 @@ fn module_serves(m: &Module) -> bool {
 /// the bytecode engine runs what it admits (bit-exact to the oracle) and transparently falls
 /// back to the tree-walker for the rest, so a legitimate short-circuit (a shape bytecode also
 /// declines) collapses the ladder by construction rather than by caller assumption.
-fn folds_to_oracle(m: &temen_ir::Module) -> bool {
+pub(crate) fn folds_to_oracle(m: &temen_ir::Module) -> bool {
     !temen_jit::admits(m)
         || (module_serves(m)
             && !temen_interp::bytecode::serve_qualifies(&m.funcs)
@@ -10261,6 +10261,44 @@ block 0 (va: i64, vb: i64) {
             temen_verify::verify_module(&m).expect("verify");
             assert!(!temen_jit::admits(&m), "self-op {op}: the JIT declines it");
             assert!(folds_to_oracle(&m), "self-op {op}: so a JIT run folds");
+        }
+    }
+
+    /// #2877 — a module whose code takes `setjmp` checkpoints folds when the JIT's one-stack rule
+    /// refuses it: beside its own fibers or threads, or serving an interface (`temen_jit::admits`, on
+    /// unix where the JIT has `setjmp`; elsewhere it declines `setjmp` outright). Without `setjmp`,
+    /// neither folds it.
+    #[test]
+    fn a_module_with_setjmp_folds_where_the_one_stack_rule_refuses_it() {
+        let module = |body: &str, head: &str| {
+            let src = format!(
+                "memory 16\n{head}func 0 (i32) -> (i64) {{\nblock 0 (vh: i32) {{\n{body}  \
+                 vr = i64.const 0\n  return vr\n  }}\n}}\nfunc 1 (i64, i64) -> (i64) {{\n\
+                 block 0 (va: i64, vb: i64) {{\n  return va\n  }}\n}}\n"
+            );
+            let m = temen_text::parse_module(&src).unwrap_or_else(|e| panic!("{e:?}\n{src}"));
+            temen_verify::verify_module(&m).unwrap_or_else(|e| panic!("{e:?}\n{src}"));
+            m
+        };
+        let sj = "  vb = i64.const 48000\n  vs = setjmp vb\n";
+        let serves = "type 0 func (i64, i64) -> (i64)\ntype 1 interface { f: 0 }\n\
+                      export 0 interface \"svc\" 1 { f: 1 }\n";
+        let spawns = "  vz = i64.const 0\n  vt = thread.spawn 1 vz vz\n";
+        for (name, m, folds) in [
+            ("setjmp alone", module(sj, ""), false),
+            ("setjmp, serving", module(sj, serves), true),
+            (
+                "setjmp, spawning",
+                module(&format!("{sj}{spawns}"), ""),
+                true,
+            ),
+            ("serving, no setjmp", module("", serves), false),
+            ("spawning, no setjmp", module(spawns, ""), false),
+        ] {
+            // Off unix the JIT has no `setjmp` at all, so every module with one folds.
+            let folds = folds || (!cfg!(unix) && name.starts_with("setjmp"));
+            assert_eq!(temen_jit::admits(&m), !folds, "{name}: the JIT's own check");
+            assert_eq!(folds_to_oracle(&m), folds, "{name}");
         }
     }
 }

@@ -311,19 +311,20 @@ fn code_that_uses_setjmp_is_shared_and_each_instance_keeps_its_own_jmp_bufs() {
     );
 }
 
-/// `setjmp` at 64, then a `longjmp` back to it with 7: the second return of `setjmp` answers.
+/// `setjmp` at 48000, then a `longjmp` back to it with 7: the second return of `setjmp` answers. (The
+/// `setjmp` writes its token into the buffer, so it lives above the NULL guard, #2877.)
 #[cfg(unix)]
 const JUMPS: &str = "memory 16
 func (i32) -> (i64) {
 block 0 (v0: i32) {
-  v1 = i64.const 64
+  v1 = i64.const 48000
   v2 = setjmp v1
   v3 = i32.const 0
   v4 = i32.eq v2 v3
   br_if v4 1() 2(v2)
   }
 block 1 () {
-  v5 = i64.const 64
+  v5 = i64.const 48000
   v6 = i32.const 7
   longjmp v5 v6
   unreachable

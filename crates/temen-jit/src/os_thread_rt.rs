@@ -2786,29 +2786,34 @@ impl Domain {
         }
     }
 
-    /// Re-attach and run the spawned children a multi-vCPU freeze flattened (slice 3.3, thaw side),
-    /// **before** the root re-enters — the JIT's single-worker thaw. Mirrors the interp `drive` thaw
-    /// re-spawn: the root's `REWINDING` rewind *skips* its prologue `thread.spawn` (it reloads the
-    /// recorded handle), so a child that existed before the freeze point is reconstructed here, not by
-    /// the root. Each child (in ascending task = spawn order) is pinned back at its slot of the
-    /// domain's child table, which the thaw rebuilt from its counters ([`Children::restored`], #2043),
-    /// so the root's reloaded handle resolves and a spent one stays spent; one its spawner detached
-    /// is re-created with no handle naming it. Each runs under `REWINDING` from its restored shadow
-    /// extent: it rewinds, flips to `NORMAL`, runs forward to completion, and publishes its result —
-    /// so the root's re-executed `thread.join` (after its checkpoint) resolves immediately. Finally the
-    /// active shadow-SP + state word are set to the root's extent + `REWINDING` so the root rewinds
-    /// from the right point.
-    ///
-    /// The children run *before* the root (rather than the interp's root-parks-on-join dispatch): a
-    /// thaw runs to completion with no re-snapshot, and the §12.6 equivalence holds because a
-    /// `REWINDING` vCPU **reloads** its recorded side effects (it never re-issues them), so the
-    /// serialization order doesn't change the result. Scope mirrors the interp's: flat root-spawned
-    /// children, no nested spawns, no child-owned fibers.
+    /// Re-attach the spawned vCPUs a multi-vCPU freeze flattened (slice 3.3, thaw side) before the
+    /// root re-enters. Mirrors the interpreters' thaw re-spawn: the root's `REWINDING` rewind *skips*
+    /// its prologue `thread.spawn` (it reloads the recorded handle), so a vCPU that existed before the
+    /// freeze point is reconstructed here, not by the root. Each record (in ascending task = spawn
+    /// order) is filed back at its slot of the domain's child table, which the thaw rebuilt from its
+    /// counters ([`Children::restored`], #2043), so the root's reloaded handle resolves and a spent
+    /// one stays spent; one its spawner detached is re-created with no handle naming it. A completed
+    /// one is filed with its result and not re-run. A live one is re-spawned on an OS thread of its
+    /// own under `REWINDING` from its restored shadow extent, concurrently with its siblings and with
+    /// the root, which re-enters after this returns (§12.8 concurrent-thaw stage 2): it rewinds,
+    /// flips to `NORMAL` and runs on. A rewinding vCPU reloads the side effects recorded before the
+    /// freeze; the joins and waits it makes after its checkpoint run for real against its live
+    /// siblings. Finally the root's shadow-SP and thaw word are set to its extent and `REWINDING`.
     ///
     /// # Safety
     /// Called from `run_inner` after `set_env`, before the root's guarded call, on a durable thaw run;
     /// the env's window / fault range / call-trampoline are the live run's, the reserve committed RW.
-    pub(crate) unsafe fn thaw_reattach_and_run(&self, seed: &[crate::FrozenVCpu], root_sp: u64) {
+    ///
+    /// `entry` resolves a vCPU's recorded `func` to the code its `thread.spawn` would run
+    /// ([`crate::CompiledModule::thawed_spawn_entry`]). Every value the residue holds is untrusted
+    /// (DURABILITY.md §4, #2878): a running vCPU whose context, entry or join slot is not one a spawn
+    /// could have made ends `ThreadFault` without running, as one the pools refuse does.
+    pub(crate) unsafe fn thaw_reattach_and_run(
+        &self,
+        seed: &[crate::FrozenVCpu],
+        root_sp: u64,
+        entry: &dyn Fn(i32) -> Option<u64>,
+    ) {
         if seed.is_empty() {
             return;
         }
@@ -2848,15 +2853,28 @@ impl Domain {
             // it: charged again. #2318 — never past the process's pools: one they have no room for is
             // a vCPU the process cannot hold, so it is not re-run either, and its join answers
             // `ThreadFault`, as a re-spawn the OS refuses does (below).
+            // #2878 — checked before anything is charged or pinned.
+            let slot_ok = !v.joinable || v.slot < temen_ir::handles::SLOTS;
+            let start = v
+                .completed_result
+                .is_none()
+                .then(|| {
+                    temen_ir::durable_abi::ShadowContexts::vcpu_of_sp(self.shadow(), v.shadow_sp)
+                        .zip(entry(v.func))
+                })
+                .flatten()
+                .filter(|_| slot_ok);
             let ended = match v.completed_result {
+                Some(_) if !slot_ok => Some((0, TrapKind::ThreadFault as i64)),
                 Some(r) => Some((r, 0)),
+                None if start.is_none() => Some((0, TrapKind::ThreadFault as i64)),
                 None if self.node.as_ref().is_some_and(|n| !n.rebuild_vcpu()) => {
                     Some((0, TrapKind::ThreadFault as i64))
                 }
                 None => None,
             };
             let done = Done::new(ended);
-            if v.joinable {
+            if v.joinable && slot_ok {
                 lock(&self.children.table)
                     .pin(v.slot, ChildEntry::Thread(std::sync::Arc::clone(&done)));
             }
@@ -2870,14 +2888,16 @@ impl Domain {
             if !std::ptr::eq(self.hub(), self) {
                 lock(&self.hub().threads).live += 1;
             }
-            let entry = slot_record(env.fn_table_base as *const _, v.func as u32 as usize);
+            let Some((ctx, code)) = start else {
+                unreachable!("a vCPU with no checked start ended above")
+            };
             runs.push(Run {
                 task: v.task as u64,
                 parent: v.parent_task as u64,
                 slot: v.slot,
                 func_idx: v.func as u32,
-                ctx: self.shadow().ctx_of_sp(v.shadow_sp),
-                code: entry.code(),
+                ctx,
+                code,
                 arg0: v.args.first().copied().unwrap_or(0) as u64,
                 arg1: v.args.get(1).copied().unwrap_or(0) as u64,
                 shadow_sp: v.shadow_sp,
@@ -2893,7 +2913,7 @@ impl Domain {
         // those bits stay clear — a post-thaw spawn correctly reuses them.)
         if let Some(table) = self.fiber_table() {
             let mask: u64 = runs.iter().fold(0, |m, r| m | (1u64 << r.ctx));
-            table.seed_vcpu_mask(mask);
+            table.seed_vcpu_contexts(mask);
         }
 
         // (2) §12.8 concurrent-thaw stage 2: **re-spawn each frozen vCPU on its own OS thread**, rewinding
@@ -2941,13 +2961,19 @@ impl Domain {
                 }
             }
         }
-        // The root rewinds first on its re-entry: point the active shadow-SP at its restored extent and
-        // re-arm REWINDING (the last child flipped the word to NORMAL when its rewind completed).
+        // The root rewinds on its re-entry: point its shadow-SP word at its restored extent and arm its
+        // own (context 0) thaw word REWINDING; each re-spawned vCPU rewinds against its own context's.
         // §12.8 4A.5: the root's extent goes into context 0's own region word. The thread that runs the
         // root seeds its own shadow-base register to that region (`run_inner` before its guarded call,
         // a child task's residency, #2010), so nothing here touches the calling thread's.
-        fiber_rt::write_shadow_sp(env.mem_base, self.shadow().region_base(0), root_sp);
-        fiber_rt::window_set_rewinding(env.mem_base, self.shadow(), 0); // the root's own (ctx 0) thaw word
+        // A module with no arena has no root region and no thaw words (INVARIANTS #16): these two
+        // stores would land at window offsets 0 and 8, outside any guarded call. Every record above
+        // was still filed (each live one refused, since no context is a vCPU's), as the interpreters
+        // file them.
+        if self.shadow().region_fits(0) {
+            fiber_rt::write_shadow_sp(env.mem_base, self.shadow().region_base(0), root_sp);
+            fiber_rt::window_set_rewinding(env.mem_base, self.shadow(), 0); // the root's own (ctx 0) thaw word
+        }
 
         *lock(&self.cur_task) = 0; // the root runs next (its joins resolve in its table)
     }
