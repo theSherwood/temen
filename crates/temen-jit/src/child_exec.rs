@@ -1988,8 +1988,11 @@ struct ExecState {
     workers: Vec<std::thread::JoinHandle<()>>,
     /// Workers not yet returned, of those in `workers` (a returned one's handle waits there for the
     /// join): what [`ChildExec::find_worker`] holds against the pool's cap. A worker that panics
-    /// never returns here, and the join waits for its task as it always did (a hang, not a leak to
-    /// recover from); the process-wide [`LIVE_WORKERS`] gives its share back through a drop guard.
+    /// never returns here. If it panicked running a task, before the task was filed back, the join
+    /// waits for that task as it always did (a hang); if after (`finish_child`, `finish_handler`),
+    /// the table empties, and [`ChildExec::join`] sets this and `free_workers` to 0 once every
+    /// handle is joined. The process-wide [`LIVE_WORKERS`] gives its share back through a drop
+    /// guard either way.
     live_workers: usize,
     /// Workers not running a task: waiting for one, back from one, or spawned and not yet started.
     /// A task queued while none is free adds one, up to the pool's cap (#1991).
@@ -3474,8 +3477,14 @@ impl ChildExec {
             let _ = w.join();
         }
         // At rest, and nothing of this run can file again: the next run's tasks run until it ends.
+        // Every worker is joined, so none is alive or free, whatever the counts say: a worker that
+        // panicked after its task was filed (in `finish_child` or `finish_handler`) never counted
+        // itself out, and a next run that met its stale `free_workers` would wait for a worker
+        // that is not there.
         let mut g = lock(&self.state);
-        debug_assert!(g.tasks.is_empty() && g.live_workers == 0);
+        debug_assert!(g.tasks.is_empty());
+        g.live_workers = 0;
+        g.free_workers = 0;
         g.shutdown = false;
         g.end_domain = false;
         g.joining = false;

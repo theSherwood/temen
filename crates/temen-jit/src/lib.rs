@@ -5188,7 +5188,9 @@ impl CompiledModule {
         {
             let lane = hooks.as_ref().map(|h| (h.parent_domain, h.parent_lane_cap));
             *self.run_lane.lock().unwrap_or_else(|e| e.into_inner()) = lane;
-            if let (Some(d), Some((id, cap))) = (&self.domain, lane) {
+            // No hooks: no lane, and the previous hooks' goes (a negative cap is an empty chain).
+            if let Some(d) = &self.domain {
+                let (id, cap) = lane.unwrap_or((0, -1));
                 d.set_lane_chain(id, cap);
             }
         }
@@ -5916,7 +5918,9 @@ impl CompiledModule {
         // S1c — join every §14 child task before freeing the window: a child copies to and from the
         // parent window, so none may outlive it. Once, and last of the run's joins: `join_all` above
         // joined every vCPU, so only a task of the pool can file another meanwhile, which this join
-        // waits for too (it was ended at filing), and a held site has taken no call since its rest.
+        // waits for too (it was ended at filing, unless the run froze: a freeze raises nothing on a
+        // task that has not parked, and it unwinds under its own freeze word), and a held site has
+        // taken no call since its rest.
         #[cfg(fiber_rt)]
         if let Some(n) = &(*this)._nursery {
             (*this).detached_out = n.join_children(froze);
