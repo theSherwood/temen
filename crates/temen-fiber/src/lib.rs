@@ -89,6 +89,31 @@ mod fiber;
 ))]
 pub use fiber::{Fiber, State, Yielder};
 
+/// How many fiber control stacks are live in the process (handed out, not yet dropped), where the
+/// stack arena backs them; `None` on the guard-paged backend, which does not count. Diagnostic.
+pub fn live_stacks() -> Option<usize> {
+    #[cfg(all(
+        not(feature = "guard-page-stacks"),
+        any(
+            all(unix, any(target_arch = "x86_64", target_arch = "aarch64")),
+            all(windows, target_arch = "x86_64")
+        )
+    ))]
+    {
+        Some(stack::live())
+    }
+    #[cfg(not(all(
+        not(feature = "guard-page-stacks"),
+        any(
+            all(unix, any(target_arch = "x86_64", target_arch = "aarch64")),
+            all(windows, target_arch = "x86_64")
+        )
+    )))]
+    {
+        None
+    }
+}
+
 // Combined switch + stack integration tests, ABI-agnostic (they drive whichever `switch`/`stack` the
 // target selected), so every supported target runs the same behavioral checks.
 #[cfg(all(

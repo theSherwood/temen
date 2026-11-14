@@ -94,6 +94,15 @@ struct ArenaState {
 // consumed under the `STATE` mutex, and a `Stack` (which is `Send`) is the only thing that escapes.
 unsafe impl Send for ArenaState {}
 
+/// How many slots are handed out and not yet freed ([`live`]).
+static LIVE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// How many control stacks are live in the process: handed out and not yet dropped. Diagnostic: a
+/// test reads it to show a run gives back every stack it took (temen#3020).
+pub fn live() -> usize {
+    LIVE.load(core::sync::atomic::Ordering::SeqCst)
+}
+
 static STATE: Mutex<ArenaState> = Mutex::new(ArenaState {
     free: Vec::new(),
     cur_base: core::ptr::null_mut(),
@@ -107,6 +116,7 @@ static STATE: Mutex<ArenaState> = Mutex::new(ArenaState {
 fn alloc_slot() -> Option<*mut u8> {
     let mut st = STATE.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(p) = st.free.pop() {
+        LIVE.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
         return Some(p);
     }
     // Need a fresh slot. Reserve a new arena if the current one is exhausted (or none yet).
@@ -129,11 +139,13 @@ fn alloc_slot() -> Option<*mut u8> {
     if !unsafe { commit_slot(slot) } {
         return None; // Windows commit refused — recoverable FiberFault (the slot index is simply skipped).
     }
+    LIVE.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
     Some(slot)
 }
 
 /// Return a slot to the free-list (kept committed — reuse is a pop, not a re-commit).
 fn free_slot(p: *mut u8) {
+    LIVE.fetch_sub(1, core::sync::atomic::Ordering::SeqCst);
     STATE.lock().unwrap_or_else(|e| e.into_inner()).free.push(p);
 }
 
