@@ -375,6 +375,10 @@ pub(crate) fn fault_range_of(base: *mut u8, reserved: usize) -> (usize, usize) {
 impl Drop for GuestWindow {
     fn drop(&mut self) {
         if !self.base.is_null() {
+            // #3059 — the futex registry's entries for this window go with it, before its addresses
+            // can be anyone else's.
+            #[cfg(all(fiber_rt, not(loom)))]
+            crate::os_thread_rt::region_canon_forget_window(self.base as u64, self.total as u64);
             // SAFETY: releasing exactly the reservation we created.
             unsafe { pal::release(self.base, self.total) };
         }

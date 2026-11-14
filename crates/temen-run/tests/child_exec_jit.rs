@@ -1088,3 +1088,152 @@ fn a_reused_compile_spawns_a_child_after_joining_one_on_every_run() {
     assert_eq!(run_interp(&p, &a, &b, -1), 0, "the oracle");
     assert_eq!(reused_jit(&p, &a, &b, -1, 3), vec![0, 0, 0]);
 }
+
+// ---- #3059 — a reused host records at its current window ----
+
+/// `func 0 (aspace, mode)`: mode 0 mints a 64 KiB region, maps it at 65536 of the window and answers
+/// the map's status (0); any other mode maps nothing and answers 7.
+const MAPS_ON_MODE_0: &str = "memory 17
+func (i32, i64) -> (i64) {
+block 0 (v1: i32, vm: i64) {
+  vz = i64.const 0
+  vis0 = i64.eq vm vz
+  br_if vis0 1(v1) 2()
+}
+block 1 (va: i32) {
+  vlen = i64.const 65536
+  vrh64 = call.cap 5 5 (i64) -> (i64) va (vlen)
+  vrh = i32.wrap_i64 vrh64
+  vwo = i64.const 65536
+  vro = i64.const 0
+  vprot = i32.const 3
+  vm0 = call.cap 4 0 (i64, i64, i64, i32) -> (i64) vrh (vwo, vro, vlen, vprot)
+  return vm0
+}
+block 2 () {
+  v7b = i64.const 7
+  return v7b
+  }
+}";
+
+/// Each window's base as it starts, and what the registry held then for the page the region maps
+/// to in the first window.
+static WINDOWS: std::sync::Mutex<Vec<WindowStart>> = std::sync::Mutex::new(Vec::new());
+
+/// A window's base as it started, and the region identity the first window's mapped page had then.
+type WindowStart = (u64, Option<(u64, u64)>);
+
+/// A window-ready hook for the row below: notes the window's base and looks up the first window's
+/// mapped page.
+unsafe extern "C" fn note_window(
+    _ctx: *mut c_void,
+    base: *mut u8,
+    _mapped: u64,
+    _reserved: u64,
+    _ro: *const [u64; 2],
+    _n_ro: usize,
+    _shadow: temen_ir::durable_abi::ShadowArena,
+) -> i32 {
+    let mut w = WINDOWS.lock().unwrap_or_else(|e| e.into_inner());
+    let first = w.first().map_or(base as u64, |&(b, _)| b);
+    let seen = temen_jit::region_canon_lookup(first + 65536);
+    w.push((base as u64, seen));
+    1
+}
+
+/// #3059 — one host, one compile, two runs: run 1 maps a region, run 2 maps none. As run 2's window
+/// starts, the page run 1 mapped has no region identity in the futex registry: run 1's window forgot
+/// it as it was released. Before, the host's recorder lived as long as the host, so the entry stayed
+/// under whatever window took the address next.
+///
+/// It runs alone, re-running itself as the only test in a child process of this binary: with other
+/// tests' windows in the process, run 1's address may be another live window's by then, holding an
+/// identity of its own. Alone, sequential runs of one size reuse the base on Linux, which is the
+/// case that kept run 1's recorder, and the row asserts it there; elsewhere it checks the page
+/// wherever run 2 lands.
+#[test]
+fn a_reused_host_s_later_run_finds_nothing_of_an_earlier_window_s_regions() {
+    const ALONE: &str = "TEMEN_REUSED_HOST_ALONE";
+    if std::env::var_os(ALONE).is_none() {
+        let name = "a_reused_host_s_later_run_finds_nothing_of_an_earlier_window_s_regions";
+        let out = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args(["--exact", name, "--test-threads=1"])
+            .env(ALONE, "1")
+            .output()
+            .expect("re-run the test binary");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        // "1 passed", not just a zero exit: a filter that matched nothing would exit 0 too.
+        assert!(
+            out.status.success() && stdout.contains("1 passed"),
+            "the row failed in its own process:\n{stdout}{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        return;
+    }
+    let m = module(MAPS_ON_MODE_0);
+    let mut host = Box::new(Host::new());
+    host.set_region_factory(temen_run::new_shared_region);
+    let aspace = host.grant_address_space(0, 1u64 << 17);
+    let hp = &mut *host as *mut Host;
+    let mut cm = temen_jit::CompiledModule::compile(
+        &m,
+        0,
+        temen_run::cap_thunk,
+        hp as *mut c_void,
+        temen_ir::DEFAULT_RESERVED_LOG2,
+        None,
+        None,
+        None,
+        None,
+        None,
+        0,
+    )
+    .expect("jit compile");
+    cm.set_window_ready(Some((note_window, hp as *mut c_void)));
+    for (mode, answer) in [(0, 0), (1, 7)] {
+        let (out, _) = cm.run(&[aspace as i64, mode], None, None).expect("jit run");
+        assert_eq!(
+            out,
+            JitOutcome::Returned(vec![answer]),
+            "run of mode {mode}"
+        );
+    }
+    let w = WINDOWS.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    assert_eq!(w.len(), 2, "both windows started");
+    assert_eq!(
+        w[0].1, None,
+        "run 1's page held an identity before run 1 mapped it"
+    );
+    #[cfg(target_os = "linux")]
+    assert_eq!(w[1].0, w[0].0, "run 2's window did not reuse run 1's base");
+    assert_eq!(
+        w[1].1, None,
+        "run 2's window (base {:#x}, run 1's {:#x}) found run 1's region identity",
+        w[1].0, w[0].0
+    );
+    drop(cm);
+    drop(host);
+}
+
+/// #3059 — two reused hosts in one process: each run's maps are recorded at its own window, so a
+/// waiter and its notifier always agree on the key. Before, a host's later runs recorded at its first
+/// window's base, which the other host's child could hold by then: the notify woke nobody and the
+/// join's deadlock verdict fired, about 1 iteration in 7. The address reuse cannot be forced from
+/// here, so the row loops the interleaving.
+#[test]
+fn two_reused_hosts_in_one_process_agree_on_their_futex_keys() {
+    for i in 0..60 {
+        let parks = std::thread::spawn(|| {
+            let p = module(&parent("", TAIL_SUM));
+            reused_jit(&p, &module(&waiter(-1)), &module(NOTIFIER), 1, 3)
+        });
+        let p = module(&parent("", TAIL_SUM));
+        let other = reused_jit(&p, &module(TRIVIAL), &module(TRIVIAL), -1, 3);
+        assert_eq!(other, vec![0, 0, 0], "iteration {i}: the trivial host");
+        assert_eq!(
+            parks.join().expect("the parking host's thread"),
+            vec![1001, 1001, 1001],
+            "iteration {i}: the parking host"
+        );
+    }
+}

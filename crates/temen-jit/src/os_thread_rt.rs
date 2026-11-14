@@ -1050,58 +1050,35 @@ pub(crate) enum FutexKey {
 /// itself is process-global (real OS threads); keyed **absolutely** so a thunk needs only `phys`, never
 /// the window base.
 ///
-/// **Entries are owner-scoped, because window addresses are recycled** (#1608). Two runs never hold
-/// the same virtual address at once, but they reuse it constantly — a freed reservation is handed
-/// straight back out — while the purge runs from the host's teardown, i.e. *after* the reservation is
-/// released. A dying run could therefore forget pages a live one had already recorded, and since a
-/// window purge spans its whole reservation it did not have to be anywhere near the same base
-/// to do it.
+/// **A window's entries go as its reservation does** (#3059). Window virtual addresses are recycled
+/// constantly, so an entry that outlives its window sits under whichever window is handed those
+/// addresses next, and a waiter and a notifier there can compute different keys for one address: the
+/// notify reaches nobody and the run wedges, or its deadlock verdict fires, with no error anywhere.
+/// #1608 caught one way in (a host's purge that ran after the release erased a live window's entry)
+/// and #3059 another (a host reused across runs recorded at its first window's base, under that
+/// window's owner). So the window forgets its own: [`crate::mem::GuestWindow`]'s drop clears every
+/// entry in its reservation **before** releasing it ([`region_canon_forget_window`]). While the
+/// reservation is held no other window can have those addresses, so whoever recorded an entry
+/// there, it is this window's, and none outlives it.
 ///
-/// That is not hypothetical. `child_exec_jit`'s ping-pong test hangs about 1 run in 10 at
-/// `--test-threads=6`, and instrumenting the registry catches it exactly: one page was recorded by
-/// four different runs at the same recycled base (backings 3, 6, 5, 7), and a dead run's purge then
-/// erased the live run's entry between the waiter parking and the notifier waking it —
-///
-/// ```text
-/// forget base=7340c3ffa000 size=1099511627776   <- a dead run's purge, 1 TiB span
-/// keyof phys=7340c400a000 -> Region(7, 0)       <- the waiter parks on this key
-/// keyof phys=7340c400a000 -> Anon (MISS)        <- the notifier computes a different one
-/// ```
-///
-/// A `notify` on `Anon(..)` cannot reach a waiter parked on `Region(7, 0)`, so the handoff is lost and
-/// the run wedges with no error anywhere. Each entry therefore records **which run wrote it**, and a
-/// purge forgets only its own; a record may still replace another owner's entry for a page, which is
-/// correct because a live run's reservation proves the previous owner is gone.
-///
-/// Still keyed **absolutely** so a thunk needs only `phys`, never the window base, and still
-/// process-global because the JIT futex itself is (real OS threads). Scoping the whole map to the
-/// `Domain` would make even a stale *read* impossible and is the end state #1608 describes; it needs
-/// the recorder's install path to carry the `Domain`, which `cap_thunk`'s ABI does not. Real-runtime
-/// only — regions are not part of the loom futex model.
+/// Scoping the whole map to the `Domain` would make even a stale *read* impossible and is the end
+/// state #1608 describes; it needs the recorder's install path to carry the `Domain`, which
+/// `cap_thunk`'s ABI does not. Real-runtime only — regions are not part of the loom futex model.
 #[cfg(not(loom))]
 static REGION_MAP: std::sync::OnceLock<std::sync::Mutex<HashMap<u64, RegionRecord>>> =
     std::sync::OnceLock::new();
 
-/// One page's canonical region identity, plus the run that recorded it (see [`REGION_MAP`]).
+/// One page's canonical region identity (see [`REGION_MAP`]).
 #[cfg(not(loom))]
 #[derive(Clone, Copy)]
 struct RegionRecord {
     backing: u64,
     region_off: u64,
-    owner: u64,
 }
 
 #[cfg(not(loom))]
 fn region_map() -> &'static std::sync::Mutex<HashMap<u64, RegionRecord>> {
     REGION_MAP.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
-}
-
-/// A fresh registry owner id for one run's window, taken once when its recorder is installed. Plain
-/// monotonic counter: ids are never reused, so a dead run's late purge can never match a live one.
-#[cfg(not(loom))]
-pub fn region_canon_new_owner() -> u64 {
-    static NEXT: AtomicU64 = AtomicU64::new(1);
-    NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
 /// Record that the absolute window range `[abs_base, abs_base + len)` aliases region-`backing` starting
@@ -1110,7 +1087,7 @@ pub fn region_canon_new_owner() -> u64 {
 /// the granule); `abs_base`/`region_off` are page-aligned (`map` requires it), so page `i` of the span
 /// aliases region byte `region_off + i·page`.
 #[cfg(not(loom))]
-pub fn region_canon_record(abs_base: u64, len: u64, backing: u64, region_off: u64, owner: u64) {
+pub fn region_canon_record(abs_base: u64, len: u64, backing: u64, region_off: u64) {
     if len == 0 {
         return;
     }
@@ -1124,28 +1101,23 @@ pub fn region_canon_record(abs_base: u64, len: u64, backing: u64, region_off: u6
             RegionRecord {
                 backing,
                 region_off: region_off + (p - first) * page,
-                owner,
             },
         );
     }
 }
 
-/// Forget `owner`'s canonical mappings in the absolute window `[base, base + size)` — called at `unmap`
-/// and at run teardown so a reused virtual address never inherits a stale region identity.
-///
-/// **`owner` is what makes this safe.** The teardown caller no longer holds the address range by the
-/// time it runs, and the range is the whole reservation, so without the owner test a dying run wiped
-/// live entries belonging to whichever runs had since been handed those addresses — the wedge written
-/// up on [`REGION_MAP`] and #1608.
+/// Forget every canonical mapping in the absolute range `[base, base + size)` — at a §13 `unmap`, and
+/// as a window's reservation is released ([`REGION_MAP`]): both while the range is still the caller's,
+/// so nothing of another window's is in it.
 #[cfg(not(loom))]
-pub fn region_canon_forget_window(base: u64, size: u64, owner: u64) {
+pub fn region_canon_forget_window(base: u64, size: u64) {
     let page = mem::page_size() as u64;
     let lo = base / page;
     let hi = base.saturating_add(size).div_ceil(page);
     region_map()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .retain(|&p, r| p < lo || p >= hi || r.owner != owner);
+        .retain(|&p, _| p < lo || p >= hi);
 }
 
 /// The canonical futex key for absolute guest address `phys`: `Region(backing, off)` when its page was
