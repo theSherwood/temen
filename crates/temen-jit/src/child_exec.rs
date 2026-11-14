@@ -2618,7 +2618,13 @@ impl ChildExec {
             .collect();
         for id in ids {
             let ExecState { tasks, windows, .. } = &mut *g;
-            let e = tasks.get_mut(&id).expect("listed");
+            // One woken already since it was listed: a carried task's `offer` wakes its carrier,
+            // which, as a task of this pool, this wake may list after it. Queued twice, the stale
+            // entry would hand the carrier its task while it is parked, and its next park would be
+            // counted again over the count it holds, which no wake undoes (`Entry::counted`).
+            let Some(e) = tasks.get_mut(&id).filter(|e| e.parked) else {
+                continue;
+            };
             e.parked = false;
             e.deadline = None;
             e.woken = true;
@@ -3477,9 +3483,59 @@ enum Outcome {
 
 #[cfg(test)]
 mod tests {
-    use super::{activation_ctx, HeldCaller};
+    use super::{activation_ctx, CarriedBy, Carrier, ChildExec, Entry, HeldCaller, Wake};
     use crate::{FuelCell, InstanceAddrs, VmCtx};
     use std::sync::Arc;
+
+    /// #3000 — a wake queues each task it wakes once, though a carried task's wake wakes its
+    /// carrier, another task of the pool, from inside it. Before, the outer wake went on to its
+    /// stale listing of the carrier and queued it again; the carrier then took its task from the
+    /// queue while it was parked, and a later park of it was counted twice and woken once, which
+    /// left the run's teardown with a park counted ("a park outlived its run").
+    ///
+    /// A chain of activations, each carried by the next, parked: on the old code every carrier the
+    /// map lists after its activation is queued twice, so the chain fails it whatever the order.
+    #[test]
+    fn a_wake_queues_a_carrier_its_carried_task_woke_once() {
+        const N: u64 = 64;
+        let exec = ChildExec::new(0);
+        let vm = Arc::new(VmCtx::new(InstanceAddrs::NONE, crate::Window::NONE));
+        let mut g = super::lock(&exec.state);
+        for id in 1..=N {
+            let by = if id == N {
+                CarriedBy::Thread(std::thread::current())
+            } else {
+                CarriedBy::Task(id + 1)
+            };
+            let carrier = Arc::new(Carrier {
+                woken: std::sync::atomic::AtomicBool::new(false),
+                by,
+            });
+            let entry = Entry {
+                task: None,
+                parked: true,
+                counted: false,
+                deadline: None,
+                woken: false,
+                killed: false,
+                dom: None,
+                vm: Arc::clone(&vm),
+                carrier: Some(carrier),
+            };
+            g.tasks.insert(id, entry);
+        }
+        exec.wake_parked(&mut g, Wake::All);
+        let mut queued: Vec<u64> = g.runnable.iter().copied().collect();
+        queued.sort_unstable();
+        assert_eq!(
+            queued,
+            (1..=N).collect::<Vec<_>>(),
+            "each woken task queued once"
+        );
+        assert!(g.tasks.values().all(|e| !e.parked), "every one woken");
+        g.tasks.clear();
+        g.runnable.clear();
+    }
 
     /// #3000 — a nested activation on a fixed allowance charges its caller's cell (#2488) and holds
     /// a share of its owner, so the cell outlives the caller's context. Before, the inner was handed
