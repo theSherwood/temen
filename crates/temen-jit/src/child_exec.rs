@@ -1987,7 +1987,9 @@ struct ExecState {
     next_id: u64,
     workers: Vec<std::thread::JoinHandle<()>>,
     /// Workers not yet returned, of those in `workers` (a returned one's handle waits there for the
-    /// join): what [`ChildExec::find_worker`] holds against the pool's cap.
+    /// join): what [`ChildExec::find_worker`] holds against the pool's cap. A worker that panics
+    /// never returns here, and the join waits for its task as it always did (a hang, not a leak to
+    /// recover from); the process-wide [`LIVE_WORKERS`] gives its share back through a drop guard.
     live_workers: usize,
     /// Workers not running a task: waiting for one, back from one, or spawned and not yet started.
     /// A task queued while none is free adds one, up to the pool's cap (#1991).

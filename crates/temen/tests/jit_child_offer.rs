@@ -520,3 +520,94 @@ fn a_childs_faulting_handler_kills_the_child_on_every_transport() {
         );
     }
 }
+
+/// #3018 — the parent's spawned vCPU calls a serving child's handler that never returns, and the
+/// parent's root returns meanwhile. Under direct handoff the vCPU claims the call and runs the
+/// handler on its own thread, polling the *child's* end, not the run's: the run's teardown ends the
+/// child's pool task (`Nursery::end_children`) before it joins the run's vCPUs, so the handler
+/// stops and the vCPU's join returns. With the pool ended only after the vCPUs' join, that join
+/// waited for the spinning handler for good.
+///
+/// The root waits until the vCPU is about to call (16400); the vCPU claims the call when the child
+/// is parked in its `svc.wait` in time, else the call is queued and the child's own thread runs the
+/// handler, which the same end stops. Either way the run returns 7.
+const SPIN_SRC: &str = r#"memory 17
+type 0 func (i64, i64) -> (i64)
+type 1 interface { spin: 0 }
+export 0 interface "spinner" 1 { spin: 2 }
+
+func (i32, i32, i32) -> (i64) {
+block 0 (vinst: i32, vbud: i32, vmod: i32) {
+  vrm = i64.const 17544
+  i32.store vrm vmod
+  vrb = i64.const 17548
+  i32.store vrb vbud
+  vrp = i64.const 17536
+  vch = call.cap 6 17 (i64) -> (i32) vinst (vrp)
+  vexp = i64.const 0
+  vh = call.cap 6 14 (i32, i64) -> (i32) vinst (vch, vexp)
+  vha = i64.const 16392
+  i32.store vha vh
+  vz = i64.const 0
+  vt = thread.spawn 3 vz vz
+  br 1()
+}
+block 1 () {
+  vfa = i64.const 16400
+  vf = i32.atomic.load vfa
+  vz1 = i32.const 0
+  vgo = i32.eq vf vz1
+  br_if vgo 2() 3()
+}
+block 2 () {
+  vfa2 = i64.const 16400
+  vz2 = i32.const 0
+  vinf = i64.const -1
+  vw = i32.atomic.wait vfa2 vz2 vinf
+  br 1()
+}
+block 3 () {
+  vr = i64.const 7
+  return vr
+  }
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vz = i32.const 0
+  vn = call.cap 4294967295 10 () -> (i64) vz ()
+  return vn
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (va: i64, vb: i64) {
+  br 1(va)
+}
+block 1 (vx: i64) {
+  vone = i64.const 1
+  vy = i64.add vx vone
+  br 1(vy)
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, varg: i64) {
+  vha = i64.const 16392
+  vh = i32.load vha
+  vfa = i64.const 16400
+  vone = i32.const 1
+  i32.atomic.store vfa vone
+  vn1 = i32.const 1
+  vwk = atomic.notify vfa vn1
+  va = i64.const 1
+  vb = i64.const 2
+  vr = call.cap 268435456 0 (i64, i64) -> (i64) vh (va, vb)
+  return vr
+  }
+}
+"#;
+
+#[test]
+fn a_vcpu_running_a_spinning_childs_handler_ends_with_the_run() {
+    for _ in 0..20 {
+        assert_eq!(run_jit_i64_knob(SPIN_SRC, true), 7, "the run ends");
+    }
+}

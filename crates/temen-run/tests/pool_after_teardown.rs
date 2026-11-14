@@ -42,7 +42,10 @@ fn bounded(f: impl FnOnce() + Send + 'static) {
 /// Before, a stray worker read the freed `Domain` (a host SIGSEGV in 7 of 10 runs on main, ASan:
 /// heap-use-after-free in `Domain::hub`). Here, at each run's return, no worker of a pool is alive.
 /// `pool_workers_live` counts the whole process's, so the assert is sound only because this binary
-/// runs this one test: a test added here must start no pool.
+/// runs this one test: a test added here must start no pool. A weak detector now: a stray filing is
+/// ended as it is filed and its worker returns within microseconds, so what excludes a stray worker
+/// is the teardown's order (the pool ended before the vCPUs' join, joined once after it), not this
+/// assert.
 #[test]
 fn a_child_a_thread_spawns_as_its_root_returns_ends_with_the_run() {
     bounded(three_runs);

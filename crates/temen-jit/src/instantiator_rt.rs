@@ -587,11 +587,6 @@ pub(crate) struct Nursery {
     /// ([`crate::GrantChildHooks::build_detached`] / [`crate::BudgetMemTaker`]; 0 = none ⇒ a spawn is an
     /// inert `CapFault`, like the other grant ops without hooks).
     grant_build_detached: std::sync::atomic::AtomicUsize,
-    /// D66 — the run's own lane, `(domain id, cap)`, from its grant hooks
-    /// (`GrantChildHooks::parent_domain`): installed on the run's domain by [`Self::join_domain`]
-    /// when the domain is made after the hooks were set (`CompiledModule::set_grant_child_hooks`
-    /// installs it on one made before).
-    run_lane: Mutex<Option<(u64, i64)>>,
     grant_budget_mem_take: std::sync::atomic::AtomicUsize,
     /// #2864 — [`crate::GrantListCheck`]: a spawn's grant list, checked before it is admitted.
     grant_check_grants: std::sync::atomic::AtomicUsize,
@@ -700,7 +695,6 @@ impl Nursery {
             durable: AtomicBool::new(false),
             shadow,
             grant_build_detached: std::sync::atomic::AtomicUsize::new(0),
-            run_lane: Mutex::new(None),
             grant_budget_mem_take: std::sync::atomic::AtomicUsize::new(0),
             grant_check_grants: std::sync::atomic::AtomicUsize::new(0),
             grant_budget_mem_give: std::sync::atomic::AtomicUsize::new(0),
@@ -743,9 +737,6 @@ impl Nursery {
         self.children = std::sync::Arc::clone(d.children());
         self.child_exec.join_domain(d);
         d.set_child_exec(std::sync::Arc::clone(&self.child_exec));
-        if let Some((id, cap)) = *self.run_lane.lock().unwrap_or_else(|e| e.into_inner()) {
-            d.set_lane_chain(id, cap);
-        }
     }
 
     /// #2993 — the run's pool, which every task of the run runs on, a held site's activations
@@ -808,8 +799,6 @@ impl Nursery {
             None => (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
         };
         self.grant_build_detached.store(bd, Ordering::Release);
-        *self.run_lane.lock().unwrap_or_else(|e| e.into_inner()) =
-            hooks.map(|h| (h.parent_domain, h.parent_lane_cap));
         self.grant_budget_mem_take.store(mt, Ordering::Release);
         self.grant_check_grants.store(
             hooks.map_or(0, |h| h.check_grants as usize),
