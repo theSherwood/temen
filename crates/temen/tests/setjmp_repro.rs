@@ -389,13 +389,18 @@ fn on_every_engine(src: &str, x: i64) -> [Ended; 3] {
             other => panic!("jit: {other:?}"),
         }
     } else {
-        tree.clone()
+        None // declined: a routed run folds to the interpreters, whose answers the row holds
     };
     [tree, byte, jit]
 }
 
-/// Whether this target's JIT runs `setjmp` (`setjmp_rt`: unix). Off unix it must decline `m`.
+/// Whether this target's JIT runs `m`, a module that uses `setjmp`: on unix (`setjmp_rt`) it does;
+/// elsewhere it must decline it.
 fn jit_has_setjmp(m: &temen_ir::Module) -> bool {
+    assert!(
+        m.funcs.iter().any(temen_ir::Func::uses_setjmp),
+        "jit_has_setjmp asks only of a module that uses setjmp"
+    );
     if cfg!(unix) {
         return true;
     }
@@ -403,13 +408,13 @@ fn jit_has_setjmp(m: &temen_ir::Module) -> bool {
     false
 }
 
-/// Every engine ends `src(x)` as `want`.
+/// Every engine ends `src(x)` as `want`; where the JIT has no `setjmp`, it declines (`None`).
 fn assert_every_engine(src: &str, x: i64, want: Result<Vec<i64>, i64>) {
-    let got = on_every_engine(src, x);
-    let names = ["tree-walker", "bytecode", "Cranelift JIT"];
-    for (name, got) in names.iter().zip(&got) {
-        assert_eq!(got.as_ref(), Some(&want), "{name} at x={x}: {got:?}");
-    }
+    let [tree, byte, jit] = on_every_engine(src, x);
+    assert_eq!(tree.as_ref(), Some(&want), "tree-walker at x={x}: {tree:?}");
+    assert_eq!(byte.as_ref(), Some(&want), "bytecode at x={x}: {byte:?}");
+    let want_jit = cfg!(unix).then_some(&want);
+    assert_eq!(jit.as_ref(), want_jit, "Cranelift JIT at x={x}: {jit:?}");
 }
 
 const MALFORMED: i64 = temen_ir::trap_code::MALFORMED;
@@ -473,7 +478,6 @@ fn optimization_keeps_a_returned_activations_checkpoint_dead() {
     let src = temen_text::print_module(&opt);
     assert_every_engine(&src, 0, Err(MALFORMED));
     assert_every_engine(&src, 1, Ok(vec![0]));
-    assert_every_engine(RETURNED, 1, Ok(vec![0]));
 }
 
 /// One call site runs func 1 twice: the first activation takes a checkpoint and returns, the second

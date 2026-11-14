@@ -6036,8 +6036,9 @@ impl CompiledModule {
     /// still traps, fail-closed — but a signature first introduced here keeps a stable id, so
     /// a future table install of a structurally equal function can satisfy it.
     ///
-    /// A unit may use §12 fibers or threads only when the domain hosts them
-    /// ([`Self::enable_fiber_hosting`] / [`Self::enable_thread_hosting`], from the grant), and
+    /// A unit may use §12 fibers or threads only when the domain runs them: the module's own ops or a
+    /// nesting module's Instantiator calls stood the runtime up at compile, or the grant did
+    /// ([`Self::enable_fiber_hosting`] / [`Self::enable_thread_hosting`]); and
     /// `setjmp`/`longjmp` only when the module has a `setjmp` table. Every unit is asked the module's
     /// one-stack rule too ([`setjmp_rt::admits`], #2877). A refusal is `Unsupported`, before anything
     /// is recorded.

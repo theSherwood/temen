@@ -2807,24 +2807,19 @@ impl Domain {
         }
     }
 
-    /// Re-attach and run the spawned children a multi-vCPU freeze flattened (slice 3.3, thaw side),
-    /// **before** the root re-enters — the JIT's single-worker thaw. Mirrors the interp `drive` thaw
-    /// re-spawn: the root's `REWINDING` rewind *skips* its prologue `thread.spawn` (it reloads the
-    /// recorded handle), so a child that existed before the freeze point is reconstructed here, not by
-    /// the root. Each child (in ascending task = spawn order) is pinned back at its slot of the
-    /// domain's child table, which the thaw rebuilt from its counters ([`Children::restored`], #2043),
-    /// so the root's reloaded handle resolves and a spent one stays spent; one its spawner detached
-    /// is re-created with no handle naming it. Each runs under `REWINDING` from its restored shadow
-    /// extent: it rewinds, flips to `NORMAL`, runs forward to completion, and publishes its result —
-    /// so the root's re-executed `thread.join` (after its checkpoint) resolves immediately. Finally the
-    /// active shadow-SP + state word are set to the root's extent + `REWINDING` so the root rewinds
-    /// from the right point.
-    ///
-    /// Each re-attached vCPU is re-spawned on an OS thread of its own and rewinds concurrently with its
-    /// siblings and with the root, which re-enters after this returns (§12.8 concurrent-thaw stage 2),
-    /// as a fresh concurrent durable run's vCPUs run. The §12.6 equivalence holds because a
-    /// `REWINDING` vCPU **reloads** its recorded side effects (it never re-issues them), so the order
-    /// the threads run in does not change the result.
+    /// Re-attach the spawned vCPUs a multi-vCPU freeze flattened (slice 3.3, thaw side) before the
+    /// root re-enters. Mirrors the interpreters' thaw re-spawn: the root's `REWINDING` rewind *skips*
+    /// its prologue `thread.spawn` (it reloads the recorded handle), so a vCPU that existed before the
+    /// freeze point is reconstructed here, not by the root. Each record (in ascending task = spawn
+    /// order) is filed back at its slot of the domain's child table, which the thaw rebuilt from its
+    /// counters ([`Children::restored`], #2043), so the root's reloaded handle resolves and a spent
+    /// one stays spent; one its spawner detached is re-created with no handle naming it. A completed
+    /// one is filed with its result and not re-run. A live one is re-spawned on an OS thread of its
+    /// own under `REWINDING` from its restored shadow extent, concurrently with its siblings and with
+    /// the root, which re-enters after this returns (§12.8 concurrent-thaw stage 2): it rewinds,
+    /// flips to `NORMAL` and runs on. A rewinding vCPU reloads the side effects recorded before the
+    /// freeze; the joins and waits it makes after its checkpoint run for real against its live
+    /// siblings. Finally the root's shadow-SP and thaw word are set to its extent and `REWINDING`.
     ///
     /// # Safety
     /// Called from `run_inner` after `set_env`, before the root's guarded call, on a durable thaw run;
@@ -2840,9 +2835,7 @@ impl Domain {
         root_sp: u64,
         entry: &dyn Fn(i32) -> Option<u64>,
     ) {
-        // A module with no arena has no thaw words and no root region to rewind from: nothing below
-        // may write one (INVARIANTS #16; the stores at the end are at the root region's offsets).
-        if seed.is_empty() || !self.shadow().region_fits(0) {
+        if seed.is_empty() {
             return;
         }
         let env = self.env();
@@ -2994,8 +2987,14 @@ impl Domain {
         // §12.8 4A.5: the root's extent goes into context 0's own region word. The thread that runs the
         // root seeds its own shadow-base register to that region (`run_inner` before its guarded call,
         // a child task's residency, #2010), so nothing here touches the calling thread's.
-        fiber_rt::write_shadow_sp(env.mem_base, self.shadow().region_base(0), root_sp);
-        fiber_rt::window_set_rewinding(env.mem_base, self.shadow(), 0); // the root's own (ctx 0) thaw word
+        // A module with no arena has no root region and no thaw words (INVARIANTS #16): these two
+        // stores would land at window offsets 0 and 8, outside any guarded call. Every record above
+        // was still filed (each live one refused, since no context is a vCPU's), as the interpreters
+        // file them.
+        if self.shadow().region_fits(0) {
+            fiber_rt::write_shadow_sp(env.mem_base, self.shadow().region_base(0), root_sp);
+            fiber_rt::window_set_rewinding(env.mem_base, self.shadow(), 0); // the root's own (ctx 0) thaw word
+        }
 
         *lock(&self.cur_task) = 0; // the root runs next (its joins resolve in its table)
     }

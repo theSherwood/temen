@@ -1484,44 +1484,36 @@ fn a_thawed_vcpu_no_spawn_could_have_made_ends_thread_fault_on_both_engines() {
     }
 }
 
-/// #2878 — a thaw residue naming a vCPU, handed to a durable run of a threaded module that declares
-/// no shadow arena: there are no thaw words and no root region, so the runtime writes none (it used
-/// to store the root's shadow-SP and thaw word at window offsets 0 and 8, in the NULL guard, outside
-/// any guarded call) and the run answers as an ordinary one does.
+/// #2878 — a thaw residue naming a vCPU, handed to the JIT's durable run of a threaded module that
+/// declares no shadow arena. There are no thaw words and no root region, so the JIT writes none (it
+/// used to store the root's shadow-SP and thaw word at window offsets 0 and 8, in the NULL guard,
+/// outside any guarded call): every run leaves the window the unseeded run leaves. It still files
+/// each record at its slot: a completed child's join reloads its result, and a live one, which no
+/// context can hold, is refused `ThreadFault`. The root spawns nothing; it joins slot 0 and answers
+/// `status * 1000 + value`. (Only the JIT takes a residue an arena-less module could not have
+/// frozen; the interpreters re-create vCPUs only on a thaw of an instrumented window.)
 #[test]
-fn a_vcpu_thaw_residue_on_a_module_with_no_arena_writes_no_control_words() {
-    let mut m = temen_text::parse_module(SRC).expect("parse");
-    m.memory = Some(Memory {
-        size_log2: SIZE_LOG2,
-        shadow: None,
-    });
+fn a_vcpu_thaw_residue_on_a_module_with_no_arena_is_filed_and_writes_no_control_words() {
+    let src = "memory 17
+func () -> (i64) {
+block 0 () {
+  vh = i32.const 0
+  vst, vv = thread.join vh
+  vk = i64.const 1000
+  vs = i64.mul vst vk
+  vr = i64.add vs vv
+  return vr
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (va: i64, vb: i64) {
+  return va
+  }
+}
+";
+    let m = temen_text::parse_module(src).expect("parse");
     temen_verify::verify_module(&m).expect("verify");
-    let run = |seed: Vec<JitVCpu>| {
-        let mut h = Host::new();
-        h.set_durable(true);
-        h.clock_ns = 42;
-        let clk = h.grant_clock();
-        compile_and_run_durable(
-            &m,
-            0,
-            &[clk as i64],
-            &vec![0u8; WINDOW],
-            SIZE_LOG2,
-            temen_run::cap_thunk,
-            &mut h as *mut Host as *mut c_void,
-            DurableRun {
-                seed: DurableResidue {
-                    vcpus: seed,
-                    root_sp: Some(16448 + 64),
-                    ..Default::default()
-                },
-                ..Default::default()
-            },
-        )
-        .map(|(o, ..)| o)
-    };
-    let plain = run(Vec::new());
-    let seeded = run(vec![JitVCpu {
+    let record = |completed: Option<i64>| temen_interp::FrozenVCpu {
         task: 2,
         parent_task: 1,
         slot: 0,
@@ -1529,12 +1521,62 @@ fn a_vcpu_thaw_residue_on_a_module_with_no_arena_writes_no_control_words() {
         func: 1,
         args: vec![0, 0],
         shadow_sp: 16448 + 4096,
-        completed_result: None,
-    }]);
-
+        completed_result: completed,
+    };
+    let jit = |seed: Vec<temen_interp::FrozenVCpu>| {
+        let mut h = Host::new();
+        h.set_durable(true);
+        let (o, win, _) = compile_and_run_durable(
+            &m,
+            0,
+            &[],
+            &vec![0u8; WINDOW],
+            SIZE_LOG2,
+            temen_run::cap_thunk,
+            &mut h as *mut Host as *mut c_void,
+            DurableRun {
+                seed: DurableResidue {
+                    vcpus: seed
+                        .into_iter()
+                        .map(|v| JitVCpu {
+                            task: v.task,
+                            parent_task: v.parent_task,
+                            slot: v.slot,
+                            joinable: v.joinable,
+                            func: v.func,
+                            args: v.args,
+                            shadow_sp: v.shadow_sp,
+                            completed_result: v.completed_result,
+                        })
+                        .collect(),
+                    root_sp: Some(16448 + 64),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .expect("compile");
+        let r = match o {
+            JitOutcome::Returned(v) => Ok(v),
+            JitOutcome::Trapped(k) => Err(k.code()),
+            other => panic!("{other:?}"),
+        };
+        (r, win)
+    };
+    let (plain, plain_win) = jit(vec![]);
     assert_eq!(
-        format!("{seeded:?}"),
-        format!("{plain:?}"),
-        "the residue changes nothing"
+        plain_win.len(),
+        WINDOW,
+        "the run hands its whole window back"
     );
+    let no_thread = Err(temen_ir::trap_code::THREAD_FAULT);
+    assert_eq!(plain, no_thread, "the root joins a slot nothing filled");
+    for (name, seed, want) in [
+        ("a completed child", record(Some(5)), Ok(vec![5])),
+        ("a live child", record(None), no_thread),
+    ] {
+        let (got, win) = jit(vec![seed]);
+        assert_eq!(got, want, "{name}");
+        assert!(win == plain_win, "{name}: the run wrote control words");
+    }
 }
