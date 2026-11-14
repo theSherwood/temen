@@ -767,6 +767,7 @@ dependencies = [
  "temen-interp",
  "temen-ir",
  "temen-jit",
+ "temen-opt",
  "temen-parity",
  "temen-posix",
  "temen-run",

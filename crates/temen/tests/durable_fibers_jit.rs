@@ -763,6 +763,161 @@ fn a_consumed_park_frozen_mid_delivery_redelivers_on_the_jit() {
     jit_thaw(&jsnap, &jr, "JIT-frozen consumed park thawed on the JIT");
 }
 
+/// #2878 — a durable fiber's context (`slot + 1`) must lie inside the arena and below every live
+/// vCPU's: its resume writes the context's words with raw host stores. The root keeps creating fibers
+/// that suspend (so each holds its slot) and counts them in the window, above the arena. `TEST_ARENA` holds 11 regions —
+/// the root's and contexts 1..=10 — so the 11th fiber (slot 10, context 11) has no region: the
+/// tree-walker traps `FiberFault` there, and the JIT must trap at the same fiber. Before the fix it
+/// handed the slot out and its resumes wrote past the arena, and soon past the window.
+#[test]
+fn jit_durable_fiber_past_the_arena_faults_like_the_oracle() {
+    let src = "memory 17 shadow 16448 65536\n\
+        func () -> (i64) {\n\
+        block 0 () {\n\
+        \x20 v0 = i64.const 0\n\
+        \x20 br 1(v0)\n\
+          }\n\
+        block 1 (v0: i64) {\n\
+        \x20 v1 = ref.func 1\n\
+        \x20 v2 = cont.new v1 v0\n\
+        \x20 v3 = i64.const 0\n\
+        \x20 v4, v5 = cont.resume v2 v3\n\
+        \x20 v6 = i64.const 1\n\
+        \x20 v7 = i64.add v0 v6\n\
+        \x20 v8 = i64.const 65600\n\
+        \x20 i64.store v8 v7\n\
+        \x20 v9 = i64.const 64\n\
+        \x20 v10 = i64.lt_s v7 v9\n\
+        \x20 br_if v10 1(v7) 2(v7)\n\
+          }\n\
+        block 2 (v0: i64) {\n\
+        \x20 return v0\n\
+          }\n\
+        }\n\
+        func (i64, i64) -> (i64) {\n\
+        block 0 (v0: i64, v1: i64) {\n\
+        \x20 v2 = i64.const 1\n\
+        \x20 v3 = suspend v2\n\
+        \x20 return v3\n\
+          }\n\
+        }\n";
+    let m = parse_module(src).expect("parse");
+    verify_module(&m).expect("verify");
+    assert_eq!(
+        TEST_ARENA.ctx_ceiling(),
+        10,
+        "the arena holds contexts 0..=10"
+    );
+    let created = |win: &[u8]| u64::from_le_bytes(win[65600..65608].try_into().expect("8 bytes"));
+
+    let mut ihost = Host::new();
+    ihost.set_durable(true);
+    let iwin = init_durable_window(WINDOW, TEST_ARENA);
+    let mut fuel = 10_000_000u64;
+    let (ires, isnap) =
+        run_capture_reserved_with_host(&m, 0, &[], &mut fuel, &iwin, WINDOW_LOG2, &mut ihost);
+    assert!(
+        matches!(ires, Err(temen_interp::Trap::FiberFault)),
+        "the oracle refuses the fiber with no region: {ires:?}"
+    );
+    assert_eq!(created(&isnap), 10, "the oracle ran ten fibers first");
+
+    let mut jhost = Host::new();
+    let jwin = init_durable_window(WINDOW, TEST_ARENA);
+    let (jout, jsnap, DurableResidue { .. }) = compile_and_run_durable(
+        &m,
+        0,
+        &[],
+        &jwin,
+        WINDOW_LOG2,
+        temen_run::cap_thunk,
+        &mut jhost as *mut Host as *mut c_void,
+        DurableRun::default(),
+    )
+    .expect("JIT compiles + runs the durable fiber module");
+    assert!(
+        matches!(jout, JitOutcome::Trapped(temen_jit::TrapKind::FiberFault)),
+        "the JIT refuses the same fiber: {jout:?}"
+    );
+    assert_eq!(created(&jsnap), 10, "the JIT ran the same ten fibers");
+}
+
+/// [`FIBER_SRC`] with its second resume naming handle 10, a fiber it never made.
+fn past_src() -> String {
+    FIBER_SRC.replace(
+        " v7, v8 = cont.resume v2 v6\n",
+        " vten = i64.const 10\n v7, v8 = cont.resume vten v6\n",
+    )
+}
+
+/// #2878 — a thaw residue is untrusted (DURABILITY.md §4), so a seed is bounded by the arena as
+/// `cont.new` is: an interp-frozen one-fiber artifact whose residue is padded to eleven fibers, one
+/// more than `TEST_ARENA`'s ten fiber contexts hold. Both engines seed the ten that fit and stop at
+/// the eleventh (slot 10, context 11). The root's second resume names handle 10 ([`past_src`]):
+/// unseeded, it is no fiber, so both engines trap `FiberFault`, as the uninterrupted run does.
+/// Before, the JIT seeded slot 10 and its resume wrote the context's words past the arena.
+#[test]
+fn a_thaw_seed_past_the_arena_is_not_seeded_on_either_engine() {
+    let m = parse_module(&past_src()).expect("parse");
+    let inst = transform_module(&m).expect("transform");
+    verify_module(&inst).expect("verify");
+    let mut ihost = Host::new();
+    ihost.set_durable(true);
+    let mut iwin = init_durable_window(WINDOW, TEST_ARENA);
+    write_state(&mut iwin, TEST_ARENA, STATE_UNWINDING);
+    let mut ifuel = 1_000_000u64;
+    let (ires, isnap) =
+        run_capture_reserved_with_host(&inst, 0, &[], &mut ifuel, &iwin, WINDOW_LOG2, &mut ihost);
+    assert!(ires.is_ok());
+    let artifact = freeze(&inst, &isnap, &ihost).expect("freeze");
+    let mut thost = Host::new();
+    let mut thaw_win = restore(&artifact, &inst, &mut thost).expect("restore");
+    begin_thaw(&mut thaw_win, TEST_ARENA, 0);
+    let real = thost.frozen_fibers().to_vec();
+    assert_eq!(real.len(), 1, "the artifact carried one frozen fiber");
+    let padded: Vec<InterpFrozen> = (0..11)
+        .map(|slot| InterpFrozen { slot, ..real[0] })
+        .collect();
+    assert_eq!(TEST_ARENA.ctx_ceiling(), 10, "contexts 1..=10 hold fibers");
+
+    let mut jhost = Host::new();
+    let (jout, _win, DurableResidue { .. }) = compile_and_run_durable(
+        &inst,
+        0,
+        &[],
+        &thaw_win,
+        WINDOW_LOG2,
+        temen_run::cap_thunk,
+        &mut jhost as *mut Host as *mut c_void,
+        DurableRun {
+            seed: DurableResidue {
+                fibers: jit_seed(&padded),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )
+    .expect("JIT thaw");
+    assert!(
+        matches!(jout, JitOutcome::Trapped(temen_jit::TrapKind::FiberFault)),
+        "JIT thaw: {jout:?}"
+    );
+
+    thost.set_durable(true);
+    thost.set_frozen_fibers(padded);
+    let mut tfuel = 1_000_000u64;
+    let (tres, _) = run_capture_reserved_with_host(
+        &inst,
+        0,
+        &[],
+        &mut tfuel,
+        &thaw_win,
+        WINDOW_LOG2,
+        &mut thost,
+    );
+    assert_eq!(tres, Err(temen_interp::Trap::FiberFault), "oracle thaw");
+}
+
 /// #3020 — `func 0 (mode, h)`: mode 0 makes a fiber, resumes it once (it suspends with 42) and
 /// answers its handle, leaving it suspended; mode 1 resumes `h` with 7 (a fiber would return 107).
 const LEAVES_A_FIBER: &str = "memory 17 shadow 16448 65536\n\

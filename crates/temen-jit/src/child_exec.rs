@@ -2214,7 +2214,11 @@ impl ChildExec {
                     let root_sp = thaw.root_sp.unwrap_or(d.shadow().frame_base(0));
                     // SAFETY: the env just set is the task's: its window (seeded with its image)
                     // and code live until the task finishes, after its vCPUs are joined.
-                    unsafe { d.thaw_reattach_and_run(&thaw.vcpus, root_sp) };
+                    unsafe {
+                        d.thaw_reattach_and_run(&thaw.vcpus, root_sp, &|f| {
+                            task._code.thawed_spawn_entry(f)
+                        })
+                    };
                 }
                 task.dom = Some(d);
             }

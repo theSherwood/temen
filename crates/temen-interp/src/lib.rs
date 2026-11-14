@@ -2966,6 +2966,12 @@ fn seed_domain(s: &mut Sched, sched: &Arc<Scheduler>, mut root: Box<VCpu>, resid
         let mut seed: Vec<FrozenFiber> = thaw_fibers;
         seed.sort_by_key(|f| f.slot);
         for (expected, ff) in seed.into_iter().enumerate() {
+            // #2878 — the residue is untrusted (DURABILITY.md §4): a slot whose context would lie
+            // past the arena is not seeded, as `cont.new` refuses one ([`ShadowContexts::fiber_fits`]),
+            // and the rewound `cont.resume` that names it fails closed.
+            if !root.domain.registry.seed_fits(arena) {
+                break;
+            }
             let got = if ff.is_free() {
                 root.domain.registry.seed_free(ff.generation)
             } else {
@@ -3135,7 +3141,7 @@ fn mint_task(s: &mut Sched) -> TaskId {
 /// thaw did not re-create leaves the thread out: that parent's rewound join then fails closed.
 ///
 /// Per-piece rebuild (none of "top `n`, densely" holds with recycling):
-///   • context — *derived* from the restored shadow-SP (`ShadowArena::ctx_of_sp`), since the region
+///   • context — *derived* from the restored shadow-SP (`ShadowContexts::vcpu_of_sp`), since the region
 ///     rides in the absolute shadow-SP; added to the parent registry's occupancy mask so a post-thaw
 ///     spawn lands in a genuinely-free context.
 ///   • task id — *preserved* when free ([`claim_task`]).
@@ -3161,6 +3167,20 @@ fn seed_thread(
         }
     };
     let cid = claim_task(s, ff.task);
+    // #2878 — the residue is untrusted (DURABILITY.md §4): a thread whose join slot, context or entry
+    // no spawn could have made ends `ThreadFault` without running, as one the pools refuse does. The
+    // entry is a function of the spawn signature; the context one a vCPU may hold.
+    let slot_ok = !ff.joinable || ff.slot < temen_ir::handles::SLOTS;
+    let entry_ok = usize::try_from(ff.func)
+        .ok()
+        .and_then(|f| p.domain.funcs.get(f))
+        .is_some_and(|f| f.params == [ValType::I64, ValType::I64] && f.results == [ValType::I64]);
+    let ctx = ShadowContexts::vcpu_of_sp(p.arena(), ff.shadow_sp).filter(|_| entry_ok);
+    if !slot_ok {
+        s.results
+            .insert(cid, Outcome::ended(Err(Trap::ThreadFault)));
+        return;
+    }
     // #2043 — a detached thread runs on with no handle naming it, as it did before the freeze.
     let mut c = p.domain.children.lock_unpoisoned();
     if ff.joinable {
@@ -3176,6 +3196,11 @@ fn seed_thread(
             .insert(cid, Outcome::ended(Ok(vec![Value::I64(r)])));
         return;
     }
+    let Some(ctx) = ctx else {
+        s.results
+            .insert(cid, Outcome::ended(Err(Trap::ThreadFault)));
+        return;
+    };
     // #2001 — the thread handed its `spawn` back when it unwound for the freeze, and lived before
     // it: charged again past any ceiling. #2318 — never past the process's pools: a thread they
     // have no room for is one the process cannot hold, so it ends with `ThreadFault`, which its
@@ -3187,8 +3212,7 @@ fn seed_thread(
     };
     live_ids.insert(ff.task as TaskId, cid);
     s.live += 1;
-    let ctx = p.arena().ctx_of_sp(ff.shadow_sp);
-    p.domain.registry.seed_vcpu_mask(1 << ctx);
+    p.domain.registry.seed_vcpu_contexts(p.arena(), 1 << ctx);
     // It joins its domain, as its spawn did ([`Domain`]).
     let mut child = Box::new(VCpu::new(
         Arc::clone(&p.domain),
@@ -5138,9 +5162,26 @@ pub(crate) struct Frame {
     /// Block-local SSA values produced so far (entry = the call arguments), as raw [`Reg`]s, with
     /// the values of the block's ancestors ([`Vals`]).
     vals: Vals,
+    /// #2877 — the `setjmp` checkpoints this activation took, oldest first. They live exactly as long
+    /// as it does: popping, replacing (a tail call) or unwinding past the frame takes them with it,
+    /// so a `longjmp` finds only a live one, on this computation's own stack.
+    setjmps: Vec<SetJmpPoint>,
 }
 
 impl Frame {
+    /// A fresh activation of `func` (in function space `module`), at its entry block with `vals` as
+    /// its arguments.
+    fn new(func: FuncIdx, module: u32, vals: Vals) -> Frame {
+        Frame {
+            func,
+            module,
+            block: 0,
+            inst: 0,
+            vals,
+            setjmps: Vec::new(),
+        }
+    }
+
     /// The function's first param: value 0 of its entry block, which every other block has as an
     /// ancestor, so the frame holds it wherever it is. A §3d frontend passes the data-SP there and
     /// never moves it within the function, so this is the frame's data-SP — whether or not the
@@ -5297,17 +5338,17 @@ impl FromIterator<Reg> for Vals {
     }
 }
 
-/// A `<setjmp.h>` checkpoint: the resume point of a `setjmp` call (see [`VCpu::setjmp_points`]). Since
-/// `Frame::vals` is **replaced per block** (block-param SSA), the value state at the `setjmp` point can
-/// not be reconstructed from the live (later-block) frame, so it is snapshotted here. `longjmp` truncates
-/// the call stack to `depth` (the intervening frames discarded — C has no cleanups), overwrites the
-/// surviving `setjmp` frame with `(block, inst, vals)`, sets `vals[result_idx]` to the long-jump value,
-/// and resumes. The data-stack pointer is among those values ([`Frame::sp`]), so restoring `vals`
-/// restores it.
+/// A `<setjmp.h>` checkpoint: the resume point of a `setjmp` call, kept in the frame that took it
+/// ([`Frame::setjmps`]). Since `Frame::vals` is **replaced per block** (block-param SSA), the value
+/// state at the `setjmp` point can not be reconstructed from the live (later-block) frame, so it is
+/// snapshotted here. `longjmp` truncates the call stack to that frame (the intervening frames discarded
+/// — C has no cleanups), overwrites it with `(block, inst, vals)`, sets `vals[result_idx]` to the
+/// long-jump value, and resumes. The data-stack pointer is among those values ([`Frame::sp`]), so
+/// restoring `vals` restores it.
 #[derive(Clone)]
 struct SetJmpPoint {
-    /// Call-stack length at `setjmp` (the `setjmp` frame is at index `depth - 1`).
-    depth: usize,
+    /// The token the `setjmp` wrote into the guest `jmp_buf` (#1062), which names this checkpoint.
+    token: u64,
     /// The `setjmp` frame's block, and the instruction index just *after* the `setjmp`.
     block: usize,
     inst: usize,
@@ -12058,6 +12099,7 @@ fn freeze_has_landed(mem: Option<&dyn GuestMem>) -> bool {
 /// The shadow arena: where every durable-runtime word sits — the per-context regions, and the
 /// arena's control words in context 0's region header (one definition of placement).
 pub use temen_ir::durable_abi::ShadowArena;
+use temen_ir::durable_abi::ShadowContexts;
 /// The region stride an arena declares unless it names its own: context `i` occupies
 /// `[ShadowArena::region_base(i), +stride)`, 4 KiB by default. The transform's shadow-overflow
 /// guard bounds each push by the arena's stride (#1683), so a context recursed deeper than one
@@ -12685,12 +12727,9 @@ struct RegState {
     /// top-down vCPU pool) and bounding the table to the *peak concurrent* fiber count rather than the
     /// lifetime total. A finished slot's generation is already bumped, so reuse is ABA-safe.
     free: BinaryHeap<Reverse<usize>>,
-    /// **Occupied** durable vCPU shadow contexts (slice 3.2.2 + context recycling): a bitmask over
-    /// contexts `1..=MAX_SHADOW_CTX` (bit `c` set ⇒ context `c` is live). The root spawns children that
-    /// grow **down** from `MAX_SHADOW_CTX` while fibers grow **up** from context 1; a child's context is
-    /// *freed* (its bit cleared) when it genuinely finishes, so the bound is now *peak concurrent* vCPUs
-    /// rather than the lifetime total. `MAX_SHADOW_CTX` is 15, so a `u16` holds every context bit.
-    vcpu_mask: u64,
+    /// The durable shadow contexts the domain's spawned vCPUs hold — the allocator every engine
+    /// shares ([`ShadowContexts`], #2878).
+    contexts: ShadowContexts,
 }
 
 impl FiberRegistry {
@@ -12704,7 +12743,7 @@ impl FiberRegistry {
                 pending: Vec::new(),
                 charges: Vec::new(),
                 free: BinaryHeap::new(),
-                vcpu_mask: 0,
+                contexts: ShadowContexts::default(),
             }),
         }
     }
@@ -12738,43 +12777,25 @@ impl FiberRegistry {
         }
     }
 
-    /// Reserve the next durable vCPU shadow-context (slice 3.2.2): the `thread.spawn` path calls this
-    /// to claim a top-down region (`MAX_SHADOW_CTX`, `−1`, …) for a freshly spawned child. `None` if
-    /// the reserve is full (the vCPU pool growing down would meet the fiber pool growing up) — a clean
-    /// `ThreadFault`, never an overlap. Atomic with the fiber count under the registry lock.
+    /// Reserve a durable vCPU shadow context for a freshly spawned child (`thread.spawn`): the highest
+    /// free one above the fiber pool ([`ShadowContexts::reserve`]). `None` if the reserve is full — a
+    /// clean `ThreadFault`, never an overlap. Atomic with the fiber count under the registry lock.
     fn reserve_vcpu_context(&self, arena: ShadowArena) -> Option<usize> {
         let mut t = self.lock();
-        // Hand out the **highest free** context above the fiber pool (`fibers.len()` occupies contexts
-        // `1..=fibers.len()`). Top-down keeps the vCPU pool clear of the upward-growing fibers; reusing
-        // a freed (cleared) bit is the recycling that lifts the lifetime cap to peak-concurrent.
-        let floor = t.fibers.len();
-        let mut c = arena.ctx_ceiling();
-        while c > floor {
-            if t.vcpu_mask & (1u64 << c) == 0 {
-                t.vcpu_mask |= 1u64 << c;
-                return Some(c);
-            }
-            c -= 1;
-        }
-        None // the reserve is full (the vCPU pool growing down would meet the fibers growing up)
+        let fiber_slots = t.fibers.len();
+        t.contexts.reserve(arena, fiber_slots)
     }
 
-    /// Free a spawned vCPU's shadow context for reuse (context recycling): called when the child
-    /// **genuinely finishes** (not a freeze-unwind, which keeps the region for thaw). A no-op for the
-    /// root / a non-durable child (context 0).
+    /// Free a spawned vCPU's shadow context when the child **genuinely finishes** (not a
+    /// freeze-unwind, which keeps the region for thaw). A no-op for the root / a non-durable child.
     fn free_vcpu_context(&self, ctx: usize) {
-        if (1..64).contains(&ctx) {
-            self.lock().vcpu_mask &= !(1u64 << ctx);
-        }
+        self.lock().contexts.free(ctx);
     }
 
-    /// Seed the durable vCPU-context occupancy a **thaw** re-establishes (context recycling): the
-    /// re-spawned children reclaim *exactly* the contexts they held at freeze (derived from their
-    /// restored shadow-SPs — recycling means these need not be the top `n`), so a post-thaw spawn
-    /// allocates into a genuinely-free context. Each re-spawned child adds its own, before forward
-    /// execution.
-    fn seed_vcpu_mask(&self, mask: u64) {
-        self.lock().vcpu_mask |= mask;
+    /// Seed the vCPU contexts a **thaw** re-establishes (each re-spawned child reclaims the context it
+    /// held at the freeze), so a post-thaw spawn allocates into a genuinely free one.
+    fn seed_vcpu_contexts(&self, arena: ShadowArena, mask: u64) {
+        self.lock().contexts.seed(arena, mask);
     }
 
     /// `cont.new`: allocate a slot — the guest handle — under [`MAX_FIBERS`], which is **per run** now
@@ -12800,20 +12821,10 @@ impl FiberRegistry {
             return Err(Trap::FiberFault);
         }
         let slot = reuse.unwrap_or(t.fibers.len());
-        // A durable fiber needs a distinct shadow region; refuse if the reserve has no room (a
-        // clean `FiberFault`, like reaching the ceiling — never an overflow into another
-        // context's region). The fiber's context index is `slot + 1` (the root is context 0). The
-        // fiber pool grows up from 1 and the spawned-vCPU pool grows down from `MAX_SHADOW_CTX`
-        // (slice 3.2.2), so this fiber must stay strictly below the lowest live vCPU context (which,
-        // with recycling, need not be a simple count from the top).
-        let lowest_vcpu = {
-            if t.vcpu_mask == 0 {
-                arena.ctx_ceiling() + 1
-            } else {
-                t.vcpu_mask.trailing_zeros() as usize
-            }
-        };
-        if durable && (!arena.region_fits(slot + 1) || slot + 1 >= lowest_vcpu) {
+        // A durable fiber needs a distinct shadow region (context `slot + 1`) inside the arena and
+        // below every live vCPU's; refuse if it has none — a clean `FiberFault`, like reaching the
+        // ceiling, never an overflow into another context's region ([`ShadowContexts::fiber_fits`]).
+        if durable && !t.contexts.fiber_fits(arena, slot) {
             return Err(Trap::FiberFault);
         }
         let generation = if reuse.is_some() {
@@ -13143,6 +13154,13 @@ impl FiberRegistry {
     /// `shadow` table (so the swap re-points there). Seed in ascending slot order to rebuild the
     /// dense handle namespace; returns the slot, which must equal the recorded one. `charge` is the
     /// fiber's, taken again (#2112): the freeze handed it back.
+    /// #2878 — whether the next slot a thaw seeds owns a context inside `arena`, as
+    /// [`Self::create`] requires of a durable fiber ([`ShadowContexts::fiber_fits`]).
+    fn seed_fits(&self, arena: ShadowArena) -> bool {
+        let t = self.lock();
+        t.contexts.fiber_fits(arena, t.fibers.len())
+    }
+
     fn seed_frozen(
         &self,
         func: i32,
@@ -13588,15 +13606,6 @@ struct VCpu {
     /// seeds a thread's from [`Host::next_vcpu_id`]), guest-overwritable. Read at the op's execution
     /// point — so a fiber that migrated here reads *this* vCPU's word.
     tls: i64,
-    /// `<setjmp.h>` checkpoints — `setjmp` records this vCPU's resume point here, keyed by a
-    /// per-`setjmp` **token** it writes into the guest `jmp_buf`'s opaque first 8 bytes (#1062);
-    /// `longjmp` reads the token back from the (possibly-copied) buffer and looks it up. Per-vCPU
-    /// (a checkpoint references *this* frame stack; cross-thread `longjmp` is UB in C and simply
-    /// misses). Token-keying (vs the old buffer-address key) is what lets a guest *copy* a `jmp_buf`
-    /// — bash's `COPY_PROCENV` memcpy of `top_level`, which address-keying mis-resolved into an
-    /// infinite `longjmp` loop — carry the checkpoint identity with the bytes. Bounded by pruning
-    /// checkpoints whose `setjmp` frame has returned (`SetJmp` arm), so it does not grow without end.
-    setjmp_points: BTreeMap<u64, SetJmpPoint>,
     /// Set when resuming from a park: how to finish the blocked op (see [`Pending`]).
     pending: Option<Pending>,
     /// The executor this vCPU runs under — the real OS-thread [`Scheduler`] or the deterministic
@@ -13770,13 +13779,11 @@ impl VCpu {
             invoked_types: None,
             chain: vec![ROOT_FIBER],
             cur: ROOT_FIBER,
-            frames: vec![Frame {
-                func: entry,
-                module: 0,
-                block: 0,
-                inst: 0,
-                vals: args.iter().map(|&x| Reg::from_value(x)).collect(),
-            }],
+            frames: vec![Frame::new(
+                entry,
+                0,
+                args.iter().map(|&x| Reg::from_value(x)).collect(),
+            )],
             root_parked: None,
             below: Vec::new(),
             parked_frames: 0,
@@ -13797,7 +13804,6 @@ impl VCpu {
             id,
             parent_task: 0,
             tls: 0, // §12 a domain's root; `thread.spawn` seeds a thread's (#1775)
-            setjmp_points: BTreeMap::new(),
             pending: None,
             sched,
             memop: false,
@@ -13872,7 +13878,6 @@ impl VCpu {
             id: new_id,
             parent_task: self.parent_task,
             tls: self.tls,
-            setjmp_points: BTreeMap::new(),
             pending: None, // the caller sets `CapResult(reply_twin)`
             sched: self.sched.clone(),
             memop: false,
@@ -13927,13 +13932,11 @@ impl VCpu {
             invoked_types: Some(unit_types),
             chain: vec![ROOT_FIBER],
             cur: ROOT_FIBER,
-            frames: vec![Frame {
-                func: 0, // the unit's entry
-                module: INVOKE_MODULE,
-                block: 0,
-                inst: 0,
-                vals: args.iter().map(|&x| Reg::from_value(x)).collect(),
-            }],
+            frames: vec![Frame::new(
+                0, // the unit's entry
+                INVOKE_MODULE,
+                args.iter().map(|&x| Reg::from_value(x)).collect(),
+            )],
             root_parked: None,
             below: Vec::new(),
             parked_frames: 0,
@@ -13954,7 +13957,6 @@ impl VCpu {
             id: 0, // unused: driven inline, never via the executor
             parent_task: 0,
             tls: 0, // §12 per-vCPU TLS seed (id 0)
-            setjmp_points: BTreeMap::new(),
             pending: None,
             sched,
             memop: false,
@@ -14988,7 +14990,6 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
         tls,
         memop,
         acc,
-        setjmp_points,
         units,
         invoked,
         invoked_ref_slots,
@@ -15268,13 +15269,11 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                     .zip(args_)
                                     .map(|(ty, &s)| Reg::from_value(slot_to_val(*ty, s)))
                                     .collect();
-                                frames.push(Frame {
-                                    func: f_,
-                                    module: INVOKE_MODULE,
-                                    block: 0,
-                                    inst: 0,
-                                    vals: hvals_.into(),
-                                });
+                                frames.push(Frame::new(
+                                    f_,
+                                    INVOKE_MODULE,
+                                    hvals_.into(),
+                                ));
                                 continue 'frames;
                             }
                             // The admission outcomes, decided under one brief state lock (the busy
@@ -15578,13 +15577,11 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                     }
                                     chain.push(hslot_);
                                     *cur = hslot_;
-                                    *frames = vec![Frame {
-                                        func: f_,
-                                        module: INVOKE_MODULE,
-                                        block: 0,
-                                        inst: 0,
-                                        vals: hvals_.into(),
-                                    }];
+                                    *frames = vec![Frame::new(
+                                        f_,
+                                        INVOKE_MODULE,
+                                        hvals_.into(),
+                                    )];
                                     // CALLS.md 4b.2 — invalidate the `cur_funcs` cache: the handler
                                     // frame is `INVOKE_MODULE` but `invoked` just changed to the
                                     // provider's `entry.funcs`. A *nested* animation switches
@@ -15787,14 +15784,11 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 {
                                     return Err(Trap::StackOverflow);
                                 }
-                                frames.push(Frame {
-                                    func: cfunc,
-                                    module: cmod,
-                                    block: 0,
-                                    inst: 0,
-                                    vals: vec![Reg::from_i64(sp as i64), Reg::from_i32(signum)]
-                                        .into(),
-                                });
+                                frames.push(Frame::new(
+                                    cfunc,
+                                    cmod,
+                                    vec![Reg::from_i64(sp as i64), Reg::from_i32(signum)].into(),
+                                ));
                                 sig_handler_stack.push(frames.len());
                                 continue 'frames;
                             }
@@ -16271,13 +16265,11 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     if depth as usize + *parked_frames + frames.len() > MAX_CALL_DEPTH as usize {
                         return Err(Trap::StackOverflow);
                     }
-                    frames.push(Frame {
-                        func: *func,
-                        module: frames[top].module, // a direct call stays in the caller's module
-                        block: 0,
-                        inst: 0,
-                        vals: argv,
-                    });
+                    frames.push(Frame::new(
+                        *func,
+                        frames[top].module, // a direct call stays in the caller's module
+                        argv,
+                    ));
                     continue 'frames;
                 }
                 Inst::CallIndirect(c) => {
@@ -16297,13 +16289,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     if depth as usize + *parked_frames + frames.len() > MAX_CALL_DEPTH as usize {
                         return Err(Trap::StackOverflow);
                     }
-                    frames.push(Frame {
-                        func: cfunc,
-                        module: cmod,
-                        block: 0,
-                        inst: 0,
-                        vals: argv,
-                    });
+                    frames.push(Frame::new(cfunc, cmod, argv));
                     continue 'frames;
                 }
                 // The arms below serve their ops here, each delivering the results its op's contract
@@ -17089,13 +17075,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                     pslot,
                                     phandle,
                                     pticket,
-                                    vec![Frame {
-                                        func: hfunc as FuncIdx,
-                                        module: 0,
-                                        block: 0,
-                                        inst: 0,
-                                        vals,
-                                    }]
+                                    vec![Frame::new(hfunc as FuncIdx, 0, vals,)]
                                 );
                             }
                             _ => return Err(Trap::FiberFault),
@@ -17147,13 +17127,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             hslot,
                             handle,
                             d.ticket,
-                            vec![Frame {
-                                func: fidx,
-                                module: 0,
-                                block: 0,
-                                inst: 0,
-                                vals: child_vals.into(),
-                            }]
+                            vec![Frame::new(fidx, 0, child_vals.into(),)]
                         );
                     }
                     // Nothing runnable. `svc.wait` with no progress parks, keyed by this
@@ -18199,13 +18173,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             vals.extend([Reg::from_i64(arg0), Reg::from_i64(av)]);
                             let mut f = std::mem::take(&mut spare_frames);
                             f.clear(); // already empty, as a returned fiber's stack is
-                            f.push(Frame {
-                                func: cfunc,
-                                module: cmod,
-                                block: 0,
-                                inst: 0,
-                                vals,
-                            });
+                            f.push(Frame::new(cfunc, cmod, vals));
                             f
                         }
                         Claimed::Live(mut f) => {
@@ -18329,9 +18297,9 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     }
                 }
                 // `setjmp`: snapshot this frame's resume point (the value state is captured because
-                // `vals` is replaced per block) keyed by the guest `jmp_buf` address, and fall through
+                // `vals` is replaced per block) as a checkpoint of this frame, and fall through
                 // returning 0. `frames[top].inst` is already advanced past the `setjmp` (line above), so
-                // it is exactly the re-entry point. A re-`setjmp` to the same buffer overwrites.
+                // it is exactly the re-entry point.
                 Inst::SetJmp { buf } => {
                     let buf_addr = get_i64(&frames[top].vals, *buf)? as u64;
                     // #1062 — mint a fresh token and write it into the guest `jmp_buf`'s opaque
@@ -18348,33 +18316,28 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         StoreOp::I64,
                         Value::I64(token as i64),
                     )?;
-                    // Bound the token map (address-keying was bounded by overwrite; tokens are not):
-                    // drop checkpoints whose `setjmp` frame has already returned — a `longjmp` to one
-                    // would trap regardless. A copied-but-live checkpoint sits at a still-live frame
-                    // (`depth <= live`) and is retained.
-                    let live = frames.len();
-                    setjmp_points.retain(|_, p| p.depth <= live);
+                    // #2877 — the checkpoint lives in this frame, so it dies with the activation
+                    // (a return, a tail call, a longjmp or trap past it) and nothing else can reach
+                    // it: no returned activation, no sibling at the same depth, no other fiber.
                     let result_idx = frames[top].vals.len();
                     let mut snap = frames[top].vals.clone();
                     snap.push(Reg::from_i32(0)); // the result slot (overwritten by longjmp)
-                    setjmp_points.insert(
+                    let point = SetJmpPoint {
                         token,
-                        SetJmpPoint {
-                            depth: frames.len(),
-                            block: frames[top].block,
-                            inst: frames[top].inst,
-                            vals: snap,
-                            result_idx,
-                        },
-                    );
+                        block: frames[top].block,
+                        inst: frames[top].inst,
+                        vals: snap,
+                        result_idx,
+                    };
+                    frames[top].setjmps.push(point);
                     frames[top].vals.push(Reg::from_i32(0)); // the direct call returns 0
                 }
                 // `longjmp`: read the #1062 token back from the (possibly-copied) `jmp_buf`, look up
                 // the checkpoint by token, unwind the call stack to it (the intervening frames
                 // discarded — C has no cleanups), restore the `setjmp` frame's (block, inst, vals)
                 // with the result slot set to `val` (a `0` `val` becomes `1`, per C), and resume
-                // there. A token that names no live checkpoint (never `setjmp`'d, or its frame
-                // already returned — `depth` now exceeds the live stack) traps in-sandbox (§3b).
+                // there. A token that names no checkpoint of a live frame of this computation (never
+                // `setjmp`'d, or its activation already returned) traps in-sandbox (§3b, #2877).
                 Inst::LongJmp { buf, val } => {
                     let buf_addr = get_i64(&frames[top].vals, *buf)? as u64;
                     let v = get_i32(&frames[top].vals, *val)?;
@@ -18388,11 +18351,18 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             Value::I64(t) => t as u64,
                             _ => return Err(Trap::Malformed),
                         };
-                    let point = setjmp_points.get(&token).cloned().ok_or(Trap::Malformed)?;
-                    if point.depth == 0 || point.depth > frames.len() {
-                        return Err(Trap::Malformed); // the setjmp frame has already returned
-                    }
-                    frames.truncate(point.depth);
+                    let (at, point) = frames
+                        .iter()
+                        .enumerate()
+                        .rev()
+                        .find_map(|(k, f)| {
+                            f.setjmps
+                                .iter()
+                                .find(|p| p.token == token)
+                                .map(|p| (k, p.clone()))
+                        })
+                        .ok_or(Trap::Malformed)?;
+                    frames.truncate(at + 1);
                     // #802 — a longjmp that unwinds OUT of an injected signal handler leaves the
                     // handler exactly like a return does: pop each crossed guard entry and fire
                     // `handler_returned()` per crossed handler, so the personality restores its
@@ -18413,7 +18383,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         // handled (POSIX: EINTR is per-interrupted-call).
                         host.lock_unpoisoned().take_sig_interrupt();
                     }
-                    let f = &mut frames[point.depth - 1];
+                    let f = &mut frames[at];
                     f.block = point.block;
                     f.inst = point.inst;
                     f.vals = point.vals;
@@ -19254,13 +19224,11 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 if fs.get(*func as usize).is_none() {
                     return Err(Trap::Malformed);
                 }
-                let callee = Frame {
-                    func: *func,
-                    module: frames[top].module, // a direct tail call stays in the caller's module
-                    block: 0,
-                    inst: 0,
-                    vals: argv,
-                };
+                let callee = Frame::new(
+                    *func,
+                    frames[top].module, // a direct tail call stays in the caller's module
+                    argv,
+                );
                 recycle(&mut spare, std::mem::replace(&mut frames[top], callee).vals);
             }
             Terminator::ReturnCallIndirect { ty, idx, args } => {
@@ -19274,13 +19242,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     call_sig(&cur_types, *ty),
                 )?;
                 let argv = callee_vals(&mut spare, &frames[top].vals, args)?;
-                let callee = Frame {
-                    func: cfunc,
-                    module: cmod,
-                    block: 0,
-                    inst: 0,
-                    vals: argv,
-                };
+                let callee = Frame::new(cfunc, cmod, argv);
                 recycle(&mut spare, std::mem::replace(&mut frames[top], callee).vals);
             }
         }

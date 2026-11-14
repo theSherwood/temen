@@ -378,11 +378,18 @@ fn callee_total_insts(callee: &Func) -> usize {
 /// stay inside the callee), a value `return`, or `unreachable`, and at least one block actually
 /// `return`s (so the spliced-in continuation has a predecessor). Tail-call exits
 /// (`return_call`/`return_call.dyn`) are excluded — turning a callee tail call into a caller
-/// non-tail call is a separate transform. A single-block `return` callee takes the in-place fast path
+/// non-tail call is a separate transform. A callee that takes `setjmp` checkpoints is never inlined
+/// ([`Func::takes_checkpoints`]). A single-block `return` callee takes the in-place fast path
 /// ([`inline_single_block_call`]); anything else with internal control flow takes the CFG-splicing path
 /// ([`inline_multi_block_call`]).
 fn is_inlinable(callee: &Func, max_callee: usize) -> bool {
-    if callee.blocks.is_empty() || callee_total_insts(callee) > max_callee {
+    // #2877 — a checkpoint lives exactly as long as the activation that took it: inlined, a callee's
+    // `setjmp` would take it in the caller's activation, and a `longjmp` after the callee "returned"
+    // would succeed where it must trap.
+    if callee.blocks.is_empty()
+        || callee_total_insts(callee) > max_callee
+        || callee.takes_checkpoints()
+    {
         return false;
     }
     let exits_ok = callee.blocks.iter().all(|b| {

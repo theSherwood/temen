@@ -398,20 +398,7 @@ pub(crate) unsafe fn run_guarded(
 ) -> bool {
     pal::install_guard();
     let (lo, hi) = window.fault_range();
-    let f: Entry = std::mem::transmute(code);
-    // The entry ABI spells the context pointer as the trap cell it starts with (`VmCtx` field 0).
-    guarded(|| {
-        pal::run_guarded(
-            f,
-            args,
-            results,
-            mem_base,
-            fn_table,
-            vmctx as *mut i64,
-            lo,
-            hi,
-        )
-    })
+    run_guarded_range(code, args, results, mem_base, fn_table, vmctx, lo, hi)
 }
 
 /// #3020 — `call` a guarded entry. A fault's recovery jumps out of every fiber the entry resumed on
@@ -497,6 +484,11 @@ pub(crate) unsafe fn run_guarded_range(
     hi: usize,
 ) -> bool {
     let f: Entry = std::mem::transmute(code);
+    // #2877 — the `setjmp` checkpoints this call takes die with it, however it ends (a fault skips
+    // every frame's exit), and a `longjmp` inside it cannot reach an enclosing call's.
+    #[cfg(setjmp_rt)]
+    let _checkpoints = crate::setjmp_rt::Scope::enter(vmctx);
+    // The entry ABI spells the context pointer as the trap cell it starts with (`VmCtx` field 0).
     guarded(|| {
         pal::run_guarded(
             f,
@@ -578,6 +570,72 @@ pub(crate) unsafe extern "C" fn mem_fill(vm: &crate::VmCtx, dst: u64, val: u64, 
     ) {
         fault(vm);
     }
+}
+
+/// #2877 — store `val` into the 8 guest bytes at window offset `at` of `vm`'s window, for a host
+/// function in place of a guest store: confined and paged as [`mem_copy`] does its destination, and
+/// run through [`try_access`], so it faults exactly where a guest store would (the null guard, an
+/// unbacked or read-only page) and the fault is the guest's, not the host's (#2996). `false` when it
+/// did not complete, with the `MemoryFault` raised (or the domain stopped by its pager). The `setjmp`
+/// runtime writes a `jmp_buf`'s token through it.
+///
+/// # Safety
+/// As [`mem_copy`].
+#[cfg(setjmp_rt)]
+pub(crate) unsafe fn guest_store_u64(vm: &crate::VmCtx, at: u64, val: u64) -> bool {
+    let w = vm.window();
+    let Some(d) = w.span(at, 8) else {
+        fault(vm);
+        return false;
+    };
+    if w.pages != 0 && !pages_admit(vm, at, 8, true) {
+        return false;
+    }
+    let bytes = val.to_ne_bytes();
+    let ok = try_access(
+        w,
+        &mut Access::Copy {
+            dst: d,
+            src: bytes.as_ptr(),
+            len: 8,
+        },
+    );
+    if !ok {
+        fault(vm);
+    }
+    ok
+}
+
+/// #2877 — the 8 guest bytes at window offset `at` of `vm`'s window, read for a host function in
+/// place of a guest load, as [`guest_store_u64`] writes them. `None` when the guest may not read
+/// them, with the `MemoryFault` raised (or the domain stopped by its pager). The `setjmp` runtime
+/// reads a `jmp_buf`'s token through it.
+///
+/// # Safety
+/// As [`mem_copy`].
+#[cfg(setjmp_rt)]
+pub(crate) unsafe fn guest_load_u64(vm: &crate::VmCtx, at: u64) -> Option<u64> {
+    let w = vm.window();
+    let Some(s) = w.span(at, 8) else {
+        fault(vm);
+        return None;
+    };
+    if w.pages != 0 && !pages_admit(vm, at, 8, false) {
+        return None;
+    }
+    let mut bytes = [0u8; 8];
+    if !try_access(
+        w,
+        &mut Access::Copy {
+            dst: bytes.as_mut_ptr(),
+            src: s,
+            len: 8,
+        },
+    ) {
+        fault(vm);
+        return None;
+    }
+    Some(u64::from_ne_bytes(bytes))
 }
 
 /// A bulk op's span past the reservation: the `MemoryFault` a guest access there is. Out of line, so
