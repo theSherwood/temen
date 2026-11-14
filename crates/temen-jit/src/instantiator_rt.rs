@@ -1055,15 +1055,24 @@ impl Nursery {
         // ended, its retained ref is released, and a freeze's harvest is taken. The nursery outlives
         // the run on a reused compile, so a later run would otherwise find every earlier run's child
         // nurseries still held.
-        lock(&self.kids).clear();
-        lock(&self.unclaimed).clear();
+        self.kids.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.unclaimed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         harvest
     }
 
     /// #3024 — how many child nurseries and claim-ended children this nursery holds: none between
     /// runs.
     pub(crate) fn held(&self) -> (usize, usize) {
-        (lock(&self.kids).len(), lock(&self.unclaimed).len())
+        (
+            self.kids.lock().unwrap_or_else(|e| e.into_inner()).len(),
+            self.unclaimed
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .len(),
+        )
     }
 
     /// CALLS.md 5c.0 — release each child's nursery-retained shared-powerbox ref (minted live-impls

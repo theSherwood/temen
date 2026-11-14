@@ -877,3 +877,52 @@ fn a_reused_compile_freezes_a_fiber_thaws_it_and_a_later_run_cannot_reach_it() {
         "run 3 resumed the thaw's fiber"
     );
 }
+
+/// #3024 — a freeze's residue is its run's: one compile, run 1 frozen with a fiber parked and its
+/// residue never taken, then run 2 runs uninterrupted. What the durable entry reads after run 2 is
+/// run 2's, which froze nothing. Before, the residue stayed on the module and run 2 handed back run
+/// 1's fiber.
+#[test]
+fn a_reused_compile_s_later_run_hands_back_no_earlier_freeze_s_residue() {
+    use temen_jit::CompiledModule;
+    let m = parse_module(LEAVES_A_FIBER).expect("parse");
+    let inst = transform_module(&m).expect("transform");
+    verify_module(&inst).expect("verify");
+    let mut host = Host::new();
+    let mut cm = match CompiledModule::compile(
+        &inst,
+        0,
+        temen_run::cap_thunk,
+        &mut host as *mut Host as *mut c_void,
+        WINDOW_LOG2,
+        None,
+        None,
+        None,
+        None,
+        None,
+        0,
+    ) {
+        Ok(cm) => cm,
+        Err(temen_jit::JitError::Unsupported(_)) => return,
+        Err(e) => panic!("compile: {e:?}"),
+    };
+
+    // Run 1: frozen from its start, the fiber parked; nobody takes its residue.
+    let mut win = init_durable_window(WINDOW, TEST_ARENA);
+    write_state(&mut win, TEST_ARENA, STATE_UNWINDING);
+    cm.set_durable(DurableResidue::default());
+    let (out, _) = cm.run(&[0, 0], Some(&win), Some(WINDOW)).expect("freeze");
+    assert!(matches!(out, JitOutcome::Returned(_)), "run 1: {out:?}");
+
+    // Run 2: uninterrupted.
+    cm.set_durable(DurableResidue::default());
+    let fresh = init_durable_window(WINDOW, TEST_ARENA);
+    let (out, _) = cm.run(&[0, 0], Some(&fresh), Some(WINDOW)).expect("run 2");
+    assert!(matches!(out, JitOutcome::Returned(_)), "run 2: {out:?}");
+    assert_eq!(
+        cm.take_durable_residue(),
+        DurableResidue::default(),
+        "run 2 handed back run 1's freeze residue"
+    );
+    assert!(cm.take_detached_harvest().is_empty());
+}

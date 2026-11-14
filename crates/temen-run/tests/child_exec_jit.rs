@@ -993,7 +993,7 @@ fn reused_jit(
 ) -> Vec<i64> {
     let (p, a, b) = (p.clone(), a.clone(), b.clone());
     let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
+    let t = std::thread::spawn(move || {
         let (host, h) = host(&a, &b, cap);
         let mut host = Box::new(host);
         let hp = &mut *host as *mut Host;
@@ -1026,11 +1026,22 @@ fn reused_jit(
         drop(cm);
         drop(host);
     });
+    let mut t = Some(t);
     (1..=runs)
         .map(|run| {
-            let (r, held) = rx
-                .recv_timeout(std::time::Duration::from_secs(30))
-                .unwrap_or_else(|e| panic!("run {run} of one compile did not end: {e:?}"));
+            let (r, held) = match rx.recv_timeout(std::time::Duration::from_secs(30)) {
+                Ok(got) => got,
+                // A panic drops the sender: report it as itself.
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => std::panic::resume_unwind(
+                    t.take()
+                        .expect("the runs' thread")
+                        .join()
+                        .expect_err("the runs panicked"),
+                ),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    panic!("run {run} of one compile did not end within 30 s")
+                }
+            };
             // #3024 — the nursery keeps nothing of a run's children past it.
             assert_eq!(
                 held,
@@ -1052,13 +1063,34 @@ fn a_reused_compile_spawns_and_joins_children_on_every_run() {
     assert_eq!(reused_jit(&p, &a, &b, -1, 3), vec![0, 0, 0]);
 }
 
-/// #3024 — children a run leaves unjoined end with it, and the nursery keeps nothing of them for
-/// the next run: no child nursery, no claim-ended child (the harness checks after every run).
+/// #3024 — a child that spawns a grandchild: the child's nursery is held in the run's `kids` from its
+/// birth, and the run's teardown lets it go. Three runs of one compile answer the same, and after
+/// each the run's nursery holds nothing (the harness checks). Fails without the clear: run 1's child
+/// nursery is still held after it.
 #[test]
-fn a_reused_compile_keeps_nothing_of_a_run_s_unjoined_children() {
-    let p = module(&parent("", TAIL_LEAVE));
-    let a = module(TRIVIAL);
-    let b = module(TRIVIAL);
+fn a_reused_compile_lets_go_of_each_run_s_child_nurseries() {
+    let p = module(&root_spins_beside_grandchild());
+    let c = module(&grandchild_spins());
+    let g = temen_ir::child_image_at(&c, 1).expect("the grandchild's image");
+    let want = i64::from(temen_ir::handles::pack(0, 1)) + 7;
+    assert_eq!(reused_jit(&p, &c, &g, 1, 3), vec![want; 3]);
+}
+
+/// Detach both, while they spin, and return 7.
+const TAIL_DETACH: &str = "vda = call.cap 6 10 (i32) -> (i32) v0 (vca)
+  vdb = call.cap 6 10 (i32) -> (i32) v0 (vcb)
+  vr = i64.const 7
+  return vr";
+
+/// #3024 — children a run detaches while they still run: each detach leaves the child in the
+/// nursery's `unclaimed` until its subtree has ended, which for a spinner is the run's teardown. The
+/// teardown lets them go, so after every run the nursery holds nothing (the harness checks). Fails
+/// without the clear: run 1 leaves its two spinners in `unclaimed`.
+#[test]
+fn a_reused_compile_keeps_nothing_of_a_run_s_detached_children() {
+    let p = module(&parent("", TAIL_DETACH));
+    let a = module(SPINNER);
+    let b = module(SPINNER);
     assert_eq!(reused_jit(&p, &a, &b, -1, 3), vec![7, 7, 7]);
 }
 
@@ -1148,19 +1180,30 @@ unsafe extern "C" fn note_window(
 ///
 /// It runs alone, re-running itself as the only test in a child process of this binary: with other
 /// tests' windows in the process, run 1's address may be another live window's by then, holding an
-/// identity of its own. Alone, sequential runs of one size reuse the base on Linux, which is the
-/// case that kept run 1's recorder, and the row asserts it there; elsewhere it checks the page
-/// wherever run 2 lands.
+/// identity of its own. Alone, it checks run 1's page wherever run 2 lands: on main the entry stayed
+/// whether or not run 2 reused the base (sequential runs of one size usually do; the failure message
+/// says whether it did).
 #[test]
 fn a_reused_host_s_later_run_finds_nothing_of_an_earlier_window_s_regions() {
     const ALONE: &str = "TEMEN_REUSED_HOST_ALONE";
     if std::env::var_os(ALONE).is_none() {
         let name = "a_reused_host_s_later_run_finds_nothing_of_an_earlier_window_s_regions";
-        let out = std::process::Command::new(std::env::current_exe().expect("test binary"))
+        let child = std::process::Command::new(std::env::current_exe().expect("test binary"))
             .args(["--exact", name, "--test-threads=1"])
             .env(ALONE, "1")
-            .output()
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
             .expect("re-run the test binary");
+        // Bounded: a child that hangs fails the row rather than the job.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(child.wait_with_output());
+        });
+        let out = rx
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .expect("the row's own process did not end within 60 s")
+            .expect("the row's own process");
         let stdout = String::from_utf8_lossy(&out.stdout);
         // "1 passed", not just a zero exit: a filter that matched nothing would exit 0 too.
         assert!(
@@ -1204,8 +1247,6 @@ fn a_reused_host_s_later_run_finds_nothing_of_an_earlier_window_s_regions() {
         w[0].1, None,
         "run 1's page held an identity before run 1 mapped it"
     );
-    #[cfg(target_os = "linux")]
-    assert_eq!(w[1].0, w[0].0, "run 2's window did not reuse run 1's base");
     assert_eq!(
         w[1].1, None,
         "run 2's window (base {:#x}, run 1's {:#x}) found run 1's region identity",

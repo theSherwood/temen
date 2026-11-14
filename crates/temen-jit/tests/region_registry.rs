@@ -13,9 +13,10 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use temen_jit::{region_canon_forget_window, region_canon_lookup, CompiledModule, JitOutcome};
 
-/// 4 KiB everywhere temen runs; the registry pages with its own granule, so a test that stays a
-/// whole page away from its neighbours does not need to know it exactly.
-const PAGE: u64 = 4096;
+/// A span that is a whole number of host pages wherever temen runs (4 KiB on x86-64, 16 KiB on macOS
+/// arm64, up to 64 KiB elsewhere): the registry pages with the host's granule, so a test that keeps
+/// its spans this far apart does not need to know it.
+const PAGE: u64 = 1 << 16;
 
 /// A forget clears every entry in its range, and nothing outside it.
 #[test]

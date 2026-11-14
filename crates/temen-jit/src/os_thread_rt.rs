@@ -802,7 +802,7 @@ pub(crate) struct Domain {
     completed_children: Mutex<Vec<CompletedChild>>,
     /// **Durable** (slice 3.4): residue of the fibers a *spawned child* flattened with its own
     /// `freeze_drive` (a child that owns `cont.*` fibers). Accumulated by [`Domain::run_child_inline`];
-    /// `run_inner` merges it into the run's `frozen_out` (the root's own fibers are flattened directly
+    /// `run_inner` merges it into the run's `frozen.fibers` (the root's own fibers are flattened directly
     /// there). Empty on a non-durable run or a thread-only domain.
     frozen_fibers: Mutex<Vec<crate::FrozenFiber>>,
     /// #2043 D1 — the domain's child handles, shared with its nursery: every vCPU's `thread.spawn`
@@ -1059,13 +1059,16 @@ pub(crate) enum FutexKey {
 /// window's owner). So the window forgets its own: [`crate::mem::GuestWindow`]'s drop clears every
 /// entry in its reservation **before** releasing it ([`region_canon_forget_window`]). While the
 /// reservation is held no other window can have those addresses, so whoever recorded an entry
-/// there, it is this window's, and none outlives it.
+/// there, it is this window's. That makes the registry exact for records made through JIT
+/// dispatch, which hands the host's recorder the current window before any record. A recorder a
+/// host still holds past its window can record at the dead base from another engine's dispatch
+/// (#3062).
 ///
 /// Scoping the whole map to the `Domain` would make even a stale *read* impossible and is the end
 /// state #1608 describes; it needs the recorder's install path to carry the `Domain`, which
 /// `cap_thunk`'s ABI does not. Real-runtime only — regions are not part of the loom futex model.
 #[cfg(not(loom))]
-static REGION_MAP: std::sync::OnceLock<std::sync::Mutex<HashMap<u64, RegionRecord>>> =
+static REGION_MAP: std::sync::OnceLock<std::sync::Mutex<BTreeMap<u64, RegionRecord>>> =
     std::sync::OnceLock::new();
 
 /// One page's canonical region identity (see [`REGION_MAP`]).
@@ -1077,8 +1080,8 @@ struct RegionRecord {
 }
 
 #[cfg(not(loom))]
-fn region_map() -> &'static std::sync::Mutex<HashMap<u64, RegionRecord>> {
-    REGION_MAP.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+fn region_map() -> &'static std::sync::Mutex<BTreeMap<u64, RegionRecord>> {
+    REGION_MAP.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
 }
 
 /// Record that the absolute window range `[abs_base, abs_base + len)` aliases region-`backing` starting
@@ -1114,10 +1117,13 @@ pub fn region_canon_forget_window(base: u64, size: u64) {
     let page = mem::page_size() as u64;
     let lo = base / page;
     let hi = base.saturating_add(size).div_ceil(page);
-    region_map()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .retain(|&p, _| p < lo || p >= hi);
+    // Ordered by page, so a window's release visits its own entries alone, however many other
+    // windows hold (#3056: a scan of the whole map cost every window drop ~150 µs at 64k entries).
+    let mut g = region_map().lock().unwrap_or_else(|e| e.into_inner());
+    let gone: Vec<u64> = g.range(lo..hi).map(|(&p, _)| p).collect();
+    for p in gone {
+        g.remove(&p);
+    }
 }
 
 /// The canonical futex key for absolute guest address `phys`: `Region(backing, off)` when its page was
@@ -1135,8 +1141,9 @@ fn futex_key_of(phys: u64) -> FutexKey {
 /// place the registry is read (#15).
 ///
 /// Public because it is the only way to ask the registry what it believes, which is what a lost
-/// wakeup comes down to: two vCPUs of one run disagreeing about a key. #1608's owner scoping is
-/// tested through it, and an embedder debugging a stuck rendezvous wants the same question answered.
+/// wakeup comes down to: two vCPUs of one run disagreeing about a key. The registry's lifetime
+/// rule is tested through it (#3059), and an embedder debugging a stuck rendezvous wants the same
+/// question answered.
 #[cfg(not(loom))]
 pub fn region_canon_lookup(phys: u64) -> Option<(u64, u64)> {
     let page = mem::page_size() as u64;
@@ -1347,8 +1354,8 @@ impl Domain {
     /// freeze residue taken and its kill and freeze wakes retired, so no guest code of the run can
     /// reach the domain. Through `&self`: a host may still reach [`Self::park`] (a wake by
     /// [`crate::CompiledModule::park_hub`]'s address, an [`outside_waker`]), so nothing it reads is
-    /// written. At the run's end, not the next one's start: a thaw seeds the table before its run
-    /// ([`crate::CompiledModule::set_durable`], #2619).
+    /// written. At the run's end, not the next one's start: the next run installs a thaw's table as it
+    /// starts (#2619, #3024), so a reset at its start would erase it.
     ///
     /// One destructure names every field: each is per-run, and reset below, or configuration the
     /// instance keeps (`_`). A field added to the domain does not compile until it is one or the
@@ -1797,7 +1804,7 @@ impl Domain {
     }
 
     /// Drain the child-owned fiber residue (slice 3.4) — the fibers spawned children flattened with
-    /// their own `freeze_drive`. `run_inner` merges this into the run's `frozen_out`.
+    /// their own `freeze_drive`. `run_inner` merges this into the run's `frozen.fibers`.
     pub(crate) fn take_frozen_fibers(&self) -> Vec<crate::FrozenFiber> {
         std::mem::take(&mut lock(&self.frozen_fibers))
     }
@@ -2629,7 +2636,7 @@ impl Domain {
         // runtime is still `CURRENT_RT` and the window is `UNWINDING`; `freeze_drive` resumes each
         // parked fiber to zero-progress completion, leaving its flattened extent in its slot and the
         // active shadow-SP restored to the child's region. Drain the child's residue into the domain
-        // accumulator (`run_inner` merges it into the run's `frozen_out`; canonical sort-by-slot at
+        // accumulator (`run_inner` merges it into the run's `frozen.fibers`; canonical sort-by-slot at
         // serialize keeps the artifact order-independent).
         if !faulted && fiber_rt::window_is_unwinding(env.mem_base, env.shadow) {
             if let Some(b) = frt.as_mut() {

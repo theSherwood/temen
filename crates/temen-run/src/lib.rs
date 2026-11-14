@@ -491,8 +491,9 @@ unsafe fn cap_thunk_impl(
     live: &mut Option<LiveTarget>,
 ) {
     let host = &mut *(ctx as *mut Host);
-    // PROCESS.md S1b/S1c — the canonical-key futex region recorder, installed on the root thread's first
-    // `call.cap` (before any `map`/spawn), so no vCPU races the install.
+    // PROCESS.md S1b/S1c — the canonical-key futex region recorder for this window: installed on the
+    // root thread's first `call.cap` of the window (before any `map`/spawn, so no vCPU races it), and
+    // again when the host's next window is another (#3059).
     install_region_hook(host, mem_base);
     // The JIT passes a null args/results pointer when the count is 0; `from_raw_parts` requires a
     // non-null (aligned) pointer even for an empty slice, so use `&[]` in that case (UB otherwise).

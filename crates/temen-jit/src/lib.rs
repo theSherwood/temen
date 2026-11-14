@@ -3444,22 +3444,11 @@ pub struct CompiledModule {
     /// The module-declared shadow arena (INVARIANTS.md #16) — [`ShadowArena::EMPTY`] for a module
     /// that declared none, which a durable run refuses at entry rather than placing by default.
     shadow: temen_ir::durable_abi::ShadowArena,
-    /// Durable **freeze** residue (slice 3.3.3): the fibers the freeze driver flattened this run,
-    /// read back by the durable entry point. Empty unless a freeze flattened fibers.
-    frozen_out: Vec<FrozenFiber>,
-    /// Durable **freeze** residue (slice 3.3): the spawned vCPUs that unwound under the freeze (each
-    /// run inline single-worker by `thread.spawn`). Drained from the `Domain` after the root unwinds,
-    /// read back by the durable entry point. Empty unless a freeze caught a live child.
-    frozen_vcpus_out: Vec<FrozenVCpu>,
-    /// Durable **freeze** residue (slice 3.3): the **root** vCPU's flattened shadow-SP extent, captured
-    /// after the freeze driver (before the children overwrite the shared active-SP word). The root's
-    /// continuation rides in the window image like everyone's, but the active-SP word ends at the last
-    /// child's extent, so the root's own extent is reported separately for a thaw to restore. `0` on a
-    /// non-freeze run.
-    frozen_root_sp_out: u64,
-    /// #2043 — the domain's child-handle table's counters at the freeze (see
-    /// [`DurableResidue::children`]). Empty on a non-freeze run.
-    frozen_children_out: Vec<u32>,
+    /// Durable **freeze** residue (DURABILITY.md §12.8): what the last run's freeze flattened — its
+    /// fibers, the spawned vCPUs that unwound under it, the root's extent and the child table's
+    /// counters — read back by the durable entry ([`Self::take_durable_residue`]). #3024 — the run's
+    /// own: cleared as a run starts, so a run whose embedder took none never hands it to the next.
+    frozen: DurableResidue,
     /// #1361 step 4 — the durable **detached** children a freeze reached, after teardown (see
     /// [`DetachedHarvest`]); taken by the embedder. Empty unless a freeze caught one.
     detached_out: Vec<DetachedHarvest>,
@@ -4700,10 +4689,7 @@ impl CompiledModule {
             tail_out: Vec::new(),
             durable: false,
             shadow,
-            frozen_out: Vec::new(),
-            frozen_vcpus_out: Vec::new(),
-            frozen_root_sp_out: 0,
-            frozen_children_out: Vec::new(),
+            frozen: DurableResidue::default(),
             detached_out: Vec::new(),
             freeze_ctl: None,
             held_tail: None,
@@ -4986,10 +4972,7 @@ impl CompiledModule {
             tail_out: Vec::new(),
             durable: false,
             shadow: self.shadow,
-            frozen_out: Vec::new(),
-            frozen_vcpus_out: Vec::new(),
-            frozen_root_sp_out: 0,
-            frozen_children_out: Vec::new(),
+            frozen: DurableResidue::default(),
             detached_out: Vec::new(),
             freeze_ctl: None,
             held_tail: None,
@@ -5082,13 +5065,7 @@ impl CompiledModule {
     /// The residue the last durable run's freeze produced (empty unless a freeze caught something);
     /// taken, so a later run starts clean.
     pub fn take_durable_residue(&mut self) -> DurableResidue {
-        let root_sp = std::mem::take(&mut self.frozen_root_sp_out);
-        DurableResidue {
-            fibers: std::mem::take(&mut self.frozen_out),
-            vcpus: std::mem::take(&mut self.frozen_vcpus_out),
-            root_sp: (root_sp != 0).then_some(root_sp),
-            children: std::mem::take(&mut self.frozen_children_out),
-        }
+        std::mem::take(&mut self.frozen)
     }
 
     /// #1361 step 4 — the durable detached children the last run's freeze reached (see
@@ -5480,6 +5457,9 @@ impl CompiledModule {
         {
             (*this).parked_backtraces = (0, Vec::new());
         }
+        // #3024 — and the last run's freeze residue, whether or not its embedder took it.
+        (*this).frozen = DurableResidue::default();
+        (*this).detached_out = Vec::new();
         // #3024 — the run takes its seed whole, before anything can end it: a run that ends before it
         // runs anything drops the seed with itself, and no later run finds it.
         let seed = std::mem::take(&mut (*this).seed);
@@ -5867,7 +5847,7 @@ impl CompiledModule {
             if let Some(rt) = run_fibers.as_mut().and_then(|f| f.root.as_mut()) {
                 let rt = &mut **rt as *mut fiber_rt::FiberRuntime;
                 fiber_rt::freeze_drive(rt, &vm as *const VmCtx as u64);
-                (*this).frozen_out = fiber_rt::take_frozen(rt); // read back by the durable entry
+                (*this).frozen.fibers = fiber_rt::take_frozen(rt); // read back by the durable entry
             }
             // Slice 3.3: capture the **root's** flattened extent now — the freeze driver restored the
             // active shadow-SP to context 0's region (root rewinds first on thaw), but the children
@@ -5875,8 +5855,8 @@ impl CompiledModule {
             // (its implicit residue, reported separately for a thaw to restore).
             // §12.8 4A.5: the root's shadow-SP word lives in its own region (context 0); children no
             // longer share it.
-            (*this).frozen_root_sp_out =
-                fiber_rt::read_shadow_sp(mem_base as u64, (*this).shadow.region_base(0));
+            let root_sp = fiber_rt::read_shadow_sp(mem_base as u64, (*this).shadow.region_base(0));
+            (*this).frozen.root_sp = (root_sp != 0).then_some(root_sp);
             // Slice 3.3: each `thread.spawn` during the freeze *deferred* its child (recording the
             // request, returning the handle) so the root could unwind first — matching the interp,
             // which enqueues a child and runs it only after the spawning vCPU yields. Now that the
@@ -5890,12 +5870,12 @@ impl CompiledModule {
                 // **concurrent** children record their residue on their own OS threads, drained again
                 // after `join_all` below. `extend` (vs. assign) so both contribute. Canonical sort at
                 // serialize means the append order can't affect the artifact (§12.6).
-                (*this).frozen_vcpus_out.extend(d.take_frozen_vcpus());
+                (*this).frozen.vcpus.extend(d.take_frozen_vcpus());
                 // Slice 3.4: a spawned child that owns fibers flattened them with its own
                 // `freeze_drive` (in `run_child_inline`) into the domain accumulator; merge that into
                 // the run residue alongside the root's. Sort-by-slot at serialize is canonical, so the
                 // append order doesn't affect the artifact.
-                (*this).frozen_out.extend(d.take_frozen_fibers());
+                (*this).frozen.fibers.extend(d.take_frozen_fibers());
             }
             // #1361 step 4 — reach its detached children, which own windows the freeze word above
             // is not in: ring each one's own; they unwind and are harvested at teardown.
@@ -5960,27 +5940,28 @@ impl CompiledModule {
             // §12.8 4A.5 stage (ii): concurrent durable children self-unwound into their own regions
             // and recorded their `FrozenVCpu` residue before their OS threads ended; `join_all` is
             // the coordinator-wait (every child finished). No-op off the concurrent path.
-            (*this).frozen_vcpus_out.extend(d.take_frozen_vcpus());
+            (*this).frozen.vcpus.extend(d.take_frozen_vcpus());
             // §12.8 4A.5 follow-up A: carry completed concurrent children's join results, so a
             // `thread.join` of a child that finished before the freeze point resolves on thaw.
             (*this)
-                .frozen_vcpus_out
+                .frozen
+                .vcpus
                 .extend(d.take_completed_children_residue());
             // §12.8 4A.5 follow-up B: a concurrent child that owns fibers flattened them in its own
             // `run_child` `freeze_drive`, recorded during `join_all`.
-            (*this).frozen_out.extend(d.take_frozen_fibers());
+            (*this).frozen.fibers.extend(d.take_frozen_fibers());
             // #2043 — and the domain's child table, which the records name their slots in: after
             // the joins and the nursery's harvest, nothing changes it.
-            (*this).frozen_children_out = d.children().generations();
+            (*this).frozen.children = d.children().generations();
         }
         // #1684 — every fiber slot nobody flattened rides too (a fresh one, a free one), so the thaw
         // rebuilds the table slot for slot. After `join_all`: no vCPU can still create a fiber.
         #[cfg(fiber_rt)]
         if froze {
             if let Some(f) = run_fibers.as_ref().filter(|f| f.root.is_some()) {
-                let flattened: Vec<usize> = (*this).frozen_out.iter().map(|f| f.slot).collect();
+                let flattened: Vec<usize> = (*this).frozen.fibers.iter().map(|f| f.slot).collect();
                 let rest = f.table.unflattened_for_freeze(&flattened);
-                (*this).frozen_out.extend(rest);
+                (*this).frozen.fibers.extend(rest);
             }
         }
         // §5 W3 Stage 3 — a trap that originated on a *spawned* vCPU stashed its backtrace capture in
@@ -9019,10 +9000,7 @@ fn compile_child_windowed(
         seed: RunSeed::default(),
         tail_out: Vec::new(),
         durable: false,
-        frozen_out: Vec::new(),
-        frozen_vcpus_out: Vec::new(),
-        frozen_root_sp_out: 0,
-        frozen_children_out: Vec::new(),
+        frozen: DurableResidue::default(),
         detached_out: Vec::new(),
         shadow,
         freeze_ctl: None,
