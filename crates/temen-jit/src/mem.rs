@@ -417,6 +417,11 @@ pub(crate) unsafe fn run_guarded(
 /// #3020 — `call` a guarded entry. A fault's recovery jumps out of every fiber the entry resumed on
 /// this thread, past each resume's return: those are marked abandoned, so their table's end knows
 /// nothing is on them, and the fibers the call itself runs inside are left as they are.
+///
+/// It rests on one assumption: this thread's fiber runtime ([`crate::fiber_rt::current`]) is the
+/// same at the guard's entry and at its recovery. A scope inside the call that publishes another
+/// runtime (a spawned vCPU's, a child task's residency) runs under a guard of its own and restores
+/// the runtime on its way out, so a fault inside it is recovered, and its fibers marked, there.
 fn guarded(call: impl FnOnce() -> bool) -> bool {
     #[cfg(fiber_rt)]
     let depth = crate::fiber_rt::active_depth();

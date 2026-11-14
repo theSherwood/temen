@@ -313,33 +313,36 @@ const NOT_RUNNING: u64 = u64::MAX;
 /// it, and nothing will: its slot stays `RUNNING`, so no claim takes it.
 const FAULTED: u64 = u64::MAX - 1;
 
-/// #3020 — how many resumes are live on this thread's runtime: a guarded call records it as it
-/// starts, so a fault's recovery can tell the fibers it abandoned from those it returns into.
-pub(crate) fn active_depth() -> usize {
+/// #3020 — how deep this thread's runtime is in resumes: its live resumes and its fibers'
+/// yielders. A guarded call records both as it starts, so a fault's recovery can tell the fibers it
+/// abandoned from those it returns into ([`abandon_after_fault`]).
+pub(crate) fn active_depth() -> (usize, usize) {
     let rt = current();
-    // SAFETY: `current()` is this thread's live runtime; the read is momentary.
     if rt.is_null() {
-        0
+        (0, 0)
     } else {
-        unsafe { (*rt).active_slots.len() }
+        // SAFETY: `current()` is this thread's live runtime; the read is momentary.
+        unsafe { ((*rt).active_slots.len(), (*rt).yielders.len()) }
     }
 }
 
-/// #3020 — a guarded call that started at resume depth `depth` faulted: its recovery jumped out of
-/// every fiber resumed inside it, past each resume's return. Mark each abandoned ([`FAULTED`]) and
-/// drop it from this thread's live resumes, so the table's end knows nothing is on it.
-pub(crate) fn abandon_after_fault(depth: usize) {
+/// #3020 — a guarded call that started at resume depth `depth` ([`active_depth`]) faulted: its
+/// recovery jumped out of every fiber resumed inside it, past each resume's return and each body's
+/// yielder pop. Mark each abandoned ([`FAULTED`]) and drop it, and its yielder, from this thread's
+/// runtime, so the two stacks stay in step and none names a stack the table's end frees.
+pub(crate) fn abandon_after_fault(depth: (usize, usize)) {
     let rt = current();
     if rt.is_null() {
         return;
     }
     // SAFETY: `current()` is this thread's live runtime, and this thread runs no guest code now.
     let rt = unsafe { &mut *rt };
-    while rt.active_slots.len() > depth {
+    while rt.active_slots.len() > depth.0 {
         if let Some(s) = rt.active_slots.pop() {
             s.running_on.store(FAULTED, Ordering::Release);
         }
     }
+    rt.yielders.truncate(depth.1);
 }
 
 /// §3.6 slice 5a — the third `cont.resume` status (beside suspended = 0 / returned = 1),
