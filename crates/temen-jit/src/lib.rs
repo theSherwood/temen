@@ -208,6 +208,19 @@ pub fn in_guest_fiber() -> bool {
         false
     }
 }
+/// #3018 — the §14 pool's worker threads alive in this process, each counted from its spawn until
+/// its thread function returns: what a test that asks whether a run's teardown left a worker behind
+/// reads. Every run's pool counts, so read it with no other run in flight.
+pub fn pool_workers_live() -> usize {
+    #[cfg(fiber_rt)]
+    {
+        child_exec::live_workers()
+    }
+    #[cfg(not(fiber_rt))]
+    {
+        0
+    }
+}
 pub use vcpu_tls::serve_handlers;
 
 // #1768 — the per-instance context compiled code reaches through its threaded context pointer.
@@ -3522,6 +3535,12 @@ pub struct CompiledModule {
     /// table and root runtime each run makes (#3020). A §14 child's runtimes are its task's and its nursery its spawn's
     /// (temen#2168).
     hosted: bool,
+    /// D66 — the run's own lane, `(domain id, cap)`, from its grant hooks
+    /// ([`GrantChildHooks::parent_domain`]): installed on the thread domain by
+    /// [`Self::set_grant_child_hooks`] when the domain exists, and by
+    /// [`Self::enable_thread_hosting`] when it is made after the hooks were set (#3033).
+    #[cfg(fiber_rt)]
+    run_lane: std::sync::Mutex<Option<(u64, i64)>>,
     /// temen#2168 — whether the code's own `Instantiator` sites spawn through its instance's nursery
     /// ([`VmCtx::nursery`]): every instance of it has one exactly then.
     nests: bool,
@@ -4618,6 +4637,8 @@ impl CompiledModule {
         };
         Ok(CompiledModule {
             hosted: false,
+            #[cfg(fiber_rt)]
+            run_lane: std::sync::Mutex::new(None),
             nests: cfg!(fiber_rt) && module_uses_instantiator(m),
             page: PageEnv::NONE,
             fn_table,
@@ -4907,6 +4928,8 @@ impl CompiledModule {
         let _ = node;
         CompiledModule {
             hosted: self.hosted,
+            #[cfg(fiber_rt)]
+            run_lane: std::sync::Mutex::new(None),
             nests: self.nests,
             page: self.page,
             fn_table: self.fn_table.instance(),
@@ -5010,9 +5033,18 @@ impl CompiledModule {
     /// Its calls then run as activations on their callers' threads until it ends. Only for a
     /// non-durable run with a thread domain ([`Self::enable_thread_hosting`]), whose code charges fuel:
     /// each call lends its own. A run that ends in its entry rests not at all.
+    ///
+    /// #2993 — a held domain's calls run on its run's one pool, its nursery's, which its teardown
+    /// joins: a module with none (no install room and no `Instantiator` op) is refused.
     #[cfg(fiber_rt)]
-    pub fn set_rest(&mut self, rest: Option<Rest>) {
+    pub fn set_rest(&mut self, rest: Option<Rest>) -> Result<(), JitError> {
+        if rest.is_some() && self._nursery.is_none() {
+            return Err(JitError::Unsupported(
+                "a held domain needs a nursery: install room or an Instantiator op",
+            ));
+        }
         self.rest = rest;
+        Ok(())
     }
 
     /// Make the next run **durable** (DURABILITY.md §12.8) on a caller-built module — the
@@ -5153,8 +5185,14 @@ impl CompiledModule {
         // lane rather than two copies of the cap. Done here rather than at the nursery so a module
         // that only uses `thread.*` — and therefore has no nursery at all — is still bounded.
         #[cfg(fiber_rt)]
-        if let (Some(d), Some(h)) = (&self.domain, hooks.as_ref()) {
-            d.set_lane_chain(h.parent_domain, h.parent_lane_cap);
+        {
+            let lane = hooks.as_ref().map(|h| (h.parent_domain, h.parent_lane_cap));
+            *self.run_lane.lock().unwrap_or_else(|e| e.into_inner()) = lane;
+            // No hooks: no lane, and the previous hooks' goes (a negative cap is an empty chain).
+            if let Some(d) = &self.domain {
+                let (id, cap) = lane.unwrap_or((0, -1));
+                d.set_lane_chain(id, cap);
+            }
         }
         #[cfg(not(fiber_rt))]
         let _ = hooks;
@@ -5791,11 +5829,14 @@ impl CompiledModule {
         // residue (incl. any fiber unwound mid-resume-chain during the root run, slice 3.2) is
         // accumulated in the runtime by each fiber's `Complete` arm; drain it after driving — then the
         // deferred children run (`drive_frozen_spawns`).
+        // A durable run's freeze, as the root's unwind left the state word: what the rest of this
+        // teardown asks, every time it asks.
         #[cfg(fiber_rt)]
-        if (*this).durable
+        let froze = (*this).durable
             && !faulted
-            && fiber_rt::window_is_unwinding(mem_base as u64, (*this).shadow)
-        {
+            && fiber_rt::window_is_unwinding(mem_base as u64, (*this).shadow);
+        #[cfg(fiber_rt)]
+        if froze {
             if let Some(rt) = run_fibers.as_mut().and_then(|f| f.root.as_mut()) {
                 let rt = &mut **rt as *mut fiber_rt::FiberRuntime;
                 fiber_rt::freeze_drive(rt, &vm as *const VmCtx as u64);
@@ -5842,19 +5883,22 @@ impl CompiledModule {
         if let Some(f) = run_fibers.as_mut() {
             f.unpublish();
         }
-        // S1c: join every async §14 child OS thread before freeing the window — a child copies to/from
-        // the parent window, so none may outlive it (mirrors the vCPU `join_all` just below).
-        #[cfg(fiber_rt)]
-        if let Some(n) = &(*this)._nursery {
-            let froze = (*this).durable
-                && !faulted
-                && fiber_rt::window_is_unwinding(mem_base as u64, (*this).shadow);
-            (*this).detached_out = n.join_children(froze);
-        }
         // A caught guard fault is detect-and-kill (§5): the root's `MemoryFault` ends its domain,
-        // unless a sibling's end came first (#2499).
+        // unless a sibling's end came first (#2499). Before the pool's end below, which raises
+        // `DOMAIN_DONE` on a handler of the root's own window through the end word they share.
         if faulted {
             vm.raise(mem::FAULT_TRAP);
+        }
+        // #3018 — every §14 child task ends with the run, before its vCPUs are joined: a vCPU may be
+        // running a child's work on its own thread (a handler of a child's offer it claimed by
+        // direct handoff, an activation it carries), which polls the child's end, not the run's: a
+        // handler's context is a vCPU context of its callee domain (`VmCtx::vcpu`). A task filed
+        // from now on is ended as it is filed. The pool is joined once the vCPUs are, below.
+        // Pinned by `jit_child_offer::a_vcpu_running_a_spinning_childs_handler_ends_with_the_run`,
+        // which hangs with the pool ended after `join_all`.
+        #[cfg(fiber_rt)]
+        if let Some(n) = &(*this)._nursery {
+            n.end_children(froze);
         }
         // Join every spawned vCPU OS thread before freeing the window — no vCPU may outlive it.
         #[cfg(fiber_rt)]
@@ -5868,40 +5912,44 @@ impl CompiledModule {
             // returns promptly instead of hanging on a parked daemon. A durable **freeze** is not
             // teardown: the root unwound under `UNWINDING` and parked siblings return through the
             // freeze re-issue machinery (the sentinel is skipped so their residue is recorded).
-            let freezing = (*this).durable
-                && !faulted
-                && fiber_rt::window_is_unwinding(mem_base as u64, (*this).shadow);
-            d.begin_teardown(freezing);
+            d.begin_teardown(froze);
             d.join_all(true);
+        }
+        // S1c — join every §14 child task before freeing the window: a child copies to and from the
+        // parent window, so none may outlive it. Once, and last of the run's joins: `join_all` above
+        // joined every vCPU, so only a task of the pool can file another meanwhile, which this join
+        // waits for too (it was ended at filing, unless the run froze: a freeze raises nothing on a
+        // task that has not parked, and it unwinds under its own freeze word), and a held site has
+        // taken no call since its rest.
+        #[cfg(fiber_rt)]
+        if let Some(n) = &(*this)._nursery {
+            (*this).detached_out = n.join_children(froze);
+        }
+        // A freeze's residue, once everything is joined: nothing of the run runs now, so none of it
+        // changes after it is taken (a pool task still running after `join_all`, a handler of the
+        // root's window, could retire a thread handle after its residue was taken).
+        #[cfg(fiber_rt)]
+        if let (true, Some(d)) = (froze, &(*this).domain) {
             // §12.8 4A.5 stage (ii): concurrent durable children self-unwound into their own regions
-            // and recorded their `FrozenVCpu` residue before their OS threads ended; `join_all` is the
-            // coordinator-wait (every child finished). Collect that residue now — after the join, so the
-            // snapshot below captures a fully-quiesced window. No-op off the concurrent path.
-            if (*this).durable
-                && !faulted
-                && fiber_rt::window_is_unwinding(mem_base as u64, (*this).shadow)
-            {
-                (*this).frozen_vcpus_out.extend(d.take_frozen_vcpus());
-                // §12.8 4A.5 follow-up A: carry completed concurrent children's join results, so a
-                // `thread.join` of a child that finished before the freeze point resolves on thaw.
-                (*this)
-                    .frozen_vcpus_out
-                    .extend(d.take_completed_children_residue());
-                // §12.8 4A.5 follow-up B: a concurrent child that owns fibers flattened them in its own
-                // `run_child` `freeze_drive`, recorded during `join_all` — drain after the join.
-                (*this).frozen_out.extend(d.take_frozen_fibers());
-                // #2043 — and the domain's child table, which the records name their slots in: after
-                // the join and the nursery's harvest, nothing changes it.
-                (*this).frozen_children_out = d.children().generations();
-            }
+            // and recorded their `FrozenVCpu` residue before their OS threads ended; `join_all` is
+            // the coordinator-wait (every child finished). No-op off the concurrent path.
+            (*this).frozen_vcpus_out.extend(d.take_frozen_vcpus());
+            // §12.8 4A.5 follow-up A: carry completed concurrent children's join results, so a
+            // `thread.join` of a child that finished before the freeze point resolves on thaw.
+            (*this)
+                .frozen_vcpus_out
+                .extend(d.take_completed_children_residue());
+            // §12.8 4A.5 follow-up B: a concurrent child that owns fibers flattened them in its own
+            // `run_child` `freeze_drive`, recorded during `join_all`.
+            (*this).frozen_out.extend(d.take_frozen_fibers());
+            // #2043 — and the domain's child table, which the records name their slots in: after
+            // the joins and the nursery's harvest, nothing changes it.
+            (*this).frozen_children_out = d.children().generations();
         }
         // #1684 — every fiber slot nobody flattened rides too (a fresh one, a free one), so the thaw
         // rebuilds the table slot for slot. After `join_all`: no vCPU can still create a fiber.
         #[cfg(fiber_rt)]
-        if (*this).durable
-            && !faulted
-            && fiber_rt::window_is_unwinding(mem_base as u64, (*this).shadow)
-        {
+        if froze {
             if let Some(f) = run_fibers.as_ref().filter(|f| f.root.is_some()) {
                 let flattened: Vec<usize> = (*this).frozen_out.iter().map(|f| f.slot).collect();
                 let rest = f.table.unflattened_for_freeze(&flattened);
@@ -6400,7 +6448,21 @@ impl CompiledModule {
         // Its per-run `Env` (window / fn-table / trap cell / this trampoline) is supplied later by the
         // run entry's `set_env`; the address is stable now, which is all the context needs.
         let domain = Box::new(os_thread_rt::Domain::new(self.node.clone()));
+        // #3033 — the run's lane, if its grant hooks were set before this domain was made.
+        if let Some((id, cap)) = *self.run_lane.lock().unwrap_or_else(|e| e.into_inner()) {
+            domain.set_lane_chain(id, cap);
+        }
         self.instance.sched = &*domain as *const os_thread_rt::Domain as *const core::ffi::c_void;
+        // #2993 — the run has one pool: the nursery the compile stood up for its install room
+        // (#1726), made before there was a domain, joins this one, as a nesting module's does at
+        // its making, so its children share the domain's futex, wakes and pool, and a held site
+        // finds that pool rather than making a second one no teardown joins. It stays the nursery
+        // the embedder configured (its grant hooks, its child-code cache); no spawn can have
+        // happened yet: the run has not begun.
+        if let Some(n) = self._nursery.as_deref_mut() {
+            n.join_domain(&domain);
+            n.adopt();
+        }
         self.threads = true;
         self.spawns = true;
         self.domain = Some(domain);
@@ -8886,6 +8948,8 @@ fn compile_child_windowed(
         // (temen#2168), so its code is only code: every spawn of it can run one compile
         // ([`ChildCodeCache`]).
         hosted: false,
+        #[cfg(fiber_rt)]
+        run_lane: std::sync::Mutex::new(None),
         nests: nesting && funcs_use_instantiator(funcs),
         page,
         fn_table,
@@ -10599,17 +10663,19 @@ fn nursery_over(
     domain: Option<&os_thread_rt::Domain>,
     shadow: temen_ir::durable_abi::ShadowArena,
 ) -> Box<instantiator_rt::Nursery> {
-    let n = Box::new(instantiator_rt::Nursery::new(
+    let mut n = Box::new(instantiator_rt::Nursery::new(
         cap_thunk,
         cap_ctx,
         resolve_module,
         epoch_addr,
-        domain.map_or(0, |d| d as *const os_thread_rt::Domain as usize),
+        0,    // no domain until it joins one, below
         None, // the run's own child executor
         shadow,
-        // #2043 D1 — the domain's one child table, its threads' and its §14 children's.
-        domain.map_or_else(Default::default, |d| std::sync::Arc::clone(d.children())),
+        Default::default(),
     ));
+    if let Some(d) = domain {
+        n.join_domain(d);
+    }
     n.adopt();
     n
 }

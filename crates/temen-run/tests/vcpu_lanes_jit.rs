@@ -290,3 +290,60 @@ fn a_lane_of_zero_faults_rather_than_hanging() {
         "the JIT refuses it too rather than hanging: {jo:?}"
     );
 }
+
+/// The guest of [`an_installed_units_threads_take_the_runs_lane_on_the_jit`]: install the unit
+/// (`Jit.install`, handles `jit` and `code`) and call it, returning what it returns.
+const INSTALLS_SPINNERS: &str = r#"memory 16
+func (i32, i32) -> (i64) {
+block 0 (vjit: i32, vcode: i32) {
+  vc = i64.extend_i32_u vcode
+  vslot = call.cap 11 3 (i64) -> (i64) vjit (vc)
+  vs32 = i32.wrap_i64 vslot
+  vz = i64.const 0
+  vr = call.dyn (i64) -> (i64) vs32 (vz)
+  return vr
+  }
+}
+"#;
+
+/// #3018 — a run's own lane bounds the threads an installed unit spawns when the run's thread domain
+/// is made after its grant hooks are set. `jit_cap_run` sets the hooks, which carry the run's
+/// `(domain, lane cap)`, before a `Jit` that hosts threads makes the domain; the domain used to take
+/// no lane chain then, so the unit's four siblings ran at once under a cap of one, while the run's
+/// §14 children were held to it. The unit is [`FOUR_SPINNERS`], its entry taking the call's
+/// argument; the oracle counts no overlap (`a_lane_cap_of_one_serializes_four_spinning_siblings_on_both_engines`).
+/// With the lane installed, 0 holds by construction (a cap of one admits one runner at a time), so
+/// the row cannot flake; only the unfixed code's overlap count depends on timing (3 of 4 in 5/5).
+#[test]
+fn an_installed_units_threads_take_the_runs_lane_on_the_jit() {
+    let guest = module(INSTALLS_SPINNERS);
+    let unit = module(&FOUR_SPINNERS.replacen(
+        "func () -> (i64) {\nblock 0 () {",
+        "func (i64) -> (i64) {\nblock 0 (varg0: i64) {",
+        1,
+    ));
+    let mut host = Host::new();
+    host.set_lane_cap(1);
+    host.set_self_module(&std::sync::Arc::new(guest.clone()));
+    let jit = temen_run::grant_jit_threads(&mut host, &guest, 4);
+    let code = host
+        .jit_compile(jit, &temen_encode::encode_module(&unit))
+        .expect("no trap")
+        .expect("compile ok")
+        .handle;
+    let (jo, _) = temen_run::jit_cap_run(
+        &guest,
+        0,
+        &[jit as i64, code as i64],
+        &temen_interp::MemLayout::image(Vec::new()),
+        temen_ir::DEFAULT_RESERVED_LOG2,
+        4,
+        &mut host,
+        None,
+    )
+    .expect("jit run");
+    assert!(
+        matches!(jo, JitOutcome::Returned(ref v) if v == &[0]),
+        "no two of the unit's threads ran at once under a lane of one: {jo:?}"
+    );
+}
