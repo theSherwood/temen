@@ -186,6 +186,8 @@ std::thread_local! {
 /// Test-facing: how many runs this thread has taken the kernel route for. The kernel runs its root on
 /// the caller's thread, so a test reads, before and after an embedder's run, which route that run
 /// took (`jit_run` falls back to the JIT's own runtime when [`admit`] declines, and says nothing).
+/// Correct only while the run's root runs on the caller's thread: a change that moves it elsewhere
+/// must move this count with it.
 #[doc(hidden)]
 pub fn kernel_runs() -> u64 {
     RUNS.with(std::cell::Cell::get)

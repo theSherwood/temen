@@ -891,7 +891,9 @@ fn by_instance(
     if oracle {
         lanes.push((
             "the oracle",
-            instance_run(make, grant, Backend::TreeWalk, &cfg(false)),
+            bounded("the oracle", move || {
+                instance_run(make, grant, Backend::TreeWalk, &cfg(false))
+            }),
         ));
     }
     lanes.push((
@@ -1012,8 +1014,9 @@ block 2 (vr: i64) {{
 /// eight bytes from page 8 to a captured stdout (`Stream.write`) in a loop while the root unmaps and
 /// maps that page (or protects it to nothing and back), on both JIT routes ([`racing`]). Every host
 /// copy of guest memory and every page op is made under the domain's `Host` lock, so a write meets
-/// the page whole or refused (its errno), and the run ends with the vCPU's count; a guest
-/// `MemoryFault` is the guest's own answer. The host never faults, which would end the process.
+/// the page whole or refused (its errno), and the run ends with the vCPU's count. The host never
+/// faults, which would end the process (or, recovered, surface as a `MemoryFault` the program
+/// cannot raise itself).
 #[cfg(any(unix, windows))]
 #[test]
 fn a_stream_write_racing_page_ops_on_its_buffer_never_faults_the_host() {
@@ -1043,9 +1046,10 @@ fn a_stream_write_racing_page_ops_on_its_buffer_never_faults_the_host() {
         for make in [unmapping as fn(i32) -> temen_ir::Module, protecting] {
             for run in 0..10 {
                 for (route, answer) in by_instance(make, grant, false, None) {
+                    // Only the count: the program cannot fault (an unreadable buffer is the write's
+                    // `-EFAULT`), and a recovered host fault would surface as `MemoryFault`.
                     assert!(
-                        matches!(&answer, Ok(v) if v[0] >= 1)
-                            || answer == Err("MemoryFault".into()),
+                        matches!(&answer, Ok(v) if v[0] >= 1),
                         "run {run}, {route}: {answer:?}"
                     );
                 }
@@ -1078,8 +1082,9 @@ fn spin<'s, 'e>(s: &'s std::thread::Scope<'s, 'e>, stop: &'e std::sync::atomic::
 /// The race test: under busy threads, a vCPU's futex ops on a page the root keeps unmapping or
 /// protecting never fault the host. The ops overlap the page ops by construction ([`racing`]):
 /// - a wait shape's root cycles until a wait meets the page revoked and its `MemoryFault` ends the
-///   run (microseconds idle, a few scheduler slices under load), under a bound of `WAIT_TURNS`
-///   cycles, tens of seconds, that a run reaches only if the two threads never raced at all;
+///   run (microseconds idle, a few scheduler slices under load). A run whose two threads never
+///   raced at all would cycle on, and the harness's bound ([`PROMPT`], far fewer than
+///   `WAIT_TURNS` cycles) fails it; `WAIT_TURNS` only caps the program;
 /// - a notify never faults: its run ends with the vCPU's count (every op answered, at least one).
 #[test]
 fn futex_ops_racing_page_ops_never_fault_the_host() {
@@ -1122,8 +1127,8 @@ fn futex_ops_racing_page_ops_never_fault_the_host() {
                 match (op, result) {
                     ("wait", Err(Trap::MemoryFault)) => {}
                     ("wait", r) => panic!(
-                        "wait (protect: {protect}): the root made {WAIT_TURNS} page-op cycles \
-                         and no wait met the page revoked (the two never raced): {r:?}"
+                        "wait (protect: {protect}): the run ended without a wait meeting the \
+                         page revoked: {r:?}"
                     ),
                     // A notify reads no memory: it never faults.
                     (_, Ok(v)) => {
@@ -1429,6 +1434,62 @@ block 0 () {{
     let [_, (_, kernel), (_, today)] = granted(|h| program(h, true), maps);
     assert_eq!(kernel, Ok(vec![1]), "the kernel route reads the region");
     assert_eq!(today, Ok(vec![1]), "today's route reads the region");
+}
+
+/// #2958 slice 4 review — a trusted host procedure maps a file-backed region into its window itself
+/// (`GuestMem::map_region`, which admission cannot see: the procedure is `Sync`, and the backing
+/// never enters the host's regions), then truncates the file. A wait on the alias meets a page whose
+/// backing is gone: `wait_word`'s recoverable load answers `MemoryFault` on both JIT routes, and
+/// the process lives. (The oracle reads the backing in host code and dies of SIGBUS, #3005, so it
+/// is left out.)
+#[cfg(unix)]
+#[test]
+fn a_wait_on_a_file_alias_a_procedure_mapped_and_truncated_faults_the_guest() {
+    fn program(handle: i32) -> temen_ir::Module {
+        rooted(&format!(
+            "  vp = i32.const {handle}
+  vz = i64.const 0
+  vm = call.cap 13 0 (i64) -> (i64) vp(vz)
+  va = i64.const 1048576
+  vx = i32.const 1
+  vto = i64.const 0
+  vw = i32.atomic.wait va vx vto
+  vr = i64.extend_i32_u vw"
+        ))
+    }
+    fn maps_and_truncates(h: &mut Host) -> i32 {
+        use temen_interp::{put_results, CapState, HostProcGrant, ProcHandler};
+        h.grant_host_proc(HostProcGrant::new(
+            ProcHandler::Sync(Box::new(|_op, _args, out, mem, _minter| {
+                static FILES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                let n = FILES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let path = std::env::temp_dir()
+                    .join(format!("temen_jit_kernel_trunc_{}_{n}", std::process::id()));
+                let file = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .open(&path)
+                    .expect("a file");
+                let len = temen_interp::host_region_granularity();
+                file.set_len(len).expect("sized");
+                let backing = temen_run::new_file_region(&file, len as usize).expect("a region");
+                let rc = mem.map_or(-1, |m| m.map_region(1 << 20, 0, len, 3, 0, backing));
+                file.set_len(0).expect("truncated");
+                let _ = std::fs::remove_file(&path);
+                put_results(out, &[rc])
+            })),
+            CapState::Stateless,
+        ))
+    }
+    all_answer(
+        program,
+        maps_and_truncates,
+        false,
+        METERED,
+        Err("MemoryFault".into()),
+    );
 }
 
 /// A root that makes one §12 op (so the kernel admits it), then `body`, returning `vr`.
@@ -2072,7 +2133,8 @@ fn a_wait_racing_an_unmap_of_its_alias_faults_the_guest_never_the_host() {
 
 /// The same race with each map replacing the live alias, for a bounded count. Whether a wait meets
 /// the page between the old alias's drop and the new one's map is the race's: each route ends either
-/// returning or `MemoryFault`. The row still fails when the host faults (the test process dies) or
+/// returning or `MemoryFault` (the replacement is not atomic to the guest on macOS and Windows,
+/// #3050). The row still fails when the host faults (the test process dies) or
 /// the run hangs (the harness's [`PROMPT`]).
 #[cfg(any(unix, windows))]
 #[test]
@@ -2195,8 +2257,9 @@ block 2 (vr2: i32) {
 
 /// #2958 slice 4 — an import is decided on the op its binding reaches, as an inline call on it is
 /// ([`each_declined_call_names_its_clause`]): `self.fuel.remaining` (`fuel`, or the bytecode
-/// compile's refusal first) and a region post's `signal` (`region signal`) are declined through an
-/// import as they are inline.
+/// compile's refusal first), a service point (`serving`, which the bytecode compile declines first
+/// inline but cannot see through an import) and a region post's `signal` (`region signal`) are
+/// declined through an import as they are inline.
 #[test]
 fn an_import_is_declined_by_its_targets_clause() {
     let m = module(
@@ -2221,6 +2284,8 @@ block 0 () {
     };
     let rows = [
         (temen_ir::CAP_SELF_TYPE_ID, 13, "fuel"),
+        (temen_ir::CAP_SELF_TYPE_ID, 9, "serving"),
+        (temen_ir::CAP_SELF_TYPE_ID, 10, "serving"),
         (temen_ir::cap_id::SHARED_REGION, 7, "region signal"),
     ];
     for (type_id, op, clause) in rows {
@@ -2349,4 +2414,45 @@ fn a_run_that_ends_with_timed_waiters_parked_holds_what_a_returned_one_does() {
         });
         assert_eq!(parked, returned);
     }
+}
+
+/// #2958 slice 4 review — `export.handle` mints an offer of the module's own impl, under its
+/// interface's interned id, which is a built-in's when the shapes match (here `Stream`'s `read`,
+/// `write`, `close`): a call on that handle is a call through a guest interface, so the kernel route
+/// declines the instruction (`serving`).
+#[test]
+fn an_export_handle_is_declined_as_serving() {
+    let m = module(
+        "type 0 func (i64, i64) -> (i64)
+type 1 func () -> ()
+type 2 interface { read: 0, write: 0, close: 1 }
+export 0 interface \"stdio\" 2 { read: 1, write: 1, close: 2 }
+memory 16
+func () -> (i64) {
+block 0 () {
+  vq = i64.const 16400
+  vone = i32.const 1
+  vk = atomic.notify vq vone
+  vh = export.handle 0
+  vr = i64.extend_i32_u vh
+  return vr
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (va: i64, vb: i64) {
+  vs = i64.add va vb
+  return vs
+  }
+}
+func () -> () {
+block 0 () {
+  return
+  }
+}
+",
+    );
+    assert_eq!(
+        jit_kernel::admit(&m, &Host::new(), false).err(),
+        Some("serving")
+    );
 }

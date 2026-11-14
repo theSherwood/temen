@@ -21669,8 +21669,10 @@ pub type CapPageMap = Arc<CapPages>;
 /// and what a reader keys a futex word on a §13 alias by (#2958 slice 4).
 #[derive(Default)]
 ///
-/// Two locks, both leaves: neither is held while the other is taken, and neither across a system
-/// call. A futex key takes `pages`, lets it go, then takes `regions`.
+/// Two locks, both leaves: neither is held while the other is taken. `pages` is held across a
+/// unix `map_region`'s `mmap`, so the hardware and the map change as one step to a reader that
+/// holds it (`MprotectWindow::reprotect`'s contract). A futex key takes `pages`, lets it go, then
+/// takes `regions`.
 pub struct CapPages {
     pages: Mutex<BTreeMap<u64, temen_ir::PageState>>,
     /// Each §13 region a page of the window aliases, by the host's region id: a weak hold on its
@@ -21678,7 +21680,7 @@ pub struct CapPages {
     /// ([`FutexKey::Region`]), as the interpreter's window holds its regions. The hold keeps the
     /// allocation, and so the identity, from being reused by a later region while an entry names it,
     /// so a waiter parked on a region that was unmapped and closed meets no new one at its address.
-    /// Written once an alias is in, before its pages are marked, so a reader that sees a `Backed`
+    /// Written once a map call is valid, before its pages are marked, so a reader that sees a `Backed`
     /// page finds its region here; a map of a reused id writes its new backing before any page names
     /// it. Entries are not removed: a host's region ids are slots it reuses ([`Host::hold_region`]),
     /// so this holds at most one entry per slot, as many as the regions the domain has held at once.
@@ -21698,7 +21700,8 @@ impl CapPages {
         }
     }
 
-    /// The page states, under the map's lock: a leaf, held across no system call and no other lock.
+    /// The page states, under the map's lock: a leaf, held while no other lock is taken (and across
+    /// a unix `map_region`'s `mmap`, [`CapPages`]).
     pub fn lock(&self) -> std::sync::MutexGuard<'_, BTreeMap<u64, temen_ir::PageState>> {
         self.pages.lock_unpoisoned()
     }
@@ -21720,8 +21723,9 @@ impl CapPages {
         self.aliased.load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    /// Record that `region`, over `backing`, is about to be aliased into the window: before the
-    /// alias's pages are marked `Backed`, once its mapping is in.
+    /// Record that `region`, over `backing`, is about to be aliased into the window: once the map
+    /// call is valid, before its mapping is made and its pages are marked `Backed` (so a refused
+    /// `mmap` can leave an entry, which keys nothing until a page of the region is `Backed`).
     pub fn record_region(&self, region: u32, backing: &RegionBacking) {
         self.aliased
             .store(true, std::sync::atomic::Ordering::SeqCst);

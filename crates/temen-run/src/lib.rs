@@ -740,7 +740,9 @@ fn import_dispatch(host: &Host, packed: u32) -> Option<(u32, u32, i32)> {
 /// left something only the JIT's own runtime acts on (a park, a punted call's wait, a live callee, a
 /// region wake, a service point, `Jit.invoke`) traps the domain `Malformed`, in every build. Each is
 /// a call `native_scope` declines, and each host fact it reads at admission (the pipe ends held, a
-/// blocking stdin, the import bindings, the signal source, how the host procedures park) changes
+/// blocking stdin, the import bindings, the signal source, how the host procedures park, the live
+/// callees' offers (`serving`), and the minting procedures and outside-written backings held
+/// (`file region`)) changes
 /// mid-run only through a call it declines too: so reaching this is a bug in that predicate, and it
 /// fails closed instead of reaching a runtime the task is not on. `true` when it trapped.
 fn kernel_backstop(vm: &temen_jit::VmCtx) -> bool {
@@ -5047,9 +5049,13 @@ impl temen_interp::FutexWindow for MprotectWindow {
     fn confine_for_notify(&self, addr: u64) -> Result<u64, Trap> {
         self.confine(addr, 1)
     }
-    /// The guarded read: the check and the load under one hold of the map's lock, which a page op
-    /// takes to revoke a page before it changes the hardware ([`MprotectWindow::reprotect`]). The
-    /// lock is a leaf: nothing is taken while it is held, and no system call is made under it.
+    /// The guarded read: the check and the load under one hold of the map's lock, which every change
+    /// to the window's hardware takes ([`MprotectWindow::reprotect`]'s contract). The map check
+    /// decides the guest's answer. The load is the recoverable one today's route makes
+    /// ([`temen_jit::try_load_in`]), for every page whatever its state: a page that vanishes under
+    /// it anyway (a file a trusted host procedure mapped directly, then truncated) answers
+    /// `MemoryFault`, never a fault in host code. The lock is a leaf: nothing else is taken while
+    /// it is held.
     fn wait_word(&self, base: u64, width: u32) -> Option<u64> {
         // A naturally aligned word of at most 8 bytes lies on one page.
         if !matches!(width, 4 | 8) || !base.is_multiple_of(u64::from(width)) {
@@ -5061,22 +5067,20 @@ impl temen_interp::FutexWindow for MprotectWindow {
         if !self.word_readable(&map, base) {
             return None;
         }
-        // SAFETY: `[base, base + width)` is inside the reservation, aligned, and on a page the map
-        // says is readable, which the hardware keeps readable while this holds the map's lock (the
-        // contract above). The word is guest memory other vCPUs write with atomics: read it as one.
+        // SAFETY: `[base, base + width)` is inside the reservation, aligned, on a page the map says
+        // is readable. The load is atomic (other vCPUs write the word with atomics) and
+        // recoverable: every native caller is a vCPU's thread inside its guarded call, whose fault
+        // handler recovers it; a load that does not fault (a unit test's, outside one) needs none.
         let word = unsafe {
-            let at = self.base.add(base as usize);
-            match width {
-                4 => u64::from(
-                    core::sync::atomic::AtomicU32::from_ptr(at.cast())
-                        .load(core::sync::atomic::Ordering::SeqCst),
-                ),
-                _ => core::sync::atomic::AtomicU64::from_ptr(at.cast())
-                    .load(core::sync::atomic::Ordering::SeqCst),
-            }
+            temen_jit::try_load_in(
+                self.base,
+                self.reserved as usize,
+                self.base.add(base as usize),
+                width,
+            )
         };
         drop(map);
-        Some(word)
+        word
     }
     /// A word on a §13 alias parks at its region's byte, so every mapping of that byte rendezvous
     /// (`Mem::futex_site`'s rule); any other word at its address. A window that never held an alias
@@ -5725,7 +5729,7 @@ impl GuestMem for MprotectWindow {
             // never meets the replacement midway: a `MAP_FIXED` over a live mapping is not atomic to
             // a concurrent reader on every OS (macOS faults one, #2958 slice 4). No other host
             // reader runs outside the `Host` lock this call holds; the guest's own loads that race
-            // it fault into the guest. A refused `mmap` leaves the window, and so its map, as they
+            // it fault into the guest, on macOS and Windows only (#3050). A refused `mmap` leaves the window, and so its map, as they
             // were.
             // #2958 slice 4 — the backing's identity, which the page map keys a region word on, is
             // recorded once the call is valid and before the map's lock is taken, so the identity

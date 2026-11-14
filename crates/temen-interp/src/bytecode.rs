@@ -8931,6 +8931,11 @@ fn image_parks(host: &Host, m: &Module, census: &ImageCensus) -> Parks {
 ///   or for good if no consumer needs it);
 /// - **`signals`**: delivery into native code is the engine's safepoint redirect, not executor 2's
 ///   interrupt (a later phase);
+/// - **`serving`**: the host holds a live callee's offer (`Binding::LiveImpl`), which may sit under
+///   any interface's id, a built-in's included, so [`kernel_op`]'s table cannot see a call through
+///   it (#2791, #2792);
+/// - **`file region`**: the host holds a minting procedure or an outside-written backing
+///   ([`file_region`]; #3005's fix);
 /// - **`imports`**: an import the host leaves unbound or may rebind (`import.attach` may retarget it to
 ///   anything mid-run), a binding count that differs from the module's imports, or a
 ///   `call.import.dyn`: what the call reaches is not known at admission (removed with the last
@@ -9009,13 +9014,18 @@ pub fn native_scope(m: &Module, host: &Host) -> Result<(), &'static str> {
 }
 
 /// #2958 slice 4 — the `file region` clause: whether the run could map a region whose pages can
-/// shrink under it, so that a host read of an aliased word (a futex wait's) would fault in host
-/// code (#3005). It covers three ways in: a host procedure that may mint a backing
-/// ([`super::ProcHandler::Minting`], which can mint any kind, a file's included); a region the host
-/// holds at admission that something outside the VM writes ([`super::SharedBacking::outside_writers`]);
-/// and, decided per call in [`kernel_op`], an `AddressSpace` `create_region` (op 5) under a region
-/// factory ([`Host::set_region_factory`]). What is left is a host-granted anonymous region the guest
-/// maps. #3005's fix, which makes every host read of such a page recoverable, lifts this clause.
+/// shrink under it (a host file the guest truncates), which admission can see. A host copy of such
+/// a page faults in host code on both routes (#3005), and the kernel route's release behaviour is
+/// worse there, so the run stays on today's route. It names the three ways in admission can see: a
+/// host procedure that may mint a backing ([`super::ProcHandler::Minting`], which can mint any
+/// kind, a file's included); a region the host holds at admission that something outside the VM
+/// writes ([`super::SharedBacking::outside_writers`]); and, decided per call in [`kernel_op`], an
+/// `AddressSpace` `create_region` (op 5) under a region factory ([`Host::set_region_factory`]).
+///
+/// A fourth way in is not declined: a trusted `Sync` or `Unlocked` procedure that maps a backing
+/// through the window it is handed (`GuestMem::map_region`), which admission cannot see. A futex
+/// wait on such a page is recoverable (`wait_word`'s load answers `MemoryFault`); a host copy of it
+/// is #3005's, on both routes. #3005's fix lifts this clause.
 fn file_region(host: &Host) -> bool {
     host.host_procs
         .iter()
@@ -9041,10 +9051,13 @@ fn kernel_inst(host: &Host, i: &Inst) -> Result<(), &'static str> {
         | Inst::ImportAttach { .. }
         | Inst::DataSym { .. }
         | Inst::RefSym { .. } => Err("imports"),
+        // `export.handle` mints an offer of the module's own impl under its interface's interned id,
+        // which is a built-in's (`Stream`, `Exit`) when the shapes match: a `call.cap` on it would
+        // pass `kernel_op` as that built-in's op and run the guest's impl, a call through a guest
+        // interface.
+        Inst::ExportHandle { .. } => Err("serving"),
         // §3.5 reflection over the domain's own table, answered in the dispatch.
-        Inst::ExportHandle { .. } | Inst::CapSelfTypeId { .. } | Inst::CapSelfCovers { .. } => {
-            Ok(())
-        }
+        Inst::CapSelfTypeId { .. } | Inst::CapSelfCovers { .. } => Ok(()),
         Inst::ConstI32 { .. }
         | Inst::ConstI64 { .. }
         | Inst::IntBin { .. }
@@ -9144,6 +9157,8 @@ fn kernel_inst(host: &Host, i: &Inst) -> Result<(), &'static str> {
 /// - **`region signal`**: a post's `signal`, a wake of a region word, which needs the rules after
 ///   the `Host` lock is let go (slice 5);
 /// - **`fuel`**: `self.fuel.remaining`, whose parity on a native task is slice 6's;
+/// - **`file region`**: `create_region` while a region factory is set ([`file_region`]; #3005's
+///   fix);
 /// - **`process`**: `clone_caller`, `reap`, `exec` (a later phase; #2958 amendment 5);
 /// - **`serving`**: a service point or a call through a guest interface (#2791, #2792);
 /// - **`§14 children`**: `Instantiator`, `Module`, `ModuleLoader` (a later phase);
