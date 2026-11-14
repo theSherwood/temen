@@ -762,3 +762,118 @@ fn a_consumed_park_frozen_mid_delivery_redelivers_on_the_jit() {
     begin_thaw(&mut jsnap, TEST_ARENA, 0);
     jit_thaw(&jsnap, &jr, "JIT-frozen consumed park thawed on the JIT");
 }
+
+/// #3020 — `func 0 (mode, h)`: mode 0 makes a fiber, resumes it once (it suspends with 42) and
+/// answers its handle, leaving it suspended; mode 1 resumes `h` with 7 (a fiber would return 107).
+const LEAVES_A_FIBER: &str = "memory 17 shadow 16448 65536\n\
+    func (i64, i64) -> (i64) {\n\
+    block 0 (vm: i64, vh: i64) {\n\
+    \x20 vz = i64.const 0\n\
+    \x20 vis0 = i64.eq vm vz\n\
+    \x20 br_if vis0 1() 2(vh)\n\
+    }\n\
+    block 1 () {\n\
+    \x20 v0 = ref.func 1\n\
+    \x20 v1 = i64.const 4096\n\
+    \x20 v2 = cont.new v0 v1\n\
+    \x20 v3 = i64.const 0\n\
+    \x20 v4, v5 = cont.resume v2 v3\n\
+    \x20 return v2\n\
+    }\n\
+    block 2 (vh2: i64) {\n\
+    \x20 v6 = i64.const 7\n\
+    \x20 v7, v8 = cont.resume vh2 v6\n\
+    \x20 return v8\n\
+      }\n\
+    }\n\
+    func (i64, i64) -> (i64) {\n\
+    block 0 (v0: i64, v1: i64) {\n\
+    \x20 v2 = i64.const 42\n\
+    \x20 v3 = suspend v2\n\
+    \x20 v4 = i64.const 100\n\
+    \x20 v5 = i64.add v3 v4\n\
+    \x20 return v5\n\
+      }\n\
+    }\n";
+
+/// #3020 — one compile: a run freezes with a fiber suspended, the next run thaws it on the same
+/// compile (the seed lands in that run's own fiber table, and the fiber resolves), and the run after
+/// that cannot reach the fiber the thaw left suspended: its resume traps `FiberFault`, as on a fresh
+/// compile, where the fiber's run once went on into the next.
+#[test]
+fn a_reused_compile_freezes_a_fiber_thaws_it_and_a_later_run_cannot_reach_it() {
+    use temen_jit::{CompiledModule, TrapKind};
+    let m = parse_module(LEAVES_A_FIBER).expect("parse");
+    let inst = transform_module(&m).expect("transform");
+    verify_module(&inst).expect("verify");
+
+    // The uninterrupted answer: the fiber's handle.
+    let mut bhost = Host::new();
+    let mut bfuel = 1_000_000u64;
+    let (base, _) = run_capture_reserved_with_host(
+        &inst,
+        0,
+        &[Value::I64(0), Value::I64(0)],
+        &mut bfuel,
+        &init_durable_window(WINDOW, TEST_ARENA),
+        WINDOW_LOG2,
+        &mut bhost,
+    );
+    let Ok(base) = base else {
+        panic!("uninterrupted: {base:?}")
+    };
+    let Value::I64(handle) = base[0] else {
+        panic!("a handle: {base:?}")
+    };
+
+    let mut host = Host::new();
+    let mut cm = match CompiledModule::compile(
+        &inst,
+        0,
+        temen_run::cap_thunk,
+        &mut host as *mut Host as *mut c_void,
+        WINDOW_LOG2,
+        None,
+        None,
+        None,
+        None,
+        None,
+        0,
+    ) {
+        Ok(cm) => cm,
+        Err(temen_jit::JitError::Unsupported(_)) => return,
+        Err(e) => panic!("compile: {e:?}"),
+    };
+
+    // Run 1: frozen from its start, the fiber parked.
+    let mut win = init_durable_window(WINDOW, TEST_ARENA);
+    write_state(&mut win, TEST_ARENA, STATE_UNWINDING);
+    cm.set_durable(DurableResidue::default());
+    let (out, snap) = cm.run(&[0, 0], Some(&win), Some(WINDOW)).expect("freeze");
+    assert!(matches!(out, JitOutcome::Returned(_)), "run 1: {out:?}");
+    let residue = cm.take_durable_residue();
+    assert_eq!(residue.fibers.len(), 1, "run 1 froze its fiber");
+
+    // Run 2: the thaw, on the same compile, answers the uninterrupted run's handle.
+    let mut twin = snap;
+    begin_thaw(&mut twin, TEST_ARENA, 0);
+    cm.set_durable(residue);
+    let (out, _) = cm.run(&[0, 0], Some(&twin), Some(WINDOW)).expect("thaw");
+    assert_eq!(
+        out,
+        JitOutcome::Returned(vec![handle]),
+        "the thaw reproduces the uninterrupted answer"
+    );
+
+    // Run 3: the fiber the thaw left suspended is not this run's.
+    cm.set_durable(DurableResidue::default());
+    let fresh = init_durable_window(WINDOW, TEST_ARENA);
+    let (out, _) = cm
+        .run(&[1, handle], Some(&fresh), Some(WINDOW))
+        .expect("run 3");
+    assert_eq!(
+        out,
+        JitOutcome::Trapped(TrapKind::FiberFault),
+        "run 3 resumed the thaw's fiber"
+    );
+}

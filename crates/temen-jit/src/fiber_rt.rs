@@ -107,6 +107,14 @@ extern "C" {
     fn temen_set_current_fiber(handle: i64) -> i64;
 }
 
+/// #3047 — a root computation starts on this thread: no fiber runs on it. A fault inside a fiber
+/// jumps past the resume that would restore the trap-attribution thread-local, so without this a
+/// later run's root trap on the same thread was attributed to that fiber.
+pub(crate) fn enter_root() {
+    // SAFETY: a thread-local store in `trap_capture.c`.
+    unsafe { temen_set_current_fiber(-1) };
+}
+
 /// Max concurrently-allocated fibers per run ([`temen_ir::MAX_FIBERS`]): an anti-bomb ceiling so a
 /// fiber-bomb traps (`FiberFault`) instead of exhausting host memory. `1 << 24` (~16.7M): the ceiling
 /// equals the fiber-handle index width ([`FIBER_GEN_SHIFT`]) now the arena removed the
@@ -193,6 +201,15 @@ fn fiber_handle(slot: usize, generation: u64) -> i64 {
 /// in the top byte is ignored (mask, don't just shift).
 fn fiber_handle_generation(handle: i64) -> u64 {
     ((handle as u64) >> FIBER_GEN_SHIFT) & FIBER_HANDLE_GEN_MASK
+}
+
+/// #3020 — whether `handle` names the fiber `canonical` names in a table of `slots` slots, as
+/// [`SharedFiberTable::resolve`] reads a handle: its slot masked to the table, its generation masked.
+pub(crate) fn names_same_fiber(canonical: i64, handle: i64, slots: usize) -> bool {
+    let mask = slots.next_power_of_two() - 1;
+    let slot = |h: i64| (h as u64 as usize) & mask;
+    slot(handle) == slot(canonical)
+        && fiber_handle_generation(handle) == fiber_handle_generation(canonical)
 }
 
 #[cfg(all(test, not(loom)))]
@@ -290,6 +307,43 @@ pub(crate) type FiberCallTramp = extern "C" fn(
 
 /// Sentinel for [`FiberSlot::running_on`]: no vCPU is running this fiber.
 const NOT_RUNNING: u64 = u64::MAX;
+
+/// #3020 — [`FiberSlot::running_on`] of a fiber a fault abandoned: a guard's recovery jumped out of
+/// it, past the resume that would have marked it parked ([`abandon_after_fault`]). Nothing runs on
+/// it, and nothing will: its slot stays `RUNNING`, so no claim takes it.
+const FAULTED: u64 = u64::MAX - 1;
+
+/// #3020 — how deep this thread's runtime is in resumes: its live resumes and its fibers'
+/// yielders. A guarded call records both as it starts, so a fault's recovery can tell the fibers it
+/// abandoned from those it returns into ([`abandon_after_fault`]).
+pub(crate) fn active_depth() -> (usize, usize) {
+    let rt = current();
+    if rt.is_null() {
+        (0, 0)
+    } else {
+        // SAFETY: `current()` is this thread's live runtime; the read is momentary.
+        unsafe { ((*rt).active_slots.len(), (*rt).yielders.len()) }
+    }
+}
+
+/// #3020 — a guarded call that started at resume depth `depth` ([`active_depth`]) faulted: its
+/// recovery jumped out of every fiber resumed inside it, past each resume's return and each body's
+/// yielder pop. Mark each abandoned ([`FAULTED`]) and drop it, and its yielder, from this thread's
+/// runtime, so the two stacks stay in step and none names a stack the table's end frees.
+pub(crate) fn abandon_after_fault(depth: (usize, usize)) {
+    let rt = current();
+    if rt.is_null() {
+        return;
+    }
+    // SAFETY: `current()` is this thread's live runtime, and this thread runs no guest code now.
+    let rt = unsafe { &mut *rt };
+    while rt.active_slots.len() > depth.0 {
+        if let Some(s) = rt.active_slots.pop() {
+            s.running_on.store(FAULTED, Ordering::Release);
+        }
+    }
+    rt.yielders.truncate(depth.1);
+}
 
 /// §3.6 slice 5a — the third `cont.resume` status (beside suspended = 0 / returned = 1),
 /// matching the interpreter's `FIBER_PARKED`: the fiber hit an event park (`memory.wait`) and
@@ -506,6 +560,15 @@ impl SharedFiberTable {
         }
     }
 
+    /// #3020 — room for `slots` slots up front: a run of a compile that held `slots` at once last time
+    /// holds as many again, so its table need not regrow to them. A size hint, no state.
+    pub(crate) fn reserve(&self, slots: usize) {
+        let mut t = self.lock();
+        // A hint stays a hint: a reservation the allocator refuses is skipped, not an abort.
+        let _ = t.slots.try_reserve(slots);
+        let _ = t.charges.try_reserve(slots);
+    }
+
     fn lock(&self) -> MutexGuard<'_, TableState> {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -616,9 +679,41 @@ impl SharedFiberTable {
     /// #2112 — this table's domain has ended: each fiber still live hands its charge back now, not
     /// when the last reference to the table goes, so whoever learns of the end (a joining parent)
     /// finds the budget whole. Its slots stay as they are.
+    /// Its one caller is a run's end on an unwind (`RunFibers::drop`), where a fiber may still be in
+    /// use; every other end of a table is [`Self::end`], which refunds the charges too.
     pub(crate) fn release_charges(&self) {
         for c in self.lock().charges.iter_mut() {
             *c = FiberCharge::none();
+        }
+    }
+
+    /// How many slots the table holds, which a handle's slot is masked to.
+    pub(crate) fn slot_count(&self) -> usize {
+        self.lock().slots.len()
+    }
+
+    /// #3020 — this table's run has ended, and nothing runs on any of its fibers: every fiber goes,
+    /// its stack and its charge with it. By ownership: each slot's [`Fiber`] is taken out and
+    /// dropped, whatever holds the slot. A fiber parked on an event keeps an `Arc` of its own slot in
+    /// a frame on its own stack, which no unwinding ever drops, so waiting for the last reference
+    /// would keep the stack for the life of the process. The slots go too, so a table something
+    /// still holds (a closed held site's) names no fiber.
+    pub(crate) fn end(&self) {
+        let slots = {
+            let mut t = self.lock();
+            // Slot and charge share an index: both go, so a table something still holds stays
+            // consistent. Clearing the charges hands each back.
+            t.charges.clear();
+            t.free.clear();
+            std::mem::take(&mut t.slots)
+        };
+        for s in slots {
+            // Nothing runs on a fiber once its run has ended: each is parked, or a fault abandoned it.
+            debug_assert!(
+                matches!(s.running_on.load(Ordering::Acquire), NOT_RUNNING | FAULTED),
+                "a fiber ran past its run's end"
+            );
+            drop(s.fiber.lock().unwrap_or_else(|e| e.into_inner()).take());
         }
     }
 }
@@ -891,7 +986,7 @@ impl SharedFiberTable {
     /// durable freeze driver flattens (DURABILITY.md §12.8). Collected once: flattening a fiber
     /// makes zero forward progress (its post-suspend poll unwinds immediately), so it spawns no new
     /// parked fibers, and it ends `FREE` — the set never grows.
-    fn runnable_handles(&self) -> Vec<i64> {
+    pub(crate) fn runnable_handles(&self) -> Vec<i64> {
         self.lock()
             .slots
             .iter()
