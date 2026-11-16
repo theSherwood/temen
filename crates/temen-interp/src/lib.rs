@@ -12,6 +12,8 @@
 /// path, not yet the default; gated by the equality harness against this interpreter.
 pub mod bytecode;
 mod futex_count;
+#[cfg(all(loom, test))]
+mod park_listen_loom;
 pub mod journal;
 pub mod moment;
 

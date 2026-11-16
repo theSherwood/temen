@@ -4,8 +4,12 @@
 //! each `thread.spawn` child tiers up at its entry, so every vCPU is a kernel task whose own thread
 //! runs Cranelift code from its entry. A §12 op the code makes goes to the kernel
 //! ([`EmittedCall::park`]) through the vCPU's hook ([`temen_jit::kernel_rt`]), and the thread parks
-//! there with its frames on its stack. Everything [`admit`] declines runs on the JIT's own thread
-//! runtime, unchanged: `jit_cap_run` and `jit_run` ask it first, and nothing else chooses.
+//! there with its frames on its stack. A capability call that parks (a pipe or stdin read, a pipe
+//! write, a punted call) or wakes another's park (a region post's `signal`) is dispatched under the
+//! domain's `Host` lock, decided there as an interpreted op's is ([`temen_interp::bytecode::call_park`]),
+//! and carried out by the kernel's rules once the lock is let go ([`park_call`], #2958 slice 5): the
+//! lock order is the run lock, then the `Host` lock. Everything [`admit`] declines runs on the JIT's
+//! own thread runtime, unchanged: `jit_cap_run` and `jit_run` ask it first, and nothing else chooses.
 //!
 //! The window is the JIT's, started as the JIT's own runs start one (`seed_window`, then the
 //! host's page map over it), and it has one page map: the domain `Host`'s, which its capability
@@ -20,8 +24,8 @@
 
 use std::sync::Arc;
 use temen_interp::bytecode::{
-    CallEntry, CoopEvent, CoopRun, EmittedCall, EmittedTarget, NativeStop, NativeTier, Opener,
-    ProgramEmit, ThreadPlatform, ThreadTier, TierWindow,
+    CallEntry, CallPark, CoopEvent, CoopRun, EmittedCall, EmittedTarget, NativeStop, NativeTier,
+    Opener, ProgramEmit, ThreadPlatform, ThreadTier, TierWindow,
 };
 use temen_interp::{Host, ShadowArena, Trap, Value};
 use temen_ir::Module;
@@ -463,6 +467,26 @@ impl KernelPark for Hook<'_, '_> {
     fn park(&mut self, stop: NativeStop) -> Result<[i64; 2], i64> {
         self.0.park(stop).map_err(|t| t.code())
     }
+
+    fn park_call(&mut self, call: &mut dyn std::any::Any) -> Result<[i64; 2], i64> {
+        // What [`park_call`] sent; anything else is no call of this embedder's: the backstop.
+        let park = (call.downcast_mut::<CallPayload>())
+            .and_then(Option::take)
+            .ok_or(Trap::Malformed.code())?;
+        self.0.park_call(park).map_err(|t| t.code())
+    }
+}
+
+/// #2958 slice 5 — what a capability call's park carries from the cap thunk to [`Hook`], through
+/// `temen_jit`, which cannot name it: [`park_call`] sends it, and [`Hook::park_call`] takes it.
+type CallPayload = Option<CallPark>;
+
+/// #2958 slice 5 — hand `park`, what a call the vCPU on `vm` just made left it to do
+/// ([`temen_interp::bytecode::call_park`]), to its task's rules ([`EmittedCall::park_call`]): `None`
+/// when `vm` is no kernel vCPU's. The caller holds no `Host` lock.
+pub(crate) fn park_call(vm: &temen_jit::VmCtx, park: CallPark) -> Option<[i64; 2]> {
+    let mut payload: CallPayload = Some(park);
+    temen_jit::kernel_rt::park_call(vm, &mut payload)
 }
 
 #[cfg(test)]

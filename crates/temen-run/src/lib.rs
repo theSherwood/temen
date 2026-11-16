@@ -254,9 +254,8 @@ pub unsafe extern "C" fn cap_thunk(
             }
             return;
         }
-        match park {
-            Some(p) if p.park(vm) => continue,
-            _ => return,
+        if !park.is_some_and(|p| p.park(vm)) {
+            return;
         }
     }
 }
@@ -279,6 +278,10 @@ pub(crate) enum HostParkReq {
     /// so it waits for the tree's bell to ring past `bell`, the count read before the op looked
     /// ([`jit_proc::wait_for_bell`]).
     Tree { bell: u64 },
+    /// #2958 slice 5 — on a kernel vCPU: what the call left its task to do, which the kernel's rules
+    /// carry out as an interpreted op's ([`jit_kernel::park_call`]): a pipe or stdin park, rewound,
+    /// or a region post's wake, after which the call is done.
+    Kernel(temen_interp::bytecode::CallPark),
 }
 
 impl HostParkReq {
@@ -291,10 +294,17 @@ impl HostParkReq {
     ///
     /// # Safety
     /// `vm` is the live call's context; the caller holds no lock the run's other vCPUs need.
-    unsafe fn park(&self, vm: &temen_jit::VmCtx) -> bool {
+    unsafe fn park(self, vm: &temen_jit::VmCtx) -> bool {
         let (probe, freeze) = match self {
-            HostParkReq::Tree { bell } => return jit_proc::wait_for_bell(vm, *bell),
-            HostParkReq::Hub { probe, freeze } => (probe, *freeze),
+            HostParkReq::Tree { bell } => return jit_proc::wait_for_bell(vm, bell),
+            HostParkReq::Hub { probe, freeze } => (probe, freeze),
+            HostParkReq::Kernel(park) => {
+                // A rewound park runs the op again once its task can run; a wake is the op's last act.
+                let rewound = !matches!(park, temen_interp::bytecode::CallPark::Done(_));
+                return jit_kernel::park_call(vm, park).is_some()
+                    && rewound
+                    && vm.ended().is_none();
+            }
         };
         let key = probe.as_ref().map_or(Self::STDIN, |p| p.gid() as u64);
         let still_parked = || probe.as_ref().is_none_or(|p| !p.ready());
@@ -323,6 +333,12 @@ unsafe fn cap_wait(
     fiber: bool,
     vm: &temen_jit::VmCtx,
 ) -> i64 {
+    // #2958 slice 5 — a kernel vCPU's task parks on the call through its rules, which deliver the
+    // answer; a run that ends meanwhile leaves it unclaimed, as here.
+    if vm.on_kernel() {
+        let park = temen_interp::bytecode::CallPark::CapPending(id);
+        return jit_kernel::park_call(vm, park).map_or(0, |[r, _]| r);
+    }
     if fiber {
         return fiber_cap_wait(comps, id, vm);
     }
@@ -571,13 +587,13 @@ unsafe fn cap_thunk_impl(
     // ([`jit_proc::serve_request`]).
     let serves = host.caller_requests_armed();
     // FORK.md §8.6 — `pipe(fds)`: a process tree serves the parks its pipes' reads and writes make,
-    // so it mints them, through the one mint ([`Host::mint_pipe`]). Any other JIT run leaves the op
-    // to the host's `-EINVAL`, as every tier that can't park does.
-    if serves && type_id == temen_ir::CAP_SELF_TYPE_ID && op == temen_interp::CAP_SELF_PIPE {
-        // #2958 slice 4 — a pipe minted mid-run is one `native_scope` could not see (`stream parks`).
-        if kernel_backstop(vm) {
-            return;
-        }
+    // so it mints them, through the one mint ([`Host::mint_pipe`]), as a kernel run does, whose rules
+    // park them (#2958 slice 5). Any other JIT run leaves the op to the host's dispatch, which
+    // refuses it (#3070: both interpreters mint).
+    if (serves || vm.on_kernel())
+        && type_id == temen_ir::CAP_SELF_TYPE_ID
+        && op == temen_interp::CAP_SELF_PIPE
+    {
         let r = host.mint_pipe(arg_slots.first().copied().unwrap_or(0) as u64, gm);
         if n_results != 0 {
             *results = r;
@@ -613,6 +629,24 @@ unsafe fn cap_thunk_impl(
         // #2847 — a call through a live-callee offer, handed back: the thunk makes it, and the
         // dispatch left no transient.
         Ok(()) if live.is_some() => {}
+        // #2958 slice 5 — on a kernel vCPU what the op leaves its task to do is the one decision an
+        // interpreted op's is ([`temen_interp::bytecode::call_park`]), made under this hold, and the
+        // kernel's rules carry it out once the thunk lets the lock go ([`HostParkReq::Kernel`]).
+        Ok(()) if vm.on_kernel() => {
+            use temen_interp::bytecode::{call_park, CallPark};
+            let read = type_id == cap_id::STREAM && op == 0;
+            match call_park(host, read) {
+                CallPark::Done(None) => {}
+                CallPark::Eintr if n_results != 0 => *results = temen_ir::errno::EINTR,
+                p @ (CallPark::Done(Some(_))
+                | CallPark::Stdin
+                | CallPark::PipeRead(_)
+                | CallPark::PipeWrite(_)) => *park = Some(HostParkReq::Kernel(p)),
+                // A request, an abandon, or `EINTR` with no slot to answer in: none reachable on a
+                // kernel run (`native_scope`'s `signals`, `process` and `durable`).
+                _ => _ = kernel_backstop(vm),
+            }
+        }
         Ok(()) => {
             // Every transient the op left is drained, acted on or not: one left set would land on a
             // later call.
@@ -624,11 +658,6 @@ unsafe fn cap_thunk_impl(
                 None if !stdin_park => return,
                 None => temen_interp::ParkTransients::default(),
             };
-            // #2958 slice 4 — a kernel task's call that leaves a park, a wake or a request to serve
-            // is one `native_scope` declines: the backstop ([`kernel_backstop`]).
-            if kernel_backstop(vm) {
-                return;
-            }
             // #1936 — a post's signal: its word's waiters wake by the key a §13 `map` gave it.
             if let Some((backing, off)) = parks.wake_region.as_ref().and_then(|w| w.os_key()) {
                 temen_jit::notify_region(vm, backing, off);
@@ -719,15 +748,17 @@ fn import_dispatch(host: &Host, packed: u32) -> Option<(u32, u32, i32)> {
     host.import_target(packed).ok()
 }
 
-/// #2958 slice 4 — the kernel route's backstop: on a kernel task's context, a call whose dispatch
-/// left something only the JIT's own runtime acts on (a park, a punted call's wait, a live callee, a
-/// region wake, a service point, `Jit.invoke`) traps the domain `Malformed`, in every build. Each is
-/// a call `native_scope` declines, and each host fact it reads at admission (the pipe ends held, a
-/// blocking stdin, the import bindings, the signal source, how the host procedures park, the guest
-/// offers held, a live callee's or a module's own (`serving`), and the minting procedures and
-/// outside-written backings held (`file region`)) changes
-/// mid-run only through a call it declines too: so reaching this is a bug in that predicate, and it
-/// fails closed instead of reaching a runtime the task is not on. `true` when it trapped.
+/// #2958 slices 4 and 5 — the kernel route's backstop: on a kernel task's context, a call whose
+/// dispatch left something only the JIT's own runtime acts on (a live callee, a service point,
+/// `Jit.invoke`, a personality's request, a freeze's abandon) traps the domain `Malformed`, in every
+/// build. Its parks (a pipe or stdin read, a pipe write, a punted call) and its region wakes are the
+/// kernel's rules' ([`HostParkReq::Kernel`], [`cap_wait`]). Each call that reaches this is one
+/// `native_scope` declines, and each host fact it reads at admission (the import bindings, the
+/// signal source, the guest offers held, a live callee's or a module's own (`serving`), the minting
+/// procedures and outside-written backings held (`file region`), the host-answered procedures held
+/// (`punt shape`)) changes mid-run only through a call it declines too: so reaching this is a bug in
+/// that predicate, and it fails closed instead of reaching a runtime the task is not on. `true` when
+/// it trapped.
 fn kernel_backstop(vm: &temen_jit::VmCtx) -> bool {
     if vm.on_kernel() {
         vm.raise(Trap::Malformed.code());
@@ -850,7 +881,7 @@ pub unsafe extern "C" fn cap_thunk_locked(
         // A punted call's job may still run and post its answer: that answer lands in this domain's
         // completions, which no caller claims, and the domain's end (this trap) ends the run, so
         // nothing waits on it.
-        if (live.is_some() || pending_id.is_some()) && kernel_backstop(vm) {
+        if live.is_some() && kernel_backstop(vm) {
             return;
         }
         if let Some(target) = live {
