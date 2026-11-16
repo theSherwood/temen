@@ -993,6 +993,7 @@ fn reused_jit(
 ) -> Vec<i64> {
     let (p, a, b) = (p.clone(), a.clone(), b.clone());
     let (tx, rx) = std::sync::mpsc::channel();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
     let t = std::thread::spawn(move || {
         let (host, h) = host(&a, &b, cap);
         let mut host = Box::new(host);
@@ -1025,9 +1026,10 @@ fn reused_jit(
         }
         drop(cm);
         drop(host);
+        let _ = done_tx.send(());
     });
     let mut t = Some(t);
-    (1..=runs)
+    let answers = (1..=runs)
         .map(|run| {
             let (r, held) = match rx.recv_timeout(std::time::Duration::from_secs(30)) {
                 Ok(got) => got,
@@ -1050,7 +1052,20 @@ fn reused_jit(
             );
             r
         })
-        .collect()
+        .collect();
+    // The worker's teardown (the compile's and the host's drop) after its last send fails the test
+    // too, bounded as each run is.
+    let t = t.expect("the runs' thread");
+    match done_rx.recv_timeout(std::time::Duration::from_secs(30)) {
+        Ok(()) => t.join().expect("the runs' thread"),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            std::panic::resume_unwind(t.join().expect_err("the teardown panicked"))
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            panic!("the compile's teardown did not end within 30 s")
+        }
+    }
+    answers
 }
 
 /// #3024 — a later run of one compile spawns and joins detached children as its first did: the
@@ -1188,28 +1203,41 @@ fn a_reused_host_s_later_run_finds_nothing_of_an_earlier_window_s_regions() {
     const ALONE: &str = "TEMEN_REUSED_HOST_ALONE";
     if std::env::var_os(ALONE).is_none() {
         let name = "a_reused_host_s_later_run_finds_nothing_of_an_earlier_window_s_regions";
-        let child = std::process::Command::new(std::env::current_exe().expect("test binary"))
+        use std::io::Read;
+        let mut child = std::process::Command::new(std::env::current_exe().expect("test binary"))
             .args(["--exact", name, "--test-threads=1"])
             .env(ALONE, "1")
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()
             .expect("re-run the test binary");
-        // Bounded: a child that hangs fails the row rather than the job.
+        // Bounded: the pipes are read on threads of their own, and the row keeps the child, so one
+        // that hangs is killed and fails the row rather than outliving it.
+        let (mut so, mut se) = (child.stdout.take(), child.stderr.take());
+        let stderr = std::thread::spawn(move || {
+            let mut e = Vec::new();
+            se.as_mut().map(|p| p.read_to_end(&mut e));
+            e
+        });
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let _ = tx.send(child.wait_with_output());
+            let mut o = Vec::new();
+            so.as_mut().map(|p| p.read_to_end(&mut o));
+            let _ = tx.send(o);
         });
-        let out = rx
-            .recv_timeout(std::time::Duration::from_secs(60))
-            .expect("the row's own process did not end within 60 s")
-            .expect("the row's own process");
-        let stdout = String::from_utf8_lossy(&out.stdout);
+        let Ok(stdout) = rx.recv_timeout(std::time::Duration::from_secs(60)) else {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("the row's own process did not end within 60 s; killed");
+        };
+        let status = child.wait().expect("the row's own process");
+        let stderr = stderr.join().expect("its stderr");
+        let stdout = String::from_utf8_lossy(&stdout);
         // "1 passed", not just a zero exit: a filter that matched nothing would exit 0 too.
         assert!(
-            out.status.success() && stdout.contains("1 passed"),
+            status.success() && stdout.contains("1 passed"),
             "the row failed in its own process:\n{stdout}{}",
-            String::from_utf8_lossy(&out.stderr)
+            String::from_utf8_lossy(&stderr)
         );
         return;
     }

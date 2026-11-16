@@ -34,8 +34,8 @@ fn a_forget_clears_its_range_alone() {
 static RECORDED_AT: AtomicU64 = AtomicU64::new(0);
 static SEEN_LIVE: AtomicU64 = AtomicU64::new(0);
 
-/// A window-ready hook that records a region identity for the window's second page, as a host's
-/// region recorder would at a §13 `map`, and reads it back.
+/// A window-ready hook that records a region identity for the span one `PAGE` into the window (inside
+/// its reservation), as a host's region recorder would at a §13 `map`, and reads it back.
 unsafe extern "C" fn record_a_page(
     _ctx: *mut core::ffi::c_void,
     base: *mut u8,

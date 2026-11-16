@@ -1066,13 +1066,14 @@ impl Nursery {
     /// #3024 — how many child nurseries and claim-ended children this nursery holds: none between
     /// runs.
     pub(crate) fn held(&self) -> (usize, usize) {
-        (
-            self.kids.lock().unwrap_or_else(|e| e.into_inner()).len(),
-            self.unclaimed
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .len(),
-        )
+        // One lock at a time: `forget` takes `unclaimed` and then `kids`.
+        let kids = self.kids.lock().unwrap_or_else(|e| e.into_inner()).len();
+        let unclaimed = self
+            .unclaimed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len();
+        (kids, unclaimed)
     }
 
     /// CALLS.md 5c.0 — release each child's nursery-retained shared-powerbox ref (minted live-impls

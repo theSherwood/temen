@@ -1119,11 +1119,11 @@ pub fn region_canon_forget_window(base: u64, size: u64) {
     let hi = base.saturating_add(size).div_ceil(page);
     // Ordered by page, so a window's release visits its own entries alone, however many other
     // windows hold (#3056: a scan of the whole map cost every window drop ~150 µs at 64k entries).
-    let mut g = region_map().lock().unwrap_or_else(|e| e.into_inner());
-    let gone: Vec<u64> = g.range(lo..hi).map(|(&p, _)| p).collect();
-    for p in gone {
-        g.remove(&p);
-    }
+    region_map()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .extract_if(lo..hi, |_, _| true)
+        .for_each(drop);
 }
 
 /// The canonical futex key for absolute guest address `phys`: `Region(backing, off)` when its page was
@@ -1354,8 +1354,9 @@ impl Domain {
     /// freeze residue taken and its kill and freeze wakes retired, so no guest code of the run can
     /// reach the domain. Through `&self`: a host may still reach [`Self::park`] (a wake by
     /// [`crate::CompiledModule::park_hub`]'s address, an [`outside_waker`]), so nothing it reads is
-    /// written. At the run's end, not the next one's start: the next run installs a thaw's table as it
-    /// starts (#2619, #3024), so a reset at its start would erase it.
+    /// written. At the run's end: then the domain is clean between runs, whoever looks, and the next
+    /// run's start only installs a thaw's table over it (#2619, #3024). A reset at that start would
+    /// have to run before the install, or it would erase it.
     ///
     /// One destructure names every field: each is per-run, and reset below, or configuration the
     /// instance keeps (`_`). A field added to the domain does not compile until it is one or the
