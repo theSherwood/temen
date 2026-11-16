@@ -26307,9 +26307,10 @@ pub struct Host {
     /// thunk has no region map. `temen-run` installs a recorder here (over the JIT window's `mem_base`);
     /// the dispatch calls it after each successful `map` (`Some(win_off, region_off, len, backing_fd)`)
     /// and each `unmap` (`None`), so the JIT registry stays in step. `None` on the interpreter (whose own
-    /// `PageProt::Backed` already canonicalizes) and on any host with no recorder installed.
+    /// `PageProt::Backed` already canonicalizes) and on any host with no recorder installed. #3059 —
+    /// with the window base it records for: a window of its own per recorder.
     #[allow(clippy::type_complexity)]
-    region_hook: Option<Arc<dyn Fn(u64, u64, Option<(u64, u64)>) + Send + Sync>>,
+    region_hook: Option<(u64, Arc<dyn Fn(u64, u64, Option<(u64, u64)>) + Send + Sync>)>,
     /// A spawn record's **pre-mapped region** staged into this (child) powerbox at spawn ([`Host::stage_premap`]):
     /// `(this host's region id, window offset)`. Applied once, onto the child's freshly minted window,
     /// by [`Host::apply_premap`] — the whole region aliased read-write at the offset, exactly what the
@@ -32957,7 +32958,7 @@ impl Host {
         // S1b/S1c: on a successful map of an OS-fd-backed region, tell the JIT futex registry which
         // pages now alias which region bytes (a no-op on the interp).
         if r >= 0 {
-            if let (Some(hook), Some(id)) = (&self.region_hook, backing_id) {
+            if let (Some((_, hook)), Some(id)) = (&self.region_hook, backing_id) {
                 hook(win_off, len, Some((region_off, id)));
             }
         }
@@ -33025,18 +33026,21 @@ impl Host {
     /// registry (and `unmap` forgets them); the interpreter needs none (its `PageProt::Backed` already
     /// canonicalizes). Called with `(win_off, len, Some((region_off, backing)))` on `map`,
     /// `(win_off, len, None)` on `unmap`.
+    /// #3059 — `hook` records for the JIT window at `base`: a host whose next window starts elsewhere
+    /// gets a recorder of its own for it.
     #[allow(clippy::type_complexity)]
     pub fn set_region_hook(
         &mut self,
-        hook: Option<Arc<dyn Fn(u64, u64, Option<(u64, u64)>) + Send + Sync>>,
+        hook: Option<(u64, Arc<dyn Fn(u64, u64, Option<(u64, u64)>) + Send + Sync>)>,
     ) {
         self.region_hook = hook;
     }
 
-    /// Whether a canonical-key region hook is installed — so `temen-run`'s `call.cap` trampoline installs
-    /// it lazily (once, over the run's `mem_base`) only when absent.
-    pub fn has_region_hook(&self) -> bool {
-        self.region_hook.is_some()
+    /// The window base the installed canonical-key region hook records for, if one is installed: so
+    /// `temen-run` installs one lazily, over the window it is handed, only when none records for that
+    /// window (#3059).
+    pub fn region_hook_window(&self) -> Option<u64> {
+        self.region_hook.as_ref().map(|&(base, _)| base)
     }
 
     /// §3b — the room left along a Budget handle's chain (and its node's lane), without charging
@@ -36162,7 +36166,7 @@ impl Host {
                                 let r = m.unmap(win_off, len);
                                 // As `region_map`'s: the hook hears of a span only once the op took
                                 // it, so a span outside the window never reaches it (#2400).
-                                if let (0, Some(hook)) = (r, &h.region_hook) {
+                                if let (0, Some((_, hook))) = (r, &h.region_hook) {
                                     hook(win_off, len, None);
                                 }
                                 r
