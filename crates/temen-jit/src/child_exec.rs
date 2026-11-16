@@ -1137,24 +1137,30 @@ impl ServeSite {
     /// so a claim always precedes the withdraw, and the root's end (`ChildExec::file`), after it,
     /// sees the claim. The end's mark and the claim are read-modify-writes of the one count: either
     /// the end sees the claim and retires the domain until the claim lets go, or the claim sees the
-    /// end and gives its place back.
+    /// end and takes no place, leaving the count as it was.
     ///
     /// The refused branch is reachable: a child whose root has returned while another of its vCPUs
     /// still parks in a serve op keeps that site published, its domain ending (`file` marked it).
-    pub fn claim(self: &Arc<Self>) -> Option<Claim> {
+    pub fn claim(self: Arc<Self>) -> Option<Claim> {
         if !self.window.take(fiber_rt::context_id()) {
             return None;
         }
-        let handlers = self.window.vm.handlers();
-        if handlers.fetch_add(1, Ordering::SeqCst) & HANDLERS_ENDING != 0 {
-            // A plain undo: the end decided before this claim that it waits for no handler, so it
-            // retired nothing for it, and there is nothing to re-offer.
-            handlers.fetch_sub(1, Ordering::SeqCst);
+        // The place is taken only while the end is unmarked, in one step: a refused claim never
+        // changes the count. An add undone after (the first version) let the domain's last handler
+        // end between the two, read a count above its own, and wake nobody.
+        let taken =
+            self.window
+                .vm
+                .handlers()
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                    (n & HANDLERS_ENDING == 0).then_some(n + 1)
+                });
+        if taken.is_err() {
             self.step_aside();
             return None;
         }
         Some(Claim {
-            site: Arc::clone(self),
+            site: self,
             holds_gate: true,
         })
     }
@@ -1407,6 +1413,14 @@ impl Claim {
     /// Whether `inline_ok(func)` on the claimed site ([`ServeSite::inline_ok`]).
     pub fn inline_ok(&self, func: u32) -> bool {
         self.site.inline_ok(func)
+    }
+
+    /// Let the claim go, as its `Drop` does: whether it gave the gate back here, for which the
+    /// caller rings the serve op's bell. A handler that parked gave it back with its park.
+    pub fn release(self) -> bool {
+        let gave = self.holds_gate;
+        drop(self);
+        gave
     }
 }
 
@@ -3741,14 +3755,14 @@ mod tests {
     }
 
     /// #3060 (a) — a claim the domain's end has already decided against (`HANDLERS_ENDING`, no
-    /// handler) is refused, and leaves everything as it was: the count back at the mark alone, the
-    /// gate free, and nothing offered. Its undo is a plain one: the end retired nothing for it.
+    /// handler) is refused, and leaves everything as it was: the count never changed, the gate
+    /// free, and nothing offered.
     #[test]
     fn a_claim_after_the_domains_end_is_refused_and_offers_nothing() {
         let (site, exec) = parked_site();
         let handlers = site.window.vm.handlers();
         handlers.fetch_or(HANDLERS_ENDING, Ordering::SeqCst);
-        assert!(site.claim().is_none(), "refused");
+        assert!(Arc::clone(&site).claim().is_none(), "refused");
         assert_eq!(handlers.load(Ordering::SeqCst), HANDLERS_ENDING);
         assert!(gate_free(&site), "the gate is given back");
         assert!(still_parked(&exec), "nothing is offered");
@@ -3762,7 +3776,7 @@ mod tests {
     fn a_domains_end_after_a_claim_waits_for_it() {
         let (site, exec) = parked_site();
         let handlers = site.window.vm.handlers();
-        let claim = site.claim().expect("the gate is free");
+        let claim = Arc::clone(&site).claim().expect("the gate is free");
         assert!(!gate_free(&site), "the claim holds the gate");
         let before = handlers.fetch_or(HANDLERS_ENDING, Ordering::SeqCst);
         assert_ne!(before & !HANDLERS_ENDING, 0, "the end sees the claim");
@@ -3774,13 +3788,15 @@ mod tests {
     }
 
     /// #3060 (c) — a claim whose handler never starts (the caller's grant failed, or the handler's
-    /// `NoHandler` or `NoStack`: each a drop of the claim, before or inside `run_inline` / `start`)
-    /// leaves the count and the gate as they were before it, and wakes nothing.
+    /// `NoHandler` or `NoStack`) leaves the count and the gate as they were before it, and wakes
+    /// nothing. The two refusals are this row by construction: `Claim::start` returns them by its
+    /// `?` before `holds_gate` changes, so the claim drops as this one does (a site with no handler
+    /// needs a compiled serve context, which this harness has none of).
     #[test]
     fn a_claim_let_go_before_its_handler_leaves_the_site_as_it_was() {
         let (site, exec) = parked_site();
         let handlers = site.window.vm.handlers();
-        let claim = site.claim().expect("the gate is free");
+        let claim = Arc::clone(&site).claim().expect("the gate is free");
         assert_eq!(handlers.load(Ordering::SeqCst), 1);
         drop(claim);
         assert_eq!(handlers.load(Ordering::SeqCst), 0);
@@ -3789,6 +3805,25 @@ mod tests {
             still_parked(&exec),
             "a live domain's handler count wakes nothing"
         );
+    }
+
+    /// #3060 (d) — a refused claim cannot steal the last handler's wake. The domain ends with one
+    /// handler still counted (`HANDLERS_ENDING + 1`: its task retired and parked, waiting for it);
+    /// a claim then is refused and leaves the count exactly so, and that handler's end re-offers.
+    /// The first version added and then undid: a handler ending between the two read
+    /// `HANDLERS_ENDING + 2`, woke nobody, and the undo left the domain's end waiting for good.
+    #[test]
+    fn a_refused_claim_leaves_the_last_handlers_wake_to_it() {
+        let (site, exec) = parked_site();
+        let handlers = site.window.vm.handlers();
+        handlers.store(HANDLERS_ENDING + 1, Ordering::SeqCst);
+        assert!(Arc::clone(&site).claim().is_none(), "refused");
+        assert_eq!(handlers.load(Ordering::SeqCst), HANDLERS_ENDING + 1);
+        assert!(gate_free(&site));
+        assert!(still_parked(&exec), "a refused claim wakes nothing");
+        exec.handler_ended(&site.window.vm);
+        assert_eq!(handlers.load(Ordering::SeqCst), HANDLERS_ENDING);
+        assert!(!still_parked(&exec), "the last handler's end re-offers");
     }
 
     /// An entry of the pool's table for a task that never runs: filed, never picked (it holds no

@@ -3634,7 +3634,7 @@ unsafe fn handoff_call(
         })
     });
     // Ended here, parked (it counts as the domain's handler in the pool now, and gave the gate back
-    // with its park), or refused: the claim goes either way.
+    // with its park), or refused: the claim goes either way, ringing only if it held the gate.
     leave_site(claim, callee);
     let ran = match ran {
         Ok(ran) => ran,
@@ -3665,14 +3665,15 @@ unsafe fn handoff_call(
 }
 
 /// #2742 — a caller lets its claim of a serve op go (#3060), whether its handler ran or never
-/// started: the gate, if the claim still holds it, so a woken handler of the window may run on the
-/// pool; its place in the domain's handlers, so an end that waited for it goes on; then the bell of
-/// `callee`, the site's cell, rings for the serve op, which counts the dispatch served or waits to
-/// take the gate.
+/// started: its place in the domain's handlers, so an end that waited for it goes on; the gate, if
+/// the claim still holds it, so a woken handler of the window may run on the pool, and then the
+/// bell of `callee`, the site's cell, rings for the serve op, which counts the dispatch served or
+/// waits to take the gate. A handler that parked gave the gate back with its park: no ring.
 unsafe fn leave_site(claim: temen_jit::Claim, callee: &Mutex<Host>) {
-    drop(claim);
-    // SAFETY: the callee's cell is live, its hub its live run's.
-    ring(&callee.lock().unwrap_or_else(|e| e.into_inner()));
+    if claim.release() {
+        // SAFETY: the callee's cell is live, its hub its live run's.
+        ring(&callee.lock().unwrap_or_else(|e| e.into_inner()));
+    }
 }
 
 /// #2742 — the reply a handler's end gives a direct handoff's caller: its results, or, for a handler
