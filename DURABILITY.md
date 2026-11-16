@@ -2484,7 +2484,7 @@ original site map is retained below for reference:
   (`shadow_switch` out/in ctx, the `fiber_rt` resumer/slot, `os_thread_rt` `p.ctx`, the root). Shift
   every SP **init** from `shadow_region_base(ctx)` to `+ 8` (interp `root_shadow_sp` 4644/4707, registry
   `shadow`/`saved_sp` seeds, child `root_shadow_sp` 6004, the `4839` reset; JIT `AtomicU64` 371,
-  `root_shadow_sp` 538, `thaw_root_sp` lib.rs 2395, `os_thread_rt` 825), and the **"spilled?" extent
+  `root_shadow_sp` 538, `RunSeed::root_sp` (temen-jit lib.rs, #3024; was `thaw_root_sp`), `os_thread_rt` 825), and the **"spilled?" extent
   checks** (e.g. `fiber_rt` `flat_sp > fiber_region_base(slot)` → `+ 8`).
 - **Helpers / format.** `init_durable_window` writes the root SP word at `window[SHADOW_BASE] =
   SHADOW_BASE + 8` (offset 8 unused). `temen-snapshot`'s `SHADOW_BASE` residue defaults (root_sp, the
