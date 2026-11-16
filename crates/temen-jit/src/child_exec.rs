@@ -1148,16 +1148,18 @@ impl ServeSite {
         // The place is taken only while the end is unmarked, in one step: a refused claim never
         // changes the count. An add undone after (the first version) let the domain's last handler
         // end between the two, read a count above its own, and wake nobody.
-        let taken =
-            self.window
-                .vm
-                .handlers()
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
-                    (n & HANDLERS_ENDING == 0).then_some(n + 1)
-                });
-        if taken.is_err() {
-            self.step_aside();
-            return None;
+        // (A compare-exchange loop by hand: `fetch_update` is deprecated on newer toolchains.)
+        let handlers = self.window.vm.handlers();
+        let mut n = handlers.load(Ordering::SeqCst);
+        loop {
+            if n & HANDLERS_ENDING != 0 {
+                self.step_aside();
+                return None;
+            }
+            match handlers.compare_exchange_weak(n, n + 1, Ordering::SeqCst, Ordering::SeqCst) {
+                Ok(_) => break,
+                Err(now) => n = now,
+            }
         }
         Some(Claim {
             site: self,
