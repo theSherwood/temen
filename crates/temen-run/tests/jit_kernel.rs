@@ -1842,6 +1842,95 @@ block 0 (va0: i64, vb0: i64) {{
     all_answer(make, grant, false, METERED, Err("Exit(7)".into()));
 }
 
+/// #3037 — a vCPU inside a long synchronous host call holds its domain's `Host` lock for the call,
+/// and the other vCPUs' stops must not wait on it: the rules read nothing under the run lock that
+/// needs the `Host`. The root calls a `Sync` procedure, which marks it is in (16384) and holds the
+/// call until a pair of vCPUs reports it is done (16388): a thread that spawns a second thread and
+/// joins it, two full stops of the rules. The pair's own completion lets the call go, so nothing is
+/// timed: a route whose spawn or join waits on the `Host` lock never reports, and the procedure
+/// gives up after its bound and answers the done word it saw (0), so the row fails saying so.
+#[test]
+fn a_vcpus_long_host_call_stalls_no_other_vcpus_stops() {
+    static LEFT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    fn make(h: i32) -> temen_ir::Module {
+        module(&format!(
+            "memory 16
+func () -> (i64) {{
+block 0 () {{
+  vz = i64.const 0
+  vt = thread.spawn 1 vz vz
+  vp = i32.const {h}
+  vr = call.cap 13 0 (i64) -> (i64) vp(vz)
+  vst, vv = thread.join vt
+  return vr
+  }}
+}}
+func (i64, i64) -> (i64) {{
+block 0 (va0: i64, vb0: i64) {{
+  br 1()
+}}
+block 1 () {{
+  vin = i64.const 16384
+  vs = i32.atomic.load vin
+  vgo = i32.eqz vs
+  br_if vgo 1() 2()
+}}
+block 2 () {{
+  vz = i64.const 0
+  vt = thread.spawn 2 vz vz
+  vst, vv = thread.join vt
+  vout = i64.const 16388
+  vone = i32.const 1
+  i32.atomic.store vout vone
+  return vv
+  }}
+}}
+func (i64, i64) -> (i64) {{
+block 0 (va1: i64, vb1: i64) {{
+  vr = i64.const 5
+  return vr
+  }}
+}}
+"
+        ))
+    }
+    fn grant(h: &mut Host) -> i32 {
+        use temen_interp::{put_results, CapState, HostProcGrant, ProcHandler};
+        h.grant_host_proc(HostProcGrant::new(
+            ProcHandler::Sync(Box::new(|_op, _args, out, mem, _minter| {
+                let mem = mem.ok_or(Trap::Malformed)?;
+                mem.write_bytes(16384, &1u32.to_le_bytes())
+                    .ok_or(Trap::MemoryFault)?;
+                // Held, with the domain's `Host` lock, until the pair reports or the bound passes.
+                let until = Instant::now() + PROMPT / 2;
+                let done = loop {
+                    let w = mem.read_bytes(16388, 4).ok_or(Trap::MemoryFault)?;
+                    let w = u32::from_le_bytes(w.try_into().expect("four bytes"));
+                    if w != 0
+                        || Instant::now() >= until
+                        || LEFT.load(std::sync::atomic::Ordering::Relaxed)
+                    {
+                        break w;
+                    }
+                    std::hint::spin_loop();
+                };
+                put_results(out, &[i64::from(done)])
+            })),
+            CapState::Stateless,
+        ))
+    }
+    // However the row ends, a call it leaves held lets go.
+    struct Left;
+    impl Drop for Left {
+        fn drop(&mut self) {
+            LEFT.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    let _left = Left;
+    // The oracle runs one task at a time, so its pair cannot run inside the call: it is left out.
+    all_answer(make, grant, false, None, Ok(vec![1]));
+}
+
 /// #2958 slice 4 — the calls the kernel route declines, inline, each with the clause that names what
 /// removes it (`native_scope`'s `kernel_op`, default-deny), under a host that holds what makes it
 /// park where that matters.

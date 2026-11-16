@@ -18515,7 +18515,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     let cdebug = debug.as_ref().map(|d| Arc::clone(&d.shared));
                     // #2001 — the thread is one `spawn` of its domain's node while it lives: a full
                     // ceiling refuses it as the live cap does (dropped with the closure if that does).
-                    let mut h = host.lock_unpoisoned();
+                    let h = host.lock_unpoisoned();
                     let live = LiveVcpu::charge(h.own_node()).ok_or(Trap::ThreadFault)?;
                     let vcpu_id = h.next_vcpu_id();
                     drop(h);
@@ -21044,7 +21044,7 @@ impl Drop for PipeListen {
 /// #1826 — one end of a pipe, as a parked op sees it: whether the op can proceed, readable from the
 /// pipe's shared state alone, so a waiter can re-check it without the `Host` (a JIT park waits with
 /// the `Host` released, for a sibling's write to get in). The one readiness rule: the `Host`'s own
-/// checks ([`Host::pipe_read_ready`], [`Host::pipe_write_ready`]) read it too.
+/// parks (the bytecode drivers' settle, #3037) read it too.
 #[derive(Clone)]
 pub struct PipeProbe {
     fifo: Arc<Mutex<VecDeque<u8>>>,
@@ -26405,7 +26405,7 @@ pub struct Host {
     /// [`Host::spawn_child_powerbox`] on every §14 builder path, so a child's lane chain can be walked.
     parent_domain: Option<u64>,
     /// §12 — the threads this domain has started: the last one's vCPU id ([`Host::next_vcpu_id`]).
-    threads_started: i64,
+    threads_started: Arc<std::sync::atomic::AtomicI64>,
     /// §6 (PROCESS.md) — this domain's platform-vouched provenance, reported verbatim by
     /// `self.attest`. Defaults to a **root** report ([`Attestation::default`]); the embedder sets it
     /// for the top-level domain and the §14 spawn path stamps a nested child's (exposed) one.
@@ -27387,7 +27387,7 @@ impl Host {
             workers: None,
             granted_lanes: 0,
             parent_domain: None,
-            threads_started: 0,
+            threads_started: Arc::default(),
             attestation: Attestation::default(),
             modules: Vec::new(),
             region_factory: None,
@@ -28320,15 +28320,6 @@ impl Host {
         self.pipe_wake_writers.take()
     }
 
-    /// #1080 rung 4 — pipe-read readiness for the **bytecode cooperative driver**, which POLLS instead
-    /// of holding scheduler-side `pipe_waiters`: a parked reader re-checks its pipe each settle and
-    /// re-admits (re-executes the rewound read) once ready — bytes buffered, OR every writer closed
-    /// (EOF). A vanished pipe reads ready (the re-run fails closed). `pipe` is the domain-local index
-    /// the read park flag reports. Byte-identical to the tree-walker's `Step::Park(PipeRead)` re-check.
-    pub(crate) fn pipe_read_ready(&self, pipe: u32) -> bool {
-        self.pipe_probe(pipe, false).is_none_or(|p| p.ready())
-    }
-
     /// #1826 — end `write` of domain-local pipe `pipe`, as a [`PipeProbe`]: its readiness, readable
     /// without this `Host`. `None` for no such pipe.
     pub fn pipe_probe(&self, pipe: u32, write: bool) -> Option<PipeProbe> {
@@ -28345,17 +28336,10 @@ impl Host {
     /// #1146 (deeper) — blocking-stdin readiness for the bytecode scheduler drivers: a task parked in a
     /// `Stream{In}` read under [`Self::set_stdin_blocking`] ([`TaskState::BlockedStdin`]) re-admits once
     /// the stdin buffer has unconsumed bytes, or once the embedder ends stdin by turning blocking off:
-    /// the re-run read then sees EOF (#1414 5b-2). The stdin twin of [`Self::pipe_read_ready`]; a
+    /// the re-run read then sees EOF (#1414 5b-2). The stdin twin of a pipe park's [`PipeProbe`]; a
     /// root-host resource (never per-`env`).
     pub(crate) fn stdin_ready(&self) -> bool {
         self.stdin_pos < self.stdin.len() || !self.stdin_block
-    }
-
-    /// #1080 rung 4 — pipe-write readiness (backpressure) for the bytecode cooperative driver: ready
-    /// when the FIFO has room under `PIPE_CAP`, OR every reader closed (the re-run writes / `-EPIPE`s).
-    /// The write twin of [`Self::pipe_read_ready`].
-    pub(crate) fn pipe_write_ready(&self, pipe: u32) -> bool {
-        self.pipe_probe(pipe, true).is_none_or(|p| p.ready())
     }
 
     /// #796 L1 — set the transient "a signal interrupted a blocking syscall" flag, so the next re-run of
@@ -31036,9 +31020,14 @@ impl Host {
 
     /// §12 (#1775) — the vCPU id of a thread this domain starts, which seeds its `vcpu.tls` word:
     /// dense within the domain in spawn order (its root 0, its threads 1, 2, …), as on the JIT.
-    pub(crate) fn next_vcpu_id(&mut self) -> i64 {
-        self.threads_started += 1;
-        self.threads_started
+    pub(crate) fn next_vcpu_id(&self) -> i64 {
+        self.threads_started.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    /// #3037 — the counter [`Self::next_vcpu_id`] draws from, shared, so a scheduler can number a
+    /// thread without this `Host`'s lock.
+    pub(crate) fn vcpu_ids(&self) -> Arc<std::sync::atomic::AtomicI64> {
+        Arc::clone(&self.threads_started)
     }
 
     /// #1944 slice 3 — the node this domain's vCPUs draw their fuel from: its own.

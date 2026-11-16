@@ -4715,7 +4715,7 @@ fn rebuild_detached_domain(
         return Domain {
             mem: None,
             native: None,
-            host: host.into_cell(),
+            host: DomainHost::new(host.into_cell()),
             table: std::sync::Arc::new(table),
             program: es.module as u32,
             fuel: Fuel::fixed(es.fuel),
@@ -4744,7 +4744,7 @@ fn rebuild_detached_domain(
         program: es.module as u32,
         fuel: Fuel::fixed(es.fuel),
         fibers: FiberTables::restored(es.fibers.clone(), &host),
-        host: host.into_cell(),
+        host: DomainHost::new(host.into_cell()),
         spawner: es.spawner,
         nested: true,
         twin_of: None,
@@ -6297,7 +6297,7 @@ fn dbg_spawn(
 ) -> Result<(), Trap> {
     let env = tasks[ti].domain; // a thread runs in its spawner's domain (shares its window)
     let (vt, live) = {
-        let mut host = envs[env].host.lock_unpoisoned();
+        let host = envs[env].host.lock_unpoisoned();
         let (payer, fuel) = (Some(host.own_node()), &mut envs[env].fuel);
         let mut vt = thread_task(source, module, func, arg0, arg1, payer, fuel)?;
         if tasks.live_count() >= super::MAX_VCPUS {
@@ -6609,7 +6609,7 @@ fn dbg_start_child(
     domains.push(Domain {
         mem,
         native: None,
-        host: child_host.into_cell(),
+        host: DomainHost::new(child_host.into_cell()),
         table: std::sync::Arc::new(table),
         program: module,
         // The debugger runs every task on a fixed allowance: a detached child gets what its chain
@@ -6946,7 +6946,7 @@ fn registries(envs: &mut [Domain]) -> Vec<&mut Vec<FiberState>> {
 /// cut carries every domain still live.
 fn root_unwinding(envs: &[Domain]) -> bool {
     let root = &envs[0];
-    root.host.lock_unpoisoned().is_durable() && is_unwinding(&root.mem)
+    root.host.durable() && is_unwinding(&root.mem)
 }
 
 /// Why no thread runs next ([`dbg_pick_runnable`]).
@@ -7045,7 +7045,7 @@ fn dbg_take_answer(
     }
     loop {
         for &(p, env, dst, id, _) in &parked {
-            let answer = take_answer(&mut domains[env].host.lock_unpoisoned(), id);
+            let answer = take_answer(&domains[env].host, id);
             if let Some(r) = answer {
                 tasks[p].deliver(dst, Reg::from_i64(r));
                 tasks[p].state = TaskState::Runnable;
@@ -7121,7 +7121,7 @@ fn pool_parked(tasks: &[TaskSlot], domains: &[Domain]) -> bool {
 
 /// The completion store of a debug task's domain.
 fn dbg_completions(env: usize, domains: &[Domain]) -> std::sync::Arc<super::Completions> {
-    domains[env].host.lock_unpoisoned().completions()
+    domains[env].host.comps().clone()
 }
 
 impl ScheduledDebugRun {
@@ -8407,9 +8407,7 @@ impl ScheduledDebugRun {
                 // back as it drops.
                 live: match ts.live {
                     false => LiveVcpu::none(),
-                    true => {
-                        LiveVcpu::force(self.domains[ts.domain].host.lock_unpoisoned().own_node())
-                    }
+                    true => LiveVcpu::force(self.domains[ts.domain].host.node().clone()),
                 },
             })
             .collect();
@@ -8673,7 +8671,7 @@ fn spawn_task(
     let spawner = &domains[tasks[ti].domain];
     // #2001 — the process is one `spawn` of the node it shares with its spawner while it lives: a full
     // ceiling refuses it as the live cap does.
-    let node = spawner.host.lock_unpoisoned().own_node();
+    let node = spawner.host.node().clone();
     let Some(live) = LiveVcpu::charge(node) else {
         return super::EAGAIN;
     };
@@ -8721,7 +8719,7 @@ fn spawn_task(
     domains.push(Domain {
         mem: child_mem,
         native: None,
-        host: child_host.into_cell(),
+        host: DomainHost::new(child_host.into_cell()),
         table: std::sync::Arc::new(table),
         fuel: child_fuel,
         fibers: FiberTables::default(),
@@ -9546,9 +9544,9 @@ struct DispatchParks {
     /// What a `posix_spawn` request's source staged ([`super::SignalSource::spawn_take`]).
     spawn: Option<super::SpawnPlan>,
     /// A pipe read that found an empty FIFO with writers still open.
-    pipe_read: Option<u32>,
+    pipe_read: Option<super::PipeProbe>,
     /// A pipe write that found a full FIFO with readers still open.
-    pipe_write: Option<u32>,
+    pipe_write: Option<super::PipeProbe>,
     /// A signal interrupted a blocking op: the latch a driver's interrupt path set.
     sig_interrupt: bool,
     /// #1936 — a post's `signal` left this region word to wake.
@@ -9566,8 +9564,10 @@ impl DispatchParks {
             stdin: p.take_stdin_parked(),
             request,
             spawn,
-            pipe_read: p.take_pipe_read_parked(),
-            pipe_write: p.take_pipe_write_parked(),
+            // #3037 — the pipe the op parks on, taken under the dispatch's own hold: a waiter reads
+            // it without the `Host`, and no other end can come between the op and its park.
+            pipe_read: (p.take_pipe_read_parked()).and_then(|i| p.pipe_probe(i, false)),
+            pipe_write: (p.take_pipe_write_parked()).and_then(|i| p.pipe_probe(i, true)),
             sig_interrupt: p.take_sig_interrupt(),
             region: p.take_region_wake(),
         };
@@ -9763,15 +9763,15 @@ enum Outcome {
         child: Option<usize>,
     },
     /// #1080 rung 4 — a personality blocking pipe **read** on an empty FIFO with writers still open: the
-    /// op was rewound, the driver parks the task on the pipe (`pipe` = the domain-local index) and the
+    /// op was rewound, the driver parks the task on the pipe (`pipe`, the end the op read, #3037) and the
     /// settle scan re-admits it when the FIFO has bytes or every writer closed (EOF). Cooperative-only.
     PipeRead {
-        pipe: u32,
+        pipe: super::PipeProbe,
     },
     /// #1080 rung 4 (backpressure) — a personality blocking pipe **write** to a full FIFO with readers
     /// still open: rewound + parked, re-admitted when the FIFO has room or every reader closed (`-EPIPE`).
     PipeWrite {
-        pipe: u32,
+        pipe: super::PipeProbe,
     },
     /// §5 `Instantiator.instantiate_rec` (op 17, #1286): the driver
     /// admits the separate-module child `spawn` describes, in a fresh window of its own
@@ -10249,7 +10249,7 @@ fn claim_fiber(
             Some(FiberState::HostParked { on, .. }) => Some(on.clone()),
             _ => None,
         })
-        .is_some_and(|on| host.with(|h| on.ready(h)));
+        .is_some_and(|on| on.ready(|| host.with(|h| h.stdin_ready())));
     // F2 (FIBER_PARK.md) — a poll of a cap-parked fiber runs the drain first, so a busy
     // resume-poll loop observes its completion without waiting for driver idle (the WaitParked
     // `real_deadline` shape, completion form).
@@ -10767,22 +10767,23 @@ enum HostWait {
 }
 
 impl HostWait {
-    /// What a host-park `stop` waits on, over the parker's powerbox: `None` for any other stop, or a
-    /// pipe that has vanished (its re-run fails closed).
-    fn of(stop: &VcpuStop, host: &Host) -> Option<HostWait> {
-        match *stop {
-            VcpuStop::PipeRead { pipe } => host.pipe_probe(pipe, false).map(HostWait::Pipe),
-            VcpuStop::PipeWrite { pipe } => host.pipe_probe(pipe, true).map(HostWait::Pipe),
+    /// What a host-park `stop` waits on: `None` for any other stop.
+    fn of(stop: &VcpuStop) -> Option<HostWait> {
+        match stop {
+            VcpuStop::PipeRead { pipe } | VcpuStop::PipeWrite { pipe } => {
+                Some(HostWait::Pipe(pipe.clone()))
+            }
             VcpuStop::StdinPark => Some(HostWait::Stdin),
             _ => None,
         }
     }
 
-    /// Whether the parked op can proceed, over the parked fiber's domain powerbox.
-    fn ready(&self, host: &Host) -> bool {
+    /// Whether the parked op can proceed: a pipe's end is read without the `Host`, and stdin, whose
+    /// buffer is the `Host`'s, through `stdin`, under the parked fiber's domain powerbox (#3037).
+    fn ready(&self, stdin: impl FnOnce() -> bool) -> bool {
         match self {
             HostWait::Pipe(p) => p.ready(),
-            HostWait::Stdin => host.stdin_ready(),
+            HostWait::Stdin => stdin(),
         }
     }
 }
@@ -10817,7 +10818,7 @@ fn drain_cap_parked(fibers: &mut [FiberState], comps: &super::Completions) -> Ve
 fn drain_task_completions(tasks: &mut Tasks, domains: &[Domain]) {
     for (_, t) in tasks.live_mut() {
         if let TaskState::BlockedHostCap { id, dst, .. } = t.state {
-            let answer = take_answer(&mut domains[t.domain].host.lock_unpoisoned(), id);
+            let answer = take_answer(&domains[t.domain].host, id);
             if let Some(r) = answer {
                 t.deliver(dst, Reg::from_i64(r));
                 t.state = TaskState::Runnable;
@@ -10838,9 +10839,11 @@ fn drain_fiber_completions(domains: &mut [Domain]) -> bool {
             .iter()
             .any(|f| matches!(f, FiberState::CapParked { woken: None, .. }))
         {
-            let mut host = host.lock_unpoisoned();
-            for (id, r) in drain_cap_parked(reg, &host.completions()) {
-                tape_answer(&mut host, id, r);
+            // #3037 — the store is read without the domain's `Host`, which only a taping host takes.
+            for (id, r) in drain_cap_parked(reg, host.comps()) {
+                if host.records() {
+                    tape_answer(&mut host.lock_unpoisoned(), id, r);
+                }
                 claimed = true;
             }
         }
@@ -11088,11 +11091,7 @@ mod tasks_tests {
 /// #1198 — whether task `t`'s process is stopped (SIGTSTP/SIGTTIN/SIGTTOU, before its SIGCONT): a
 /// stopped process makes no progress, so neither executor steps its runnable tasks.
 fn process_stopped(envs: &[Domain], t: &TaskSlot) -> bool {
-    envs[t.domain]
-        .host
-        .lock_unpoisoned()
-        .signal_poll()
-        .is_some_and(|(_, s)| s.stopped())
+    envs[t.domain].host.stopped()
 }
 
 /// The root activation's id in a vCPU's resume chain (it has no fiber handle).
@@ -12054,10 +12053,10 @@ enum VcpuStop {
     /// #1080 rung 4 — a personality blocking pipe read/write surfaced to the cooperative driver
     /// ([`Outcome::PipeRead`]/[`Outcome::PipeWrite`]). `pipe` is the parker's domain-local pipe index.
     PipeRead {
-        pipe: u32,
+        pipe: super::PipeProbe,
     },
     PipeWrite {
-        pipe: u32,
+        pipe: super::PipeProbe,
     },
     /// #1157 — the cooperative preemption quantum expired at an op boundary. `resume` already persisted
     /// the Vm cursor (its `Outcome::Suspended` path), so the pump re-admits the still-`Runnable` task and
@@ -12519,8 +12518,9 @@ struct Domain {
     native: Option<NativeWindow>,
     /// The domain's live powerbox, in its cell ([`DomainCell`]): a §3.6 live-callee offer holds the
     /// SAME callee the tree-walker's `wire_live_impl` machinery expects — enqueue, offer-shape, and
-    /// settle all go through the shared type.
-    host: DomainCell,
+    /// settle all go through the shared type. With it, what the rules read of it without its lock
+    /// ([`DomainHost`], #3037).
+    host: DomainHost,
     /// Its dispatch table, shared (`Arc`), so the thread that steps one of its tasks unlocked can
     /// hold it ([`drive_threads`]).
     table: std::sync::Arc<SharedSlots>,
@@ -12572,7 +12572,7 @@ impl Domain {
         Domain {
             mem,
             native: None,
-            host,
+            host: DomainHost::new(host),
             table,
             fuel,
             fibers: FiberTables::default(),
@@ -12590,10 +12590,137 @@ impl Domain {
 /// (#744). The pump locks a task's cell for the task's step.
 type DomainCell = std::sync::Arc<std::sync::Mutex<Host>>;
 
+pub(crate) use domain_host::DomainHost;
+
+/// #3037 — a domain's powerbox and what the rules read of it without its lock.
+mod domain_host {
+    use super::{DomainCell, Host, LockUnpoisoned};
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+
+    /// A [`Domain`](super::Domain)'s powerbox ([`DomainCell`]) with the facts the rules read of it
+    /// under the run lock, without its lock: a vCPU inside a long synchronous host call holds the
+    /// lock for the call, and a rule that waited on it would hold up every other vCPU's stop (#3037).
+    /// [`DomainHost::new`] is the one way to make one, so a domain's facts are always its own
+    /// powerbox's. Each is the very object the `Host` holds, or a value no setter changes while a
+    /// domain is made over the `Host`:
+    ///
+    /// - **`signals`**, the `(armed, source)` pair ([`Host::signal_arm_pair`]): set by
+    ///   `Host::set_signal_source`, whose callers are an embedder's setup before its run (the posix
+    ///   personality's `install`, `temen-run`'s own signal doors) and the build of a child's or an
+    ///   exec image's powerbox (the spawn's re-grant, the exec's carry-over), each before the domain
+    ///   over it is made. The source's own state (a guest arming a handler, a pending signal) is behind
+    ///   these `Arc`s, shared, not copied.
+    /// - **`comps`**, the completions store: the `Arc` the `Host` makes in `Host::new` and never
+    ///   replaces.
+    /// - **`node`**, the budget node the domain's vCPUs draw from ([`Host::own_node`]): the tree is
+    ///   the `Arc` the `Host` holds, and its own index is set as a powerbox is built (a fork twin's, a
+    ///   child's, a relaunch's), before the domain over it is made.
+    /// - **`durable`**: set as a powerbox is built ([`Host::set_durable`], a thaw's or a spawn's), before
+    ///   the domain over it is made.
+    /// - **`records`**, whether the host tapes its calls ([`Host::records_caps`]): set by the
+    ///   embedder's `record_caps` before its run.
+    /// - **`vcpu_ids`**, the counter a thread's id is drawn from ([`Host::next_vcpu_id`]): the
+    ///   `Host`'s own atomic.
+    pub(crate) struct DomainHost {
+        cell: DomainCell,
+        signals: Option<(
+            Arc<AtomicBool>,
+            Arc<dyn super::super::SignalSource + Send + Sync>,
+        )>,
+        comps: Arc<super::super::Completions>,
+        node: super::super::NodeRef,
+        durable: bool,
+        records: bool,
+        vcpu_ids: Arc<std::sync::atomic::AtomicI64>,
+    }
+
+    impl DomainHost {
+        /// The powerbox `cell`, with its facts read under one hold of its lock.
+        pub(crate) fn new(cell: DomainCell) -> DomainHost {
+            let h = cell.lock_unpoisoned();
+            let facts = (
+                h.signal_arm_pair(),
+                h.completions(),
+                h.own_node(),
+                h.is_durable(),
+                h.records_caps(),
+                h.vcpu_ids(),
+            );
+            drop(h);
+            let (signals, comps, node, durable, records, vcpu_ids) = facts;
+            DomainHost {
+                cell,
+                signals,
+                comps,
+                node,
+                durable,
+                records,
+                vcpu_ids,
+            }
+        }
+
+        /// The powerbox's cell.
+        pub(crate) fn cell(&self) -> &DomainCell {
+            &self.cell
+        }
+
+        /// Whether the domain's process is stopped (SIGTSTP/SIGTTIN/SIGTTOU, before its SIGCONT).
+        pub(crate) fn stopped(&self) -> bool {
+            self.signals.as_ref().is_some_and(|(_, s)| s.stopped())
+        }
+
+        /// The domain's signal source, if it has one.
+        pub(crate) fn signals(&self) -> Option<&Arc<dyn super::super::SignalSource + Send + Sync>> {
+            self.signals.as_ref().map(|(_, s)| s)
+        }
+
+        /// The armed flag beside the signal source, if it has one.
+        #[allow(dead_code)]
+        pub(crate) fn armed(&self) -> Option<&Arc<AtomicBool>> {
+            self.signals.as_ref().map(|(a, _)| a)
+        }
+
+        /// The domain's completions store: the punted calls its vCPUs wait on.
+        pub(crate) fn comps(&self) -> &Arc<super::super::Completions> {
+            &self.comps
+        }
+
+        /// The budget node the domain's vCPUs draw from.
+        pub(crate) fn node(&self) -> &super::super::NodeRef {
+            &self.node
+        }
+
+        /// Whether the domain is durable.
+        pub(crate) fn durable(&self) -> bool {
+            self.durable
+        }
+
+        /// The id of the next thread the domain starts: as [`Host::next_vcpu_id`], from the same counter.
+        pub(crate) fn next_vcpu_id(&self) -> i64 {
+            self.vcpu_ids
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                + 1
+        }
+
+        /// Whether the domain's host tapes its calls.
+        pub(crate) fn records(&self) -> bool {
+            self.records
+        }
+    }
+
+    impl std::ops::Deref for DomainHost {
+        type Target = std::sync::Mutex<Host>;
+        fn deref(&self) -> &std::sync::Mutex<Host> {
+            &self.cell
+        }
+    }
+}
+
 /// The domain whose powerbox `cell` is, or `None` for a cell that is no domain of this run.
 fn domain_of(envs: &[Domain], cell: &DomainCell) -> Option<usize> {
     envs.iter()
-        .position(|e| std::sync::Arc::ptr_eq(&e.host, cell))
+        .position(|e| std::sync::Arc::ptr_eq(e.host.cell(), cell))
 }
 
 /// Re-admit every task of domain `env` parked in `svc.wait`: its re-executed drain serves what a
@@ -12656,7 +12783,7 @@ fn coop_start_child(
     domains.push(Domain {
         mem,
         native: None,
-        host: child_host.into_cell(),
+        host: DomainHost::new(child_host.into_cell()),
         table: std::sync::Arc::new(table),
         fuel,
         fibers: FiberTables::default(),
@@ -13264,18 +13391,18 @@ enum TaskState {
         child: Option<usize>,
     },
     /// #1080 rung 4 — parked in a blocking personality pipe **read** on an empty FIFO (writers open). The
-    /// read op was rewound; the settle scan polls the shared FIFO via `pipe_read_ready(pipe)` (`pipe` =
-    /// this task's domain-local index into its domain host's pipe table) and re-admits when bytes arrive or
-    /// every writer closed (EOF), so the re-executed read completes / EOFs. The cooperative analogue of
+    /// read op was rewound; the settle scan polls the shared FIFO through `pipe`, the end the read
+    /// found empty, taken under its dispatch's hold (#3037), and re-admits when bytes arrive or every
+    /// writer closed (EOF), so the re-executed read completes / EOFs. The cooperative analogue of
     /// the tree-walker's `Blocked::PipeRead` — polled, not held in a `pipe_waiters` map.
     BlockedPipeRead {
-        pipe: u32,
+        pipe: super::PipeProbe,
     },
     /// #1080 rung 4 (backpressure) — parked in a blocking personality pipe **write** to a full FIFO
-    /// (readers open); re-admitted by `pipe_write_ready(pipe)` (room under `PIPE_CAP`, or all readers gone
+    /// (readers open); re-admitted once `pipe` is ready (room under `PIPE_CAP`, or all readers gone
     /// → the re-run `-EPIPE`s). The write twin of [`Self::BlockedPipeRead`].
     BlockedPipeWrite {
-        pipe: u32,
+        pipe: super::PipeProbe,
     },
     /// #1146 (deeper) — parked in a blocking **`Stream{In}` read** on an exhausted stdin under
     /// [`super::Host::set_stdin_blocking`] ([`Outcome::StdinPark`]). The read op was rewound; the
@@ -13328,10 +13455,14 @@ fn tape_answer(host: &mut Host, id: u64, r: i64) -> i64 {
     r
 }
 
-/// Call `id`'s answer, if it has come to `host`'s store: taken, and taped ([`tape_answer`]).
-fn take_answer(host: &mut Host, id: u64) -> Option<i64> {
-    let r = host.completions().try_take(id)?;
-    Some(tape_answer(host, id, r))
+/// Call `id`'s answer, if it has come to `host`'s store: taken, and taped ([`tape_answer`]). The
+/// store is read without the domain's lock, which only a host that tapes its calls takes (#3037).
+fn take_answer(host: &DomainHost, id: u64) -> Option<i64> {
+    let r = host.comps().try_take(id)?;
+    Some(match host.records() {
+        true => tape_answer(&mut host.lock_unpoisoned(), id, r),
+        false => r,
+    })
 }
 
 /// Park `vt`'s running fiber (never fiber 0) as `park(vm)` — §3.6 slice 5a, the one route every
@@ -13415,14 +13546,16 @@ fn park_fiber_on_host(
 /// confined `instantiate` env's. Nothing parks for a vanished pipe: its op re-runs, and fails closed.
 #[allow(clippy::too_many_arguments)]
 fn host_park_fiber(tasks: &mut [TaskSlot], ti: usize, domains: &mut [Domain], stop: &VcpuStop) {
-    let durable = domains[0].host.lock_unpoisoned().is_durable();
-    let parked = {
-        let h = &*domains[tasks[ti].domain].host.lock_unpoisoned();
-        HostWait::of(stop, h).map(|on| {
-            let ready = on.ready(h);
-            (on, ready)
-        })
-    };
+    let durable = domains[0].host.durable();
+    let parked = HostWait::of(stop).map(|on| {
+        let ready = on.ready(|| {
+            domains[tasks[ti].domain]
+                .host
+                .lock_unpoisoned()
+                .stdin_ready()
+        });
+        (on, ready)
+    });
     let Some((on, ready)) = parked else {
         return;
     };
@@ -13453,7 +13586,7 @@ fn ticket_park_fiber(
     dst: u32,
     sig: super::OpSig,
 ) {
-    let durable = domains[0].host.lock_unpoisoned().is_durable();
+    let durable = domains[0].host.durable();
     let e = &mut domains[tasks[ti].domain];
     if let Some(k) = park_running_fiber(
         &mut tasks[ti].vm.vt,
@@ -14330,8 +14463,7 @@ fn settle_wakes(
             continue;
         }
         last = Some(k);
-        let killed =
-            || (domains[k].host.lock_unpoisoned().signal_poll()).is_some_and(|(_, s)| s.killed());
+        let killed = || domains[k].host.signals().is_some_and(|s| s.killed());
         if !killed_domains.contains(&k) && killed() {
             killed_domains.push(k);
         }
@@ -14383,7 +14515,7 @@ fn settle_wakes(
             };
             // A domain with no spawner pages from the root's, as it always has.
             if h.pager.is_some() {
-                let pager = &domains[domains[k].spawner.unwrap_or(0)].host;
+                let pager = domains[domains[k].spawner.unwrap_or(0)].host.cell();
                 services.push(std::sync::Arc::clone(pager));
             }
             drop(h);
@@ -14434,7 +14566,7 @@ fn settle_wakes(
     for k in finished {
         let env = &mut domains[k];
         env.mem = None;
-        env.host = std::sync::Arc::clone(&released.host);
+        env.host = DomainHost::new(std::sync::Arc::clone(&released.host));
         env.fibers = FiberTables::default();
     }
     // FORK.md §9.2 — reap wakes: a caller parked in `wait(pid)` wakes when fork twin `pid`
@@ -14510,16 +14642,18 @@ fn settle_wakes(
             // #1171 — a STOPPED reader/writer is not re-admitted by an input/room wake: a
             // stopped process makes no progress, so a suspended foreground `cat` must not steal
             // the bytes the shell should read (it re-admits at its `SIGCONT`). Domain-scoped.
-            let h = domains[t.domain].host.lock_unpoisoned();
-            if h.signal_poll().is_some_and(|(_, s)| s.stopped()) {
+            if domains[t.domain].host.stopped() {
                 return false;
             }
             match &t.state {
-                TaskState::BlockedPipeRead { pipe } => h.pipe_read_ready(*pipe),
-                TaskState::BlockedPipeWrite { pipe } => h.pipe_write_ready(*pipe),
+                TaskState::BlockedPipeRead { pipe } | TaskState::BlockedPipeWrite { pipe } => {
+                    pipe.ready()
+                }
                 // #1146 (deeper) — a blocking stdin park re-admits once its own host's stdin
                 // buffer has bytes (the stdin twin of the pipe poll; domain-scoped like the rest).
-                TaskState::BlockedStdin => h.stdin_ready(),
+                // Stdin's buffer is the `Host`'s, which its embedder feeds: the one park whose
+                // readiness takes the domain's lock (#3037).
+                TaskState::BlockedStdin => domains[t.domain].host.lock_unpoisoned().stdin_ready(),
                 _ => false,
             }
         })
@@ -14557,7 +14691,9 @@ fn fiber_woken(e: &Domain, k: usize) -> bool {
             | FiberState::CapParked { woken: Some(_), .. }
             | FiberState::TicketParked { woken: Some(_), .. },
         ) => true,
-        Some(FiberState::HostParked { on, .. }) => on.ready(&e.host.lock_unpoisoned()),
+        Some(FiberState::HostParked { on, .. }) => {
+            on.ready(|| e.host.lock_unpoisoned().stdin_ready())
+        }
         _ => false,
     }
 }
@@ -14726,7 +14862,7 @@ impl CoopSched {
             core.arm_tierup(e);
         }
         let root = &core.domains[0];
-        let freeze_on_quiesce = root.host.lock_unpoisoned().is_durable()
+        let freeze_on_quiesce = root.host.durable()
             && root
                 .mem
                 .as_ref()
@@ -15087,7 +15223,7 @@ impl CoopSched {
             // The task's domain cell is locked for its step. Nothing a step runs locks it again: a
             // live call, which may be into the task's own domain, stops the step to be made
             // ([`LiveCall`]).
-            let cell = std::sync::Arc::clone(&domains[tasks[ti].domain].host);
+            let cell = std::sync::Arc::clone(domains[tasks[ti].domain].host.cell());
             let mut guard = cell.lock_unpoisoned();
             let durable = guard.is_durable();
             // #2695 step 2 — an activation steps on its caller's fuel, which goes back with its
@@ -15575,7 +15711,7 @@ impl SchedCore {
                     complete(tasks, domains, ti, Err(Trap::MemoryFault));
                     return Applied::All;
                 };
-                let pager = std::sync::Arc::clone(&domains[pager_env].host);
+                let pager = std::sync::Arc::clone(domains[pager_env].host.cell());
                 let ticket = pager.lock_unpoisoned().request_page(export, sink);
                 wake_serve_loops(tasks, pager_env);
                 if let Some(ticket) = ticket {
@@ -15598,8 +15734,8 @@ impl SchedCore {
                 // oracle's: `freeze_drive` has no cap-park re-derivation, so the freeze must never
                 // meet one (a host-answered call never reaches it, declined at dispatch).
                 let env = tasks[ti].domain;
-                let comps = domains[env].host.lock_unpoisoned().completions();
-                let durable = domains[0].host.lock_unpoisoned().is_durable();
+                let comps = domains[env].host.comps().clone();
+                let durable = domains[0].host.durable();
                 if durable {
                     tasks[ti].deliver(dst, Reg::from_i64(comps.wait(id)));
                 } else if tasks[ti].vm.vt.active_id != ROOT_FIBER {
@@ -15651,8 +15787,9 @@ impl SchedCore {
                 arg,
                 dst,
             }) => {
-                let callee = grant_target(tasks, domains, ti, child).map(|k| &domains[k].host);
-                let parent = &domains[tasks[ti].domain].host;
+                let callee =
+                    grant_target(tasks, domains, ti, child).map(|k| domains[k].host.cell());
+                let parent = domains[tasks[ti].domain].host.cell();
                 match super::grant_into_running(parent, callee, arg as i32) {
                     Ok(h) => tasks[ti].deliver(dst, Reg::from_i32(h as i32)),
                     Err(t) => complete(tasks, domains, ti, Err(t)),
@@ -15676,7 +15813,7 @@ impl SchedCore {
                     .flatten()
                     .map(|(_, cidx)| tasks[cidx].domain)
                     .filter(|&k| k != tasks[ti].domain)
-                    .map(|k| std::sync::Arc::clone(&domains[k].host));
+                    .map(|k| std::sync::Arc::clone(domains[k].host.cell()));
                 let cap = callee.and_then(|callee: DomainCell| {
                     let (names, sigs) = callee.lock_unpoisoned().offer_shape(export)?;
                     domains[tasks[ti].domain]
@@ -15711,7 +15848,7 @@ impl SchedCore {
                     if server_env == 0 {
                         break 'fork super::EINVAL;
                     }
-                    let server_host = std::sync::Arc::clone(&domains[server_env].host);
+                    let server_host = std::sync::Arc::clone(domains[server_env].host.cell());
                     // Locate the parked caller on `(ticket, this server)`. In the cooperative driver
                     // the caller has already parked (it enqueued + woke us before we ran), so a miss
                     // is defensive → degrade.
@@ -15792,7 +15929,7 @@ impl SchedCore {
                     domains.push(Domain {
                         mem: twin_mem,
                         native: None,
-                        host: twin_host.into_cell(),
+                        host: DomainHost::new(twin_host.into_cell()),
                         table: std::sync::Arc::new(twin_table),
                         fuel: domains[ck].fuel.for_thread(),
                         fibers: FiberTables::default(),
@@ -15835,7 +15972,7 @@ impl SchedCore {
                     if server_env == 0 {
                         break 'reap super::EINVAL;
                     }
-                    let server_host = std::sync::Arc::clone(&domains[server_env].host);
+                    let server_host = std::sync::Arc::clone(domains[server_env].host.cell());
                     let caller_ti = tasks.live().find(|&i| {
                         matches!(&tasks[i].state,
                         TaskState::BlockedTicket { ticket: tk, callee, .. }
@@ -15932,7 +16069,7 @@ impl SchedCore {
                 let clean = tasks[ti].vm.vt.active.dispatch().is_none()
                     && tasks[ti].answers.is_none()
                     && tasks[ti].vm.vt.active_id == ROOT_FIBER
-                    && !domains[0].host.lock_unpoisoned().is_durable();
+                    && !domains[0].host.durable();
                 if !clean {
                     refuse!(super::EINVAL);
                 }
@@ -15973,7 +16110,7 @@ impl SchedCore {
                                 domains.push(Domain {
                                     mem: Some(built.mem),
                                     native: None,
-                                    host: built.host.into_cell(),
+                                    host: DomainHost::new(built.host.into_cell()),
                                     table: std::sync::Arc::new(built.table),
                                     fuel,
                                     fibers: FiberTables::default(),
@@ -15991,7 +16128,7 @@ impl SchedCore {
                         // Fork twin: build against its confined domain (its powerbox carries the
                         // personality), then overwrite the env's window, host and table — the fuel
                         // and task id are kept.
-                        let host_arc = std::sync::Arc::clone(&domains[k].host);
+                        let host_arc = std::sync::Arc::clone(domains[k].host.cell());
                         let built = {
                             let mut g = host_arc.lock_unpoisoned();
                             exec_image_build(
@@ -16011,7 +16148,7 @@ impl SchedCore {
                             Err(e) => refuse!(e),
                             Ok(built) => {
                                 tasks[ti].vm.vt = built.vt;
-                                domains[k].host = built.host.into_cell();
+                                domains[k].host = DomainHost::new(built.host.into_cell());
                                 domains[k].table = std::sync::Arc::new(built.table);
                                 domains[k].mem = Some(built.mem);
                                 domains[k].program = tasks[ti].vm.vt.active.module as u32;
@@ -16101,7 +16238,7 @@ impl SchedCore {
                         domains.push(Domain {
                             mem: twin_mem,
                             native: None,
-                            host: twin_host.into_cell(),
+                            host: DomainHost::new(twin_host.into_cell()),
                             table: std::sync::Arc::new(twin_table),
                             fuel: twin_fuel,
                             fibers: FiberTables::default(),
@@ -16128,7 +16265,7 @@ impl SchedCore {
             }
             Ok(VcpuStop::PipeRead { pipe }) => {
                 // #1080 rung 4 — park this task on a blocking pipe read; the settle scan polls
-                // `pipe_read_ready` and re-admits (the rewound read re-executes) when ready.
+                // its end and re-admits (the rewound read re-executes) when ready.
                 tasks[ti].state = TaskState::BlockedPipeRead { pipe };
             }
             Ok(VcpuStop::PipeWrite { pipe }) => {
@@ -16142,7 +16279,7 @@ impl SchedCore {
                 module,
             }) => {
                 let e = &mut domains[tasks[ti].domain];
-                let node = e.host.lock_unpoisoned().own_node();
+                let node = e.host.node().clone();
                 let payer = Some(node.clone());
                 let (m, fuel) = (module as usize, &mut e.fuel);
                 let mut child = match thread_task(source, m, func, arg0, arg1, payer, fuel) {
@@ -16186,12 +16323,12 @@ impl SchedCore {
                 let dispatches =
                     env == 0 || child_runs_emit(module, &domains[env].host.lock_unpoisoned());
                 if let Some(e) = programs.of(module).filter(|_| dispatches && servable) {
-                    let durable = domains[env].host.lock_unpoisoned().is_durable();
+                    let durable = domains[env].host.durable();
                     child.active.tier_up(module, e, !durable);
                 }
                 let cidx = tasks.len();
                 // §12: its `vcpu.tls` starts at its id in its domain (#1775).
-                child.active.tls = domains[env].host.lock_unpoisoned().next_vcpu_id();
+                child.active.tls = domains[env].host.next_vcpu_id();
                 // #2043 — a full child table refuses it as the live cap does.
                 if child_room(tasks, domains, ti) {
                     tasks.push(TaskSlot::new(child, env, live));
@@ -16260,7 +16397,7 @@ impl SchedCore {
             }) => {
                 // The run's durability, the root's, which only a fiber's park reads: read it then.
                 let fiber = tasks[ti].vm.vt.active_id != ROOT_FIBER;
-                let durable = fiber && domains[0].host.lock_unpoisoned().is_durable();
+                let durable = fiber && domains[0].host.durable();
                 // The wait is against THIS task's domain's registry and window. A child's `wait`
                 // on its mapped ring flag must not re-read an unrelated root byte.
                 let e = &mut domains[tasks[ti].domain];
@@ -16990,7 +17127,7 @@ impl HeldPump {
             let seen = *self.bell.0.lock_unpoisoned();
             let core = &r.run.sched.core;
             let calls: Vec<_> = (outstanding_calls(&core.tasks, &core.domains).into_iter())
-                .map(|(env, id)| (core.domains[env].host.lock_unpoisoned().completions(), id))
+                .map(|(env, id)| (core.domains[env].host.comps().clone(), id))
                 .collect();
             drop(g);
             let since = std::time::Instant::now();
@@ -17029,7 +17166,7 @@ impl HeldPump {
         let core = &mut sched.core;
         refund_ended_windows(&mut core.tasks, &mut core.domains, true);
         super::publish_twin_traps(std::mem::take(&mut core.tasks.twin_traps));
-        let root = std::sync::Arc::clone(&core.domains[0].host);
+        let root = std::sync::Arc::clone(core.domains[0].host.cell());
         // The tasks hand their fuel back as they go, before the powerbox does.
         drop(sched);
         let mut host = Host::from_cell(root);
@@ -18053,7 +18190,7 @@ mod dbg_domain_end_tests {
             Domain {
                 mem: None,
                 native: None,
-                host: child.into_cell(),
+                host: DomainHost::new(child.into_cell()),
                 table: table(),
                 program: 0,
                 fuel: Fuel::fixed(0),
@@ -18453,6 +18590,11 @@ struct ThreadRun {
     /// continue ([`wire_run_bell`]); an answer to a punted call (#2423); and the run's end. A store
     /// into a pipe wakes the threads parked on it itself ([`Self::listen`]).
     bell: super::Bell,
+    /// #3037 — whether [`Self::bell`] is the external-wake bell the embedder armed, which only an
+    /// embedder that feeds the run from outside rings: read as the run opens, so the idle verdict
+    /// takes no `Host` lock. `Host::arm_external_wake` arms it before a run (a held run's start, the
+    /// posix personality's setup), never during one.
+    outside_bell: bool,
     /// The hook a punted call's store calls as its answer posts: ring [`Self::bell`].
     on_answer: std::sync::Arc<dyn Fn() + Send + Sync>,
     /// Whether the thread that opened the run watches it ([`ThreadPlatform::opener`]), or
@@ -19141,7 +19283,8 @@ impl ThreadRun {
             false => Fuel::drawn(node),
         };
         // The run's processes ring its bell, armed by the embedder or the run's own.
-        let bell = host.external_wake().unwrap_or_default();
+        let outside_bell = host.external_wake();
+        let bell = outside_bell.clone().unwrap_or_default();
         let root = host.into_cell();
         let mut mem = mem;
         let cell = std::sync::Arc::clone(&root);
@@ -19208,6 +19351,7 @@ impl ThreadRun {
             platform,
             on_answer: super::ring_on_answer(&bell),
             bell,
+            outside_bell: outside_bell.is_some(),
             watched,
             ended: std::sync::Condvar::new(),
             end: std::sync::atomic::AtomicI64::new(0),
@@ -19357,7 +19501,7 @@ fn carry<'g>(
         std::mem::swap(&mut g.core.tasks[ti].vm, &mut vm);
         lend_fuel(&mut g, ti, &mut fuel);
         let mut exits = g.core.hooked_twins.len();
-        let host = std::sync::Arc::clone(&g.core.domains[env].host);
+        let host = std::sync::Arc::clone(g.core.domains[env].host.cell());
         let table = std::sync::Arc::clone(&g.core.domains[env].table);
         release(g);
         let mut ctx = RunCtx {
@@ -20180,7 +20324,7 @@ impl ThreadRun {
             // A resting held domain is never stalled: its embedder can always call in.
             None
         } else if self.idle(core) {
-            let bell = self.root.lock_unpoisoned().external_wake().is_some();
+            let bell = self.outside_bell;
             match stalled(&core.tasks, g.embedder_pumps, bell) {
                 Stalled::Deadlock => Some(Err(Trap::ThreadFault)),
                 Stalled::Idle => {
@@ -20350,10 +20494,7 @@ impl ThreadRun {
     fn owes(&self, core: &SchedCore) -> bool {
         outstanding_calls(&core.tasks, &core.domains)
             .into_iter()
-            .any(|(env, id)| {
-                let h = core.domains[env].host.lock_unpoisoned();
-                h.completions().is_host_owned(id)
-            })
+            .any(|(env, id)| core.domains[env].host.comps().is_host_owned(id))
     }
 
     /// Wait out task `ti`'s park, asleep until something wakes it ([`Park::asleep`]): a rule's
@@ -20400,7 +20541,7 @@ impl ThreadRun {
                 // filed (#1414 D4), while the run's other tasks go on.
                 if let Some(id) = call.filter(|id| g.embedder_pumps && !g.told.contains(id)) {
                     let env = g.core.tasks[ti].domain;
-                    let comps = g.core.domains[env].host.lock_unpoisoned().completions();
+                    let comps = g.core.domains[env].host.comps().clone();
                     if comps.is_host_owned(id) {
                         self.ring();
                     }
@@ -20468,25 +20609,18 @@ impl ThreadRun {
             }) => Some(p.clone()),
             _ => None,
         };
-        // A vanished pipe reads ready to the settle (its re-run fails closed), so a park on one
-        // looks at the run, as one that waits on anything but a pipe does.
-        let (comps, probes): (_, Vec<super::PipeProbe>) = {
-            let host = d.host.lock_unpoisoned();
-            let probes = match t.state {
-                TaskState::BlockedPipeRead { pipe } => {
-                    host.pipe_probe(pipe, false).into_iter().collect()
-                }
-                TaskState::BlockedPipeWrite { pipe } => {
-                    host.pipe_probe(pipe, true).into_iter().collect()
-                }
-                TaskState::BlockedOnFiber { fiber } => fiber_pipe(fiber).into_iter().collect(),
-                TaskState::BlockedSvc => (t.vm.vt.active.handlers().iter())
-                    .filter_map(|&k| fiber_pipe(k))
-                    .collect(),
-                _ => Vec::new(),
-            };
-            (host.completions(), probes)
+        // #3037 — read without the domain's `Host`: the pipe ends the parks took, and its store.
+        let probes: Vec<super::PipeProbe> = match &t.state {
+            TaskState::BlockedPipeRead { pipe } | TaskState::BlockedPipeWrite { pipe } => {
+                vec![pipe.clone()]
+            }
+            TaskState::BlockedOnFiber { fiber } => fiber_pipe(*fiber).into_iter().collect(),
+            TaskState::BlockedSvc => (t.vm.vt.active.handlers().iter())
+                .filter_map(|&k| fiber_pipe(k))
+                .collect(),
+            _ => Vec::new(),
         };
+        let comps = d.host.comps();
         let only_pipes = !probes.is_empty()
             && matches!(
                 t.state,
@@ -21143,7 +21277,7 @@ fn wait_out(
         return false;
     };
     let began = sched_wall_now();
-    let woke = idle_wait(&domains[0].host, calls, seen, left);
+    let woke = idle_wait(domains[0].host.cell(), calls, seen, left);
     *clock += sched_wall_now().saturating_sub(began).min(left);
     if woke {
         drain_fiber_completions(domains);
@@ -21204,10 +21338,10 @@ fn interrupt_parks(tasks: &mut Tasks, domains: &[Domain]) -> bool {
         // blocking `waitpid(WUNTRACED/WCONTINUED)` wakes when a child stops/continues
         // even with no async SIGCHLD delivery (bash: no sigaltstack). The re-run
         // `waitpid` reports the fresh stop/continue (report-once) and returns.
-        let mut h = domains[t.domain].host.lock_unpoisoned();
-        let signals = h.signal_poll();
-        let interrupt = signals.as_ref().is_some_and(|(_, s)| s.interrupt_pending());
-        let reap = is_reap && signals.is_some_and(|(_, s)| s.reap_pending());
+        // #3037 — the source is read without the domain's `Host`, which only a latch takes.
+        let host = &domains[t.domain].host;
+        let interrupt = host.signals().is_some_and(|s| s.interrupt_pending());
+        let reap = is_reap && host.signals().is_some_and(|s| s.reap_pending());
         if !interrupt && !reap {
             continue;
         }
@@ -21215,7 +21349,7 @@ fn interrupt_parks(tasks: &mut Tasks, domains: &[Domain]) -> bool {
         // rewound read/write completes `-EINTR`); a re-run `waitpid` re-consults the
         // personality with no flag.
         if is_pipe && interrupt {
-            h.set_sig_interrupt();
+            host.lock_unpoisoned().set_sig_interrupt();
         }
         t.state = TaskState::Runnable;
         woke = true;
@@ -21330,7 +21464,7 @@ fn teardown_domains(
         // come), and drop the queue. Later calls are refused at the LiveCall arm (`dead_domains`).
         // A fault parked on a page it was to supply is a pagerless one (#2164), and its sink goes.
         if env != 0 || rests {
-            let dying = std::sync::Arc::clone(&domains[env].host);
+            let dying = std::sync::Arc::clone(domains[env].host.cell());
             let mut stranded = Vec::new();
             let mut unanswered = Vec::new();
             for (i, t) in tasks.live_mut() {
