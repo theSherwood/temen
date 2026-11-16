@@ -1122,8 +1122,41 @@ impl ServeSite {
     }
 
     /// Take the gate if it is free: no handler of this window runs, and the serve op is parked.
+    /// The serve op's own, taking its gate back; a caller claims it ([`Self::claim`]).
     pub fn try_enter(&self) -> bool {
         self.window.take(fiber_rt::context_id())
+    }
+
+    /// #3060 — a caller claims the parked serve op's gate for a direct handoff of its call: the gate,
+    /// and a place in its domain's handlers, taken together, so the domain's end waits for the
+    /// handler from the claim on, before its window, fiber table and code go. `None` when the gate
+    /// is taken, or when the domain's end has already been decided (`HANDLERS_ENDING`): then nothing
+    /// is held, and the call is queued, which answers a dead callee `CAP_REVOKED`.
+    ///
+    /// Taken under the callee's lock, which its serve op's publish and withdraw of the site take too,
+    /// so a claim always precedes the withdraw, and the root's end (`ChildExec::file`), after it,
+    /// sees the claim. The end's mark and the claim are read-modify-writes of the one count: either
+    /// the end sees the claim and retires the domain until the claim lets go, or the claim sees the
+    /// end and gives its place back.
+    ///
+    /// The refused branch is reachable: a child whose root has returned while another of its vCPUs
+    /// still parks in a serve op keeps that site published, its domain ending (`file` marked it).
+    pub fn claim(self: &Arc<Self>) -> Option<Claim> {
+        if !self.window.take(fiber_rt::context_id()) {
+            return None;
+        }
+        let handlers = self.window.vm.handlers();
+        if handlers.fetch_add(1, Ordering::SeqCst) & HANDLERS_ENDING != 0 {
+            // A plain undo: the end decided before this claim that it waits for no handler, so it
+            // retired nothing for it, and there is nothing to re-offer.
+            handlers.fetch_sub(1, Ordering::SeqCst);
+            self.step_aside();
+            return None;
+        }
+        Some(Claim {
+            site: Arc::clone(self),
+            holds_gate: true,
+        })
     }
 
     /// The serve op takes the gate back, waiting while a handler holds it: `false` when its domain
@@ -1326,6 +1359,63 @@ impl ServeSite {
             reusable: false,
             done: None,
         })
+    }
+}
+
+/// #3060 — a caller's claim of a parked serve op's gate and of a place in its domain's handlers
+/// ([`ServeSite::claim`]), for a direct handoff of its call. Held until the claim is dropped: past
+/// the handler's own count, which it takes as it starts (`run_inline_as`, `run_here`), so the
+/// domain's end waits throughout. Every way out, a handler that ran or one that never started
+/// (`NoHandler`, `NoStack`, a grant the caller could not make), lets go through its `Drop`: the
+/// gate, if the claim still holds it, and the place, re-offering the domain's retiring task if its
+/// end was waiting for this claim last.
+pub struct Claim {
+    site: Arc<ServeSite>,
+    /// Whether the gate is still the claim's: a handler that parked gave it back with its park.
+    holds_gate: bool,
+}
+
+impl Claim {
+    /// [`ServeSite::run_inline`] under this claim: the handler that cannot park, on this stack.
+    ///
+    /// # Safety
+    /// As [`ServeSite::run_inline`]: `inline_ok(func)`.
+    pub unsafe fn run_inline(
+        &mut self,
+        func: u32,
+        args: &[i64],
+    ) -> Result<HandlerEnd, ServeRefused> {
+        self.site.run_inline(func, args)
+    }
+
+    /// [`ServeSite::start`] under this claim: the handler on a fiber of its own, here. One that
+    /// parks has given the gate back ([`Ran::held`]); the claim then holds only its place.
+    ///
+    /// # Safety
+    /// As [`ServeSite::start`].
+    pub unsafe fn start(
+        &mut self,
+        func: u32,
+        args: &[i64],
+        make_done: &mut dyn FnMut() -> HandlerDone,
+    ) -> Result<Ran, ServeRefused> {
+        let ran = self.site.start(func, args, make_done)?;
+        self.holds_gate = ran.held;
+        Ok(ran)
+    }
+
+    /// Whether `inline_ok(func)` on the claimed site ([`ServeSite::inline_ok`]).
+    pub fn inline_ok(&self, func: u32) -> bool {
+        self.site.inline_ok(func)
+    }
+}
+
+impl Drop for Claim {
+    fn drop(&mut self) {
+        if self.holds_gate {
+            self.site.step_aside();
+        }
+        self.site.exec.handler_ended(&self.site.window.vm);
     }
 }
 
@@ -3582,10 +3672,124 @@ enum Outcome {
 
 #[cfg(test)]
 mod tests {
-    use super::{activation_ctx, CarriedBy, Carrier, ChildExec, Entry, HeldCaller, Wake};
+    use super::{
+        activation_ctx, CarriedBy, Carrier, ChildExec, Entry, HeldCaller, ServeSite, Wake,
+        HANDLERS_ENDING,
+    };
     use crate::{FuelCell, InstanceAddrs, VmCtx};
+    use std::sync::atomic::Ordering;
     use std::sync::Arc;
     use std::time::Duration;
+
+    /// #3060 — a serve site of a domain whose serve op parks, over no module or window: enough for
+    /// its gate and its domain's handler count, which is all a claim touches. With it, one task of
+    /// the pool, parked and carried by this thread, so a wake the claim causes shows as its park
+    /// ending and starts no worker.
+    fn parked_site() -> (Arc<ServeSite>, Arc<ChildExec>) {
+        let exec = ChildExec::new();
+        let vm = Arc::new(VmCtx::new(InstanceAddrs::NONE, crate::Window::NONE));
+        let window = Arc::new(super::Window {
+            tls: std::sync::atomic::AtomicI64::new(0),
+            ring: Box::new(|| {}),
+            served: std::sync::atomic::AtomicU64::new(0),
+            vm: Arc::clone(&vm),
+            idle: std::cell::UnsafeCell::new(Vec::new()),
+            pooled: std::sync::atomic::AtomicUsize::new(0),
+            open: std::sync::atomic::AtomicBool::new(false),
+            gate: std::sync::atomic::AtomicU64::new(0),
+            gate_waiters: std::sync::atomic::AtomicUsize::new(0),
+            self_calls: std::sync::atomic::AtomicUsize::new(0),
+            held: false,
+            outside: std::sync::Mutex::new(()),
+            outside_cv: std::sync::Condvar::new(),
+        });
+        let site = Arc::new(ServeSite {
+            cc: core::ptr::null(),
+            mem_base: core::ptr::null_mut(),
+            mem_reserved: 0,
+            table: Arc::new(super::SharedFiberTable::new(
+                1,
+                temen_ir::durable_abi::ShadowArena::EMPTY,
+                None,
+            )),
+            domain: core::ptr::null(),
+            exec: Arc::clone(&exec),
+            window,
+        });
+        let mut e = entry(&vm);
+        e.parked = true;
+        e.carrier = Some(Arc::new(Carrier {
+            woken: std::sync::atomic::AtomicBool::new(false),
+            by: CarriedBy::Thread(std::thread::current()),
+        }));
+        super::lock(&exec.state).enter(e);
+        (site, exec)
+    }
+
+    /// The parked task of [`parked_site`]'s pool: still parked (nothing was offered), or not.
+    fn still_parked(exec: &ChildExec) -> bool {
+        super::lock(&exec.state).tasks.values().all(|e| e.parked)
+    }
+
+    /// The site's gate is free: another context takes it, and gives it back.
+    fn gate_free(site: &ServeSite) -> bool {
+        let free = site.window.take(u64::MAX);
+        if free {
+            site.window.release(u64::MAX);
+        }
+        free
+    }
+
+    /// #3060 (a) — a claim the domain's end has already decided against (`HANDLERS_ENDING`, no
+    /// handler) is refused, and leaves everything as it was: the count back at the mark alone, the
+    /// gate free, and nothing offered. Its undo is a plain one: the end retired nothing for it.
+    #[test]
+    fn a_claim_after_the_domains_end_is_refused_and_offers_nothing() {
+        let (site, exec) = parked_site();
+        let handlers = site.window.vm.handlers();
+        handlers.fetch_or(HANDLERS_ENDING, Ordering::SeqCst);
+        assert!(site.claim().is_none(), "refused");
+        assert_eq!(handlers.load(Ordering::SeqCst), HANDLERS_ENDING);
+        assert!(gate_free(&site), "the gate is given back");
+        assert!(still_parked(&exec), "nothing is offered");
+    }
+
+    /// #3060 (b) — a claim the domain's end comes after: the end's mark reads a live handler, so the
+    /// end waits (`file` retires the domain), and the claim's release, the last handler of an ending
+    /// domain, re-offers the domain's tasks. Before, the claimer was counted only once its handler
+    /// started, so the mark read none and the domain was torn down under it.
+    #[test]
+    fn a_domains_end_after_a_claim_waits_for_it() {
+        let (site, exec) = parked_site();
+        let handlers = site.window.vm.handlers();
+        let claim = site.claim().expect("the gate is free");
+        assert!(!gate_free(&site), "the claim holds the gate");
+        let before = handlers.fetch_or(HANDLERS_ENDING, Ordering::SeqCst);
+        assert_ne!(before & !HANDLERS_ENDING, 0, "the end sees the claim");
+        assert!(still_parked(&exec));
+        drop(claim);
+        assert_eq!(handlers.load(Ordering::SeqCst), HANDLERS_ENDING);
+        assert!(gate_free(&site));
+        assert!(!still_parked(&exec), "the last handler's release re-offers");
+    }
+
+    /// #3060 (c) — a claim whose handler never starts (the caller's grant failed, or the handler's
+    /// `NoHandler` or `NoStack`: each a drop of the claim, before or inside `run_inline` / `start`)
+    /// leaves the count and the gate as they were before it, and wakes nothing.
+    #[test]
+    fn a_claim_let_go_before_its_handler_leaves_the_site_as_it_was() {
+        let (site, exec) = parked_site();
+        let handlers = site.window.vm.handlers();
+        let claim = site.claim().expect("the gate is free");
+        assert_eq!(handlers.load(Ordering::SeqCst), 1);
+        drop(claim);
+        assert_eq!(handlers.load(Ordering::SeqCst), 0);
+        assert!(gate_free(&site));
+        assert!(
+            still_parked(&exec),
+            "a live domain's handler count wakes nothing"
+        );
+    }
 
     /// An entry of the pool's table for a task that never runs: filed, never picked (it holds no
     /// task), and gone when the test clears the table.

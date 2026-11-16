@@ -191,7 +191,7 @@ pub unsafe fn fiber_park_outside() {
 mod vcpu_tls;
 #[cfg(fiber_rt)]
 pub use child_exec::{
-    handler_steps_aside, handler_steps_back, GateAside, HandlerDone, HandlerEnd, HeldCaller,
+    handler_steps_aside, handler_steps_back, Claim, GateAside, HandlerDone, HandlerEnd, HeldCaller,
     HeldSite, Ran, ServeRefused, ServeSite,
 };
 
