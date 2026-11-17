@@ -6,7 +6,8 @@
 //! writers ([`temen_snapshot::decode_residue`], [`temen_snapshot::encode_residue`]), and restores it.
 //! A value no run could have made is refused as `Malformed` before any engine sees it. The decline rows
 //! pin the engines that re-create less than the whole residue: they refuse it whole, to the oracle,
-//! and never thaw part of it.
+//! and never thaw part of it. The D3 rows pin a thaw that is transparent for a thread whose spawner
+//! finished before the freeze, on every engine.
 #![cfg(any(
     all(unix, target_arch = "x86_64"),
     all(unix, target_arch = "aarch64"),
@@ -14,13 +15,14 @@
 ))]
 
 use temen_durable::{
-    begin_thaw, init_durable_window, transform_module_assume_confined, write_state, STATE_UNWINDING,
+    arm_freeze_after, begin_thaw, init_durable_window, transform_module_assume_confined,
+    write_state, STATE_UNWINDING,
 };
-use temen_interp::{run_capture_reserved_with_host, Host, MemLayout};
+use temen_interp::{run_capture_reserved_with_host, Host, MemLayout, Value};
 use temen_ir::durable_abi::ShadowArena;
 use temen_ir::thaw::{FrozenFiber, LiveTwin};
 use temen_ir::{Memory, Module};
-use temen_jit::JitError;
+use temen_jit::{JitError, JitOutcome};
 use temen_snapshot::{decode_residue, encode_residue, ResidueEdit, RestoreError, TwinRest};
 
 const TEST_ARENA: ShadowArena = ShadowArena::new(16448, 65536);
@@ -289,4 +291,188 @@ fn a_fork_twin_is_declined_whole_by_the_engines_that_do_not_recreate_one() {
         r.as_ref().map(|(o, _)| o)
     );
     assert_eq!(h.thawed_twins().len(), 1, "and leaves the residue whole");
+}
+
+// ---- #3034 D3: a thread whose spawner finished before the freeze. Root spawns A; A spawns B and
+// finishes; B owns a fiber, so the armed fiber trigger fires inside B while the root is parked in
+// B's join. A real freeze writes B with `parent_task` naming A whether or not A rides a record. ----
+
+/// B: owns a fiber that suspends 5; returns 5 + 100.
+const B: &str = r#"
+func (i64, i64) -> (i64) {
+block 0 (v0: i64, v1: i64) {
+  v2 = ref.func 3
+  v3 = i64.const 4096
+  v4 = cont.new v2 v3
+  v5 = i64.const 0
+  v6, v7 = cont.resume v4 v5
+  v8 = i64.const 100
+  v9 = i64.add v7 v8
+  return v9
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (v0: i64, v1: i64) {
+  v2 = i64.const 5
+  v3 = suspend v2
+  return v3
+  }
+}
+"#;
+
+/// (a): A finishes unjoined. The root waits on the word at 66000 for B's handle, which A stores and
+/// notifies before it returns 7.
+const ROOT_UNJOINED: &str = r#"
+func () -> (i64) {
+block 0 () {
+  vz = i64.const 0
+  va = thread.spawn 1 vz vz
+  vaddr = i64.const 66000
+  vexp = i32.const 0
+  vinf = i64.const -1
+  vst = i32.atomic.wait vaddr vexp vinf
+  vhb = i32.load vaddr
+  vbst, vbr = thread.join vhb
+  return vbr
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (v0: i64, v1: i64) {
+  vz = i64.const 0
+  vb = thread.spawn 2 vz vz
+  vaddr = i64.const 66000
+  i32.store vaddr vb
+  vone = i32.const 1
+  vn = atomic.notify vaddr vone
+  vr = i64.const 7
+  return vr
+  }
+}
+"#;
+
+/// (b): A finishes and is joined; it returns B's handle.
+const ROOT_JOINED: &str = r#"
+func () -> (i64) {
+block 0 () {
+  vz = i64.const 0
+  va = thread.spawn 1 vz vz
+  vast, var = thread.join va
+  vhb = i32.wrap_i64 var
+  vbst, vbr = thread.join vhb
+  return vbr
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (v0: i64, v1: i64) {
+  vz = i64.const 0
+  vb = thread.spawn 2 vz vz
+  vr = i64.extend_i32_u vb
+  return vr
+  }
+}
+"#;
+
+fn interp_run(inst: &Module, win: &[u8], h: &mut Host) -> Result<Vec<Value>, temen_interp::Trap> {
+    h.set_durable(true);
+    let mut fuel = 10_000_000u64;
+    run_capture_reserved_with_host(inst, 0, &[], &mut fuel, win, SIZE_LOG2, h).0
+}
+
+/// Freeze `root` + [`B`] with the trigger inside B, check what the freeze wrote, and thaw it on every
+/// engine: each gives the uninterrupted answer. On `b099bbb` the tree-walker's thaw dropped B (its
+/// spawner was not re-created) and the root's rewound join answered `-EBADF`, so it returned 0.
+fn spawner_finished(root: &str, a_rides: bool) {
+    let inst = instrument(&format!("{root}{B}"));
+    let want = interp_run(
+        &inst,
+        &init_durable_window(WINDOW, TEST_ARENA),
+        &mut Host::new(),
+    );
+    assert_eq!(want, Ok(vec![Value::I64(105)]), "uninterrupted");
+
+    let mut win = init_durable_window(WINDOW, TEST_ARENA);
+    arm_freeze_after(&mut win, TEST_ARENA, 1);
+    let mut h = Host::new();
+    h.set_durable(true);
+    let mut fuel = 10_000_000u64;
+    let (r, snap) =
+        run_capture_reserved_with_host(&inst, 0, &[], &mut fuel, &win, SIZE_LOG2, &mut h);
+    assert!(r.is_ok(), "the freeze returns a placeholder: {r:?}");
+    let art = temen_snapshot::freeze(&inst, &snap, &h).expect("freeze");
+
+    // What the freeze wrote: B, its spawner A by id; A itself only while unjoined.
+    let written = decode_residue(&art).expect("decode");
+    let b = written
+        .vcpus
+        .iter()
+        .find(|v| v.completed_result.is_none())
+        .expect("B rides live");
+    assert_eq!(b.parent_task, 1, "B names A, the thread that spawned it");
+    assert_eq!(
+        written.vcpus.iter().any(|v| v.task == 1),
+        a_rides,
+        "A rides a record iff no one joined it"
+    );
+
+    let restored = || {
+        let mut h = Host::new();
+        let mut win = temen_snapshot::restore(&art, &inst, &mut h).expect("a real artifact");
+        begin_thaw(&mut win, TEST_ARENA, 0);
+        (h, win)
+    };
+
+    // A re-freeze of the restored domain, before its thaw begins: byte-identical (§12.6).
+    let mut h = Host::new();
+    let win = temen_snapshot::restore(&art, &inst, &mut h).expect("a real artifact");
+    let again = temen_snapshot::freeze(&inst, &win, &h).expect("re-freeze");
+    assert_eq!(again, art, "a restored domain re-freezes byte-identically");
+
+    // The tree-walker.
+    let (mut h, win) = restored();
+    assert_eq!(interp_run(&inst, &win, &mut h), want, "tree-walker thaw");
+
+    // The bytecode engine runs no `thread.*` durably: it declines to the tree-walker.
+    let (mut h, win) = restored();
+    let mut fuel = 10_000_000u64;
+    assert!(
+        temen_interp::bytecode::compile_and_run_capture_reserved_with_host(
+            &inst,
+            0,
+            &[],
+            &mut fuel,
+            &win,
+            SIZE_LOG2,
+            &mut h,
+        )
+        .is_none(),
+        "the bytecode engine declines"
+    );
+
+    // The Cranelift JIT.
+    let (mut h, win) = restored();
+    h.set_durable(true);
+    match temen_run::jit_cap_run(
+        &inst,
+        0,
+        &[],
+        &MemLayout::image(win),
+        SIZE_LOG2,
+        0,
+        &mut h,
+        None,
+    ) {
+        Ok((JitOutcome::Returned(v), _)) => assert_eq!(v, vec![105], "JIT thaw"),
+        Err(JitError::Unsupported(_)) => {} // a target without the threads runtime
+        other => panic!("JIT thaw: {:?}", other.map(|(o, _)| o)),
+    }
+}
+
+#[test]
+fn a_thread_whose_spawner_finished_unjoined_thaws_transparently() {
+    spawner_finished(ROOT_UNJOINED, true);
+}
+
+#[test]
+fn a_thread_whose_spawner_finished_and_was_joined_thaws_transparently() {
+    spawner_finished(ROOT_JOINED, false);
 }

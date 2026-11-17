@@ -2893,8 +2893,9 @@ fn seed_domain(s: &mut Sched, sched: &Arc<Scheduler>, mut root: Box<VCpu>, resid
     // The residue names tasks by their ids in the **frozen** run; the thaw hands out its own. Every
     // re-created task enters this `freeze id → thaw id` map as it is created, and every `parent_task`
     // resolves through it (#1687), so a record re-attaches to the parent it names whatever order ids
-    // are handed out in. A parent the thaw did not re-create resolves to nothing, and its child is not
-    // re-created either: the parent's rewound join then fails closed rather than meeting a stranger.
+    // are handed out in. A parent the thaw did not re-create (it finished before the freeze) resolves
+    // to nothing, and its child is re-created under the root: the domain's one child table holds it
+    // either way (#2043, #3034 D3).
     let mut live_ids: BTreeMap<TaskId, TaskId> = BTreeMap::from([(residue.task, id)]);
     let live = |m: &BTreeMap<TaskId, TaskId>, t: usize| m.get(&(t as TaskId)).copied();
     // Every vCPU the thaw re-creates below the root, by thaw id, so any record can attach to any of
@@ -2994,22 +2995,12 @@ fn seed_domain(s: &mut Sched, sched: &Arc<Scheduler>, mut root: Box<VCpu>, resid
             let mut dseed: Vec<FrozenDetached> = thaw_detached;
             dseed.sort_by(|a, b| a.parent_task.cmp(&b.parent_task).then(a.slot.cmp(&b.slot)));
             for fd in dseed {
-                let Some(parent) = live(&live_ids, fd.parent_task) else {
-                    continue;
-                };
-                let spawner = if parent == id {
-                    Some(&mut *root)
-                } else {
-                    children.get_mut(&parent).map(|p| &mut **p)
-                };
-                let result = joined(fd.completed_result);
-                match spawner {
-                    Some(p) => deliver_detached(s, p, fd.slot, result),
-                    None => {
-                        let cid = mint_task(s);
-                        s.results.insert(cid, Outcome::ended(result));
-                    }
-                }
+                // #3034 D3 — under its spawner when the thaw re-created it, the root otherwise: the
+                // domain's one child table holds it either way.
+                let spawner = live(&live_ids, fd.parent_task)
+                    .and_then(|q| children.get_mut(&q))
+                    .map_or(&mut *root, |p| &mut **p);
+                deliver_detached(s, spawner, fd.slot, joined(fd.completed_result));
             }
         }
         // #1361 step 4 — re-launch each **live** detached child: a domain of its own window and
@@ -3020,14 +3011,12 @@ fn seed_domain(s: &mut Sched, sched: &Arc<Scheduler>, mut root: Box<VCpu>, resid
         let mut lseed = thaw_live_detached;
         lseed.sort_by_key(|l| (l.parent_task, l.slot));
         for td in lseed {
-            let spawner: &mut VCpu = match live(&live_ids, td.parent_task) {
-                Some(p) if p == id => &mut root,
-                Some(p) => match children.get_mut(&p) {
+            // #3034 D3 — as a completed one: under the root when its spawner was not re-created.
+            let spawner: &mut VCpu =
+                match live(&live_ids, td.parent_task).and_then(|q| children.get_mut(&q)) {
                     Some(p) => p,
-                    None => continue,
-                },
-                None => continue, // not re-created ⇒ its own rewound join already fails closed
-            };
+                    None => &mut root,
+                };
             relaunch_detached(s, sched, spawner, td);
         }
         // #1688 — the twins this domain forked, each re-created under the pid its `fork()` returned,
@@ -3116,10 +3105,10 @@ fn mint_task(s: &mut Sched) -> TaskId {
 }
 
 /// Thaw: re-create one spawned vCPU a freeze recorded ([`seed_domain`]), under the parent that spawned
-/// it — the root or a re-created thread. The thread gets its
-/// parent's window, powerbox, fiber registry and freeze-residue sink, exactly as `thread.spawn` gave
-/// them, and its handle lands at its recorded slot in the parent's join table (#1685). A parent the
-/// thaw did not re-create leaves the thread out: that parent's rewound join then fails closed.
+/// it — the root or a re-created thread — or, when that parent finished before the freeze, under the
+/// root (#3034 D3). The thread gets its domain's window, powerbox, fiber registry and freeze-residue
+/// sink, exactly as `thread.spawn` gave them, and its handle lands at its recorded slot in the
+/// domain's one child table (#1685, #2043).
 ///
 /// Per-piece rebuild (none of "top `n`, densely" holds with recycling):
 ///   • context — *derived* from the restored shadow-SP (`ShadowContexts::vcpu_of_sp`), since the region
@@ -3136,17 +3125,16 @@ fn seed_thread(
     live_ids: &mut BTreeMap<TaskId, TaskId>,
     ff: FrozenVCpu,
 ) {
-    let Some(&parent) = live_ids.get(&(ff.parent_task as TaskId)) else {
-        return;
+    // #3034 D3 — a domain has one child table (#2043), so a thread outlives the thread that spawned
+    // it: its spawner may have finished, joined or not, before the freeze, and ride no record. It is
+    // re-created in the domain all the same, under its spawner when that was re-created and under the
+    // root otherwise, keeping its frozen parent id so a re-freeze writes the same record.
+    let parent = live_ids.get(&(ff.parent_task as TaskId)).copied();
+    let p: &mut VCpu = match parent.and_then(|q| children.get_mut(&q)) {
+        Some(p) => p,
+        None => root,
     };
-    let p: &mut VCpu = if parent == root.id {
-        root
-    } else {
-        match children.get_mut(&parent) {
-            Some(p) => p,
-            None => return,
-        }
-    };
+    let parent = parent.unwrap_or(ff.parent_task as TaskId);
     let cid = claim_task(s, ff.task);
     // #3034 — the thaw pass admitted every record ([`temen_ir::thaw::validate`]): its join slot, its
     // context and its entry are ones a spawn makes. The slot and the context keep their refusal
