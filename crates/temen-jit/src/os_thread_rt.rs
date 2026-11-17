@@ -2190,10 +2190,16 @@ fn run_child(a: SpawnArgs) {
         env.ctx().raise(TrapKind::ThreadFault as i64);
     }
     // #3081 — the entry its spawn paid, for its prologue to burn. Only once it will run guest code:
-    // a vCPU refused a lane keeps the unit paid, as the oracle's does, and hands back nothing.
-    if let Some(cell) = own.cell.as_deref_mut().filter(|_| got_lane && a.paid_entry) {
+    // a vCPU refused a lane keeps the unit paid, as the oracle's does, and hands back nothing; so
+    // does one whose code never charged it (`keep_unburned_entry`, after the call).
+    let credited = own
+        .cell
+        .as_deref_mut()
+        .filter(|_| got_lane && a.paid_entry)
+        .map(|c| c as *mut crate::FuelCell);
+    if let Some(cell) = credited {
         // SAFETY: the vCPU's own live cell.
-        unsafe { crate::FuelCell::credit(cell, 1) };
+        unsafe { crate::FuelCell::credit_entry(cell) };
     }
     // SAFETY: `child_entry` honours the `Entry` ABI; `call` outlives the run; a guest fault in the
     // window range unwinds back here (this vCPU's stack is abandoned — the domain is being killed).
@@ -2212,6 +2218,10 @@ fn run_child(a: SpawnArgs) {
         };
     if got_lane {
         dom.lane_give_back(&chain);
+    }
+    if let Some(cell) = credited {
+        // SAFETY: the vCPU's own live cell, until `put_vcpu_ctx` below.
+        unsafe { crate::FuelCell::keep_unburned_entry(cell) };
     }
     // §12.8 4A.5 follow-up B: a concurrent durable child that **owns fibers** must flatten the ones it
     // parked into their shadow regions — its own `freeze_drive`, the concurrent mirror of
