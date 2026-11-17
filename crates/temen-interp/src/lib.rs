@@ -2949,11 +2949,16 @@ fn seed_domain(s: &mut Sched, sched: &Arc<Scheduler>, mut root: Box<VCpu>, resid
         seed.sort_by_key(|f| f.slot);
         for (expected, ff) in seed.into_iter().enumerate() {
             // #3034 — the thaw pass admitted each slot's context as one `cont.new` hands out
-            // ([`ShadowContexts::fiber_fits`]).
-            debug_assert!(
-                root.domain.registry.seed_fits(arena),
-                "the thaw pass admits only a fiber slot inside the arena"
-            );
+            // ([`ShadowContexts::fiber_fits`]). The refusal stays in front of the swap's stores at
+            // `region_base(slot + 1)`: a slot past it is not seeded, and its resume answers
+            // `FiberFault`, as the JIT's seed does. A hole in the pass is loud in debug.
+            if !root.domain.registry.seed_fits(arena) {
+                debug_assert!(
+                    false,
+                    "the thaw pass admits only a fiber slot inside the arena"
+                );
+                break;
+            }
             let got = if ff.is_free() {
                 root.domain.registry.seed_free(ff.generation)
             } else {
@@ -3137,21 +3142,16 @@ fn seed_thread(
     let parent = parent.unwrap_or(ff.parent_task as TaskId);
     let cid = claim_task(s, ff.task);
     // #3034 — the thaw pass admitted every record ([`temen_ir::thaw::validate`]): its join slot, its
-    // context and its entry are ones a spawn makes. The slot and the context keep their refusal
-    // (`ThreadFault`) as a backstop, since `Table::pin` panics past the table and no context can
-    // stand in for a missing one; a hole in the pass is loud in debug.
+    // context and its entry are ones a spawn makes. Each keeps its refusal (`ThreadFault`) as a
+    // backstop, as the JIT's re-attach does, since `Table::pin` panics past the table, no context can
+    // stand in for a missing one, and no entry for one of another signature; a hole in the pass is
+    // loud in debug.
     let slot_ok = !ff.joinable || ff.slot < temen_ir::handles::SLOTS;
-    debug_assert!(
-        ff.completed_result.is_some()
-            || usize::try_from(ff.func)
-                .ok()
-                .and_then(|f| p.domain.funcs.get(f))
-                .is_some_and(
-                    |f| f.params == [ValType::I64, ValType::I64] && f.results == [ValType::I64]
-                ),
-        "the thaw pass admits only a spawn entry"
-    );
-    let ctx = ShadowContexts::vcpu_of_sp(p.arena(), ff.shadow_sp);
+    let entry_ok = usize::try_from(ff.func)
+        .ok()
+        .and_then(|f| p.domain.funcs.get(f))
+        .is_some_and(|f| f.params == [ValType::I64, ValType::I64] && f.results == [ValType::I64]);
+    let ctx = ShadowContexts::vcpu_of_sp(p.arena(), ff.shadow_sp).filter(|_| entry_ok);
     if !slot_ok {
         debug_assert!(false, "the thaw pass admits only a join slot of the table");
         s.results
@@ -3167,14 +3167,18 @@ fn seed_thread(
     }
     drop(c);
     // #1685 — a child that finished unjoined is not re-created: its result waits in the scheduler
-    // for the rewound `join`, as it did before the freeze.
+    // for the rewound `join`, as it did before the freeze, and rides the next freeze again if no
+    // join takes it first (#3103: it was dropped).
     if let Some(r) = ff.completed_result {
         s.results
             .insert(cid, Outcome::ended(Ok(vec![Value::I64(r)])));
         return;
     }
     let Some(ctx) = ctx else {
-        debug_assert!(false, "the thaw pass admits only a vCPU's context");
+        debug_assert!(
+            false,
+            "the thaw pass admits only a vCPU's context and a spawn entry"
+        );
         s.results
             .insert(cid, Outcome::ended(Err(Trap::ThreadFault)));
         return;
@@ -3182,7 +3186,8 @@ fn seed_thread(
     // #2001 — the thread handed its `spawn` back when it unwound for the freeze, and lived before
     // it: charged again past any ceiling. #2318 — never past the process's pools: a thread they
     // have no room for is one the process cannot hold, so it ends with `ThreadFault`, which its
-    // rewound join answers, and nothing it spawned is re-created.
+    // rewound join answers. What it spawned is re-created under the root, as a thread whose spawner
+    // finished is (#3034 D3).
     let Some(live) = LiveVcpu::rebuild(p.domain.host.lock_unpoisoned().own_node()) else {
         s.results
             .insert(cid, Outcome::ended(Err(Trap::ThreadFault)));
@@ -12461,6 +12466,18 @@ pub type LiveTwin = temen_ir::thaw::LiveTwin<ThawedTwin>;
 /// The thaw residue a domain's powerbox holds at rest: what its last freeze left, or what a restore
 /// admitted ([`Host::set_thaw`]); taken by the next run.
 pub type Residue = temen_ir::thaw::RawResidue<ThawedDetached, ThawedTwin>;
+
+/// #3034 — a domain's serve state as a snapshot carries it (DURABILITY.md §13.4, #1676, #1901), for
+/// [`Host::set_serve`]: the dispatches queued and the replies settled, the ticket counter, the
+/// abandoned reply waits `(context, ticket)`, and the frozen handlers `(fiber slot, ticket)`.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Serve {
+    pub queue: Vec<SvcDispatch>,
+    pub results: Vec<(u64, Reply)>,
+    pub next_ticket: u64,
+    pub waits: Vec<(u32, u64)>,
+    pub handlers: Vec<(u32, u64)>,
+}
 
 /// An admitted thaw residue for this crate's engines ([`temen_ir::thaw::validate`]).
 pub type Thaw = temen_ir::thaw::Thaw<ThawedDetached, ThawedTwin>;
@@ -28415,8 +28432,20 @@ impl Host {
         m: &Module,
         raw: Residue,
     ) -> Result<(), temen_ir::thaw::Malformed> {
-        self.set_thaw(temen_ir::thaw::validate(m, 0, raw)?);
+        let installs = self.installs_code();
+        self.set_thaw(temen_ir::thaw::validate(m, installs, 0, raw)?);
         Ok(())
+    }
+
+    /// #3034 — the residue this powerbox holds, admitted for a run of `m` and taken: what an engine
+    /// that thaws it seeds. Refused, and left in place, when a value in it is one no run of `m` makes
+    /// (an artifact restored against another module), so a declining engine hands it to the next.
+    pub fn take_thaw(&mut self, m: &Module) -> Result<Thaw, temen_ir::thaw::Malformed> {
+        let installs = self.installs_code();
+        temen_ir::thaw::validate(m, installs, 0, self.take_residue()).map_err(|r| {
+            self.residue = r.0;
+            temen_ir::thaw::Malformed
+        })
     }
 
     /// #3034 — take the residue this powerbox holds (cleared here): an embedder that thaws it on
@@ -31823,14 +31852,33 @@ impl Host {
         )
     }
 
-    /// DURABILITY.md §13.4 step 3 — restore this domain's serve state from a snapshot's
-    /// serve section (the inverse of [`Host::svc_state`]). Replaces whatever is present.
-    pub fn set_svc_state(
-        &mut self,
-        queue: Vec<SvcDispatch>,
-        results: Vec<(u64, Reply)>,
-        next: u64,
-    ) {
+    /// #3034 — seed this domain's serve state ([`Serve`]): what a restore decoded, or an embedder
+    /// assembles. Refused, changing nothing, when it is state no run makes: a counter a `+ 1`
+    /// overflows, a ticket at or past it, or a frozen handler in a fiber slot the admitted residue
+    /// ([`Host::set_thaw`]) does not hold live. Seed the residue first.
+    pub fn set_serve(&mut self, s: Serve) -> Result<(), temen_ir::thaw::Malformed> {
+        let minted = s.queue.iter().map(|d| d.ticket);
+        let minted = minted.chain(s.results.iter().map(|r| r.0));
+        let fibers = &self.residue.fibers;
+        if s.next_ticket > temen_ir::thaw::TASK_MAX
+            || minted
+                .chain(s.handlers.iter().map(|h| h.1))
+                .any(|t| t >= s.next_ticket)
+            || s.handlers
+                .iter()
+                .any(|&(slot, _)| fibers.get(slot as usize).is_none_or(|f| f.is_free()))
+        {
+            return Err(temen_ir::thaw::Malformed);
+        }
+        self.set_svc_state(s.queue, s.results, s.next_ticket);
+        self.reply_waits = s.waits.into_iter().collect();
+        self.frozen_handlers = s.handlers.into_iter().collect();
+        Ok(())
+    }
+
+    /// DURABILITY.md §13.4 step 3 — restore this domain's serve state from a checkpoint (the inverse
+    /// of [`Host::svc_state`]). Replaces whatever is present.
+    fn set_svc_state(&mut self, queue: Vec<SvcDispatch>, results: Vec<(u64, Reply)>, next: u64) {
         self.svc_queue = queue.into();
         self.svc_results = results.into_iter().collect();
         self.svc_next_ticket = next;
@@ -31853,12 +31901,6 @@ impl Host {
         self.reply_waits.iter().map(|(&c, &t)| (c, t)).collect()
     }
 
-    /// #1901 — restore the abandoned reply waits from a snapshot (the inverse of
-    /// [`Host::reply_waits`]). Replaces whatever is present.
-    pub fn set_reply_waits(&mut self, waits: Vec<(u32, u64)>) {
-        self.reply_waits = waits.into_iter().collect();
-    }
-
     /// #1676 — the handler in fiber `slot` replies to `ticket`; its serve loop froze with it.
     fn hold_handler_for_thaw(&mut self, slot: usize, ticket: u64) {
         self.frozen_handlers.insert(slot as u32, ticket);
@@ -31876,12 +31918,6 @@ impl Host {
     /// order (the artifact's canonical order).
     pub fn frozen_handlers(&self) -> Vec<(u32, u64)> {
         self.frozen_handlers.iter().map(|(&s, &t)| (s, t)).collect()
-    }
-
-    /// #1676 — restore the frozen handlers from a snapshot (the inverse of
-    /// [`Host::frozen_handlers`]). Replaces whatever is present.
-    pub fn set_frozen_handlers(&mut self, handlers: Vec<(u32, u64)>) {
-        self.frozen_handlers = handlers.into_iter().collect();
     }
 
     /// DURABILITY.md §13.3 — this domain's stable identity (see the field doc).
@@ -32499,6 +32535,13 @@ impl Host {
     /// guest doing a lot of legitimate work).
     pub fn try_grant_freeze_authority(&mut self) -> Option<i32> {
         self.try_grant(cap_id::FREEZE_AUTHORITY, Binding::FreezeAuthority)
+    }
+
+    /// #3034 — whether code can be installed into this domain: it was granted a `Jit` domain (its
+    /// handle may since be closed; the units it installed stay). Installed code runs in the domain's
+    /// frames and may make any kind of thaw record ([`temen_ir::thaw::validate`]'s `installs`).
+    pub fn installs_code(&self) -> bool {
+        !self.jit_tables.is_empty()
     }
 
     /// Whether this host holds freeze authority — i.e. may snapshot the detached children it spawns.
@@ -44623,6 +44666,9 @@ mod detached_freeze_tests;
 
 #[cfg(test)]
 mod freeze_census_tests;
+
+#[cfg(test)]
+mod thaw_backstop_tests;
 
 #[cfg(test)]
 mod take_from_cell_tests {

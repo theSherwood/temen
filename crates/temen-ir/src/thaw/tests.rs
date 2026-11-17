@@ -25,6 +25,11 @@ fn module(arena: Option<ShadowArena>) -> Module {
 
 type Raw = RawResidue<(), ()>;
 
+/// [`validate`] for a domain that holds a `Jit` grant (its code may make every record kind), in context 0.
+fn admit(m: &Module, r: Raw) -> Result<Thaw<(), ()>, Malformed> {
+    validate(m, true, 0, r).map_err(Malformed::from)
+}
+
 /// A residue a run makes: two fibers (one free), a live vCPU in the top context, a completed one, a
 /// completed detached child, a live detached child, a live twin and an exited one.
 fn real() -> Raw {
@@ -92,13 +97,29 @@ fn real() -> Raw {
 
 #[test]
 fn a_residue_a_run_makes_is_admitted_whole() {
-    let t = validate(&module(Some(A)), 0, real()).expect("admitted");
+    let t = admit(&module(Some(A)), real()).expect("admitted");
     assert_eq!(t.into_parts(), real());
-    assert!(validate(&module(Some(A)), 0, Raw::default())
+    assert!(admit(&module(Some(A)), Raw::default())
         .expect("empty")
         .is_empty());
     // A module without an arena admits only the empty residue (INVARIANTS #16).
-    assert!(validate(&module(None), 0, Raw::default()).is_ok());
+    assert!(admit(&module(None), Raw::default()).is_ok());
+}
+
+/// A context whose unwound chain fills its region exactly: the extent is the region's end, which the
+/// transform's push check admits (`newsp > region_end` traps). Before #3034's fix `vcpu_of_sp` floored
+/// it into the next context and the pass refused a real freeze.
+#[test]
+fn an_extent_at_its_regions_end_is_admitted() {
+    let mut r = real();
+    r.vcpus[1].shadow_sp = A.region_base(10) + A.stride;
+    r.root_sp = Some(A.region_base(0) + A.stride);
+    r.fibers[0].shadow_sp = A.region_base(1) + A.stride;
+    assert!(admit(&module(Some(A)), r).is_ok());
+    // One past it is the next context's SP word, and refused.
+    let mut r = real();
+    r.vcpus[1].shadow_sp = A.region_base(10) + A.stride + 1;
+    assert_eq!(admit(&module(Some(A)), r).map(|_| ()), Err(Malformed));
 }
 
 #[test]
@@ -178,12 +199,25 @@ fn each_value_no_run_makes_is_refused() {
         ("a twin context past the arena", |r| r.twins[0].ctx = 11),
         ("a twin pid past TASK_MAX", |r| r.twins[0].pid = u64::MAX),
         ("an exited twin pid of 0", |r| r.exited_twins[0].pid = 0),
+        // trap codes a join outcome carries
+        ("a detached trap code of 0", |r| {
+            r.detached[0].completed_result = Err(0)
+        }),
+        ("a JIT-internal trap code", |r| {
+            r.detached[0].completed_result = Err(crate::trap_code::DOMAIN_DONE)
+        }),
+        ("a status on a trap that is not an exit", |r| {
+            r.detached[0].completed_result = Err(crate::trap_code::THREAD_FAULT | 1 << 32)
+        }),
+        ("an exited twin's trap code of 0", |r| {
+            r.exited_twins[0].outcome = Err(0)
+        }),
     ];
     for (name, bend) in cases {
         let mut r = real();
         bend(&mut r);
         assert_eq!(
-            validate(&module(Some(A)), 0, r).map(|_| ()),
+            admit(&module(Some(A)), r).map(|_| ()),
             Err(Malformed),
             "{name}"
         );
@@ -191,5 +225,108 @@ fn each_value_no_run_makes_is_refused() {
     // Any residue at all on a module with no arena.
     let mut r = Raw::default();
     r.fibers.push(FrozenFiber::free(0, 0));
-    assert_eq!(validate(&module(None), 0, r).map(|_| ()), Err(Malformed));
+    assert_eq!(admit(&module(None), r).map(|_| ()), Err(Malformed));
+}
+
+/// Each record kind is admitted only where the domain's code can make it (#3034): a fiber
+/// from a `cont.new`, a vCPU from a `thread.spawn`, a detached child from an `Instantiator` call, or
+/// any of them from code installed through a `Jit` grant.
+#[test]
+fn a_record_kind_the_domains_code_cannot_make_is_refused() {
+    let site = |m: &mut Module, inst: Inst| {
+        m.funcs[1].blocks = vec![crate::Block {
+            parent: 0,
+            params: vec![],
+            captures: vec![],
+            insts: vec![inst],
+            term: crate::Terminator::Unreachable,
+        }]
+    };
+    let kinds: &[(&str, fn(&mut Raw), Inst)] = &[
+        (
+            "fibers",
+            |r| r.fibers.clear(),
+            Inst::ContNew { func: 0, arg0: 0 },
+        ),
+        (
+            "vCPUs",
+            |r| {
+                r.vcpus.clear();
+                r.root_sp = None;
+            },
+            Inst::ThreadSpawn {
+                func: 1,
+                arg0: 0,
+                arg1: 0,
+            },
+        ),
+        (
+            "detached children",
+            |r| {
+                r.detached.clear();
+                r.live_detached.clear();
+            },
+            Inst::CapCall(Box::new(crate::CapCall {
+                type_id: crate::cap_id::INSTANTIATOR,
+                op: 0,
+                sig: 0,
+                handle: 0,
+                args: Box::new([]),
+            })),
+        ),
+    ];
+    // `real()` with only `kind` (all other kinds cleared).
+    let only = |keep: usize| {
+        let mut r = real();
+        r.twins.clear();
+        r.exited_twins.clear();
+        for (i, (_, clear, _)) in kinds.iter().enumerate() {
+            if i != keep {
+                clear(&mut r);
+            }
+        }
+        r
+    };
+    for (k, (name, _, inst)) in kinds.iter().enumerate() {
+        let bare = module(Some(A));
+        assert!(
+            validate(&bare, false, 0, only(k)).is_err(),
+            "{name}: no site, no Jit grant"
+        );
+        assert!(
+            validate(&bare, true, 0, only(k)).is_ok(),
+            "{name}: under a Jit grant"
+        );
+        let mut m = module(Some(A));
+        site(&mut m, inst.clone());
+        assert!(
+            validate(&m, false, 0, only(k)).is_ok(),
+            "{name}: at its site"
+        );
+    }
+}
+
+/// A refusal hands the residue back whole.
+#[test]
+fn a_refused_residue_is_handed_back() {
+    let mut r = real();
+    r.vcpus[1].func = 99;
+    let want = r.clone();
+    match validate(&module(Some(A)), true, 0, r) {
+        Err(Refused(back)) => assert_eq!(back.vcpus, want.vcpus),
+        Ok(_) => panic!("admitted"),
+    }
+}
+
+/// A freeze hands its residue over in memory in the order its records unwound; the pass admits it in
+/// the order every engine seeds in, fibers by slot and vCPUs by task.
+#[test]
+fn an_unsorted_residue_is_admitted_in_seeding_order() {
+    let mut r = real();
+    r.fibers.reverse();
+    r.vcpus.reverse();
+    assert_eq!(
+        admit(&module(Some(A)), r).expect("admitted").into_parts(),
+        real()
+    );
 }

@@ -3492,7 +3492,7 @@ pub fn compile_and_run_seeded_with_host(
     let table = source.root_table(host.jit_table_log2());
     let mut mem = Mem::root(m, default_reserved_log2(), None, init_mem);
     super::LAST_CAPTURE_FAULT.with(|c| *c.borrow_mut() = None);
-    let r = run(source, table, func, args, fuel, &mut mem, host);
+    let r = run(source, table, func, args, fuel, &mut mem, host)?;
     // #1714: the faulting address of a `MemoryFault`, in the same per-run slot the tree-walker's
     // run funnel fills (`last_capture_fault_addr`) — this path dropped the window with it, so an
     // embedder of a plain run could not say *where* a segfault was. The scheduler records the
@@ -3657,7 +3657,7 @@ pub fn compile_and_run_capture(
     let source = ModuleSource::shared(std::sync::Arc::new(c));
     let table = source.root_table(host.jit_table_log2());
     let mut mem = Mem::root(m, default_reserved_log2(), None, init_mem);
-    let r = run(source, table, func, args, fuel, &mut mem, &mut host);
+    let r = run(source, table, func, args, fuel, &mut mem, &mut host)?;
     let snap = mem
         .as_ref()
         .map(|mm| mm.snapshot(init_mem.len() as u64))
@@ -3695,7 +3695,7 @@ pub fn compile_and_run_capture_over(
         Some(std::sync::Arc::clone(&back)),
         init_mem,
     );
-    let r = run(source, table, func, args, fuel, &mut mem, &mut host);
+    let r = run(source, table, func, args, fuel, &mut mem, &mut host)?;
     let snap = mem
         .as_ref()
         .map(|mm| mm.snapshot(init_mem.len() as u64))
@@ -3742,7 +3742,7 @@ pub fn compile_and_run_over_shared_with_host(
             ..WindowSpec::default()
         })
     });
-    Some(run(source, table, func, args, fuel, &mut mem, host))
+    run(source, table, func, args, fuel, &mut mem, host)
 }
 
 /// A module compiled **once** for repeated runs over a caller-provided shared window — the cached form
@@ -3908,7 +3908,9 @@ impl SharedProgram {
             }
             mm
         });
-        let out = run(source, table, func, args, fuel, &mut mem, host);
+        // A reactor thaws nothing: a host carrying a residue is refused, never seeded in part (#3034).
+        let out =
+            run(source, table, func, args, fuel, &mut mem, host).unwrap_or(Err(Trap::Malformed));
         let (pages, mapped) = match mem.as_ref() {
             None => (Some((1, 0, 0, Vec::new())), 0),
             Some(m) => {
@@ -4068,7 +4070,7 @@ fn parallel_domain(
     back: Option<std::sync::Arc<super::Region>>,
     init_mem: &[u8],
 ) -> Option<Result<ParallelStart, Trap>> {
-    if host.is_durable() {
+    if host.is_durable() || !admits_thaw(host) {
         return None;
     }
     let c = compile_module_for(m, host.self_module(), true)?;
@@ -4174,7 +4176,8 @@ impl Reactor {
     ) -> Result<Vec<Value>, Trap> {
         // A frame's program and table are fresh; the persistent `mem` carries state across calls.
         let (source, table) = self.frame(func, host)?;
-        run(source, table, func, args, fuel, &mut self.mem, host)
+        // A reactor thaws nothing: a host carrying a residue is refused, never seeded in part (#3034).
+        run(source, table, func, args, fuel, &mut self.mem, host).unwrap_or(Err(Trap::Malformed))
     }
 
     /// The program and root table one frame of `func` runs over, for [`call`](Self::call) and
@@ -4267,6 +4270,7 @@ pub fn compile_and_run_capture_reserved_with_host(
     // fail-closed refusal of a freeze over a live-or-unjoined §14 child; this engine's own
     // instantiate arm has none of them, so driving a durable §14 module here would both skip the
     // admission rule and mint the exact thaw-faulting artifact the tree-walker refuses.
+    // (The thaw gate is also [`run`]'s; asked here first, it saves the compile.)
     if outside_reserved_subset(m) || !admits_thaw(host) {
         return None;
     }
@@ -4373,7 +4377,7 @@ pub fn run_capture_reserved_over_compiled_with_host(
     let source = ModuleSource::shared(compiled);
     let table = source.root_table(host.jit_table_log2());
     let mut mem = Mem::root(m, reserved_log2, None, init_mem);
-    let r = run(source, table, func, args, fuel, &mut mem, host);
+    let r = run(source, table, func, args, fuel, &mut mem, host)?;
     let snap = mem
         .as_ref()
         .map(|mm| mm.snapshot_window(super::SNAP_CAP))
@@ -9550,10 +9554,15 @@ fn run(
     fuel: &mut u64,
     mem: &mut Option<Mem>,
     host: &mut Host,
-) -> Result<Vec<Value>, Trap> {
+) -> Option<Result<Vec<Value>, Trap>> {
+    // #3034 — the one thaw gate of every entry that runs here: a residue this engine does not
+    // re-create whole is declined to the tree-walker, left on the host.
+    if !admits_thaw(host) {
+        return None;
+    }
     // The production path never preempts itself: an unlimited budget makes `resume` run straight to
     // completion, with the per-op budget branch perfectly predicted (so the hot loop is unchanged).
-    drive(source, table, entry, args, fuel, mem, host, u64::MAX)
+    Some(drive(source, table, entry, args, fuel, mem, host, u64::MAX))
 }
 
 /// The per-op park/interrupt flags one capability dispatch may raise (#1173). They live on the shared
@@ -10265,6 +10274,7 @@ fn new_fiber(
         .as_ref()
         .map_or(super::ShadowArena::EMPTY, |m| m.shadow_arena());
     let func = (funcref as u32 as usize & source.primary().table_mask) as i32;
+    let durable = host.with(|h| h.is_durable());
     let charge = host.with(|h| h.fiber_charge()).ok_or(Trap::FiberFault)?;
     fibers
         .with(|f, fsp, meta| {
@@ -24482,7 +24492,7 @@ block 0 () {
         let (mut host, mut fuel) = (Host::new(), u64::MAX);
         let mut mem = Mem::root(&m, default_reserved_log2(), None, &[]);
         let r = run(source, table, 0, &[], &mut fuel, &mut mem, &mut host);
-        assert_eq!(r, Ok(vec![Value::I32(7)]));
+        assert_eq!(r, Some(Ok(vec![Value::I32(7)])));
         assert!(c.progs[0].get().is_some() && c.progs[1].get().is_some());
         assert!(c.progs[2].get().is_none(), "nothing enters function 2");
     }

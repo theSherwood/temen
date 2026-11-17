@@ -16,7 +16,7 @@
 use alloc::vec::Vec;
 
 use crate::durable_abi::{ShadowArena, ShadowContexts, MAX_SHADOW_CONTEXTS};
-use crate::{handles, Module, ValType};
+use crate::{cap_id, handles, trap_code, Inst, Module, ValType};
 
 /// The largest task id, pid or ticket a thaw accepts: room for every `+ 1` a run makes after it.
 pub const TASK_MAX: u64 = i64::MAX as u64;
@@ -169,6 +169,20 @@ pub struct RawResidue<D, T> {
     pub exited_twins: Vec<FrozenTwin>,
 }
 
+impl<D, T> RawResidue<D, T> {
+    /// Whether it carries nothing.
+    pub fn is_empty(&self) -> bool {
+        self.fibers.is_empty()
+            && self.vcpus.is_empty()
+            && self.root_sp.is_none()
+            && self.children.is_empty()
+            && self.detached.is_empty()
+            && self.live_detached.is_empty()
+            && self.twins.is_empty()
+            && self.exited_twins.is_empty()
+    }
+}
+
 impl<D, T> Default for RawResidue<D, T> {
     fn default() -> Self {
         RawResidue {
@@ -206,15 +220,7 @@ impl<D, T> Thaw<D, T> {
 
     /// Whether it carries nothing.
     pub fn is_empty(&self) -> bool {
-        let r = &self.0;
-        r.fibers.is_empty()
-            && r.vcpus.is_empty()
-            && r.root_sp.is_none()
-            && r.children.is_empty()
-            && r.detached.is_empty()
-            && r.live_detached.is_empty()
-            && r.twins.is_empty()
-            && r.exited_twins.is_empty()
+        self.0.is_empty()
     }
 
     /// Read it.
@@ -225,6 +231,21 @@ impl<D, T> Thaw<D, T> {
     /// Take it apart, to consume it.
     pub fn into_parts(self) -> ThawParts<D, T> {
         self.0
+    }
+
+    /// #3099 — the residue as a live detached child's own root sees it: the JIT runs the child as the
+    /// root of its domain (task 0), where the tree-walker records the child's scheduler id `task`, so a
+    /// vCPU it spawned names `task` as its spawner. Each such `parent_task` becomes 0, which is below
+    /// every vCPU's task, so the residue stays one the pass admits.
+    pub fn rerooted(mut self, task: u64) -> Self {
+        if task != 0 {
+            for v in &mut self.0.vcpus {
+                if v.parent_task as u64 == task {
+                    v.parent_task = 0;
+                }
+            }
+        }
+        self
     }
 
     /// The same residue with each live domain's payload rebuilt for another engine, from its record
@@ -279,6 +300,58 @@ impl<D, T> Thaw<D, T> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Malformed;
 
+/// A residue [`validate`] refused, handed back whole: a caller that declines the thaw leaves it where
+/// it found it.
+pub struct Refused<D, T>(pub RawResidue<D, T>);
+
+impl<D, T> core::fmt::Debug for Refused<D, T> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("Refused")
+    }
+}
+
+impl<D, T> From<Refused<D, T>> for Malformed {
+    fn from(_: Refused<D, T>) -> Malformed {
+        Malformed
+    }
+}
+
+/// The record kinds the code of a domain of `m` can make (#3034): a fiber needs a `cont.new`, a vCPU
+/// a `thread.spawn`, and a detached child an `Instantiator` call. `installs` says the domain holds a
+/// `Jit` grant: code installed through it runs in the domain's frames and may make any of them
+/// (DESIGN.md §22), and the engines re-create what it made (the JIT hosts an installed unit's fibers
+/// and threads only under the grant's hosting, and its nursery under any install table).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Makes {
+    fibers: bool,
+    vcpus: bool,
+    detached: bool,
+}
+
+impl Makes {
+    fn of(m: &Module, installs: bool) -> Makes {
+        let site = |p: fn(&Inst) -> bool| {
+            installs
+                || m.funcs
+                    .iter()
+                    .any(|f| f.blocks.iter().any(|b| b.insts.iter().any(p)))
+        };
+        Makes {
+            fibers: site(|i| matches!(i, Inst::ContNew { .. })),
+            vcpus: site(|i| matches!(i, Inst::ThreadSpawn { .. })),
+            detached: site(|i| matches!(i, Inst::CapCall(c) if c.type_id == cap_id::INSTANTIATOR)),
+        }
+    }
+}
+
+/// Whether `code` is a trap's wire code as a join outcome carries it: one a guest can see
+/// ([`trap_code::DIV_BY_ZERO`] to [`trap_code::STACK_OVERFLOW`]), with a status only on an exit.
+pub fn surfaced_trap(code: TrapCode) -> bool {
+    let low = code & 0xffff_ffff;
+    (trap_code::DIV_BY_ZERO..=trap_code::STACK_OVERFLOW).contains(&low)
+        && (low == trap_code::EXIT || code == low)
+}
+
 /// Whether `f` is a module function `thread.spawn` can name: `(i64, i64) -> (i64)`.
 fn spawn_entry(m: &Module, f: i32) -> bool {
     usize::try_from(f)
@@ -299,17 +372,32 @@ fn issued(children: &[u32], slot: usize) -> bool {
 }
 
 /// Admit `raw`, the residue of a domain of `m` whose root runs in shadow context `root_ctx` (`0`, or a
-/// fork twin's forking context), or refuse it. The one check every engine's thaw goes through
-/// (#3034); the ranges are the ones a freeze writes.
+/// fork twin's forking context), or refuse it, handing it back. `installs`: the domain holds a `Jit`
+/// grant ([`Makes`]). The one check every engine's thaw goes through (#3034); the ranges are the ones
+/// a freeze writes.
 pub fn validate<D, T>(
     m: &Module,
+    installs: bool,
     root_ctx: usize,
     mut raw: RawResidue<D, T>,
-) -> Result<Thaw<D, T>, Malformed> {
+) -> Result<Thaw<D, T>, Refused<D, T>> {
     // The order every engine seeds in (and the codec writes): fibers by slot, vCPUs by task. A freeze
     // that hands its residue over in memory records them in the order they unwound.
     raw.fibers.sort_by_key(|f| f.slot);
     raw.vcpus.sort_by_key(|v| v.task);
+    match check(m, Makes::of(m, installs), root_ctx, &raw) {
+        Ok(()) => Ok(Thaw(raw)),
+        Err(Malformed) => Err(Refused(raw)),
+    }
+}
+
+/// [`validate`]'s checks, over a residue in seeding order.
+fn check<D, T>(
+    m: &Module,
+    makes: Makes,
+    root_ctx: usize,
+    r: &RawResidue<D, T>,
+) -> Result<(), Malformed> {
     let ok = |c: bool| if c { Ok(()) } else { Err(Malformed) };
     let a = m
         .memory
@@ -318,10 +406,13 @@ pub fn validate<D, T>(
 
     // A module without a shadow arena is not freezable (INVARIANTS #16): it has no residue at all.
     if !a.region_fits(root_ctx) {
-        ok(Thaw(raw).is_empty())?;
-        return Ok(Thaw::none());
+        return ok(r.is_empty());
     }
-    let r = &raw;
+
+    // Only a kind of record the domain's code can make.
+    ok(makes.fibers || r.fibers.is_empty())?;
+    ok(makes.vcpus || r.vcpus.is_empty())?;
+    ok(makes.detached || (r.detached.is_empty() && r.live_detached.is_empty()))?;
 
     // ---- The child-handle table (#2043): at most `SLOTS` counters, the last one issued, and each one
     // a counter `Table::issue` can leave (it skips a generation of 0).
@@ -387,8 +478,11 @@ pub fn validate<D, T>(
         }
     }
 
-    // ---- Detached children: a live one's own id and lane are ones a spawn makes.
-    ok(r.detached.iter().all(|d| d.parent_task as u64 <= TASK_MAX))?;
+    // ---- Detached children: a completed one's outcome is a value or a trap a guest sees; a live one's
+    // own id and lane are ones a spawn makes.
+    ok(r.detached.iter().all(|d| {
+        d.parent_task as u64 <= TASK_MAX && d.completed_result.err().is_none_or(surfaced_trap)
+    }))?;
     for l in &r.live_detached {
         ok(l.parent_task as u64 <= TASK_MAX)?;
         // A JIT freeze records its live children's own id as 0 (each is the root of its domain).
@@ -404,9 +498,8 @@ pub fn validate<D, T>(
     }
     ok(r.exited_twins
         .iter()
-        .all(|t| t.pid >= 1 && t.pid <= TASK_MAX))?;
-
-    Ok(Thaw(raw))
+        .all(|t| t.pid >= 1 && t.pid <= TASK_MAX && t.outcome.err().is_none_or(surfaced_trap)))?;
+    Ok(())
 }
 
 #[cfg(test)]

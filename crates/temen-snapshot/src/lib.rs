@@ -62,7 +62,7 @@ use temen_interp::{
     CapturedTwin, DurableBinding, DurableBudget, DurableHandle, DurableJitTable, DurableJitUnit,
     DurableNamedCap, DurablePipe, DurableRegion, FrozenDetached, FrozenFiber, FrozenTwin,
     FrozenVCpu, Host, MemLayout, NonDurableHandle, RegionBacking, RegionNotCaptured, RegionRefusal,
-    Reply, ShadowArena, StreamRole, SvcDispatch, ThawedDetached, ThawedTwin, Trap,
+    Reply, ShadowArena, StreamRole, SvcDispatch, ThawedDetached, ThawedTwin,
 };
 use temen_ir::thaw::{self, LiveDetached, LiveTwin, RawResidue, TrapCode};
 use temen_ir::Module;
@@ -1457,15 +1457,13 @@ fn write_join_outcome(b: &mut Vec<u8>, o: Option<Result<i64, TrapCode>>) {
     }
 }
 
-/// The inverse of [`write_join_outcome`]; an unknown tag, or a code no trap has, is malformed. The
-/// code read is the trap's own ([`Trap::code`]).
+/// The inverse of [`write_join_outcome`]; an unknown tag is malformed. A code no trap has is refused by
+/// the thaw pass, which every outcome reaches ([`thaw::surfaced_trap`]).
 fn read_join_outcome(r: &mut Reader<'_>) -> Result<Option<Result<i64, TrapCode>>, RestoreError> {
     Ok(match r.uleb()? {
         0 => None,
         1 => Some(Ok(r.uleb()? as i64)),
-        2 => Some(Err(Trap::from_code(r.uleb()? as i64)
-            .ok_or(RestoreError::Malformed)?
-            .code())),
+        2 => Some(Err(r.uleb()? as i64)),
         _ => return Err(RestoreError::Malformed),
     })
 }
@@ -2188,40 +2186,29 @@ fn restore_at(
     // ---- Serve state (§13.4 step 3, v13): decode the serve trio and the reply waits (v35, #1901)
     // and restore them. The section is present iff either is non-empty (canonical); its absence
     // restores the empty default. ----
-    if let Some(body) = serve_body {
-        let mut sr = Reader::new(body);
-        let (queue, results, next_ticket) = read_serve_trio(&mut sr)?;
-        let waits = read_ticket_map(&mut sr)?;
-        let handlers = read_ticket_map(&mut sr)?;
-        if !sr.at_end() {
-            return Err(RestoreError::Malformed);
+    let serve = match serve_body {
+        None => None,
+        Some(body) => {
+            let mut sr = Reader::new(body);
+            let (queue, results, next_ticket) = read_serve_trio(&mut sr)?;
+            let waits = read_ticket_map(&mut sr)?;
+            let handlers = read_ticket_map(&mut sr)?;
+            if !sr.at_end() {
+                return Err(RestoreError::Malformed);
+            }
+            let serve = temen_interp::Serve {
+                queue,
+                results,
+                next_ticket,
+                waits,
+                handlers,
+            };
+            if serve == temen_interp::Serve::default() {
+                return Err(RestoreError::Malformed); // non-canonical: an empty section is elided
+            }
+            Some(serve) // seeded once the residue is admitted: its handlers name fibers of it
         }
-        if queue.is_empty()
-            && results.is_empty()
-            && next_ticket == 0
-            && waits.is_empty()
-            && handlers.is_empty()
-        {
-            return Err(RestoreError::Malformed); // non-canonical: an empty section is elided
-        }
-        // #3034 — every ticket this domain minted lies below its counter, which a `+ 1` must not
-        // overflow; and each frozen handler is a live fiber of this domain's residue.
-        let minted = queue.iter().map(|d| d.ticket);
-        let minted = minted.chain(results.iter().map(|r| r.0));
-        if next_ticket > thaw::TASK_MAX
-            || minted
-                .chain(handlers.iter().map(|h| h.1))
-                .any(|t| t >= next_ticket)
-            || handlers
-                .iter()
-                .any(|&(slot, _)| fibers.get(slot as usize).is_none_or(|f| f.is_free()))
-        {
-            return Err(RestoreError::Malformed);
-        }
-        host.set_svc_state(queue, results, next_ticket);
-        host.set_reply_waits(waits);
-        host.set_frozen_handlers(handlers);
-    }
+    };
 
     // ---- Attestation (#1289 R1, O14, v20): decode Section 6 and re-stamp the host, so the domain's
     // placement/exposure survives the thaw. The section is present iff the attestation is non-default
@@ -2291,7 +2278,13 @@ fn restore_at(
         twins,
         exited_twins,
     };
-    host.set_thaw(thaw::validate(module, root_ctx, raw).map_err(|_| RestoreError::Malformed)?);
+    let installs = host.installs_code();
+    host.set_thaw(
+        thaw::validate(module, installs, root_ctx, raw).map_err(|_| RestoreError::Malformed)?,
+    );
+    if let Some(serve) = serve {
+        host.set_serve(serve).map_err(|_| RestoreError::Malformed)?;
+    }
     // #1944: every carried budget node is one some domain of the cut named, or an ancestor of one
     // (canonical), known only now that every detached child's handles are in.
     if depth == 0 {

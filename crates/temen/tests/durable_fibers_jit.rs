@@ -1024,5 +1024,5 @@ fn jit_thaw(
     m: &temen_ir::Module,
     raw: temen_ir::thaw::RawResidue<temen_jit::JitDetached, ()>,
 ) -> temen_jit::JitThaw {
-    temen_ir::thaw::validate(m, 0, raw).expect("a residue a run made")
+    temen_ir::thaw::validate(m, false, 0, raw).expect("a residue a run made")
 }

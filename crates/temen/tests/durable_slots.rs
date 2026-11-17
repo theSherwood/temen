@@ -592,6 +592,7 @@ mod jit {
         let seed = match seed {
             Some(r) => temen_ir::thaw::validate(
                 inst,
+                false,
                 0,
                 temen_ir::thaw::RawResidue {
                     vcpus: r.vcpus.clone(),

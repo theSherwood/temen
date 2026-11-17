@@ -37,13 +37,27 @@ fn instrument(src: &str) -> Module {
     inst
 }
 
+/// Returns 7; on a path it never takes, it spawns a detached child (#3034: the cuts below carry
+/// detached children, which only a module with an `Instantiator` call makes).
 fn parent() -> Module {
     instrument(
         "memory 17 shadow 16448 65536
 func (i64) -> (i64) {
 block 0 (v0: i64) {
+  vz = i64.const 0
+  vc = i64.eq v0 vz
+  br_if vc 1() 2(v0)
+}
+block 1 () {
   v1 = i64.const 7
   return v1
+}
+block 2 (vi: i64) {
+  vh = i32.wrap_i64 vi
+  vrp = i64.const 0
+  vs = call.cap 6 17 (i64) -> (i32) vh (vrp)
+  vs64 = i64.extend_i32_u vs
+  return vs64
   }
 }
 ",
@@ -301,8 +315,20 @@ type 1 interface { page: 0 }
 export 0 interface \"pager\" 1 { page: 1 }
 func (i64) -> (i64) {
 block 0 (v0: i64) {
+  vz = i64.const 0
+  vc = i64.eq v0 vz
+  br_if vc 1() 2(v0)
+}
+block 1 () {
   v1 = i64.const 7
   return v1
+}
+block 2 (vi: i64) {
+  vh = i32.wrap_i64 vi
+  vrp = i64.const 0
+  vs = call.cap 6 17 (i64) -> (i32) vh (vrp)
+  vs64 = i64.extend_i32_u vs
+  return vs64
   }
 }
 func (i64) -> (i64) {

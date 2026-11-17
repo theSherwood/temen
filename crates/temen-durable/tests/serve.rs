@@ -235,7 +235,13 @@ fn a_domain_frozen_at_its_serve_point_thaws_and_drains_the_restored_queue() {
     h2.set_durable(true);
     h2.set_self_module(&inst);
     let (q, res, next) = trio;
-    h2.set_svc_state(q, res, next);
+    h2.set_serve(temen_interp::Serve {
+        queue: q,
+        results: res,
+        next_ticket: next,
+        ..Default::default()
+    })
+    .expect("a run's serve state");
     h2.admit_thaw(
         &inst,
         temen_interp::Residue {
@@ -340,7 +346,13 @@ fn an_idle_server_freezes_on_quiesce_and_thaws_still_serving() {
     h2.set_durable(true);
     h2.set_self_module(&inst);
     let (q, res, next) = trio;
-    h2.set_svc_state(q, res, next);
+    h2.set_serve(temen_interp::Serve {
+        queue: q,
+        results: res,
+        next_ticket: next,
+        ..Default::default()
+    })
+    .expect("a run's serve state");
     let ticket = h2
         .svc_enqueue(0, 0, vec![41])
         .expect("enqueue into restored server");

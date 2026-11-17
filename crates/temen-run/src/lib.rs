@@ -1667,19 +1667,15 @@ fn jit_durable_enter(
 /// powerbox, #2010, #2031), taken and admitted again for the JIT against `m`, the program it thaws:
 /// each live detached child prepared for re-launch exactly as the interpreter's thaw prepares it
 /// ([`relaunch_payload`]). `task` is the id its root had in the frozen run, which the vCPUs it spawned
-/// name as their parent: a JIT domain's root is task 0. `None` if the pass refuses it, which a
-/// restore that admitted it never leaves.
+/// name as their parent: a JIT domain's root is task 0. `None`, the residue left on `host`, if the pass
+/// refuses it, which a restore against `m` never leaves.
 fn jit_thaw(host: &mut Host, m: &Module, task: u64) -> Option<temen_jit::JitThaw> {
-    let mut raw = host.take_residue();
-    if task != 0 {
-        for v in &mut raw.vcpus {
-            if v.parent_task as u64 == task {
-                v.parent_task = 0;
-            }
-        }
-    }
-    let thaw = temen_ir::thaw::validate(m, 0, raw).ok()?;
-    Some(thaw.map(|l| relaunch_payload(host, l), |_| ()))
+    // Refused, the residue stays on `host` for the engine the caller declines to (#3034).
+    let thaw = host.take_thaw(m).ok()?;
+    Some(
+        thaw.rerooted(task)
+            .map(|l| relaunch_payload(host, l), |_| ()),
+    )
 }
 
 /// #1361 step 4 — a captured detached child a restore seeded, as a JIT re-launch payload: its program
@@ -1964,16 +1960,12 @@ fn leave_residue(
         detached: completed,
         ..r.into_raw()
     };
-    match temen_ir::thaw::validate(m, 0, raw) {
-        Ok(thaw) => {
-            host.set_thaw(thaw);
-            true
-        }
-        Err(_) => {
-            debug_assert!(false, "a JIT freeze left a residue the thaw pass refuses");
-            false
-        }
-    }
+    let admitted = host.admit_thaw(m, raw).is_ok();
+    debug_assert!(
+        admitted,
+        "a JIT freeze left a residue the thaw pass refuses"
+    );
+    admitted
 }
 
 /// **Code-memory compaction** for a guest-driven `Jit` domain (DESIGN.md §22): rebuild the domain's

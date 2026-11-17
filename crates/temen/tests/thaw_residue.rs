@@ -183,13 +183,15 @@ fn a_vcpu_value_no_spawn_makes_is_refused_at_restore() {
 fn a_fiber_value_no_run_makes_is_refused_at_restore() {
     let inst = instrument(FIBERS);
     let art = frozen(&inst);
+    assert_eq!(
+        bent(&art, |_| {}),
+        art,
+        "the control: an unedited decode and encode"
+    );
     let real = decode_residue(&art).expect("decode");
     assert_eq!(real.fibers.len(), 1, "the parked fiber rides");
     let cases: &[(&str, Bend)] = &[
-        ("eleven fibers in an arena of ten", |r| {
-            let f = r.fibers[0];
-            r.fibers = (0..11).map(|slot| FrozenFiber { slot, ..f }).collect();
-        }),
+        ("eleven fibers in an arena of ten", |r| eleven(r, 11)),
         ("a slot gap", |r| {
             r.fibers.push(FrozenFiber::free(2, 0));
         }),
@@ -206,33 +208,76 @@ fn a_fiber_value_no_run_makes_is_refused_at_restore() {
     for (what, bend) in cases {
         assert_refused(what, &inst, &bent(&art, bend));
     }
+    // The control: ten, each at its own slot's extent, fill the arena and are admitted.
+    let ten = bent(&art, |r| eleven(r, 10));
+    assert!(temen_snapshot::restore(&ten, &inst, &mut Host::new()).is_ok());
+}
+
+/// `n` copies of the fiber, each in its own slot's region at the same depth.
+fn eleven(r: &mut ResidueEdit, n: usize) {
+    let f = r.fibers[0];
+    let depth = f.shadow_sp - TEST_ARENA.region_base(1);
+    r.fibers = (0..n)
+        .map(|slot| FrozenFiber {
+            slot,
+            shadow_sp: TEST_ARENA.region_base(slot + 1) + depth,
+            ..f
+        })
+        .collect();
 }
 
 /// A fork twin's re-entry: on `b099bbb` an entry past the module reached `VCpu::new` on the
-/// tree-walker. Now it is refused, as is a context past the arena.
+/// tree-walker. Now it is refused, as is a context past the arena and a pid past `TASK_MAX`. The twin
+/// carries an artifact with an empty residue, which its own pass admits in any context, so each
+/// refusal is the parent's twin rule; the control, the same twin in the arena's top context, restores.
 #[test]
 fn a_twin_value_no_fork_makes_is_refused_at_restore() {
     let inst = instrument(FIBERS);
     let art = frozen(&inst);
+    let bare = bent(&art, |r| *r = ResidueEdit::default());
+    let twinned = |ctx: u32| with_twin_of(&art, &bare, ctx);
+    assert!(
+        temen_snapshot::restore(&twinned(10), &inst, &mut Host::new()).is_ok(),
+        "the control"
+    );
     let cases: &[(&str, Bend)] = &[
         ("an entry past the module", |r| r.twins[0].entry = 2),
-        ("a context past the arena", |r| r.twins[0].ctx = 11),
         ("a pid past TASK_MAX", |r| r.twins[0].pid = u64::MAX),
     ];
     for (what, bend) in cases {
-        let twinned = with_twin(&art);
-        assert_refused(what, &inst, &bent(&twinned, bend));
+        assert_refused(what, &inst, &bent(&twinned(10), bend));
     }
+    assert_refused("a context past the arena", &inst, &twinned(11));
+}
+
+/// A twin's own residue is admitted against the context its root runs in (`root_ctx`, the forking
+/// vCPU's): a fiber of it may not hold that context. The twin here carries the frozen fiber, slot 0,
+/// in context 1: refused for a twin in context 1, admitted for one in context 5.
+#[test]
+fn a_twins_residue_is_admitted_against_its_own_context() {
+    let inst = instrument(FIBERS);
+    let art = frozen(&inst);
+    assert!(temen_snapshot::restore(&with_twin_of(&art, &art, 5), &inst, &mut Host::new()).is_ok());
+    assert_refused(
+        "a twin's fiber in the twin's own context",
+        &inst,
+        &with_twin_of(&art, &art, 1),
+    );
 }
 
 /// `art` carrying a live fork twin: a copy of itself, as a fork of its root at the cut.
 fn with_twin(art: &[u8]) -> Vec<u8> {
-    let nested = art.to_vec();
+    with_twin_of(art, art, 0)
+}
+
+/// `art` carrying a live fork twin, whose own artifact is `nested`, running in context `ctx`.
+fn with_twin_of(art: &[u8], nested: &[u8], ctx: u32) -> Vec<u8> {
+    let nested = nested.to_vec();
     bent(art, move |r| {
         r.twins.push(LiveTwin {
             pid: 5,
             entry: 0,
-            ctx: 0,
+            ctx,
             payload: TwinRest {
                 servicer: true,
                 names: Vec::new(),
@@ -274,6 +319,27 @@ fn a_fork_twin_is_declined_whole_by_the_engines_that_do_not_recreate_one() {
     );
     assert_eq!(h.thawed_twins().len(), 1, "and leaves the residue whole");
 
+    // Its entry over a cached program, too (on `f2aff3d` it skipped the gate).
+    let (mut h, win) = restored();
+    let shared = std::sync::Arc::new(inst.clone());
+    let compiled = temen_interp::bytecode::compile_reserved(&shared).expect("compiles");
+    let mut fuel = 1_000_000u64;
+    assert!(
+        temen_interp::bytecode::run_capture_reserved_over_compiled_with_host(
+            &inst,
+            compiled,
+            0,
+            &[],
+            &mut fuel,
+            &win,
+            SIZE_LOG2,
+            &mut h,
+        )
+        .is_none(),
+        "the bytecode engine declines over a cached program"
+    );
+    assert_eq!(h.thawed_twins().len(), 1, "and leaves the residue whole");
+
     let (mut h, win) = restored();
     let r = temen_run::jit_cap_run(
         &inst,
@@ -286,8 +352,13 @@ fn a_fork_twin_is_declined_whole_by_the_engines_that_do_not_recreate_one() {
         None,
     );
     assert!(
-        matches!(r, Err(JitError::Unsupported(_))),
-        "the JIT declines: {:?}",
+        matches!(
+            r,
+            Err(JitError::Unsupported(
+                "durable JIT thaw: a detached child or fork twin the JIT cannot re-create"
+            ))
+        ),
+        "the JIT declines for the twin: {:?}",
         r.as_ref().map(|(o, _)| o)
     );
     assert_eq!(h.thawed_twins().len(), 1, "and leaves the residue whole");
@@ -414,29 +485,41 @@ fn spawner_finished(root: &str, a_rides: bool) {
         "A rides a record iff no one joined it"
     );
 
+    thaws_on_every_engine(&inst, &art, &want);
+}
+
+/// `art`, a real artifact of `inst`, re-freezes byte-identically once restored (§12.6), and thaws to
+/// `want` on the tree-walker and the JIT; the bytecode engine, which runs no `thread.*` durably,
+/// declines it to the tree-walker. Each engine is asserted to have run: this file builds only where
+/// the JIT has its thread runtime (`fiber_rt`).
+fn thaws_on_every_engine(inst: &Module, art: &[u8], want: &Result<Vec<Value>, temen_interp::Trap>) {
+    // The control for every bent row: the codec's own writers, given the residue unedited, write
+    // the artifact back byte for byte.
+    assert_eq!(
+        bent(art, |_| {}),
+        art,
+        "an unedited decode and encode is the artifact"
+    );
     let restored = || {
         let mut h = Host::new();
-        let mut win = temen_snapshot::restore(&art, &inst, &mut h).expect("a real artifact");
+        let mut win = temen_snapshot::restore(art, inst, &mut h).expect("a real artifact");
         begin_thaw(&mut win, TEST_ARENA, 0);
         (h, win)
     };
 
-    // A re-freeze of the restored domain, before its thaw begins: byte-identical (§12.6).
     let mut h = Host::new();
-    let win = temen_snapshot::restore(&art, &inst, &mut h).expect("a real artifact");
-    let again = temen_snapshot::freeze(&inst, &win, &h).expect("re-freeze");
+    let win = temen_snapshot::restore(art, inst, &mut h).expect("a real artifact");
+    let again = temen_snapshot::freeze(inst, &win, &h).expect("re-freeze");
     assert_eq!(again, art, "a restored domain re-freezes byte-identically");
 
-    // The tree-walker.
     let (mut h, win) = restored();
-    assert_eq!(interp_run(&inst, &win, &mut h), want, "tree-walker thaw");
+    assert_eq!(&interp_run(inst, &win, &mut h), want, "tree-walker thaw");
 
-    // The bytecode engine runs no `thread.*` durably: it declines to the tree-walker.
     let (mut h, win) = restored();
     let mut fuel = 10_000_000u64;
     assert!(
         temen_interp::bytecode::compile_and_run_capture_reserved_with_host(
-            &inst,
+            inst,
             0,
             &[],
             &mut fuel,
@@ -448,11 +531,10 @@ fn spawner_finished(root: &str, a_rides: bool) {
         "the bytecode engine declines"
     );
 
-    // The Cranelift JIT.
     let (mut h, win) = restored();
     h.set_durable(true);
-    match temen_run::jit_cap_run(
-        &inst,
+    let got = temen_run::jit_cap_run(
+        inst,
         0,
         &[],
         &MemLayout::image(win),
@@ -460,11 +542,21 @@ fn spawner_finished(root: &str, a_rides: bool) {
         0,
         &mut h,
         None,
-    ) {
-        Ok((JitOutcome::Returned(v), _)) => assert_eq!(v, vec![105], "JIT thaw"),
-        Err(JitError::Unsupported(_)) => {} // a target without the threads runtime
-        other => panic!("JIT thaw: {:?}", other.map(|(o, _)| o)),
-    }
+    )
+    .map(|(o, _)| o);
+    let want: Vec<i64> = want
+        .as_ref()
+        .expect("an answer")
+        .iter()
+        .map(|v| match v {
+            Value::I64(x) => *x,
+            v => panic!("{v:?}"),
+        })
+        .collect();
+    assert!(
+        matches!(&got, Ok(JitOutcome::Returned(v)) if *v == want),
+        "JIT thaw: {got:?}"
+    );
 }
 
 #[test]
@@ -476,3 +568,302 @@ fn a_thread_whose_spawner_finished_unjoined_thaws_transparently() {
 fn a_thread_whose_spawner_finished_and_was_joined_thaws_transparently() {
     spawner_finished(ROOT_JOINED, false);
 }
+
+// ---- #3034: a context whose unwound chain fills its shadow region exactly. The transform's
+// push check traps only past the region's end (`newsp > region_end`), so a real freeze writes an
+// extent equal to it. Each frame of `REC` is 16 bytes; the depths below fill both regions to the byte.
+
+/// Root and spawned thread each recurse through their own `REC` to a depth; at the bottom the root
+/// raises a flag and parks in the thread's join, and the thread waits for the flag and resumes a fiber
+/// (the freeze trigger). Returns the fiber's 5.
+fn full_region_src(thread_depth: i64, root_depth: i64) -> String {
+    let rec = |idx: usize, bottom: &str| {
+        format!(
+            "func (i64) -> (i64) {{
+block 0 (vn: i64) {{
+  vz = i64.const 0
+  vc = i64.eq vn vz
+  br_if vc 1() 2(vn)
+}}
+block 1 () {{
+{bottom}}}
+block 2 (vm: i64) {{
+  vone = i64.const 1
+  vm1 = i64.sub vm vone
+  vr = call {idx}(vm1)
+  return vr
+  }}
+}}
+"
+        )
+    };
+    let thread_bottom = "  vaddr = i64.const 66000
+  vexp = i32.const 0
+  vinf = i64.const -1
+  vst = i32.atomic.wait vaddr vexp vinf
+  vf = ref.func 4
+  vss = i64.const 4096
+  vk = cont.new vf vss
+  vz2 = i64.const 0
+  va, vb = cont.resume vk vz2
+  return vb
+";
+    let root_bottom = "  vaddr = i64.const 66000
+  vone = i32.const 1
+  i32.store vaddr vone
+  vn2 = atomic.notify vaddr vone
+  vha = i64.const 66008
+  vh = i32.load vha
+  vst, vr = thread.join vh
+  return vr
+";
+    format!(
+        "func () -> (i64) {{
+block 0 () {{
+  vz = i64.const 0
+  vt = thread.spawn 1 vz vz
+  vaddr = i64.const 66008
+  i32.store vaddr vt
+  vd = i64.const {root_depth}
+  vr = call 3(vd)
+  return vr
+  }}
+}}
+func (i64, i64) -> (i64) {{
+block 0 (v0: i64, v1: i64) {{
+  vd = i64.const {thread_depth}
+  vr = call 2(vd)
+  return vr
+  }}
+}}
+{}{}func (i64, i64) -> (i64) {{
+block 0 (v0: i64, v1: i64) {{
+  v2 = i64.const 5
+  v3 = suspend v2
+  return v3
+  }}
+}}
+",
+        rec(2, thread_bottom),
+        rec(3, root_bottom)
+    )
+}
+
+/// A vCPU, and the root beside it, frozen with their regions exactly full, thaw on every engine to
+/// the uninterrupted answer. On `f2aff3d` the restore refused the artifact as `Malformed`
+/// (`vcpu_of_sp` floored the vCPU's extent into the next context); on `b099bbb` its thaw answered
+/// `ThreadFault` at the use site.
+#[test]
+fn a_vcpu_and_the_root_frozen_with_their_regions_exactly_full_thaw_on_every_engine() {
+    let inst = instrument(&full_region_src(249, 250));
+    let want = interp_run(
+        &inst,
+        &init_durable_window(WINDOW, TEST_ARENA),
+        &mut Host::new(),
+    );
+    assert_eq!(want, Ok(vec![Value::I64(5)]), "uninterrupted");
+
+    let armed = || {
+        let mut win = init_durable_window(WINDOW, TEST_ARENA);
+        arm_freeze_after(&mut win, TEST_ARENA, 1);
+        win
+    };
+    // Frozen on the tree-walker.
+    let mut h = Host::new();
+    h.set_durable(true);
+    let mut fuel = 10_000_000u64;
+    let (r, snap) =
+        run_capture_reserved_with_host(&inst, 0, &[], &mut fuel, &armed(), SIZE_LOG2, &mut h);
+    assert!(r.is_ok(), "the freeze returns a placeholder: {r:?}");
+    let art = temen_snapshot::freeze(&inst, &snap, &h).expect("freeze");
+    full_regions_written(&art);
+    thaws_on_every_engine(&inst, &art, &want);
+
+    // Frozen on the JIT, whose harvest reads the same extents (on `f2aff3d`: a refused residue, a
+    // debug assert in `leave_residue`).
+    let mut h = Host::new();
+    h.set_durable(true);
+    let snap = match temen_run::jit_cap_run(
+        &inst,
+        0,
+        &[],
+        &MemLayout::image(armed()),
+        SIZE_LOG2,
+        0,
+        &mut h,
+        None,
+    ) {
+        Ok((JitOutcome::Returned(_), snap)) => snap,
+        other => panic!("JIT freeze: {:?}", other.map(|(o, _)| o)),
+    };
+    let art = temen_snapshot::freeze(&inst, snap.bytes(), &h).expect("freeze");
+    full_regions_written(&art);
+    thaws_on_every_engine(&inst, &art, &want);
+}
+
+/// What a freeze of [`full_region_src`] wrote: both extents at their regions' ends.
+fn full_regions_written(art: &[u8]) {
+    let written = decode_residue(art).expect("decode");
+    let ctx = |sp: u64| (sp - 1 - TEST_ARENA.base) / TEST_ARENA.stride;
+    let ends = |sp: u64| TEST_ARENA.region_base(ctx(sp) as usize) + TEST_ARENA.stride;
+    assert_eq!(written.vcpus.len(), 1, "the thread rides");
+    let v = written.vcpus[0].shadow_sp;
+    assert_eq!(v, ends(v), "the thread's chain fills its region");
+    let root = written.root_sp.expect("a root extent");
+    assert_eq!(
+        root,
+        TEST_ARENA.region_base(0) + TEST_ARENA.stride,
+        "and the root's"
+    );
+}
+
+/// A JIT thaw that refuses the residue (here: the run is not of the module the artifact was restored
+/// against) declines and leaves the residue where it was, for the engine its caller declines to. On
+/// `f2aff3d` the JIT took it first and dropped it on the refusal (#3034).
+#[test]
+fn a_refused_jit_thaw_leaves_the_residue_for_the_next_engine() {
+    let inst = instrument(THREADS);
+    let art = frozen(&inst);
+    let mut h = Host::new();
+    let mut win = temen_snapshot::restore(&art, &inst, &mut h).expect("restore");
+    begin_thaw(&mut win, TEST_ARENA, 0);
+    h.set_durable(true);
+    let before = (
+        h.residue().vcpus.clone(),
+        h.residue().root_sp,
+        h.residue().children.clone(),
+    );
+    assert_eq!(before.0.len(), 1, "the parked child rides");
+
+    let other = instrument(FIBERS); // no `thread.spawn`: its runs make no vCPU
+    let r = temen_run::jit_cap_run(
+        &other,
+        0,
+        &[],
+        &MemLayout::image(win),
+        SIZE_LOG2,
+        0,
+        &mut h,
+        None,
+    );
+    assert!(
+        matches!(r, Err(JitError::Unsupported(_))),
+        "the JIT declines: {:?}",
+        r.as_ref().map(|(o, _)| o)
+    );
+    let r = h.residue();
+    assert_eq!(
+        (r.vcpus.clone(), r.root_sp, r.children.clone()),
+        before,
+        "and the residue is where it was"
+    );
+}
+
+/// A kind of record no code of the module can make is refused (#3034): a fiber in a module
+/// with no `cont.new`, a vCPU in one with no `thread.spawn`, a completed detached child in one with no
+/// `Instantiator` call. On `f2aff3d` each restored, and the engines diverged: the tree-walker
+/// re-created the fiber or vCPU, the JIT, standing up no runtime for a kind its module has no site for,
+/// skipped it.
+#[test]
+fn a_record_kind_the_module_cannot_make_is_refused_at_restore() {
+    let threads = instrument(THREADS);
+    let fibers = instrument(FIBERS);
+    let fiber = |r: &mut ResidueEdit| {
+        r.fibers.push(FrozenFiber {
+            slot: 0,
+            func: 1,
+            arg0: 0,
+            shadow_sp: TEST_ARENA.frame_base(1),
+            generation: 1,
+            consumed: false,
+        })
+    };
+    assert_refused(
+        "a fiber, no cont.new",
+        &threads,
+        &bent(&frozen(&threads), fiber),
+    );
+    let fart = frozen(&fibers);
+    let vcpu = {
+        let t = decode_residue(&frozen(&threads)).expect("decode");
+        (t.vcpus, t.children, t.root_sp)
+    };
+    assert_refused(
+        "a vCPU, no thread.spawn",
+        &fibers,
+        &bent(&fart, |r| {
+            r.vcpus = vcpu.0.clone();
+            r.children = vcpu.1.clone();
+            r.root_sp = vcpu.2;
+        }),
+    );
+    assert_refused(
+        "a detached child, no Instantiator",
+        &fibers,
+        &bent(&fart, |r| {
+            r.children = vec![1];
+            r.detached.push(temen_ir::thaw::FrozenDetached {
+                parent_task: 0,
+                slot: 0,
+                completed_result: Ok(7),
+            });
+        }),
+    );
+}
+
+/// A root that may spawn a detached child (an `Instantiator` call on a path it never takes).
+const SPAWNS: &str = r#"
+func (i32) -> (i64) {
+block 0 (v0: i32) {
+  vz = i32.const 0
+  vc = i32.eq v0 vz
+  br_if vc 1() 2(v0)
+}
+block 1 () {
+  vr = i64.const 1
+  return vr
+}
+block 2 (vi: i32) {
+  vrp = i64.const 0
+  vh = call.cap 6 17 (i64) -> (i32) vi (vrp)
+  vh64 = i64.extend_i32_u vh
+  return vh64
+  }
+}
+"#;
+
+/// The pass checks a completed child's trap code itself, so an embedder's residue meets the rule the
+/// decoder's does (#3034). On `f2aff3d` a trap code of 0 was admitted here, and on a thaw it
+/// fired the tree-walker's `joined` assert and read as success on the JIT.
+#[test]
+fn a_trap_code_no_trap_has_is_refused_on_the_embedders_route() {
+    let inst = instrument(SPAWNS);
+    let completed = |code| temen_interp::Residue {
+        children: vec![1],
+        detached: vec![temen_ir::thaw::FrozenDetached {
+            parent_task: 0,
+            slot: 0,
+            completed_result: Err(code),
+        }],
+        ..Default::default()
+    };
+    let mut h = Host::new();
+    assert!(
+        h.admit_thaw(&inst, completed(temen_ir::trap_code::THREAD_FAULT))
+            .is_ok(),
+        "a trap a join answers"
+    );
+    for code in [
+        0,
+        temen_ir::trap_code::DOMAIN_DONE,
+        temen_ir::trap_code::THREAD_FAULT | 1 << 32,
+    ] {
+        let mut h = Host::new();
+        assert!(
+            h.admit_thaw(&inst, completed(code)).is_err(),
+            "trap code {code:#x}"
+        );
+        assert!(h.residue().is_empty(), "and nothing is seeded");
+    }
+}
+

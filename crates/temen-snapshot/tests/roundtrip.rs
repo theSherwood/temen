@@ -1146,8 +1146,8 @@ fn serve_state_round_trips_through_the_codec() {
     let win = init_durable_window(WINDOW, TEST_ARENA);
 
     let mut host = Host::new();
-    host.set_svc_state(
-        vec![
+    host.set_serve(temen_interp::Serve {
+        queue: vec![
             SvcDispatch {
                 export: 0,
                 op: 1,
@@ -1161,9 +1161,11 @@ fn serve_state_round_trips_through_the_codec() {
                 ticket: 6,
             },
         ],
-        vec![(3, Reply::Results(vec![999, -1])), (4, Reply::Failed(-9))],
-        7,
-    );
+        results: vec![(3, Reply::Results(vec![999, -1])), (4, Reply::Failed(-9))],
+        next_ticket: 7,
+        ..Default::default()
+    })
+    .expect("state a run makes");
     let artifact = freeze(&inst, &win, &host).expect("freeze with serve state");
 
     let mut rhost = Host::new();
@@ -1190,14 +1192,20 @@ fn a_ticket_counter_no_run_makes_is_refused() {
     use temen_interp::SvcDispatch;
     let inst = instrument(SRC);
     let win = init_durable_window(WINDOW, TEST_ARENA);
+    // The rule is `Host::set_serve`'s, which a restore seeds the decoded state through: refused there,
+    // it is refused at restore.
     let refused = |queue: Vec<SvcDispatch>, next: u64| {
         let mut host = Host::new();
-        host.set_svc_state(queue, Vec::new(), next);
-        let artifact = freeze(&inst, &win, &host).expect("the encoder writes what it holds");
-        matches!(
-            restore(&artifact, &inst, &mut Host::new()),
-            Err(RestoreError::Malformed)
-        )
+        let serve = temen_interp::Serve {
+            queue,
+            next_ticket: next,
+            ..Default::default()
+        };
+        if host.set_serve(serve).is_err() {
+            return true;
+        }
+        let artifact = freeze(&inst, &win, &host).expect("freeze");
+        restore(&artifact, &inst, &mut Host::new()).is_err()
     };
     let dispatch = |ticket| SvcDispatch {
         export: 0,
@@ -1221,7 +1229,11 @@ fn reply_waits_and_frozen_handlers_round_trip_through_the_codec() {
     let inst = instrument(SRC);
     let win = init_durable_window(WINDOW, TEST_ARENA);
     let mut host = Host::new();
-    host.set_reply_waits(vec![(0, 4), (3, 0)]);
+    host.set_serve(temen_interp::Serve {
+        waits: vec![(0, 4), (3, 0)],
+        ..Default::default()
+    })
+    .expect("state a run makes");
     let artifact = freeze(&inst, &win, &host).expect("freeze with reply waits");
 
     let mut rhost = Host::new();
@@ -1234,13 +1246,18 @@ fn reply_waits_and_frozen_handlers_round_trip_through_the_codec() {
         "canonical re-serialize is byte-identical"
     );
 
-    // A handler with no fiber behind it, and its ticket past the counter: neither is one a run makes.
-    host.set_frozen_handlers(vec![(1, 9)]);
-    let forged = freeze(&inst, &win, &host).expect("the encoder writes what it holds");
-    assert!(matches!(
-        restore(&forged, &inst, &mut Host::new()),
-        Err(RestoreError::Malformed)
-    ));
+    // A handler with no fiber behind it, and its ticket past the counter: neither is one a run makes,
+    // and `Host::set_serve` (which a restore seeds through) refuses each, changing nothing.
+    let mut h = Host::new();
+    for handlers in [vec![(1, 9)], vec![(1, 0)]] {
+        let forged = temen_interp::Serve {
+            next_ticket: 1,
+            handlers,
+            ..Default::default()
+        };
+        assert!(h.set_serve(forged).is_err());
+    }
+    assert!(h.frozen_handlers().is_empty());
 }
 
 /// The serve section is **elided** when the trio is empty (a never-served domain), so the
@@ -2295,9 +2312,31 @@ fn a_budget_tree_rides_the_artifact_with_its_links_and_charges() {
 /// A detached residue — `(parent_task, slot, join-result)` per child — round-trips through the codec
 /// and re-freezes byte-identically. A negative result exercises the two's-complement uleb, and two
 /// records exercise the canonical `(parent_task, slot)` sort + the trailing-block framing.
+/// [`SRC`] that, on a path it never takes, spawns a detached child (#3034: a residue with detached
+/// children is one only a module with an `Instantiator` call makes).
+const SRC_SPAWNS: &str = r#"
+func (i32) -> (i64) {
+block 0 (v0: i32) {
+  vz = i32.const 0
+  vc = i32.eq v0 vz
+  br_if vc 1() 2(v0)
+}
+block 1 () {
+  v1 = i64.const 100
+  return v1
+}
+block 2 (vi: i32) {
+  vrp = i64.const 0
+  vs = call.cap 6 17 (i64) -> (i32) vi (vrp)
+  vs64 = i64.extend_i32_u vs
+  return vs64
+  }
+}
+"#;
+
 #[test]
 fn a_completed_detached_child_rides_the_control_section() {
-    let inst = instrument(SRC);
+    let inst = instrument(SRC_SPAWNS);
     let win = init_durable_window(WINDOW, TEST_ARENA);
 
     let mut host = Host::new();
