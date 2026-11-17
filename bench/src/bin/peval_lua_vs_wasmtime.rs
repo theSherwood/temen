@@ -210,7 +210,7 @@ fn build_wasm64(src_text: &str) -> Option<PathBuf> {
     std::fs::write(dir.join("src/lib.rs"), src_text).ok()?;
     let ok = Command::new("cargo")
         .args([
-            "+nightly",
+            temen_bench_vs_wasmtime::nightly_arg().as_str(),
             "build",
             "-Zbuild-std=core",
             "--target=wasm64-unknown-unknown",

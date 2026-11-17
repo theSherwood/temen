@@ -419,3 +419,114 @@ pub fn always_work_ir() -> String {
     let idle = "func (i64, i64) -> (i64) {\nblock 0 (va: i64, vb: i64) {\n  return va\n  }\n}\n";
     format!("memory 16\n{root}{idle}")
 }
+
+/// #3078 phase 2 slice 1 — [`NOWAKE_IR`]'s no-wake ops beside `k` **fibers**: `func 0 (n, k, m, s)`
+/// parks `k` fibers of the root, each waiting for good, then makes `n` no-wake ops on word 16448,
+/// `m` choosing which as in [`NOWAKE_IR`] (0: a notify with no waiter; 1: a wait that answers
+/// not-equal). With `s` 0 the fibers wait on another word (16392); with `s` 1 they wait on 16448 itself
+/// and leave before the loop (a notify wakes them all and the root resumes each to its return), the
+/// case a fiber wait that never counted out kept on the slow path. Handles go at 20000 + 8i.
+pub const NOWAKE_FIBERS_IR: &str = r#"memory 16
+func (i64, i64, i64, i64) -> (i64) {
+block 0 (vn: i64, vk: i64, vm: i64, vs: i64) {
+  vz = i64.const 0
+  br 1(vn, vk, vm, vs, vz)
+}
+block 1 (vn1: i64, vk1: i64, vm1: i64, vs1: i64, vi1: i64) {
+  vlt1 = i64.lt_u vi1 vk1
+  br_if vlt1 2(vn1, vk1, vm1, vs1, vi1) 3(vn1, vk1, vm1, vs1)
+}
+block 2 (vn2: i64, vk2: i64, vm2: i64, vs2: i64, vi2: i64) {
+  vb2 = i64.const 16392
+  vd2 = i64.const 56
+  vo2 = i64.mul vs2 vd2
+  vw2 = i64.add vb2 vo2
+  vf2 = ref.func 1
+  vc2 = cont.new vf2 vw2
+  vz2 = i64.const 0
+  vr2, vv2 = cont.resume vc2 vz2
+  vh2 = i64.const 20000
+  ve2 = i64.const 8
+  vx2 = i64.mul vi2 ve2
+  va2 = i64.add vh2 vx2
+  i64.store va2 vc2
+  vone2 = i64.const 1
+  vin2 = i64.add vi2 vone2
+  br 1(vn2, vk2, vm2, vs2, vin2)
+}
+block 3 (vn3: i64, vk3: i64, vm3: i64, vs3: i64) {
+  vz3 = i64.const 0
+  vne3 = i64.ne vs3 vz3
+  br_if vne3 4(vn3, vk3, vm3) 7(vn3, vm3)
+}
+block 4 (vn4: i64, vk4: i64, vm4: i64) {
+  vx4 = i64.const 16448
+  vk324 = i32.wrap_i64 vk4
+  vw4 = atomic.notify vx4 vk324
+  vz4 = i64.const 0
+  br 5(vn4, vk4, vm4, vz4)
+}
+block 5 (vn5: i64, vk5: i64, vm5: i64, vi5: i64) {
+  vlt5 = i64.lt_u vi5 vk5
+  br_if vlt5 6(vn5, vk5, vm5, vi5) 7(vn5, vm5)
+}
+block 6 (vn6: i64, vk6: i64, vm6: i64, vi6: i64) {
+  vh6 = i64.const 20000
+  ve6 = i64.const 8
+  vx6 = i64.mul vi6 ve6
+  va6 = i64.add vh6 vx6
+  vc6 = i64.load va6
+  vz6 = i64.const 0
+  vr6, vv6 = cont.resume vc6 vz6
+  vone6 = i64.const 1
+  vin6 = i64.add vi6 vone6
+  br 5(vn6, vk6, vm6, vin6)
+}
+block 7 (vn7: i64, vm7: i64) {
+  vzero7 = i64.const 0
+  br 8(vn7, vm7, vzero7, vzero7)
+}
+block 8 (vn8: i64, vm8: i64, vi8: i64, vacc8: i64) {
+  vlt8 = i64.lt_u vi8 vn8
+  br_if vlt8 9(vn8, vm8, vi8, vacc8) 12(vacc8)
+}
+block 9 (vn9: i64, vm9: i64, vi9: i64, vacc9: i64) {
+  vzero9 = i64.const 0
+  veq9 = i64.eq vm9 vzero9
+  br_if veq9 10(vn9, vm9, vi9, vacc9) 11(vn9, vm9, vi9, vacc9)
+}
+block 10 (vn10: i64, vm10: i64, vi10: i64, vacc10: i64) {
+  vx10 = i64.const 16448
+  vone10 = i32.const 1
+  vw10 = atomic.notify vx10 vone10
+  vw6410 = i64.extend_i32_u vw10
+  vacc210 = i64.add vacc10 vw6410
+  vinc10 = i64.const 1
+  vin10 = i64.add vi10 vinc10
+  br 8(vn10, vm10, vin10, vacc210)
+}
+block 11 (vn11: i64, vm11: i64, vi11: i64, vacc11: i64) {
+  vx11 = i64.const 16448
+  vone11 = i32.const 1
+  vto11 = i64.const -1
+  vs11 = i32.atomic.wait vx11 vone11 vto11
+  vs6411 = i64.extend_i32_u vs11
+  vacc211 = i64.add vacc11 vs6411
+  vinc11 = i64.const 1
+  vin11 = i64.add vi11 vinc11
+  br 8(vn11, vm11, vin11, vacc211)
+}
+block 12 (vr12: i64) {
+  return vr12
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vw: i64, varg: i64) {
+  vz = i32.const 0
+  vinf = i64.const -1
+  vs = i32.atomic.wait vw vz vinf
+  vr = i64.extend_i32_s vs
+  return vr
+  }
+}
+"#;

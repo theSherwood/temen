@@ -41,6 +41,9 @@ env:
   # version's cached bitcode + cluster, skip the rebuild, and ship the old Postgres — silently.
   # Keep in step with the same var in ci.yml, which shares this cache key.
   TEMEN_PG_VER: "17.5"
+  # #3068 — the dated nightly the wasm engine builds on. Keep in step with the same var in ci.yml,
+  # whose lanes test this build on it.
+  RUST_NIGHTLY: "nightly-2026-11-16"
 
 jobs:
   # Cheap change-detector (~10 s, easy to schedule even under contention): compare the published commit
@@ -78,7 +81,7 @@ jobs:
       # flex/bison are Postgres's own build-time scanner/parser generators — needed only on a cold
       # Postgres input cache, where build-pg-assets.mjs compiles it from source.
       - uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2 # nightly
-        with: { components: rust-src }
+        with: { toolchain: "${{ env.RUST_NIGHTLY }}", components: rust-src }
       # Three workspaces: `browser` (the wasm engine), the root (temen-run's `prep_temen`/`build_image`),
       # and the workspace-excluded `crates/temen-llvm` (`temen-llvm-translate`). The latter two build the
       # Postgres regenerate half below; caching them is what keeps a warm run's re-translate at ~30s
@@ -98,13 +101,13 @@ jobs:
       - name: build threads wasm engine
         working-directory: browser
         run: |
-          rustup target add wasm32-unknown-unknown --toolchain nightly
+          rustup target add wasm32-unknown-unknown --toolchain "$RUST_NIGHTLY"
           RUSTFLAGS="-Ctarget-feature=+atomics,+bulk-memory,+mutable-globals \
             -Clink-arg=--shared-memory -Clink-arg=--import-memory -Clink-arg=--max-memory=4294967296 \
             -Clink-arg=--export=__stack_pointer -Clink-arg=--export=__tls_base \
             -Clink-arg=--export=__tls_size -Clink-arg=--export=__tls_align \
             -Clink-arg=--export=__wasm_init_tls" \
-            cargo +nightly build -Z build-std=std,panic_abort --release --lib --target wasm32-unknown-unknown
+            cargo +"$RUST_NIGHTLY" build -Z build-std=std,panic_abort --release --lib --target wasm32-unknown-unknown
 
       # The on-ramp .temen assets (hello + SQLite Phase A) at --host-page 65536 (the wasm page). The
       # committed hello_c.temen is regenerated too; SQLite's amalgamation is fetched-and-cached.
