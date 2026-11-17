@@ -839,9 +839,10 @@ block 0 (va: i64, vb: i64) {
 }
 ";
 
-/// **A spawn charges a recycled context's cell only by adding to it** (PR #3091's review). The
-/// spawned thread takes the context A left, whose cell A's fiber refilled after A ended. Its paid
-/// entry is added to what that cell holds, so nothing the chain was charged for is thrown away, and
+/// **A spawn's entry throws away nothing a recycled cell held** (PR #3091's review). The spawned
+/// thread takes the context A left, whose cell A's fiber refilled after A ended. Seeding its paid
+/// entry hands what that cell held back to the chain first, then holds the unit, so nothing the
+/// chain was charged for is thrown away, and
 /// every engine charges alike, the root's entry, A's, the thread's, the fiber's three resumes and its
 /// five taken back-edges. The first version of #3081's payment assumed the cell empty: a debug
 /// build aborted in `thread_spawn`, and a release build dropped the fiber's draw.
@@ -961,11 +962,13 @@ block 1 (vi: i64) {
 ";
 
 /// **A refused spawn frees no context** (PR #3091's review). A's context waits for the next spawn
-/// while A's fiber, which B resumes, goes on charging its cell. The refused spawn must leave it
-/// alone: the first version of #3081's payment took a context on the spawner and freed it when the
-/// table refused the handle, under the running fiber. Now the spawner pays on the domain's chain
-/// and touches no context, so a context is freed only as the run ends. The tree-walker and the JIT
-/// end the run on the refusal. A use after free here shows only under a sanitizer.
+/// while A's fiber, which B resumes, goes on charging its cell. The first version of #3081's payment
+/// took a context on the spawner and freed it when the table refused the handle, under the running
+/// fiber. The protection is structural: the spawner now pays on the domain's chain and touches no
+/// context, so a context is freed only as the run ends. This row does not catch the free: on that
+/// version a debug build aborts first on its assertion that a recycled cell is empty, and a release
+/// build under ASan reports nothing, since ASan does not see the JIT's code touch the freed cell. It
+/// pins the run's end alike on the tree-walker and the JIT, with that context in the pool.
 #[test]
 fn jit_fuel_a_refused_spawn_frees_no_context_a_fiber_charges() {
     let m = parse_module(A_REFUSED_SPAWN_UNDER_A_RUNNING_FIBER).expect("parse");

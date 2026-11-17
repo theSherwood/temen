@@ -1400,6 +1400,12 @@ fn nested_outer(on: Executor, loan: u64) -> (Reply, u64) {
 /// from the loan, so a kept draw stranded half the loan, and the least loan was twice the cost.
 /// The JIT alone: the interpreters charge an activation no entry and the nested call nothing to the
 /// outer loan, so their least loan here is not the JIT's (#3093).
+///
+/// The read-back is ordered: `outer()` can call in, so it is carried (it may leave the caller's
+/// thread), and its end reads its cell's `can_burn` (`HeldSite::carry`'s `done`). `kept()` never
+/// parks, so it runs inline, on `outer()`'s own stack inside its `call.cap`: its context, and with it
+/// its cell, drops as that `call.cap` returns, handing back what it drew before `outer()` runs on,
+/// let alone ends.
 #[test]
 fn a_nested_activation_on_the_jit_can_burn_its_whole_loan() {
     let (done, cost) = nested_outer(Executor::Jit, 1_000_000);

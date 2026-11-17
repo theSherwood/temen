@@ -12874,8 +12874,8 @@ fn emit_fuel_check(b: &mut FunctionBuilder, lower: &Lower) {
         .ins()
         .load(I64, MemFlags::trusted(), addr, crate::fuel::REFILL_OFF);
     b.ins().call_indirect(sig, refill, &[addr]);
-    // What the refill granted, not a reload of `left`: a sibling vCPU's plain store may have put a
-    // stale `0` there since (see `fuel_refill`).
+    // What the refill granted, not a reload of `left`: another context's plain store (#3080) may
+    // have put a stale `0` there since (see `fuel_refill`).
     let drawn = b
         .ins()
         .load(I64, MemFlags::trusted(), addr, crate::fuel::GRANTED_OFF);
