@@ -1765,6 +1765,10 @@ block 0 (va0: i64, vb0: i64) {{
 /// mark, marks, and exits, so the sibling is inside the call when the root's exit lands, by
 /// construction. The run ends `Exit(7)` once the call returns and the sibling sees the domain's end.
 /// (Not on the oracle, which runs one task at a time: its call would wait for a root that cannot run.)
+/// Unmetered (#3065): the root spins in guest code until the sibling's OS thread has started and
+/// reached its call, which takes as long as the host takes, and a fuel grant would stand in for that
+/// time (a loaded Windows runner ran the root out of fuel first). The harness's bound ([`PROMPT`])
+/// is the row's, as for [`an_exit_beside_a_spinning_sibling_ends_the_run_on_every_route`].
 #[test]
 fn an_exit_beside_a_sibling_inside_a_host_call_ends_the_run_on_both_routes() {
     static HOST_CALL_LEFT: std::sync::atomic::AtomicBool =
@@ -1839,7 +1843,7 @@ block 0 (va0: i64, vb0: i64) {{
         }
     }
     let _left = Left;
-    all_answer(make, grant, false, METERED, Err("Exit(7)".into()));
+    all_answer(make, grant, false, None, Err("Exit(7)".into()));
 }
 
 /// #2958 slice 4 — the calls the kernel route declines, inline, each with the clause that names what
