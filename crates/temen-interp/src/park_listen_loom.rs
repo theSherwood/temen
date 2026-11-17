@@ -5,8 +5,13 @@
 //! more, then sleeps ([`crate::bytecode`]'s `ThreadRun::park`, #2757). The store that ends it lands
 //! outside the rules: another vCPU's pipe write, a pool thread's answer. Each model runs a parker
 //! against one store and asserts no wake is lost: the parker either sees the store in its look, or
-//! the store finds its registration and fires it. Each is written in the orders the code uses, over
-//! the same kinds of locks and atomics:
+//! the store finds its registration and fires it.
+//!
+//! **These model the order, not the code.** Each is a copy of the protocol, written in the orders
+//! the code uses over the same kinds of locks and atomics, not `PipeWakers` or `Completions`
+//! themselves (they use `std`'s types, which loom cannot step). A change to either's order must be
+//! made here too; moving both behind a loom-swappable module so the model runs the code is
+//! #3074. The models:
 //!
 //! - **A pipe** (`PipeProbe::listen` then `PipeProbe::ready`, against a write then
 //!   `PipeWakers::fire`): the parker pushes its waker under the wakers' mutex and bumps the count

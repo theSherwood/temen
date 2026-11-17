@@ -878,9 +878,8 @@ pub unsafe extern "C" fn cap_thunk_locked(
         // CALLS.md 5c.1b — a **locked-domain caller** takes the parked transport too, with this
         // domain's guard released before it blocks (#2139): blocking on a sibling's reply while
         // holding it would deadlock (A holds A waiting B; B blocked on A's lock).
-        // A punted call's job may still run and post its answer: that answer lands in this domain's
-        // completions, which no caller claims, and the domain's end (this trap) ends the run, so
-        // nothing waits on it.
+        // A kernel task's call to a live callee is one `native_scope` declines (`serving`): reaching
+        // it here is that predicate's bug, and it traps rather than take today's transport.
         if live.is_some() && kernel_backstop(vm) {
             return;
         }

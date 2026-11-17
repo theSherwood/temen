@@ -26219,6 +26219,28 @@ type IfaceKey = (Arc<[String]>, Arc<[FuncType]>);
 /// capability state (captured stdio, a monotonic clock). Construct with [`Host::new`],
 /// `grant_*` the initial capabilities, then pass to [`run_with_host`]; afterwards read
 /// back `stdout`/`stderr`. Deterministic by design so it serves as a §18 oracle.
+/// #3037 — the facts of a [`Host`] executor 2's rules read under the run lock, without the `Host`'s
+/// own lock, in one shared object: the `Host` writes them, a domain's
+/// [`DomainHost`](bytecode::DomainHost) holds the same `Arc`, so no setter can leave a copy stale.
+/// Each is written only by its setter: `durable` by [`Host::set_durable`], `records` by
+/// [`Host::record_caps`] and a replay restore (both turn it on; nothing turns it off).
+#[derive(Default)]
+pub(crate) struct HostFacts {
+    durable: AtomicBool,
+    records: AtomicBool,
+}
+
+impl HostFacts {
+    /// Whether the host runs a durable module ([`Host::is_durable`]).
+    pub(crate) fn durable(&self) -> bool {
+        self.durable.load(Ordering::Acquire)
+    }
+    /// Whether the host tapes its calls ([`Host::records_caps`]).
+    pub(crate) fn records(&self) -> bool {
+        self.records.load(Ordering::Acquire)
+    }
+}
+
 pub struct Host {
     table: Vec<Slot>, // CAP slots, host-owned
     /// Bytes a `Stream{In}` handle's `read` draws from.
@@ -26762,7 +26784,9 @@ pub struct Host {
     /// every vCPU so the runtime maintains the per-context shadow-SP swap (D-fiber-cont option A,
     /// DURABILITY.md §12.8). `false` (the default) ⇒ an ordinary run that never touches the
     /// durable reserve. Set with [`Host::set_durable`] before [`run_with_host`] / friends.
-    durable: bool,
+    /// It lives in [`HostFacts`], with whether the host tapes its calls, so a scheduler reads both
+    /// without this `Host`'s lock (#3037).
+    facts: Arc<HostFacts>,
     /// The freeze/thaw fiber residue (slice 3.1.5): **out** of a freeze run (the driver flattens
     /// each parked fiber and records it here for the snapshot) and **in** to a thaw run (`drive`
     /// re-seeds the registry from it before re-entering under `REWINDING`). Empty for an ordinary run.
@@ -27458,7 +27482,7 @@ impl Host {
             cap_record: None,
             cap_replay: None,
             cap_consumed: 0,
-            durable: false,
+            facts: Arc::default(),
             frozen_fibers: Vec::new(),
             frozen_vcpus: Vec::new(),
             frozen_detached: Vec::new(),
@@ -27788,7 +27812,7 @@ impl Host {
         twin.cap_names = self.cap_names.clone();
         twin.self_reified = self.self_reified.clone(); // empty (self_instance is None)
         twin.attestation = self.attestation;
-        twin.durable = self.durable;
+        twin.set_durable(self.is_durable());
         // Copied I/O scalars (POSIX fork copies the stdin buffer/offset; a shared fd is the sink case).
         (twin.stdin, twin.stdin_pos) = self.stdin_copy();
         twin.stdin_block = self.stdin_block;
@@ -28159,7 +28183,7 @@ impl Host {
             // result reloads on thaw). A serve op must *re-issue* instead (§13.4 slice 4b), and the
             // transform cannot see a runtime binding — so a durable domain never resolves an import
             // to one: the call fails closed (`CapFault`), on every engine, through this one getter.
-            .filter(|b| !(self.durable && temen_ir::durable_abi::is_serve_op(b.type_id, b.op)))
+            .filter(|b| !(self.is_durable() && temen_ir::durable_abi::is_serve_op(b.type_id, b.op)))
     }
 
     /// Install this domain's **import-binding table** (§7 / IMPORTS.md phase 1): entry `i` is the
@@ -28229,7 +28253,7 @@ impl Host {
     /// option A, DURABILITY.md §12.8). Set before handing the host to [`run_with_host`] /
     /// [`run_capture_reserved_with_host`]. A non-durable run leaves the reserve untouched.
     pub fn set_durable(&mut self, durable: bool) {
-        self.durable = durable;
+        self.facts.durable.store(durable, Ordering::Release);
     }
 
     /// Enable **blocking stdin** (a persistent interactive session — see [`Self::stdin_block`]). With it
@@ -28276,33 +28300,35 @@ impl Host {
             .and_then(|(_, source)| source.spawn_take())
     }
 
-    /// #1826 — every park transient the last dispatch left, drained at once ([`ParkTransients`]):
-    /// the one drain the interpreters' call arms use, for an engine that decides outside this crate
-    /// (a JIT process tree, `jit_proc`). #2847 — `None` when it left none, as most calls do: a few
-    /// loads that change nothing, where a drain writes every flag back.
+    /// Whether the last dispatch left a park transient [`ParkTransients::drain`] acts on: a wake, a
+    /// park, or a request. The one list of them, which [`Self::take_park_transients`] and
+    /// [`Self::parks_left`] both read.
     #[inline]
-    /// #2958 slice 5 — whether the last dispatch left any per-op park flag ([`ParkTransients`],
-    /// the stdin park, the interrupt latch): the cheap test a call that left none (most calls) stops
-    /// at, before a drain.
-    pub(crate) fn parks_left(&self) -> bool {
+    fn transients_left(&self) -> bool {
         self.pipe_wake.is_some()
             || self.pipe_wake_writers.is_some()
             || self.region_wake.is_some()
             || self.pipe_read_parked.is_some()
             || self.pipe_write_parked.is_some()
             || self.park_request.load(Ordering::Relaxed) != 0
-            || self.stdin_parked
-            || self.sig_interrupt
     }
 
+    /// #2958 slice 5 — whether the last dispatch left any per-op park flag: a transient
+    /// ([`Self::transients_left`]), the stdin park or the interrupt latch, every flag
+    /// `bytecode::DispatchParks::take` drains. The cheap test a call that left none (most calls)
+    /// stops at, before a drain.
+    #[inline]
+    pub(crate) fn parks_left(&self) -> bool {
+        self.transients_left() || self.stdin_parked || self.sig_interrupt
+    }
+
+    /// #1826 — every park transient the last dispatch left, drained at once ([`ParkTransients`]):
+    /// the one drain the interpreters' call arms use, for an engine that decides outside this crate
+    /// (a JIT process tree, `jit_proc`). #2847 — `None` when it left none, as most calls do: a few
+    /// loads that change nothing, where a drain writes every flag back.
+    #[inline]
     pub fn take_park_transients(&mut self) -> Option<ParkTransients> {
-        let left = self.pipe_wake.is_some()
-            || self.pipe_wake_writers.is_some()
-            || self.region_wake.is_some()
-            || self.pipe_read_parked.is_some()
-            || self.pipe_write_parked.is_some()
-            || self.park_request.load(Ordering::Relaxed) != 0;
-        if !left {
+        if !self.transients_left() {
             // What a drain takes, and nothing else: it takes the interrupt flag and a spawn plan
             // only beside a park or a request.
             debug_assert!(ParkTransients::drain(self).is_empty());
@@ -28520,7 +28546,7 @@ impl Host {
 
     /// Whether this domain runs a durable module (see [`Host::set_durable`]). Read by `drive`.
     pub fn is_durable(&self) -> bool {
-        self.durable
+        self.facts.durable.load(Ordering::Acquire)
     }
 
     /// Whether this host records its cap tape ([`record_caps`](Host::record_caps)).
@@ -28824,6 +28850,7 @@ impl Host {
     pub fn record_caps(&mut self) {
         if self.cap_record.is_none() {
             self.cap_record = Some(Vec::new());
+            self.facts.records.store(true, Ordering::Release);
         }
     }
 
@@ -29080,6 +29107,7 @@ impl Host {
             slot.1 = s.cap_cursor;
         }
         self.cap_record = Some(s.cap_record.clone());
+        self.facts.records.store(true, Ordering::Release);
         // Reinstate the §3.6 serve state (replaces whatever the reused caller-built host was seeded with
         // at construction) so a replay resumed from the checkpoint drains the exact remaining queue and
         // observes the same settled cells — the inverse of [`Host::svc_state`] captured above.
@@ -29452,7 +29480,7 @@ impl Host {
         submit: HostCompletion,
         pending: Option<&mut Option<u64>>,
     ) -> Result<(), Trap> {
-        let Some(slot) = pending.filter(|_| !self.durable) else {
+        let Some(slot) = pending.filter(|_| !self.is_durable()) else {
             return Err(Trap::CapFault);
         };
         // While taping, remember the call so the *delivered* value can be recorded as its
@@ -30650,7 +30678,7 @@ impl Host {
         // #1361 step 4 — R1's endpoint (#1440): a **durable** domain spawns detached only over children
         // a freeze of it may capture, i.e. while it holds freeze authority over its detached progeny.
         // Checked first, so a refusal charges nothing.
-        if self.durable && !self.holds_freeze_authority() {
+        if self.is_durable() && !self.holds_freeze_authority() {
             return Err(SpawnRefusal::Authority);
         }
         let Some(node) = self.budget_node(lease.budget) else {
@@ -31044,6 +31072,11 @@ impl Host {
     /// thread without this `Host`'s lock.
     pub(crate) fn vcpu_ids(&self) -> Arc<std::sync::atomic::AtomicI64> {
         Arc::clone(&self.threads_started)
+    }
+
+    /// #3037 — this `Host`'s [`HostFacts`], shared, so a scheduler reads them without its lock.
+    pub(crate) fn facts(&self) -> Arc<HostFacts> {
+        Arc::clone(&self.facts)
     }
 
     /// #1944 slice 3 — the node this domain's vCPUs draw their fuel from: its own.
@@ -33108,7 +33141,7 @@ impl Host {
             // Derived (#1440): an ancestor may snapshot this child iff the spawner holds freeze
             // authority *and* the subtree is durable. Both conjuncts matter — authority is *who
             // may*, durability is *whether a snapshot is possible at all*.
-            freeze_exposed: self.durable && self.holds_freeze_authority(),
+            freeze_exposed: self.is_durable() && self.holds_freeze_authority(),
         }
     }
 
@@ -33456,7 +33489,7 @@ impl Host {
         // verify — the host-side instrumentation pass this TCB crate cannot run itself (no `temen-durable`
         // dependency). Without that grant a durable domain still fails closed (`-EINVAL`): an
         // un-instrumented unit could never drain-then-unwind, silently making the domain non-snapshottable.
-        if self.durable && !self.jit_hosts_durable {
+        if self.is_durable() && !self.jit_hosts_durable {
             return Ok(Err(EINVAL));
         }
         let Some(validate) = self.jit_validator else {
@@ -33469,7 +33502,7 @@ impl Host {
         // A taint-free program recomputes an (empty) set each compile — negligible; a program that
         // taints anything caches after the first. The root's eager set is never empty-and-injected
         // together, so this no-ops for it.
-        if self.durable
+        if self.is_durable()
             && self.jit_hosts_durable
             && self.jit_durable_tainted_sigs.is_empty()
             && self.jit_durable_taint_fn.is_some()
@@ -33480,7 +33513,7 @@ impl Host {
         }
         // Read the durable install fence out before the `&mut jit_tables` borrow (disjoint fields):
         // the gate predicate (Copy) and a shared borrow of the program's tainted signatures.
-        let durable_gate = if self.durable {
+        let durable_gate = if self.is_durable() {
             self.jit_durable_gate
         } else {
             None
@@ -33556,7 +33589,7 @@ impl Host {
         // both the validated unit and the host — the injected [`JitValidator`] is a bare `fn`.
         // #2222 — at most three grants, mid-run, into a table the guest may have filled: with no room
         // for them the unit installs without the set, and its spawns refuse as before #1529.
-        if unit_spawns_detached && !self.durable && self.room() >= 3 {
+        if unit_spawns_detached && !self.is_durable() && self.room() >= 3 {
             let inst = self.resolve_cap_name("instantiator");
             if inst.is_some_and(|h| self.resolve_instantiator(h).is_ok()) {
                 self.grant_detached_spawn_caps(mem_log2.map_or(0, |m| 1u64 << m));
@@ -34437,7 +34470,7 @@ impl Host {
             import_reqs: self.import_reqs.clone(),
             self_module: self.self_module.clone(),
             attestation: self.attestation,
-            durable: self.durable,
+            durable: self.is_durable(),
             own_budget: self.own_budget,
             held: self.window_held(),
             lane_cap: self.lane_cap,
@@ -34449,7 +34482,7 @@ impl Host {
     /// aliased to this host's, as the spawn aliased it ([`Host::alias_inherited_stdio`]).
     pub(crate) fn rebuild_child_powerbox(&mut self, pb: &ChildPowerbox) -> Host {
         let mut child = self.child_host();
-        child.durable = pb.durable;
+        child.set_durable(pb.durable);
         child.attestation = pb.attestation;
         child.budgets = Arc::clone(&self.budgets);
         child.own_budget = pb.own_budget;
@@ -34510,7 +34543,7 @@ impl Host {
         // `spawn_child_powerbox` itself stays durability-neutral — its nested callers carry the bit on
         // the vCPU; the nesting × durability cell on the resumable engine is #1413's to audit, not
         // this builder's to decide.
-        let durable = self.durable;
+        let durable = self.is_durable();
         // D66, #1944 — the child is stamped with the lane its admission reserved and given the
         // budget it charged, as the tree-walker's arm does. The JIT's thunk carries both from its
         // admission hook to this build itself, so nothing waits on this host between the two for

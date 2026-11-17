@@ -236,17 +236,15 @@ fn fueled(m: &temen_ir::Module, budget: u64) -> [(Result<Vec<i64>, Trap>, u64); 
         &mut cell,
     )
     .expect("jit");
-    let mut host = Host::new();
-    let admitted = jit_kernel::admit(m, &host, false).expect("in the kernel's scope");
-    let start = fresh_start(budget);
-    let end = jit_kernel::run(admitted, start, &mut host).expect("compiles");
-    assert!(end.vcpus >= 1, "it ran as kernel tasks");
-    let kernel = result(end.outcome().0);
-    [
-        (oracle, left),
-        (result(today), cell),
-        (kernel, host.fuel_left()),
-    ]
+    let km = m.clone();
+    let kernel = bounded("the kernel route", move || {
+        let mut host = Host::new();
+        let admitted = jit_kernel::admit(&km, &host, false).expect("in the kernel's scope");
+        let end = jit_kernel::run(admitted, fresh_start(budget), &mut host).expect("compiles");
+        assert!(end.vcpus >= 1, "it ran as kernel tasks");
+        (result(end.outcome().0), host.fuel_left())
+    });
+    [(oracle, left), (result(today), cell), kernel]
 }
 
 /// Fuel on the kernel route is exact: a threaded run that completes leaves exactly the oracle's
@@ -2121,6 +2119,15 @@ block 0 (va: i64) {
         jit_kernel::admit(&roots, &Host::new(), false).err(),
         Some("gc.roots")
     );
+    // An armed external-wake bell (`outside bell`): a park nothing in the run can end would wait for
+    // it on the kernel, where today's route answers `ThreadFault`. The same program is admitted on a
+    // host without it (below).
+    let mut belled = Host::new();
+    belled.arm_external_wake();
+    assert_eq!(
+        jit_kernel::admit(&call(0, 0), &belled, false).err(),
+        Some("outside bell")
+    );
     // And what it admits beside them: a stream read with a non-blocking stdin and no pipe, and the
     // packed `type_id` and `covers` of a self interface past the first, as their typed forms are.
     assert!(jit_kernel::admit(&call(0, 0), &Host::new(), false).is_ok());
@@ -2220,6 +2227,113 @@ block 0 () {
     };
     assert_eq!(jit_kernel::admit(&m, &bound(9), false).err(), Some("cap"));
     assert!(jit_kernel::admit(&m, &bound(0), false).is_ok());
+}
+
+/// A `{ write, read }` interface over host `Stream` handle `h`, its methods remapped to ops 1 and 0,
+/// and a program that calls its `read` once and returns what it got.
+fn grouped_stream() -> (temen_ir::Module, Host) {
+    let m = module(
+        "memory 16
+type 0 func (i64, i64) -> (i64)
+type 1 interface { write: 0, read: 0 }
+import 0 interface \"stdio\" 1
+func 0 () -> (i64) {
+block 0 () {
+  vq = i64.const 16400
+  vone = i32.const 1
+  vk = atomic.notify vq vone
+  v0 = i64.const 16384
+  v1 = i64.const 4
+  v2 = call.import 0.read (v0, v1)
+  return v2
+  }
+}
+",
+    );
+    let mut host = Host::new();
+    let h = host.grant_stream(temen_interp::StreamRole::In);
+    host.set_import_bindings(vec![temen_interp::BoundImport::required(
+        temen_ir::cap_id::STREAM,
+        0,
+        h,
+    )]);
+    host.set_import_remap(0, std::sync::Arc::from(vec![1u32, 0]));
+    (m, host)
+}
+
+/// #2958 slice 5 review — a grouped `Stream` import is admitted now that a stream read's park is
+/// the kernel's, and its `read` answers as the oracle's: here the 2 bytes stdin holds.
+#[test]
+fn a_grouped_stream_read_answers_as_the_oracle_on_the_kernel_route() {
+    let (m, mut host) = grouped_stream();
+    host.push_stdin(b"hi");
+    let mut oracle_host = {
+        let (_, mut h) = grouped_stream();
+        h.push_stdin(b"hi");
+        h
+    };
+    let oracle = temen_interp::run_with_host(&m, 0, &[], &mut 1_000_000, &mut oracle_host);
+    assert_eq!(
+        oracle.map(|v| v.to_vec()),
+        Ok(vec![temen_interp::Value::I64(2)])
+    );
+    let admitted = jit_kernel::admit(&m, &host, false).expect("in the kernel's scope");
+    let end = jit_kernel::run(admitted, fresh_start(u64::MAX), &mut host).expect("compiles");
+    assert_eq!(end.result.map(|v| v.to_vec()), Ok(vec![2]));
+}
+
+/// #2958 slice 5 review — a grouped `Stream` import's `read` on a blocking stdin nothing can feed
+/// parks as the inline `call.cap` form does: the interpreted op and the kernel's thunk decide that
+/// it is a read from the op it reaches (the op through `Host::import_target`, a grouped binding's
+/// remap included; the thunk from the reached `(type_id, op)` the call site passes), so both give
+/// the deadlock verdict, `ThreadFault`. The tree-walker never parks an import-routed stdin read and
+/// answers EOF, `0`: pinned with its issue (#3076), so its fix shows up as a row to change.
+#[test]
+fn a_grouped_stream_read_on_a_blocking_stdin_parks_on_both_executor_2_lanes() {
+    let (m, mut host) = grouped_stream();
+    host.set_stdin_blocking(true);
+    let km = m.clone();
+    let kernel = bounded("the kernel route", move || {
+        let admitted = jit_kernel::admit(&km, &host, false).expect("in the kernel's scope");
+        jit_kernel::run(admitted, fresh_start(u64::MAX), &mut host)
+            .expect("compiles")
+            .result
+            .map(|v| v.to_vec())
+    });
+    assert_eq!(kernel, Err(Trap::ThreadFault), "the kernel route");
+    let interp = bounded("executor 2 interpreting", move || {
+        let (m, mut host) = grouped_stream();
+        host.set_stdin_blocking(true);
+        let mut run = temen_interp::bytecode::CoopRun::new_parallel(
+            &m,
+            0,
+            &[],
+            u64::MAX,
+            host,
+            &[],
+            temen_ir::DEFAULT_RESERVED_LOG2,
+            None,
+            false,
+        )
+        .expect("subset")
+        .expect("open");
+        match run.run() {
+            temen_interp::bytecode::CoopEvent::Trapped(t) => Err(t),
+            temen_interp::bytecode::CoopEvent::Done(v) => Ok(v),
+            _ => panic!("executor 2 interpreting: neither an end nor a trap"),
+        }
+    });
+    assert_eq!(interp, Err(Trap::ThreadFault), "executor 2 interpreting");
+    let oracle = bounded("the oracle", || {
+        let (m, mut host) = grouped_stream();
+        host.set_stdin_blocking(true);
+        temen_interp::run_with_host(&m, 0, &[], &mut 1_000_000, &mut host).map(|v| v.to_vec())
+    });
+    assert_eq!(
+        oracle,
+        Ok(vec![temen_interp::Value::I64(0)]),
+        "the oracle answers EOF (#3076)"
+    );
 }
 
 /// #2958 slice 4 review — the race on an aliased page, as slice 3's race on a private one is built:
@@ -2918,22 +3032,10 @@ fn a_metered_pingpong_leaves_the_oracles_fuel_on_the_kernel_route() {
     );
 }
 
-/// Whether the oracle runs `m` to an end within a second: it waits on a park only its embedder
-/// could end, where executor 2 and the JIT give their deadlock verdict (#2616). Its thread is left
-/// parked when it does not.
-fn oracle_ends(m: &temen_ir::Module) -> bool {
-    let m = m.clone();
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let _ = tx.send(oracle(&m));
-    });
-    rx.recv_timeout(Duration::from_secs(1)).is_ok()
-}
-
 /// #2958 slice 5 — a read of a pipe whose only write end its reader holds can never end: on the
 /// kernel route the rules park the task and, with nothing left in the run to wake it, reach their
-/// deadlock verdict, `ThreadFault`. The tree-walker counts a pipe park as one its embedder may end
-/// and waits (#2616); today's route refuses the mint ([`TODAY_PIPE`]).
+/// deadlock verdict, `ThreadFault`. Today's route refuses the mint ([`TODAY_PIPE`]). The tree-walker
+/// is not run: it counts a pipe park as one its embedder may end and waits for good (#2616).
 #[test]
 fn a_pipe_read_nothing_can_fill_is_a_deadlock_on_the_kernel_route() {
     let m = minting(
@@ -2950,13 +3052,13 @@ fn a_pipe_read_nothing_can_fill_is_a_deadlock_on_the_kernel_route() {
     );
     assert_eq!(kernel(&m), Err(Trap::ThreadFault), "the kernel route");
     assert_eq!(today(&m), TODAY_PIPE, "today's route (#3070)");
-    assert!(!oracle_ends(&m), "the oracle waits (#2616)");
 }
 
 /// #2958 slice 5, condition 6 — a blocking stdin read nothing can feed: nothing can feed stdin
 /// during a JIT run (the embedder's `push_stdin` needs the `Host` the run holds), so both JIT routes
 /// give the deadlock verdict, `ThreadFault`, the kernel route's rules as today's hub does. The
-/// tree-walker waits, its stdin park one an embedder could end (#2616).
+/// tree-walker is not run: it counts a stdin park as one an embedder could end and waits for good
+/// (#2616).
 #[test]
 fn a_blocking_stdin_read_nothing_can_feed_is_a_deadlock_on_both_routes() {
     fn make(h: i32) -> temen_ir::Module {
@@ -2985,16 +3087,6 @@ block 0 () {{
     for (route, answer) in by_instance(make, grant, false, None) {
         assert_eq!(answer, Err("ThreadFault".into()), "{route}");
     }
-    let mut h = Host::new();
-    let m = make(grant(&mut h));
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let _ = tx.send(temen_interp::run_with_host(&m, 0, &[], &mut 1_000_000, &mut h).is_ok());
-    });
-    assert!(
-        rx.recv_timeout(Duration::from_secs(1)).is_err(),
-        "the oracle waits (#2616)"
-    );
 }
 
 /// #2958 slice 5 — a run's end reaches a task parked on a pipe: a thread exits the run (here by a
@@ -3026,67 +3118,93 @@ block 0 (va: i64, vb: i64) {
     pipes_agree(&m, Err(Trap::MemoryFault));
 }
 
-/// #2958 slice 5 — a gate a punted job waits at: the job marks it reached, then waits (within
-/// [`PROMPT`]) for the harness to open it, and marks it passed. A harness opens it once the job has
-/// reached it, so the job's call is outstanding first by construction, or before the run.
+/// #2958 slice 5 — a gate punted jobs wait at, one ticket each: a job takes the next ticket as it
+/// reaches the gate, then waits (within [`PROMPT`]) for its ticket to be opened, and marks it passed.
+/// A harness opens a ticket only once its job has reached the gate ([`Gate::open_next`]), so that
+/// job's call is outstanding first by construction; or it opens every ticket before the run.
 struct Gate {
-    state: std::sync::Mutex<(bool, bool, u32)>, // (reached, open, passed)
+    state: std::sync::Mutex<GateState>,
     cv: std::sync::Condvar,
+}
+
+struct GateState {
+    reached: u32,
+    opened: u32,
+    passed: u32,
+    done: bool,
 }
 
 impl Gate {
     const fn new() -> Gate {
         Gate {
-            state: std::sync::Mutex::new((false, false, 0)),
+            state: std::sync::Mutex::new(GateState {
+                reached: 0,
+                opened: 0,
+                passed: 0,
+                done: false,
+            }),
             cv: std::sync::Condvar::new(),
         }
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, (bool, bool, u32)> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, GateState> {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// The job's side: reach the gate, wait for it to open, pass it. `false` if it never opened.
-    fn pass(&self) -> bool {
-        let mut g = self.lock();
-        g.0 = true;
-        self.cv.notify_all();
-        let (mut g, t) = (self.cv)
-            .wait_timeout_while(g, PROMPT, |s| !s.1)
+    fn wait(
+        &self,
+        until: impl FnMut(&mut GateState) -> bool,
+    ) -> (std::sync::MutexGuard<'_, GateState>, bool) {
+        let mut until = until;
+        let (g, t) = (self.cv)
+            .wait_timeout_while(self.lock(), PROMPT, |s| !until(s))
             .unwrap_or_else(|e| e.into_inner());
-        if t.timed_out() {
+        (g, !t.timed_out())
+    }
+
+    /// The job's side: take a ticket, wait for it to open, pass. `false` if it never opened.
+    fn pass(&self) -> bool {
+        let ticket = {
+            let mut g = self.lock();
+            g.reached += 1;
+            g.reached
+        };
+        self.cv.notify_all();
+        let (mut g, opened) = self.wait(|s| s.opened >= ticket);
+        if opened {
+            g.passed += 1;
+            self.cv.notify_all();
+        }
+        opened
+    }
+
+    /// Open every ticket, before any job reaches the gate.
+    fn open(&self) {
+        self.lock().opened = u32::MAX;
+        self.cv.notify_all();
+    }
+
+    /// The harness's side: wait until the next ticket's job has reached the gate, then open that
+    /// ticket alone. `false` once [`Self::finish`] was called, or if no job came within [`PROMPT`].
+    fn open_next(&self) -> bool {
+        let (mut g, came) = self.wait(|s| s.done || s.reached > s.opened);
+        if !came || g.reached <= g.opened {
             return false;
         }
-        g.2 += 1;
+        g.opened += 1;
         self.cv.notify_all();
         true
     }
 
-    /// Open it, for every job from now on.
-    fn open(&self) {
-        self.lock().1 = true;
+    /// No more jobs will come: an [`Self::open_next`] waiting returns `false`.
+    fn finish(&self) {
+        self.lock().done = true;
         self.cv.notify_all();
-    }
-
-    /// The harness's side: wait until a job has reached it, then open it. `false` if none came.
-    fn open_once_reached(&self) -> bool {
-        let g = self.lock();
-        let (mut g, t) = (self.cv)
-            .wait_timeout_while(g, PROMPT, |s| !s.0)
-            .unwrap_or_else(|e| e.into_inner());
-        g.1 = true;
-        self.cv.notify_all();
-        !t.timed_out()
     }
 
     /// Wait until `n` jobs have passed it. `false` if they did not within [`PROMPT`].
     fn passed(&self, n: u32) -> bool {
-        let g = self.lock();
-        !(self.cv)
-            .wait_timeout_while(g, PROMPT, |s| s.2 < n)
-            .unwrap_or_else(|e| e.into_inner())
-            .1
-            .timed_out()
+        self.wait(|s| s.passed >= n).1
     }
 }
 
@@ -3139,10 +3257,10 @@ fn a_punted_call_parks_until_its_answer_on_every_route() {
     static EARLY: Gate = Gate::new();
     static LATE: Gate = Gate::new();
     EARLY.open();
-    let opener = std::thread::spawn(|| {
-        // Every run of every lane reaches the gate in turn; it stays open once opened.
-        LATE.open_once_reached()
-    });
+    // Each lane's job reaches the gate in turn, and its ticket opens only then: every lane's call is
+    // outstanding before its answer can come.
+    let opener =
+        std::thread::spawn(|| std::iter::from_fn(|| LATE.open_next().then_some(())).count());
     for thread in [false, true] {
         let early: fn(i32) -> temen_ir::Module = match thread {
             false => |h| calls_punted(h, false),
@@ -3163,7 +3281,10 @@ fn a_punted_call_parks_until_its_answer_on_every_route() {
         None,
         Ok(vec![42]),
     );
-    assert!(opener.join().expect("the opener"), "a job reached the gate");
+    LATE.finish();
+    let opened = opener.join().expect("the opener");
+    assert!(opened >= 1, "a job reached the gate");
+    assert!(LATE.passed(opened as u32), "each opened job passed");
 }
 
 /// #2958 slice 5, condition 4 — a punted job may outlive its run: its job owns its inputs (an
@@ -3209,7 +3330,7 @@ block 0 (va: i64, vb: i64) {{
         Err(Trap::MemoryFault),
         "the sibling's fault ends the run"
     );
-    assert!(HELD.open_once_reached(), "the job reached the gate");
+    assert!(HELD.open_next(), "the job reached the gate");
     assert!(HELD.passed(1), "the job finished after its run");
 }
 
@@ -3285,8 +3406,9 @@ block 0 () {{
 /// #2958 slice 5, Q5 — a punted call's answer by the shape of its declared results (none, one `i64`,
 /// one `i32`, two) and by who answers it (the offload pool, or the embedder), on every engine. The
 /// tree-walker decides: only an `[i64]` reply parks on the embedder's answer, and no punt answers two
-/// results. The kernel route gives its answer, or declines what its thunk cannot tell apart (`punt
-/// shape`, #3072); the other engines' present answers are pinned with their issue (#3071), so a fix
+/// results. The kernel route gives its answer for an `[i64]` call, and declines every other shape
+/// whoever answers it (`punt shape`, #3072): its thunk cannot tell a call's result types apart, and
+/// an offloadable procedure's call is the same call as a host-answered one's to it. The other engines' present answers are pinned with their issue (#3071), so a fix
 /// shows up as a row to change. A host-answered call that declines is run with no answerer: its
 /// decline comes after the request is filed, so an embedder that answered at once could beat it on
 /// every engine (#3071).
@@ -3347,7 +3469,7 @@ fn a_punted_calls_answer_by_its_shape_on_every_engine() {
             |h| punt_shaped(h, ""),
             pool,
             false,
-            [Some(ok(0)), Some(ok(0)), Some(ok(0)), Some(ok(0))],
+            [Some(ok(0)), Some(ok(0)), None, Some(ok(0))],
         ),
         (
             "",
@@ -3379,7 +3501,7 @@ fn a_punted_calls_answer_by_its_shape_on_every_engine() {
             |h| punt_shaped(h, "i32"),
             pool,
             false,
-            [Some(ok(42)), Some(ok(42)), Some(ok(42)), Some(ok(42))],
+            [Some(ok(42)), Some(ok(42)), None, Some(ok(42))],
         ),
         // Today's route parks and answers it (#3071); it runs with the answerer, the others without.
         (
@@ -3397,7 +3519,7 @@ fn a_punted_calls_answer_by_its_shape_on_every_engine() {
             |h| punt_shaped(h, "i64, i64"),
             pool,
             false,
-            [Some(cf()), Some(cf()), Some(cf()), Some(ok(42))],
+            [Some(cf()), Some(cf()), None, Some(ok(42))],
         ),
         (
             "i64, i64",
@@ -3458,13 +3580,11 @@ fn a_punted_calls_answer_by_its_shape_on_every_engine() {
 /// A, sets a done word and returns them. The root waits for the ready word, then signals until the
 /// done word is set, and returns `100 +` the waiter's bits `+` both maps' answers.
 ///
-/// Why a signal racing the wait's park cannot lose the wake: the signal's store (its bits, then the
-/// sequence bump) is made in the dispatch, before its stop, and its wake (`wake_region`) is applied
-/// under the run lock; the waiter's compare and its entry into the wait index are made under the
-/// same lock, in the wait rule (or, on the no-wake fast path, after it counted in on the region's
-/// key, which the signal's stop never skips). So a wait that compared before the bump is in the
-/// index when the wake looks, and one that compares after it reads the new sequence and returns
-/// not-equal. Overlap is by construction: the root signals until the waiter reports.
+/// What it pins: a signal through one alias wakes a wait through the other on every route, the
+/// waiter's bits read back, and the run ends with the oracle's answer. The signals overlap the wait
+/// by construction (the root signals until the waiter reports), but a run cannot show that a signal
+/// racing the wait's park loses no wake: that rests on both being decided under the run lock (PR
+/// #3073's description has the argument).
 fn signalled(handle: i32) -> temen_ir::Module {
     let g = temen_interp::host_region_granularity();
     let b = ALIAS_A + g;

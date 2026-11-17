@@ -8813,8 +8813,7 @@ struct LeafStart {
 
 /// #1954 — whether a stream op `op` can park under `host`: a read on a pipe end or a blocking stdin,
 /// a write on a pipe end. One rule for an inline `call.cap` and an import bound to the same op, on
-/// every route that asks ([`image_parks`], [`native_scope`]). Ops past 2 are not asked: they may park
-/// anyhow.
+/// [`image_parks`]. Ops past 2 are not asked: they may park anyhow.
 fn stream_op_parks(host: &Host, op: u32) -> bool {
     (op == 0 && (host.stdin_block || holds_pipe(host))) || (op == 1 && holds_pipe(host))
 }
@@ -8830,7 +8829,7 @@ fn holds_pipe(host: &Host) -> bool {
 /// host-completed cap parks on its embedder ([`super::OpParks::OnHost`]); one that answers in the call
 /// (an in-memory file system) cannot park, since only a personality's request parks such a call; any
 /// other may. `None` is an inline call, whose handle is an operand: it parks as any of the host's
-/// could ([`Host::host_procs_park`]; #1414 S4-3b). One rule for [`image_parks`] and [`native_scope`].
+/// could ([`Host::host_procs_park`]; #1414 S4-3b). [`image_parks`]'s rule.
 fn host_proc_parks(host: &Host, handle: Option<i32>) -> super::OpParks {
     use super::OpParks;
     match handle {
@@ -8941,6 +8940,11 @@ fn image_parks(host: &Host, m: &Module, census: &ImageCensus) -> Parks {
 ///   or for good if no consumer needs it);
 /// - **`signals`**: delivery into native code is the engine's safepoint redirect, not executor 2's
 ///   interrupt (a later phase);
+/// - **`outside bell`**: the embedder armed the external-wake bell ([`Host::arm_external_wake`]),
+///   so a pipe or stdin park nothing in the run can end waits for it on the kernel, where today's
+///   JIT route answers `ThreadFault` (#2616). No in-tree embedder arms it without a signal source
+///   (the personality has one; a held run never reaches here). Removed when the kernel is the only
+///   route, so there is no second answer (the phase that runs every JIT program on the kernel);
 /// - **`serving`**: the host holds a guest's offer (a live callee's, `Binding::LiveImpl`, or a
 ///   module's own, `Binding::Offer`), which may sit under any interface's id, a built-in's
 ///   included, so [`kernel_op`]'s table cannot see a call through it (this function's own scan);
@@ -8951,8 +8955,9 @@ fn image_parks(host: &Host, m: &Module, census: &ImageCensus) -> Parks {
 ///   anything mid-run), a binding count that differs from the module's imports, or a
 ///   `call.import.dyn`: what the call reaches is not known at admission (removed with the last
 ///   clause that names a call target the kernel cannot serve);
-/// - **`punt shape`**: a host procedure's call a host-answered procedure may answer, whose declared
-///   results are not exactly one `i64` ([`punt_shape`]; #3072);
+/// - **`punt shape`**: a host procedure's call its embedder may answer (a host-answered or an
+///   offloadable procedure held), whose declared results are not exactly one `i64` ([`punt_shape`];
+///   #3072);
 /// - every other clause is [`kernel_op`]'s, which decides an inline `call.cap` and a bound import's
 ///   target alike. A call that parks (a pipe or stdin read, a pipe write, a punted call) or wakes
 ///   another's park (a pipe end's `close`, a region post's `signal`) is admitted: the kernel's rules
@@ -8985,6 +8990,9 @@ pub fn native_scope(m: &Module, host: &Host) -> Result<(), &'static str> {
     }
     if host.signal_arm_pair().is_some() {
         return Err("signals");
+    }
+    if host.external_wake().is_some() {
+        return Err("outside bell");
     }
     // A guest's offer, a live callee's (`Host::wire_live_impl`) or a module's own (an embedder's
     // `Host::wire_offer_func` or `wire_offer_proc`, `export.handle`, `Host::adopt_offer` on a
@@ -9032,13 +9040,14 @@ pub fn native_scope(m: &Module, host: &Host) -> Result<(), &'static str> {
     Ok(())
 }
 
-/// #2958 slice 5 — the `punt shape` clause: a host procedure's call that a host-answered procedure
-/// may answer, whose declared results are not exactly one `i64`. The oracle declines such a call
+/// #2958 slice 5 — the `punt shape` clause: a host procedure's call that its embedder may answer (the
+/// host holds a host-answered or an offloadable procedure, either of which may answer a call
+/// `OffloadOutcome::Host`), whose declared results are not exactly one `i64`. The oracle declines such a call
 /// (only an `[i64]` reply parks on the embedder's answer), and the Cranelift JIT's cap thunk, which
 /// sees how many result slots a call has but not their types, cannot tell it from one that parks
 /// (#3071). Removed when the thunk learns the call's result types (#3072). An inline `call.cap` on a
 /// host procedure, or a `call.import` / `call.sym` whose binding is one, is decided on the call's
-/// own signature; a host holding no host-answered procedure declines nothing here.
+/// own signature; a host holding neither kind declines nothing here.
 fn punt_shape(host: &Host, m: &Module, i: &Inst) -> Result<(), &'static str> {
     use temen_ir::cap_id::HOST_PROC;
     let sig = match i {
@@ -9053,10 +9062,14 @@ fn punt_shape(host: &Host, m: &Module, i: &Inst) -> Result<(), &'static str> {
         },
         _ => return Ok(()),
     };
-    let answered = host
-        .host_procs
-        .iter()
-        .any(|p| matches!(p.handler, super::ProcHandler::HostAnswered(_)));
+    // Either may answer a call `OffloadOutcome::Host`, which the embedder finishes (the dispatch
+    // treats the two alike).
+    let answered = host.host_procs.iter().any(|p| {
+        matches!(
+            p.handler,
+            super::ProcHandler::HostAnswered(_) | super::ProcHandler::Offloadable(_)
+        )
+    });
     let one_i64 = matches!(
         m.types.get(sig as usize),
         Some(temen_ir::TypeEntry::Func(f)) if f.results[..] == [temen_ir::ValType::I64]
@@ -9581,6 +9594,17 @@ struct DispatchParks {
 }
 
 impl DispatchParks {
+    /// Whether the op left no flag at all ([`call_park`]'s check of [`Host::parks_left`]).
+    #[cfg(debug_assertions)]
+    fn quiet(&self) -> bool {
+        !self.stdin
+            && self.request.is_none()
+            && self.pipe_read.is_none()
+            && self.pipe_write.is_none()
+            && !self.sig_interrupt
+            && self.region.is_none()
+    }
+
     /// Drain every per-op flag from `p`. Call ONLY inside the dispatch's own lock scope.
     fn take(p: &mut Host) -> Self {
         let request = p.take_park_request();
@@ -9690,6 +9714,11 @@ pub enum CallPark {
 pub fn call_park(host: &mut Host, read: bool) -> CallPark {
     // Most calls leave nothing: they pay one look at the flags.
     if !host.parks_left() {
+        // The one list of flags `parks_left` reads is every flag a drain takes.
+        debug_assert!(
+            DispatchParks::take(host).quiet(),
+            "a flag `parks_left` missed"
+        );
         return CallPark::Done(None);
     }
     let parks = DispatchParks::take(host);
@@ -12170,7 +12199,8 @@ enum VcpuStop {
         child: Option<usize>,
     },
     /// #1080 rung 4 — a personality blocking pipe read/write surfaced to the cooperative driver
-    /// ([`Outcome::PipeRead`]/[`Outcome::PipeWrite`]). `pipe` is the parker's domain-local pipe index.
+    /// ([`Outcome::PipeRead`]/[`Outcome::PipeWrite`]). `pipe` is the parked end's probe, taken under the
+    /// dispatch's hold, so its readiness reads the FIFO, not the `Host` (#3037).
     PipeRead {
         pipe: super::PipeProbe,
     },
@@ -12721,7 +12751,7 @@ mod domain_host {
     /// under the run lock, without its lock: a vCPU inside a long synchronous host call holds the
     /// lock for the call, and a rule that waited on it would hold up every other vCPU's stop (#3037).
     /// [`DomainHost::new`] is the one way to make one, so a domain's facts are always its own
-    /// powerbox's. Each is the very object the `Host` holds, or a value no setter changes while a
+    /// powerbox's. Each is the very object the `Host` holds, or a value no setter changes once a
     /// domain is made over the `Host`:
     ///
     /// - **`signals`**, the `(armed, source)` pair ([`Host::signal_arm_pair`]): set by
@@ -12735,10 +12765,9 @@ mod domain_host {
     /// - **`node`**, the budget node the domain's vCPUs draw from ([`Host::own_node`]): the tree is
     ///   the `Arc` the `Host` holds, and its own index is set as a powerbox is built (a fork twin's, a
     ///   child's, a relaunch's), before the domain over it is made.
-    /// - **`durable`**: set as a powerbox is built ([`Host::set_durable`], a thaw's or a spawn's), before
-    ///   the domain over it is made.
-    /// - **`records`**, whether the host tapes its calls ([`Host::records_caps`]): set by the
-    ///   embedder's `record_caps` before its run.
+    /// - **`facts`**, whether the domain is durable and whether its host tapes its calls: the
+    ///   `Host`'s own [`HostFacts`](super::super::HostFacts), so a setter that runs while the domain
+    ///   lives (a debugger's `host_mut`, a replay restore) is seen at once.
     /// - **`vcpu_ids`**, the counter a thread's id is drawn from ([`Host::next_vcpu_id`]): the
     ///   `Host`'s own atomic.
     pub(crate) struct DomainHost {
@@ -12749,8 +12778,7 @@ mod domain_host {
         )>,
         comps: Arc<super::super::Completions>,
         node: super::super::NodeRef,
-        durable: bool,
-        records: bool,
+        facts: Arc<super::super::HostFacts>,
         vcpu_ids: Arc<std::sync::atomic::AtomicI64>,
     }
 
@@ -12762,19 +12790,17 @@ mod domain_host {
                 h.signal_arm_pair(),
                 h.completions(),
                 h.own_node(),
-                h.is_durable(),
-                h.records_caps(),
+                h.facts(),
                 h.vcpu_ids(),
             );
             drop(h);
-            let (signals, comps, node, durable, records, vcpu_ids) = facts;
+            let (signals, comps, node, facts, vcpu_ids) = facts;
             DomainHost {
                 cell,
                 signals,
                 comps,
                 node,
-                durable,
-                records,
+                facts,
                 vcpu_ids,
             }
         }
@@ -12794,12 +12820,6 @@ mod domain_host {
             self.signals.as_ref().map(|(_, s)| s)
         }
 
-        /// The armed flag beside the signal source, if it has one.
-        #[allow(dead_code)]
-        pub(crate) fn armed(&self) -> Option<&Arc<AtomicBool>> {
-            self.signals.as_ref().map(|(a, _)| a)
-        }
-
         /// The domain's completions store: the punted calls its vCPUs wait on.
         pub(crate) fn comps(&self) -> &Arc<super::super::Completions> {
             &self.comps
@@ -12812,7 +12832,7 @@ mod domain_host {
 
         /// Whether the domain is durable.
         pub(crate) fn durable(&self) -> bool {
-            self.durable
+            self.facts.durable()
         }
 
         /// The id of the next thread the domain starts: as [`Host::next_vcpu_id`], from the same counter.
@@ -12824,7 +12844,7 @@ mod domain_host {
 
         /// Whether the domain's host tapes its calls.
         pub(crate) fn records(&self) -> bool {
-            self.records
+            self.facts.records()
         }
     }
 
@@ -19276,8 +19296,7 @@ impl TaskSeam for CallSeam<'_, '_, '_> {
         if let Some((_, v)) = self.run.no_wake(&mut self.answered, &task.vm.vt, m, &stop) {
             return Ok([v.i64(), 0]);
         }
-        let cell = task.park_native(stop)?;
-        Ok([cell[0].i64(), cell[1].i64()])
+        self.park_stop(stop)
     }
 
     fn park_call(&mut self, park: CallPark) -> Result<[i64; 2], Trap> {
@@ -19292,6 +19311,14 @@ impl TaskSeam for CallSeam<'_, '_, '_> {
                 return Err(Trap::Malformed)
             }
         };
+        self.park_stop(stop)
+    }
+}
+
+impl CallSeam<'_, '_, '_> {
+    /// Both front doors' one way in ([`TaskSeam::park`], [`TaskSeam::park_call`]): park the call's
+    /// task on `stop` through the rules ([`BounceTask::park_native`]).
+    fn park_stop(&mut self, stop: VcpuStop) -> Result<[i64; 2], Trap> {
         let task = self.task.as_mut().ok_or(Trap::Malformed)?;
         let cell = task.park_native(stop)?;
         Ok([cell[0].i64(), cell[1].i64()])
@@ -20874,10 +20901,7 @@ impl ThreadRun {
         let core = &g.core;
         let waiting: Vec<u64> = outstanding_calls(&core.tasks, &core.domains)
             .into_iter()
-            .filter(|&(env, id)| {
-                let h = core.domains[env].host.lock_unpoisoned();
-                h.completions().is_host_owned(id)
-            })
+            .filter(|&(env, id)| core.domains[env].host.comps().is_host_owned(id))
             .map(|(_, id)| id)
             .collect();
         g.told.retain(|id| waiting.contains(id));
@@ -23409,11 +23433,13 @@ impl Vm {
                         continue;
                     }
                     // A `call.import` dispatch carries the `CAP_IMPORT_TYPE_ID` sentinel — read
-                    // its bound `(type_id, op)`, so an imported stdin `read` parks exactly like the
-                    // resolved `call.cap` form (IMPORTS.md phase 3).
+                    // the `(type_id, op)` it reaches, a grouped binding's through its remap
+                    // ([`Host::import_target`], the dispatch's own translation), so an imported stdin
+                    // `read` parks exactly like the resolved `call.cap` form (IMPORTS.md phase 3), as
+                    // a native task's call does (the JIT's call site passes the reached op).
                     let (eff_tid, eff_op) = if *type_id == temen_ir::CAP_IMPORT_TYPE_ID {
-                        host.with(|p| p.import_binding(*op))
-                            .map(|b| (b.type_id, b.op))
+                        host.with(|p| p.import_target(*op))
+                            .map(|(t, o, _)| (t, o))
                             .unwrap_or((*type_id, *op))
                     } else {
                         (*type_id, *op)
