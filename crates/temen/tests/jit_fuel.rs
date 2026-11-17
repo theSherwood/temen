@@ -636,8 +636,145 @@ fn jit_fuel_a_threads_entry_runs_out_alike_on_every_engine() {
     // Paying an entry keeps none of the draw that paid it: 50 threads spawned before the first join
     // complete on twice their cost, the chunk rule's least budget, where each one holding a chunk
     // while it waited ran the root out. Below 100 the engines split by that rule (#3011): the
-    // tree-walker and the kernel route, whose waiting root holds half the room it drew, run out; the
-    // bytecode engine and today's JIT complete on the exact cost, 51.
+    // tree-walker, the JIT and the kernel route, whose waiting root holds half the room it drew, run
+    // out; the bytecode engine completes on the exact cost, 51. The JIT's vCPUs shared one cell on a
+    // fixed allowance and completed on 51 too, charging what overlapping charges did not lose (#3069).
+    // Its spawn pays each entry with an exact take of one unit, as the interpreters' does (#3081), so
+    // no thread holds a draw while others pay theirs: this holds in any schedule of its OS threads.
     let fifty = spawning(50);
     assert_eq!(assert_four_way(&fifty, 100), (Ended::Returned(350), 51));
+}
+
+/// The root spawns `n` threads, each counting `steps` down as [`COUNTING_THREAD`]'s does, joins them
+/// and returns the sum of their counts.
+fn counting_threads(n: usize, steps: u64) -> String {
+    let mut body = format!("  vn = i64.const {steps}\n  vacc0 = i64.const 0\n");
+    for i in 0..n {
+        body += &format!("  vh{i} = thread.spawn 1 vn vn\n");
+    }
+    for i in 0..n {
+        let j = i + 1;
+        body += &format!("  vs{i}, vv{i} = thread.join vh{i}\n  vacc{j} = i64.add vacc{i} vv{i}\n");
+    }
+    let thread = COUNTING_THREAD
+        .split_once("func (i64, i64)")
+        .expect("the counting thread's function")
+        .1;
+    format!(
+        "memory 16
+func () -> (i64) {{
+block 0 () {{
+{body}  return vacc{n}
+  }}
+}}
+func (i64, i64){thread}"
+    )
+}
+
+/// **Threads that count at once are each charged in full, on a fixed allowance too** (#3069). Eight
+/// threads counting 200,000 down cost the root's entry plus 200,000 each: 1,600,001 on every engine.
+/// The JIT's fixed allowance was one cell its vCPUs charged with plain loads and stores, so two
+/// charges that overlapped counted as one, and this run charged 30% to 53% of its cost. Each vCPU now
+/// charges a cell of its own, drawn from the allowance as from a chain.
+#[test]
+fn jit_fuel_charges_threads_counting_at_once_in_full() {
+    assert_eq!(
+        assert_three_way(&counting_threads(8, 200_000), 1 << 40),
+        (Ended::Returned(1_600_000), 1_600_001)
+    );
+}
+
+// #3081 — a spawned thread's entry is paid at its spawn, exactly one unit, on every engine.
+
+/// The root spawns a thread that only returns, and returns 7 without joining it.
+const UNJOINED_THREAD: &str = "memory 16
+func () -> (i64) {
+block 0 () {
+  vz = i64.const 7
+  vh = thread.spawn 1 vz vz
+  return vz
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (va: i64, vb: i64) {
+  return va
+  }
+}
+";
+
+/// **A thread's entry is paid as its spawn completes, not when it starts** (#3081). The root's entry
+/// takes a budget of 1, so its spawn cannot pay the thread's and the run runs out of fuel on the
+/// spawner, on every engine. The JIT paid the entry in the thread's own prologue, once it ran, and
+/// the root returned 7 before that. With 2, every engine completes and spends all of it.
+#[test]
+fn jit_fuel_an_unjoined_threads_entry_is_paid_at_its_spawn() {
+    assert_eq!(assert_three_way(UNJOINED_THREAD, 1), (Ended::OutOfFuel, 1));
+    assert_eq!(
+        assert_three_way(UNJOINED_THREAD, 2),
+        (Ended::Returned(7), 2)
+    );
+}
+
+/// The root spawns a thread that enters, sets a flag, notifies it and waits to be released. The root
+/// waits for the flag, counts 20,000 down (19,999 taken back-edges), releases the thread and joins it:
+/// 20,001 in all, with the thread's entry and the root's.
+const PARKED_THREAD: &str = "memory 16
+func () -> (i64) {
+block 0 () {
+  vflag = i64.const 16384
+  vz = i64.const 0
+  vh = thread.spawn 1 vz vz
+  vexp = i32.const 0
+  vinf = i64.const -1
+  vw = i32.atomic.wait vflag vexp vinf
+  vn = i64.const 20000
+  br 1(vn, vh)
+}
+block 1 (vi: i64, vh1: i32) {
+  vone = i64.const 1
+  vj = i64.sub vi vone
+  vdone = i64.eqz vj
+  br_if vdone 2(vh1) 1(vj, vh1)
+}
+block 2 (vh2: i32) {
+  vgo = i64.const 16388
+  vset = i32.const 1
+  i32.atomic.store vgo vset
+  vcnt = i32.const 1
+  vw2 = atomic.notify vgo vcnt
+  vs, vv = thread.join vh2
+  return vv
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (va: i64, vb: i64) {
+  vflag = i64.const 16384
+  vset = i32.const 1
+  i32.atomic.store vflag vset
+  vcnt = i32.const 1
+  vw = atomic.notify vflag vcnt
+  vgo = i64.const 16388
+  vexp = i32.const 0
+  vinf = i64.const -1
+  vw2 = i32.atomic.wait vgo vexp vinf
+  v7 = i64.const 7
+  return v7
+  }
+}
+";
+
+/// **A parked thread holds none of the root's fuel** (#3081). Its entry was paid at the spawn, so it
+/// parks holding nothing, and the root can burn the whole rest of the budget: the least budget is the
+/// exact cost, 20,001, on every engine. A thread that paid its own entry from a draw kept the rest of
+/// that draw while it waited, out of the root's reach.
+#[test]
+fn jit_fuel_a_parked_thread_holds_none_of_the_roots_fuel() {
+    assert_eq!(
+        assert_three_way(PARKED_THREAD, 20_001),
+        (Ended::Returned(7), 20_001)
+    );
+    assert_eq!(
+        assert_three_way(PARKED_THREAD, 20_000),
+        (Ended::OutOfFuel, 20_000)
+    );
 }

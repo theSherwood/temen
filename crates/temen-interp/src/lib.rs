@@ -5851,20 +5851,7 @@ pub fn pool_workers() -> usize {
         .clamp(1, MAX_WORKERS)
 }
 
-/// How many ops a vCPU runs on a worker before it yields it to the next runnable vCPU: the real
-/// pool's preemption quantum. Without it a vCPU kept its worker until it parked, so guest threads
-/// that spin on each other livelocked once they outnumbered the workers: the spinners held every
-/// worker, and the thread they waited for never ran (#2202, nimony's `tallocpool` on four workers).
-/// A vCPU in a bounded lane keeps its lanes across the yield (#2237, see [`dispatch`]).
-///
-/// Its size is the price of one preemption at a bad moment: a thread that spins on one that lost
-/// its worker (a lock holder, or the next in a fair ticket lock's queue) burns up to a quantum
-/// before that thread runs again. Measured on nimony's thread pool, five vCPUs on two workers:
-/// `1 << 20` ran it in 0.16 s or 35 s depending on where preemptions landed, `1 << 16` in 3.3 s
-/// every time. A vCPU running alone yields too, and the round trip costs nothing measurable: a
-/// 20M-iteration loop took ~1 s at `u64::MAX`, `1 << 20` and `1 << 16` alike. The bytecode
-/// engine's cooperative quantum is a separate knob, sized for its deterministic interleaving.
-const POOL_QUANTUM: u64 = 1 << 16;
+use temen_ir::POOL_QUANTUM;
 
 /// A task identifier (a spawned vCPU). Distinct from the per-vCPU join *handle* (an index into the
 /// spawner's child table); the executor keys results/waiters by `TaskId`.
@@ -22140,9 +22127,7 @@ struct BudgetNode {
 /// under the lock, all or nothing, however many hosts charge at once.
 struct BudgetTree(Mutex<Vec<BudgetNode>>);
 
-/// #1944 slice 3 — the most fuel one draw takes: a vCPU refills its counter this much at a time, so
-/// only one safepoint in this many walks the chain.
-pub const FUEL_CHUNK: u64 = 1 << 16;
+pub use temen_ir::{fuel_draw, FUEL_CHUNK};
 
 /// #2113 — the fuel a run's root is granted for an activation when its embedder names none (owner,
 /// 2026-10-06: "just put large bounds on everything"). One value on every engine.
@@ -22492,11 +22477,9 @@ impl BudgetTree {
         });
     }
 
-    /// #1944 slice 3 — a fuel draw for a consumer of `n`: up to [`FUEL_CHUNK`], never more than half
-    /// of the chain's room (rounded up), charged to `n` and every ancestor. Taking at most half keeps
-    /// one consumer from holding all of a small budget while its siblings starve; a lone consumer
-    /// still spends it to the last unit. `None` when every level is unbounded: there is nothing to
-    /// meter. `Some(0)` when the chain is spent.
+    /// #1944 slice 3 — a fuel draw for a consumer of `n`, [`fuel_draw`] of the chain's room, charged
+    /// to `n` and every ancestor. `None` when every level is unbounded: there is nothing to meter.
+    /// `Some(0)` when the chain is spent.
     fn draw_fuel(&self, n: u32) -> Option<u64> {
         let mut nodes = self.0.lock_unpoisoned();
         if (n as usize) >= nodes.len() {
@@ -22506,11 +22489,33 @@ impl BudgetTree {
         if room < 0 {
             return None;
         }
-        let take = (room as u64).div_ceil(2).min(FUEL_CHUNK);
+        let take = fuel_draw(room as u64);
         Self::each_level(&mut nodes, n, |node| {
             node.used[BUDGET_FUEL] = node.used[BUDGET_FUEL].saturating_add(take as i64);
         });
         Some(take)
+    }
+
+    /// #3081 — take exactly `amount` of fuel for a consumer of `n`, charged to `n` and every ancestor,
+    /// all or nothing, under the one lock a draw takes, so no other consumer meets a room emptied for a
+    /// moment. `None` when every level is unbounded: there is nothing to meter, and nothing is charged.
+    /// `Some(false)`, charging nothing, when the chain has less than `amount` of room.
+    fn take_fuel(&self, n: u32, amount: u64) -> Option<bool> {
+        let mut nodes = self.0.lock_unpoisoned();
+        if (n as usize) >= nodes.len() {
+            return Some(false);
+        }
+        let room = Self::left(&nodes, n, BUDGET_FUEL);
+        if room < 0 {
+            return None;
+        }
+        if (room as u64) < amount {
+            return Some(false);
+        }
+        Self::each_level(&mut nodes, n, |node| {
+            node.used[BUDGET_FUEL] = node.used[BUDGET_FUEL].saturating_add(amount as i64);
+        });
+        Some(true)
     }
 
     /// #1944 slice 3 — give `n` exactly `fuel` of fuel room on its own level, whatever it has burned:
@@ -22631,6 +22636,14 @@ impl NodeRef {
     /// is unbounded (nothing to meter), `Some(0)` when the chain is spent.
     pub fn draw(&self) -> Option<u64> {
         self.tree.draw_fuel(self.node)
+    }
+
+    /// #3081 — take exactly `n` of fuel from the chain, charged to every level, all or nothing: what
+    /// a spawned vCPU's entry costs, paid at the spawn. `None` when every level is unbounded (nothing
+    /// to meter, nothing charged), `Some(false)` when the chain has less than `n` of room (nothing
+    /// charged), `Some(true)` when `n` was charged.
+    pub fn take_exact(&self, n: u64) -> Option<bool> {
+        self.tree.take_fuel(self.node, n)
     }
 
     /// Hand back `unspent`, the rest of a draw its consumer did not burn, to every level.
