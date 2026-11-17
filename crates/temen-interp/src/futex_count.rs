@@ -7,14 +7,12 @@
 //! stripe make a notifier take the slow path when it need not: a count over-approximates "someone
 //! may be waiting on this key", so a collision costs today's notify, never a wake.
 //!
-//! **Who counts.** Every waiter of every engine, inside the shared wait rule: a task counts in when
-//! it joins its key's wait queue (`Tasks::park_wait`) and out when it leaves it (`Tasks::unpark_wait`),
-//! except in the wait rule itself (`wait_task`), which counts in before it compares the word and
-//! then either files the task in the queue or counts out, under one hold of the run lock. A fiber's
-//! wait counts in and
-//! never out ([`FutexCount::enter`] without a `leave`), because its exits are spread over the fiber
-//! machinery; phase 2 of #2958 moves fiber waits into the kernel's wait index, and they count out
-//! there.
+//! **Who counts.** Every waiter of every engine, task or fiber, inside the shared wait rule: a waiter
+//! counts in before it compares its word, then either is filed in its key's wait queue (`Waits`, in
+//! `bytecode.rs`) or counts out, under one hold of the run lock, and it counts out as it leaves the
+//! queue however its wait ends (`Waits::take`, `Waits::leave`). #3078 slice 1 — a fiber's wait is an
+//! entry of the same queue, so it counts out too; before, it counted in and never out. The model of
+//! the queue itself, with a fiber waiter leaving each way, is `bytecode.rs`'s `wait_index_loom`.
 //!
 //! **Why no wake is lost (store buffering, Dekker).** Waiter, under the run lock: count in
 //! ([`FutexCount::enter`]: an RMW, then `fence(SeqCst)`), then load the word and park only if it is

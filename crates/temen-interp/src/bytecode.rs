@@ -5212,9 +5212,11 @@ enum FiberStep {
 /// counterpart of [`step_vcpu`]'s fiber handling, minus durability (debug runs are non-durable, so no
 /// `shadow_switch` / `fiber_sp`). `fibers` is run-shared (a fiber created on one vCPU can be resumed on
 /// another — D57 migration) and rebuilt deterministically on a reverse `seek` replay.
+#[allow(clippy::too_many_arguments)] // the run state an op reads, and the wait index its claim leaves
 fn debug_advance_fiber(
     vt: &mut VTask,
     fibers: &mut FiberTables,
+    waits: &mut Waits,
     source: &ModuleSource,
     table: &SharedSlots,
     fuel: &mut Fuel,
@@ -5233,7 +5235,7 @@ fn debug_advance_fiber(
         return step_active_invoke(vt, fibers, source, table, fuel, mem, host);
     }
     // This engine never freezes: no fiber switch keeps a shadow-SP word.
-    let mut cell = fibers.cell();
+    let mut cell = fibers.cell_in(waits);
     match vt
         .active
         .resume(source, table, fuel, mem, &mut HostCell::Excl(host), 1)
@@ -5824,6 +5826,7 @@ fn dbg_refund_ended_windows(tasks: &mut Tasks, envs: &mut [Domain], run_ended: b
             .iter()
             .any(|t| t.domain == k && !matches!(t.state, TaskState::Done(_)));
         if run_ended || !running {
+            tasks.retire_fibers(&e.fibers.fibers);
             e.fibers = FiberTables::default();
         }
     }
@@ -6324,15 +6327,16 @@ fn dbg_spawn(
 /// The per-op driver for a scheduled debug task, in its domain: the domain's fiber registry, table,
 /// fuel, window and powerbox. Mirrors the production `drive`'s `RunCtx` selection.
 fn dbg_advance_task(
-    tasks: &mut [TaskSlot],
+    tasks: &mut Tasks,
     ti: usize,
     domains: &mut [Domain],
     source: &ModuleSource,
 ) -> FiberStep {
     let e = &mut domains[tasks[ti].domain];
     debug_advance_fiber(
-        &mut tasks[ti].vm.vt,
+        &mut tasks.slots[ti].vm.vt,
         &mut e.fibers,
+        &mut tasks.waits,
         source,
         &e.table,
         &mut e.fuel,
@@ -6459,10 +6463,8 @@ fn service_advance(
                 *turn += 1;
                 let key = futex_key_in(domains[tasks[ti].domain].window(), base);
                 let want = count as u32;
-                let mut woken = tasks.notify(key, want);
-                let regs = domains.iter_mut().flat_map(|e| e.fibers.fibers.iter_mut());
-                woken += wake_fiber_waiters(regs, key, want - woken);
-                tasks[ti].deliver(dst, Reg::from_i32(woken as i32));
+                let woke = tasks.notify(key, want, domains);
+                tasks[ti].deliver(dst, Reg::from_i32(woke.total() as i32));
             }
             Outcome::WakeRegion(w) => {
                 *turn += 1;
@@ -6912,7 +6914,7 @@ fn dbg_pick_runnable(
     turn: &mut u64,
 ) -> Result<usize, Idle> {
     let mut now = clock.saturating_add(*turn);
-    time_out_due(tasks, &mut registries(envs), now);
+    tasks.time_out(now, envs);
     loop {
         let parked = |t: &TaskSlot| matches!(t.state, TaskState::BlockedHostCap { .. });
         if tasks.iter().any(parked) {
@@ -6923,23 +6925,18 @@ fn dbg_pick_runnable(
         if let Some(i) = dbg_preview_pick(tasks, seed, forced, pref, *turn) {
             return Ok(i);
         }
-        let next = next_timeout(tasks, registries(envs).iter().flat_map(|r| r.iter()));
+        let next = tasks.next_deadline();
         if dbg_await_answer(tasks, envs, takes, replay, now, next)? {
             continue;
         }
         // #1638 — only a waiter with a REAL deadline is a clock-advance candidate, so "nothing
         // runnable and every remaining waiter is indefinite" is the deadlock exit, not a
         // `WAIT_TIMED_OUT` the guest never asked for.
-        if !fire_next_timeout(tasks, &mut registries(envs), &mut now) {
+        if !fire_next_timeout(tasks, envs, &mut now) {
             return Err(Idle::Stuck);
         }
         *clock = now - *turn;
     }
-}
-
-/// Every domain's fiber registry: the root's, then each §14 child's.
-fn registries(envs: &mut [Domain]) -> Vec<&mut Vec<FiberState>> {
-    envs.iter_mut().map(|e| &mut e.fibers.fibers).collect()
 }
 
 /// Whether the run's root is unwinding a durable freeze: the run froze rather than ended, and the
@@ -8423,7 +8420,8 @@ impl ScheduledDebugRun {
     /// an undo has rebuilt the tasks or the windows.
     fn refile_waits(&mut self) {
         let domains = &self.domains;
-        self.tasks.file_waits(|env| domains[env].window());
+        let fibers: Vec<&[FiberState]> = domains.iter().map(|e| &e.fibers.fibers[..]).collect();
+        self.tasks.file_waits(|env| domains[env].window(), &fibers);
     }
 
     /// The run's result once the root has finished (`None` while still running).
@@ -9940,8 +9938,11 @@ enum FiberState {
         /// still terminates — see [`sched_wall_now`].
         real_deadline: Option<u64>,
         /// `Some(status)` once the event fired — the fiber is claimable and the next resume
-        /// delivers the status; `None` while still blocked.
+        /// delivers the status; `None` while still blocked, which is while it is in the run's wait
+        /// index ([`Waits`], #3078 slice 1).
         woken: Option<i32>,
+        /// #3086 — its place in its word's arrival order ([`Waits`]).
+        arrived: u64,
     },
     /// F2 (FIBER_PARK.md) — **event-parked on a punt completion**: the fiber's blocking host
     /// call punted to the offload pool (`Pending(completion_id)`) and parked the FIBER, not its
@@ -10025,12 +10026,25 @@ impl FiberState {
 }
 
 impl FiberTables {
-    /// These tables, owned by the caller, as the registry a fiber transition runs over.
+    /// These tables, owned by the caller, as the registry a fiber transition runs over: one no fiber
+    /// waits in, such as an invoke's own ([`Self::cell_in`] is a domain's).
     fn cell(&mut self) -> FiberCell<'_> {
         FiberCell::Excl {
             fibers: &mut self.fibers,
             sp: &mut self.sp,
             meta: &mut self.meta,
+            waits: None,
+        }
+    }
+
+    /// [`Self::cell`] for a domain's registry, whose fibers' futex waits are in the run's wait index
+    /// `waits` (#3078 slice 1): a claim that times one out takes it out of there.
+    fn cell_in<'a>(&'a mut self, waits: &'a mut Waits) -> FiberCell<'a> {
+        FiberCell::Excl {
+            fibers: &mut self.fibers,
+            sp: &mut self.sp,
+            meta: &mut self.meta,
+            waits: Some(waits),
         }
     }
 
@@ -10082,6 +10096,9 @@ enum FiberCell<'a> {
         fibers: &'a mut Vec<FiberState>,
         sp: &'a mut Vec<u64>,
         meta: &'a mut Vec<FiberMeta>,
+        /// The run's wait index, for a domain's registry ([`FiberTables::cell_in`]); `None` for one
+        /// no fiber waits in.
+        waits: Option<&'a mut Waits>,
     },
     /// Executor 2 ([`drive_threads`]): domain `k`'s registry inside the run's scheduling core, under
     /// the core's lock.
@@ -10097,7 +10114,9 @@ impl FiberCell<'_> {
     ) -> R {
         let mut core;
         let (fibers, sp, meta) = match self {
-            FiberCell::Excl { fibers, sp, meta } => (&mut **fibers, &mut **sp, &mut **meta),
+            FiberCell::Excl {
+                fibers, sp, meta, ..
+            } => (&mut **fibers, &mut **sp, &mut **meta),
             FiberCell::Core(m, env) => {
                 core = m.lock_unpoisoned();
                 let t = &mut core.core.domains[*env].fibers;
@@ -10105,6 +10124,25 @@ impl FiberCell<'_> {
             }
         };
         f(fibers, sp, meta)
+    }
+
+    /// Run `f` over the slots and the run's wait index their futex waits are filed in (#3078 slice
+    /// 1), under one hold of a shared registry's lock, which guards both. `None` for a registry no
+    /// fiber waits in.
+    #[inline]
+    fn with_waits<R>(
+        &mut self,
+        f: impl FnOnce(&mut Vec<FiberState>, Option<&mut Waits>) -> R,
+    ) -> R {
+        let mut core;
+        match self {
+            FiberCell::Excl { fibers, waits, .. } => f(fibers, waits.as_deref_mut()),
+            FiberCell::Core(m, env) => {
+                core = m.lock_unpoisoned();
+                let c = &mut core.core;
+                f(&mut c.domains[*env].fibers.fibers, Some(&mut c.tasks.waits))
+            }
+        }
     }
 
     /// This registry as a `gc.roots` view holds it ([`FiberRegRef`]).
@@ -10267,7 +10305,7 @@ fn claim_fiber(
         blocking_ip,
         pending: None,
     };
-    fibers.with(|f, _, _| match f.get_mut(k) {
+    fibers.with_waits(|f, waits| match f.get_mut(k) {
         Some(slot @ FiberState::Pending { .. }) => {
             let FiberState::Pending {
                 funcref,
@@ -10304,6 +10342,8 @@ fn claim_fiber(
             let FiberState::WaitParked {
                 woken,
                 real_deadline,
+                key,
+                arrived,
                 ..
             } = slot
             else {
@@ -10318,9 +10358,12 @@ fn claim_fiber(
                 // other guest loop, at the identical safepoint on all three engines (`jit_fuel.rs`).
                 // Before #1638 this engine alone ended it, with a `WAIT_TIMED_OUT` at 10 s that the
                 // guest never asked for.
-                real_deadline
-                    .filter(|dl| sched_wall_now() >= *dl)
-                    .map(|_| super::WAIT_TIMED_OUT)
+                real_deadline.filter(|dl| sched_wall_now() >= *dl)?;
+                // #3078 slice 1 — its wait leaves the index as it times out, as one the clock
+                // times out does ([`Tasks::time_out`]).
+                (waits.expect("a waiting fiber's registry carries its run's wait index"))
+                    .leave(*key, *arrived);
+                Some(super::WAIT_TIMED_OUT)
             });
             // Still blocked: its deadline is already in the idle scan, and a notify wakes it too.
             let Some(st) = fired else {
@@ -10693,6 +10736,19 @@ fn handler_slot(fibers: &mut FiberCell, mem: &Option<Mem>) -> Option<usize> {
 /// #2742 — handler fiber `k` returned: its slot is free for the next handler, and the registry
 /// drops the free slots at its end, so an idle serve loop leaves no fiber for a freeze to carry.
 fn release_handler(fibers: &mut FiberCell, k: usize) {
+    // #3078 slice 1 — a handler parked in a futex wait leaves the run's wait index as it goes.
+    fibers.with_waits(|f, waits| {
+        if let Some(&FiberState::WaitParked {
+            key,
+            arrived,
+            woken: None,
+            ..
+        }) = f.get(k)
+        {
+            (waits.expect("a waiting fiber's registry carries its run's wait index"))
+                .leave(key, arrived);
+        }
+    });
     fibers.with(|f, sp, meta| {
         f[k] = FiberState::Free;
         while f.last().is_some_and(|s| matches!(s, FiberState::Free)) {
@@ -10984,6 +11040,7 @@ mod over_tests {
             site: FutexSite::Anon(0),
             deadline: Some(0),
             dst: 0,
+            arrived: 0, // set as it files
         };
         g.core.tasks.park_wait(0, FutexKey::Anon(1, 0));
         let _left = std::mem::take(&mut *g.core.tasks[0].vm);
@@ -11036,12 +11093,13 @@ mod tasks_tests {
             site: super::super::FutexSite::Anon(0),
             deadline,
             dst: 0,
+            arrived: 0, // set as it files
         };
         tasks.park_wait(i, key);
     }
 
     /// #2868 — a futex wait waits aside: out of the live list each round walks, still a live task, and
-    /// back in the list, runnable, once a notify on its own word takes it (the lowest task index
+    /// back in the list, runnable, once a notify on its own word takes it (the first to arrive
     /// first), its deadline passes, or it ends. A notify costs what it wakes.
     #[test]
     fn a_futex_wait_waits_aside_until_its_word_its_deadline_or_its_end() {
@@ -11056,26 +11114,30 @@ mod tasks_tests {
         assert_eq!(tasks.live_count(), 5, "a waiter is live");
         assert_eq!(tasks.members(), [0, 1, 2, 3, 4]);
         assert_eq!(tasks.next_deadline(), Some(50));
-        assert_eq!(tasks.notify(a, 2), 2);
+        assert_eq!(tasks.notify(a, 2, &mut []).total(), 2);
         assert_eq!(
             tasks.live().collect::<Vec<_>>(),
             [0, 1, 3],
-            "the lowest indices first"
+            "the first to arrive first (#3086)"
         );
         assert!(matches!(tasks[1].state, TaskState::Runnable));
-        tasks.time_out(60);
+        tasks.time_out(60, &mut []);
         assert_eq!(tasks.live().collect::<Vec<_>>(), [0, 1, 2, 3]);
         assert_eq!(
             tasks.next_deadline(),
             Some(90),
             "task 2's deadline has gone with it"
         );
-        assert_eq!(tasks.notify(b, 1), 0, "nothing waits on b now");
+        assert_eq!(
+            tasks.notify(b, 1, &mut []).total(),
+            0,
+            "nothing waits on b now"
+        );
         // An end takes a waiter out wherever it waits, as `complete` does: here task 4, on `a` and
         // its deadline.
         tasks.unpark_wait(4);
         tasks[4].state = TaskState::Done(Err(Trap::ThreadFault));
-        assert_eq!(tasks.notify(a, u32::MAX), 0);
+        assert_eq!(tasks.notify(a, u32::MAX, &mut []).total(), 0);
         assert_eq!(tasks.next_deadline(), None);
         tasks.prune();
         assert_eq!(tasks.live().collect::<Vec<_>>(), [0, 1, 2, 3]);
@@ -11344,8 +11406,8 @@ fn freeze_drive(
     // suspend park gets the inert placeholder (the thaw redelivers); a woken event park gets its
     // delivered status or result, which the point's spill reloads at thaw; an unwoken futex park gets
     // an inert status (the point spills without it, and its thaw arm re-issues the wait, which
-    // re-checks the restored value). Taking the state also takes the waiter: a notify finds waiters
-    // by scanning these states.
+    // re-checks the restored value). Its caller has taken each waiting fiber out of the run's wait
+    // index first ([`Tasks::retire_fibers`]).
     for slot in 0..fibers.len() {
         let (vm, consumed) = match std::mem::replace(&mut fibers[slot], FiberState::Done) {
             FiberState::Parked {
@@ -11427,6 +11489,7 @@ fn freeze_drive(
             fibers: &mut *fibers,
             sp: &mut *fiber_sp,
             meta: &mut *fiber_meta,
+            waits: None, // the unwind makes no claim
         };
         match step_vcpu(&mut sub, &mut cell, source, ctx, budget, false, false)? {
             VcpuStop::Done(_) => {}
@@ -12700,21 +12763,33 @@ struct Tasks {
     waits: Waits,
 }
 
-/// #2868 — the tasks parked on a futex wait, held aside from the live list ([`Tasks::live`]), so a
-/// round's rules walk only what can move: a thread parked for good costs nothing until its word is
-/// notified, its wait times out, or its domain ends. A notify takes its waiters from its word's
-/// queue, lowest task index first, as a scan of the tasks woke them, and so costs what it wakes.
-/// What ends a wait goes through [`Tasks::end_wait`], which puts the task back in the live list. A
-/// waiting task names its key itself ([`TaskSlot::waits_on`]).
+/// #2868 — the futex waiters held aside from the live list ([`Tasks::live`]), so a round's rules walk
+/// only what can move: a thread parked for good costs nothing until its word is notified, its wait
+/// times out, or its domain ends. #3078 slice 1 — a fiber's wait is an entry here too
+/// ([`Waiter::Fiber`]), so one index answers who waits on a word, whoever it is.
+///
+/// Each word's waiters are kept in **arrival order**, task and fiber mixed, and a notify takes them
+/// from the front: the oracle's rule (`notify_locked`, INVARIANTS #4's FIFO queues, #3086). A waiter
+/// that leaves and waits again arrives again, at the back. A notify costs what it wakes. Every way a
+/// waiter leaves — a notify's take, its deadline, its end, its domain's end — goes through
+/// [`Waits::leave`] or [`Waits::take`], which count it out ([`Self::count`]).
 #[derive(Default)]
 struct Waits {
-    /// Each word's waiters in index order, by the key their parks took ([`site_key_in`]).
-    on: std::collections::HashMap<super::FutexKey, std::collections::VecDeque<usize>>,
-    /// The timed waits, by deadline.
-    due: std::collections::BTreeSet<(u64, usize)>,
-    /// How many wait.
+    /// Each word's waiters in arrival order, by the key their parks took ([`site_key_in`]).
+    on: std::collections::HashMap<super::FutexKey, std::collections::VecDeque<Filed>>,
+    /// The timed waits, by deadline, then arrival.
+    due: std::collections::BTreeSet<(u64, u64, super::FutexKey)>,
+    /// The next waiter's place in arrival order ([`Filed::arrived`]).
+    arrivals: u64,
+    /// How many tasks wait.
     n: usize,
-    /// How many wait in each domain that has had a waiter: a domain whose every other task has
+    /// How many fibers wait.
+    fibers: usize,
+    /// How many tasks wait with a deadline: the rules that ask whether a *thread* waits out a
+    /// deadline ([`Tasks::a_task_waits_timed`]) ask only of tasks, as they did before fiber waits
+    /// were filed here.
+    timed_tasks: usize,
+    /// How many tasks wait in each domain that has had a waiter: a domain whose every other task has
     /// ended is still alive. A domain's count goes with it ([`Tasks::forget_domain`]).
     in_domain: std::collections::BTreeMap<usize, usize>,
     /// #2963 — the tasks the last [`Tasks::notify`] woke, in the order it woke them. Executor 2 takes
@@ -12724,20 +12799,134 @@ struct Waits {
     /// than one notify's waiters.
     woken: Vec<usize>,
     /// #2958 slice 2 — how many wait on each key, for a notify to read without the run lock
-    /// ([`super::futex_count`]): a task counts in as it joins [`Self::on`] ([`Tasks::park_wait`])
-    /// and out as it leaves ([`Tasks::unpark_wait`]), so the count is the queue's size, per stripe.
+    /// ([`super::futex_count`]): a waiter counts in before it compares its word and out as it
+    /// leaves the index, so outside one hold of the lock the count is the queue's size, per stripe.
     /// Executor 2's run holds the other handle ([`ThreadRun::count`]).
     count: std::sync::Arc<super::futex_count::FutexCount>,
-    /// How many fiber waits have counted in, never to count out ([`futex_wait`]): what the stripes
-    /// hold beyond [`Self::n`].
-    sticky: u64,
     /// #2975 — the storage of the last queue a wait emptied, always empty, for the next key a wait
     /// files under: a wait allocates no queue and a notify frees none, once warm. Storage only:
     /// what waits is in [`Self::on`].
-    spare: std::collections::VecDeque<usize>,
+    spare: std::collections::VecDeque<Filed>,
+}
+
+/// #3078 slice 1 — who waits on a futex word: a task, parked whole, or a fiber of domain `domain`'s
+/// registry, parked in slot `slot` ([`FiberState::WaitParked`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Waiter {
+    Task(usize),
+    Fiber { domain: usize, slot: usize },
+}
+
+/// How many waiters a notify woke ([`Tasks::notify`]): its tasks and its fibers.
+#[derive(Clone, Copy, Default, Debug)]
+struct Woke {
+    tasks: u32,
+    fibers: u32,
+}
+
+impl Woke {
+    fn total(self) -> u32 {
+        self.tasks + self.fibers
+    }
+}
+
+/// One waiter in a word's queue ([`Waits::on`]).
+#[derive(Clone, Copy, Debug)]
+struct Filed {
+    /// Its place in arrival order, which its own record keeps too, so it can leave by it.
+    arrived: u64,
+    waiter: Waiter,
+    deadline: Option<u64>,
 }
 
 impl Waits {
+    /// The next waiter's place in arrival order.
+    fn arrive(&mut self) -> u64 {
+        let a = self.arrivals;
+        self.arrivals += 1;
+        a
+    }
+
+    /// File `waiter`, already counted in on `key`, at its place `arrived`, timed out at `deadline` if
+    /// any. A new waiter is at the back; a refiled one ([`Tasks::file_waits`]) goes back where it
+    /// was.
+    fn file(&mut self, key: super::FutexKey, arrived: u64, waiter: Waiter, deadline: Option<u64>) {
+        debug_assert!(self.spare.is_empty(), "the spare queue holds no waiter");
+        let q = (self.on.entry(key)).or_insert_with(|| std::mem::take(&mut self.spare));
+        let at = q.partition_point(|f| f.arrived < arrived);
+        debug_assert!(
+            q.get(at).is_none_or(|f| f.arrived != arrived),
+            "one waiter per arrival"
+        );
+        q.insert(
+            at,
+            Filed {
+                arrived,
+                waiter,
+                deadline,
+            },
+        );
+        if let Some(d) = deadline {
+            self.due.insert((d, arrived, key));
+        }
+        self.arrivals = self.arrivals.max(arrived + 1);
+        match waiter {
+            Waiter::Task(_) => {
+                self.n += 1;
+                self.timed_tasks += deadline.is_some() as usize;
+            }
+            Waiter::Fiber { .. } => self.fibers += 1,
+        }
+    }
+
+    /// The waiter filed on `key` at `arrived` leaves, however its wait ended: it counts out, and
+    /// is no longer in the index.
+    fn leave(&mut self, key: super::FutexKey, arrived: u64) -> Waiter {
+        let q = self.on.get_mut(&key).expect("a waiter's key has a queue");
+        let at = q
+            .binary_search_by_key(&arrived, |f| f.arrived)
+            .expect("a waiter leaves the queue it was filed in");
+        let f = q.remove(at).expect("found");
+        if q.is_empty() {
+            self.drop_queue(&key);
+        }
+        self.left(key, f)
+    }
+
+    /// The first waiter on `key`, taken from its queue: a notify's, and counted out.
+    fn take(&mut self, key: super::FutexKey) -> Option<Waiter> {
+        let q = self.on.get_mut(&key)?;
+        let Some(f) = q.pop_front() else {
+            unreachable!("an empty queue leaves the map");
+        };
+        if q.is_empty() {
+            self.drop_queue(&key);
+        }
+        Some(self.left(key, f))
+    }
+
+    /// The first waiter whose deadline `clock` has reached, taken from the index and counted out.
+    fn expire(&mut self, clock: u64) -> Option<Waiter> {
+        let &(due, arrived, key) = self.due.first()?;
+        (due <= clock).then(|| self.leave(key, arrived))
+    }
+
+    /// `f`, just taken from `key`'s queue, leaves the rest of the index.
+    fn left(&mut self, key: super::FutexKey, f: Filed) -> Waiter {
+        self.count.leave(&key);
+        if let Some(d) = f.deadline {
+            self.due.remove(&(d, f.arrived, key));
+        }
+        match f.waiter {
+            Waiter::Task(_) => {
+                self.n -= 1;
+                self.timed_tasks -= f.deadline.is_some() as usize;
+            }
+            Waiter::Fiber { .. } => self.fibers -= 1,
+        }
+        f.waiter
+    }
+
     /// Key `key`'s queue, emptied: it leaves the map and its storage becomes the spare.
     fn drop_queue(&mut self, key: &super::FutexKey) {
         if let Some(q) = self.on.remove(key) {
@@ -12746,10 +12935,16 @@ impl Waits {
         }
     }
 
-    /// Whether the stripes hold exactly the waiters and the fiber waits that never count out: what
-    /// every count in and out leaves them as, outside [`wait_task`]'s one hold of the lock.
+    /// The earliest deadline among every waiter's, task or fiber: what the logical clock advances to
+    /// when no task is runnable.
+    fn next_deadline(&self) -> Option<u64> {
+        self.due.first().map(|&(due, ..)| due)
+    }
+
+    /// Whether the stripes hold exactly the waiters: what every count in and out leaves them as,
+    /// outside [`wait_task`]'s and [`futex_wait`]'s one hold of the lock.
     fn counted(&self) -> bool {
-        self.count.total() == self.n as u64 + self.sticky
+        self.count.total() == (self.n + self.fibers) as u64
     }
 }
 
@@ -12763,6 +12958,180 @@ impl Drop for Waits {
             self.counted(),
             "every futex wait counted in once and out once"
         );
+    }
+}
+
+/// #3078 slice 1 — the count protocol with a **fiber** waiter, under loom:
+/// `RUSTFLAGS="--cfg loom" cargo test -p temen-interp --lib loom`. It runs the real [`Waits`] over
+/// the real [`super::futex_count::FutexCount`] (`futex_count`'s own models run the counter alone): a
+/// fiber's wait (count in, compare, file as [`Waiter::Fiber`]) against a notifier (the guest's store,
+/// the count's read, [`Waits::take`] under the lock on the slow path), and, per model, a third way
+/// the fiber leaves: its deadline ([`Waits::expire`]) or its domain's end ([`Waits::leave`], as
+/// [`Tasks::retire_fibers`] does). The run lock is a loom `Mutex` over the index and the fiber's
+/// record. Each model asserts that a filed waiter is not lost to the notify, that it leaves once,
+/// and that the stripes end at zero. The broken variant — a fiber that counts in and never out,
+/// today's before this slice — fails the last.
+#[cfg(all(loom, test))]
+mod wait_index_loom {
+    use super::{Waiter, Waits};
+    use crate::FutexKey;
+    use loom::sync::atomic::{AtomicU32, Ordering};
+    use loom::sync::{Arc, Mutex};
+
+    const KEY: FutexKey = FutexKey::Anon(1, 8);
+    const FIBER: Waiter = Waiter::Fiber { domain: 0, slot: 0 };
+
+    /// How the fiber's wait ended: its record's `woken`.
+    #[derive(Clone, Copy, PartialEq, Debug)]
+    enum Left {
+        Woken,
+        TimedOut,
+        Retired,
+    }
+
+    /// What the run lock guards: the index, and the fiber's record.
+    #[derive(Default)]
+    struct Run {
+        waits: Waits,
+        /// The place it was filed at, once it parked.
+        filed: Option<u64>,
+        /// Whether it parked outside the index (the broken variant).
+        sticky: bool,
+        left: Option<Left>,
+    }
+
+    impl Run {
+        fn leave(&mut self, how: Left) {
+            assert!(self.left.is_none(), "a waiter leaves once");
+            self.left = Some(how);
+        }
+    }
+
+    struct World {
+        word: AtomicU32,
+        /// The notifier's handle on the count, read without the lock, as `ThreadRun::count` is.
+        count: std::sync::Arc<crate::futex_count::FutexCount>,
+        run: Mutex<Run>,
+    }
+
+    impl World {
+        fn new() -> World {
+            let run = Run::default();
+            World {
+                word: AtomicU32::new(0),
+                count: std::sync::Arc::clone(&run.waits.count),
+                run: Mutex::new(run),
+            }
+        }
+    }
+
+    /// The third actor of a model, beside the waiter and the notifier.
+    #[derive(Clone, Copy)]
+    enum Also {
+        Nothing,
+        Deadline,
+        DomainEnd,
+    }
+
+    /// The fiber's wait, as `futex_wait`'s fiber arm makes it under the run lock: count in, compare,
+    /// then file, or count out if the word already changed. `files` off is the broken variant.
+    fn wait(w: &World, files: bool) {
+        let mut r = w.run.lock().unwrap();
+        r.waits.count.enter(&KEY);
+        if w.word.load(Ordering::SeqCst) != 0 {
+            r.waits.count.leave(&KEY);
+            return;
+        }
+        if files {
+            let at = r.waits.arrive();
+            r.waits.file(KEY, at, FIBER, Some(10));
+            r.filed = Some(at);
+        } else {
+            r.sticky = true;
+        }
+    }
+
+    /// The notifier: the guest's store, the fast path's read, and the rules' notify under the lock.
+    fn notify(w: &World) {
+        w.word.store(1, Ordering::Relaxed);
+        if w.count.quiet(&KEY) {
+            return;
+        }
+        let mut r = w.run.lock().unwrap();
+        if let Some(waiter) = r.waits.take(KEY) {
+            assert_eq!(waiter, FIBER);
+            r.leave(Left::Woken);
+        } else if r.sticky && r.left.is_none() {
+            // Today's scan of the registry, which the broken variant still has to wake it.
+            r.leave(Left::Woken);
+        }
+    }
+
+    fn also(w: &World, what: Also) {
+        let mut r = w.run.lock().unwrap();
+        match what {
+            Also::Nothing => {}
+            Also::Deadline => {
+                if let Some(waiter) = r.waits.expire(u64::MAX) {
+                    assert_eq!(waiter, FIBER);
+                    r.leave(Left::TimedOut);
+                }
+            }
+            // `retire_fibers`: a record still waiting leaves the index.
+            Also::DomainEnd => {
+                if let (Some(at), None) = (r.filed, r.left) {
+                    assert_eq!(r.waits.leave(KEY, at), FIBER);
+                    r.leave(Left::Retired);
+                }
+            }
+        }
+    }
+
+    fn model(what: Also, files: bool) {
+        loom::model(move || {
+            let w = Arc::new(World::new());
+            let (w1, w2) = (Arc::clone(&w), Arc::clone(&w));
+            let waiter = loom::thread::spawn(move || wait(&w1, files));
+            let third = loom::thread::spawn(move || also(&w2, what));
+            notify(&w);
+            waiter.join().unwrap();
+            third.join().unwrap();
+            let r = w.run.lock().unwrap();
+            if let (Also::Nothing, Some(_)) = (what, r.filed) {
+                assert_eq!(
+                    r.left,
+                    Some(Left::Woken),
+                    "the waiter parked and the notify missed it"
+                );
+            }
+            assert!(
+                r.filed.is_none() || r.left.is_some(),
+                "the waiter parked and nothing ended its wait"
+            );
+            assert_eq!(r.waits.count.total(), 0, "the stripes end at zero");
+            assert!(r.waits.counted());
+        });
+    }
+
+    #[test]
+    fn loom_a_fiber_woken_by_a_notify_counts_out() {
+        model(Also::Nothing, true);
+    }
+
+    #[test]
+    fn loom_a_fiber_whose_deadline_passes_counts_out() {
+        model(Also::Deadline, true);
+    }
+
+    #[test]
+    fn loom_a_fiber_whose_domain_ends_counts_out() {
+        model(Also::DomainEnd, true);
+    }
+
+    #[test]
+    #[should_panic(expected = "the stripes end at zero")]
+    fn loom_a_fiber_that_never_counts_out_leaves_its_stripe_set() {
+        model(Also::Nothing, false);
     }
 }
 
@@ -12826,25 +13195,35 @@ impl Tasks {
         self.file_wait(i, key);
     }
 
-    /// [`Self::park_wait`]'s filing, for a waiter already counted in on `key` ([`wait_task`]).
+    /// [`Self::park_wait`]'s filing, for a waiter already counted in on `key` ([`wait_task`]): it
+    /// arrives at the back of its word's queue.
     fn file_wait(&mut self, i: usize, key: super::FutexKey) {
-        let TaskState::BlockedWait { deadline, .. } = self.slots[i].state else {
+        let at = self.waits.arrive();
+        let TaskState::BlockedWait { arrived, .. } = &mut self.slots[i].state else {
+            unreachable!("only a futex wait parks aside");
+        };
+        *arrived = at;
+        self.refile_wait(i, key);
+    }
+
+    /// File task `i`'s futex wait, counted in on `key`, at the place in arrival order its state
+    /// records.
+    fn refile_wait(&mut self, i: usize, key: super::FutexKey) {
+        let TaskState::BlockedWait {
+            deadline, arrived, ..
+        } = self.slots[i].state
+        else {
             unreachable!("only a futex wait parks aside");
         };
         if let Ok(at) = self.live.binary_search(&i) {
             self.live.remove(at);
         }
-        let w = &mut self.waits;
-        debug_assert!(w.spare.is_empty(), "the spare queue holds no waiter");
-        let q = (w.on.entry(key)).or_insert_with(|| std::mem::take(&mut w.spare));
-        if let Err(at) = q.binary_search(&i) {
-            q.insert(at, i);
-        }
-        if let Some(d) = deadline {
-            w.due.insert((d, i));
-        }
-        w.n += 1;
-        *w.in_domain.entry(self.slots[i].domain).or_default() += 1;
+        self.waits.file(key, arrived, Waiter::Task(i), deadline);
+        *self
+            .waits
+            .in_domain
+            .entry(self.slots[i].domain)
+            .or_default() += 1;
         self.slots[i].waits_on = Some(key);
     }
 
@@ -12854,34 +13233,17 @@ impl Tasks {
         let Some(key) = self.slots[i].waits_on else {
             return;
         };
-        let w = &mut self.waits;
-        if let Some(q) = w.on.get_mut(&key) {
-            if let Ok(at) = q.binary_search(&i) {
-                q.remove(at);
-            }
-            if q.is_empty() {
-                w.drop_queue(&key);
-            }
-        }
-        self.leave_wait(i);
+        let TaskState::BlockedWait { arrived, .. } = self.slots[i].state else {
+            unreachable!("a task waits aside only in a futex wait");
+        };
+        self.waits.leave(key, arrived);
+        self.left_wait(i);
     }
 
-    /// [`Self::unpark_wait`] for a task already taken out of its key's queue ([`Self::notify`]): it
-    /// counts out, leaves the deadline index and the counts, and is back in the live list.
-    fn leave_wait(&mut self, i: usize) {
-        let Some(key) = self.slots[i].waits_on.take() else {
-            unreachable!("only a waiter leaves its wait");
-        };
-        let w = &mut self.waits;
-        w.count.leave(&key);
-        if let TaskState::BlockedWait {
-            deadline: Some(d), ..
-        } = self.slots[i].state
-        {
-            w.due.remove(&(d, i));
-        }
-        w.n -= 1;
-        if let Some(n) = w.in_domain.get_mut(&self.slots[i].domain) {
+    /// Task `i`, already out of [`Waits`]: out of its domain's count, and back in the live list.
+    fn left_wait(&mut self, i: usize) {
+        self.slots[i].waits_on = None;
+        if let Some(n) = self.waits.in_domain.get_mut(&self.slots[i].domain) {
             *n -= 1;
         }
         self.enter_live(i);
@@ -12901,57 +13263,75 @@ impl Tasks {
         }
     }
 
-    /// `memory.notify` on futex `key`: wake up to `count` of its waiting tasks, lowest task index
-    /// first (deterministic), and answer how many it woke.
-    fn notify(&mut self, key: super::FutexKey, count: u32) -> u32 {
+    /// `waiter`, taken out of [`Waits`] by a notify or its deadline, gets `status`: a task runs on
+    /// with it, and a fiber of `domains` is claimable with it.
+    fn end_taken(&mut self, waiter: Waiter, domains: &mut [Domain], status: i32) {
+        match waiter {
+            Waiter::Task(i) => {
+                self.left_wait(i);
+                self.answer_wait(i, status);
+            }
+            Waiter::Fiber { domain, slot } => match domains[domain].fibers.fibers.get_mut(slot) {
+                Some(FiberState::WaitParked {
+                    woken: w @ None, ..
+                }) => *w = Some(status),
+                _ => unreachable!("a fiber in the wait index waits"),
+            },
+        }
+    }
+
+    /// `memory.notify` on futex `key`: wake up to `count` of its waiters, task or fiber of any of
+    /// `domains`, in the order they arrived (#3086), and answer how many it woke. A woken fiber's
+    /// status is delivered when a `cont.resume` claims it; the tasks it woke are in
+    /// [`Waits::woken`].
+    fn notify(&mut self, key: super::FutexKey, count: u32, domains: &mut [Domain]) -> Woke {
         self.waits.woken.clear();
-        let mut woken = 0;
-        while woken < count {
-            // #2975 — it takes its waiter from the queue it found, which it drops once empty.
-            let w = &mut self.waits;
-            let Some(q) = w.on.get_mut(&key) else {
+        let mut woke = Woke::default();
+        while woke.total() < count {
+            let Some(w) = self.waits.take(key) else {
                 break;
             };
-            let Some(i) = q.pop_front() else {
-                unreachable!("an empty queue leaves the map");
-            };
-            if q.is_empty() {
-                w.drop_queue(&key);
+            self.end_taken(w, domains, super::WAIT_WOKEN);
+            match w {
+                Waiter::Task(i) => {
+                    self.waits.woken.push(i);
+                    woke.tasks += 1;
+                }
+                Waiter::Fiber { .. } => woke.fibers += 1,
             }
-            self.leave_wait(i);
-            self.answer_wait(i, super::WAIT_WOKEN);
-            self.waits.woken.push(i);
-            woken += 1;
         }
-        woken
+        woke
     }
 
-    /// Wake every task whose futex wait's deadline the logical `clock` has reached,
-    /// `WAIT_TIMED_OUT` at its `dst`.
-    fn time_out(&mut self, clock: u64) {
-        while let Some(&(due, i)) = self.waits.due.first() {
-            if due > clock {
-                break;
-            }
-            self.end_wait(i, super::WAIT_TIMED_OUT);
+    /// Time out every futex wait, task or fiber of any of `domains`, whose deadline the logical
+    /// `clock` has reached, `WAIT_TIMED_OUT`: at a task's `dst`, or a fiber claimable with it.
+    fn time_out(&mut self, clock: u64, domains: &mut [Domain]) {
+        while let Some(w) = self.waits.expire(clock) {
+            self.end_taken(w, domains, super::WAIT_TIMED_OUT);
         }
     }
 
-    /// The earliest deadline among the tasks' futex waits: what the logical clock advances to when no
-    /// task is runnable. An infinite wait has none, so a run whose every waiter is indefinite reaches
-    /// its driver's deadlock exit instead of a `WAIT_TIMED_OUT` the guest never asked for (#1638).
+    /// The earliest deadline among the futex waits, task or fiber: what the logical clock advances
+    /// to when no task is runnable. An infinite wait has none, so a run whose every waiter is
+    /// indefinite reaches its driver's deadlock exit instead of a `WAIT_TIMED_OUT` the guest never
+    /// asked for (#1638).
     fn next_deadline(&self) -> Option<u64> {
-        self.waits.due.first().map(|&(due, _)| due)
+        self.waits.next_deadline()
+    }
+
+    /// Whether a *task* waits with a deadline: a thread that naps, which the pump's quanta and its
+    /// idle point ask after (#2224). A fiber's timed wait is not one: a poll of it times it out
+    /// ([`claim_fiber`]), and so does the clock once nothing runs.
+    fn a_task_waits_timed(&self) -> bool {
+        self.waits.timed_tasks != 0
     }
 
     /// The tasks waiting aside on a futex wait, in no order.
     fn waiting(&self) -> impl Iterator<Item = usize> + '_ {
-        self.waits.on.values().flatten().copied()
-    }
-
-    /// Whether a task waits aside on a futex wait.
-    fn any_waiting(&self) -> bool {
-        self.waits.n != 0
+        (self.waits.on.values().flatten()).filter_map(|f| match f.waiter {
+            Waiter::Task(i) => Some(i),
+            Waiter::Fiber { .. } => None,
+        })
     }
 
     /// The domains a task waits aside in.
@@ -12969,6 +13349,42 @@ impl Tasks {
         self.waits.in_domain.remove(&k);
     }
 
+    /// #3078 slice 1 — a domain's fiber registry `fibers` is about to go (its domain ended, or the
+    /// run did): each fiber of it still waiting leaves the wait index, counted out.
+    fn retire_fibers(&mut self, fibers: &[FiberState]) {
+        for f in fibers {
+            if let FiberState::WaitParked {
+                key,
+                arrived,
+                woken: None,
+                ..
+            } = *f
+            {
+                self.waits.leave(key, arrived);
+            }
+        }
+    }
+
+    /// #3078 slice 1 — file every fiber of domain `k`'s registry `fibers` that still waits, at the
+    /// place in arrival order its record keeps: a registry a restore rebuilt ([`Self::file_waits`]).
+    /// Each counts in, as it did when it first parked.
+    fn file_fibers(&mut self, k: usize, fibers: &[FiberState]) {
+        for (slot, f) in fibers.iter().enumerate() {
+            if let FiberState::WaitParked {
+                key,
+                arrived,
+                deadline,
+                woken: None,
+                ..
+            } = *f
+            {
+                self.waits.count.enter(&key);
+                let waiter = Waiter::Fiber { domain: k, slot };
+                self.waits.file(key, arrived, waiter, deadline);
+            }
+        }
+    }
+
     /// Every task a domain-wide rule reaches (a kill, a domain's end): the live ones and those
     /// waiting aside, in index order.
     fn members(&self) -> Vec<usize> {
@@ -12979,23 +13395,39 @@ impl Tasks {
 
     /// #2868 — file every futex wait under the key its site has in the windows `win` names now: after
     /// a debug restore or undo rebuilt the tasks or their windows, under the same sites
-    /// ([`super::FutexSite`]).
+    /// ([`super::FutexSite`]), each at the place in arrival order it had. #3078 slice 1 — and every
+    /// fiber of the registries `fibers` that still waits, under the key its park took.
     ///
     /// #2958 slice 2 — each waiter counts out of its old key's stripe and into its new one, so a
     /// notify reading the stripes without the run lock would see neither in between. None does: a
     /// restore or an undo runs on the cooperative debugger's core ([`SchedCore`]), whose run has no
     /// thread but the one doing this, and only executor 2's threads read a count without the lock.
-    fn file_waits<'a>(&mut self, win: impl Fn(usize) -> Option<&'a dyn super::FutexWindow>) {
+    fn file_waits<'a>(
+        &mut self,
+        win: impl Fn(usize) -> Option<&'a dyn super::FutexWindow>,
+        fibers: &[&[FiberState]],
+    ) {
         let waiting: Vec<usize> = (self.members().into_iter())
             .filter(|&i| matches!(self.slots[i].state, TaskState::BlockedWait { .. }))
             .collect();
         for &i in &waiting {
             self.unpark_wait(i);
         }
+        let filed: Vec<(super::FutexKey, u64)> = (self.waits.on.iter())
+            .flat_map(|(&key, q)| q.iter().map(move |f| (key, f.arrived)))
+            .collect();
+        for (key, arrived) in filed {
+            self.waits.leave(key, arrived);
+        }
         for i in waiting {
             if let TaskState::BlockedWait { addr, site, .. } = self.slots[i].state {
-                self.park_wait(i, site_key_in(win(self.slots[i].domain), addr, site));
+                let key = site_key_in(win(self.slots[i].domain), addr, site);
+                self.waits.count.enter(&key);
+                self.refile_wait(i, key);
             }
+        }
+        for (k, reg) in fibers.iter().enumerate() {
+            self.file_fibers(k, reg);
         }
     }
 
@@ -13193,6 +13625,7 @@ fn refund_ended_windows(tasks: &mut Tasks, envs: &mut [Domain], run_ended: bool)
             if let Some(end) = e.host.lock_unpoisoned().release_memory() {
                 let _ = end.signal();
             }
+            tasks.retire_fibers(&e.fibers.fibers);
             e.fibers = FiberTables::default();
         }
     }
@@ -13223,6 +13656,9 @@ enum TaskState {
         /// `WAIT_TIMED_OUT` the guest never asked for.
         deadline: Option<u64>,
         dst: u32,
+        /// #3086 — its place in its word's arrival order ([`Waits`]), which [`Tasks::file_wait`]
+        /// sets as it files the wait. A restore refiles it there.
+        arrived: u64,
     },
     /// §3.6 (I36 slice 2): parked in `svc.wait` on this task's own domain (its domain's host); a
     /// caller's enqueue on that host re-admits it (the rewound op re-executes the drain).
@@ -13523,7 +13959,7 @@ fn freeze_step(
 ) -> bool {
     use super::{DeclineCause, FreezeDeclined, FreezeRule};
     let mut host = root.host.lock_unpoisoned();
-    if *freeze_on_quiesce && quiesced_parks_only(tasks, &root.fibers.fibers) {
+    if *freeze_on_quiesce && quiesced_parks_only(tasks) {
         *freeze_on_quiesce = false;
         let parked_declined = tasks.live().find_map(|ti| {
             let site = tasks[ti].state.park_site()?;
@@ -13606,30 +14042,21 @@ fn admit_parks(tasks: &mut Tasks) -> bool {
 }
 
 /// The oracle's `quiesced_parks_only`: something is parked that a freeze could re-admit — a
-/// `svc.wait` (or a resumer idling beside it) or a futex wait — and no futex wait has a deadline.
-fn quiesced_parks_only(tasks: &Tasks, fibers: &[FiberState]) -> bool {
-    // #2868 — the futex waits wait aside.
+/// `svc.wait` (or a resumer idling beside it) or a futex wait, a task's or a fiber's — and no futex
+/// wait has a deadline.
+fn quiesced_parks_only(tasks: &Tasks) -> bool {
+    // #2868 — the futex waits wait aside, and #3078 slice 1 a fiber's with them.
     if tasks.next_deadline().is_some() {
         return false;
     }
-    let mut any = tasks.any_waiting();
-    for i in tasks.live() {
-        if let TaskState::BlockedSvc | TaskState::BlockedOnFiber { .. } = tasks[i].state {
-            any = true;
-        }
-    }
-    for f in fibers {
-        match f {
-            FiberState::WaitParked {
-                deadline: None,
-                woken: None,
-                ..
-            } => any = true,
-            FiberState::WaitParked { woken: None, .. } => return false,
-            _ => {}
-        }
-    }
-    any
+    let w = &tasks.waits;
+    w.n + w.fibers != 0
+        || (tasks.live()).any(|i| {
+            matches!(
+                tasks[i].state,
+                TaskState::BlockedSvc | TaskState::BlockedOnFiber { .. }
+            )
+        })
 }
 
 /// Drive a whole domain — the entry vCPU plus any `thread.spawn` children — to completion on a
@@ -13838,6 +14265,7 @@ fn hand_off(
                 site,
                 deadline: timeout.map(|t| clock.saturating_add(t)),
                 dst,
+                arrived: 0, // set as it files
             };
             let win = win.map(|m| m as &dyn super::FutexWindow);
             tasks.park_wait(ti, site_key_in(win, base, site));
@@ -14435,6 +14863,7 @@ fn settle_wakes(
         let env = &mut domains[k];
         env.mem = None;
         env.host = std::sync::Arc::clone(&released.host);
+        tasks.retire_fibers(&env.fibers.fibers);
         env.fibers = FiberTables::default();
     }
     // FORK.md §9.2 — reap wakes: a caller parked in `wait(pid)` wakes when fork twin `pid`
@@ -14581,11 +15010,7 @@ impl SchedCore {
     /// The pump's quanta move it so (#2224), and so does its embedder's clock ([`CoopRun::pass_time`]).
     fn pass_time(&mut self, ns: u64) {
         self.clock = self.clock.saturating_add(ns);
-        time_out_due(
-            &mut self.tasks,
-            &mut registries(&mut self.domains),
-            self.clock,
-        );
+        self.tasks.time_out(self.clock, &mut self.domains);
     }
 
     /// A run's initial scheduling state: the root task at `entry` in the root domain, plus any
@@ -14898,6 +15323,9 @@ impl CoopSched {
                     }) {
                         return Err(Trap::FiberFault);
                     }
+                    // #3078 slice 1 — the flatten ends every fiber's futex wait (its thaw
+                    // re-issues it), so each leaves the wait index first.
+                    tasks.retire_fibers(&fibers.fibers);
                     let FiberTables { fibers, sp, meta } = fibers;
                     let frozen = freeze_drive(fibers, sp, meta, source, &mut ctx, budget)?;
                     g.frozen_fibers = frozen;
@@ -14950,7 +15378,7 @@ impl CoopSched {
                 // call was made (#1414 D4).
                 if *embedder_pumps {
                     let owed = calls.iter().any(|(c, id)| c.is_host_owned(*id));
-                    match run_deadline(tasks, domains) {
+                    match tasks.next_deadline() {
                         Some(due) if due > *clock => {
                             return Ok(CoopStep::Idle {
                                 timer: Some(due - *clock),
@@ -14966,7 +15394,7 @@ impl CoopSched {
                 }
                 // No runnable task: fire the earliest `wait` timeout — whole-vCPU waiters and
                 // event-parked fiber waiters alike (§3.6 slice 5a), in every domain.
-                if !fire_next_timeout(tasks, &mut registries(domains), clock) {
+                if !fire_next_timeout(tasks, domains, clock) {
                     // #1146 slice 2 — before blocking, interrupt the parks a deliverable signal
                     // reached ([`interrupt_parks`]).
                     if interrupt_parks(tasks, domains) {
@@ -15051,7 +15479,7 @@ impl CoopSched {
             // #2538 — and while a task waits on a call: its answer is drained between quanta, so a
             // lone runnable task must yield to let it through, or a thread that waits on the world
             // never wakes while another spins on it.
-            let (quantum, preemptible) = if tasks.next_deadline().is_some() || {
+            let (quantum, preemptible) = if tasks.a_task_waits_timed() || {
                 let (mut runnable, mut awaits_call) = (0, false);
                 for t in tasks.live().map(|i| &tasks[i]) {
                     if matches!(t.state, TaskState::Runnable) {
@@ -15101,7 +15529,9 @@ impl CoopSched {
                 durable,
                 host: HostCell::Excl(&mut guard),
             };
-            let mut fcell = e.fibers.cell();
+            // #3078 slice 1 — with the run's wait index, which a claim that times a fiber's wait
+            // out takes it from: the task's slot below is borrowed apart from it (`tasks.slots`).
+            let mut fcell = e.fibers.cell_in(&mut tasks.waits);
             // What this task can still burn drops by exactly what it burned: no other task runs
             // while it steps, and a draw moves fuel from its chain into its hand (#1944 slice 3).
             let fuel_before = ctx.fuel.can_burn();
@@ -15115,7 +15545,7 @@ impl CoopSched {
             // When it returns, its host resumes the leaf's suspended frames with its results; when
             // it parks again, the task waits again. A trap ends the process, whose frames the host
             // never resumes.
-            if let Some(s) = tasks[ti].vm.suspended.take() {
+            if let Some(s) = tasks.slots[ti].vm.suspended.take() {
                 // Only the pump's leaf leaves a call here ([`CoopRun::bounce`]).
                 let Suspended {
                     vm,
@@ -15183,7 +15613,7 @@ impl CoopSched {
                 continue;
             }
             let stop = step_vcpu(
-                &mut tasks[ti].vm.vt,
+                &mut tasks.slots[ti].vm.vt,
                 &mut fcell,
                 source,
                 &mut ctx,
@@ -16294,22 +16724,16 @@ impl SchedCore {
                 }
             }
             Ok(VcpuStop::Notify { base, count, dst }) => {
-                // Wake up to `count` waiters, lowest task index first (deterministic). Key on the
-                // notifying task's own memory + backing identity (mirrors the wait arm), so a notify
-                // from one child's window matches a waiter parked from another child's window on the
-                // same `SharedRegion` byte.
+                // Wake up to `count` waiters, task or fiber of any domain, in the order they
+                // arrived (#3086). Key on the notifying task's own memory + backing identity
+                // (mirrors the wait arm), so a notify from one child's window matches a waiter
+                // parked from another child's window on the same `SharedRegion` byte.
                 let key = futex_key_in(domains[tasks[ti].domain].window(), base);
-                let want = count as u32;
-                let tasks_woken = tasks.notify(key, want);
-                // §3.6 slice 5a: then event-parked FIBER waiters, in every domain: the root's
-                // registry, then each child domain's.
-                let regs = domains.iter_mut().flat_map(|e| e.fibers.fibers.iter_mut());
-                let fibers_woken = wake_fiber_waiters(regs, key, want - tasks_woken);
-                let woken = tasks_woken + fibers_woken;
-                tasks[ti].deliver(dst, Reg::from_i32(woken as i32));
+                let woke = tasks.notify(key, count as u32, domains);
+                tasks[ti].deliver(dst, Reg::from_i32(woke.total() as i32));
                 // #2963 — only the tasks it woke moved ([`Waits::woken`]); a woken fiber's resumer
                 // is anything's business.
-                if fibers_woken == 0 {
+                if woke.fibers == 0 {
                     return Applied::Futex;
                 }
             }
@@ -17842,7 +18266,7 @@ impl CoopRun {
             (invoke_fibers.cell(), None)
         } else {
             (
-                e.fibers.cell(),
+                e.fibers.cell_in(&mut tasks.waits),
                 Some(BounceRunCtx {
                     park: parks.then_some(&mut parked),
                 }),
@@ -17851,7 +18275,7 @@ impl CoopRun {
         // #1627: the view beneath this bounce — the paused task's Vms and the spilled words. The
         // run's fiber registry is the bounce's own (`bounce_fibers`), which the drive scans itself.
         let beneath = spill.filter(|_| !in_invoke).map(|words| {
-            let mut b = Beneath::task(&tasks[ti].vm.vt, FiberRegRef::Owned(&[]));
+            let mut b = Beneath::task(&tasks.slots[ti].vm.vt, FiberRegRef::Owned(&[]));
             b.words.push(words);
             b
         });
@@ -20130,11 +20554,7 @@ impl ThreadRun {
             h.ended.get_or_insert(trap);
         }
         core.clock = self.now();
-        time_out_due(
-            &mut core.tasks,
-            &mut registries(&mut core.domains),
-            core.clock,
-        );
+        core.tasks.time_out(core.clock, &mut core.domains);
         // F2: a fiber parked on a punted call wakes once the call completes; #2047: a task too.
         // #2424: in any domain.
         drain_fiber_completions(&mut core.domains);
@@ -20330,7 +20750,7 @@ impl ThreadRun {
     /// another task, or an embedder through the external-wake bell, wakes it.
     fn idle(&self, core: &SchedCore) -> bool {
         // #2868 — a futex wait waits aside: one with a deadline moves on its own.
-        core.tasks.next_deadline().is_none()
+        !core.tasks.a_task_waits_timed()
             && core.tasks.live().all(|j| match core.tasks[j].state {
                 TaskState::Done(_) => true,
                 TaskState::Runnable => self.stopped(core, j),
@@ -20608,7 +21028,10 @@ impl ThreadRun {
         }
         let core = &g.core;
         g.stalled.then(|| Watched::Idle {
-            timer: run_deadline(&core.tasks, &core.domains).map(|d| d.saturating_sub(self.now())),
+            timer: core
+                .tasks
+                .next_deadline()
+                .map(|d| d.saturating_sub(self.now())),
         })
     }
 }
@@ -20683,7 +21106,7 @@ fn complete(tasks: &mut Tasks, envs: &mut [Domain], ti: usize, res: Result<Vec<V
             answer(*a, &res, &envs[tasks[done].domain]);
         }
         let domain = tasks[done].domain;
-        revoke_handlers(&mut tasks[done], &mut envs[domain]);
+        revoke_handlers(&mut tasks.slots[done], &mut tasks.waits, &mut envs[domain]);
         let joiners: Vec<(usize, i32, u32)> = (tasks.live())
             .filter_map(|j| match tasks[j].state {
                 TaskState::BlockedJoin { child, handle, dst } if child == done => {
@@ -20713,7 +21136,7 @@ fn complete(tasks: &mut Tasks, envs: &mut [Domain], ti: usize, res: Result<Vec<V
 /// serve loop parked can never run again, so each one's dispatch answers `CAP_REVOKED`, as the
 /// oracle answers a dead vCPU's parked handlers, and its fiber slot goes. Not under a freeze, whose
 /// cut carries them.
-fn revoke_handlers(t: &mut TaskSlot, d: &mut Domain) {
+fn revoke_handlers(t: &mut TaskSlot, waits: &mut Waits, d: &mut Domain) {
     let Domain {
         host, fibers, mem, ..
     } = d;
@@ -20725,7 +21148,7 @@ fn revoke_handlers(t: &mut TaskSlot, d: &mut Domain) {
         None => return,
     };
     let mut host = HostCell::Shared(host);
-    let mut fibers = fibers.cell();
+    let mut fibers = fibers.cell_in(waits);
     for k in parked {
         let ticket = fibers.with(|f, _, _| f.get(k)?.parked_vm()?.dispatch());
         release_handler(&mut fibers, k);
@@ -20980,6 +21403,7 @@ fn wait_task(
         site,
         deadline: timeout.map(|t| clock.saturating_add(t)),
         dst,
+        arrived: 0, // set as it files
     };
     tasks.file_wait(ti, key);
     Ok(())
@@ -20989,7 +21413,7 @@ fn wait_task(
 /// `fiber_sp`). Outside a fiber it is [`wait_task`]. Inside one it parks the FIBER, not the task
 /// (§3.6 slice 5a, the oracle's routing; DESIGN.md "blocks the fiber, never the domain"): the
 /// resumer gets `FIBER_PARKED` and runs on — or, under a blocking resume on a driver that
-/// `can_idle`, idles on the fiber (`BlockedOnFiber`) — until a `notify` ([`wake_fiber_waiters`]),
+/// `can_idle`, idles on the fiber (`BlockedOnFiber`) — until a `notify` ([`Tasks::notify`]),
 /// the deadline ([`fire_next_timeout`]) or the park-time value recheck wakes it. `durable` is asked
 /// only for a fiber's park. The one wait rule of the pump and the debugger (#2215). `native` is the
 /// domain's native window ([`Domain::native`]), which a task's wait reads in place of `mem`. `Err`
@@ -21022,105 +21446,56 @@ fn futex_wait(
     let key = mem
         .as_ref()
         .map_or(super::FutexKey::Anon(0, base), |m| m.futex_key(base));
-    // #2958 slice 2 — a fiber's wait counts in on its key before its read, as a task's does, and
-    // never out: its wait ends in the fiber machinery, not in [`Waits`]. The key's stripe stays on
-    // the slow path for the rest of the run. Phase 2 of #2958 puts fiber waits in the kernel's wait
-    // index, where they count out as a task's do.
+    // #2958 slice 2 — a fiber's wait counts in on its key before its read, as a task's does.
+    // #3078 slice 1 — and out as it leaves the wait index ([`Waits`]), as a task's does: here, if
+    // the re-check below fires, or else by a notify, its deadline, a poll past its real deadline
+    // ([`claim_fiber`]) or its domain's end ([`Tasks::retire_fibers`]).
     tasks.waits.count.enter(&key);
-    tasks.waits.sticky += 1;
     let cur = mem.as_ref().map_or(0, |m| m.atomic_value(base, width));
     // The park-time recheck closes the park-vs-store race: a store that already landed wakes the
-    // fiber with `WAIT_NOT_EQUAL`, after the one transient `FIBER_PARKED`, like the oracle.
+    // fiber with `WAIT_NOT_EQUAL`, after the one transient `FIBER_PARKED`, like the oracle. Its
+    // waiter is never filed, as a task's not-equal wait is not.
     let woken = (cur != expected).then_some(super::WAIT_NOT_EQUAL);
+    // #1638: an infinite wait arms neither clock. It ends by `notify`, by the park-time recheck, or
+    // not at all — and "not at all" is the driver's deadlock exit, not a fabricated `WAIT_TIMED_OUT`.
+    let deadline = timeout.map(|t| clock.saturating_add(t));
+    let arrived = tasks.waits.arrive();
     let park = |vm| FiberState::WaitParked {
         vm,
         wait_dst: dst,
         key,
-        // #1638: an infinite wait arms neither clock. It ends by `notify`, by the park-time
-        // recheck, or not at all — and "not at all" is the driver's deadlock exit, not a
-        // fabricated `WAIT_TIMED_OUT`.
-        deadline: timeout.map(|t| clock.saturating_add(t)),
+        deadline,
         real_deadline: timeout.map(sched_wall_deadline),
         woken,
+        arrived,
     };
+    let (domain, slot) = (tasks[ti].domain, tasks[ti].vm.vt.active_id);
     let vt = &mut tasks[ti].vm.vt;
     let durable = durable();
     let idle = park_running_fiber(vt, fibers, fiber_sp, mem, durable, can_idle, park, |_| {
         woken.is_some()
     });
+    match woken {
+        Some(_) => tasks.waits.count.leave(&key),
+        None => (tasks.waits).file(key, arrived, Waiter::Fiber { domain, slot }, deadline),
+    }
     if let Some(k) = idle {
         tasks[ti].state = TaskState::BlockedOnFiber { fiber: k };
     }
     Ok(())
 }
 
-/// `memory.notify`'s fiber half: after the task waiters ([`Tasks::notify`]), wake up to `want`
-/// event-parked fibers on `key`, in `fibers` order — each domain's registry in turn, lowest slot
-/// first, so the wake order is deterministic like the task scan. Returns how many it woke; a woken
-/// fiber's status is delivered when a `cont.resume` claims it.
-fn wake_fiber_waiters<'a>(
-    fibers: impl IntoIterator<Item = &'a mut FiberState>,
-    key: super::FutexKey,
-    want: u32,
-) -> u32 {
-    let mut woken = 0u32;
-    for f in fibers {
-        if woken >= want {
-            break;
-        }
-        if let FiberState::WaitParked {
-            key: fkey,
-            woken: w @ None,
-            ..
-        } = f
-        {
-            if *fkey == key {
-                *w = Some(super::WAIT_WOKEN);
-                woken += 1;
-            }
-        }
-    }
-    woken
-}
-
-/// Nothing is runnable: advance the logical `clock` to the earliest futex-wait deadline — a task's,
-/// or an event-parked fiber's in any domain's registry (`fibers`) — and time out every wait it
-/// reaches (`WAIT_TIMED_OUT` at a task's `dst`; a fiber made claimable with it). `false` when no
-/// wait has a deadline, which is the driver's deadlock (#1638: an infinite wait never times out).
-fn fire_next_timeout(
-    tasks: &mut Tasks,
-    fibers: &mut [&mut Vec<FiberState>],
-    clock: &mut u64,
-) -> bool {
-    let Some(next) = next_timeout(tasks, fibers.iter().flat_map(|reg| reg.iter())) else {
+/// Nothing is runnable: advance the logical `clock` to the earliest futex-wait deadline, a task's
+/// or a fiber's of any of `domains` ([`Waits`]), and time out every wait it reaches
+/// (`WAIT_TIMED_OUT` at a task's `dst`; a fiber made claimable with it). `false` when no wait has a
+/// deadline, which is the driver's deadlock (#1638: an infinite wait never times out).
+fn fire_next_timeout(tasks: &mut Tasks, domains: &mut [Domain], clock: &mut u64) -> bool {
+    let Some(next) = tasks.next_deadline() else {
         return false;
     };
     *clock = (*clock).max(next);
-    time_out_due(tasks, fibers, *clock);
+    tasks.time_out(*clock, domains);
     true
-}
-
-/// The earliest deadline on the logical clock: a task's futex wait's, or an event-parked fiber's
-/// among `fibers`. `None` when no wait has one.
-fn next_timeout<'a>(tasks: &Tasks, fibers: impl Iterator<Item = &'a FiberState>) -> Option<u64> {
-    let fiber_deadline = |f: &FiberState| match f {
-        FiberState::WaitParked {
-            deadline,
-            woken: None,
-            ..
-        } => *deadline,
-        _ => None,
-    };
-    fibers
-        .filter_map(fiber_deadline)
-        .chain(tasks.next_deadline())
-        .min()
-}
-
-/// The earliest deadline among a run's timed waits: its tasks', and its event-parked fibers' in
-/// every domain.
-fn run_deadline(tasks: &Tasks, envs: &[Domain]) -> Option<u64> {
-    next_timeout(tasks, envs.iter().flat_map(|e| e.fibers.fibers.iter()))
 }
 
 /// #1979 — an idle native pump lets the time to its earliest deadline pass in real time, as the
@@ -21136,7 +21511,8 @@ fn wait_out(
     calls: &[(std::sync::Arc<super::Completions>, u64)],
     seen: u64,
 ) -> bool {
-    let Some(left) = run_deadline(tasks, domains)
+    let Some(left) = tasks
+        .next_deadline()
         .and_then(|next| next.checked_sub(*clock))
         .filter(|&l| l > 0)
     else {
@@ -21223,32 +21599,11 @@ fn interrupt_parks(tasks: &mut Tasks, domains: &[Domain]) -> bool {
     woke
 }
 
-/// Time out every futex wait whose deadline `clock` has reached: a task's (`WAIT_TIMED_OUT` at its
-/// `dst`), and an event-parked fiber's in any domain's registry (`fibers`), made claimable with it.
-fn time_out_due(tasks: &mut Tasks, fibers: &mut [&mut Vec<FiberState>], clock: u64) {
-    tasks.time_out(clock);
-    for f in fibers.iter_mut().flat_map(|reg| reg.iter_mut()) {
-        if let FiberState::WaitParked {
-            deadline: Some(deadline),
-            woken: w @ None,
-            ..
-        } = f
-        {
-            if *deadline <= clock {
-                *w = Some(super::WAIT_TIMED_OUT);
-            }
-        }
-    }
-}
-
 /// #1936 — wake every task and event-parked fiber waiting on region word `w`, in every domain: a
 /// post's `signal` ([`Outcome::WakeRegion`]), or a child's end post at its end. `memory.notify` with
 /// no count, keyed as the word's waiters keyed their parks, whichever window they map it in.
 fn wake_region(tasks: &mut Tasks, domains: &mut [Domain], w: &super::RegionWake) {
-    let key = w.key();
-    tasks.notify(key, u32::MAX);
-    let regs = domains.iter_mut().flat_map(|e| e.fibers.fibers.iter_mut());
-    wake_fiber_waiters(regs, key, u32::MAX);
+    tasks.notify(w.key(), u32::MAX, domains);
 }
 
 /// Domain lifetime & teardown, cooperative-bytecode form (DESIGN.md §12, owner 2026-07-24;
