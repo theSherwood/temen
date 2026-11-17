@@ -9688,6 +9688,10 @@ pub enum CallPark {
 /// dispatch left is drained here. `read` is whether the op is a stream read. A native task runs on no
 /// durable run (`native_scope`'s `durable`), so no freeze abandons its park.
 pub fn call_park(host: &mut Host, read: bool) -> CallPark {
+    // Most calls leave nothing: they pay one look at the flags.
+    if !host.parks_left() {
+        return CallPark::Done(None);
+    }
     let parks = DispatchParks::take(host);
     parks.decide(read, |f| match f {
         ParkFact::Interrupted(sig) => (sig && !host.signal_restart()) || host.park_interrupted(),

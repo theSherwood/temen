@@ -28281,6 +28281,20 @@ impl Host {
     /// (a JIT process tree, `jit_proc`). #2847 — `None` when it left none, as most calls do: a few
     /// loads that change nothing, where a drain writes every flag back.
     #[inline]
+    /// #2958 slice 5 — whether the last dispatch left any per-op park flag ([`ParkTransients`],
+    /// the stdin park, the interrupt latch): the cheap test a call that left none (most calls) stops
+    /// at, before a drain.
+    pub(crate) fn parks_left(&self) -> bool {
+        self.pipe_wake.is_some()
+            || self.pipe_wake_writers.is_some()
+            || self.region_wake.is_some()
+            || self.pipe_read_parked.is_some()
+            || self.pipe_write_parked.is_some()
+            || self.park_request.load(Ordering::Relaxed) != 0
+            || self.stdin_parked
+            || self.sig_interrupt
+    }
+
     pub fn take_park_transients(&mut self) -> Option<ParkTransients> {
         let left = self.pipe_wake.is_some()
             || self.pipe_wake_writers.is_some()
