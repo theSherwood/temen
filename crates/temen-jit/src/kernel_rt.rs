@@ -30,6 +30,13 @@ pub use temen_ir::seams::NativeStop;
 /// code to raise: the task or its run ended meanwhile, or the op traps.
 pub trait KernelPark {
     fn park(&mut self, stop: NativeStop) -> Result<[i64; 2], i64>;
+
+    /// #2958 slice 5 — the park a capability call left its vCPU to take (a pipe or stdin read, a
+    /// punted call, a region post's wake), from the embedder's `call.cap` thunk rather than the
+    /// emitted code: `call` is the embedder's own decision, a value this crate cannot name, handed
+    /// from the embedder's thunk to its own hook through [`park_call`]. A later slice extends what
+    /// that value carries, not this trait. Answers as [`Self::park`] does.
+    fn park_call(&mut self, call: &mut dyn std::any::Any) -> Result<[i64; 2], i64>;
 }
 
 /// Route a §12 thunk's op to the kernel, if `vm` is a kernel vCPU's context: `None` otherwise, and
@@ -37,10 +44,36 @@ pub trait KernelPark {
 #[cfg(fiber_rt)]
 #[inline]
 pub(crate) fn routed(vm: &VmCtx, stop: NativeStop) -> Option<[i64; 2]> {
+    // SAFETY: a §12 thunk runs on the vCPU's own thread, inside the guarded call `run_vcpu` set the
+    // hook for (the module docs).
+    unsafe { through_hook(vm, |hook| hook.park(stop)) }
+}
+
+/// #2958 slice 5 — hand a capability call's park to the kernel, if `vm` is a kernel vCPU's context
+/// ([`KernelPark::park_call`]): `None` otherwise. A trap is raised on `vm`, whose next check unwinds.
+///
+/// # Safety
+/// The caller is the embedder's `call.cap` thunk of code running on `vm`, on the vCPU's own thread,
+/// inside the guarded call [`KernelRun::run_vcpu`] set the hook for: the hook's `&mut` it takes is
+/// then the only live one (the module docs).
+pub unsafe fn park_call(vm: &VmCtx, call: &mut dyn std::any::Any) -> Option<[i64; 2]> {
+    // SAFETY: the caller's contract.
+    unsafe { through_hook(vm, |hook| hook.park_call(call)) }
+}
+
+/// The one way into a vCPU's hook ([`routed`], [`park_call`]): run `f` on it, raising its error on
+/// `vm`.
+///
+/// # Safety
+/// As [`park_call`].
+#[inline]
+unsafe fn through_hook(
+    vm: &VmCtx,
+    f: impl FnOnce(&mut dyn KernelPark) -> Result<[i64; 2], i64>,
+) -> Option<[i64; 2]> {
     let hook = vm.kernel?;
-    // SAFETY: `run_vcpu` set `kernel` on this context for the guarded call this thunk runs inside,
-    // and nothing else reaches the hook meanwhile (the module docs).
-    match unsafe { (*hook.as_ptr()).park(stop) } {
+    // SAFETY: the caller's contract: nothing else reaches the hook meanwhile.
+    match f(unsafe { &mut *hook.as_ptr() }) {
         Ok(r) => Some(r),
         Err(code) => {
             vm.raise(code);

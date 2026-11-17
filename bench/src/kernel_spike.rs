@@ -11,7 +11,7 @@
 //! run (#2953). No lane meters fuel.
 //!
 //! `SPIKE_SECTIONS` picks sections, comma-separated: `compute`, `spawn`, `park` (the default three),
-//! `k1000`, `nowake`, `alias` (#2958 slice 4), `pairs`, `always` (#2985). `SPIKE_K` picks the park section's K values (`0,100,1000` by
+//! `k1000`, `nowake`, `alias` (#2958 slice 4), `pairs`, `always` (#2985), `pipes` (#2958 slice 5). `SPIKE_K` picks the park section's K values (`0,100,1000` by
 //! default), `SPIKE_LANES` its lanes.
 
 use std::time::{Duration, Instant};
@@ -82,8 +82,8 @@ fn kernel(m: &Module, entry: u32, host: fn() -> Host) -> Lane<'_> {
     })
 }
 
-/// Executor 2 interpreting `m`: no emitted tier.
-fn x2_interp(m: &Module) -> Lane<'_> {
+/// Executor 2 interpreting `m` over a fresh host `host` makes: no emitted tier.
+fn x2_interp(m: &Module, host: fn() -> Host) -> Lane<'_> {
     Box::new(move |args| {
         let vals: Vec<Value> = args.iter().map(|a| Value::I64(*a)).collect();
         let t0 = Instant::now();
@@ -92,7 +92,7 @@ fn x2_interp(m: &Module) -> Lane<'_> {
             0,
             &vals,
             u64::MAX,
-            Host::new(),
+            host(),
             &[],
             RESERVED,
             None,
@@ -409,6 +409,96 @@ pub fn run(reps: usize) {
     if on("always") {
         run_always(reps);
     }
+    if on("pipes") {
+        run_pipes(reps);
+    }
+}
+
+/// #2958 slice 5 — a host granted two pipes, its ends `(w1, r1, w2, r2)` the same on every fresh host.
+fn pipe_host() -> Host {
+    let mut h = Host::new();
+    h.grant_pipe();
+    h.grant_pipe();
+    h
+}
+
+/// #2958 slice 5 — a pipe pingpong between the root and one thread over two host-granted pipes:
+/// `entry(n)` sends a byte through pipe 1 and reads it back through pipe 2, `n` times, each side
+/// blocking on its read until the other has written; on the kernel route each read that finds its
+/// pipe empty parks its task through the rules, and the partner's write wakes it. Per hand-off: one
+/// byte each way is two hand-offs.
+fn run_pipes(reps: usize) {
+    println!(
+        "
+pipe pingpong between two vCPUs (us per hand-off; host-granted pipes):"
+    );
+    let mut h = Host::new();
+    let (w1, r1) = h.grant_pipe();
+    let (w2, r2) = h.grant_pipe();
+    let ir = format!(
+        "memory 16
+func (i64) -> (i64) {{
+block 0 (vn: i64) {{
+  vz = i64.const 0
+  vt = thread.spawn 1 vn vz
+  br 1(vt, vz, vn)
+}}
+block 1 (vt1: i32, vi: i64, vn1: i64) {{
+  vw = i32.const {w1}
+  vr = i32.const {r2}
+  vbuf = i64.const 16500
+  vone = i64.const 1
+  vs = call.cap 0 1 (i64, i64) -> (i64) vw (vbuf, vone)
+  vg = call.cap 0 0 (i64, i64) -> (i64) vr (vbuf, vone)
+  vi1 = i64.add vi vone
+  vmore = i64.lt_s vi1 vn1
+  br_if vmore 1(vt1, vi1, vn1) 2(vt1, vi1)
+}}
+block 2 (vt2: i32, vdone: i64) {{
+  vst, vj = thread.join vt2
+  vres = i64.add vdone vj
+  return vres
+  }}
+}}
+func (i64, i64) -> (i64) {{
+block 0 (vn: i64, vz: i64) {{
+  br 1(vz, vn)
+}}
+block 1 (vi: i64, vn1: i64) {{
+  vr = i32.const {r1}
+  vw = i32.const {w2}
+  vbuf = i64.const 16600
+  vone = i64.const 1
+  vg = call.cap 0 0 (i64, i64) -> (i64) vr (vbuf, vone)
+  vs = call.cap 0 1 (i64, i64) -> (i64) vw (vbuf, vone)
+  vi1 = i64.add vi vone
+  vmore = i64.lt_s vi1 vn1
+  br_if vmore 1(vi1, vn1) 2(vi1)
+}}
+block 2 (vres: i64) {{
+  return vres
+  }}
+}}
+"
+    );
+    let m = parse(&ir);
+    // Today's lane reuses one compile and so one host over every run: its pipes stay empty between
+    // runs, each run's bytes all read back.
+    let mut lanes = [
+        ("today", today(&m, 0, pipe_host(), true)),
+        ("kernel", kernel(&m, 0, pipe_host)),
+        ("x2-interp", x2_interp(&m, pipe_host)),
+    ];
+    per_iter(
+        "pipe pingpong",
+        &mut lanes,
+        |n| vec![n],
+        (100, 20_000),
+        2.0,
+        reps,
+        1e3,
+        "us",
+    );
 }
 
 /// #2985 — the always-block hand-off ([`crate::kernel_spike_ir::always_ir`]): the pingpong with a
@@ -439,7 +529,7 @@ fn run_always(reps: usize) {
         let all: Vec<(&str, Lane<'_>)> = vec![
             ("today", today(m, 0, Host::new(), true)),
             ("kernel", kernel(m, 0, Host::new)),
-            ("x2-interp", x2_interp(m)),
+            ("x2-interp", x2_interp(m, Host::new)),
         ];
         (all.into_iter())
             .filter(|(n, _)| pick.is_empty() || pick.split(',').any(|x| x == *n))
@@ -555,7 +645,7 @@ fn run_park(reps: usize) {
         let lanes = vec![
             ("today", today(&m, 0, Host::new(), true)),
             ("kernel", kernel(&m, 0, Host::new)),
-            ("x2-interp", x2_interp(&m)),
+            ("x2-interp", x2_interp(&m, Host::new)),
         ];
         let mut lanes: Vec<_> = lanes
             .into_iter()
@@ -620,7 +710,7 @@ fn run_nowake(reps: usize) {
             let mut lanes = [
                 ("today", today(&m, 0, Host::new(), true)),
                 ("kernel", kernel(&m, 0, Host::new)),
-                ("x2-interp", x2_interp(&m)),
+                ("x2-interp", x2_interp(&m, Host::new)),
             ];
             let label = format!("{what}, K = {k}");
             per_iter(
@@ -655,7 +745,7 @@ fn run_nowake_fibers(reps: usize) {
                     continue;
                 }
                 let args = move |n| vec![n, k, mode, same];
-                let mut lanes = [("x2-interp", x2_interp(&m))];
+                let mut lanes = [("x2-interp", x2_interp(&m, Host::new))];
                 let label = format!("{what}, K = {k} {where_}");
                 per_iter(
                     &label,
