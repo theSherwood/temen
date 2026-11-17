@@ -1802,6 +1802,14 @@ pub(crate) fn context_id() -> u64 {
     THREAD_CONTEXT.with(|t| t as *const u8 as u64)
 }
 
+/// #3078 — whether a fiber is running on this thread now: [`current_fiber_slot`] is `Some`, with no
+/// slot taken.
+pub(crate) fn in_a_fiber() -> bool {
+    let rt = current();
+    // SAFETY: `current()` is this thread's live runtime; the borrow is momentary.
+    !rt.is_null() && unsafe { !(*rt).active_slots.is_empty() }
+}
+
 pub(crate) fn current_fiber_slot() -> Option<Arc<FiberSlot>> {
     let rt = current();
     if rt.is_null() {

@@ -14,7 +14,8 @@
 //! Everything `native_scope` declines runs on [`crate::os_thread_rt`], unchanged.
 //!
 //! **The thread's record (#3078 slice 2).** A kernel vCPU's hook is found by the thread of control
-//! running now, never through the context the code carries: a fiber's code carries its creator's
+//! running now, never through the context the code carries (which says only that it is a kernel
+//! run's, `VmCtx::kernel`, a fact of the run): a fiber's code carries its creator's
 //! context ([`crate::VmCtx`], `vmctx.rs`'s note), so a fiber made on one vCPU and resumed on another
 //! must reach the hook of the vCPU it runs on. [`KernelRun::run_vcpu`] publishes the record for its
 //! guarded call, beside the vCPU's fiber runtime (`fiber_rt`'s `CURRENT_RT`), and one guard clears
@@ -52,60 +53,52 @@ pub trait KernelPark {
     fn park_call(&mut self, call: &mut dyn std::any::Any) -> Result<[i64; 2], i64>;
 }
 
-/// The thread's record (the module docs): the run its vCPU is of, by its end word, and its hook.
-#[derive(Clone, Copy)]
+/// The thread's record (the module docs): the run its vCPU is of, by its end word (null when this
+/// thread runs no kernel vCPU), and its hook, which a thunk takes for the length of its borrow: a
+/// record whose end is set and whose hook is `None` is borrowed.
 struct Record {
-    /// The run's end word; null when this thread runs no kernel vCPU.
-    end: *const AtomicI64,
-    hook: Hook,
-}
-
-#[derive(Clone, Copy)]
-enum Hook {
-    Off,
-    Free(NonNull<dyn KernelPark>),
-    /// A thunk holds the hook `&mut` (the module docs).
-    Borrowed,
-}
-
-impl Record {
-    const OFF: Record = Record {
-        end: std::ptr::null(),
-        hook: Hook::Off,
-    };
+    end: Cell<*const AtomicI64>,
+    hook: Cell<Option<NonNull<dyn KernelPark>>>,
 }
 
 thread_local! {
-    static RECORD: Cell<Record> = const { Cell::new(Record::OFF) };
+    static RECORD: Record = const {
+        Record {
+            end: Cell::new(std::ptr::null()),
+            hook: Cell::new(None),
+        }
+    };
 }
 
-/// This thread's record, read on the thread running now: `#[inline(never)]` for the reason
-/// `fiber_rt::current` is (#1466), since a thunk that reads it may run on a fiber's stack.
+/// This thread's record, resolved on the thread running now: `#[inline(never)]` for the reason
+/// `fiber_rt::current` is (#1466), since a thunk that reads it may run on a fiber's stack. It lives
+/// as long as the thread.
+///
+/// The `black_box` keeps each call a call: a function that only computes an address is otherwise
+/// taken as pure, and two calls around a switch merged into one, which is the very read the
+/// borrow's check after its park needs ([`through_hook`]).
 #[inline(never)]
-fn record() -> Record {
-    RECORD.with(Cell::get)
-}
-
-/// Replace this thread's record, answering the one it replaced.
-#[inline(never)]
-fn set_record(r: Record) -> Record {
-    RECORD.with(|c| c.replace(r))
+fn record() -> &'static Record {
+    // SAFETY: the thread's own record outlives every use of it on the thread, none of which crosses
+    // to another.
+    std::hint::black_box(RECORD.with(|r| unsafe { &*(r as *const Record) }))
 }
 
 /// Whether code running on `vm` runs as a vCPU of a kernel run on this thread: its §12 ops and
-/// parks are the kernel's, never this crate's own thread runtime's.
+/// parks are the kernel's, never this crate's own thread runtime's. A context of no kernel run
+/// answers at once, without the thread's record.
 pub fn on_vcpu(vm: &VmCtx) -> bool {
-    std::ptr::eq(record().end, vm.end_word())
+    vm.kernel && std::ptr::eq(record().end.get(), vm.end_word())
 }
 
 /// Whether code running on `vm` runs as a kernel vCPU **inside a fiber**: a park there is a fiber's,
 /// which the kernel does not take yet (`native_scope`'s `fiber parks`; #3078 slices 3 and 4).
 pub fn in_fiber(vm: &VmCtx) -> bool {
     #[cfg(fiber_rt)]
-    let fiber = || crate::fiber_rt::current_fiber_slot().is_some();
+    let fiber = crate::fiber_rt::in_a_fiber;
     #[cfg(not(fiber_rt))]
     let fiber = || false;
-    on_vcpu(vm) && fiber()
+    vm.kernel && fiber() && on_vcpu(vm)
 }
 
 /// Route a §12 thunk's op to the kernel, if `vm` is a kernel vCPU's context on this thread: `None`
@@ -113,7 +106,7 @@ pub fn in_fiber(vm: &VmCtx) -> bool {
 /// check unwinds. A wait made in a fiber is a fiber's park, which `fiber parks` declines: reaching
 /// one fails closed.
 #[cfg(fiber_rt)]
-#[inline]
+#[inline(always)]
 pub(crate) fn routed(vm: &VmCtx, stop: NativeStop) -> Option<[i64; 2]> {
     if matches!(stop, NativeStop::Wait { .. }) && in_fiber(vm) {
         vm.raise(temen_ir::trap_code::MALFORMED);
@@ -141,35 +134,35 @@ pub unsafe fn park_call(vm: &VmCtx, call: &mut dyn std::any::Any) -> Option<[i64
 ///
 /// # Safety
 /// As [`park_call`].
-#[inline]
+#[inline(always)]
 unsafe fn through_hook(
     vm: &VmCtx,
     f: impl FnOnce(&mut dyn KernelPark) -> Result<[i64; 2], i64>,
 ) -> Option<[i64; 2]> {
-    let r = record();
-    if !std::ptr::eq(r.end, vm.end_word()) {
+    if !vm.kernel {
         return None;
     }
-    let Hook::Free(hook) = r.hook else {
+    let r = record();
+    if !std::ptr::eq(r.end.get(), vm.end_word()) {
+        return None;
+    }
+    let Some(hook) = r.hook.take() else {
         // Re-entry while a borrow is live: never on a kernel run (the module docs).
         debug_assert!(false, "a kernel hook reached while it is borrowed");
         vm.raise(temen_ir::trap_code::MALFORMED);
         return Some([0, 0]);
     };
-    set_record(Record {
-        hook: Hook::Borrowed,
-        ..r
-    });
-    // SAFETY: the record is marked borrowed, so nothing else reaches the hook meanwhile.
+    // SAFETY: the record holds no hook while it is borrowed, so nothing else reaches it meanwhile.
     let out = f(unsafe { &mut *hook.as_ptr() });
-    let back = set_record(r);
-    if !(std::ptr::eq(back.end, r.end) && matches!(back.hook, Hook::Borrowed)) {
-        // The borrow spanned a switch onto another thread's record: never (the module docs).
+    // The thread running now must be the one that borrowed: resolved again, as after a switch.
+    if !std::ptr::eq(record(), r) {
+        // The borrow spanned a switch onto another thread: never (the module docs).
         debug_assert!(false, "a kernel hook's borrow spanned a switch");
-        set_record(back);
+        r.hook.set(Some(hook));
         vm.raise(temen_ir::trap_code::MALFORMED);
         return Some([0, 0]);
     }
+    r.hook.set(Some(hook));
     match out {
         Ok(r) => Some(r),
         Err(code) => {
@@ -182,7 +175,7 @@ unsafe fn through_hook(
 /// [`KernelRun::run_vcpu`]'s publication of the thread's record and the vCPU's fiber runtime,
 /// cleared as it drops, on every exit of the guarded call.
 struct Published {
-    prev: Record,
+    prev: (*const AtomicI64, Option<NonNull<dyn KernelPark>>),
     #[cfg(fiber_rt)]
     fibers: Option<(
         Box<crate::fiber_rt::FiberRuntime>,
@@ -201,10 +194,8 @@ impl Published {
         let hook: *mut (dyn KernelPark + '_) = hook;
         // SAFETY: the guard ends the record's use of the hook before the hook goes (the contract).
         let hook: *mut (dyn KernelPark + 'static) = unsafe { std::mem::transmute(hook) };
-        let prev = set_record(Record {
-            end,
-            hook: Hook::Free(NonNull::new(hook).expect("a reference")),
-        });
+        let r = record();
+        let prev = (r.end.replace(end), r.hook.replace(NonNull::new(hook)));
         #[cfg(fiber_rt)]
         let fibers = fibers.map(|mut rt| {
             let prev = crate::fiber_rt::set_current(&mut *rt);
@@ -224,7 +215,9 @@ impl Drop for Published {
         if let Some((_, prev)) = &self.fibers {
             crate::fiber_rt::set_current(*prev);
         }
-        set_record(self.prev);
+        let r = record();
+        r.end.set(self.prev.0);
+        r.hook.set(self.prev.1);
     }
 }
 
@@ -325,7 +318,8 @@ impl KernelRun {
         let Some((window, ro)) = cm.seed_window(Some(init_mem)) else {
             return Some(None);
         };
-        let root = VmCtx::new(cm.instance, cm.window_at(window.base()));
+        let mut root = VmCtx::new(cm.instance, cm.window_at(window.base()));
+        root.kernel = true;
         let run = KernelRun {
             cm,
             window,
@@ -589,7 +583,8 @@ mod tests {
     #[test]
     #[cfg_attr(debug_assertions, should_panic(expected = "while it is borrowed"))]
     fn a_hook_reached_while_it_is_borrowed_fails_closed() {
-        let root = VmCtx::new(InstanceAddrs::NONE, Window::NONE);
+        let mut root = VmCtx::new(InstanceAddrs::NONE, Window::NONE);
+        root.kernel = true;
         let end = AtomicI64::new(0);
         // SAFETY: `end` outlives `vm`.
         let vm = unsafe { root.vcpu_ending(&end, std::ptr::null_mut()) };
@@ -608,7 +603,8 @@ mod tests {
     /// kernel vCPU's, and its ops take the JIT's own runtime.
     #[test]
     fn another_runs_context_on_a_kernel_vcpus_thread_is_not_the_kernels() {
-        let root = VmCtx::new(InstanceAddrs::NONE, Window::NONE);
+        let mut root = VmCtx::new(InstanceAddrs::NONE, Window::NONE);
+        root.kernel = true;
         let (end, other_end) = (AtomicI64::new(0), AtomicI64::new(0));
         // SAFETY: both ends outlive their contexts.
         let (vm, other) = unsafe {

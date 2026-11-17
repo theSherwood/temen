@@ -4121,18 +4121,18 @@ fn a_blocking_resume_answers_as_the_oracle_in_every_state_on_the_kernel_route() 
 }
 
 /// A threaded program whose root calls host procedure `handle` (a sync one, on the vCPU's own
-/// thread) and returns what it answers. Its kernel run's thread record must not reach code the
-/// procedure runs.
+/// thread), then spawns and joins a thread, and returns what the procedure answered. Its kernel
+/// run's thread record must not reach code the procedure runs, and must be its own again after.
 fn calls_a_host_procedure(handle: i32) -> temen_ir::Module {
     module(&format!(
         "memory 16
 func () -> (i64) {{
 block 0 () {{
   vz = i64.const 0
-  vt = thread.spawn 1 vz vz
-  vts, vtv = thread.join vt
   vc = i32.const {handle}
   vr = call.cap 13 0 (i64) -> (i64) vc(vz)
+  vt = thread.spawn 1 vz vz
+  vts, vtv = thread.join vt
   return vr
   }}
 }}
@@ -4235,6 +4235,30 @@ fn a_jit_run_a_host_procedure_starts_on_a_kernel_vcpu_takes_its_own_route() {
         "the inner run's answer, through the outer"
     );
     assert_eq!(runs, 1, "only the outer run took the kernel route");
+}
+
+/// #3078 slice 2 (the audit's change) — the same when the procedure's run is itself a kernel run on
+/// the vCPU's thread: both runs' contexts are kernel ones, so it is the record's end word that tells
+/// them apart, and the inner run's guard that gives the outer vCPU its record back. The inner run's
+/// stops are its own tasks', the outer task's join and call go on after it, and both runs are kernel
+/// runs.
+#[test]
+fn a_kernel_run_a_host_procedure_starts_on_a_kernel_vcpu_keeps_its_own_record() {
+    let inner = a_to_b(true);
+    let (got, runs) = on_kernel_with(answering(move || {
+        let (o, vcpus) = jit_kernel::run_fresh(&inner, 0, &[], None, u64::MAX).expect("in scope");
+        assert!(vcpus >= 3, "the inner run's vCPUs ran as kernel tasks");
+        match o {
+            JitOutcome::Returned(v) => v[0],
+            o => panic!("the inner run ended {o:?}"),
+        }
+    }));
+    assert_eq!(
+        got,
+        Ok(vec![7]),
+        "the inner run's answer, through the outer"
+    );
+    assert_eq!(runs, 2, "both runs took the kernel route");
 }
 
 /// #3078 slice 2 (the audit's change) — the same, for a held JIT domain the procedure calls: its

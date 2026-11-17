@@ -129,6 +129,11 @@ pub struct VmCtx {
     /// ([`Self::thunk_state`]): made by the thunk's first call, dropped with the context. Never read
     /// by compiled code. #2847 — beside it, the type it was made as.
     thunk_state: std::sync::OnceLock<(core::any::TypeId, Box<dyn core::any::Any + Send + Sync>)>,
+    /// #3078 — this context is a kernel run's (`kernel_rt::KernelRun`): a fact of the run, which
+    /// every context of it carries from its root, a fiber's creator context included, so it is right
+    /// wherever the code runs. Where its §12 ops go is the thread's ([`crate::kernel_rt`]'s record),
+    /// asked only when this is set. Never read by compiled code.
+    pub(crate) kernel: bool,
     /// #3000 — the owner of the cell `fuel` names, on a held domain's activation: shared with every
     /// activation that charges the same cell, so the cell lives until the last context charging it
     /// goes ([`crate::child_exec::HeldSite::activate`]). `None` on every other context, whose cell
@@ -257,6 +262,7 @@ impl VmCtx {
             #[cfg(fiber_rt)]
             owned_handlers: Some(owned_handlers),
             thunk_state: std::sync::OnceLock::new(),
+            kernel: false,
             #[cfg(fiber_rt)]
             cell: None,
         }
@@ -306,6 +312,7 @@ impl VmCtx {
             #[cfg(fiber_rt)]
             owned_handlers: None,
             thunk_state: std::sync::OnceLock::new(),
+            kernel: self.kernel,
             #[cfg(fiber_rt)]
             cell: None,
         }
@@ -376,10 +383,10 @@ impl VmCtx {
 
     /// #2958 — whether code running on this context runs as a kernel vCPU on this thread: a task of
     /// executor 2's run (`kernel_rt::KernelRun::run_vcpu`), whose §12 ops and parks are the kernel's,
-    /// never this crate's own thread runtime's. Asked of the thread's record (`kernel_rt`'s module
-    /// docs), which names the run this context is of.
+    /// never this crate's own thread runtime's: a context of a kernel run ([`Self::kernel`]) on a
+    /// thread whose record names that run (`kernel_rt`'s module docs).
     pub fn on_kernel(&self) -> bool {
-        crate::kernel_rt::on_vcpu(self)
+        self.kernel && crate::kernel_rt::on_vcpu(self)
     }
 
     /// #3078 — the domain's end word, which names its run: every context of a run points at it.
