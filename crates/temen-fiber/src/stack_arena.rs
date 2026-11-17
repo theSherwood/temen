@@ -228,8 +228,10 @@ impl Stack {
 
 impl Drop for Stack {
     fn drop(&mut self) {
-        // ASan: nothing runs on the slot again until `new` hands it out, and whatever still points
-        // into it (a stale `Yielder`, a frame pointer of a dropped fiber) must report if it is used.
+        // ASan: nothing runs on the slot again until `new` hands it out. Until then, an access to
+        // what lived on it reports: a dropped fiber's `Control` through a stale `Yielder`, its frames
+        // through a kept frame pointer. Only until then: the free list is LIFO, so the next
+        // `Stack::new` anywhere in the process may take this slot and clear it.
         #[cfg(feature = "asan")]
         // SAFETY: the slot we own, which nothing runs on again.
         unsafe {
