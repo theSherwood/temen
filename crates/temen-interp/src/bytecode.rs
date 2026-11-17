@@ -4267,7 +4267,7 @@ pub fn compile_and_run_capture_reserved_with_host(
     // fail-closed refusal of a freeze over a live-or-unjoined §14 child; this engine's own
     // instantiate arm has none of them, so driving a durable §14 module here would both skip the
     // admission rule and mint the exact thaw-faulting artifact the tree-walker refuses.
-    if outside_reserved_subset(m) {
+    if outside_reserved_subset(m) || !admits_thaw(host) {
         return None;
     }
     // `cont.*` durability is fully supported (DURABILITY.md §12.8): the per-fiber shadow-SP swap keeps
@@ -4286,6 +4286,32 @@ pub fn compile_and_run_capture_reserved_with_host(
         reserved_log2,
         host,
     )
+}
+
+/// #3034 — whether this engine re-creates the whole thaw residue `host` holds: its fibers, and
+/// nothing else (it runs no `thread.*`, §14 nesting, fork twins or frozen serve handlers durably). A residue with more is
+/// declined to the tree-walker whole, never thawed in part: the one predicate every durable entry
+/// onto this engine asks, the browser's included.
+pub fn admits_thaw(host: &Host) -> bool {
+    let super::Residue {
+        fibers: _,
+        vcpus,
+        root_sp,
+        children,
+        detached,
+        live_detached,
+        twins,
+        exited_twins,
+    } = host.residue();
+    // Nor a serve loop's frozen handlers (#1676), which only the tree-walker's serve loop adopts.
+    host.frozen_handlers().is_empty()
+        && vcpus.is_empty()
+        && root_sp.is_none()
+        && children.is_empty()
+        && detached.is_empty()
+        && live_detached.is_empty()
+        && twins.is_empty()
+        && exited_twins.is_empty()
 }
 
 /// The modules the reserved-window entries refuse before compiling: multi-vCPU `thread.*` and §14
@@ -15196,7 +15222,13 @@ impl SchedCore {
         // (cleared) from the host; empty for a freeze or ordinary run.
         let mut fibers = FiberTables::default();
         {
-            let mut seed = std::mem::take(&mut h.frozen_fibers);
+            // Only the fibers: every durable entry onto this engine declined a residue with more
+            // ([`admits_thaw`]), and what is left stays on the host rather than being dropped.
+            debug_assert!(
+                admits_thaw(&h),
+                "a thaw residue this engine does not re-create"
+            );
+            let mut seed = h.take_frozen_fibers();
             seed.sort_by_key(|f| f.slot);
             for (expected, ff) in seed.into_iter().enumerate() {
                 debug_assert_eq!(
@@ -15463,7 +15495,7 @@ impl CoopSched {
                     let FiberTables { fibers, sp, meta } = fibers;
                     let waits = &mut tasks.waits;
                     let frozen = freeze_drive(fibers, sp, meta, waits, source, &mut ctx, budget)?;
-                    g.frozen_fibers = frozen;
+                    g.put_frozen_fibers(frozen);
                 }
                 // `res` is the root's `Result<Vec<Value>, Trap>`: `Ok(vals)` → `Done(vals)`; a root
                 // trap stays `Err(trap)` (the run's fatal trap), exactly as `drive` returned it.

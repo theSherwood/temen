@@ -798,7 +798,14 @@ pub fn fuzz_fiber_one(g: &mut Gen) {
         begin_thaw(&mut win, TEST_ARENA, 0);
         let mut h = Host::new();
         h.set_durable(true);
-        h.set_frozen_fibers(frozen);
+        h.admit_thaw(
+            &inst,
+            temen_interp::Residue {
+                fibers: frozen,
+                ..Default::default()
+            },
+        )
+        .expect("a residue a run made");
         let mut fuel = 1_000_000u64;
         run_capture_reserved_with_host(&inst, 0, &[], &mut fuel, &win, SIZE_LOG2, &mut h)
     };
@@ -1020,7 +1027,14 @@ pub fn fuzz_recycle_fiber_one(g: &mut Gen) {
         begin_thaw(&mut win, TEST_ARENA, 0);
         let mut h = Host::new();
         h.set_durable(true);
-        h.set_frozen_fibers(frozen);
+        h.admit_thaw(
+            &inst,
+            temen_interp::Residue {
+                fibers: frozen,
+                ..Default::default()
+            },
+        )
+        .expect("a residue a run made");
         let mut fuel = 1_000_000u64;
         run_capture_reserved_with_host(&inst, 0, &[], &mut fuel, &win, SIZE_LOG2, &mut h)
     };

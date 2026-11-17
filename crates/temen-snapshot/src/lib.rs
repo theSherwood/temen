@@ -59,12 +59,12 @@ use std::sync::{Arc, Mutex};
 use temen_encode::{digest256, encode_module, wire};
 use temen_interp::{
     capture_cut_regions, Attestation, BudgetState, BudgetThawRefused, CapturedDetached,
-    CapturedTwin, DetachedLaunch, DurableBinding, DurableBudget, DurableHandle, DurableJitTable,
-    DurableJitUnit, DurableNamedCap, DurablePipe, DurableRegion, FrozenDetached, FrozenFiber,
-    FrozenTwin, FrozenVCpu, Host, MemLayout, NonDurableHandle, RegionBacking, RegionNotCaptured,
-    RegionRefusal, Reply, ShadowArena, StreamRole, SvcDispatch, ThawedDetached, ThawedTwin, Trap,
-    TwinLaunch,
+    CapturedTwin, DurableBinding, DurableBudget, DurableHandle, DurableJitTable, DurableJitUnit,
+    DurableNamedCap, DurablePipe, DurableRegion, FrozenDetached, FrozenFiber, FrozenTwin,
+    FrozenVCpu, Host, MemLayout, NonDurableHandle, RegionBacking, RegionNotCaptured, RegionRefusal,
+    Reply, ShadowArena, StreamRole, SvcDispatch, ThawedDetached, ThawedTwin, Trap,
 };
+use temen_ir::thaw::{self, LiveDetached, LiveTwin, RawResidue, TrapCode};
 use temen_ir::Module;
 
 // Container (§12.2): the unified TEMEN wire header (WIRE.md) with `kind = snapshot`; the u16
@@ -873,52 +873,7 @@ fn freeze_at(
     // when present, so a fiber-only (or single-vCPU no-fiber) artifact is byte-identical to before.
     if !fibers.is_empty() || !vcpus.is_empty() || !detached.is_empty() {
         section(&mut out, TAG_CONTROL, |b| {
-            write_uleb(b, fibers.len() as u64);
-            for f in &fibers {
-                write_uleb(b, f.slot as u64);
-                write_uleb(b, f.func as u32 as u64);
-                write_uleb(b, f.arg0 as u64);
-                write_uleb(b, f.shadow_sp);
-                write_uleb(b, f.generation); // 48-bit fiber generation (recycling step 2)
-                write_uleb(b, u64::from(f.consumed)); // v24 (#1538): the park was consumed
-            }
-            if !vcpus.is_empty() {
-                write_uleb(b, vcpus.len() as u64);
-                for v in &vcpus {
-                    write_uleb(b, v.task as u64);
-                    write_uleb(b, v.parent_task as u64); // slice 3.4 (v4): who spawned it (nested spawns)
-                    write_uleb(b, v.slot as u64); // v33 (#1685): its slot in the domain's child table
-                    write_uleb(b, u64::from(v.joinable)); // v53 (#2043): a handle still names it
-                    write_uleb(b, v.func as u32 as u64);
-                    write_uleb(b, v.args.len() as u64);
-                    for &a in &v.args {
-                        write_uleb(b, a as u64);
-                    }
-                    write_uleb(b, v.shadow_sp);
-                    // §12.8 4A.5 follow-up A (v6): a completed-but-unjoined concurrent child carries its
-                    // join result (1 + the i64); a normal frozen child writes 0.
-                    match v.completed_result {
-                        None => write_uleb(b, 0),
-                        Some(r) => {
-                            write_uleb(b, 1);
-                            write_uleb(b, r as u64);
-                        }
-                    }
-                }
-                write_uleb(b, root_sp); // the root vCPU's flattened extent (its implicit residue)
-            }
-            // #1361 step 2 — the completed detached-child residue trails the vCPU residue: each is
-            // `(parent_task, slot, join-result)`. A detached child's separate window need not ride (it
-            // is completed) — only the join edge and its result. Present iff non-empty (v44), so on
-            // decode it is exactly "bytes remain".
-            if !detached.is_empty() {
-                write_uleb(b, detached.len() as u64);
-                for d in &detached {
-                    write_uleb(b, d.parent_task as u64);
-                    write_uleb(b, d.slot as u64);
-                    write_join_outcome(b, Some(d.completed_result));
-                }
-            }
+            write_control(b, &fibers, &vcpus, root_sp, &detached)
         });
     }
 
@@ -1061,6 +1016,63 @@ fn freeze_at(
     Ok(out)
 }
 
+/// Section 2's body (§12.4): the frozen-fiber residue, then the spawned-vCPU residue and the root's
+/// extent when any vCPU rides, then the completed detached children when any does ([`decode_control`]).
+fn write_control(
+    b: &mut Vec<u8>,
+    fibers: &[FrozenFiber],
+    vcpus: &[FrozenVCpu],
+    root_sp: u64,
+    detached: &[FrozenDetached],
+) {
+    write_uleb(b, fibers.len() as u64);
+    for f in fibers {
+        write_uleb(b, f.slot as u64);
+        write_uleb(b, f.func as u32 as u64);
+        write_uleb(b, f.arg0 as u64);
+        write_uleb(b, f.shadow_sp);
+        write_uleb(b, f.generation); // 48-bit fiber generation (recycling step 2)
+        write_uleb(b, u64::from(f.consumed)); // v24 (#1538): the park was consumed
+    }
+    if !vcpus.is_empty() {
+        write_uleb(b, vcpus.len() as u64);
+        for v in vcpus {
+            write_uleb(b, v.task as u64);
+            write_uleb(b, v.parent_task as u64); // slice 3.4 (v4): who spawned it (nested spawns)
+            write_uleb(b, v.slot as u64); // v33 (#1685): its slot in the domain's child table
+            write_uleb(b, u64::from(v.joinable)); // v53 (#2043): a handle still names it
+            write_uleb(b, v.func as u32 as u64);
+            write_uleb(b, v.args.len() as u64);
+            for &a in &v.args {
+                write_uleb(b, a as u64);
+            }
+            write_uleb(b, v.shadow_sp);
+            // §12.8 4A.5 follow-up A (v6): a completed-but-unjoined concurrent child carries its
+            // join result (1 + the i64); a normal frozen child writes 0.
+            match v.completed_result {
+                None => write_uleb(b, 0),
+                Some(r) => {
+                    write_uleb(b, 1);
+                    write_uleb(b, r as u64);
+                }
+            }
+        }
+        write_uleb(b, root_sp); // the root vCPU's flattened extent (its implicit residue)
+    }
+    // #1361 step 2 — the completed detached-child residue trails the vCPU residue: each is
+    // `(parent_task, slot, join-result)`. A detached child's separate window need not ride (it
+    // is completed) — only the join edge and its result. Present iff non-empty (v44), so on
+    // decode it is exactly "bytes remain".
+    if !detached.is_empty() {
+        write_uleb(b, detached.len() as u64);
+        for d in detached {
+            write_uleb(b, d.parent_task as u64);
+            write_uleb(b, d.slot as u64);
+            write_join_outcome(b, Some(d.completed_result));
+        }
+    }
+}
+
 /// Serialize Section 12 (v49): the domain's fork twins, ascending pid. Each record is the pid and its
 /// kind ([`TWIN_LIVE`], [`TWIN_LIVE_SERVICER`], [`TWIN_EXITED`]). A live twin's then holds its launch
 /// record and its own artifact, length-prefixed. That artifact is this format, frozen from its own
@@ -1097,24 +1109,85 @@ fn write_twins(
                         cut,
                     )?
                 };
-                b.push(if t.launch.servicer {
-                    TWIN_LIVE_SERVICER
-                } else {
-                    TWIN_LIVE
-                });
-                write_uleb(&mut b, u64::from(t.launch.entry));
-                write_uleb(&mut b, u64::from(t.launch.ctx));
-                write_names(&mut b, &t.launch.names);
-                write_uleb(&mut b, art.len() as u64);
-                b.extend_from_slice(&art);
+                write_twin_record(
+                    &mut b,
+                    &TwinRecord::Live {
+                        servicer: t.launch.servicer,
+                        entry: t.launch.entry,
+                        ctx: t.launch.ctx,
+                        names: t.launch.names.clone(),
+                        artifact: &art,
+                    },
+                );
             }
-            Twin::Exited(t) => {
-                b.push(TWIN_EXITED);
-                write_join_outcome(&mut b, Some(t.outcome));
-            }
+            Twin::Exited(t) => write_twin_record(&mut b, &TwinRecord::Exited(t.outcome)),
         }
     }
     Ok(b)
+}
+
+/// One Section 12 record past its pid ([`write_twins`]).
+enum TwinRecord<'a> {
+    Live {
+        servicer: bool,
+        entry: u32,
+        ctx: u32,
+        names: Vec<(String, i32)>,
+        artifact: &'a [u8],
+    },
+    Exited(Result<i64, TrapCode>),
+}
+
+fn write_twin_record(b: &mut Vec<u8>, t: &TwinRecord<'_>) {
+    match t {
+        TwinRecord::Live {
+            servicer,
+            entry,
+            ctx,
+            names,
+            artifact,
+        } => {
+            b.push(if *servicer {
+                TWIN_LIVE_SERVICER
+            } else {
+                TWIN_LIVE
+            });
+            write_uleb(b, u64::from(*entry));
+            write_uleb(b, u64::from(*ctx));
+            write_names(b, names);
+            write_uleb(b, artifact.len() as u64);
+            b.extend_from_slice(artifact);
+        }
+        TwinRecord::Exited(outcome) => {
+            b.push(TWIN_EXITED);
+            write_join_outcome(b, Some(*outcome));
+        }
+    }
+}
+
+/// The inverse of [`write_twin_record`].
+fn read_twin_record<'a>(r: &mut Reader<'a>) -> Result<TwinRecord<'a>, RestoreError> {
+    let servicer = match r.u8()? {
+        TWIN_LIVE => false,
+        TWIN_LIVE_SERVICER => true,
+        TWIN_EXITED => {
+            let outcome = read_join_outcome(r)?.ok_or(RestoreError::Malformed)?;
+            return Ok(TwinRecord::Exited(outcome));
+        }
+        _ => return Err(RestoreError::Malformed),
+    };
+    let entry = u32::try_from(r.uleb()?).map_err(|_| RestoreError::Malformed)?;
+    let ctx = u32::try_from(r.uleb()?).map_err(|_| RestoreError::Malformed)?;
+    let names = read_names(r)?;
+    let len = r.uleb()? as usize;
+    let artifact = r.take(len)?;
+    Ok(TwinRecord::Live {
+        servicer,
+        entry,
+        ctx,
+        names,
+        artifact,
+    })
 }
 
 /// #2025 — the §13 regions a freeze's cut names, numbered by position ([`capture_cut_regions`], which
@@ -1370,7 +1443,7 @@ fn number_pipes(
 }
 
 /// v31 (#1674): a finished child's `join` outcome — `0` none, `1` + its value, `2` + its trap's code.
-fn write_join_outcome(b: &mut Vec<u8>, o: Option<Result<i64, Trap>>) {
+fn write_join_outcome(b: &mut Vec<u8>, o: Option<Result<i64, TrapCode>>) {
     match o {
         None => write_uleb(b, 0),
         Some(Ok(r)) => {
@@ -1379,19 +1452,20 @@ fn write_join_outcome(b: &mut Vec<u8>, o: Option<Result<i64, Trap>>) {
         }
         Some(Err(t)) => {
             write_uleb(b, 2);
-            write_uleb(b, t.code() as u64);
+            write_uleb(b, t as u64);
         }
     }
 }
 
-/// The inverse of [`write_join_outcome`]; an unknown tag or trap code is malformed.
-fn read_join_outcome(r: &mut Reader<'_>) -> Result<Option<Result<i64, Trap>>, RestoreError> {
+/// The inverse of [`write_join_outcome`]; an unknown tag, or a code no trap has, is malformed. The
+/// code read is the trap's own ([`Trap::code`]).
+fn read_join_outcome(r: &mut Reader<'_>) -> Result<Option<Result<i64, TrapCode>>, RestoreError> {
     Ok(match r.uleb()? {
         0 => None,
         1 => Some(Ok(r.uleb()? as i64)),
-        2 => Some(Err(
-            Trap::from_code(r.uleb()? as i64).ok_or(RestoreError::Malformed)?
-        )),
+        2 => Some(Err(Trap::from_code(r.uleb()? as i64)
+            .ok_or(RestoreError::Malformed)?
+            .code())),
         _ => return Err(RestoreError::Malformed),
     })
 }
@@ -1417,20 +1491,86 @@ fn write_detached(
             freeze_at(&c.module, image, c.reserved_log2, &h, depth + 1, cut)?
         };
         let l = &c.launch;
-        write_uleb(&mut b, c.parent_task as u64);
-        write_uleb(&mut b, c.slot as u64);
-        write_uleb(&mut b, l.task);
-        b.extend_from_slice(&l.digest);
-        write_uleb(&mut b, l.lane as u64);
-        write_names(&mut b, &l.names);
-        // v47 (#2438): the spawner's pager export plus one, `0` for an unpaged child.
-        write_uleb(&mut b, l.pager.map_or(0, |e| u64::from(e) + 1));
-        // v51 (#2465): whether the spawner can still join it.
-        b.push(u8::from(l.joinable));
-        write_uleb(&mut b, art.len() as u64);
-        b.extend_from_slice(&art);
+        write_detached_record(
+            &mut b,
+            &DetachedRecord {
+                parent_task: c.parent_task as u64,
+                slot: c.slot as u64,
+                task: l.task,
+                digest: l.digest,
+                lane: l.lane,
+                names: l.names.clone(),
+                pager: l.pager,
+                joinable: l.joinable,
+                artifact: &art,
+            },
+        );
     }
     Ok(b)
+}
+
+/// One Section 8 record ([`write_detached`]): the spawner-held launch record of a live detached child,
+/// then the child's own artifact.
+struct DetachedRecord<'a> {
+    parent_task: u64,
+    slot: u64,
+    task: u64,
+    digest: [u8; 32],
+    lane: i64,
+    names: Vec<(String, i32)>,
+    pager: Option<u32>,
+    joinable: bool,
+    artifact: &'a [u8],
+}
+
+fn write_detached_record(b: &mut Vec<u8>, r: &DetachedRecord<'_>) {
+    write_uleb(b, r.parent_task);
+    write_uleb(b, r.slot);
+    write_uleb(b, r.task);
+    b.extend_from_slice(&r.digest);
+    write_uleb(b, r.lane as u64);
+    write_names(b, &r.names);
+    // v47 (#2438): the spawner's pager export plus one, `0` for an unpaged child.
+    write_uleb(b, r.pager.map_or(0, |e| u64::from(e) + 1));
+    // v51 (#2465): whether the spawner can still join it.
+    b.push(u8::from(r.joinable));
+    write_uleb(b, r.artifact.len() as u64);
+    b.extend_from_slice(r.artifact);
+}
+
+/// The inverse of [`write_detached_record`].
+fn read_detached_record<'a>(r: &mut Reader<'a>) -> Result<DetachedRecord<'a>, RestoreError> {
+    let parent_task = r.uleb()?;
+    let slot = r.uleb()?;
+    let task = r.uleb()?;
+    let digest: [u8; 32] = r
+        .take(32)?
+        .try_into()
+        .expect("take(32) yields exactly 32 bytes");
+    let lane = r.uleb()? as i64;
+    let names = read_names(r)?;
+    let pager = match r.uleb()? {
+        0 => None,
+        e => Some(u32::try_from(e - 1).map_err(|_| RestoreError::Malformed)?),
+    };
+    let joinable = match r.take(1)?[0] {
+        0 => false,
+        1 => true,
+        _ => return Err(RestoreError::Malformed),
+    };
+    let len = r.uleb()? as usize;
+    let artifact = r.take(len)?;
+    Ok(DetachedRecord {
+        parent_task,
+        slot,
+        task,
+        digest,
+        lane,
+        names,
+        pager,
+        joinable,
+        artifact,
+    })
 }
 
 /// A launch record's cap names, `(name, handle)`: the count, then each name length-prefixed and its
@@ -1624,7 +1764,7 @@ pub fn restore_layout(
     module: &Module,
     host: &mut Host,
 ) -> Result<(MemLayout, u8), RestoreError> {
-    restore_at(artifact, module, host, 0, &mut ThawCut::default())
+    restore_at(artifact, module, host, 0, 0, &mut ThawCut::default())
 }
 
 /// [`restore`] that also recovers the per-page protection map (§12.3) and the mask-domain
@@ -1660,12 +1800,14 @@ struct ThawCut {
     regions_reached: Vec<bool>,
 }
 
-/// [`restore_layout`] at detached-nesting `depth` (0 for the artifact an embedder handed in).
+/// [`restore_layout`] at detached-nesting `depth` (0 for the artifact an embedder handed in), for a
+/// domain whose root runs in shadow context `root_ctx` (`0`, or a fork twin's forking context).
 fn restore_at(
     artifact: &[u8],
     module: &Module,
     host: &mut Host,
     depth: usize,
+    root_ctx: usize,
     cut: &mut ThawCut,
 ) -> Result<(MemLayout, u8), RestoreError> {
     // The unified TEMEN wire header (WIRE.md): magic, then this codec's own kind/version/flags,
@@ -1843,8 +1985,8 @@ fn restore_at(
     // ---- Handle table: decode, bounds-check, re-grant. ----
     let mut hr = Reader::new(handles_body);
     let generations = read_generations(&mut hr, Host::handle_capacity())?;
-    let n = hr.uleb()?;
-    let mut handles: Vec<DurableHandle> = Vec::with_capacity(n as usize);
+    let n = hr.count()?;
+    let mut handles: Vec<DurableHandle> = Vec::with_capacity(n);
     for _ in 0..n {
         let slot = u32::try_from(hr.uleb()?).map_err(|_| RestoreError::Malformed)?;
         if slot >= Host::handle_capacity() {
@@ -1880,16 +2022,8 @@ fn restore_at(
 
     // ---- Control state (§12.4): decode the frozen-fiber, spawned-vCPU and completed detached-child
     // residue. The section is present iff any of them is (canonical). ----
-    let (fibers, vcpus, root_sp, detached) = decode_control(
-        control_body,
-        fiber_count,
-        spawned_count,
-        module
-            .memory
-            .and_then(|m| m.shadow)
-            .unwrap_or(ShadowArena::EMPTY)
-            .region_base(0),
-    )?;
+    let (fibers, vcpus, root_sp, detached) =
+        decode_control(control_body, fiber_count, spawned_count)?;
     // ---- Pipes inside the cut (#1680, v32): every end must name a carried pipe, and every carried
     // pipe must be named (canonical: a freeze carries only pipes with an end in the cut). ----
     // Each pipe's end counts are the ends the cut carries, so they are rebuilt here, not stored.
@@ -1933,6 +2067,25 @@ fn restore_at(
     // `jit_tables` out of bounds. Absent section ⇒ no JIT granted (any JIT binding then fails the
     // bounds check). ----
     let (jit_table_log2, jit) = decode_jit(jit_body)?;
+    // #3034 — each re-applied `install` is one the guest's own made: into a padding slot of the
+    // dispatch table (a run's `install` takes the first free one past the module's functions, never a
+    // module function's), naming a unit its domain holds, one unit per slot.
+    let table_len = (1usize << jit_table_log2)
+        .max(module.funcs.len().next_power_of_two())
+        .max(1);
+    let mut taken = BTreeSet::new();
+    for d in &jit {
+        for &(slot, unit) in &d.installed {
+            let slot = slot as usize;
+            if slot < module.funcs.len()
+                || slot >= table_len
+                || unit as usize >= d.units.len()
+                || !taken.insert(slot)
+            {
+                return Err(RestoreError::Malformed);
+            }
+        }
+    }
     // #1455: the same treatment for named host capabilities — decode Section 7, bounds-check every
     // `B_NAMED` index against it, then re-grant through the embedder's registrar *before* the handle
     // table is pinned. A forged index that names no captured entry is rejected here rather than
@@ -2032,18 +2185,6 @@ fn restore_at(
         host.restore_end_post(region_ids[&region], off, badge);
     }
 
-    // ---- Control state (§12.4): seed the residue (decoded above) for the thaw, so the next
-    // (REWINDING) run re-creates the fibers, re-spawns the vCPUs and delivers the completed
-    // detached children's results. ----
-    host.set_frozen_fibers(fibers);
-    if !vcpus.is_empty() {
-        host.set_frozen_vcpus(vcpus);
-        host.set_frozen_root_sp(root_sp);
-    }
-    if !detached.is_empty() {
-        host.set_frozen_detached(detached);
-    }
-
     // ---- Serve state (§13.4 step 3, v13): decode the serve trio and the reply waits (v35, #1901)
     // and restore them. The section is present iff either is non-empty (canonical); its absence
     // restores the empty default. ----
@@ -2062,6 +2203,20 @@ fn restore_at(
             && handlers.is_empty()
         {
             return Err(RestoreError::Malformed); // non-canonical: an empty section is elided
+        }
+        // #3034 — every ticket this domain minted lies below its counter, which a `+ 1` must not
+        // overflow; and each frozen handler is a live fiber of this domain's residue.
+        let minted = queue.iter().map(|d| d.ticket);
+        let minted = minted.chain(results.iter().map(|r| r.0));
+        if next_ticket > thaw::TASK_MAX
+            || minted
+                .chain(handlers.iter().map(|h| h.1))
+                .any(|t| t >= next_ticket)
+            || handlers
+                .iter()
+                .any(|&(slot, _)| fibers.get(slot as usize).is_none_or(|f| f.is_free()))
+        {
+            return Err(RestoreError::Malformed);
         }
         host.set_svc_state(queue, results, next_ticket);
         host.set_reply_waits(waits);
@@ -2102,21 +2257,12 @@ fn restore_at(
     // its own powerbox, against the module grant its launch record names. Last, so the parent's own
     // handle table (and so the registrar's answers for it) is settled first; all-or-nothing — any
     // child failing fails this restore. ----
-    let mut joinable_slots = Vec::new();
-    if let Some(body) = detached_body {
-        let children = decode_detached(body, module, host, depth, cut)?;
-        joinable_slots.extend(
-            children
-                .iter()
-                .filter(|c| c.launch.joinable)
-                .map(|c| c.slot),
-        );
-        host.set_thawed_detached(children);
-    }
-    // ---- The child-handle table (#2043, v53): every slot's counter. Each record a join slot names is
-    // one the table issued, and no two name one slot: the domain has one table, which the thaw rebuilds
-    // before re-filing them. ----
-    let child_generations = match children_body {
+    let live_detached = match detached_body {
+        Some(body) => decode_detached(body, module, host, depth, cut)?,
+        None => Vec::new(),
+    };
+    // ---- The child-handle table (#2043, v53): every slot's counter. ----
+    let children = match children_body {
         Some(body) => {
             let mut cr = Reader::new(body);
             let g = read_generations(&mut cr, temen_ir::handles::SLOTS as u32)?;
@@ -2127,26 +2273,25 @@ fn restore_at(
         }
         None => Vec::new(),
     };
-    joinable_slots.extend(
-        host.frozen_vcpus()
-            .iter()
-            .filter(|v| v.joinable)
-            .map(|v| v.slot),
-    );
-    joinable_slots.extend(host.frozen_detached().iter().map(|d| d.slot));
-    joinable_slots.sort_unstable();
-    let issued = |&slot: &usize| child_generations.get(slot).is_some_and(|&g| g != 0);
-    if !joinable_slots.iter().all(issued) || joinable_slots.windows(2).any(|w| w[0] == w[1]) {
-        return Err(RestoreError::Malformed);
-    }
-    host.set_child_generations(child_generations);
     // ---- Fork twins (#1688, v49): each live one restored from its own nested artifact into its own
     // powerbox, against its parent's program, as a detached child is. ----
-    if let Some(body) = twins_body {
-        let (twins, exited) = decode_twins(body, module, host, depth, cut)?;
-        host.set_thawed_twins(twins);
-        host.set_frozen_twins(exited);
-    }
+    let (twins, exited_twins) = match twins_body {
+        Some(body) => decode_twins(body, module, host, depth, cut)?,
+        None => (Vec::new(), Vec::new()),
+    };
+    // ---- The thaw residue (§12.4, #3034): admitted whole by the one pass every engine's thaw goes
+    // through, against this domain's module, then seeded for the next (REWINDING) run. ----
+    let raw = RawResidue {
+        fibers,
+        vcpus,
+        root_sp,
+        children,
+        detached,
+        live_detached,
+        twins,
+        exited_twins,
+    };
+    host.set_thaw(thaw::validate(module, root_ctx, raw).map_err(|_| RestoreError::Malformed)?);
     // #1944: every carried budget node is one some domain of the cut named, or an ancestor of one
     // (canonical), known only now that every detached child's handles are in.
     if depth == 0 {
@@ -2169,6 +2314,231 @@ fn restore_at(
     Ok((layout, reserved_log2))
 }
 
+/// #3034 — the rest of a live detached child's Section 8 record: what the thaw pass does not check.
+#[doc(hidden)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DetachedRest {
+    pub digest: [u8; 32],
+    pub names: Vec<(String, i32)>,
+    pub pager: Option<u32>,
+    /// Its own artifact, opaque here.
+    pub artifact: Vec<u8>,
+}
+
+/// #3034 — the rest of a live fork twin's Section 12 record: what the thaw pass does not check.
+#[doc(hidden)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TwinRest {
+    pub servicer: bool,
+    pub names: Vec<(String, i32)>,
+    /// Its own artifact, opaque here.
+    pub artifact: Vec<u8>,
+}
+
+/// #3034 — an artifact's root residue as its sections hold it, for a test or a fuzz target to edit
+/// ([`decode_residue`], [`encode_residue`]). Nothing thaws one: a restore admits what it decodes.
+#[doc(hidden)]
+pub type ResidueEdit = RawResidue<DetachedRest, TwinRest>;
+
+/// An artifact's wire header and its sections by tag (the last of a repeated tag).
+fn sections(artifact: &[u8]) -> Result<(wire::Header, BTreeMap<u64, &[u8]>), RestoreError> {
+    let (hdr, payload) = wire::read_header(artifact).map_err(|e| match e {
+        wire::HeaderError::Truncated => RestoreError::Truncated,
+        wire::HeaderError::BadMagic => RestoreError::BadMagic,
+    })?;
+    let mut r = Reader::new(payload);
+    let mut map = BTreeMap::new();
+    while !r.at_end() {
+        let tag = r.uleb()?;
+        let len = r.uleb()? as usize;
+        map.insert(tag, r.take(len)?);
+    }
+    Ok((hdr, map))
+}
+
+/// #3034 — test and fuzz support: decode `artifact`'s root residue (Sections 2, 8, 12 and 13, and the
+/// header's counts) without restoring anything. A nested artifact rides as bytes.
+#[doc(hidden)]
+pub fn decode_residue(artifact: &[u8]) -> Result<ResidueEdit, RestoreError> {
+    let (_, map) = sections(artifact)?;
+    let header = map
+        .get(&TAG_HEADER)
+        .ok_or(RestoreError::MissingSection(TAG_HEADER))?;
+    let mut h = Reader::new(header);
+    h.take(32)?;
+    h.u8()?;
+    h.uleb()?;
+    h.uleb()?;
+    let spawned = h.uleb()?.checked_sub(1).ok_or(RestoreError::Malformed)?;
+    let fiber_count = h.uleb()?;
+    let (fibers, vcpus, root_sp, detached) =
+        decode_control(map.get(&TAG_CONTROL).copied(), fiber_count, spawned)?;
+    let children = match map.get(&TAG_CHILDREN) {
+        Some(body) => read_generations(&mut Reader::new(body), temen_ir::handles::SLOTS as u32)?,
+        None => Vec::new(),
+    };
+    let mut live_detached = Vec::new();
+    if let Some(body) = map.get(&TAG_DETACHED) {
+        let mut r = Reader::new(body);
+        for _ in 0..r.uleb()? {
+            let d = read_detached_record(&mut r)?;
+            live_detached.push(LiveDetached {
+                parent_task: usize::try_from(d.parent_task).map_err(|_| RestoreError::Malformed)?,
+                slot: usize::try_from(d.slot).map_err(|_| RestoreError::Malformed)?,
+                joinable: d.joinable,
+                task: d.task,
+                lane: d.lane,
+                payload: DetachedRest {
+                    digest: d.digest,
+                    names: d.names,
+                    pager: d.pager,
+                    artifact: d.artifact.to_vec(),
+                },
+            });
+        }
+    }
+    let (mut twins, mut exited_twins) = (Vec::new(), Vec::new());
+    if let Some(body) = map.get(&TAG_TWINS) {
+        let mut r = Reader::new(body);
+        for _ in 0..r.uleb()? {
+            let pid = r.uleb()?;
+            match read_twin_record(&mut r)? {
+                TwinRecord::Exited(outcome) => exited_twins.push(FrozenTwin { pid, outcome }),
+                TwinRecord::Live {
+                    servicer,
+                    entry,
+                    ctx,
+                    names,
+                    artifact,
+                } => twins.push(LiveTwin {
+                    pid,
+                    entry,
+                    ctx,
+                    payload: TwinRest {
+                        servicer,
+                        names,
+                        artifact: artifact.to_vec(),
+                    },
+                }),
+            }
+        }
+    }
+    Ok(RawResidue {
+        fibers,
+        vcpus,
+        root_sp,
+        children,
+        detached,
+        live_detached,
+        twins,
+        exited_twins,
+    })
+}
+
+/// #3034 — test and fuzz support: `artifact` with its root residue replaced by `edit`, through the
+/// codec's own section writers, its other sections as they were. Records are written in `edit`'s
+/// order (the twins merged by pid), canonical or not, so a restore sees exactly the edit. A root extent
+/// rides only beside a vCPU, as the format holds it.
+#[doc(hidden)]
+pub fn encode_residue(artifact: &[u8], edit: &ResidueEdit) -> Result<Vec<u8>, RestoreError> {
+    let (hdr, map) = sections(artifact)?;
+    let mut map: BTreeMap<u64, Vec<u8>> = map.into_iter().map(|(t, b)| (t, b.to_vec())).collect();
+    let header = map
+        .get(&TAG_HEADER)
+        .ok_or(RestoreError::MissingSection(TAG_HEADER))?;
+    let mut h = Reader::new(header);
+    h.take(32)?;
+    h.u8()?;
+    h.uleb()?;
+    h.uleb()?;
+    let fixed = h.pos; // digest, reservation, mapped, page size
+    let mut hb = header[..fixed].to_vec();
+    write_uleb(&mut hb, 1 + edit.vcpus.len() as u64);
+    write_uleb(&mut hb, edit.fibers.len() as u64);
+    map.insert(TAG_HEADER, hb);
+    let mut put = |tag, body: Option<Vec<u8>>| match body {
+        Some(b) => map.insert(tag, b),
+        None => map.remove(&tag),
+    };
+    put(
+        TAG_CONTROL,
+        (!edit.fibers.is_empty() || !edit.vcpus.is_empty() || !edit.detached.is_empty()).then(
+            || {
+                let mut b = Vec::new();
+                let root_sp = edit.root_sp.unwrap_or(0);
+                write_control(&mut b, &edit.fibers, &edit.vcpus, root_sp, &edit.detached);
+                b
+            },
+        ),
+    );
+    put(
+        TAG_DETACHED,
+        (!edit.live_detached.is_empty()).then(|| {
+            let mut b = Vec::new();
+            write_uleb(&mut b, edit.live_detached.len() as u64);
+            for l in &edit.live_detached {
+                write_detached_record(
+                    &mut b,
+                    &DetachedRecord {
+                        parent_task: l.parent_task as u64,
+                        slot: l.slot as u64,
+                        task: l.task,
+                        digest: l.payload.digest,
+                        lane: l.lane,
+                        names: l.payload.names.clone(),
+                        pager: l.payload.pager,
+                        joinable: l.joinable,
+                        artifact: &l.payload.artifact,
+                    },
+                );
+            }
+            b
+        }),
+    );
+    put(
+        TAG_TWINS,
+        (!edit.twins.is_empty() || !edit.exited_twins.is_empty()).then(|| {
+            let live = edit.twins.iter().map(|t| {
+                let rec = TwinRecord::Live {
+                    servicer: t.payload.servicer,
+                    entry: t.entry,
+                    ctx: t.ctx,
+                    names: t.payload.names.clone(),
+                    artifact: &t.payload.artifact,
+                };
+                (t.pid, rec)
+            });
+            let exited = edit
+                .exited_twins
+                .iter()
+                .map(|t| (t.pid, TwinRecord::Exited(t.outcome)));
+            let mut all: Vec<_> = live.chain(exited).collect();
+            all.sort_by_key(|&(pid, _)| pid);
+            let mut b = Vec::new();
+            write_uleb(&mut b, all.len() as u64);
+            for (pid, rec) in &all {
+                write_uleb(&mut b, *pid);
+                write_twin_record(&mut b, rec);
+            }
+            b
+        }),
+    );
+    put(
+        TAG_CHILDREN,
+        (!edit.children.is_empty()).then(|| {
+            let mut b = Vec::new();
+            write_generations(&mut b, &edit.children);
+            b
+        }),
+    );
+    let mut out = Vec::new();
+    wire::write_header(&mut out, hdr.kind, hdr.version, hdr.flags);
+    for (tag, body) in &map {
+        section(&mut out, *tag, |b| b.extend_from_slice(body));
+    }
+    Ok(out)
+}
+
 /// Decode Section 12 ([`write_twins`]) and restore each live twin's artifact into a fresh powerbox
 /// holding the restoring host's thaw seams ([`Host::detached_thaw_host`]), against `module`, its
 /// parent's program: the live twins, then the exited ones.
@@ -2178,7 +2548,7 @@ fn decode_twins(
     host: &mut Host,
     depth: usize,
     cut: &mut ThawCut,
-) -> Result<(Vec<ThawedTwin>, Vec<FrozenTwin>), RestoreError> {
+) -> Result<(Vec<LiveTwin<ThawedTwin>>, Vec<FrozenTwin>), RestoreError> {
     if depth >= MAX_DETACHED_DEPTH {
         return Err(RestoreError::Malformed);
     }
@@ -2195,33 +2565,37 @@ fn decode_twins(
             return Err(RestoreError::Malformed); // canonical: strictly ascending pid
         }
         last = Some(pid);
-        let servicer = match r.u8()? {
-            TWIN_LIVE => false,
-            TWIN_LIVE_SERVICER => true,
-            TWIN_EXITED => {
-                let outcome = read_join_outcome(&mut r)?.ok_or(RestoreError::Malformed)?;
+        let (servicer, entry, ctx, names, art) = match read_twin_record(&mut r)? {
+            TwinRecord::Exited(outcome) => {
                 exited.push(FrozenTwin { pid, outcome });
                 continue;
             }
-            _ => return Err(RestoreError::Malformed),
-        };
-        let entry = u32::try_from(r.uleb()?).map_err(|_| RestoreError::Malformed)?;
-        let ctx = u32::try_from(r.uleb()?).map_err(|_| RestoreError::Malformed)?;
-        let names = read_names(&mut r)?;
-        let art_len = r.uleb()? as usize;
-        let art = r.take(art_len)?;
-        let mut twin = host.detached_thaw_host();
-        let restored = restore_at(art, module, &mut twin, depth + 1, cut);
-        host.reclaim_thaw_seams(&mut twin);
-        let (window, reserved_log2) = restored?;
-        twins.push(ThawedTwin {
-            pid,
-            window,
-            reserved_log2,
-            host: twin,
-            launch: TwinLaunch {
+            TwinRecord::Live {
+                servicer,
                 entry,
                 ctx,
+                names,
+                artifact,
+            } => (servicer, entry, ctx, names, artifact),
+        };
+        // Its root runs in the forking vCPU's context, which its own residue's extent lies in. A
+        // context past the arena is refused here, before the nested pass reads it (and again by the
+        // parent's pass with the rest of the record).
+        if ctx as usize >= temen_ir::durable_abi::MAX_SHADOW_CONTEXTS {
+            return Err(RestoreError::Malformed);
+        }
+        let mut twin = host.detached_thaw_host();
+        let restored = restore_at(art, module, &mut twin, depth + 1, ctx as usize, cut);
+        host.reclaim_thaw_seams(&mut twin);
+        let (window, reserved_log2) = restored?;
+        twins.push(LiveTwin {
+            pid,
+            entry,
+            ctx,
+            payload: ThawedTwin {
+                window,
+                reserved_log2,
+                host: twin,
                 servicer,
                 names,
             },
@@ -2243,7 +2617,7 @@ fn decode_detached(
     host: &mut Host,
     depth: usize,
     cut: &mut ThawCut,
-) -> Result<Vec<ThawedDetached>, RestoreError> {
+) -> Result<Vec<LiveDetached<ThawedDetached>>, RestoreError> {
     if depth >= MAX_DETACHED_DEPTH {
         return Err(RestoreError::Malformed);
     }
@@ -2252,61 +2626,52 @@ fn decode_detached(
     if n == 0 {
         return Err(RestoreError::Malformed); // canonical: an empty list elides the section
     }
-    let mut out: Vec<ThawedDetached> = Vec::with_capacity(n.min(64));
+    let mut out: Vec<LiveDetached<ThawedDetached>> = Vec::with_capacity(n.min(64));
     for _ in 0..n {
-        let parent_task = r.uleb()? as usize;
-        let slot = r.uleb()? as usize;
+        let DetachedRecord {
+            parent_task,
+            slot,
+            task,
+            digest,
+            lane,
+            names,
+            pager,
+            joinable,
+            artifact: art,
+        } = read_detached_record(&mut r)?;
+        let parent_task = usize::try_from(parent_task).map_err(|_| RestoreError::Malformed)?;
+        let slot = usize::try_from(slot).map_err(|_| RestoreError::Malformed)?;
         if out
             .last()
             .is_some_and(|p| (p.parent_task, p.slot) >= (parent_task, slot))
         {
             return Err(RestoreError::Malformed); // canonical: strictly ascending `(parent_task, slot)`
         }
-        let task = r.uleb()?;
-        let digest: [u8; 32] = r
-            .take(32)?
-            .try_into()
-            .expect("take(32) yields exactly 32 bytes");
-        let lane = r.uleb()? as i64;
-        let names = read_names(&mut r)?;
         // #2438 — op 17 admits only a `{ page: (i64) -> (i64) }` export of the spawner's program as a
         // pager (`Module::is_pager_export`), so an artifact naming anything else is malformed.
-        let pager = match r.uleb()? {
-            0 => None,
-            e => Some(
-                u32::try_from(e - 1)
-                    .ok()
-                    .filter(|&e| spawner.is_pager_export(e))
-                    .ok_or(RestoreError::Malformed)?,
-            ),
-        };
-        let joinable = match r.take(1)?[0] {
-            0 => false,
-            1 => true,
-            _ => return Err(RestoreError::Malformed),
-        };
-        let art_len = r.uleb()? as usize;
-        let art = r.take(art_len)?;
+        if pager.is_some_and(|e| !spawner.is_pager_export(e)) {
+            return Err(RestoreError::Malformed);
+        }
         let module = host
             .durable_module_by_digest(&digest)
             .ok_or(RestoreError::ModuleUnresolved(digest))?;
         let mut child = host.detached_thaw_host();
-        let restored = restore_at(art, &module, &mut child, depth + 1, cut);
+        let restored = restore_at(art, &module, &mut child, depth + 1, 0, cut);
         host.reclaim_thaw_seams(&mut child);
         let (window, reserved_log2) = restored?;
-        out.push(ThawedDetached {
+        out.push(LiveDetached {
             parent_task,
             slot,
-            window,
-            reserved_log2,
-            host: child,
-            launch: DetachedLaunch {
-                task,
+            joinable,
+            task,
+            lane,
+            payload: ThawedDetached {
+                window,
+                reserved_log2,
+                host: child,
                 digest,
-                lane,
                 names,
                 pager,
-                joinable,
             },
         });
     }
@@ -2326,21 +2691,27 @@ fn decode_control(
     body: Option<&[u8]>,
     fiber_count: u64,
     spawned_count: u64,
-    // The root's empty extent when the artifact carries no residue: the module's arena base.
-    root_default: u64,
-) -> Result<(Vec<FrozenFiber>, Vec<FrozenVCpu>, u64, Vec<FrozenDetached>), RestoreError> {
+) -> Result<
+    (
+        Vec<FrozenFiber>,
+        Vec<FrozenVCpu>,
+        Option<u64>,
+        Vec<FrozenDetached>,
+    ),
+    RestoreError,
+> {
     let body = match (body, fiber_count, spawned_count) {
         // no residue ⇒ no section
-        (None, 0, 0) => return Ok((Vec::new(), Vec::new(), root_default, Vec::new())),
+        (None, 0, 0) => return Ok((Vec::new(), Vec::new(), None, Vec::new())),
         (None, _, _) => return Err(RestoreError::MissingSection(TAG_CONTROL)),
         (Some(b), _, _) => b,
     };
     let mut cr = Reader::new(body);
-    let n = cr.uleb()?;
+    let n = cr.count()? as u64;
     if n != fiber_count {
         return Err(RestoreError::Malformed); // header and section must agree
     }
-    let mut fibers = Vec::with_capacity(n as usize);
+    let mut fibers = Vec::with_capacity(n as usize); // `n` is a `count`
     let mut last: Option<u64> = None;
     for _ in 0..n {
         let slot = cr.uleb()?;
@@ -2368,10 +2739,10 @@ fn decode_control(
         });
     }
     // Spawned-vCPU residue (slice 3.2.1): present iff the header declares spawned vCPUs.
-    let mut vcpus = Vec::with_capacity(spawned_count as usize);
-    let mut root_sp = root_default;
+    let mut vcpus = Vec::new();
+    let mut root_sp = None;
     if spawned_count > 0 {
-        let nv = cr.uleb()?;
+        let nv = cr.count()? as u64;
         if nv != spawned_count {
             return Err(RestoreError::Malformed); // header and section must agree
         }
@@ -2390,8 +2761,8 @@ fn decode_control(
                 _ => return Err(RestoreError::Malformed),
             };
             let func = u32::try_from(cr.uleb()?).map_err(|_| RestoreError::Malformed)? as i32;
-            let nargs = cr.uleb()?;
-            let mut args = Vec::with_capacity(nargs as usize);
+            let nargs = cr.count()?;
+            let mut args = Vec::with_capacity(nargs);
             for _ in 0..nargs {
                 args.push(cr.uleb()? as i64);
             }
@@ -2416,7 +2787,7 @@ fn decode_control(
                 completed_result,
             });
         }
-        root_sp = cr.uleb()?;
+        root_sp = Some(cr.uleb()?);
     }
     // #1361 step 2 — the completed detached-child residue trails the section, present iff bytes
     // remain; canonical: absent when empty (v44).
@@ -2475,8 +2846,12 @@ fn decode_jit(body: Option<&[u8]>) -> Result<(u8, Vec<DurableJitTable>), Restore
 /// block (v19, #1296); the caller enforces the section-level canonical checks (`at_end`, non-empty).
 fn read_jit_body(jr: &mut Reader) -> Result<(u8, Vec<DurableJitTable>), RestoreError> {
     let table_log2 = jr.u8()?;
-    let nd = jr.uleb()?;
-    let mut domains = Vec::with_capacity(nd as usize);
+    // #3034 — every engine sizes its dispatch table `1 << table_log2` slots, named by `u32`.
+    if u32::from(table_log2) >= u32::BITS {
+        return Err(RestoreError::Malformed);
+    }
+    let nd = jr.count()?;
+    let mut domains = Vec::with_capacity(nd);
     for _ in 0..nd {
         let mem_log2 = match jr.uleb()? {
             0 => None,
@@ -2485,8 +2860,8 @@ fn read_jit_body(jr: &mut Reader) -> Result<(u8, Vec<DurableJitTable>), RestoreE
         };
         let units_left = u32::try_from(jr.uleb()?).map_err(|_| RestoreError::Malformed)?;
         let bytes_left = jr.uleb()?;
-        let nu = jr.uleb()?;
-        let mut units = Vec::with_capacity(nu as usize);
+        let nu = jr.count()?;
+        let mut units = Vec::with_capacity(nu);
         for _ in 0..nu {
             let install_type_id = u32::try_from(jr.uleb()?).map_err(|_| RestoreError::Malformed)?;
             let ir_len = jr.uleb()? as usize;
@@ -2497,8 +2872,8 @@ fn read_jit_body(jr: &mut Reader) -> Result<(u8, Vec<DurableJitTable>), RestoreE
             });
         }
         // v17: B2 install occupancy — (slot, unit) in install order.
-        let ni = jr.uleb()?;
-        let mut installed = Vec::with_capacity(ni as usize);
+        let ni = jr.count()?;
+        let mut installed = Vec::with_capacity(ni);
         for _ in 0..ni {
             let slot = u32::try_from(jr.uleb()?).map_err(|_| RestoreError::Malformed)?;
             let unit = u32::try_from(jr.uleb()?).map_err(|_| RestoreError::Malformed)?;
@@ -2567,13 +2942,13 @@ type ServeTrio = (Vec<SvcDispatch>, Vec<(u64, Reply)>, u64);
 /// (the root serve section and a child domain's state). Each caller does its own framing/canonicality
 /// checks (section `at_end`, empty-trio elision) around it. (#915)
 fn read_serve_trio(r: &mut Reader) -> Result<ServeTrio, RestoreError> {
-    let nq = r.uleb()?;
-    let mut queue = Vec::with_capacity(nq as usize);
+    let nq = r.count()?;
+    let mut queue = Vec::with_capacity(nq);
     for _ in 0..nq {
         let export = u32::try_from(r.uleb()?).map_err(|_| RestoreError::Malformed)?;
         let op = u32::try_from(r.uleb()?).map_err(|_| RestoreError::Malformed)?;
-        let nargs = r.uleb()?;
-        let mut args = Vec::with_capacity(nargs as usize);
+        let nargs = r.count()?;
+        let mut args = Vec::with_capacity(nargs);
         for _ in 0..nargs {
             args.push(r.uleb()? as i64);
         }
@@ -2585,8 +2960,8 @@ fn read_serve_trio(r: &mut Reader) -> Result<ServeTrio, RestoreError> {
             ticket,
         });
     }
-    let nr = r.uleb()?;
-    let mut results = Vec::with_capacity(nr as usize);
+    let nr = r.count()?;
+    let mut results = Vec::with_capacity(nr);
     let mut last: Option<u64> = None;
     for _ in 0..nr {
         let t = r.uleb()?;
@@ -2857,6 +3232,15 @@ impl<'a> Reader<'a> {
     fn u8(&mut self) -> Result<u8, RestoreError> {
         Ok(self.take(1)?[0])
     }
+    /// #3034 — an element count, at most the bytes left: every element takes at least one, so a
+    /// count past them is a lie, refused before anything is allocated for it.
+    fn count(&mut self) -> Result<usize, RestoreError> {
+        let n = self.uleb()?;
+        usize::try_from(n)
+            .ok()
+            .filter(|&n| n <= self.b.len() - self.pos.min(self.b.len()))
+            .ok_or(RestoreError::Malformed)
+    }
     fn uleb(&mut self) -> Result<u64, RestoreError> {
         let mut v = 0u64;
         let mut shift = 0u32;
@@ -2881,6 +3265,52 @@ impl<'a> Reader<'a> {
 /// lanes with distinct odd primes, length-mixed. Guards *accidental* restore-into-wrong-module
 /// (§12.6 invariant 2), not an adversary (a guest can't forge past confinement — §3), so no
 /// crypto-hash dependency is pulled into the toolchain.
+/// #3034 — the decoder's own bounds on untrusted counts and sizes. On `b099bbb` each of these
+/// allocated or shifted before it read a byte: a capacity-overflow panic, a shift overflow.
+#[cfg(test)]
+mod decoder_bounds_tests {
+    use super::*;
+
+    #[test]
+    fn a_count_past_the_bytes_left_is_refused_before_any_allocation() {
+        let mut b = Vec::new();
+        write_uleb(&mut b, 1 << 62);
+        let refused = |b: &[u8]| matches!(Reader::new(b).count(), Err(RestoreError::Malformed));
+        assert!(refused(&b), "2^62 elements in a few bytes");
+        let mut ok = Vec::new();
+        write_uleb(&mut ok, 2);
+        ok.extend_from_slice(&[0, 0]);
+        assert_eq!(Reader::new(&ok).count().ok(), Some(2));
+        // The vCPU section's spawn args, the site that allocated first.
+        let mut body = Vec::new();
+        write_uleb(&mut body, 0); // no fibers
+        write_uleb(&mut body, 1); // one vCPU
+        for v in [1u64, 0, 0, 1, 1] {
+            write_uleb(&mut body, v); // task, parent, slot, joinable, func
+        }
+        write_uleb(&mut body, 1 << 62); // nargs
+        assert!(matches!(
+            decode_control(Some(&body), 0, 1),
+            Err(RestoreError::Malformed)
+        ));
+    }
+
+    #[test]
+    fn a_dispatch_table_past_u32_slots_is_refused() {
+        for log2 in [32u8, 64, 255] {
+            let mut b = vec![log2];
+            write_uleb(&mut b, 0); // no domains
+            assert!(matches!(
+                read_jit_body(&mut Reader::new(&b)),
+                Err(RestoreError::Malformed)
+            ));
+        }
+        let mut b = vec![31u8];
+        write_uleb(&mut b, 0);
+        assert!(read_jit_body(&mut Reader::new(&b)).is_ok());
+    }
+}
+
 #[cfg(test)]
 mod binding_window_tests {
     use super::*;

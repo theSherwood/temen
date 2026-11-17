@@ -281,9 +281,32 @@ as any guest access — the existing hinge already covers it. The verifier still
 typing/control-flow/index-ranges of the instrumented IR. A transform bug is a
 *correctness* bug, never a confinement bug.
 
-Corollary: restore never crosses a trust boundary as structured data (host loads
-opaque bytes and calls the entry), unlike host-side frame capture, whose restore path
-is a parser over attacker-controlled frames in the host.
+**The artifact is untrusted input (owner, 2026-11-13, #3034), and restore is the trust
+boundary.** The shadow stack itself crosses as opaque window bytes, as above; but an artifact
+also carries structured data the host parses and acts on — the thaw residue (frozen fibers and
+vCPUs, the root's extent, the child table, detached children and fork twins), the serve state,
+the handle table, guest-JIT units — and on the Cranelift JIT some of it picks the offsets of raw
+host stores. Every value restore reads is therefore one of:
+
+1. **checked against the module and the cut** — by the decoder (`temen-snapshot`: geometry,
+   canonical order, counts no larger than the bytes left, handle bindings, the serve tickets,
+   guest-JIT installs) or by the **one thaw pass**, `temen_ir::thaw::validate`, which admits a
+   domain's residue whole only if every value in it is one a run of the module could have made
+   (each nested artifact through the same pass, against its own module);
+2. **handed to an embedder hook that may only narrow it** — named capabilities, budget ceilings,
+   module grants;
+3. **re-verified** — a guest-JIT unit's IR goes through the verifier again; or
+4. **opaque guest bytes** — window pages, pipe buffers, region bytes — which reach the guest
+   only through the confinement lowering, like any other guest memory.
+
+An engine thaws only an admitted residue: the pass's result type, `Thaw`, is the only way a
+residue reaches an engine (`Host::set_thaw`, `CompiledModule::set_durable`), and an engine that
+re-creates less than all of it declines the thaw whole to the tree-walker rather than thawing part
+of it. The checks at each use that predate the pass (#2945) stay only in front of a raw host store
+or an unchecked index, as a backstop that is loud in debug. Open: whether an artifact may set the
+attestation and the guest-JIT quotas at all, or only narrow what the restoring host grants (#3101).
+A frame-capture design would have had the same boundary, as a parser over attacker-controlled
+frames in the host; this one keeps the structured part small and checks it in one place.
 
 ---
 

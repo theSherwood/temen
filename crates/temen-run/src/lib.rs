@@ -1562,7 +1562,7 @@ pub fn jit_cap_run(
             let mut hg = host_cell.lock().unwrap_or_else(|e| e.into_inner());
             // Either failing hands the embedder its powerbox back (it moved into the cell above).
             let prepared = reconstruct_jit_units(&mut cm, &mut hg)
-                .and_then(|()| jit_durable_enter(&mut cm, &mut hg));
+                .and_then(|()| jit_durable_enter(&mut cm, m, &mut hg));
             drop(hg);
             if let Err(e) = prepared {
                 *host = Host::from_cell(host_cell);
@@ -1577,9 +1577,11 @@ pub fn jit_cap_run(
             hg.set_jit_native_ctx(0);
             hg.set_serve_ctx(0);
             hg.set_park_hub(0);
-            jit_durable_leave(&mut cm, &mut hg);
+            let left = jit_durable_leave(&mut cm, m, &mut hg);
+            drop(hg);
+            *host = Host::from_cell(host_cell);
+            left?;
         }
-        *host = Host::from_cell(host_cell);
         return r.map(|(o, bytes)| (o, jit_layout(m, host, bytes, cm.take_tail_out())));
     }
     let cc = CapCtx::Raw(host as *mut Host);
@@ -1614,7 +1616,7 @@ pub fn jit_cap_run(
     // this fresh module so a native `invoke` of them runs their own code. A no-op for a fresh run (no
     // restored units); the guest is not yet running, so `define_extra` is at a quiescent point.
     let prepared =
-        reconstruct_jit_units(&mut cm, host).and_then(|()| jit_durable_enter(&mut cm, host));
+        reconstruct_jit_units(&mut cm, host).and_then(|()| jit_durable_enter(&mut cm, m, host));
     if let Err(e) = prepared {
         host.set_jit_native_ctx(0);
         host.set_park_hub(0);
@@ -1628,7 +1630,7 @@ pub fn jit_cap_run(
     // The module dies with this call — leave no dangling registration behind.
     host.set_jit_native_ctx(0);
     host.set_park_hub(0);
-    jit_durable_leave(&mut cm, host);
+    jit_durable_leave(&mut cm, m, host)?;
     r.map(|(o, bytes)| (o, jit_layout(m, host, bytes, cm.take_tail_out())))
 }
 
@@ -1640,141 +1642,119 @@ pub fn jit_cap_run(
 /// Residue the JIT cannot yet re-create is refused whole (`Unsupported`), never dropped (#1690): the
 /// detached children [`jit_relaunches`] refuses. The embedder then thaws on the interpreter, which
 /// carries all of it.
-fn jit_durable_enter(cm: &mut CompiledModule, host: &mut Host) -> Result<(), temen_jit::JitError> {
+fn jit_durable_enter(
+    cm: &mut CompiledModule,
+    m: &Module,
+    host: &mut Host,
+) -> Result<(), temen_jit::JitError> {
     if !host.is_durable() {
         return Ok(());
     }
     // Checked before anything is taken, so the refusal leaves the residue on the Host (as the other
-    // refusals here do) for a thaw that re-grants the program.
+    // refusals here do) for a thaw that re-grants the program, or thaws on the tree-walker.
     if !jit_relaunches(host) {
         return Err(temen_jit::JitError::Unsupported(
-            "durable JIT thaw: a detached child the JIT cannot re-launch",
+            "durable JIT thaw: a detached child or fork twin the JIT cannot re-create",
         ));
     }
-    cm.set_detached_seed(detached_seeds(host));
-    cm.set_durable(take_residue(host));
-    Ok(())
+    let thaw = jit_thaw(host, m, 0).ok_or(temen_jit::JitError::Unsupported(
+        "durable JIT thaw: a residue the thaw pass refuses",
+    ))?;
+    cm.set_durable(thaw)
 }
 
-/// The residue a freeze left on `host`, taken for a JIT thaw to re-create: a run root's, or a
-/// captured detached child's on its powerbox (#2010, #2031). [`leave_residue`]'s inverse.
-fn take_residue(host: &mut Host) -> temen_jit::DurableResidue {
-    let r = temen_jit::DurableResidue {
-        fibers: host.frozen_fibers().iter().map(jit_fiber).collect(),
-        vcpus: host.frozen_vcpus().iter().map(jit_vcpu).collect(),
-        root_sp: host.take_frozen_root_sp(),
-        children: host.child_generations().to_vec(),
-    };
-    host.set_frozen_fibers(Vec::new());
-    host.set_frozen_vcpus(Vec::new());
-    host.set_child_generations(Vec::new());
-    r
-}
-
-/// #1361 step 4 — the captured detached children a restore seeded, as JIT re-launch seeds: each child's
-/// program resolved and its powerbox prepared by the same [`Host::prepare_detached_relaunch`] the
-/// interpreter's thaw uses, then built into a shared child powerbox exactly as a spawn builds one
-/// ([`grant_child`]). #2010 — each seed carries its own captured children, taken from its own
-/// powerbox. #2430 — its caller has checked that the JIT re-launches every one ([`jit_relaunches`]),
-/// so nothing here refuses the thaw part-way, once leases are filed: a child it cannot relaunch is
-/// dropped, as the interpreter drops it ([`Host::drop_restored`]).
-fn detached_seeds(host: &mut Host) -> Vec<temen_jit::DetachedSeed> {
-    let mut out = Vec::new();
-    for td in host.take_thawed_detached() {
-        let temen_interp::ThawedDetached {
-            slot,
-            window,
-            reserved_log2,
-            host: mut child,
-            launch,
-            ..
-        } = td;
-        // #1971 — the lease the spawn filed for its window, filed again for the thawed child's end.
-        let runs = window
-            .page_map()
-            .window_runs(temen_ir::module_null_guard(), 1u64 << reserved_log2);
-        let ready = host
-            .prepare_detached_relaunch(&launch, &mut child, window.page_map())
-            .and_then(|r| {
-                let lease = host.relaunch_lease(&mut child, r.memory_log2, runs).ok()?;
-                Some((r, lease))
-            });
-        let Some((r, window_lease)) = ready else {
-            // #2430 — not relaunched, as the interpreter's thaw drops one, whatever refused it (its
-            // program no longer binds, or #2318 the process's pools have no room for its lease):
-            // with what the freeze kept for it and its own captured children, and one its parent
-            // can join ends with `ThreadFault`. #2465 — one its parent detached just ends.
-            // #1936 — its end post is signalled with no wake: the run has not started, so its
-            // waiters' waits re-issue on the thaw and read the new sequence.
-            let _ = child.drop_restored(&launch, &window, false);
-            if launch.joinable {
-                out.push(temen_jit::DetachedSeed::Completed {
-                    slot,
-                    result: 0,
-                    trap: temen_interp::Trap::ThreadFault.code(),
-                });
-            }
-            continue;
-        };
-        // #1854 — its Memory capability sees the pages its window is restored with, as a thawed
-        // root's does (`jit_cap_run`).
-        child.reset_cap_pages(window.page_map());
-        if !host.try_grant_lane(launch.lane) {
-            // As the interpreter's re-launch: a lane the thawing parent's cap no longer fits is not
-            // re-drawn; the child keeps its own cap either way.
-        }
-        let children = detached_seeds(&mut child);
-        // A thawed child's window is always a whole window, never a seed.
-        let temen_jit::WindowRestore { prots, tail } = jit_restore(&window).unwrap_or_default();
-        // Its root is task 0 in its domain, as in a JIT capture: re-parent the vCPUs it spawned
-        // from the id an interpreter capture gave it.
-        let mut residue = take_residue(&mut child);
-        for v in &mut residue.vcpus {
-            if v.parent_task == launch.task as usize {
+/// #3034 — the residue a restore left on `host` (a run root's, or a captured detached child's on its
+/// powerbox, #2010, #2031), taken and admitted again for the JIT against `m`, the program it thaws:
+/// each live detached child prepared for re-launch exactly as the interpreter's thaw prepares it
+/// ([`relaunch_payload`]). `task` is the id its root had in the frozen run, which the vCPUs it spawned
+/// name as their parent: a JIT domain's root is task 0. `None` if the pass refuses it, which a
+/// restore that admitted it never leaves.
+fn jit_thaw(host: &mut Host, m: &Module, task: u64) -> Option<temen_jit::JitThaw> {
+    let mut raw = host.take_residue();
+    if task != 0 {
+        for v in &mut raw.vcpus {
+            if v.parent_task as u64 == task {
                 v.parent_task = 0;
             }
         }
-        // A thaw never re-launches a demand-paged child on this engine (#2438).
-        let child = grant_child(host, child, 0, 0, None);
-        out.push(temen_jit::DetachedSeed::Captured(Box::new(
-            temen_jit::CapturedSeed {
-                slot,
-                mapped_log2: r.memory_log2,
-                reserved_log2,
-                funcs: r.funcs,
-                types: r.types,
-                impl_exports: r.module.impl_exports.clone(),
-                shadow: r
-                    .shadow
-                    .unwrap_or(temen_ir::durable_abi::ShadowArena::EMPTY),
-                digest: launch.digest,
-                image: window.bytes().to_vec(),
-                prots,
-                tail,
-                child,
-                window: window_lease.map(|l| (l.budget, l.bytes, l.runs)),
-                children,
-                residue,
-                joinable: launch.joinable,
-            },
-        )));
     }
-    // #2041 — and each child that had completed but was not joined, as its outcome, at its slot of
-    // the domain's one child table (#2043), whichever vCPU spawned it.
-    let completed = host.frozen_detached().to_vec();
-    host.set_frozen_detached(Vec::new());
-    for fd in completed {
-        let (result, trap) = match fd.completed_result {
-            Ok(v) => (v, 0),
-            Err(t) => (0, t.code()),
-        };
-        out.push(temen_jit::DetachedSeed::Completed {
-            slot: fd.slot,
-            result,
-            trap,
+    let thaw = temen_ir::thaw::validate(m, 0, raw).ok()?;
+    Some(thaw.map(|l| relaunch_payload(host, l), |_| ()))
+}
+
+/// #1361 step 4 — a captured detached child a restore seeded, as a JIT re-launch payload: its program
+/// resolved and its powerbox prepared by the same [`Host::prepare_detached_relaunch`] the
+/// interpreter's thaw uses, then built into a shared child powerbox exactly as a spawn builds one
+/// ([`grant_child`]). #2010 — it carries its own thaw, its captured children with it. #2430 — its
+/// caller has checked that the JIT re-launches every one ([`jit_relaunches`]), so nothing here
+/// refuses the thaw part-way, once leases are filed: a child it cannot relaunch is dropped, as the
+/// interpreter drops it ([`Host::drop_restored`]).
+fn relaunch_payload(host: &mut Host, l: temen_interp::LiveDetached) -> temen_jit::JitDetached {
+    let launch = temen_interp::detached_launch(&l);
+    let temen_interp::ThawedDetached {
+        window,
+        reserved_log2,
+        host: mut child,
+        ..
+    } = l.payload;
+    // #1971 — the lease the spawn filed for its window, filed again for the thawed child's end.
+    let runs = window
+        .page_map()
+        .window_runs(temen_ir::module_null_guard(), 1u64 << reserved_log2);
+    let ready = host
+        .prepare_detached_relaunch(&launch, &mut child, window.page_map())
+        .and_then(|r| {
+            let lease = host.relaunch_lease(&mut child, r.memory_log2, runs).ok()?;
+            Some((r, lease))
         });
+    let Some((r, window_lease)) = ready else {
+        // #2430 — not relaunched, as the interpreter's thaw drops one, whatever refused it (its
+        // program no longer binds, or #2318 the process's pools have no room for its lease): with
+        // what the freeze kept for it and its own captured children, and one its parent can join
+        // ends with `ThreadFault`. #2465 — one its parent detached just ends. #1936 — its end post
+        // is signalled with no wake: the run has not started, so its waiters' waits re-issue on the
+        // thaw and read the new sequence.
+        let _ = child.drop_restored(&launch, &window, false);
+        return temen_jit::JitDetached::Dropped;
+    };
+    // #1854 — its Memory capability sees the pages its window is restored with, as a thawed root's
+    // does (`jit_cap_run`).
+    child.reset_cap_pages(window.page_map());
+    if !host.try_grant_lane(launch.lane) {
+        // As the interpreter's re-launch: a lane the thawing parent's cap no longer fits is not
+        // re-drawn; the child keeps its own cap either way.
     }
-    out
+    // Its own thaw, its captured children with it. Its root is task 0 in its domain, as in a JIT
+    // capture: the vCPUs it spawned are re-parented from the id an interpreter capture gave it.
+    let Some(residue) = jit_thaw(&mut child, &r.module, launch.task) else {
+        debug_assert!(
+            false,
+            "a detached child's residue the restore admitted, refused"
+        );
+        let _ = child.drop_restored(&launch, &window, false);
+        return temen_jit::JitDetached::Dropped;
+    };
+    // A thawed child's window is always a whole window, never a seed.
+    let temen_jit::WindowRestore { prots, tail } = jit_restore(&window).unwrap_or_default();
+    // A thaw never re-launches a demand-paged child on this engine (#2438).
+    let child = grant_child(host, child, 0, 0, None);
+    temen_jit::JitDetached::Relaunch(Box::new(temen_jit::CapturedSeed {
+        mapped_log2: r.memory_log2,
+        reserved_log2,
+        funcs: r.funcs,
+        types: r.types,
+        impl_exports: r.module.impl_exports.clone(),
+        shadow: r
+            .shadow
+            .unwrap_or(temen_ir::durable_abi::ShadowArena::EMPTY),
+        digest: launch.digest,
+        image: window.bytes().to_vec(),
+        prots,
+        tail,
+        child,
+        window: window_lease.map(|l| (l.budget, l.bytes, l.runs)),
+        residue,
+    }))
 }
 
 /// #2010 — whether the JIT can re-create every detached child a restore seeded on `host`, at every
@@ -1784,13 +1764,17 @@ fn detached_seeds(host: &mut Host) -> Vec<temen_jit::DetachedSeed> {
 /// #2438 — and none is demand-paged: a durable JIT run pages no child, so its relaunch re-links no
 /// pager (#2489). A paged artifact thaws on the interpreter, where it was frozen.
 fn jit_relaunches(host: &Host) -> bool {
-    host.thawed_detached().iter().all(|td| {
-        let c = &td.host;
-        host.durable_module_by_digest(&td.launch.digest).is_some()
-            && td.launch.pager.is_none()
-            && (c.frozen_vcpus().is_empty() || c.frozen_root_sp().is_some())
-            && jit_relaunches(c)
-    })
+    // #3034 — and no fork twin, live or exited, at any depth: the JIT does not re-create one (#3100).
+    // Nor a serve loop's frozen handlers (#1676), which only the tree-walker's serve loop adopts.
+    host.thawed_twins().is_empty()
+        && host.frozen_twins().is_empty()
+        && host.frozen_handlers().is_empty()
+        && host.thawed_detached().iter().all(|td| {
+            let c = &td.payload.host;
+            host.durable_module_by_digest(&td.payload.digest).is_some()
+                && td.payload.pager.is_none()
+                && jit_relaunches(c)
+        })
 }
 
 /// #1361 step 4 — the durable detached children a JIT freeze reached, onto the `Host` where the
@@ -1800,26 +1784,27 @@ fn jit_relaunches(host: &Host) -> bool {
 /// unreached — which the codec refuses whole rather than emit part of the tree. #2010 — a captured
 /// child's own children land on its powerbox the same way, and every unreached one in the tree on
 /// the root's, as the oracle's recursive harvest leaves them.
-fn jit_detached_leave(cm: &mut CompiledModule, host: &mut Host) {
+fn jit_detached_leave(
+    cm: &mut CompiledModule,
+    host: &mut Host,
+) -> Vec<temen_interp::FrozenDetached> {
     let mut unreached = Vec::new();
     let (captured, completed) = detached_left(cm.take_detached_harvest(), &mut unreached);
     if !captured.is_empty() {
         host.set_captured_detached(captured);
     }
-    if !completed.is_empty() {
-        host.set_frozen_detached(completed);
-    }
     if !unreached.is_empty() {
         host.set_unreached_detached(unreached);
     }
+    completed
 }
 
 /// A finished child's `join` outcome from its `(result, trap)` cell — its value, or its trap (#1674);
 /// `None` for a child not finished, or a trap cell that names no trap.
-fn join_outcome(outcome: Option<(i64, i64)>) -> Option<Result<i64, temen_interp::Trap>> {
+fn join_outcome(outcome: Option<(i64, i64)>) -> Option<Result<i64, temen_ir::thaw::TrapCode>> {
     outcome.and_then(|(result, trap)| match trap {
         0 => Some(Ok(result)),
-        t => temen_interp::Trap::from_code(t).map(Err),
+        t => temen_interp::Trap::from_code(t).map(|t| Err(t.code())),
     })
 }
 
@@ -1893,11 +1878,21 @@ fn detached_left(
             if !grand_captured.is_empty() {
                 c.set_captured_detached(grand_captured);
             }
-            if !grand_completed.is_empty() {
-                c.set_frozen_detached(grand_completed);
+            // #2010, #2031 — what its root, fibers and vCPUs left rides its artifact too. One the
+            // thaw pass refuses is a freeze no artifact can carry: the child is unreached, which
+            // refuses the freeze whole (#3034).
+            if !leave_residue(&mut c, &module, capture.residue, grand_completed) {
+                drop(c);
+                unreached.push(temen_interp::PendingDetached {
+                    parent_task: 0,
+                    slot: h.slot,
+                    child_task: 0,
+                    host: child,
+                    spawn,
+                    joinable: h.joinable,
+                });
+                continue;
             }
-            // #2010, #2031 — what its root, fibers and vCPUs left rides its artifact too.
-            leave_residue(&mut c, capture.residue);
             jit_layout(&module, &c, capture.image, capture.tail)
         };
         captured.push(temen_interp::CapturedDetached {
@@ -1936,80 +1931,48 @@ fn pending_detached(c: temen_interp::CapturedDetached) -> temen_interp::PendingD
     }
 }
 
-/// A JIT vCPU's freeze residue, as the interpreter records it: one record serves both engines.
-fn interp_vcpu(v: temen_jit::FrozenVCpu) -> temen_interp::FrozenVCpu {
-    temen_interp::FrozenVCpu {
-        task: v.task,
-        parent_task: v.parent_task,
-        slot: v.slot,
-        joinable: v.joinable,
-        func: v.func,
-        args: v.args,
-        shadow_sp: v.shadow_sp,
-        completed_result: v.completed_result,
-    }
-}
-
-/// [`interp_vcpu`]'s inverse, for a JIT thaw.
-fn jit_vcpu(v: &temen_interp::FrozenVCpu) -> temen_jit::FrozenVCpu {
-    temen_jit::FrozenVCpu {
-        task: v.task,
-        parent_task: v.parent_task,
-        slot: v.slot,
-        joinable: v.joinable,
-        func: v.func,
-        args: v.args.clone(),
-        shadow_sp: v.shadow_sp,
-        completed_result: v.completed_result,
-    }
-}
-
-/// A JIT fiber's freeze residue, as the interpreter records it.
-fn interp_fiber(f: temen_jit::FrozenFiber) -> temen_interp::FrozenFiber {
-    temen_interp::FrozenFiber {
-        slot: f.slot,
-        func: f.func,
-        arg0: f.arg0,
-        shadow_sp: f.shadow_sp,
-        generation: f.generation,
-        consumed: f.consumed,
-    }
-}
-
-/// [`interp_fiber`]'s inverse, for a JIT thaw.
-fn jit_fiber(f: &temen_interp::FrozenFiber) -> temen_jit::FrozenFiber {
-    temen_jit::FrozenFiber {
-        slot: f.slot,
-        func: f.func,
-        arg0: f.arg0,
-        shadow_sp: f.shadow_sp,
-        generation: f.generation,
-        consumed: f.consumed,
-    }
-}
-
 /// The freeze residue of a durable [`jit_cap_run`], handed to the embedder on the `Host` exactly where
 /// the interp's freeze driver leaves it, so one `temen_snapshot::freeze(module, window, host)` serves
 /// both engines. The whole residue, not just the fibers (#1690).
-fn jit_durable_leave(cm: &mut CompiledModule, host: &mut Host) {
-    jit_detached_leave(cm, host);
-    leave_residue(host, cm.take_durable_residue());
+fn jit_durable_leave(
+    cm: &mut CompiledModule,
+    m: &Module,
+    host: &mut Host,
+) -> Result<(), temen_jit::JitError> {
+    let completed = jit_detached_leave(cm, host);
+    if leave_residue(host, m, cm.take_durable_residue(), completed) {
+        Ok(())
+    } else {
+        Err(temen_jit::JitError::Unsupported(
+            "durable JIT freeze: a residue the thaw pass refuses",
+        ))
+    }
 }
 
 /// A JIT freeze's residue onto `host`, where the interpreter's freeze leaves it: a run root's, or a
-/// captured detached child's on its powerbox (#2010, #2031). [`take_residue`]'s inverse.
-fn leave_residue(host: &mut Host, r: temen_jit::DurableResidue) {
-    if !r.children.is_empty() {
-        host.set_child_generations(r.children);
-    }
-    if !r.fibers.is_empty() {
-        host.set_frozen_fibers(r.fibers.into_iter().map(interp_fiber).collect());
-    }
-    if !r.vcpus.is_empty() {
-        host.set_frozen_vcpus(r.vcpus.into_iter().map(interp_vcpu).collect());
-    }
-    if let Some(sp) = r.root_sp {
-        host.set_frozen_root_sp(sp);
+/// captured detached child's on its powerbox (#2010, #2031), with the children it left completed and
+/// unjoined. Admitted by the thaw pass against `m`, the program it ran, as every residue that reaches a
+/// powerbox from outside it is (#3034): `false` if the pass refuses it, which no run's freeze makes.
+/// [`jit_thaw`]'s inverse.
+fn leave_residue(
+    host: &mut Host,
+    m: &Module,
+    r: temen_jit::DurableResidue,
+    completed: Vec<temen_interp::FrozenDetached>,
+) -> bool {
+    let raw = temen_interp::Residue {
+        detached: completed,
+        ..r.into_raw()
+    };
+    match temen_ir::thaw::validate(m, 0, raw) {
+        Ok(thaw) => {
+            host.set_thaw(thaw);
+            true
+        }
+        Err(_) => {
+            debug_assert!(false, "a JIT freeze left a residue the thaw pass refuses");
+            false
+        }
     }
 }
 

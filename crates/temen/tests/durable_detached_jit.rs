@@ -262,7 +262,8 @@ fn a_live_detached_child_freezes_and_thaws_on_the_jit_through_the_codec() {
     let (mut granted, twin) = restore();
     let mut bare = Host::new();
     bare.set_durable(true);
-    bare.set_thawed_detached(granted.take_thawed_detached());
+    bare.admit_thaw(&parent, granted.take_residue())
+        .expect("a residue a run made");
     let refused = temen_run::jit_cap_run(
         &parent,
         0,
@@ -279,7 +280,9 @@ fn a_live_detached_child_freezes_and_thaws_on_the_jit_through_the_codec() {
         refused.as_ref().map(|(o, _)| o)
     );
     assert_eq!(bare.thawed_detached().len(), 1, "and keeps the residue");
-    granted.set_thawed_detached(bare.take_thawed_detached());
+    granted
+        .admit_thaw(&parent, bare.take_residue())
+        .expect("a residue a run made");
 
     // Thaw on the JIT: the child re-launches at its slot and the join delivers the total.
     let (mut thost, twin) = (granted, twin);
@@ -1207,7 +1210,8 @@ fn a_thaw_that_drops_a_child_hands_back_its_subtree() {
     );
     let mut bare = Host::new();
     bare.set_durable(true);
-    bare.set_thawed_detached(granted.take_thawed_detached());
+    bare.admit_thaw(&root, granted.take_residue())
+        .expect("a residue a run made");
     // The thaw on the bare host ends as it may: its root holds none of its own capabilities.
     let _ = nest_run(Engine::Interp, &root, &args, &twin, &mut bare, None);
     assert_eq!(

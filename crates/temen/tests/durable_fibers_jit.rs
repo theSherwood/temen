@@ -302,19 +302,15 @@ fn jit_and_interp_freeze_a_fiber_to_an_identical_artifact() {
     );
     // Re-state the JIT's residue (as interp `FrozenFiber`) on a host and serialize identically.
     let mut jhost2 = Host::new();
-    jhost2.set_frozen_fibers(
-        residue
-            .iter()
-            .map(|f| InterpFrozen {
-                slot: f.slot,
-                func: f.func,
-                arg0: f.arg0,
-                shadow_sp: f.shadow_sp,
-                generation: f.generation,
-                consumed: f.consumed,
-            })
-            .collect(),
-    );
+    jhost2
+        .admit_thaw(
+            &inst,
+            temen_interp::Residue {
+                fibers: residue.to_vec(),
+                ..Default::default()
+            },
+        )
+        .expect("a residue a run made");
     let artifact_j = freeze(&inst, &jsnap, &jhost2).expect("JIT artifact");
 
     assert_eq!(
@@ -376,10 +372,13 @@ fn interp_frozen_fiber_artifact_thaws_on_the_jit() {
         temen_run::cap_thunk,
         &mut jhost as *mut Host as *mut c_void,
         DurableRun {
-            seed: DurableResidue {
-                fibers: seed.to_vec(),
-                ..Default::default()
-            },
+            seed: jit_thaw(
+                &inst,
+                temen_ir::thaw::RawResidue {
+                    fibers: seed.to_vec(),
+                    ..Default::default()
+                },
+            ),
             ..Default::default()
         },
     )
@@ -476,10 +475,13 @@ fn interp_frozen_active_chain_fiber_thaws_on_the_jit() {
         temen_run::cap_thunk,
         &mut jhost as *mut Host as *mut c_void,
         DurableRun {
-            seed: DurableResidue {
-                fibers: seed.to_vec(),
-                ..Default::default()
-            },
+            seed: jit_thaw(
+                &inst,
+                temen_ir::thaw::RawResidue {
+                    fibers: seed.to_vec(),
+                    ..Default::default()
+                },
+            ),
             ..Default::default()
         },
     )
@@ -630,10 +632,13 @@ fn jit_and_interp_freeze_a_recycled_fiber_identically_and_thaw_on_the_jit() {
         temen_run::cap_thunk,
         &mut jhost2 as *mut Host as *mut c_void,
         DurableRun {
-            seed: DurableResidue {
-                fibers: seed.to_vec(),
-                ..Default::default()
-            },
+            seed: jit_thaw(
+                &inst,
+                temen_ir::thaw::RawResidue {
+                    fibers: seed.to_vec(),
+                    ..Default::default()
+                },
+            ),
             ..Default::default()
         },
     )
@@ -693,10 +698,13 @@ fn a_consumed_park_frozen_mid_delivery_redelivers_on_the_jit() {
             temen_run::cap_thunk,
             &mut jhost as *mut Host as *mut c_void,
             DurableRun {
-                seed: DurableResidue {
-                    fibers: seed.to_vec(),
-                    ..Default::default()
-                },
+                seed: jit_thaw(
+                    &inst,
+                    temen_ir::thaw::RawResidue {
+                        fibers: seed.to_vec(),
+                        ..Default::default()
+                    },
+                ),
                 ..Default::default()
             },
         )
@@ -842,82 +850,6 @@ fn jit_durable_fiber_past_the_arena_faults_like_the_oracle() {
     assert_eq!(created(&jsnap), 10, "the JIT ran the same ten fibers");
 }
 
-/// [`FIBER_SRC`] with its second resume naming handle 10, a fiber it never made.
-fn past_src() -> String {
-    FIBER_SRC.replace(
-        " v7, v8 = cont.resume v2 v6\n",
-        " vten = i64.const 10\n v7, v8 = cont.resume vten v6\n",
-    )
-}
-
-/// #2878 — a thaw residue is untrusted (DURABILITY.md §4), so a seed is bounded by the arena as
-/// `cont.new` is: an interp-frozen one-fiber artifact whose residue is padded to eleven fibers, one
-/// more than `TEST_ARENA`'s ten fiber contexts hold. Both engines seed the ten that fit and stop at
-/// the eleventh (slot 10, context 11). The root's second resume names handle 10 ([`past_src`]):
-/// unseeded, it is no fiber, so both engines trap `FiberFault`, as the uninterrupted run does.
-/// Before, the JIT seeded slot 10 and its resume wrote the context's words past the arena.
-#[test]
-fn a_thaw_seed_past_the_arena_is_not_seeded_on_either_engine() {
-    let m = parse_module(&past_src()).expect("parse");
-    let inst = transform_module(&m).expect("transform");
-    verify_module(&inst).expect("verify");
-    let mut ihost = Host::new();
-    ihost.set_durable(true);
-    let mut iwin = init_durable_window(WINDOW, TEST_ARENA);
-    write_state(&mut iwin, TEST_ARENA, STATE_UNWINDING);
-    let mut ifuel = 1_000_000u64;
-    let (ires, isnap) =
-        run_capture_reserved_with_host(&inst, 0, &[], &mut ifuel, &iwin, WINDOW_LOG2, &mut ihost);
-    assert!(ires.is_ok());
-    let artifact = freeze(&inst, &isnap, &ihost).expect("freeze");
-    let mut thost = Host::new();
-    let mut thaw_win = restore(&artifact, &inst, &mut thost).expect("restore");
-    begin_thaw(&mut thaw_win, TEST_ARENA, 0);
-    let real = thost.frozen_fibers().to_vec();
-    assert_eq!(real.len(), 1, "the artifact carried one frozen fiber");
-    let padded: Vec<InterpFrozen> = (0..11)
-        .map(|slot| InterpFrozen { slot, ..real[0] })
-        .collect();
-    assert_eq!(TEST_ARENA.ctx_ceiling(), 10, "contexts 1..=10 hold fibers");
-
-    let mut jhost = Host::new();
-    let (jout, _win, DurableResidue { .. }) = compile_and_run_durable(
-        &inst,
-        0,
-        &[],
-        &thaw_win,
-        WINDOW_LOG2,
-        temen_run::cap_thunk,
-        &mut jhost as *mut Host as *mut c_void,
-        DurableRun {
-            seed: DurableResidue {
-                fibers: jit_seed(&padded),
-                ..Default::default()
-            },
-            ..Default::default()
-        },
-    )
-    .expect("JIT thaw");
-    assert!(
-        matches!(jout, JitOutcome::Trapped(temen_jit::TrapKind::FiberFault)),
-        "JIT thaw: {jout:?}"
-    );
-
-    thost.set_durable(true);
-    thost.set_frozen_fibers(padded);
-    let mut tfuel = 1_000_000u64;
-    let (tres, _) = run_capture_reserved_with_host(
-        &inst,
-        0,
-        &[],
-        &mut tfuel,
-        &thaw_win,
-        WINDOW_LOG2,
-        &mut thost,
-    );
-    assert_eq!(tres, Err(temen_interp::Trap::FiberFault), "oracle thaw");
-}
-
 /// #3020 — `func 0 (mode, h)`: mode 0 makes a fiber, resumes it once (it suspends with 42) and
 /// answers its handle, leaving it suspended; mode 1 resumes `h` with 7 (a fiber would return 107).
 const LEAVES_A_FIBER: &str = "memory 17 shadow 16448 65536\n\
@@ -1003,7 +935,8 @@ fn a_reused_compile_freezes_a_fiber_thaws_it_and_a_later_run_cannot_reach_it() {
     // Run 1: frozen from its start, the fiber parked.
     let mut win = init_durable_window(WINDOW, TEST_ARENA);
     write_state(&mut win, TEST_ARENA, STATE_UNWINDING);
-    cm.set_durable(DurableResidue::default());
+    cm.set_durable(temen_jit::JitThaw::default())
+        .expect("no residue");
     let (out, snap) = cm.run(&[0, 0], Some(&win), Some(WINDOW)).expect("freeze");
     assert!(matches!(out, JitOutcome::Returned(_)), "run 1: {out:?}");
     let residue = cm.take_durable_residue();
@@ -1012,7 +945,8 @@ fn a_reused_compile_freezes_a_fiber_thaws_it_and_a_later_run_cannot_reach_it() {
     // Run 2: the thaw, on the same compile, answers the uninterrupted run's handle.
     let mut twin = snap;
     begin_thaw(&mut twin, TEST_ARENA, 0);
-    cm.set_durable(residue);
+    cm.set_durable(jit_thaw(&inst, residue.into_raw()))
+        .expect("a residue a run made");
     let (out, _) = cm.run(&[0, 0], Some(&twin), Some(WINDOW)).expect("thaw");
     assert_eq!(
         out,
@@ -1021,7 +955,8 @@ fn a_reused_compile_freezes_a_fiber_thaws_it_and_a_later_run_cannot_reach_it() {
     );
 
     // Run 3: the fiber the thaw left suspended is not this run's.
-    cm.set_durable(DurableResidue::default());
+    cm.set_durable(temen_jit::JitThaw::default())
+        .expect("no residue");
     let fresh = init_durable_window(WINDOW, TEST_ARENA);
     let (out, _) = cm
         .run(&[1, handle], Some(&fresh), Some(WINDOW))
@@ -1065,12 +1000,14 @@ fn a_reused_compile_s_later_run_hands_back_no_earlier_freeze_s_residue() {
     // Run 1: frozen from its start, the fiber parked; nobody takes its residue.
     let mut win = init_durable_window(WINDOW, TEST_ARENA);
     write_state(&mut win, TEST_ARENA, STATE_UNWINDING);
-    cm.set_durable(DurableResidue::default());
+    cm.set_durable(temen_jit::JitThaw::default())
+        .expect("no residue");
     let (out, _) = cm.run(&[0, 0], Some(&win), Some(WINDOW)).expect("freeze");
     assert!(matches!(out, JitOutcome::Returned(_)), "run 1: {out:?}");
 
     // Run 2: uninterrupted.
-    cm.set_durable(DurableResidue::default());
+    cm.set_durable(temen_jit::JitThaw::default())
+        .expect("no residue");
     let fresh = init_durable_window(WINDOW, TEST_ARENA);
     let (out, _) = cm.run(&[0, 0], Some(&fresh), Some(WINDOW)).expect("run 2");
     assert!(matches!(out, JitOutcome::Returned(_)), "run 2: {out:?}");
@@ -1080,4 +1017,12 @@ fn a_reused_compile_s_later_run_hands_back_no_earlier_freeze_s_residue() {
         "run 2 handed back run 1's freeze residue"
     );
     assert!(cm.take_detached_harvest().is_empty());
+}
+
+/// #3034 — a JIT thaw seed: `raw`, admitted against `m` by the one thaw pass.
+fn jit_thaw(
+    m: &temen_ir::Module,
+    raw: temen_ir::thaw::RawResidue<temen_jit::JitDetached, ()>,
+) -> temen_jit::JitThaw {
+    temen_ir::thaw::validate(m, 0, raw).expect("a residue a run made")
 }

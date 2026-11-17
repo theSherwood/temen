@@ -2808,18 +2808,8 @@ fn drive_arc_shared(
 struct ThawResidue {
     /// The id this domain's root had in the frozen run (`0` for the run's root).
     task: TaskId,
-    root_sp: Option<u64>,
-    fibers: Vec<FrozenFiber>,
-    vcpus: Vec<FrozenVCpu>,
-    detached: Vec<FrozenDetached>,
-    /// #1361 step 4 — live detached children, each a domain with its own window and residue.
-    live_detached: Vec<ThawedDetached>,
-    /// #1688 — the live twins this domain forked, each a domain of its own.
-    twins: Vec<ThawedTwin>,
-    /// #2571 — its servicer twins that exited unreaped.
-    exited_twins: Vec<FrozenTwin>,
-    /// #2043 — its child table's counters ([`Host::child_generations`]).
-    children: Vec<u32>,
+    /// Its residue, as the powerbox held it ([`Host::set_thaw`]).
+    residue: Residue,
 }
 
 impl ThawResidue {
@@ -2828,14 +2818,7 @@ impl ThawResidue {
     fn take(host: &mut Host, task: TaskId) -> Self {
         ThawResidue {
             task,
-            root_sp: host.frozen_root_sp.take(),
-            fibers: std::mem::take(&mut host.frozen_fibers),
-            vcpus: std::mem::take(&mut host.frozen_vcpus),
-            detached: std::mem::take(&mut host.frozen_detached),
-            live_detached: std::mem::take(&mut host.thawed_detached),
-            twins: std::mem::take(&mut host.thawed_twins),
-            exited_twins: std::mem::take(&mut host.frozen_twins),
-            children: std::mem::take(&mut host.frozen_children),
+            residue: host.take_residue(),
         }
     }
 
@@ -2843,24 +2826,18 @@ impl ThawResidue {
     /// exited, and those of its twins and detached children, whose residue is still on their
     /// restored powerboxes.
     fn twin_pids(&self) -> BTreeSet<TaskId> {
-        fn of(host: &Host, out: &mut BTreeSet<TaskId>) {
-            out.extend(host.frozen_twins.iter().map(|t| t.pid as TaskId));
-            for t in &host.thawed_twins {
+        fn of(r: &Residue, out: &mut BTreeSet<TaskId>) {
+            out.extend(r.exited_twins.iter().map(|t| t.pid as TaskId));
+            for t in &r.twins {
                 out.insert(t.pid as TaskId);
-                of(&t.host, out);
+                of(&t.payload.host.residue, out);
             }
-            for d in &host.thawed_detached {
-                of(&d.host, out);
+            for d in &r.live_detached {
+                of(&d.payload.host.residue, out);
             }
         }
-        let mut out: BTreeSet<TaskId> = self.exited_twins.iter().map(|t| t.pid as TaskId).collect();
-        for t in &self.twins {
-            out.insert(t.pid as TaskId);
-            of(&t.host, &mut out);
-        }
-        for d in &self.live_detached {
-            of(&d.host, &mut out);
-        }
+        let mut out = BTreeSet::new();
+        of(&self.residue, &mut out);
         out
     }
 }
@@ -2923,16 +2900,20 @@ fn seed_domain(s: &mut Sched, sched: &Arc<Scheduler>, mut root: Box<VCpu>, resid
     // Every vCPU the thaw re-creates below the root, by thaw id, so any record can attach to any of
     // them. Enqueued together at the end, ascending id = parents first.
     let mut children: BTreeMap<TaskId, Box<VCpu>> = BTreeMap::new();
+    // Every part of the residue, by name: one this engine does not consume does not compile.
     let ThawResidue {
         task: _,
-        root_sp: thaw_root_sp,
-        fibers: thaw_fibers,
-        vcpus: thaw_vcpus,
-        detached: thaw_detached,
-        live_detached: thaw_live_detached,
-        twins: thaw_twins,
-        exited_twins: thaw_exited_twins,
-        children: thaw_children,
+        residue:
+            Residue {
+                fibers: thaw_fibers,
+                vcpus: thaw_vcpus,
+                root_sp: thaw_root_sp,
+                children: thaw_children,
+                detached: thaw_detached,
+                live_detached: thaw_live_detached,
+                twins: thaw_twins,
+                exited_twins: thaw_exited_twins,
+            },
     } = residue;
     // #2043 — the domain's child table, as the freeze left it: every slot's counter, before the
     // children below are re-filed at their slots.
@@ -2966,12 +2947,12 @@ fn seed_domain(s: &mut Sched, sched: &Arc<Scheduler>, mut root: Box<VCpu>, resid
         let mut seed: Vec<FrozenFiber> = thaw_fibers;
         seed.sort_by_key(|f| f.slot);
         for (expected, ff) in seed.into_iter().enumerate() {
-            // #2878 — the residue is untrusted (DURABILITY.md §4): a slot whose context would lie
-            // past the arena is not seeded, as `cont.new` refuses one ([`ShadowContexts::fiber_fits`]),
-            // and the rewound `cont.resume` that names it fails closed.
-            if !root.domain.registry.seed_fits(arena) {
-                break;
-            }
+            // #3034 — the thaw pass admitted each slot's context as one `cont.new` hands out
+            // ([`ShadowContexts::fiber_fits`]).
+            debug_assert!(
+                root.domain.registry.seed_fits(arena),
+                "the thaw pass admits only a fiber slot inside the arena"
+            );
             let got = if ff.is_free() {
                 root.domain.registry.seed_free(ff.generation)
             } else {
@@ -3021,7 +3002,7 @@ fn seed_domain(s: &mut Sched, sched: &Arc<Scheduler>, mut root: Box<VCpu>, resid
                 } else {
                     children.get_mut(&parent).map(|p| &mut **p)
                 };
-                let result = fd.completed_result.map(|x| vec![Value::I64(x)]);
+                let result = joined(fd.completed_result);
                 match spawner {
                     Some(p) => deliver_detached(s, p, fd.slot, result),
                     None => {
@@ -3037,7 +3018,7 @@ fn seed_domain(s: &mut Sched, sched: &Arc<Scheduler>, mut root: Box<VCpu>, resid
         // rewound `thread.join` (op 17 is a `call.cap` checkpoint: its slot handle reloads, the spawn
         // is not re-issued) parks on the child exactly as before the cut.
         let mut lseed = thaw_live_detached;
-        lseed.sort_by(|a, b| a.parent_task.cmp(&b.parent_task).then(a.slot.cmp(&b.slot)));
+        lseed.sort_by_key(|l| (l.parent_task, l.slot));
         for td in lseed {
             let spawner: &mut VCpu = match live(&live_ids, td.parent_task) {
                 Some(p) if p == id => &mut root,
@@ -3059,7 +3040,7 @@ fn seed_domain(s: &mut Sched, sched: &Arc<Scheduler>, mut root: Box<VCpu>, resid
         // #2571 — and the servicer twins it forked that exited unreaped, filed again under their
         // pids for its `wait` to reap.
         for ft in thaw_exited_twins {
-            let result = ft.outcome.map(|x| vec![Value::I64(x)]);
+            let result = joined(ft.outcome);
             file_exited_twin(s, ft.pid as TaskId, root.domain.id, result);
         }
         // §13.4 slice 4d, #1681: this domain's restored `LiveImpl` handles wait for the whole tree,
@@ -3167,16 +3148,24 @@ fn seed_thread(
         }
     };
     let cid = claim_task(s, ff.task);
-    // #2878 — the residue is untrusted (DURABILITY.md §4): a thread whose join slot, context or entry
-    // no spawn could have made ends `ThreadFault` without running, as one the pools refuse does. The
-    // entry is a function of the spawn signature; the context one a vCPU may hold.
+    // #3034 — the thaw pass admitted every record ([`temen_ir::thaw::validate`]): its join slot, its
+    // context and its entry are ones a spawn makes. The slot and the context keep their refusal
+    // (`ThreadFault`) as a backstop, since `Table::pin` panics past the table and no context can
+    // stand in for a missing one; a hole in the pass is loud in debug.
     let slot_ok = !ff.joinable || ff.slot < temen_ir::handles::SLOTS;
-    let entry_ok = usize::try_from(ff.func)
-        .ok()
-        .and_then(|f| p.domain.funcs.get(f))
-        .is_some_and(|f| f.params == [ValType::I64, ValType::I64] && f.results == [ValType::I64]);
-    let ctx = ShadowContexts::vcpu_of_sp(p.arena(), ff.shadow_sp).filter(|_| entry_ok);
+    debug_assert!(
+        ff.completed_result.is_some()
+            || usize::try_from(ff.func)
+                .ok()
+                .and_then(|f| p.domain.funcs.get(f))
+                .is_some_and(
+                    |f| f.params == [ValType::I64, ValType::I64] && f.results == [ValType::I64]
+                ),
+        "the thaw pass admits only a spawn entry"
+    );
+    let ctx = ShadowContexts::vcpu_of_sp(p.arena(), ff.shadow_sp);
     if !slot_ok {
+        debug_assert!(false, "the thaw pass admits only a join slot of the table");
         s.results
             .insert(cid, Outcome::ended(Err(Trap::ThreadFault)));
         return;
@@ -3197,6 +3186,7 @@ fn seed_thread(
         return;
     }
     let Some(ctx) = ctx else {
+        debug_assert!(false, "the thaw pass admits only a vCPU's context");
         s.results
             .insert(cid, Outcome::ended(Err(Trap::ThreadFault)));
         return;
@@ -3245,14 +3235,19 @@ fn seed_thread(
 /// parent's program. When it cannot be (the process's pools have no room for it, or its pages name
 /// a region its powerbox does not hold), it ends with `ThreadFault`, which its parent's `wait` reaps
 /// as a crash.
-fn relaunch_twin(s: &mut Sched, sched: &Arc<Scheduler>, parent: &VCpu, tt: ThawedTwin) {
+fn relaunch_twin(s: &mut Sched, sched: &Arc<Scheduler>, parent: &VCpu, tt: LiveTwin) {
     let (funcs, types) = (&parent.domain.funcs, &parent.domain.types);
-    let ThawedTwin {
+    let launch = twin_launch(&tt);
+    let LiveTwin {
         pid,
-        window,
-        reserved_log2,
-        mut host,
-        launch,
+        payload:
+            ThawedTwin {
+                window,
+                reserved_log2,
+                mut host,
+                ..
+            },
+        ..
     } = tt;
     let pid = pid as TaskId;
     let residue = ThawResidue::take(&mut host, pid);
@@ -3386,18 +3381,17 @@ fn thaw_window(spec: WindowSpec, image: &MemLayout, host: &mut Host, ctx: usize)
 /// dropped with what the freeze kept charged for it and for its own captured children
 /// ([`Host::drop_restored`]), and one its spawner can join ends with `ThreadFault`, which the
 /// spawner's rewound join answers. #2465 — one its spawner detached just ends.
-fn relaunch_detached(
-    s: &mut Sched,
-    sched: &Arc<Scheduler>,
-    spawner: &mut VCpu,
-    td: ThawedDetached,
-) {
-    let ThawedDetached {
+fn relaunch_detached(s: &mut Sched, sched: &Arc<Scheduler>, spawner: &mut VCpu, td: LiveDetached) {
+    let launch = detached_launch(&td);
+    let LiveDetached {
         slot,
-        window,
-        reserved_log2,
-        mut host,
-        launch,
+        payload:
+            ThawedDetached {
+                window,
+                reserved_log2,
+                mut host,
+                ..
+            },
         ..
     } = td;
     let task = launch.task as TaskId;
@@ -3852,7 +3846,8 @@ fn drive_over_cell(
                         if p.joinable {
                             owner
                                 .lock_unpoisoned()
-                                .frozen_detached
+                                .residue
+                                .detached
                                 .push(FrozenDetached {
                                     parent_task: p.parent_task,
                                     slot: p.slot,
@@ -3943,7 +3938,7 @@ fn drive_over_cell(
             let mut h = owner.lock_unpoisoned();
             h.set_captured_detached(captured);
             h.captured_twins = captured_twins;
-            h.frozen_twins = exited_twins;
+            h.residue.exited_twins = exited_twins;
         }
         // A twin whose parent did not ride is lost with it.
         unreached_twins.extend(twins.into_keys());
@@ -3961,7 +3956,8 @@ fn drive_over_cell(
         if froze {
             host_shared
                 .lock_unpoisoned()
-                .frozen_fibers
+                .residue
+                .fibers
                 .extend(registry.unflattened_for_freeze(arena));
         }
         // #1685 — a thread that finished and was never joined rides the freeze as completed
@@ -3972,7 +3968,7 @@ fn drive_over_cell(
                 else {
                     continue;
                 };
-                f.sink.lock_unpoisoned().frozen_vcpus.push(FrozenVCpu {
+                f.sink.lock_unpoisoned().residue.vcpus.push(FrozenVCpu {
                     task: task as usize,
                     parent_task: f.parent_task as usize,
                     slot: f.slot,
@@ -10299,7 +10295,7 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                         if let Some(o) = finished.then(|| v.sched.take_result(cid)).flatten() {
                             // One no one can join leaves nothing a thaw needs (#2465).
                             if let Some(slot) = slot {
-                                v.domain.host.lock_unpoisoned().frozen_detached.push(
+                                v.domain.host.lock_unpoisoned().residue.detached.push(
                                     FrozenDetached {
                                         parent_task: v.id as usize,
                                         slot,
@@ -10363,7 +10359,8 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                         v.domain
                             .host
                             .lock_unpoisoned()
-                            .frozen_vcpus
+                            .residue
+                            .vcpus
                             .push(FrozenVCpu {
                                 task: v.id as usize,
                                 parent_task: v.parent_task as usize,
@@ -10377,19 +10374,24 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                     } else {
                         // The root: record its extent (the shared active-SP word will be overwritten by a
                         // later child, so the root's residue can't ride the window).
-                        v.domain.host.lock_unpoisoned().frozen_root_sp = Some(self_sp);
+                        v.domain.host.lock_unpoisoned().residue.root_sp = Some(self_sp);
                     }
                     // #2043 — its domain's child counters, as they stand now: the last vCPU of the
                     // domain to unwind writes the cut's, since nothing changes the table after it.
                     let generations = v.domain.children.lock_unpoisoned().table.generations();
-                    v.domain.host.lock_unpoisoned().frozen_children = generations;
+                    v.domain.host.lock_unpoisoned().residue.children = generations;
                     let r = v.freeze_drive().and(result);
                     // Hand this vCPU's flattened fibers back to the embedder via the shared host. **Extend**
                     // (not assign): every vCPU contributes its own, and the snapshot's canonical sort-by-slot
                     // makes the accumulation order irrelevant to the artifact.
                     if !v.frozen.is_empty() {
                         let frozen = std::mem::take(&mut v.frozen);
-                        v.domain.host.lock_unpoisoned().frozen_fibers.extend(frozen);
+                        v.domain
+                            .host
+                            .lock_unpoisoned()
+                            .residue
+                            .fibers
+                            .extend(frozen);
                     }
                     r
                 } else {
@@ -12320,131 +12322,24 @@ fn shadow_switch(
 /// frames (while it is resuming a fiber) live in `VCpu::root_parked`.
 const ROOT_FIBER: usize = usize::MAX;
 
-/// A fiber **flattened for freeze** (DURABILITY.md §12.8 slice 3.1.4–5), as the snapshot carries it
-/// (the eventual §12.4 Section-2 per-fiber record). Its continuation is bytes in its in-window
-/// shadow region `[shadow_region_base(slot+1), shadow_sp)`; this is the small host-side residue:
-/// where it sits and how to re-enter it on thaw. Re-entry recreates it as a `Pending` fiber so a
-/// thaw `cont.resume` runs its entry under `REWINDING`, rebuilding then re-parking it.
-///
-/// Every slot of the fiber table rides (#1684), so a thaw rebuilds the table slot for slot: a
-/// **fresh** fiber (never resumed) is a record whose extent is its empty frame base — the resume that
-/// thaws it starts it from its entry — and a **free** slot is [`FrozenFiber::free`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct FrozenFiber {
-    /// Registry slot = the guest fiber handle (so re-seeding preserves handle values).
-    pub slot: usize,
-    /// The fiber's entry funcref (== func index; `ref.func`/the identity table), re-entered on thaw.
-    pub func: i32,
-    /// The entry's first argument, `cont.new`'s `arg0`. Inert for rewind (the prologue dispatches
-    /// to the resume arm, ignoring params) but recorded for fidelity / forward use.
-    pub arg0: i64,
-    /// Window offset of the flattened shadow-SP — the extent of its frozen continuation, restored
-    /// into the registry's `shadow` table so the swap re-points to it when the fiber is resumed.
-    /// `0` for a free slot: no shadow region lies at offset 0.
-    pub shadow_sp: u64,
-    /// The slot's **generation** at freeze (recycling step 2): re-seeded on thaw so a guest handle to a
-    /// *recycled* (generation > 0) fiber still resolves (`(generation << 24) | slot`). 0 for a
-    /// non-recycled fiber — then the handle is exactly its slot. 32-bit field (the `i64` handle's
-    /// generation bits, with the top byte reserved for a guest tag — DESIGN.md §3c); serialized as
-    /// `uleb(u64)` (snapshot format v3 — see `FORMAT_VERSION`).
-    pub generation: u64,
-    /// #1538 — the fiber's last `suspend` value was already **consumed**: its resumer took the value
-    /// and ran on (the park happened under `NORMAL`, or the fiber was re-claimed under `UNWINDING`,
-    /// which unwinds it at that park with the delivered argument dropped). A thaw claim of such a
-    /// fiber must *deliver* the claim's argument at the re-executed `suspend` (the fiber runs on),
-    /// not re-park it (which would hand the resumer the stale value a second time). `false` — the
-    /// park is **fresh**: the resumer's in-flight `cont.resume` has yet to observe it, so the thaw
-    /// re-issue re-parks and re-delivers `(SUSPENDED, value)`. Snapshot format v24.
-    pub consumed: bool,
-}
-
-impl FrozenFiber {
-    /// #1684 — a free slot (its fiber finished): only its generation rides.
-    pub fn free(slot: usize, generation: u64) -> FrozenFiber {
-        FrozenFiber {
-            slot,
-            func: 0,
-            arg0: 0,
-            shadow_sp: 0,
-            generation,
-            consumed: false,
-        }
-    }
-
-    /// Whether this is a [`FrozenFiber::free`] slot.
-    pub fn is_free(&self) -> bool {
-        self.shadow_sp == 0
-    }
-}
-
-/// A **spawned vCPU** (a `thread.spawn` child) flattened for freeze (DURABILITY.md §12.8 slice 3.2.1).
-/// Like [`FrozenFiber`] but for a whole green thread rather than a fiber: under a multi-vCPU freeze the
-/// child unwinds its own native stack into *its* per-context shadow region (`context = task id`), and
-/// this is the host-side residue needed to reconstruct it on thaw. The **root** vCPU needs no residue —
-/// its entry/args are supplied by the thaw caller (it is re-entered directly, like the single-vCPU
-/// case). On thaw the child is re-attached by the runtime: the root's rewind re-executes `thread.spawn`
-/// (not a transform checkpoint), and under `REWINDING` that op re-spawns the next frozen child from this
-/// residue — in deterministic spawn order — instead of creating a fresh one (a reload-not-reissue done
-/// in the runtime, so `temen-durable` is unchanged).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct FrozenVCpu {
-    /// The child's task id at freeze — globally unique + monotonic in spawn order across the whole vCPU
-    /// tree. Preserved on thaw so the §12.6 canonical re-freeze records the same task.
-    pub task: usize,
-    /// The task id of the vCPU that **spawned** this child (slice 3.4: nested spawns). The root's direct
-    /// children carry the root's id (`0`); a grandchild carries its parent child's task. Thaw groups the
-    /// residue by this, re-attaches parents before children, and rebuilds each parent's join table so a
-    /// grandchild's reloaded handle resolves in its *parent's* table, not the root's.
-    pub parent_task: usize,
-    /// The child's slot in its domain's child table (#1685, #2043). The thaw re-attaches it there,
-    /// not by push, so a handle joined before the freeze leaves its slot spent instead of shifting
-    /// the rest. `0` for one no handle names ([`Self::joinable`]).
-    pub slot: usize,
-    /// #2043 — whether a handle still names it. A thread its spawner detached (op 10) is not
-    /// joinable: its slot may since have been reissued, so it rides at slot `0`, and the thaw
-    /// re-creates it with no handle naming it. One that finished after the detach does not ride at
-    /// all: nothing can join it.
-    pub joinable: bool,
-    /// The child's entry function (the `thread.spawn` target), re-entered on thaw.
-    pub func: i32,
-    /// The child's spawn args (`thread.spawn`'s `[arg0, arg1]`), replayed on re-spawn.
-    pub args: Vec<i64>,
-    /// Window offset of the child's flattened shadow-SP — the extent of its frozen continuation in its
-    /// region; restored as the child's shadow-SP so its thaw re-entry rewinds from the right point.
-    pub shadow_sp: u64,
-    /// §12.8 4A.5 follow-up A: `Some(result)` for a **completed-but-unjoined** child — one that
-    /// finished before or during the freeze and was never joined (#1685). The thaw delivers the result
-    /// into the spawner's join table without re-running the child; `func`, `args` and `shadow_sp` are
-    /// then inert (`0`, empty, `0`). `None` for a normal frozen child (re-spawned + rewound).
-    pub completed_result: Option<i64>,
-}
-
-/// #1361 step 2 — a **completed-but-unjoined detached §14 child** captured at a subtree freeze. A
-/// detached child owns a *separate* window (it holds a `child_hosts` entry); a **live** one is rung
-/// and harvested (steps 3–4). A **completed** one has nothing to unwind — only its `thread.join`
-/// result crosses the boundary (reload-not-reissue). On thaw the runtime posts the result into the scheduler and maps it to the
-/// recording parent's join `slot`, so the parent's re-executed `thread.join` delivers it without
-/// re-spawning the child: op 17 is a `call.cap` checkpoint, so the rewind reloads its spilled slot
-/// handle (the transform instruments every `call.cap`) rather than re-running the spawn.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct FrozenDetached {
-    /// The task that spawned this child (op 17): `0` for a direct child of the root; a deeper
-    /// parent carries its own task id, so the thaw rebuilds the join edge in the right table.
-    pub parent_task: usize,
-    /// The spawner's `threads`/join slot the child was minted at — where the reloaded handle resolves.
-    pub slot: usize,
-    /// The child's `thread.join` outcome: its value (an `i32` result is sign-extended at capture), or
-    /// the trap its `join` answers (#1674).
-    pub completed_result: Result<i64, Trap>,
-}
+pub use temen_ir::thaw::{FrozenDetached, FrozenFiber, FrozenTwin, FrozenVCpu};
 
 /// A finished child's `thread.join` outcome as a freeze records it: its first result as an `i64` (an
-/// `i32` sign-extended), or its trap.
-fn join_outcome(r: Result<Vec<Value>, Trap>) -> Result<i64, Trap> {
+/// `i32` sign-extended), or its trap's code.
+fn join_outcome(r: Result<Vec<Value>, Trap>) -> Result<i64, temen_ir::thaw::TrapCode> {
     r.map(|vals| match vals.first() {
         Some(Value::I64(x)) => *x,
         Some(Value::I32(x)) => *x as i64,
         _ => 0,
+    })
+    .map_err(Trap::code)
+}
+
+/// A recorded join outcome as the join answers it. The codec admits only codes a trap has.
+fn joined(r: Result<i64, temen_ir::thaw::TrapCode>) -> Result<Vec<Value>, Trap> {
+    r.map(|x| vec![Value::I64(x)]).map_err(|c| {
+        debug_assert!(Trap::from_code(c).is_some(), "an outcome no trap has: {c}");
+        Trap::from_code(c).unwrap_or(Trap::ThreadFault)
     })
 }
 
@@ -12551,22 +12446,57 @@ pub struct DetachedRelaunch {
 }
 
 /// #1361 step 4 — a captured detached child as a **thaw** receives it: its restored window and
-/// powerbox (its own residue already seeded on the powerbox, exactly as a restored root's is) plus the
-/// spawner-held [`DetachedLaunch`]. The run driver re-launches it under `REWINDING` and rebuilds its
-/// parent's join edge, doorbell and lane.
+/// powerbox (its own residue already seeded on the powerbox, exactly as a restored root's is) plus
+/// what the spawner held that the thaw pass does not check. It rides a [`LiveDetached`], whose keys
+/// (its spawner, join slot, task, lane) the pass admitted: [`detached_launch`] puts the two together.
 pub struct ThawedDetached {
-    /// The task that spawned this child in the frozen run — `0` for a direct child of the root.
-    pub parent_task: usize,
-    /// The spawner's join slot.
-    pub slot: usize,
     /// The child's restored window image.
     pub window: MemLayout,
     /// `log2` of the child's reservation.
     pub reserved_log2: u8,
     /// The child's restored powerbox.
     pub host: Host,
-    /// How to launch it.
-    pub launch: DetachedLaunch,
+    /// The §4 content digest of the module grant it runs.
+    pub digest: [u8; 32],
+    /// The names its spawner registered its grants under.
+    pub names: Vec<(String, i32)>,
+    /// #2438 — the spawner's pager export, if it is demand-paged.
+    pub pager: Option<u32>,
+}
+
+/// A live detached child of a thaw residue: the admitted keys and the restored domain.
+pub type LiveDetached = temen_ir::thaw::LiveDetached<ThawedDetached>;
+
+/// A live fork twin of a thaw residue: the admitted keys and the restored domain.
+pub type LiveTwin = temen_ir::thaw::LiveTwin<ThawedTwin>;
+
+/// The thaw residue a domain's powerbox holds at rest: what its last freeze left, or what a restore
+/// admitted ([`Host::set_thaw`]); taken by the next run.
+pub type Residue = temen_ir::thaw::RawResidue<ThawedDetached, ThawedTwin>;
+
+/// An admitted thaw residue for this crate's engines ([`temen_ir::thaw::validate`]).
+pub type Thaw = temen_ir::thaw::Thaw<ThawedDetached, ThawedTwin>;
+
+/// A live detached child's launch record: the keys the pass admitted, and what else its spawner held.
+pub fn detached_launch(l: &LiveDetached) -> DetachedLaunch {
+    DetachedLaunch {
+        task: l.task,
+        digest: l.payload.digest,
+        lane: l.lane,
+        names: l.payload.names.clone(),
+        pager: l.payload.pager,
+        joinable: l.joinable,
+    }
+}
+
+/// A live twin's launch record: the keys the pass admitted, and what else its parent held.
+pub fn twin_launch(t: &LiveTwin) -> TwinLaunch {
+    TwinLaunch {
+        entry: t.entry,
+        ctx: t.ctx,
+        servicer: t.payload.servicer,
+        names: t.payload.names.clone(),
+    }
 }
 
 /// #1688 — a **fork twin** a freeze carried: its unwound window and powerbox, for the codec to freeze
@@ -12600,28 +12530,17 @@ pub struct TwinLaunch {
     pub names: Vec<(String, i32)>,
 }
 
-/// #2571 — a servicer's **fork twin that exited** before a freeze, its outcome waiting for its
-/// parent's `wait`. A personality's twin that exits is the personality's zombie, which its own state
-/// carries; a servicer's waits in the core, so its outcome rides its parent's artifact, and the thaw
-/// files it again for the servicer's `wait` to reap. The exited half of [`CapturedTwin`], as
-/// [`FrozenDetached`] is of [`CapturedDetached`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct FrozenTwin {
-    /// Its pid, which the parent's `wait` names.
-    pub pid: u64,
-    /// How it ended: its first result as an `i64` (an `i32` sign-extended), or its trap. Its
-    /// `wait` status follows from it ([`reap_status`]).
-    pub outcome: Result<i64, Trap>,
-}
-
 /// #1688 — a carried twin as a thaw receives it: its restored window and powerbox (its own residue
-/// seeded on the powerbox, as a restored root's is) and its [`TwinLaunch`].
+/// seeded on the powerbox, as a restored root's is) and what of its [`TwinLaunch`] the thaw pass does
+/// not check. It rides a [`LiveTwin`] ([`twin_launch`]).
 pub struct ThawedTwin {
-    pub pid: u64,
     pub window: MemLayout,
     pub reserved_log2: u8,
     pub host: Host,
-    pub launch: TwinLaunch,
+    /// #2571 — a servicer's `clone_caller` forked it.
+    pub servicer: bool,
+    /// The names its caps were registered under.
+    pub names: Vec<(String, i32)>,
 }
 
 /// A §12 fiber as the run-shared registry holds it: a first-class suspendable computation whose
@@ -26761,20 +26680,11 @@ pub struct Host {
     /// DURABILITY.md §12.8). `false` (the default) ⇒ an ordinary run that never touches the
     /// durable reserve. Set with [`Host::set_durable`] before [`run_with_host`] / friends.
     durable: bool,
-    /// The freeze/thaw fiber residue (slice 3.1.5): **out** of a freeze run (the driver flattens
-    /// each parked fiber and records it here for the snapshot) and **in** to a thaw run (`drive`
-    /// re-seeds the registry from it before re-entering under `REWINDING`). Empty for an ordinary run.
-    frozen_fibers: Vec<FrozenFiber>,
-    /// The freeze/thaw **spawned-vCPU** residue (slice 3.2.1): **out** of a multi-vCPU freeze (each
-    /// `thread.spawn` child that unwinds records itself here for the snapshot) and **in** to a thaw
-    /// (the root's re-executed `thread.spawn` re-attaches these, in spawn order, under `REWINDING`).
-    /// Empty for a single-vCPU or ordinary run.
-    frozen_vcpus: Vec<FrozenVCpu>,
-    /// #1361 step 2 — completed-but-unjoined **detached** §14 child residue of a subtree freeze:
-    /// **out** of a freeze (a finished detached child records its join result here instead of being
-    /// refused) and **in** to a thaw (the seeding posts each result and rebuilds the join edge).
-    /// See [`FrozenDetached`]. Empty for every run that froze no completed detached child.
-    frozen_detached: Vec<FrozenDetached>,
+    /// The domain's thaw residue at rest (#3034): **out** of a freeze (each vCPU, fiber and detached
+    /// child the driver flattens records itself here for the snapshot) and **in** to a thaw (`drive`
+    /// re-creates it before re-entering under `REWINDING`). From outside this crate only
+    /// [`Host::set_thaw`] writes it, with a residue the thaw pass admitted. Empty for an ordinary run.
+    residue: Residue,
     /// #1361 step 3 — **live** detached children a freeze rang the doorbell for, awaiting harvest by
     /// the run driver (see [`PendingDetached`]). Transient: the driver drains this into
     /// [`captured_detached`](Self::captured_detached) once each child has unwound and finished, so a
@@ -26783,19 +26693,9 @@ pub struct Host {
     /// #1361 step 3 — the harvested form (see [`CapturedDetached`]): each live detached child's
     /// unwound window + powerbox, for the codec to embed as a sub-artifact.
     captured_detached: Vec<CapturedDetached>,
-    /// #1361 step 4 — the live detached children a **thaw** re-launches (see [`ThawedDetached`]),
-    /// seeded by restore alongside the rest of the residue and taken by the run driver.
-    thawed_detached: Vec<ThawedDetached>,
     /// #1688 — this domain's fork twins a freeze carried, each a domain of its own (see
     /// [`CapturedTwin`]), for the codec to embed under their pids.
     captured_twins: Vec<CapturedTwin>,
-    /// #1688 — the twins a **thaw** re-creates under this domain (see [`ThawedTwin`]), seeded by
-    /// restore and taken by the run driver.
-    thawed_twins: Vec<ThawedTwin>,
-    /// #2571 — this domain's servicer twins that exited unreaped (see [`FrozenTwin`]): a freeze's
-    /// capture for the codec, or a thaw's to file again, seeded by restore and taken by the run
-    /// driver.
-    frozen_twins: Vec<FrozenTwin>,
     /// #1688 — the pids of the live twins a freeze could not carry, across the whole tree, on the
     /// run root's powerbox: the codec refuses the artifact rather than leave them out.
     unreached_twins: Vec<u64>,
@@ -26807,17 +26707,6 @@ pub struct Host {
     /// #1859 — the names [`Host::restore_durable_named`] rebuilt `host_procs` under, by index, for
     /// [`Host::restore_durable_handles`] to register at each re-pinned `Named { idx }` handle.
     thaw_names: Vec<Option<String>>,
-    /// The freeze/thaw **root** vCPU's flattened shadow-SP extent (slice 3.2.1). The single shared
-    /// active-SP word holds only the *last* context to run at freeze end (a spawned child), so the
-    /// root's own extent — its implicit residue (the thaw caller re-enters the root directly) — is
-    /// recorded here instead. `None` ⇒ a single-vCPU thaw, which reads the extent from the window's
-    /// active-SP word as before. Set by the freeze driver; consumed by `drive` on thaw.
-    frozen_root_sp: Option<u64>,
-    /// #2043 — this domain's child table's counters ([`Children`]). Each vCPU of the domain writes them
-    /// as it unwinds for a freeze, so the last to unwind leaves the cut's; a restore seeds them, and
-    /// the thaw's seeding gives them to the domain's table before re-filing the children the artifact
-    /// holds. The table itself dies with the domain's vCPUs, its children's records with it.
-    frozen_children: Vec<u32>,
     /// §7 the **capability-name directory** (Followup F7): name → handle for the powerbox grants, so a
     /// guest can resolve a capability by name at runtime (`cap.self` op 2) — dlopen-style discovery, the
     /// dynamic counterpart to load-time name binding. Populated by the powerbox layer at grant time
@@ -27457,21 +27346,14 @@ impl Host {
             cap_replay: None,
             cap_consumed: 0,
             durable: false,
-            frozen_fibers: Vec::new(),
-            frozen_vcpus: Vec::new(),
-            frozen_detached: Vec::new(),
+            residue: Residue::default(),
             pending_detached: Vec::new(),
             captured_detached: Vec::new(),
-            thawed_detached: Vec::new(),
             captured_twins: Vec::new(),
-            thawed_twins: Vec::new(),
-            frozen_twins: Vec::new(),
             unreached_twins: Vec::new(),
             freeze_declined: None,
             thaw_pipes: BTreeMap::new(),
             thaw_names: Vec::new(),
-            frozen_root_sp: None,
-            frozen_children: Vec::new(),
             cap_names: Vec::new(),
             notes: Arc::default(),
             named_cap_registrar: None,
@@ -27648,9 +27530,9 @@ impl Host {
             && self.cap_record.is_none()
             && self.cap_replay.is_none()
             && self.cap_pages.is_none()
-            && self.frozen_fibers.is_empty()
-            && self.frozen_vcpus.is_empty()
-            && self.frozen_detached.is_empty();
+            && self.residue.fibers.is_empty()
+            && self.residue.vcpus.is_empty()
+            && self.residue.detached.is_empty();
         // #1648 — a powerbox whose providers disagree about who owns the domain's signal door was
         // refused once already; refuse now, before any factory runs, so exactly one attempt ever
         // reaches them (see [`Host::multi_door`]).
@@ -28528,37 +28410,65 @@ impl Host {
         self.cap_record.is_some()
     }
 
+    /// #3034 — seed the residue the next (thaw) run re-creates: what a restore admitted, or a JIT
+    /// freeze's left for the codec. The only way into a powerbox's residue from outside this crate: a
+    /// [`Thaw`] is built only by [`temen_ir::thaw::validate`], so every value in it is one a run of the
+    /// module could have made. Replaces whatever is there.
+    pub fn set_thaw(&mut self, thaw: Thaw) {
+        self.residue = thaw.into_parts();
+    }
+
+    /// #3034 — admit `raw` as the residue of a domain of `m` whose root runs in context 0, and seed it
+    /// ([`Host::set_thaw`]): what an embedder assembling a cut by hand, or a JIT freeze's harvest,
+    /// hands a powerbox. Refused, leaving the powerbox as it was, when a value in it is one no run of
+    /// `m` makes.
+    pub fn admit_thaw(
+        &mut self,
+        m: &Module,
+        raw: Residue,
+    ) -> Result<(), temen_ir::thaw::Malformed> {
+        self.set_thaw(temen_ir::thaw::validate(m, 0, raw)?);
+        Ok(())
+    }
+
+    /// #3034 — take the residue this powerbox holds (cleared here): an embedder that thaws it on
+    /// another engine admits it again for that engine ([`temen_ir::thaw::validate`]).
+    pub fn take_residue(&mut self) -> Residue {
+        std::mem::take(&mut self.residue)
+    }
+
+    /// The residue this powerbox holds (see [`Host::set_thaw`]).
+    pub fn residue(&self) -> &Residue {
+        &self.residue
+    }
+
+    /// The fibers of the residue, taken: the part of it the bytecode engine re-creates.
+    pub(crate) fn take_frozen_fibers(&mut self) -> Vec<FrozenFiber> {
+        std::mem::take(&mut self.residue.fibers)
+    }
+
+    /// Record the fibers a freeze flattened.
+    pub(crate) fn put_frozen_fibers(&mut self, frozen: Vec<FrozenFiber>) {
+        self.residue.fibers = frozen;
+    }
+
     /// The fibers the freeze driver flattened on the last freeze run (slice 3.1.5) — the host-side
     /// residue a snapshot records (their continuations are in the captured window). Empty otherwise.
     pub fn frozen_fibers(&self) -> &[FrozenFiber] {
-        &self.frozen_fibers
-    }
-
-    /// Seed the frozen fibers a **thaw** must reconstruct (from a snapshot's Section 2). `drive`
-    /// re-creates each in the registry before re-entering the root under `REWINDING`. Set alongside
-    /// the restored (REWINDING) window and [`Host::set_durable`].
-    pub fn set_frozen_fibers(&mut self, frozen: Vec<FrozenFiber>) {
-        self.frozen_fibers = frozen;
+        &self.residue.fibers
     }
 
     /// The spawned vCPUs a multi-vCPU freeze flattened on the last freeze run (slice 3.2.1) — the
     /// host-side residue a snapshot records (their continuations are in the captured window, each in
     /// its own per-context region). Empty for a single-vCPU or ordinary run.
     pub fn frozen_vcpus(&self) -> &[FrozenVCpu] {
-        &self.frozen_vcpus
-    }
-
-    /// Seed the spawned vCPUs a **thaw** must reconstruct (from a snapshot's control section). The
-    /// root's re-executed `thread.spawn` re-attaches these (in spawn order) under `REWINDING`. Set
-    /// alongside the restored (REWINDING) window and [`Host::set_durable`].
-    pub fn set_frozen_vcpus(&mut self, frozen: Vec<FrozenVCpu>) {
-        self.frozen_vcpus = frozen;
+        &self.residue.vcpus
     }
 
     /// #1361 step 2 — the completed detached children a freeze captured (see [`FrozenDetached`]),
     /// read by the codec's control-section encoder.
     pub fn frozen_detached(&self) -> &[FrozenDetached] {
-        &self.frozen_detached
+        &self.residue.detached
     }
 
     /// #1361 step 3 — the **live** detached children this run's freeze captured, each with its own
@@ -28589,36 +28499,20 @@ impl Host {
         self.pending_detached = unreached;
     }
 
-    /// Seed the completed detached children a **thaw** must deliver, alongside the restored window.
-    pub fn set_frozen_detached(&mut self, frozen: Vec<FrozenDetached>) {
-        self.frozen_detached = frozen;
-    }
-
     /// #1688 — the fork twins this domain's freeze carried (see [`CapturedTwin`]).
     pub fn captured_twins(&self) -> &[CapturedTwin] {
         &self.captured_twins
     }
 
-    /// #1688 — seed the twins a **thaw** re-creates under this domain, as restore does.
-    pub fn set_thawed_twins(&mut self, thawed: Vec<ThawedTwin>) {
-        self.thawed_twins = thawed;
-    }
-
-    /// #1688 — the twins this domain's thaw re-creates (see [`Host::set_thawed_twins`]).
-    pub fn thawed_twins(&self) -> &[ThawedTwin] {
-        &self.thawed_twins
+    /// #1688 — the twins this domain's thaw re-creates.
+    pub fn thawed_twins(&self) -> &[LiveTwin] {
+        &self.residue.twins
     }
 
     /// #2571 — the servicer twins of this domain that exited unreaped (see [`FrozenTwin`]): those a
     /// freeze captured, or those a thaw files again.
     pub fn frozen_twins(&self) -> &[FrozenTwin] {
-        &self.frozen_twins
-    }
-
-    /// #2571 — seed the exited servicer twins a **thaw** files again under this domain, as restore
-    /// does.
-    pub fn set_frozen_twins(&mut self, frozen: Vec<FrozenTwin>) {
-        self.frozen_twins = frozen;
+        &self.residue.exited_twins
     }
 
     /// #1688 — the pids of the live twins a freeze could not carry, across the whole tree. Non-empty
@@ -28765,12 +28659,6 @@ impl Host {
         self.module_arc_by_digest(digest)
     }
 
-    /// #1361 step 4 — seed the live detached children a **thaw** re-launches (each with its restored
-    /// window, powerbox and launch record), alongside the restored root window.
-    pub fn set_thawed_detached(&mut self, thawed: Vec<ThawedDetached>) {
-        self.thawed_detached = thawed;
-    }
-
     /// #1671 — take the freeze this domain's run declined, if one was (see [`FreezeDeclined`]). A
     /// declined freeze leaves the run to finish normally, so its result is the run's own.
     pub fn take_freeze_declined(&mut self) -> Option<FreezeDeclined> {
@@ -28778,26 +28666,15 @@ impl Host {
     }
 
     /// The live detached children seeded for the next thaw (see [`Host::set_thawed_detached`]).
-    pub fn thawed_detached(&self) -> &[ThawedDetached] {
-        &self.thawed_detached
-    }
-
-    /// Take the live detached children seeded for the next thaw (see [`Host::set_thawed_detached`]).
-    pub fn take_thawed_detached(&mut self) -> Vec<ThawedDetached> {
-        std::mem::take(&mut self.thawed_detached)
+    pub fn thawed_detached(&self) -> &[LiveDetached] {
+        &self.residue.live_detached
     }
 
     /// The root vCPU's flattened shadow-SP extent from the last multi-vCPU freeze (slice 3.2.1), or
     /// `None` for a single-vCPU freeze (its extent is the window's active-SP word). A snapshot records
     /// it alongside [`Host::frozen_vcpus`].
     pub fn frozen_root_sp(&self) -> Option<u64> {
-        self.frozen_root_sp
-    }
-
-    /// Seed the root vCPU's flattened shadow-SP extent a **thaw** must restore (slice 3.2.1). Set only
-    /// for a multi-vCPU thaw, alongside [`Host::set_frozen_vcpus`].
-    pub fn set_frozen_root_sp(&mut self, sp: u64) {
-        self.frozen_root_sp = Some(sp);
+        self.residue.root_sp
     }
 
     /// #2043 — every slot's counter in this domain's child table as the last freeze left it, in slot
@@ -28805,18 +28682,7 @@ impl Host {
     /// child handle stays spent and the next spawn gets the handle the uninterrupted run would have
     /// (#2619). Empty for a domain that never spawned.
     pub fn child_generations(&self) -> &[u32] {
-        &self.frozen_children
-    }
-
-    /// #2043 — seed the child table's counters a **thaw** must restore ([`Host::child_generations`]).
-    pub fn set_child_generations(&mut self, generations: Vec<u32>) {
-        self.frozen_children = generations;
-    }
-
-    /// Take the root extent [`Host::set_frozen_root_sp`] seeded (cleared here) — for an engine that
-    /// consumes a restored residue itself, as the JIT's durable hand-off does.
-    pub fn take_frozen_root_sp(&mut self) -> Option<u64> {
-        self.frozen_root_sp.take()
+        &self.residue.children
     }
 
     /// Begin recording the nondeterministic capability **inputs** crossing into the guest, so a
@@ -30922,10 +30788,12 @@ impl Host {
             (self.own_budget, self.grown) = (node, map.grown_bytes());
         }
         let mut wakes = Vec::new();
-        for child in self.take_thawed_detached() {
+        for child in std::mem::take(&mut self.residue.live_detached) {
+            let launch = detached_launch(&child);
             let woken = child
+                .payload
                 .host
-                .drop_restored(&child.launch, &child.window, false);
+                .drop_restored(&launch, &child.payload.window, false);
             wakes.extend(woken);
         }
         wakes.extend(self.release_memory().map(EndPost::signal));

@@ -314,7 +314,15 @@ block 0 (v0: i64, v1: i64) {
     begin_thaw(&mut thaw_win, TEST_ARENA, 0);
     let mut thost = Host::new();
     thost.set_durable(true);
-    thost.set_frozen_fibers(frozen);
+    thost
+        .admit_thaw(
+            &inst,
+            temen_interp::Residue {
+                fibers: frozen,
+                ..Default::default()
+            },
+        )
+        .expect("a residue a run made");
     let mut tfuel = 1_000_000u64;
     let (rt, _) =
         run_capture_reserved_with_host(&inst, 0, &[], &mut tfuel, &thaw_win, SIZE_LOG2, &mut thost);
@@ -434,7 +442,14 @@ block 0 (v0: i64, v1: i64) {
         h.set_durable(true);
         h.clock_ns = clock_after;
         let clk = h.grant_clock();
-        h.set_frozen_fibers(frozen);
+        h.admit_thaw(
+            &inst,
+            temen_interp::Residue {
+                fibers: frozen,
+                ..Default::default()
+            },
+        )
+        .expect("a residue a run made");
         let mut fuel = 1_000_000u64;
         let (r, _) = run_capture_reserved_with_host(
             &inst,
@@ -682,7 +697,15 @@ block 0 (v0: i64, v1: i64) {
         begin_thaw(&mut thaw_win, TEST_ARENA, 0);
         let mut thost = Host::new();
         thost.set_durable(true);
-        thost.set_frozen_fibers(frozen);
+        thost
+            .admit_thaw(
+                &inst,
+                temen_interp::Residue {
+                    fibers: frozen,
+                    ..Default::default()
+                },
+            )
+            .expect("a residue a run made");
         let mut tfuel = 1_000_000u64;
         let (rt, done_win) = run_capture_reserved_with_host(
             &inst,
@@ -805,8 +828,15 @@ fn a_futex_event_parked_fiber_freezes_and_the_thawed_wait_reissues() {
         begin_thaw(&mut win, TEST_ARENA, 0);
         let mut h = Host::new();
         h.set_durable(true);
-        h.set_frozen_fibers(frozen_fibers);
-        h.set_frozen_root_sp(root_sp);
+        h.admit_thaw(
+            &inst,
+            temen_interp::Residue {
+                fibers: frozen_fibers,
+                root_sp: Some(root_sp),
+                ..Default::default()
+            },
+        )
+        .expect("a residue a run made");
         let mut fuel = 1_000_000u64;
         let (r, _) =
             run_capture_reserved_with_host(&inst, 0, &[], &mut fuel, &win, SIZE_LOG2, &mut h);
@@ -968,7 +998,14 @@ fn an_unwoken_cap_parked_fiber_freezes_and_its_thaw_reissues_the_read() {
     // The input arrives after the freeze; the thaw re-issues the fiber's read, which takes it.
     h.push_stdin(b"abcd");
     let fibers = h.frozen_fibers().to_vec();
-    h.set_frozen_fibers(fibers);
+    h.admit_thaw(
+        &inst,
+        temen_interp::Residue {
+            fibers: fibers,
+            ..Default::default()
+        },
+    )
+    .expect("a residue a run made");
     let mut twin = snap;
     begin_thaw(&mut twin, TEST_ARENA, 0);
     let mut fuel = 1_000_000u64;
@@ -1107,8 +1144,15 @@ fn a_woken_event_park_thaws_through_a_post_rewind_claim() {
         begin_thaw(&mut win, TEST_ARENA, 0);
         let mut h = Host::new();
         h.set_durable(true);
-        h.set_frozen_fibers(frozen_fibers);
-        h.set_frozen_root_sp(root_sp);
+        h.admit_thaw(
+            &inst,
+            temen_interp::Residue {
+                fibers: frozen_fibers,
+                root_sp: Some(root_sp),
+                ..Default::default()
+            },
+        )
+        .expect("a residue a run made");
         let mut fuel = 1_000_000u64;
         let (r, _) =
             run_capture_reserved_with_host(&inst, 0, &[], &mut fuel, &win, SIZE_LOG2, &mut h);
@@ -1213,7 +1257,14 @@ fn a_consumed_park_delivers_the_next_resume_after_thaw() {
     let mut thaw_win = snap;
     begin_thaw(&mut thaw_win, TEST_ARENA, 0);
     let (mut th, hf2) = consumed_park_host(false);
-    th.set_frozen_fibers(frozen);
+    th.admit_thaw(
+        &inst,
+        temen_interp::Residue {
+            fibers: frozen,
+            ..Default::default()
+        },
+    )
+    .expect("a residue a run made");
     let mut fuel = 100_000u64;
     let (r, _) = run_capture_reserved_with_host(
         &inst,

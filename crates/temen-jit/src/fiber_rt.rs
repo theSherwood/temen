@@ -1932,6 +1932,12 @@ pub(crate) unsafe fn seed_frozen_fibers(
         // the arena is not seeded, as `cont.new` refuses one, and the rewound `cont.resume` that
         // names it fails closed. The oracle's thaw stops at the same slot.
         if !r.table.seed_fits() {
+            // #3034 — the thaw pass admitted each slot's context; this refusal stays in front of the
+            // raw stores at `region_base(slot + 1)`, loud in debug.
+            debug_assert!(
+                false,
+                "the thaw pass admits only a fiber slot inside the arena"
+            );
             break;
         }
         if f.is_free() {

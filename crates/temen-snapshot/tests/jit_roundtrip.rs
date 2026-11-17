@@ -139,6 +139,32 @@ fn jit_install_occupancy_round_trips() {
     );
 }
 
+/// #3034 — a re-applied `install` is one the guest's own made: into a padding slot of the dispatch
+/// table, past the module's functions, naming a unit its domain holds. On `b099bbb` an artifact could
+/// place a unit over a module function's slot (slot 0 here): the next run's `call.dyn` of that slot
+/// reached the unit's code instead of the module function the slot names. A slot past the table, or a
+/// unit the domain does not hold, was skipped silently. Each is now refused.
+#[test]
+fn an_install_no_run_makes_is_refused() {
+    let module = gate_module();
+    let refused = |slot: u32, unit: Option<u32>| {
+        let mut host = Host::new();
+        host.set_jit_validator(validator);
+        let dom = host.grant_jit_with_table(Some(SIZE_LOG2), 4); // 16 slots, function 0 in slot 0
+        let c0 = host.jit_compile(dom, &unit_blob(42)).unwrap().unwrap();
+        host.jit_record_install(c0.domain, slot, unit.unwrap_or(c0.unit));
+        let artifact = freeze(&module, &vec![0u8; WINDOW], &host).expect("freeze");
+        matches!(
+            restore(&artifact, &module, &mut Host::new()),
+            Err(RestoreError::Malformed)
+        )
+    };
+    assert!(!refused(3, None), "a padding slot, as a run installs");
+    assert!(refused(0, None), "a module function's slot");
+    assert!(refused(16, None), "a slot past the table");
+    assert!(refused(3, Some(5)), "a unit the domain does not hold");
+}
+
 /// A JIT-free durable domain's artifact is unaffected by Slice 2: Section 5 is elided, so it stays
 /// byte-identical across a round-trip (the `!jit.is_empty()` guard).
 #[test]

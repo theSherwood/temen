@@ -27,6 +27,7 @@ use temen_interp::{
     bytecode, run_capture_reserved_with_host, FrozenFiber, Host, HostProcGrant, ProcHandler, Trap,
     Value,
 };
+use temen_ir::Module;
 use temen_snapshot::{freeze, restore};
 use temen_text::parse_module;
 use temen_verify::verify_module;
@@ -41,10 +42,17 @@ fn window_with(state: i32) -> Vec<u8> {
 }
 
 /// A durable host seeded with any `frozen` fibers a thaw must re-create.
-fn durable_host(frozen: Vec<FrozenFiber>) -> Host {
+fn durable_host(inst: &Module, frozen: Vec<FrozenFiber>) -> Host {
     let mut h = Host::new();
     h.set_durable(true);
-    h.set_frozen_fibers(frozen);
+    h.admit_thaw(
+        inst,
+        temen_interp::Residue {
+            fibers: frozen,
+            ..Default::default()
+        },
+    )
+    .expect("a residue a run made");
     h
 }
 
@@ -54,7 +62,7 @@ fn tw_run(
     window: &[u8],
     frozen: Vec<FrozenFiber>,
 ) -> (Result<Vec<Value>, Trap>, Vec<u8>, Host) {
-    let mut h = durable_host(frozen);
+    let mut h = durable_host(&inst, frozen);
     let mut fuel = 1_000_000u64;
     let (r, win) =
         run_capture_reserved_with_host(inst, 0, &[], &mut fuel, window, SIZE_LOG2, &mut h);
@@ -67,7 +75,7 @@ fn bc_run(
     window: &[u8],
     frozen: Vec<FrozenFiber>,
 ) -> (Result<Vec<Value>, Trap>, Vec<u8>, Host) {
-    let mut h = durable_host(frozen);
+    let mut h = durable_host(&inst, frozen);
     let mut fuel = 1_000_000u64;
     let (r, win) = bytecode::compile_and_run_capture_reserved_with_host(
         inst,
@@ -289,7 +297,7 @@ fn a_consumed_park_redelivers_after_thaw_on_the_bytecode_engine() {
 
     // A durable host whose host proc writes `UNWINDING` when `freeze`, seeded with `frozen`.
     let host = |freeze: bool, frozen: Vec<FrozenFiber>| -> (Host, i32) {
-        let mut h = durable_host(frozen);
+        let mut h = durable_host(&inst, frozen);
         let hf = h.grant_host_proc(HostProcGrant::new(
             ProcHandler::Sync(Box::new(move |_op, _args, out, mem, _| {
                 if freeze {
@@ -433,7 +441,7 @@ fn a_wait_parked_fiber_freezes_and_thaws_on_the_bytecode_engine() {
 /// thaws to `want` on both engines.
 fn freeze_at_host_call(inst: &temen_ir::Module, want: Result<Vec<Value>, Trap>) {
     let run = |bytecode_engine: bool, win: &[u8], freeze: bool, frozen: Vec<FrozenFiber>| {
-        let mut h = durable_host(frozen);
+        let mut h = durable_host(&inst, frozen);
         let hf = h.grant_host_proc(HostProcGrant::new(
             ProcHandler::Sync(Box::new(move |_op, _args, out, mem, _| {
                 if freeze {

@@ -9459,6 +9459,12 @@ pub extern "C" fn temen_durable_thaw_resume(
         return 0;
     }
     let (t_space, t_clk) = (caps[0].handle(), caps[1].handle());
+    // #3034 — the bytecode engine re-creates a residue's fibers and nothing else: one with more
+    // (spawned vCPUs, detached children, fork twins) is refused whole, never thawed in part.
+    if !bytecode::admits_thaw(&host) {
+        set(STATUS_UNSUPPORTED);
+        return 0;
+    }
     let Some(prog) = bytecode::SharedProgram::compile(&m) else {
         set(STATUS_UNSUPPORTED);
         return 0;

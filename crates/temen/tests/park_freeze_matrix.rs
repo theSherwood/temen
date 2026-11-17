@@ -353,8 +353,7 @@ fn freeze_parked_then_thaw(
     );
 
     release(&mut h);
-    let fibers = h.frozen_fibers().to_vec();
-    h.set_frozen_fibers(fibers);
+    // The freeze's residue stays on `h` for its thaw.
     let mut win2 = snap;
     // The arm rides the window: a quiesce-frozen run that goes idle again would freeze again. The
     // thaw runs disarmed, to give the uninterrupted answer.

@@ -263,7 +263,7 @@ fn a_far_page_rides_a_detached_childs_artifact_alone() {
         let grown: Vec<u64> = thost
             .thawed_detached()
             .iter()
-            .map(|t| t.window.page_map().grown_bytes())
+            .map(|t| t.payload.window.page_map().grown_bytes())
             .collect();
         assert_eq!(grown, [16384], "frozen on {engine:?}");
     }

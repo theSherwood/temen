@@ -653,42 +653,33 @@ fn restore_refuses_child_records_the_child_table_does_not_name() {
     let vcpu = fhost.frozen_vcpus()[0].clone();
     assert_eq!((vcpu.slot, vcpu.joinable), (0, true), "the child at slot 0");
 
-    let refused = |what: &str, host: &Host| {
-        let artifact = freeze(&inst, &snapshot, host).expect("freeze");
-        let r = restore(&artifact, &inst, &mut Host::new());
+    // #3034 — each case edits the residue of the real artifact, through the codec's own writers.
+    let artifact = freeze(&inst, &snapshot, &fhost).expect("freeze");
+    let refused = |what: &str, edit: &dyn Fn(&mut temen_snapshot::ResidueEdit)| {
+        let mut r = temen_snapshot::decode_residue(&artifact).expect("decode");
+        edit(&mut r);
+        let bent = temen_snapshot::encode_residue(&artifact, &r).expect("encode");
+        let got = restore(&bent, &inst, &mut Host::new());
         assert!(
-            matches!(r, Err(RestoreError::Malformed)),
+            matches!(got, Err(RestoreError::Malformed)),
             "{what}: {:?}",
-            r.err()
+            got.err()
         );
     };
-    let unnamed = {
-        let mut h = Host::new();
-        h.set_durable(true);
-        h.grant_clock();
-        h.set_frozen_vcpus(vec![vcpu.clone()]);
-        h.set_frozen_root_sp(fhost.frozen_root_sp().expect("root extent"));
-        h
-    };
-    refused("a slot the table never issued", &unnamed);
-
-    let mut twice = unnamed;
-    twice.set_child_generations(vec![1]);
-    let second = temen_interp::FrozenVCpu {
-        task: vcpu.task + 1,
-        ..vcpu.clone()
-    };
-    twice.set_frozen_vcpus(vec![vcpu.clone(), second]);
-    refused("two records at one slot", &twice);
-
-    twice.set_child_generations(vec![1, 1]);
-    let stray = temen_interp::FrozenVCpu {
-        slot: 1,
-        joinable: false,
-        ..vcpu.clone()
-    };
-    twice.set_frozen_vcpus(vec![stray]);
-    refused("an unjoinable record at slot 1", &twice);
+    refused("a slot the table never issued", &|r| r.children.clear());
+    refused("two records at one slot", &|r| {
+        let second = temen_interp::FrozenVCpu {
+            task: r.vcpus[0].task + 1,
+            shadow_sp: r.vcpus[0].shadow_sp - TEST_ARENA.stride,
+            ..r.vcpus[0].clone()
+        };
+        r.vcpus.push(second);
+    });
+    refused("an unjoinable record at slot 1", &|r| {
+        r.children = vec![1, 1];
+        r.vcpus[0].slot = 1;
+        r.vcpus[0].joinable = false;
+    });
 }
 
 // Slice 3.2.2 — vCPU + fiber coexistence through the codec. The root spawns a child vCPU and owns a
@@ -857,7 +848,15 @@ fn fiber_residue_generation_round_trips_through_the_codec() {
     residue[0].generation = 7;
     let mut shost = Host::new();
     shost.set_durable(true);
-    shost.set_frozen_fibers(residue);
+    shost
+        .admit_thaw(
+            &inst,
+            temen_interp::Residue {
+                fibers: residue,
+                ..Default::default()
+            },
+        )
+        .expect("a recycled fiber's residue");
     let artifact = freeze(&inst, &snapshot, &shost).expect("freeze");
 
     // Restore: the generation must come back intact (format v2 carries it).
@@ -1183,28 +1182,65 @@ fn serve_state_round_trips_through_the_codec() {
     );
 }
 
+/// #3034 — every ticket a domain minted lies below its counter, and the counter leaves room for the
+/// `+ 1` the next dispatch makes: on `b099bbb` a counter of `u64::MAX` restored, and the next enqueue
+/// overflowed (a debug panic).
+#[test]
+fn a_ticket_counter_no_run_makes_is_refused() {
+    use temen_interp::SvcDispatch;
+    let inst = instrument(SRC);
+    let win = init_durable_window(WINDOW, TEST_ARENA);
+    let refused = |queue: Vec<SvcDispatch>, next: u64| {
+        let mut host = Host::new();
+        host.set_svc_state(queue, Vec::new(), next);
+        let artifact = freeze(&inst, &win, &host).expect("the encoder writes what it holds");
+        matches!(
+            restore(&artifact, &inst, &mut Host::new()),
+            Err(RestoreError::Malformed)
+        )
+    };
+    let dispatch = |ticket| SvcDispatch {
+        export: 0,
+        op: 0,
+        args: vec![],
+        ticket,
+    };
+    assert!(refused(Vec::new(), u64::MAX), "a counter past TASK_MAX");
+    assert!(refused(vec![dispatch(7)], 7), "a ticket at the counter");
+    assert!(!refused(vec![dispatch(6)], 7), "a ticket below it");
+}
+
 /// #1901 (v35), #1676 (v36) — a domain's **reply waits** and **frozen handlers** ride the serve
 /// section, even when its own serve trio is empty: restored exactly, and the canonical re-freeze is
 /// byte-identical.
+///
+/// #3034 — a frozen handler is a live fiber of the domain's residue replying to a ticket the domain
+/// minted, so one naming no fiber, or a ticket at or past the counter, is refused.
 #[test]
 fn reply_waits_and_frozen_handlers_round_trip_through_the_codec() {
     let inst = instrument(SRC);
     let win = init_durable_window(WINDOW, TEST_ARENA);
     let mut host = Host::new();
     host.set_reply_waits(vec![(0, 4), (3, 0)]);
-    host.set_frozen_handlers(vec![(1, 9)]);
     let artifact = freeze(&inst, &win, &host).expect("freeze with reply waits");
 
     let mut rhost = Host::new();
     let rwin = restore(&artifact, &inst, &mut rhost).expect("restore");
     assert_eq!(rhost.reply_waits(), vec![(0, 4), (3, 0)]);
-    assert_eq!(rhost.frozen_handlers(), vec![(1, 9)]);
     assert_eq!(rhost.svc_state(), (Vec::new(), Vec::new(), 0));
     let refrozen = freeze(&inst, &rwin, &rhost).expect("re-freeze");
     assert_eq!(
         refrozen, artifact,
         "canonical re-serialize is byte-identical"
     );
+
+    // A handler with no fiber behind it, and its ticket past the counter: neither is one a run makes.
+    host.set_frozen_handlers(vec![(1, 9)]);
+    let forged = freeze(&inst, &win, &host).expect("the encoder writes what it holds");
+    assert!(matches!(
+        restore(&forged, &inst, &mut Host::new()),
+        Err(RestoreError::Malformed)
+    ));
 }
 
 /// The serve section is **elided** when the trio is empty (a never-served domain), so the
@@ -2267,8 +2303,7 @@ fn a_completed_detached_child_rides_the_control_section() {
     let mut host = Host::new();
     host.set_durable(true);
     // #2043 — its child table: slots 0 to 4 issued, slot 1's child joined.
-    host.set_child_generations(vec![1; 5]);
-    host.set_frozen_detached(vec![
+    let detached = vec![
         FrozenDetached {
             parent_task: 0,
             slot: 0,
@@ -2283,14 +2318,23 @@ fn a_completed_detached_child_rides_the_control_section() {
         FrozenDetached {
             parent_task: 0,
             slot: 3,
-            completed_result: Err(temen_interp::Trap::Exit(-2)),
+            completed_result: Err(temen_interp::Trap::Exit(-2).code()),
         },
         FrozenDetached {
             parent_task: 0,
             slot: 4,
-            completed_result: Err(temen_interp::Trap::MemoryFault),
+            completed_result: Err(temen_interp::Trap::MemoryFault.code()),
         },
-    ]);
+    ];
+    host.admit_thaw(
+        &inst,
+        temen_interp::Residue {
+            children: vec![1; 5],
+            detached,
+            ..Default::default()
+        },
+    )
+    .expect("a detached residue");
     let artifact = freeze(&inst, &win, &host).expect("a detached residue is freezable");
 
     let mut thost = Host::new();
