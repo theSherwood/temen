@@ -2401,15 +2401,25 @@ waiting for good was still live, so every round walked it about a dozen times, t
 its domain's host lock for it, and every `notify` re-keyed it through its window. Beside 1,000
 threads parked on a word nothing notifies, a pingpong hand-off cost 64 µs on the pump and 200 µs on
 executor 2, against 0.5 and about 9 µs beside none. A futex wait now waits aside from the live list
-(`Waits`): filed under the key its park took, in task order, and under its deadline when it has one.
-A `notify` takes its waiters from its word's queue, lowest task index first as before, so it costs
-what it wakes; a deadline is the deadline index's; a kill, a domain's end and a freeze reach the
+(`Waits`): filed under the key its park took, in arrival order, and under its deadline when it has one.
+A `notify` takes its waiters from the front of its word's queue, so it costs what it wakes (until
+#3086, the queue was in task order: lowest task index first, which the oracle's arrival order
+contradicts where a program forces the order); a deadline is the deadline index's; a kill, a domain's end and a freeze reach the
 waiters through the members the rules ask for (`Tasks::members`). Each puts the task back in the
 live list. The same hand-off now costs 0.59 µs on the pump and about 10 µs on executor 2, the cost
 of a hand-off beside none. The kill check asks a domain's host once per run of its tasks in the
 live list, not once per task. The debug scheduler files its waits too, and files them again under the keys their sites have once a restore
 or an undo has rebuilt the windows. Pinned in `tasks_tests` and by `temen-bench --threads
 pingpong_idle`.
+
+**A fiber's futex wait is an entry of the same index (#3078 phase 2 slice 1, 2026-11-17).** A
+fiber's `memory.wait` counted in on its key and never out, and its wake and its deadline were scans
+of every domain's fiber registry. It is now a `Waiter::Fiber { domain, slot }` beside the task
+waiters, in one arrival order per word (the oracle's, INVARIANTS #4). It counts out as it leaves,
+however that is: a notify, its deadline (the logical clock's, or its real one at a `cont.resume`
+poll), its domain's end, a freeze's flatten, its serve handler's release, or a re-check that fired
+at its park (never filed). A word a fiber has waited on and left is back on executor 2's no-wake
+fast path. Pinned in `fiber_wait_order`, `fiber_wait_counts_out`, and the `wait_index_loom` model.
 
 Pinned constraints (tests in `temen/tests/host_park.rs`, `temen-run/tests/fast_cap.rs`): a parkable
 registration is **never** `fast_cap_resolver`-claimed; **sync ops never pay for parkable ops'

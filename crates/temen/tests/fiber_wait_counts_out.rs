@@ -3,8 +3,8 @@
 //! Before, a fiber's wait counted in and never out, so every word a fiber ever waited on kept
 //! executor 2's notify off its no-wake fast path for the rest of the run.
 //!
-//! Each row parks a fiber on a word and lets it leave one way: a notify, its real deadline passed at
-//! a `cont.resume` poll, or the park-time re-check (the word already changed). Then it notifies the
+//! Each row parks a fiber on a word and lets it leave one way: a notify, its deadline, or the
+//! park-time re-check (the word already changed). Then it notifies the
 //! word `NOTIFIES` times with no waiter. On executor 2 each of those must be answered without the
 //! run lock: [`bytecode::futex_no_wakes`] rises by at least `NOTIFIES`. The count is the process's
 //! and kept only in a debug build, so this file holds one test, run in a debug build only, and the
@@ -93,7 +93,10 @@ fn a_fiber_that_left_its_wait_leaves_its_word_on_the_fast_path() {
     // (how it leaves, the program, its `WAIT_*` status)
     let rows = [
         ("a notify", program(0, 10_000_000_000, true), 0),
-        ("its real deadline, at a poll", program(0, 1, false), 2),
+        // A 1 ns deadline: whichever of executor 2's settle after the park and the root's poll reaches
+        // it first times the wait out. The poll's own leave on executor 2's registry cell is pinned
+        // by `a_poll_past_a_fibers_real_deadline_takes_its_wait_out_of_the_index` (temen-interp).
+        ("its deadline", program(0, 1, false), 2),
         (
             "the park-time re-check",
             program(1, 10_000_000_000, false),

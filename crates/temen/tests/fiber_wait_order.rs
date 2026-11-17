@@ -389,3 +389,106 @@ block 2 (vs2: i32, vv2: i64) {{
     pin(&idles, 102);
     pin(&polls, 102);
 }
+
+/// #3086 — a debugger restore files each futex wait back at its place in arrival order (its record
+/// keeps it), not in task order. Thread 2 waits on `W` at once; thread 1 first naps 1 ms (the debug
+/// scheduler's logical clock), then waits on `W` too, so the waits arrive in the reverse of task
+/// order. The root naps 5 ms, notifies 1, and waits for the woken thread to write its index at
+/// `STATUS` (16392) and notify it; then it wakes the other and joins both. The answer is the
+/// index of the thread woken first: 2. A checkpoint taken at every turn, restored into a fresh
+/// session and run on, must answer the same.
+#[test]
+fn a_debugger_restore_keeps_the_waits_in_arrival_order() {
+    use temen_interp::bytecode::{BlockedOn, ScheduledDebugRun};
+    let waiter = |id: u32, nap: bool| {
+        let nap = if nap {
+            "  vx = i64.const 16400\n  vxz = i32.const 0\n  vxt = i64.const 1000000\n  vxs = i32.atomic.wait vx vxz vxt\n"
+        } else {
+            ""
+        };
+        format!(
+            r#"func (i64, i64) -> (i64) {{
+block 0 (vsp: i64, varg: i64) {{
+{nap}  vw = i64.const 16384
+  vz = i32.const 0
+  vto = i64.const -1
+  vst = i32.atomic.wait vw vz vto
+  vf = i64.const 16392
+  vid = i32.const {id}
+  i32.atomic.store vf vid
+  vone = i32.const 1
+  vn = atomic.notify vf vone
+  vr = i64.const 0
+  return vr
+  }}
+}}
+"#
+        )
+    };
+    let src = format!(
+        r#"memory 16
+func () -> (i64) {{
+block 0 () {{
+  vz = i64.const 0
+  vt1 = thread.spawn 1 vz vz
+  vt2 = thread.spawn 2 vz vz
+  vx = i64.const 16400
+  vxz = i32.const 0
+  vxt = i64.const 5000000
+  vxs = i32.atomic.wait vx vxz vxt
+  vw = i64.const 16384
+  vone = i32.const 1
+  vn1 = atomic.notify vw vone
+  vf = i64.const 16392
+  vinf = i64.const -1
+  vfs = i32.atomic.wait vf vxz vinf
+  vfirst = i32.atomic.load vf
+  vn2 = atomic.notify vw vone
+  vj1s, vj1 = thread.join vt1
+  vj2s, vj2 = thread.join vt2
+  vr = i64.extend_i32_u vfirst
+  return vr
+  }}
+}}
+{}{}"#,
+        waiter(1, true),
+        waiter(2, false)
+    );
+    let m = parse_module(&src).expect("parse");
+    temen_verify::verify_module(&m).expect("verify");
+    let session = || ScheduledDebugRun::new(&m, 0, &[]).expect("the debugger runs the module");
+    let want = Some(Ok(vec![Value::I64(2)]));
+    let mut reference = session();
+    let mut fuel = FUEL;
+    while reference.tick(&mut fuel) {}
+    assert_eq!(
+        reference.result().cloned(),
+        want,
+        "the thread that waited first"
+    );
+    let total = reference.op_turn();
+    let mut both_parked = 0;
+    for c in 0..=total {
+        let mut at_c = session();
+        let mut fuel = FUEL;
+        while at_c.op_turn() < c && at_c.tick(&mut fuel) {}
+        let Ok(snap) = at_c.snapshot() else {
+            continue;
+        };
+        let on_w = (at_c.blocked_on().into_iter())
+            .filter(|(_, on)| matches!(on, BlockedOn::Futex(16384)))
+            .count();
+        if on_w == 2 {
+            both_parked += 1;
+        }
+        let mut warm = session();
+        warm.restore(at_c.op_turn(), &snap);
+        let mut fuel = FUEL;
+        while warm.tick(&mut fuel) {}
+        assert_eq!(warm.result().cloned(), want, "restored at turn {c}");
+    }
+    assert!(
+        both_parked > 0,
+        "a checkpoint caught both threads parked on the word"
+    );
+}
