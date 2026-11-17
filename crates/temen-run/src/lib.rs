@@ -3554,9 +3554,9 @@ unsafe fn live_call(
     // register-then-recheck does (#1952), and a handoff would answer it before it could.
     let in_fiber = temen_jit::in_guest_fiber();
     if fast && !in_fiber {
-        if let Some((site, func)) = handoff_site(&guard, export, op, args.len()) {
+        if let Some((claim, func)) = handoff_site(&guard, export, op, args.len()) {
             drop(guard);
-            return handoff_call(caller, callee, &site, func, args, params, vm);
+            return handoff_call(caller, callee, claim, func, args, params, vm);
         }
     }
     let bell = guard.svc_bell().cloned().expect("checked above");
@@ -3594,16 +3594,17 @@ unsafe fn live_call(
     await_settle(callee, guard, &bell, ticket, Parks::Fiber, vm)
 }
 
-/// #2742 — the direct handoff of a call to handler `func` of the callee's serve op parked at `site`,
-/// whose gate the caller holds: the handler runs on the caller's thread, on the caller's own stack
-/// when it cannot park ([`temen_jit::ServeSite::run_inline`]), else on a fiber of its own. Its
-/// dispatch is the caller's own, so it takes no ticket: its end leaves the reply in a slot the caller
-/// reads, at once when it ended here, else once the pool ends it (a handler that parks). It counts
-/// in the serve op's served count, whose bell the gate's release rings ([`leave_site`]).
+/// #2742 — the direct handoff of a call to handler `func` of the callee's serve op the caller claimed
+/// (`claim`: its gate and a place in its domain's handlers, #3060): the handler runs on the caller's
+/// thread, on the caller's own stack when it cannot park ([`temen_jit::ServeSite::run_inline`]),
+/// else on a fiber of its own. Its dispatch is the caller's own, so it takes no ticket: its end
+/// leaves the reply in a slot the caller reads, at once when it ended here, else once the pool ends
+/// it (a handler that parks). It counts in the serve op's served count, whose bell the claim's
+/// release rings ([`leave_site`]), the one way out of every route here.
 unsafe fn handoff_call(
     caller: &mut CallerHost,
     callee: &Mutex<Host>,
-    site: &temen_jit::ServeSite,
+    mut claim: temen_jit::Claim,
     func: u32,
     args: &[i64],
     params: &[temen_ir::ValType],
@@ -3615,7 +3616,7 @@ unsafe fn handoff_call(
     let args = if params.contains(&temen_ir::ValType::Cap) {
         let mut a = args.to_vec();
         if temen_interp::grant_live_args(caller, callee, params, &mut a).is_err() {
-            leave_site(site, callee);
+            leave_site(claim, callee);
             vm.raise(TrapKind::CapFault as i64);
             return None;
         }
@@ -3626,10 +3627,10 @@ unsafe fn handoff_call(
     };
     // A handler that cannot park runs on this stack: it never gives the gate back, and returns or
     // traps here.
-    if site.inline_ok(func) {
-        // SAFETY: the gate is held, its serve op parked in its serve loop, and `inline_ok`.
-        let end = site.run_inline(func, args);
-        leave_site(site, callee);
+    if claim.inline_ok(func) {
+        // SAFETY: the gate is the claim's, its serve op parked in its serve loop, and `inline_ok`.
+        let end = claim.run_inline(func, args);
+        leave_site(claim, callee);
         return Some(match end {
             Ok(end) => handoff_reply(end),
             Err(_) => Reply::Failed(EAGAIN),
@@ -3637,17 +3638,18 @@ unsafe fn handoff_call(
     }
     // A handler that parks leaves its reply here, once the pool has ended it.
     let mut slot: Option<Arc<std::sync::OnceLock<Reply>>> = None;
-    // SAFETY: the gate is held, and its serve op is parked in its serve loop.
-    let ran = site.start(func, args, &mut || {
+    // SAFETY: the gate is the claim's, and its serve op is parked in its serve loop.
+    let ran = claim.start(func, args, &mut || {
         let reply = Arc::new(std::sync::OnceLock::new());
         slot = Some(Arc::clone(&reply));
         Box::new(move |end| {
             let _ = reply.set(handoff_reply(end));
         })
     });
-    if ran.as_ref().map_or(true, |ran| ran.held) {
-        leave_site(site, callee);
-    }
+    // Ended here, parked or preempted (it counts as the domain's handler in the pool now), or
+    // refused: the claim goes either way, ringing only if it still held the gate. A handler that
+    // kept the gate (preempted, or parked on a whole-vCPU wait) gives it back from the pool.
+    leave_site(claim, callee);
     let ran = match ran {
         Ok(ran) => ran,
         // The OS refused the handler's stack: probeable backpressure.
@@ -3676,13 +3678,17 @@ unsafe fn handoff_call(
     }
 }
 
-/// #2742 — a caller that started a handler at `site` gives its gate back: a woken handler of the
-/// window may run on the pool, and the bell of `callee`, the site's cell, rings for the serve op,
-/// which counts the dispatch served or waits to take the gate.
-unsafe fn leave_site(site: &temen_jit::ServeSite, callee: &Mutex<Host>) {
-    site.step_aside();
-    // SAFETY: the callee's cell is live, its hub its live run's.
-    ring(&callee.lock().unwrap_or_else(|e| e.into_inner()));
+/// #2742 — a caller lets its claim of a serve op go (#3060), whether its handler ran or never
+/// started: its place in the domain's handlers, so an end that waited for it goes on; the gate, if
+/// the claim still holds it, so a woken handler of the window may run on the pool, and then the
+/// bell of `callee`, the site's cell, rings for the serve op, which counts the dispatch served or
+/// waits to take the gate. A handler that kept the gate (preempted, or parked on a whole-vCPU
+/// wait) gives it back from the pool: no ring here.
+unsafe fn leave_site(claim: temen_jit::Claim, callee: &Mutex<Host>) {
+    if claim.release() {
+        // SAFETY: the callee's cell is live, its hub its live run's.
+        ring(&callee.lock().unwrap_or_else(|e| e.into_inner()));
+    }
 }
 
 /// #2742 — the reply a handler's end gives a direct handoff's caller: its results, or, for a handler
@@ -3694,15 +3700,11 @@ fn handoff_reply(end: temen_jit::HandlerEnd) -> Reply {
     }
 }
 
-/// #2742 — the callee's parked serve op, its gate taken, for a direct handoff of a call of op `op` of
-/// export `export` with `n_args` arguments: its queue is empty, and the op's handler exists and takes
-/// that many. `None` otherwise: the call is queued, and its serve loop answers it, refusals included.
-fn handoff_site(
-    g: &Host,
-    export: u32,
-    op: u32,
-    n_args: usize,
-) -> Option<(Arc<temen_jit::ServeSite>, u32)> {
+/// #2742 — the callee's parked serve op, claimed (its gate and a place in its domain's handlers,
+/// under `g`, the callee's lock: #3060), for a direct handoff of a call of op `op` of export `export`
+/// with `n_args` arguments: its queue is empty, and the op's handler exists and takes that many.
+/// `None` otherwise: the call is queued, and its serve loop answers it, refusals included.
+fn handoff_site(g: &Host, export: u32, op: u32, n_args: usize) -> Option<(temen_jit::Claim, u32)> {
     if g.svc_queued() != 0 {
         return None;
     }
@@ -3711,7 +3713,10 @@ fn handoff_site(
     // SAFETY: a published site's serve context is live while its serve op parks.
     let (_, n_params, _) =
         unsafe { temen_jit::handler_tramp_of(g.serve_ctx() as *const c_void, func)? };
-    (n_params == n_args && site.try_enter()).then_some((site, func))
+    if n_params != n_args {
+        return None;
+    }
+    Some((site.claim()?, func))
 }
 
 /// The arm-5 caller park: wait, from `guard` on `callee`'s cell, parked as `parks` says, for its

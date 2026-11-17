@@ -118,9 +118,9 @@ pub struct VmCtx {
     /// end word is; owned by its root context ([`Self::owned_handlers`]). Never read by compiled
     /// code.
     #[cfg(fiber_rt)]
-    handlers: *const std::sync::atomic::AtomicUsize,
+    handlers: *const crate::child_exec::HandlerCount,
     #[cfg(fiber_rt)]
-    owned_handlers: Option<Box<std::sync::atomic::AtomicUsize>>,
+    owned_handlers: Option<Box<crate::child_exec::HandlerCount>>,
     /// #2534 — the window and function table this run's code runs over, for the host functions,
     /// which read them here rather than take them from the code. Never read by compiled code, so
     /// it sits past every field the code loads, which keep their short offsets.
@@ -235,7 +235,7 @@ impl VmCtx {
         // Boxed, so the word stays put when the context moves.
         let owned_end = Box::new(AtomicI64::new(0));
         #[cfg(fiber_rt)]
-        let owned_handlers = Box::new(std::sync::atomic::AtomicUsize::new(0));
+        let owned_handlers = Box::new(crate::child_exec::HandlerCount::new());
         VmCtx {
             trap: AtomicI64::new(0),
             end: &*owned_end,
@@ -320,7 +320,7 @@ impl VmCtx {
     /// #2742 — the domain's count of serve handlers its end waits for
     /// ([`crate::child_exec::HANDLERS_ENDING`]).
     #[cfg(fiber_rt)]
-    pub(crate) fn handlers(&self) -> &std::sync::atomic::AtomicUsize {
+    pub(crate) fn handlers(&self) -> &crate::child_exec::HandlerCount {
         // SAFETY: as the end word's: the root context's boxed count, which outlives every context of
         // its domain.
         unsafe { &*self.handlers }
