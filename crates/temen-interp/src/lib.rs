@@ -12771,6 +12771,11 @@ struct RegState {
     /// handed back when the fiber returns ([`Self::finish`]) or the registry goes. Grows with
     /// `fibers` (same index).
     charges: Vec<LiveFiber>,
+    /// #3108 — per slot: the funcref the fiber was made with (`cont.new`'s), the dispatch-table slot
+    /// its start resolves. A freeze records it as the fiber's entry, as the JIT does: the frame's
+    /// function index is local to its module, and a unit's would name another function in the
+    /// program. Grows with `fibers` (same index).
+    entry: Vec<i32>,
     /// Freed slots reclaimable for a new fiber (recycling step 3), a **min-heap** so `create` reuses the
     /// *lowest* free slot — keeping contexts dense and low (within `MAX_SHADOW_CTX`, and clear of the
     /// top-down vCPU pool) and bounding the table to the *peak concurrent* fiber count rather than the
@@ -12791,6 +12796,7 @@ impl FiberRegistry {
                 consumed: Vec::new(),
                 pending: Vec::new(),
                 charges: Vec::new(),
+                entry: Vec::new(),
                 free: BinaryHeap::new(),
                 contexts: ShadowContexts::default(),
             }),
@@ -12883,6 +12889,7 @@ impl FiberRegistry {
             t.consumed[slot] = false;
             t.pending[slot] = None;
             t.charges[slot] = charge;
+            t.entry[slot] = func;
             t.gens[slot] // kept from the freed occupant's bump (the ABA guard)
         } else {
             t.fibers.push(RegFiber::Pending { func, arg0 });
@@ -12891,6 +12898,7 @@ impl FiberRegistry {
             t.consumed.push(false);
             t.pending.push(None);
             t.charges.push(charge);
+            t.entry.push(func);
             0
         };
         Ok(fiber_handle(slot, generation))
@@ -13151,6 +13159,7 @@ impl FiberRegistry {
         t.consumed.push(false);
         t.pending.push(None);
         t.charges.push(LiveFiber::none());
+        t.entry.push(0);
         t.free.push(Reverse(slot));
         slot
     }
@@ -13227,6 +13236,7 @@ impl FiberRegistry {
         t.consumed.push(consumed); // #1538: a consumed park delivers at its rewound suspend
         t.pending.push(None);
         t.charges.push(charge);
+        t.entry.push(func);
         slot
     }
 
@@ -13242,6 +13252,11 @@ impl FiberRegistry {
         } else if t.consumed[slot] {
             t.pending[slot] = Some(arg);
         }
+    }
+
+    /// #3108 — the funcref the fiber at `slot` was made with ([`RegState::entry`]).
+    fn entry(&self, slot: usize) -> i32 {
+        self.lock().entry[slot]
     }
 
     /// #1538 — the argument a thawed, consumed fiber's re-executed `suspend` must return (taken).
@@ -14288,8 +14303,10 @@ impl VCpu {
         placeholder: Option<Reg>,
         reissue: bool,
     ) -> Result<(), Trap> {
-        // The entry funcref (== func index) + its first argument, to re-enter the fiber on thaw.
-        let func = frames.first().map(|f| f.func as i32).unwrap_or(0);
+        // The entry funcref + its first argument, to re-enter the fiber on thaw. The funcref is the
+        // one `cont.new` took, not the entry frame's function index: a unit's index is local to it,
+        // and the thaw's start resolves the funcref through the dispatch table (#3108).
+        let func = self.domain.registry.entry(slot);
         let arg0 = match frames.first().and_then(Frame::sp) {
             Some(r) => r.i64(),
             _ => 0,
@@ -17161,8 +17178,14 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         // finish), so [`MAX_FIBERS`] bounds concurrent parked handlers too.
                         // Exhaustion is backpressure to the dispatch, not a trap. A fiber the
                         // runtime makes for a dispatch is mechanism, charged to nothing (#2112).
-                        let handle = match registry.create(0, 0, durable, arena, LiveFiber::none())
-                        {
+                        // Its entry is the handler, a function of the program (#3108).
+                        let handle = match registry.create(
+                            fidx as i32,
+                            0,
+                            durable,
+                            arena,
+                            LiveFiber::none(),
+                        ) {
                             Ok(h_) => h_,
                             Err(_) => {
                                 sched.cap_reply_or_stash(d.ticket, Reply::Failed(EAGAIN), host);
@@ -23583,9 +23606,8 @@ pub enum DeclineCause {
     ForkTwin,
     /// A vCPU is parked at a site whose [`FreezeRule`] is still `Decline` (#1898).
     Parked(ParkSite),
-    /// #3034 — a `thread.spawn` child runs an installed §22 unit's function: its residue names the
-    /// function by its index in the unit, but not the unit, so no thaw could re-create it (one would
-    /// run a function of module 0 by that index).
+    /// #3034 — a `thread.spawn` child runs an installed §22 unit's function. Neither engine's thaw can
+    /// re-create it: it resolves a thread's entry as a function of the program (#3108).
     UnitThread,
 }
 

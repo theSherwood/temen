@@ -1370,23 +1370,17 @@ block 2 () {
 }
 ";
 
-/// R2.1 — the program compiles the unit from its window, installs it and calls it; the unit's thread
-/// is live when the freeze is asked for. The tree-walker's census declines that freeze
-/// (`DeclineCause::UnitThread`) and the run goes on to the unit's 7; the JIT, which has no census,
-/// declines a durable run that hosts a unit's threads whole. Before #3034 the freeze was taken and
-/// its thaw ran the program's function of the unit function's index (#3108). The bytecode does not
-/// run this program to its result (#3110), so it reaches no freeze here.
-#[test]
-fn a_freeze_while_a_units_thread_runs_is_declined_and_the_run_goes_on() {
-    const BLOB_AT: usize = 0x1_1000;
-    let unit = temen_text::parse_module(UNIT_SPAWNS).expect("parse");
-    temen_verify::verify_module(&unit).expect("verify");
-    let blob = temen_encode::encode_module(&unit);
-    // The second function only taints the entry signature the durable install fence asks for.
-    let inst = instrument(&format!(
+/// Where [`unit_guest`] finds its unit's encoding in the window.
+const UNIT_AT: usize = 0x1_1000;
+
+/// A program that compiles the unit encoded at [`UNIT_AT`] (`blob_len` bytes), installs it, and calls
+/// its entry `() -> (i32)`, answering what it returns. Its second function only taints the entry
+/// signature the durable install fence asks for.
+fn unit_guest(blob_len: usize) -> Module {
+    instrument(&format!(
         "func (i32) -> (i64) {{
 block 0 (v0: i32) {{
-  v1 = i64.const {BLOB_AT}
+  v1 = i64.const {UNIT_AT}
   v2 = i64.const {len}
   v3 = call.cap 11 0 (i64, i64) -> (i64) v0 (v1, v2)
   v4 = call.cap 11 3 (i64) -> (i64) v0 (v3)
@@ -1406,10 +1400,30 @@ block 0 () {{
   }}
 }}
 ",
-        len = blob.len()
-    ));
+        len = blob_len
+    ))
+}
+
+/// A window holding `blob` at [`UNIT_AT`].
+fn unit_window(blob: &[u8]) -> Vec<u8> {
     let mut win = init_durable_window(WINDOW, TEST_ARENA);
-    win[BLOB_AT..BLOB_AT + blob.len()].copy_from_slice(&blob);
+    win[UNIT_AT..UNIT_AT + blob.len()].copy_from_slice(blob);
+    win
+}
+
+/// R2.1 — the program compiles the unit from its window, installs it and calls it; the unit's thread
+/// is live when the freeze is asked for. The tree-walker's census declines that freeze
+/// (`DeclineCause::UnitThread`) and the run goes on to the unit's 7; the JIT, which has no census,
+/// declines a durable run that hosts a unit's threads whole. Before #3034 the freeze was taken and
+/// its thaw ran the program's function of the unit function's index (#3108). The bytecode does not
+/// run this program to its result (#3110), so it reaches no freeze here.
+#[test]
+fn a_freeze_while_a_units_thread_runs_is_declined_and_the_run_goes_on() {
+    let unit = temen_text::parse_module(UNIT_SPAWNS).expect("parse");
+    temen_verify::verify_module(&unit).expect("verify");
+    let blob = temen_encode::encode_module(&unit);
+    let inst = unit_guest(blob.len());
+    let mut win = unit_window(&blob);
     temen_durable::arm_freeze_after_backedges(&mut win, TEST_ARENA, 5);
 
     let mut h = Host::new();
@@ -1504,4 +1518,173 @@ block 0 (v0: i64, v1: i64) {
         h.residue().is_empty() && !h.freeze_refused(),
         "nothing is carried"
     );
+}
+
+/// #3108 — a unit whose `f0` makes a fiber of its own `f1` (`ref.func 1`: the table slot its `f1`
+/// was installed into) and resumes it (it suspends 5), waits 64 times (safepoints), then resumes it
+/// with 2 (it returns 102) and answers `1000 + 102`.
+const UNIT_FIBER: &str = "memory 17 shadow 16448 65536
+func () -> (i32) {
+block 0 () {
+  vf = ref.func 1
+  vss = i64.const 4096
+  vk = cont.new vf vss
+  vz = i64.const 0
+  vs1, vv1 = cont.resume vk vz
+  vi0 = i64.const 0
+  br 1(vi0, vk)
+}
+block 1 (vi: i64, vkk: i64) {
+  va = i64.const 66000
+  vx = i32.const 99
+  vto = i64.const 0
+  vw = i32.atomic.wait va vx vto
+  vone = i64.const 1
+  vi2 = i64.add vi vone
+  vlim = i64.const 64
+  vmore = i64.ne vi2 vlim
+  br_if vmore 1(vi2, vkk) 2(vkk)
+}
+block 2 (vk3: i64) {
+  vtwo = i64.const 2
+  vs2, vv2 = cont.resume vk3 vtwo
+  vth = i64.const 1000
+  vr = i64.add vth vv2
+  vr32 = i32.wrap_i64 vr
+  return vr32
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (v0: i64, v1: i64) {
+  v2 = i64.const 5
+  v3 = suspend v2
+  v4 = i64.const 100
+  v5 = i64.add v3 v4
+  return v5
+  }
+}
+";
+
+/// #3108 — a live fiber an installed unit made over its own function rides a freeze: the freeze
+/// records the funcref the fiber was made with (the table slot), which the thaw's start resolves
+/// through the re-applied table. Frozen on the tree-walker or the JIT (the bytecode takes no freeze
+/// in this program), it thaws on all three engines to the uninterrupted 1102. On `0265ec4` the tree-walker recorded the entry frame's index in the unit
+/// (`1`), and its thaw started module 0's function 1 instead: `FiberFault` (another signature).
+#[test]
+fn a_units_live_fiber_freezes_and_thaws_on_every_engine() {
+    let unit = temen_text::parse_module(UNIT_FIBER).expect("parse");
+    temen_verify::verify_module(&unit).expect("verify");
+    let blob = temen_encode::encode_module(&unit);
+    let inst = unit_guest(blob.len());
+    let host = || {
+        let mut h = Host::new();
+        h.set_durable(true);
+        h.set_jit_hosts_fibers(true);
+        let jh = temen_run::grant_jit_durable_confined(&mut h, &inst, 4);
+        (h, jh)
+    };
+    let fresh = unit_window(&blob);
+    let mut armed = fresh.clone();
+    temen_durable::arm_freeze_after_backedges(&mut armed, TEST_ARENA, 5);
+    let (mut h, jh) = host();
+    assert_eq!(
+        interp_run_with(&inst, &fresh, jh, &mut h),
+        Ok(vec![Value::I64(1102)])
+    );
+
+    let (mut h, jh) = host();
+    let mut fuel = 10_000_000u64;
+    let (r, tw_win) = run_capture_reserved_with_host(
+        &inst,
+        0,
+        &[Value::I32(jh)],
+        &mut fuel,
+        &armed,
+        SIZE_LOG2,
+        &mut h,
+    );
+    assert_eq!(r, Ok(vec![Value::I64(0)]), "the tree-walker freezes");
+    assert_eq!(h.residue().fibers.len(), 1);
+    let tw_art = temen_snapshot::freeze(&inst, &tw_win, &h).expect("freeze");
+
+    let (mut h, jh) = host();
+    let (o, snap) = temen_run::jit_cap_run(
+        &inst,
+        0,
+        &[jh as i64],
+        &MemLayout::image(armed),
+        SIZE_LOG2,
+        4,
+        &mut h,
+        None,
+    )
+    .expect("JIT run");
+    assert!(
+        matches!(&o, JitOutcome::Returned(v) if *v == [0]),
+        "the JIT freezes: {o:?}"
+    );
+    assert_eq!(h.residue().fibers.len(), 1);
+    let jit_art = temen_snapshot::freeze(&inst, snap.bytes(), &h).expect("freeze");
+
+    for (froze, art) in [("tree-walker", &tw_art), ("JIT", &jit_art)] {
+        let restored = || {
+            let mut h = Host::new();
+            h.set_durable(true);
+            h.set_jit_hosts_fibers(true);
+            temen_run::set_jit_durable_policy_confined(&mut h, &inst);
+            let mut w = temen_snapshot::restore(art, &inst, &mut h).expect("restore");
+            begin_thaw(&mut w, TEST_ARENA, 0);
+            (h, w)
+        };
+        let (mut h, w) = restored();
+        assert_eq!(
+            interp_run_with(&inst, &w, jh, &mut h),
+            Ok(vec![Value::I64(1102)]),
+            "frozen on the {froze}, thawed on the tree-walker"
+        );
+        let (mut h, w) = restored();
+        let mut fuel = 10_000_000u64;
+        let bc = temen_interp::bytecode::compile_and_run_capture_reserved_with_host(
+            &inst,
+            0,
+            &[Value::I32(jh)],
+            &mut fuel,
+            &w,
+            SIZE_LOG2,
+            &mut h,
+        )
+        .map(|c| c.0);
+        assert_eq!(
+            bc,
+            Some(Ok(vec![Value::I64(1102)])),
+            "frozen on the {froze}, thawed on the bytecode"
+        );
+        let (mut h, w) = restored();
+        let jit = temen_run::jit_cap_run(
+            &inst,
+            0,
+            &[jh as i64],
+            &MemLayout::image(w),
+            SIZE_LOG2,
+            4,
+            &mut h,
+            None,
+        )
+        .map(|(o, _)| o);
+        assert!(
+            matches!(&jit, Ok(JitOutcome::Returned(v)) if *v == [1102]),
+            "frozen on the {froze}, thawed on the JIT: {jit:?}"
+        );
+    }
+}
+
+/// [`interp_run`] with the program's `Jit` handle as its argument.
+fn interp_run_with(
+    inst: &Module,
+    win: &[u8],
+    jh: i32,
+    h: &mut Host,
+) -> Result<Vec<Value>, temen_interp::Trap> {
+    let mut fuel = 10_000_000u64;
+    run_capture_reserved_with_host(inst, 0, &[Value::I32(jh)], &mut fuel, win, SIZE_LOG2, h).0
 }

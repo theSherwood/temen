@@ -330,7 +330,9 @@ function, `Host::leave_freeze`, which runs the pass:
 - a freeze asked for while an installed unit's thread runs is **declined**
   (`DeclineCause::UnitThread`) and the run goes on: the residue names a function by its index in the
   program, so it cannot name one of a unit's (#3108). The JIT, which has no freeze census, declines
-  a durable run that hosts a unit's threads whole.
+  a durable run that hosts a unit's threads whole. A unit's fiber rides: its freeze records the
+  funcref the fiber was made with (the table slot), which the thaw's start resolves through the
+  re-applied table, on every engine.
 
 A guest that corrupts a shadow-SP word thus gets `Unreachable`, on every engine, and its cut carries
 nothing; a `freeze` of that powerbox writes the window as the guest left it and no residue. A bug in
