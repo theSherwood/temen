@@ -9685,14 +9685,15 @@ struct DispatchParks {
     sig_interrupt: bool,
     /// #1936 — a post's `signal` left this region word to wake.
     region: Option<super::RegionWake>,
-    /// A peer's pipe write or close raised a wake flag. It needs no action at a dispatch site (see
-    /// [`Self::take`]), but it is per-op too, so it is drained, and counted in [`Self::quiet`].
+    /// This dispatch's own pipe write or close raised a wake flag (for the peers parked on that
+    /// pipe). It needs no action at a dispatch site (see [`Self::take`]), but it is per-op too, so
+    /// it is drained, and counted in [`Self::quiet`].
     woke: bool,
 }
 
 impl DispatchParks {
-    /// Whether the op left no flag at all ([`call_park`]'s check of [`Host::parks_left`]). An
-    /// exhaustive destructure, so a new flag fails to compile until it is decided here.
+    /// Whether the op left no flag at all ([`Self::left`]'s debug check of [`Host::parks_left`]).
+    /// An exhaustive destructure, so a new flag fails to compile until it is decided here.
     fn quiet(&self) -> bool {
         let DispatchParks {
             stdin,
@@ -9716,9 +9717,9 @@ impl DispatchParks {
 
     /// The flags the last dispatch left, drained into `into`, which is left as it was (`None`)
     /// when the dispatch left none, as most calls do: such a call writes nothing, where returning
-    /// the `Option` would move one the size of `Self`. Call ONLY inside the dispatch's own lock scope: the read is under the hold the call that
-    /// could leave a flag ran in, so no other vCPU's dispatch can leave or clear one between the
-    /// call and the read (#1173).
+    /// the `Option` would move one the size of `Self`. Call ONLY inside the dispatch's own lock
+    /// scope: the read is under the hold the call that could leave a flag ran in, so no other
+    /// vCPU's dispatch can leave or clear one between the call and the read (#1173).
     ///
     /// `!parks_left()` is exactly "[`Self::take`] would find nothing". `take` drains, and
     /// [`Host::parks_left`] covers:
