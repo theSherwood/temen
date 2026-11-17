@@ -148,7 +148,7 @@ fn concurrent_freeze_from(inst: &Module, from: FreezeFrom) -> Option<FreezeOutco
         cc.ptr(),
         DurableRun {
             seed: jit_thaw(
-                &inst,
+                inst,
                 temen_ir::thaw::RawResidue {
                     root_sp: Some(TEST_ARENA.frame_base(0)),
                     ..Default::default()
@@ -203,7 +203,7 @@ fn thaw(
         cc.ptr(),
         DurableRun {
             seed: jit_thaw(
-                &inst,
+                inst,
                 temen_ir::thaw::RawResidue {
                     fibers: fibers.to_vec(),
                     vcpus: vcpus.to_vec(),
@@ -1233,7 +1233,7 @@ fn run_mv_fresh(inst: &Module) -> (JitOutcome, Vec<u8>) {
         cc.ptr(),
         DurableRun {
             seed: jit_thaw(
-                &inst,
+                inst,
                 temen_ir::thaw::RawResidue {
                     root_sp: Some(TEST_ARENA.frame_base(0)),
                     ..Default::default()

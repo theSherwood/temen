@@ -149,7 +149,7 @@ fn two_vcpu_domain_freezes_and_thaws() {
             temen_interp::Residue {
                 vcpus: frozen,
                 root_sp: Some(root_sp),
-                children: children,
+                children,
                 ..Default::default()
             },
         )
@@ -306,7 +306,7 @@ fn vcpu_and_fiber_coexist_through_freeze_thaw() {
                 fibers: frozen_fibers,
                 vcpus: frozen_vcpus,
                 root_sp: Some(root_sp),
-                children: children,
+                children,
                 ..Default::default()
             },
         )
@@ -459,7 +459,7 @@ fn child_owns_fiber_through_freeze_thaw() {
                 fibers: frozen_fibers,
                 vcpus: frozen_vcpus,
                 root_sp: Some(root_sp),
-                children: children,
+                children,
                 ..Default::default()
             },
         )
@@ -617,7 +617,7 @@ fn nested_spawn_tree_freezes_and_thaws() {
             temen_interp::Residue {
                 vcpus: frozen,
                 root_sp: Some(root_sp),
-                children: children,
+                children,
                 ..Default::default()
             },
         )
@@ -721,7 +721,7 @@ fn a_frozen_threads_entry_is_paid_once() {
             temen_interp::Residue {
                 vcpus: frozen,
                 root_sp: Some(root_sp),
-                children: children,
+                children,
                 ..Default::default()
             },
         )

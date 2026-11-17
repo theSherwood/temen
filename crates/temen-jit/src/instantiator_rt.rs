@@ -1389,7 +1389,7 @@ impl Nursery {
                 );
                 release(gc.ctx);
                 release(gc.retained_ctx);
-                release_thaw(release, thaw);
+                release_thaw(release, *thaw);
                 return false;
             }
         };

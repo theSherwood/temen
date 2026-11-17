@@ -62,7 +62,7 @@ fn tw_run(
     window: &[u8],
     frozen: Vec<FrozenFiber>,
 ) -> (Result<Vec<Value>, Trap>, Vec<u8>, Host) {
-    let mut h = durable_host(&inst, frozen);
+    let mut h = durable_host(inst, frozen);
     let mut fuel = 1_000_000u64;
     let (r, win) =
         run_capture_reserved_with_host(inst, 0, &[], &mut fuel, window, SIZE_LOG2, &mut h);
@@ -75,7 +75,7 @@ fn bc_run(
     window: &[u8],
     frozen: Vec<FrozenFiber>,
 ) -> (Result<Vec<Value>, Trap>, Vec<u8>, Host) {
-    let mut h = durable_host(&inst, frozen);
+    let mut h = durable_host(inst, frozen);
     let mut fuel = 1_000_000u64;
     let (r, win) = bytecode::compile_and_run_capture_reserved_with_host(
         inst,
@@ -441,7 +441,7 @@ fn a_wait_parked_fiber_freezes_and_thaws_on_the_bytecode_engine() {
 /// thaws to `want` on both engines.
 fn freeze_at_host_call(inst: &temen_ir::Module, want: Result<Vec<Value>, Trap>) {
     let run = |bytecode_engine: bool, win: &[u8], freeze: bool, frozen: Vec<FrozenFiber>| {
-        let mut h = durable_host(&inst, frozen);
+        let mut h = durable_host(inst, frozen);
         let hf = h.grant_host_proc(HostProcGrant::new(
             ProcHandler::Sync(Box::new(move |_op, _args, out, mem, _| {
                 if freeze {

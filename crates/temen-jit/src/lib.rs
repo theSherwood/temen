@@ -2228,9 +2228,9 @@ pub(crate) struct Seeded {
 
 /// Take `thaw` apart for this runtime. `Err` (it, untouched) for one holding a fork twin, which this
 /// engine does not re-create (#3100): the caller refuses the thaw whole, never part of it (#1690).
-pub(crate) fn seeded(thaw: JitThaw) -> Result<Seeded, JitThaw> {
+pub(crate) fn seeded(thaw: JitThaw) -> Result<Seeded, Box<JitThaw>> {
     if !thaw.parts().twins.is_empty() || !thaw.parts().exited_twins.is_empty() {
-        return Err(thaw);
+        return Err(Box::new(thaw));
     }
     // Every part of the residue, by name: one this engine does not consume does not compile.
     let temen_ir::thaw::RawResidue {

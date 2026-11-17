@@ -119,7 +119,7 @@ fn a_mid_handler_freeze_thaws_and_the_handler_replies() {
     h.admit_thaw(
         &inst,
         temen_interp::Residue {
-            fibers: fibers,
+            fibers,
             ..Default::default()
         },
     )

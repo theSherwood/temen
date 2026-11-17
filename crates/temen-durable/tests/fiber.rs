@@ -1001,7 +1001,7 @@ fn an_unwoken_cap_parked_fiber_freezes_and_its_thaw_reissues_the_read() {
     h.admit_thaw(
         &inst,
         temen_interp::Residue {
-            fibers: fibers,
+            fibers,
             ..Default::default()
         },
     )
