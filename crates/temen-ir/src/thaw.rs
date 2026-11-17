@@ -316,7 +316,8 @@ impl<D, T> From<Refused<D, T>> for Malformed {
     }
 }
 
-/// The record kinds the code of a domain of `m` can make (#3034): a fiber needs a `cont.new`, a vCPU
+/// The record kinds the code of a domain of `m` can make (#3034): a fiber needs a `cont.new` or a serve
+/// op (`svc.poll`/`svc.wait`, whose handlers are fibers), a vCPU
 /// a `thread.spawn`, and a detached child an `Instantiator` call. `installs` says the domain holds a
 /// `Jit` grant: code installed through it runs in the domain's frames and may make any of them
 /// (DESIGN.md §22). An engine that stood up no runtime for a kind its residue holds declines the thaw
@@ -343,7 +344,13 @@ impl Makes {
                     .any(|f| f.blocks.iter().any(|b| b.insts.iter().any(p)))
         };
         Makes {
-            fibers: site(|i| matches!(i, Inst::ContNew { .. })),
+            // A serve op runs each dispatch as a handler fiber of the serving task (#2742); a durable
+            // domain reaches one only by a direct `call.cap` (an import never binds to one).
+            fibers: site(|i| match i {
+                Inst::ContNew { .. } => true,
+                Inst::CapCall(c) => crate::durable_abi::is_serve_op(c.type_id, c.op),
+                _ => false,
+            }),
             vcpus: site(|i| matches!(i, Inst::ThreadSpawn { .. })),
             detached: site(|i| matches!(i, Inst::CapCall(c) if c.type_id == cap_id::INSTANTIATOR)),
         }

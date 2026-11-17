@@ -305,6 +305,22 @@ fn a_record_kind_the_domains_code_cannot_make_is_refused() {
             "{name}: at its site"
         );
     }
+    // A serve op's handlers are fibers (#2742): its site admits them too.
+    let mut m = module(Some(A));
+    site(
+        &mut m,
+        Inst::CapCall(Box::new(crate::CapCall {
+            type_id: crate::CAP_SELF_TYPE_ID,
+            op: crate::durable_abi::SVC_WAIT_OP,
+            sig: 0,
+            handle: 0,
+            args: Box::new([]),
+        })),
+    );
+    assert!(
+        validate(&m, false, 0, only(0)).is_ok(),
+        "fibers: at a serve op"
+    );
 }
 
 /// A refusal hands the residue back whole.
