@@ -2041,20 +2041,28 @@ block 0 (va: i64, vb: i64) {
         (call(4, 7), Host::new()),
         (call(10, 0), blocking()),
         (call(13, 0), host_answered()),
+        // #2958 slice 6 — calls no interface serves, a `CapFault` on every engine
+        // (`a_call_no_interface_serves_is_a_cap_fault_on_every_engine`).
+        (call(2, 1), Host::new()),
     ];
     for (i, (m, host)) in admitted.iter().enumerate() {
         assert_eq!(jit_kernel::admit(m, host, false).err(), None, "row {i}");
     }
     let rows: Vec<(temen_ir::Module, Host, &str)> = vec![
-        // An op no interface has: `Clock` has only op 0.
-        (call(2, 1), Host::new(), "cap"),
+        // A §13 region's `grant` into a child domain: inline, the bytecode compile declines it
+        // first; through an import it is `kernel_op`'s `§14 children`
+        // (`a_grouped_import_is_decided_on_every_op_it_reaches`).
+        (call(4, 4), Host::new(), "bytecode"),
+        // Being settled in slice 6: `FreezeAuthority` answers `-EINVAL` on every engine, and a
+        // plain `self` op packed with an index is `Malformed` on all but today's route.
+        (call(16, 0), Host::new(), "cap"),
+        (call(selfop, 5 | 1 << 8), Host::new(), "cap"),
         // `fuel` is the table's, but the bytecode compile declines the op first.
         (call(selfop, 13), Host::new(), "bytecode"),
         (call(6, 17), Host::new(), "§14 children"),
         (call(7, 0), Host::new(), "§14 children"),
         (call(8, 1), Host::new(), "§14 children"),
         (call(11, 0), Host::new(), "jit cap"),
-        (call(16, 0), Host::new(), "cap"),
         (call(0x1000_0000, 0), Host::new(), "serving"),
         // A live callee's offer under a built-in's id: a call on it is the callee's to serve.
         (call(0, 1), live_impl(), "serving"),
@@ -2193,8 +2201,9 @@ fn a_wait_on_an_alias_of_a_truncated_file_is_declined() {
 }
 
 /// #2958 slice 4 review, finding 3 — a grouped import reaches every op its remap names, and the
-/// kernel route decides each: a `{ write, read }` interface over a `Budget` is declined when its
-/// `read` reaches an op no interface has (`cap`), though its first op would not be.
+/// kernel route decides each: a `{ write, read }` interface over a `SharedRegion` is declined when
+/// its `read` reaches the region's `grant` into a child (`§14 children`), though its first op would
+/// not be.
 #[test]
 fn a_grouped_import_is_decided_on_every_op_it_reaches() {
     let m = module(
@@ -2218,14 +2227,17 @@ block 0 () {
     let bound = |read: u32| {
         let mut host = Host::new();
         host.set_import_bindings(vec![temen_interp::BoundImport::required(
-            temen_ir::cap_id::BUDGET,
+            temen_ir::cap_id::SHARED_REGION,
             1,
             0,
         )]);
         host.set_import_remap(0, std::sync::Arc::from(vec![1u32, read]));
         host
     };
-    assert_eq!(jit_kernel::admit(&m, &bound(9), false).err(), Some("cap"));
+    assert_eq!(
+        jit_kernel::admit(&m, &bound(4), false).err(),
+        Some("§14 children")
+    );
     assert!(jit_kernel::admit(&m, &bound(0), false).is_ok());
 }
 
@@ -3956,4 +3968,64 @@ block 0 () {
         assert!(third.result.is_ok());
         assert!(third.backtrace.is_empty() && third.trap_fiber.is_none());
     });
+}
+
+/// The calls #2958 slice 6 takes out of the `cap` clause, each `(type_id, op)`: every engine answers
+/// them `CapFault` in the dispatch. An op past the last of a built-in interface's (`Exit`, `Clock`,
+/// `AddressSpace`, `Budget`, `SharedRegion`); an id `cap_id` leaves unassigned (3 and 9 retired,
+/// 15, 17, and the last below the guest ids); and a `self` op no engine serves (15 retired, 20, 255,
+/// and one of 16–19 packed with an index).
+const CAP_FAULTS: [(u32, u32); 14] = [
+    (1, 1),
+    (2, 1),
+    (5, 6),
+    (14, 4),
+    (4, 8),
+    (3, 0),
+    (9, 0),
+    (15, 0),
+    (17, 0),
+    (0x0FFF_FFFF, 0),
+    (u32::MAX, 15),
+    (u32::MAX, 20),
+    (u32::MAX, 255),
+    (u32::MAX, 17 | 1 << 8),
+];
+
+/// #2958 slice 6 — a call no interface serves answers `CapFault` on the tree-walker, the bytecode
+/// engine, the kernel route and today's route, each asserting its route: the `cap` clause, which
+/// kept such a program on today's route with no event to remove it, is gone.
+#[test]
+fn a_call_no_interface_serves_is_a_cap_fault_on_every_engine() {
+    fn case<const N: usize>(h: i32) -> temen_ir::Module {
+        let (t, op) = CAP_FAULTS[N];
+        rooted(&format!(
+            "  vc = i32.const {h}\n  vr = call.cap {t} {op} () -> (i64) vc ()"
+        ))
+    }
+    macro_rules! each {
+        ($($n:literal)*) => {[$((case::<$n> as fn(i32) -> temen_ir::Module, $n)),*]};
+    }
+    let want: Answer = Err("CapFault".into());
+    for (make, n) in each!(0 1 2 3 4 5 6 7 8 9 10 11 12 13) {
+        let (t, op) = CAP_FAULTS[n];
+        let mut host = Host::new();
+        let m = make(host.grant_freeze_authority());
+        let bytecode = temen_interp::bytecode::compile_and_run_with_host(
+            &m,
+            0,
+            &[],
+            &mut 1_000_000,
+            &mut host,
+        )
+        .map(|r| r.map(|_| Vec::new()).map_err(|t| format!("{t:?}")));
+        assert_eq!(
+            bytecode,
+            Some(want.clone()),
+            "the bytecode engine: ({t}, {op:#x})"
+        );
+        for (route, got) in granted(make, Host::grant_freeze_authority) {
+            assert_eq!(got, want, "{route}: ({t}, {op:#x})");
+        }
+    }
 }

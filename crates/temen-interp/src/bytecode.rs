@@ -9213,16 +9213,29 @@ fn kernel_inst(host: &Host, i: &Inst) -> Result<(), &'static str> {
 /// `call.cap` and a bound import's target. **Default-deny**: what this does not list, the kernel
 /// route declines, and `Err` names the clause and so what removes it (#2958's plan, section B):
 ///
-/// - **`fuel`**: `self.fuel.remaining`, whose parity on a native task is slice 6's;
+/// - **`fuel`**: `self.fuel.remaining`. Unreachable today: the bytecode compile declines the op, so
+///   [`native_scope`]'s `bytecode` declines such a module first. Removed with `bytecode` (slice 7),
+///   whose PR adds the rows that compare the op's answer with the oracle's;
 /// - **`file region`**: `create_region` while a region factory is set ([`file_region`]; #3005's
 ///   fix);
 /// - **`process`**: `clone_caller`, `reap`, `exec` (a later phase; #2958 amendment 5);
 /// - **`serving`**: a service point, a call through a guest interface, or `export.handle` (self
 ///   op 8, packed), which mints an offer of the module's own impl (#2791, #2792);
-/// - **`§14 children`**: `Instantiator`, `Module`, `ModuleLoader` (a later phase);
+/// - **`§14 children`**: `Instantiator`, `Module`, `ModuleLoader`, and a §13 region's `grant` into
+///   a child domain (`SharedRegion` op 4) (a later phase);
 /// - **`jit cap`**: §22 `Jit` and its code handles: two dispatch tables (a later phase);
-/// - **`cap`**: `FreezeAuthority` (a `CapFault` on every engine, with no consumer) and an op no
-///   interface has.
+/// - **`imports`**: a `call.cap` on a reserved pseudo-id at or above [`temen_ir::CAP_DYN_TYPE_ID`]
+///   but `self`'s, whose target a binding or a mid-run attach chooses ([`native_scope`]'s clause).
+///
+/// - **`cap`** (being settled in #2958 slice 6): `FreezeAuthority`, whose ops answer `-EINVAL` on
+///   every engine, and a plain `self` op (0–5) packed with an index, `Malformed` on the
+///   interpreters and the kernel route, not on today's route.
+///
+/// A call no interface serves is admitted (#2958 slice 6): every engine answers it `CapFault` in the
+/// dispatch, so the kernel route answers as they do. That is an op past the last of a built-in
+/// interface's, any op on an id [`cap_id`] leaves unassigned (nothing is ever granted under one),
+/// and a `self` op no engine serves. **A new built-in id or op
+/// must be decided here**: until it is, it falls under these arms as one no engine serves.
 fn kernel_op(host: &Host, type_id: u32, op: u32) -> Result<(), &'static str> {
     use temen_ir::cap_id::*;
     use temen_ir::{CAP_DYN_TYPE_ID, CAP_SELF_TYPE_ID};
@@ -9242,6 +9255,21 @@ fn kernel_op(host: &Host, type_id: u32, op: u32) -> Result<(), &'static str> {
         | (SHARED_REGION, 0..=3 | 5..=7)
         | (HOST_PROC, _)
         | (BLOCKING, _) => Ok(()),
+        // A §13 region's `grant` into a child domain.
+        (SHARED_REGION, 4) => Err("§14 children"),
+        // `FreezeAuthority`: every op answers `-EINVAL` on every engine, an answer, not a fault, so it
+        // stays declined until #2958's audit rules on it (slice 6).
+        (FREEZE_AUTHORITY, _) => Err("cap"),
+        // Calls no interface serves, a `CapFault` on every engine: an op past a built-in interface's
+        // last, and every op on an id `cap_id` leaves unassigned (3 and 9 are retired interfaces, 15
+        // and 17 up to the guest ids never held one).
+        (EXIT, 1..)
+        | (CLOCK, 1..)
+        | (ADDRESS_SPACE, 6..)
+        | (BUDGET, 4..)
+        | (SHARED_REGION, 8..)
+        | (3 | 9 | 15, _)
+        | (17..GUEST_IMPL_BASE, _) => Ok(()),
         // The `self` ops: plain below 6 and at 17–19; from 6 on, packed as `selfop | idx << 8`
         // (the host's dispatch), so decided on the low byte. `self.pipe` (16) mints a pipe, as both
         // interpreters' do.
@@ -9256,12 +9284,17 @@ fn kernel_op(host: &Host, type_id: u32, op: u32) -> Result<(), &'static str> {
             8..=10 => Err("serving"),
             11 | 12 | 14 => Err("process"),
             13 => Err("fuel"),
-            _ => Err("cap"),
+            // A plain op (0–5) packed with an index: `Malformed` on the interpreters and the kernel
+            // route, but not on today's route; declined until #2958's audit rules on it (slice 6).
+            0..=5 => Err("cap"),
+            // A self op no engine serves (15 is retired, 20 up), or one of 16–19 packed with an
+            // index: a `CapFault` on every engine.
+            _ => Ok(()),
         },
         (INSTANTIATOR | MODULE | MODULE_LOADER, _) => Err("§14 children"),
         (JIT | JIT_CODE, _) => Err("jit cap"),
-        (t, _) if (GUEST_IMPL_BASE..CAP_DYN_TYPE_ID).contains(&t) => Err("serving"),
-        _ => Err("cap"),
+        (GUEST_IMPL_BASE..CAP_DYN_TYPE_ID, _) => Err("serving"),
+        (CAP_DYN_TYPE_ID.., _) => Err("imports"),
     }
 }
 
