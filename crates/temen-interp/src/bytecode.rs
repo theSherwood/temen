@@ -2010,8 +2010,9 @@ fn entry_task(
 /// or function the run's source does not have.
 ///
 /// Its entry is paid from `fuel`, the fuel of the domain it runs in, as the spawn completes
-/// ([`entry_task`], #2977): a freeze after the spawn has paid it, and a thaw re-creates no thread
-/// through here. Out of fuel traps the spawner, which ends the run as the thread's own trap would.
+/// ([`super::Fuel::pay_entry`], #2977, #3081: one unit, no draw kept for it), as the tree-walker pays it: a
+/// freeze after the spawn has paid it, and a thaw re-creates no thread through here. Out of fuel
+/// traps the spawner, which ends the run as the thread's own trap would.
 fn thread_task(
     source: &ModuleSource,
     module: usize,
@@ -2022,13 +2023,14 @@ fn thread_task(
     fuel: &mut Fuel,
 ) -> Result<VTask, Trap> {
     let cm = source.get(module).ok_or(Trap::Malformed)?;
+    fuel.pay_entry()?;
     entry_task(
         &cm,
         module,
         func as usize,
         &[Value::I64(arg0), Value::I64(arg1)],
         payer,
-        Some(fuel),
+        None,
     )
 }
 
@@ -18949,7 +18951,8 @@ pub enum CallEntry {
     Call,
     /// The run's root task's entry.
     Root,
-    /// A spawned thread's entry.
+    /// A spawned thread's entry. Its spawn paid it, one unit taken from its node ([`thread_task`],
+    /// #3081): a native tier's code starts its fuel holding that unit for its entry's own charge.
     Thread,
 }
 

@@ -4146,3 +4146,118 @@ fn a_packed_plain_self_op_is_malformed_as_on_the_oracle() {
         );
     }
 }
+
+/// The root spawns a thread that only returns, and returns 7 without joining it: one unit for the
+/// root's entry and one for the thread's, paid as the spawn completes.
+const SPAWN_NO_JOIN: &str = "memory 16
+func () -> (i64) {
+block 0 () {
+  v0 = i64.const 0
+  vh = thread.spawn 1 v0 v0
+  vr = i64.const 7
+  return vr
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (va0: i64, vb0: i64) {
+  vr = i64.const 0
+  return vr
+  }
+}
+";
+
+/// #2958 slice 6, #3081 — a thread's entry is paid as its spawn completes, on every engine: with a
+/// budget of 1, the root's entry takes it, and the spawn cannot pay, so the run is `OutOfFuel` on the
+/// oracle, the kernel route and today's route alike, whether or not the thread would have started
+/// before the root returned. With 2 every engine completes.
+#[test]
+fn a_spawn_that_cannot_pay_its_threads_entry_is_out_of_fuel() {
+    let m = module(SPAWN_NO_JOIN);
+    for (budget, want) in [(1, Err(Trap::OutOfFuel)), (2, Ok(vec![7]))] {
+        for _ in 0..20 {
+            let [oracle, today, kernel] = fueled(&m, budget);
+            assert_eq!(oracle.0, want, "the oracle, budget {budget}");
+            assert_eq!(kernel.0, want, "the kernel route, budget {budget}");
+            assert_eq!(
+                kernel.1, oracle.1,
+                "the oracle's fuel left, budget {budget}"
+            );
+            assert_eq!(today.0, want, "today's route, budget {budget}");
+        }
+    }
+}
+
+/// A thread enters, sets a flag, wakes the root and parks; the root waits for the flag, runs 19,999
+/// taken back-edges, releases the thread and joins it. Its exact cost is 20,001.
+const PARKED_THEN_WORK: &str = "memory 16
+func () -> (i64) {
+block 0 () {
+  v0 = i64.const 0
+  vh = thread.spawn 1 v0 v0
+  vflag = i64.const 16384
+  vz32 = i32.const 0
+  vinf = i64.const -1
+  vw = i32.atomic.wait vflag vz32 vinf
+  vn = i64.const 20000
+  br 1(vn, vh)
+}
+block 1 (vi: i64, vh1: i32) {
+  vone = i64.const 1
+  vj = i64.sub vi vone
+  vz = i64.eqz vj
+  br_if vz 2(vh1) 1(vj, vh1)
+}
+block 2 (vh: i32) {
+  vrel = i64.const 16388
+  vone2 = i32.const 1
+  i32.atomic.store vrel vone2
+  vn2 = atomic.notify vrel vone2
+  vst, vv = thread.join vh
+  return vv
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (va0: i64, vb0: i64) {
+  vflag = i64.const 16384
+  vone = i32.const 1
+  i32.atomic.store vflag vone
+  vn = atomic.notify vflag vone
+  vrel = i64.const 16388
+  vz32 = i32.const 0
+  vinf = i64.const -1
+  vw = i32.atomic.wait vrel vz32 vinf
+  vr = i64.const 0
+  return vr
+  }
+}
+";
+
+/// #2958 slice 6, #3081 — a thread that paid its entry keeps none of the draw that paid it, on every
+/// engine: parked beside a root that works, it strands nothing, so the kernel route's least budget is
+/// the oracle's, the run's exact cost (20,001), and a completed run leaves the oracle's fuel.
+#[test]
+fn a_parked_thread_strands_none_of_its_entrys_draw() {
+    let m = module(PARKED_THEN_WORK);
+    let [oracle, today, kernel] = fueled(&m, 1_000_000);
+    assert_eq!(oracle.0, Ok(vec![0]));
+    assert_eq!(
+        kernel, oracle,
+        "the kernel route: the oracle's answer and fuel left"
+    );
+    assert_eq!(
+        today, oracle,
+        "today's route: the oracle's answer and fuel left"
+    );
+    let least = least_budget(&m, 0, 1_000_000);
+    assert_eq!(least, 20_001, "the oracle completes on the exact cost");
+    assert_eq!(
+        least_budget(&m, 2, 1_000_000),
+        least,
+        "the kernel route's least budget"
+    );
+    assert_eq!(
+        least_budget(&m, 1, 1_000_000),
+        least,
+        "today's route's least budget"
+    );
+}

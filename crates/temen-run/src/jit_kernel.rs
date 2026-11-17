@@ -450,10 +450,17 @@ fn tier_run(call: &mut EmittedCall<'_>) -> Result<(), Trap> {
     };
     // Its own cell, drawing from its task's budget node, so siblings never share one; what it drew
     // and did not burn goes back to the node as it drops, when the vCPU ends however it ends.
+    // #3081 — a thread's entry was paid as its spawn completed, one unit taken from its node and none
+    // kept beside it ([`CallEntry::Thread`]): its cell starts holding that unit, which the entry's
+    // prologue burns, so its first draw is at its first back-edge or call, as on the oracle.
+    let paid = u64::from(matches!(call.entry, CallEntry::Thread));
     let mut fuel = match call.fuel_node.take() {
         Some(node) => FuelCell::drawing(Arc::new(crate::HostNode(node))),
         None => FuelCell::fixed(u64::MAX),
     };
+    if fuel.left == 0 {
+        fuel.left = paid;
+    }
     let (tls, host, end) = (call.tls, call.host_cell(), call.end);
     let ran = {
         let mut hook = Hook(call);
