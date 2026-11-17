@@ -2057,8 +2057,9 @@ block 0 (va: i64, vb: i64) {
         // first; through an import it is `kernel_op`'s `§14 children`
         // (`a_grouped_import_is_decided_on_every_op_it_reaches`).
         (call(4, 4), Host::new(), "bytecode"),
-        // Unlisted, so declined until the table decides it: an op no interface has (`Clock` has
-        // only op 0), and `FreezeAuthority` past op 5.
+        // Unlisted, so declined until the table decides it: an op past an interface's last (`Clock`
+        // has only op 0; on a genuine handle every engine serves op 1 as `now`, #3119), and
+        // `FreezeAuthority` past op 5 (`-EINVAL` on every engine).
         (call(16, 6), Host::new(), "cap"),
         (call(2, 1), Host::new(), "cap"),
         // `fuel` is the table's, but the bytecode compile declines the op first.
@@ -4021,16 +4022,12 @@ block 0 () {
     });
 }
 
-/// The open-ended kinds the `cap` clause declines, each `(type_id, op)`: an op past the last of a
-/// built-in interface's (`Exit`, `Clock`, `AddressSpace`, `Budget`, `SharedRegion`), an id `cap_id`
-/// leaves unassigned (3 and 9 retired, 15, 17, and the last below the guest ids), a `self` op no
-/// engine serves (15 retired, 20, 255, and one of 16–19 packed with an index).
-const CAP_FAULTS: [(u32, u32); 14] = [
-    (1, 1),
-    (2, 1),
-    (5, 6),
-    (14, 4),
-    (4, 8),
+/// The open-ended kinds the `cap` clause declines where no handle can change the answer, each
+/// `(type_id, op)`: an id `cap_id` leaves unassigned (3 and 9 retired, 15, 17, and the last below the
+/// guest ids), under which nothing is ever granted, so every call on one is a `CapFault`; and a
+/// `self` op no engine serves (15 retired, 20, 255, and one of 16–19 packed with an index), which
+/// takes no handle. An op past a built-in interface's last is [`PAST_LAST`]'s, on a genuine handle.
+const CAP_FAULTS: [(u32, u32); 9] = [
     (3, 0),
     (9, 0),
     (15, 0),
@@ -4052,10 +4049,13 @@ fn cap_call(t: u32, op: u32, h: i32) -> temen_ir::Module {
     ))
 }
 
-/// The bytecode engine's answer for `make(h)` over a host holding a freeze authority, `h`.
-fn bytecode_answer(make: impl Fn(i32) -> temen_ir::Module) -> Option<Answer> {
+/// The bytecode engine's answer for `make(h)` over a host `grant` granted one capability, `h`.
+fn bytecode_answer(
+    make: impl Fn(i32) -> temen_ir::Module,
+    grant: fn(&mut Host) -> i32,
+) -> Option<Answer> {
     let mut host = Host::new();
-    let m = make(host.grant_freeze_authority());
+    let m = make(grant(&mut host));
     temen_interp::bytecode::compile_and_run_with_host(&m, 0, &[], &mut 1_000_000, &mut host).map(
         |r| {
             r.map(|v| {
@@ -4086,7 +4086,7 @@ fn a_call_no_interface_serves_is_a_cap_fault_and_the_kernel_declines_it() {
         ($($n:literal)*) => {[$((case::<$n> as fn(i32) -> temen_ir::Module, $n)),*]};
     }
     let want: Answer = Err("CapFault".into());
-    for (make, n) in each!(0 1 2 3 4 5 6 7 8 9 10 11 12 13) {
+    for (make, n) in each!(0 1 2 3 4 5 6 7 8) {
         let (t, op) = CAP_FAULTS[n];
         let mut host = Host::new();
         let m = make(host.grant_freeze_authority());
@@ -4096,7 +4096,7 @@ fn a_call_no_interface_serves_is_a_cap_fault_and_the_kernel_declines_it() {
             "({t}, {op:#x})"
         );
         assert_eq!(
-            bytecode_answer(make),
+            bytecode_answer(make, Host::grant_freeze_authority),
             Some(want.clone()),
             "the bytecode engine: ({t}, {op:#x})"
         );
@@ -4152,7 +4152,7 @@ fn a_freeze_authority_op_answers_einval_on_every_engine() {
     ];
     for (make, op) in ops {
         assert_eq!(
-            bytecode_answer(make),
+            bytecode_answer(make, Host::grant_freeze_authority),
             Some(want.clone()),
             "the bytecode engine: op {op}"
         );
@@ -4162,9 +4162,10 @@ fn a_freeze_authority_op_answers_einval_on_every_engine() {
     }
 }
 
-/// #2958 slice 6 — a plain `self` op (0–5) packed with an index answers `Malformed` on the
-/// tree-walker, the bytecode engine and the kernel route, each asserting its route; today's route
-/// answers `SetjmpFault` (#3087), pinned here so its fix shows up as a row to change.
+/// #2958 slice 6 — a plain `self` op (0–5) packed with an index traps `Malformed` on every engine,
+/// each asserting its route: the tree-walker, the bytecode engine and the kernel route's own result
+/// name the `Trap`, and an embedder's JIT run (`jit_run`) on either route names the same trap code
+/// as the JIT's `TrapKind` spells it, `SetjmpFault` (#3087: one code, two names).
 #[test]
 fn a_packed_plain_self_op_is_malformed_as_on_the_oracle() {
     fn case<const N: u32>(h: i32) -> temen_ir::Module {
@@ -4181,19 +4182,21 @@ fn a_packed_plain_self_op_is_malformed_as_on_the_oracle() {
     ];
     for (make, op) in ops {
         assert_eq!(
-            bytecode_answer(make),
+            bytecode_answer(make, Host::grant_freeze_authority),
             Some(want.clone()),
             "the bytecode engine: op {op}"
         );
         let [oracle, kernel, today] = granted(make, Host::grant_freeze_authority);
         assert_eq!(oracle.1, want, "{}: op {op}", oracle.0);
         assert_eq!(kernel.1, want, "{}: op {op}", kernel.0);
-        assert_eq!(
-            today.1,
-            Err("SetjmpFault".into()),
-            "{} (#3087): op {op}",
-            today.0
-        );
+        // The JIT's name for the oracle's trap code, on both of `jit_run`'s routes.
+        let code = Trap::Malformed.code() as u32;
+        let named = temen_jit::TrapKind::from_code(code).expect("a trap code");
+        let jit: Answer = Err(format!("{named:?}"));
+        assert_eq!(today.1, jit, "{}: op {op}", today.0);
+        for (route, answer) in by_instance(make, Host::grant_freeze_authority, false, None) {
+            assert_eq!(answer, jit, "{route} through `jit_run`: op {op}");
+        }
     }
 }
 
@@ -4310,4 +4313,148 @@ fn a_parked_thread_strands_none_of_its_entrys_draw() {
         least,
         "today's route's least budget"
     );
+}
+
+/// A root that spawns `n` threads that only return, and returns 7 without joining any.
+fn spawning_unjoined(n: usize) -> temen_ir::Module {
+    let mut body = String::from("  v0 = i64.const 0\n");
+    for i in 0..n {
+        body += &format!("  vh{i} = thread.spawn 1 v0 v0\n");
+    }
+    module(&format!(
+        "memory 16
+func () -> (i64) {{
+block 0 () {{
+{body}  vr = i64.const 7
+  return vr
+  }}
+}}
+func (i64, i64) -> (i64) {{
+block 0 (va0: i64, vb0: i64) {{
+  vr = i64.const 0
+  return vr
+  }}
+}}
+"
+    ))
+}
+
+/// How a run on each engine ended at `budget`, and what it charged: the tree-walker, the bytecode
+/// engine's pump, executor 2 interpreting, the kernel route and today's route.
+fn spawn_rows(m: &temen_ir::Module, budget: u64) -> [(&'static str, &'static str, u64); 5] {
+    let ended = |ok: bool, trap: Option<Trap>| match (ok, trap) {
+        (true, _) => "Ok",
+        (false, Some(Trap::OutOfFuel)) => "OutOfFuel",
+        (false, t) => panic!("{t:?}"),
+    };
+    let mut l = budget;
+    let tree = temen_interp::run(m, 0, &[], &mut l);
+    let tree = (ended(tree.is_ok(), tree.err()), budget - l);
+    let mut l = budget;
+    let pump = temen_interp::bytecode::compile_and_run(m, 0, &[], &mut l).expect("in its subset");
+    let pump = (ended(pump.is_ok(), pump.err()), budget - l);
+    let mut l = budget;
+    let (x2, _) =
+        temen_interp::bytecode::compile_and_run_capture_over_parallel(m, 0, &[], &mut l, &[], None)
+            .expect("in its subset");
+    let x2 = (ended(x2.is_ok(), x2.err()), budget - l);
+    let km = m.clone();
+    let kernel = bounded("the kernel route", move || {
+        let mut host = Host::new();
+        let admitted = jit_kernel::admit(&km, &host, false).expect("in the kernel's scope");
+        let end = jit_kernel::run(admitted, fresh_start(budget), &mut host).expect("compiles");
+        let r = end.result;
+        (ended(r.is_ok(), r.err()), budget - host.fuel_left())
+    });
+    let [_, today, _] = fueled(m, budget);
+    let today = (ended(today.0.is_ok(), today.0.err()), budget - today.1);
+    [
+        ("the tree-walker", tree.0, tree.1),
+        ("the pump", pump.0, pump.1),
+        ("executor 2", x2.0, x2.1),
+        ("the kernel route", kernel.0, kernel.1),
+        ("today's route", today.0, today.1),
+    ]
+}
+
+/// #2958 slice 6, #3081 — every engine's spawn pays a thread's entry by one rule: one unit taken from
+/// the node, never from a chunk the payer holds. `n` unjoined threads cost `n + 1`, and the least
+/// budget is `2n` on every engine (the root's entry draws half the room and holds it): at `2n - 1`
+/// each runs out at a spawn. Before, the pump and executor 2 paid from the domain fuel's held chunk,
+/// and completed `n` spawns on `n + 1`: 3 for two and 4 for three, where the oracle needs 4 and 6.
+#[test]
+fn every_engines_spawn_pays_its_threads_entry_from_the_node() {
+    for n in 1..=3usize {
+        let m = spawning_unjoined(n);
+        let least = 2 * n as u64;
+        for _ in 0..5 {
+            for (engine, ended, charged) in spawn_rows(&m, least) {
+                assert_eq!(
+                    (ended, charged),
+                    ("Ok", n as u64 + 1),
+                    "{engine}, {n} spawns"
+                );
+            }
+            for (engine, ended, _) in spawn_rows(&m, least - 1) {
+                assert_eq!(ended, "OutOfFuel", "{engine}, {n} spawns, one under");
+            }
+        }
+    }
+}
+
+/// A grant: what a row's host is granted, and the handle it answers.
+type Grant = fn(&mut Host) -> i32;
+
+/// `(type_id, op past its interface's last, grant, the answer on every engine)`: a genuine handle of
+/// each built-in type whose ops are numbered, called on an op its interface does not have. The
+/// answers differ by type: `Exit` faults, `Clock` serves any op as `now` (#3119: its arm reads no
+/// op), and `AddressSpace`, `Budget` and `SharedRegion` answer `-EINVAL`, as `FreezeAuthority` does
+/// past the ops the table lists (0–5).
+const PAST_LAST: [(u32, u32, Grant, Result<i64, &str>); 6] = [
+    (1, 1, Host::grant_exit, Err("CapFault")),
+    (2, 1, Host::grant_clock, Ok(0)),
+    (5, 6, Host::grant_memory, Ok(-22)),
+    (14, 4, budget_grant, Ok(-22)),
+    (4, 8, grant_region, Ok(-22)),
+    (16, 6, Host::grant_freeze_authority, Ok(-22)),
+];
+
+fn budget_grant(h: &mut Host) -> i32 {
+    h.grant_budget(-1, -1, -1)
+}
+
+/// #2958 slice 6 — an op past a built-in interface's last, on a genuine handle of that interface,
+/// answers alike on the tree-walker, the bytecode engine and today's route, as [`PAST_LAST`] lists
+/// it, and the kernel route declines it (`cap`): the clause's removal (today's route cut, such a
+/// program on the bytecode engine) loses nothing. The answers are not one kind: what is alike is
+/// each type's answer across the engines.
+#[cfg(any(unix, windows))]
+#[test]
+fn an_op_past_a_builtins_last_answers_alike_and_the_kernel_declines_it() {
+    fn case<const N: usize>(h: i32) -> temen_ir::Module {
+        let (t, op, _, _) = PAST_LAST[N];
+        cap_call(t, op, h)
+    }
+    let makes: [Make; 6] = [
+        case::<0>, case::<1>, case::<2>, case::<3>, case::<4>, case::<5>,
+    ];
+    for (n, make) in makes.into_iter().enumerate() {
+        let (t, op, grant, want) = PAST_LAST[n];
+        let want: Answer = want.map(|v| vec![v]).map_err(str::to_string);
+        let mut host = Host::new();
+        let m = make(grant(&mut host));
+        assert_eq!(
+            jit_kernel::admit(&m, &host, false).err(),
+            Some("cap"),
+            "({t}, {op})"
+        );
+        assert_eq!(
+            bytecode_answer(make, grant),
+            Some(want.clone()),
+            "the bytecode engine: ({t}, {op})"
+        );
+        for (route, got) in granted_but_kernel(make, grant) {
+            assert_eq!(got, want, "{route}: ({t}, {op})");
+        }
+    }
 }

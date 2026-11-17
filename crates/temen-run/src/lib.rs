@@ -6777,14 +6777,7 @@ impl PowerboxProgram {
         let jr = jr.map_err(|e| format!("JIT run failed: {e:?}"))?;
         // Fold a guest trap into an `Err` with its backtrace + trapping fiber, exactly as `jit_run`.
         if let JitOutcome::Trapped(kind) = jr.outcome {
-            let who = match jr.trap_fiber {
-                Some(h) if h >= 0 => format!(" [fiber {h}]"),
-                _ => String::new(),
-            };
-            let msg = format!(
-                "guest trapped ({kind:?}) — detect-and-kill (§5){who}{}",
-                format_backtrace(&jr.backtrace)
-            );
+            let msg = trapped_message(kind, jr.trap_fiber, &jr.backtrace);
             return Err(trap_err_with_output(
                 msg,
                 &self.host.stdout_bytes(),
@@ -8068,8 +8061,8 @@ fn jit_run(
     Ok((run.outcome, run.snapshot, results))
 }
 
-/// A JIT run's trap as `jit_run` reports it, on either of its routes: the trap, the fiber it trapped
-/// in, and its backtrace (§5 W3).
+/// A JIT run's trap as it is reported, on either of `jit_run`'s routes and on a prebuilt powerbox's
+/// run: the trap, the fiber it trapped in, and its backtrace (§5 W3).
 fn trapped_message(kind: TrapKind, fiber: Option<i64>, backtrace: &[JitFrameLoc]) -> String {
     let who = match fiber {
         Some(h) if h >= 0 => format!(" [fiber {h}]"),

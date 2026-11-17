@@ -23167,23 +23167,24 @@ impl Fuel {
 
     /// #2977, #3081 — pay a thread's entry as its spawn completes: one unit, and no draw kept for it.
     /// A thread waits in the run queue after its spawn has paid, and a chunk held there is fuel no
-    /// running vCPU can burn: a thousand queued threads would strand a thousand chunks. What this fuel
-    /// already holds pays first; otherwise exactly one unit is taken from its node in one step
-    /// ([`NodeRef::take_exact`]), never a draw and a give-back, which would empty the node's room for a
-    /// moment beside vCPUs drawing from it on threads of their own. A native task's fuel holds
-    /// nothing its code burns ([`Self::native`]): its unit comes from the node, and the tier's code
-    /// starts with it for the entry's own charge. Every level unbounded charges nothing.
+    /// running vCPU can burn: a thousand queued threads would strand a thousand chunks. One rule for
+    /// every engine's spawn, whoever pays (the tree-walker pays on the child's fresh fuel, executor 2
+    /// and the pump on the domain's): fuel with a node takes exactly one unit from it in one step
+    /// ([`NodeRef::take_exact`]), never from a chunk it already holds and never by a draw and a
+    /// give-back, which would empty the node's room for a moment beside vCPUs drawing from it on
+    /// threads of their own. A chunk the payer holds is its own running vCPU's, so paying from it
+    /// would let N spawns cost N + 1 where the oracle's cost 2N. Every level unbounded charges
+    /// nothing. A fixed allowance (no node: a debug tier's, or a lent one) pays from what it holds.
     pub(crate) fn pay_entry(&mut self) -> Result<(), Trap> {
-        if self.left > 0 && !self.native {
-            self.left -= 1;
-            return Ok(());
-        }
         match self.src.as_ref() {
-            None => Err(Trap::OutOfFuel),
             Some(s) => match s.take_exact(1) {
                 Some(false) => Err(Trap::OutOfFuel),
                 None | Some(true) => Ok(()),
             },
+            None => {
+                self.left = self.left.checked_sub(1).ok_or(Trap::OutOfFuel)?;
+                Ok(())
+            }
         }
     }
 

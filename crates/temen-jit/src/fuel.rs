@@ -214,8 +214,9 @@ impl FuelCell {
     /// and through the raw pointer, as [`Self::settle`] does; a fiber of the cell's earlier vCPU that
     /// refills it in between races it as any shared charge does (#3080).
     ///
-    /// Today's route seeds through it (`os_thread_rt::run_child`); the kernel route's call lands with
-    /// #2958 slice 6 (PR #3085), on each native thread's own cell.
+    /// Both of the JIT's routes seed through it, each on the thread's own cell, and each only for an
+    /// entry its spawn paid: today's (`os_thread_rt::run_child`) and the kernel route's (temen-run's
+    /// `jit_kernel::tier_run`).
     ///
     /// # Safety
     /// - `cell` is a live cell that no context but this vCPU's (and #3080's fibers) charges.

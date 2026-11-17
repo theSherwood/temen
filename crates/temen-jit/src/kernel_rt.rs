@@ -236,8 +236,6 @@ impl KernelRun {
         crate::vcpu_tls::seed(tls);
         crate::vcpu_tls::set_serve_handlers(0);
         crate::durable_shadow::seed(cm.shadow.region_base(0));
-        // A capture an earlier run left on this thread is no trap of this vCPU's.
-        drop(mem::take_trap_frame());
         let mut results;
         let faulted = match entry {
             VcpuEntry::Root(args) => {
@@ -288,20 +286,18 @@ impl KernelRun {
         if faulted {
             vm.raise(mem::FAULT_TRAP);
         }
-        // This vCPU's own trap-time capture, taken on its thread, which may end with it: kept for the
-        // run's backtrace if the vCPU ended in a trap, first wins. A vCPU stopped by another's end
-        // made none.
-        let capture = mem::take_trap_frame();
-        let ended = vm.ended();
-        if let (Some(cap), Some(code)) = (capture, ended) {
-            if TrapKind::from_code(code as u32).is_some() {
-                self.trap
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .get_or_insert(cap);
-            }
+        // This vCPU's own trap-time capture, taken on its thread, which may end with it, so none is
+        // left there for a later run to read: a capture is made only where this vCPU trapped, and the
+        // first one published is the run's ([`Self::trap_backtrace`]), whatever end word won. A kill
+        // door's `DOMAIN_DONE` can win the word over an epoch trap's own raise, and the run still
+        // ends in a trap whose capture this is. A vCPU stopped by another's end made none.
+        if let Some(cap) = mem::take_trap_frame() {
+            self.trap
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get_or_insert(cap);
         }
-        match ended {
+        match vm.ended() {
             Some(code) => Err(code),
             None => Ok(results),
         }

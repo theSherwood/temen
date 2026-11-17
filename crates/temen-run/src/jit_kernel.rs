@@ -335,7 +335,13 @@ pub fn run(
         start.fuel,
         std::mem::take(host),
         &[], // the window is the tier's, started above
-        reserved.trailing_zeros() as u8,
+        // The reservation's size as a log2; for a module with no memory there is none (the tier's
+        // window reserves nothing), and the run's own requested size stands in, unread, as
+        // executor 2 builds no window for a module without one.
+        match reserved {
+            0 => start.reserved_log2,
+            r => r.trailing_zeros() as u8,
+        },
         None,
         false,
     );
@@ -450,18 +456,25 @@ fn tier_run(call: &mut EmittedCall<'_>) -> Result<(), Trap> {
     };
     // Its own cell, drawing from its task's budget node, so siblings never share one; what it drew
     // and did not burn goes back to the node as it drops, when the vCPU ends however it ends.
-    let metered = call.fuel_node.is_some();
+    // #3081 — a thread's entry was paid as its spawn completed, exactly one unit taken from its node
+    // (`Fuel::pay_entry`'s `take_exact(1)` answered `Some(true)`): on a node bounded at some level,
+    // the only kind that charges, for a thread that exists, since a spent node trapped its spawner.
+    // Boundedness does not change while the run lives. A node unbounded at every level paid nothing,
+    // and its thread's cell is not seeded: seeding there would mint a unit.
+    let paid = matches!(call.entry, CallEntry::Thread)
+        && call.fuel_node.as_ref().is_some_and(|n| n.fuel_room() >= 0);
     let mut fuel = match call.fuel_node.take() {
         Some(node) => FuelCell::drawing(Arc::new(crate::HostNode(node))),
         None => FuelCell::fixed(u64::MAX),
     };
-    // #3081 — a thread's entry was paid as its spawn completed, one unit taken from its node
-    // ([`CallEntry::Thread`]): its cell starts holding that unit, never refunded, whether its
-    // prologue burns it or the vCPU stops first (the JIT's one rule, `FuelCell::seed_entry`, as today's
-    // route's `run_child` seeds its thread's). Seeded here, once the thread will run guest code; a task
-    // that never gets here is never seeded, and its unit stays paid.
-    if metered && matches!(call.entry, CallEntry::Thread) {
-        // SAFETY: the cell was made just above, for this vCPU alone, and nothing charges it yet.
+    // The paid unit goes into the thread's own cell, never refunded, whether its prologue burns it or
+    // the vCPU stops first: the JIT's one rule (`FuelCell::seed_entry`), as today's route's `run_child`
+    // seeds its thread's, and only when the unit was paid, as it gates on its `paid_entry`. Seeded
+    // here, once the thread will run guest code; a task that never gets here is never seeded, and
+    // its unit stays paid.
+    if paid {
+        // SAFETY: the cell was made just above, for this vCPU alone, and nothing charges it yet; its
+        // chain paid exactly this vCPU's one unit (above).
         unsafe { FuelCell::seed_entry(&mut *fuel as *mut FuelCell) };
     }
     let (tls, host, end) = (call.tls, call.host_cell(), call.end);
