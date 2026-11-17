@@ -9227,15 +9227,13 @@ fn kernel_inst(host: &Host, i: &Inst) -> Result<(), &'static str> {
 /// - **`imports`**: a `call.cap` on a reserved pseudo-id at or above [`temen_ir::CAP_DYN_TYPE_ID`]
 ///   but `self`'s, whose target a binding or a mid-run attach chooses ([`native_scope`]'s clause).
 ///
-/// - **`cap`** (being settled in #2958 slice 6): `FreezeAuthority`, whose ops answer `-EINVAL` on
-///   every engine, and a plain `self` op (0–5) packed with an index, `Malformed` on the
-///   interpreters and the kernel route, not on today's route.
-///
-/// A call no interface serves is admitted (#2958 slice 6): every engine answers it `CapFault` in the
-/// dispatch, so the kernel route answers as they do. That is an op past the last of a built-in
-/// interface's, any op on an id [`cap_id`] leaves unassigned (nothing is ever granted under one),
-/// and a `self` op no engine serves. **A new built-in id or op
-/// must be decided here**: until it is, it falls under these arms as one no engine serves.
+/// - **`cap`**: every `(type_id, op)` this table does not list: an op past the last of a built-in
+///   interface's, an id [`cap_id`] leaves unassigned, a `self` op no engine serves (each a
+///   `CapFault` on every engine today), and a `FreezeAuthority` op past 5 (`-EINVAL` on every
+///   engine). They are not admitted: an unlisted op may gain a meaning later, and must then be
+///   decided here. Removed when today's route is cut: a program it declines then runs on the
+///   bytecode engine and loses nothing, since every engine answers these calls alike (#2958 slice 6;
+///   owner decision 19 on #2949).
 fn kernel_op(host: &Host, type_id: u32, op: u32) -> Result<(), &'static str> {
     use temen_ir::cap_id::*;
     use temen_ir::{CAP_DYN_TYPE_ID, CAP_SELF_TYPE_ID};
@@ -9257,19 +9255,8 @@ fn kernel_op(host: &Host, type_id: u32, op: u32) -> Result<(), &'static str> {
         | (BLOCKING, _) => Ok(()),
         // A §13 region's `grant` into a child domain.
         (SHARED_REGION, 4) => Err("§14 children"),
-        // `FreezeAuthority`: every op answers `-EINVAL` on every engine, an answer, not a fault, so it
-        // stays declined until #2958's audit rules on it (slice 6).
-        (FREEZE_AUTHORITY, _) => Err("cap"),
-        // Calls no interface serves, a `CapFault` on every engine: an op past a built-in interface's
-        // last, and every op on an id `cap_id` leaves unassigned (3 and 9 are retired interfaces, 15
-        // and 17 up to the guest ids never held one).
-        (EXIT, 1..)
-        | (CLOCK, 1..)
-        | (ADDRESS_SPACE, 6..)
-        | (BUDGET, 4..)
-        | (SHARED_REGION, 8..)
-        | (3 | 9 | 15, _)
-        | (17..GUEST_IMPL_BASE, _) => Ok(()),
+        // `FreezeAuthority`'s ops 0–5, each `-EINVAL` on every engine (#2958 slice 6).
+        (FREEZE_AUTHORITY, 0..=5) => Ok(()),
         // The `self` ops: plain below 6 and at 17–19; from 6 on, packed as `selfop | idx << 8`
         // (the host's dispatch), so decided on the low byte. `self.pipe` (16) mints a pipe, as both
         // interpreters' do.
@@ -9284,17 +9271,16 @@ fn kernel_op(host: &Host, type_id: u32, op: u32) -> Result<(), &'static str> {
             8..=10 => Err("serving"),
             11 | 12 | 14 => Err("process"),
             13 => Err("fuel"),
-            // A plain op (0–5) packed with an index: `Malformed` on the interpreters and the kernel
-            // route, but not on today's route; declined until #2958's audit rules on it (slice 6).
-            0..=5 => Err("cap"),
-            // A self op no engine serves (15 is retired, 20 up), or one of 16–19 packed with an
-            // index: a `CapFault` on every engine.
-            _ => Ok(()),
+            // A plain op (0–5) packed with an index (the arm above took it with none): `Malformed`
+            // on the interpreters and the kernel route; today's route differs (#3087).
+            0..=5 => Ok(()),
+            _ => Err("cap"),
         },
         (INSTANTIATOR | MODULE | MODULE_LOADER, _) => Err("§14 children"),
         (JIT | JIT_CODE, _) => Err("jit cap"),
         (GUEST_IMPL_BASE..CAP_DYN_TYPE_ID, _) => Err("serving"),
         (CAP_DYN_TYPE_ID.., _) => Err("imports"),
+        _ => Err("cap"),
     }
 }
 

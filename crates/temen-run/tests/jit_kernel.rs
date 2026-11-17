@@ -2041,9 +2041,10 @@ block 0 (va: i64, vb: i64) {
         (call(4, 7), Host::new()),
         (call(10, 0), blocking()),
         (call(13, 0), host_answered()),
-        // #2958 slice 6 — calls no interface serves, a `CapFault` on every engine
-        // (`a_call_no_interface_serves_is_a_cap_fault_on_every_engine`).
-        (call(2, 1), Host::new()),
+        // #2958 slice 6 — `FreezeAuthority`'s listed ops, and a plain `self` op packed with an
+        // index.
+        (call(16, 0), Host::new()),
+        (call(selfop, 5 | 1 << 8), Host::new()),
     ];
     for (i, (m, host)) in admitted.iter().enumerate() {
         assert_eq!(jit_kernel::admit(m, host, false).err(), None, "row {i}");
@@ -2053,10 +2054,10 @@ block 0 (va: i64, vb: i64) {
         // first; through an import it is `kernel_op`'s `§14 children`
         // (`a_grouped_import_is_decided_on_every_op_it_reaches`).
         (call(4, 4), Host::new(), "bytecode"),
-        // Being settled in slice 6: `FreezeAuthority` answers `-EINVAL` on every engine, and a
-        // plain `self` op packed with an index is `Malformed` on all but today's route.
-        (call(16, 0), Host::new(), "cap"),
-        (call(selfop, 5 | 1 << 8), Host::new(), "cap"),
+        // Unlisted, so declined until the table decides it: an op no interface has (`Clock` has
+        // only op 0), and `FreezeAuthority` past op 5.
+        (call(16, 6), Host::new(), "cap"),
+        (call(2, 1), Host::new(), "cap"),
         // `fuel` is the table's, but the bytecode compile declines the op first.
         (call(selfop, 13), Host::new(), "bytecode"),
         (call(6, 17), Host::new(), "§14 children"),
@@ -3970,11 +3971,10 @@ block 0 () {
     });
 }
 
-/// The calls #2958 slice 6 takes out of the `cap` clause, each `(type_id, op)`: every engine answers
-/// them `CapFault` in the dispatch. An op past the last of a built-in interface's (`Exit`, `Clock`,
-/// `AddressSpace`, `Budget`, `SharedRegion`); an id `cap_id` leaves unassigned (3 and 9 retired,
-/// 15, 17, and the last below the guest ids); and a `self` op no engine serves (15 retired, 20, 255,
-/// and one of 16–19 packed with an index).
+/// The open-ended kinds the `cap` clause declines, each `(type_id, op)`: an op past the last of a
+/// built-in interface's (`Exit`, `Clock`, `AddressSpace`, `Budget`, `SharedRegion`), an id `cap_id`
+/// leaves unassigned (3 and 9 retired, 15, 17, and the last below the guest ids), a `self` op no
+/// engine serves (15 retired, 20, 255, and one of 16–19 packed with an index).
 const CAP_FAULTS: [(u32, u32); 14] = [
     (1, 1),
     (2, 1),
@@ -3992,16 +3992,45 @@ const CAP_FAULTS: [(u32, u32); 14] = [
     (u32::MAX, 17 | 1 << 8),
 ];
 
-/// #2958 slice 6 — a call no interface serves answers `CapFault` on the tree-walker, the bytecode
-/// engine, the kernel route and today's route, each asserting its route: the `cap` clause, which
-/// kept such a program on today's route with no event to remove it, is gone.
+/// A row's program, made over the handle a host granted it.
+type Make = fn(i32) -> temen_ir::Module;
+
+/// `(type_id, op)` called inline on handle `h`, from a root the kernel admits.
+fn cap_call(t: u32, op: u32, h: i32) -> temen_ir::Module {
+    rooted(&format!(
+        "  vc = i32.const {h}\n  vr = call.cap {t} {op} () -> (i64) vc ()"
+    ))
+}
+
+/// The bytecode engine's answer for `make(h)` over a host holding a freeze authority, `h`.
+fn bytecode_answer(make: impl Fn(i32) -> temen_ir::Module) -> Option<Answer> {
+    let mut host = Host::new();
+    let m = make(host.grant_freeze_authority());
+    temen_interp::bytecode::compile_and_run_with_host(&m, 0, &[], &mut 1_000_000, &mut host).map(
+        |r| {
+            r.map(|v| {
+                v.into_iter()
+                    .map(|x| match x {
+                        temen_interp::Value::I64(n) => n,
+                        other => panic!("{other:?}"),
+                    })
+                    .collect()
+            })
+            .map_err(|t| format!("{t:?}"))
+        },
+    )
+}
+
+/// #2958 slice 6 — the open-ended calls the `cap` clause declines answer `CapFault` on the
+/// tree-walker, the bytecode engine and today's route; the kernel route declines them (`cap`), so
+/// such a program loses nothing once today's route is cut and it runs on the bytecode engine. They
+/// stay declined because an unlisted op may gain a meaning later, and must then be decided in the
+/// table.
 #[test]
-fn a_call_no_interface_serves_is_a_cap_fault_on_every_engine() {
+fn a_call_no_interface_serves_is_a_cap_fault_and_the_kernel_declines_it() {
     fn case<const N: usize>(h: i32) -> temen_ir::Module {
         let (t, op) = CAP_FAULTS[N];
-        rooted(&format!(
-            "  vc = i32.const {h}\n  vr = call.cap {t} {op} () -> (i64) vc ()"
-        ))
+        cap_call(t, op, h)
     }
     macro_rules! each {
         ($($n:literal)*) => {[$((case::<$n> as fn(i32) -> temen_ir::Module, $n)),*]};
@@ -4011,21 +4040,109 @@ fn a_call_no_interface_serves_is_a_cap_fault_on_every_engine() {
         let (t, op) = CAP_FAULTS[n];
         let mut host = Host::new();
         let m = make(host.grant_freeze_authority());
-        let bytecode = temen_interp::bytecode::compile_and_run_with_host(
-            &m,
-            0,
-            &[],
-            &mut 1_000_000,
-            &mut host,
-        )
-        .map(|r| r.map(|_| Vec::new()).map_err(|t| format!("{t:?}")));
         assert_eq!(
-            bytecode,
+            jit_kernel::admit(&m, &host, false).err(),
+            Some("cap"),
+            "({t}, {op:#x})"
+        );
+        assert_eq!(
+            bytecode_answer(make),
             Some(want.clone()),
             "the bytecode engine: ({t}, {op:#x})"
         );
-        for (route, got) in granted(make, Host::grant_freeze_authority) {
+        for (route, got) in granted_but_kernel(make, Host::grant_freeze_authority) {
             assert_eq!(got, want, "{route}: ({t}, {op:#x})");
         }
+    }
+}
+
+/// [`granted`]'s oracle and today's lanes, for a program the kernel route declines.
+fn granted_but_kernel(
+    make: fn(i32) -> temen_ir::Module,
+    grant: fn(&mut Host) -> i32,
+) -> [(&'static str, Answer); 2] {
+    let mut host = Host::new();
+    let m = make(grant(&mut host));
+    let oracle = temen_interp::run_with_host(&m, 0, &[], &mut 1_000_000, &mut host)
+        .map(|v| {
+            v.into_iter()
+                .map(|x| match x {
+                    temen_interp::Value::I64(n) => n,
+                    other => panic!("{other:?}"),
+                })
+                .collect()
+        })
+        .map_err(|t| format!("{t:?}"));
+    let today = bounded("today's route", move || {
+        let cfg = temen_run::RunConfig {
+            jit_code: Some(temen_run::JitCodeCache::default()),
+            ..temen_run::RunConfig::default()
+        };
+        instance_run(make, grant, temen_run::Backend::Jit, &cfg)
+    });
+    [("the oracle", oracle), ("today's route", today)]
+}
+
+/// #2958 slice 6 — `FreezeAuthority`'s ops 0–5, on a granted handle, answer `-EINVAL` on the
+/// tree-walker, the bytecode engine, the kernel route and today's route, each asserting its route:
+/// the table lists them. An op past 5 (6 answers `-EINVAL` too) stays `cap`: unlisted.
+#[test]
+fn a_freeze_authority_op_answers_einval_on_every_engine() {
+    fn case<const N: u32>(h: i32) -> temen_ir::Module {
+        cap_call(16, N, h)
+    }
+    let want: Answer = Ok(vec![-22]);
+    let ops: [(Make, u32); 6] = [
+        (case::<0>, 0),
+        (case::<1>, 1),
+        (case::<2>, 2),
+        (case::<3>, 3),
+        (case::<4>, 4),
+        (case::<5>, 5),
+    ];
+    for (make, op) in ops {
+        assert_eq!(
+            bytecode_answer(make),
+            Some(want.clone()),
+            "the bytecode engine: op {op}"
+        );
+        for (route, got) in granted(make, Host::grant_freeze_authority) {
+            assert_eq!(got, want, "{route}: op {op}");
+        }
+    }
+}
+
+/// #2958 slice 6 — a plain `self` op (0–5) packed with an index answers `Malformed` on the
+/// tree-walker, the bytecode engine and the kernel route, each asserting its route; today's route
+/// answers `SetjmpFault` (#3087), pinned here so its fix shows up as a row to change.
+#[test]
+fn a_packed_plain_self_op_is_malformed_as_on_the_oracle() {
+    fn case<const N: u32>(h: i32) -> temen_ir::Module {
+        cap_call(u32::MAX, N | 1 << 8, h)
+    }
+    let want: Answer = Err("Malformed".into());
+    let ops: [(Make, u32); 6] = [
+        (case::<0>, 0),
+        (case::<1>, 1),
+        (case::<2>, 2),
+        (case::<3>, 3),
+        (case::<4>, 4),
+        (case::<5>, 5),
+    ];
+    for (make, op) in ops {
+        assert_eq!(
+            bytecode_answer(make),
+            Some(want.clone()),
+            "the bytecode engine: op {op}"
+        );
+        let [oracle, kernel, today] = granted(make, Host::grant_freeze_authority);
+        assert_eq!(oracle.1, want, "{}: op {op}", oracle.0);
+        assert_eq!(kernel.1, want, "{}: op {op}", kernel.0);
+        assert_eq!(
+            today.1,
+            Err("SetjmpFault".into()),
+            "{} (#3087): op {op}",
+            today.0
+        );
     }
 }
