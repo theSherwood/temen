@@ -3202,6 +3202,11 @@ impl Gate {
         self.cv.notify_all();
     }
 
+    /// Wait until `n` jobs have reached it. `false` if they did not within [`PROMPT`].
+    fn reached(&self, n: u32) -> bool {
+        self.wait(|s| s.reached >= n).1
+    }
+
     /// Wait until `n` jobs have passed it. `false` if they did not within [`PROMPT`].
     fn passed(&self, n: u32) -> bool {
         self.wait(|s| s.passed >= n).1
@@ -3289,19 +3294,25 @@ fn a_punted_call_parks_until_its_answer_on_every_route() {
 
 /// #2958 slice 5, condition 4 — a punted job may outlive its run: its job owns its inputs (an
 /// `OffloadWork` is a `'static` closure: no window, no `Host`), and its answer goes to the
-/// completions store, an `Arc` the job's completer holds. A sibling's fault ends the run while the
-/// root waits on the call; the gate opens only once the run has returned, and the job then finishes.
+/// completions store, an `Arc` the job's completer holds. The root's call is punted, and its job
+/// waits at the gate; a sibling first makes a host-answered call, which the harness answers only once
+/// that job has reached the gate, then faults, which ends the run while the root waits on its call.
+/// The gate opens only once the run has returned, and the job then finishes. Each step waits on the
+/// one before it, so the order holds by construction.
 #[test]
 fn a_punted_job_that_outlives_its_run_finishes_cleanly() {
     static HELD: Gate = Gate::new();
-    fn make(h: i32) -> temen_ir::Module {
-        module(&format!(
-            "memory 16
+    let requests = temen_interp::CapRequests::default();
+    let mut host = Host::new();
+    let job = grant_punting(&mut host, &HELD);
+    let hold = host.grant_host_proc(temen_interp::HostProcGrant::declared("hold", &requests));
+    let m = module(&format!(
+        "memory 16
 func () -> (i64) {{
 block 0 () {{
   vz = i64.const 0
   vt = thread.spawn 1 vz vz
-  vp = i32.const {h}
+  vp = i32.const {job}
   vone64 = i64.const 1
   vr = call.cap 13 0 (i64) -> (i64) vp(vone64)
   return vr
@@ -3309,28 +3320,53 @@ block 0 () {{
 }}
 func (i64, i64) -> (i64) {{
 block 0 (va: i64, vb: i64) {{
+  vh = i32.const {hold}
+  vz = i64.const 0
+  vw = call.cap 13 0 (i64) -> (i64) vh(vz)
   vnull = i64.const 8
   vx = i64.load vnull
   return vx
   }}
 }}
 "
-        ))
-    }
-    let ended = bounded("the kernel route", || {
-        let mut host = Host::new();
-        let m = make(grant_punting(&mut host, &HELD));
+    ));
+    let answerer = std::thread::spawn(move || {
+        // The sibling's call is answered only once the root's job is at the gate.
+        if !HELD.reached(1) {
+            return false;
+        }
+        let until = Instant::now() + PROMPT;
+        loop {
+            let req = requests
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .pop_first();
+            match req {
+                Some((_, r)) => {
+                    r.completer.complete(0);
+                    return true;
+                }
+                None if Instant::now() >= until => return false,
+                None => std::thread::yield_now(),
+            }
+        }
+    });
+    let ended = bounded("the kernel route", move || {
         let admitted = jit_kernel::admit(&m, &host, false).expect("in the kernel's scope");
         let end = jit_kernel::run(admitted, fresh_start(u64::MAX), &mut host).expect("compiles");
         assert!(end.vcpus >= 1, "it ran as kernel tasks");
         end.result
     });
+    assert!(
+        answerer.join().expect("the answerer"),
+        "the job reached the gate, the hold was filed"
+    );
     assert_eq!(
         ended,
         Err(Trap::MemoryFault),
         "the sibling's fault ends the run"
     );
-    assert!(HELD.open_next(), "the job reached the gate");
+    assert!(HELD.open_next(), "the job is at the gate");
     assert!(HELD.passed(1), "the job finished after its run");
 }
 
