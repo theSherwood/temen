@@ -949,6 +949,7 @@ fn ir_once(kernel: &str, engine: &str, n: i32) {
         "call_indirect" => CALL_INDIRECT.into(),
         "mem" => MEM.into(),
         "hostcall" => HOSTCALL.into(),
+        "tls" => TLS.into(),
         "fiber_switch" => FIBER_SWITCH.into(),
         "fiber_wait" => FIBER_WAIT.into(),
         _ => panic!("no kernel {kernel}"),
@@ -973,8 +974,45 @@ fn ir_once(kernel: &str, engine: &str, n: i32) {
         (_, "tree-walker") => temen_interp::run(&m, 0, &[Value::I32(n)], &mut fuel),
         _ => panic!("no engine {engine}"),
     };
-    assert!(r.is_ok(), "{kernel} trapped on the {engine}: {r:?}");
+    // The kernel's answer, so a count can only come from a run that did the kernel's work: a
+    // dispatch that began answering an errno, say, would read cheaper and still be `Ok`.
+    let want = match kernel {
+        // `acc += n; n -= 1`, down to 1.
+        "alu" => vec![Value::I32((1..=n).fold(0i32, |a, i| a.wrapping_add(i)))],
+        // One `+1` per iteration: a call, an indirect call, a store and a load, a host call.
+        "call" | "call_indirect" | "mem" | "hostcall" => vec![Value::I32(n)],
+        // The root vCPU's TLS word is seeded to its dense id, 0.
+        "tls" => vec![Value::I32(0)],
+        // The fiber's count after its `n`th suspend.
+        "fiber_switch" => vec![Value::I64(n as i64)],
+        // The fiber only parks (never suspends with a value), so each resume yields 0.
+        "fiber_wait" => vec![Value::I64(0)],
+        _ => unreachable!(),
+    };
+    assert_eq!(r, Ok(want), "{kernel} on the {engine}");
 }
+
+/// Each iteration reads the vCPU's TLS word (`vcpu.tls.get`), which every thread-local access in
+/// the C, LLVM and Nim frontends lowers to.
+const TLS: &str = r#"
+func (i32) -> (i32) {
+block 0 (v0: i32) {
+  v1 = i32.const 0
+  br 1(v0, v1)
+}
+block 1 (v2: i32, v3: i32) {
+  v8 = vcpu.tls.get
+  v9 = i32.wrap_i64 v8
+  v4 = i32.add v3 v9
+  v5 = i32.const 1
+  v6 = i32.sub v2 v5
+  br_if v6 1(v6, v4) 2(v4)
+}
+block 2 (v7: i32) {
+  return v7
+  }
+}
+"#;
 
 /// Each iteration makes one synchronous host call (`call.cap`) — the cost of an op that leaves the
 /// engine and comes back, which a guest's every libc call through a personality pays. The handle is

@@ -687,20 +687,31 @@ enum Op {
     },
 }
 
-/// #3088 — the ops [`Vm::run_hot`] runs: every op whose arm calls nothing outside the engine's own
-/// register, memory, frame and fuel helpers (it computes, branches, or calls and returns between guest
-/// functions), and `call.cap`, the one op that leaves the engine often enough to sit between them. Its
-/// arm is a single call to the out-of-line [`Vm::cap_call`], so how a host call is written cannot
-/// reach the loop. Every other op ([`cold_ops`]) is [`Vm::run_ops`]'s: it calls the host, a driver
-/// or the scheduler, or ends the step with an [`Outcome`]. A new op that calls out goes there, or, if
-/// it sits between hot ops often enough to matter, here as one call to an `#[inline(never)]` method,
-/// with `scripts/ci/ir-guard.sh` as the arbiter.
+/// #3088 — the ops [`Vm::run_hot`] runs. The rule is about what an op's common path calls: an op is
+/// here if that path calls nothing outside the engine's own register, memory, frame and fuel
+/// helpers (it computes, branches, calls and returns between guest functions, or reads or writes a
+/// field of the vCPU: its TLS word, its durable region's base). `call.cap` is here too, as the one
+/// op that leaves the engine often enough to sit between them: its arm is a single call to the
+/// out-of-line [`Vm::cap_call`], so how a host call is written cannot reach the loop.
+///
+/// A hot arm still has rare exits, each of which ends the step: a call that tiers up
+/// (`Outcome::TierUp`), the entry's return (`Outcome::Done`), a page fault in a demand-paged child,
+/// a trap, and a host call that parks. And `Ret` from an async signal handler tells the signal
+/// source the handler returned (`handler_returned`), off its common path.
+///
+/// Every other op ([`cold_ops`]) is [`Vm::run_ops`]'s: its common path calls the host, a driver or the
+/// scheduler, or hands the step to the driver with an [`Outcome`]. A new op whose common path calls
+/// out goes there or, if it sits between hot ops often enough to matter, here as one call to an
+/// `#[inline(never)]` method, with `scripts/ci/ir-guard.sh` as the arbiter.
 ///
 /// The two lists partition [`Op`], and the compiler holds them to it: [`runs_hot`] matches both with
 /// no wildcard, and each loop matches its own ops' arms plus the other's list with none.
 macro_rules! hot_ops {
     () => {
         Op::Const { .. }
+            | Op::DurableShadowBase { .. }
+            | Op::VcpuTlsGet { .. }
+            | Op::VcpuTlsSet { .. }
             | Op::CapCall(..)
             | Op::IntBin { .. }
             | Op::IntCmp { .. }
@@ -767,9 +778,6 @@ macro_rules! cold_ops {
             | Op::Unreachable
             | Op::CapFault
             | Op::Eval { .. }
-            | Op::DurableShadowBase { .. }
-            | Op::VcpuTlsGet { .. }
-            | Op::VcpuTlsSet { .. }
     };
 }
 
@@ -9757,7 +9765,7 @@ impl DispatchParks {
             pipe_write: (p.take_pipe_write_parked()).and_then(|i| p.pipe_probe(i, true)),
             sig_interrupt: p.take_sig_interrupt(),
             region: p.take_region_wake(),
-            // The wake flags a peer's write/close raised need no action at a dispatch site (the
+            // The wake flags this dispatch's own write/close raised need no action here (the
             // pump looks at pipe readiness at each round's settle, and the store itself fired the
             // wakers executor 2's parked tasks registered on the pipe, #2757,
             // [`super::PipeProbe::listen`]), but they are per-op too, so they drain here as well.
@@ -22392,18 +22400,40 @@ enum Hand {
     Done(Outcome),
 }
 
+/// The two flags the per-op checks read: the domain's `term_flag` and the signal personality's
+/// `armed`. A run has both or neither (`None` without a signal personality).
+type Watch<'a> = Option<(
+    &'a std::sync::atomic::AtomicBool,
+    &'a std::sync::atomic::AtomicBool,
+)>;
+
+/// #3088 — whether one of the per-op checks has something to do before the next op: the budget is
+/// spent (suspend), the domain was killed (`term_flag`), or a caught signal is pending (`armed`) and
+/// the vCPU is under `MAX_SIG_HANDLER_NEST` handlers deep (`nest`, read only then). The one definition both loops
+/// use: [`Vm::run_hot`] hands back on it, and [`Vm::run_ops`] runs its check block only when it
+/// holds. A new per-op check goes here and in that block; one added to the block alone never fires.
+macro_rules! checks_due {
+    ($budget:expr, $watch:expr, $nest:expr) => {
+        $budget == 0
+            || match $watch {
+                Some((term, armed)) => {
+                    term.load(std::sync::atomic::Ordering::Relaxed)
+                        || (armed.load(std::sync::atomic::Ordering::Relaxed)
+                            && $nest.len() < super::MAX_SIG_HANDLER_NEST)
+                }
+                None => false,
+            }
+    };
+}
+
 /// #3088 — what [`Vm::run_hot`] reads of [`Vm::run_ops`]'s step and never changes.
 #[derive(Clone, Copy)]
 struct HotCtx<'a> {
     source: &'a ModuleSource,
     table: &'a SharedSlots,
     signal_poll: &'a SignalPoll,
-    /// The two flags `run_ops` checks before every op: the domain's `term_flag` and the signal
-    /// personality's `armed`. A run has both or neither.
-    watch: Option<(
-        &'a std::sync::atomic::AtomicBool,
-        &'a std::sync::atomic::AtomicBool,
-    )>,
+    /// The flags [`checks_due`] reads.
+    watch: Watch<'a>,
 }
 
 // `Clone` for time-travel checkpointing (DEBUGGING.md W1): a `ScheduledDebugRun` snapshots each task's
@@ -22980,7 +23010,8 @@ impl Vm {
         }
     }
 
-    /// §2.2 / #2164 — the fault arm of [`paged!`](Self::run_ops) in a demand-paged child: a
+    /// §2.2 / #2164 — the fault arm of `paged!` (in [`Self::run_hot`] and [`Self::run_ops`]) in a
+    /// demand-paged child: a
     /// recoverable fault becomes [`Outcome::PageFault`] with the cursor left at the op, `at`; any
     /// other trap stands. Out of line and cold, so the memory ops keep only their branch on the
     /// error in the op loop.
@@ -23558,6 +23589,10 @@ impl Vm {
             };
         }
         loop {
+            debug_assert!(
+                std::ptr::eq(ops, &c.prog(cur).ops[..]),
+                "the ops a run reads are its current function's"
+            );
             match &ops[pc] {
                 Op::Const { dst, val } => {
                     r!(*dst) = *val;
@@ -24062,6 +24097,21 @@ impl Vm {
                         Err(out) => return Ok(Hand::Done(out)),
                     }
                 }
+                Op::DurableShadowBase { dst } => {
+                    // §12.8 4A.5: this context's shadow-SP word address (its own region base).
+                    self.regs[base + *dst as usize] =
+                        Reg::from_i64(self.durable_region_base as i64);
+                    pc += 1;
+                }
+                Op::VcpuTlsGet { dst } => {
+                    // §12 per-vCPU TLS read: this vCPU's word (seeded to its dense id, guest-overwritable).
+                    self.regs[base + *dst as usize] = Reg::from_i64(self.tls);
+                    pc += 1;
+                }
+                Op::VcpuTlsSet { val } => {
+                    self.tls = r!(*val).i64();
+                    pc += 1;
+                }
                 cold_ops!() => {
                     // `run_ops`'s, charged and checked: it runs it as it is.
                     *at = Cursor {
@@ -24074,17 +24124,9 @@ impl Vm {
                     return Ok(Hand::Checked);
                 }
             }
-            // The next op's checks, as `run_ops` makes them: any with something to do, it does.
-            if budget == 0 {
+            // The next op's checks: any with something to do, `run_ops` does.
+            if checks_due!(budget, watch, self.sig_handler_stack) {
                 break;
-            }
-            if let Some((term, armed)) = watch {
-                if term.load(std::sync::atomic::Ordering::Relaxed)
-                    || (armed.load(std::sync::atomic::Ordering::Relaxed)
-                        && self.sig_handler_stack.len() < super::MAX_SIG_HANDLER_NEST)
-                {
-                    break;
-                }
             }
             budget -= 1;
             #[cfg(feature = "callprof")]
@@ -24113,6 +24155,7 @@ impl Vm {
     /// #3088 — it runs the ops that leave the engine ([`cold_ops`]) and makes the per-op checks; the
     /// rest run in [`Vm::run_hot`], which it enters at the first of them. An op's arm lives in the
     /// loop its list names, and nowhere else.
+    #[deny(unreachable_patterns)]
     fn run_ops<const PAGED: bool>(
         &mut self,
         source: &ModuleSource,
@@ -24203,87 +24246,93 @@ impl Vm {
         let mut checked = false;
         loop {
             if !std::mem::take(&mut checked) {
-                if budget == 0 {
-                    // Pause at this op boundary: persist the cursor so a later `resume` continues here.
-                    self.module = module;
-                    self.cur = cur;
-                    self.base = base;
-                    self.pc = pc;
-                    return Ok(Outcome::Suspended);
-                }
-                budget -= 1;
-                // #1246 default-action terminate: a `SIG_DFL` SIGKILL/SIGTERM/SIGINT delivered to this
-                // domain set its `term_flag` (the personality's inline kill apply, [`wire_kill`]). Die at
-                // this op — the step returns the trap, and the exit hook reports term-by-signal from the
-                // personality's `term_sig` bookkeeping (WIFSIGNALED), exactly like the tree-walker.
-                // Checked before the async-signal redirect (death beats a caught delivery).
-                if let Some(tf) = &term_flag {
-                    if tf.load(std::sync::atomic::Ordering::Relaxed) {
-                        return Err(Trap::ThreadFault);
+                // #3088 — the per-op checks run only when [`checks_due`] says one has something to do,
+                // the one predicate `run_hot` stops on too: a check added here and not there never fires.
+                if checks_due!(budget, rcx.watch, self.sig_handler_stack) {
+                    if budget == 0 {
+                        // Pause at this op boundary: persist the cursor so a later `resume` continues here.
+                        self.module = module;
+                        self.cur = cur;
+                        self.base = base;
+                        self.pc = pc;
+                        return Ok(Outcome::Suspended);
                     }
-                }
-                // #1146 async signal delivery: at this per-op safepoint, if the personality has a caught,
-                // unmasked signal pending (its cheap `armed` flag) and we are not already
-                // `MAX_SIG_HANDLER_NEST` deep, redirect this vCPU into the guest handler
-                // `(i64 sp, i32 signum) -> ()` — a window opened exactly like a `call.dyn`, resolved and
-                // type-checked through the dispatch table. The interrupted op is NOT advanced (the return
-                // entry resumes at `pc`, re-running it once the handler returns), matching the tree-walker.
-                // Same interrupt-at-safepoint shape as `kill`, but non-lethal. (Interruptible-park `-EINTR`
-                // is a follow-up: no interruptible parks reach this synchronous safepoint path yet.)
-                if self.sig_handler_stack.len() < super::MAX_SIG_HANDLER_NEST {
-                    if let Some((armed, source)) = &signal_poll {
-                        if armed.load(std::sync::atomic::Ordering::Relaxed) {
-                            // The source owns its own locking (an `Arc<Mutex<Proc>>`); we hold no host lock
-                            // here. A `None` means nothing deliverable (ignored/masked/stopped) — it also
-                            // disarms, so the check idles until the next `raise`/`kill`.
-                            if let Some((fref, signum, sp)) = source.take_deliverable() {
-                                let slot = (fref as u32 as usize) & (table.len() - 1);
-                                let ts = table.slot(slot);
-                                if ts.module != super::TABLE_EMPTY {
-                                    let (tmod, tfunc) = (ts.module as usize, ts.func as usize);
-                                    let tm = resolve!(tmod);
-                                    let (cp, cr) = &tm.sigs[tfunc];
-                                    // `void handler(int)` = `(i64 sp, i32 signum) -> ()` — chibicc threads
-                                    // the data-SP as v0. A mis-typed handler is dropped (the signal was
-                                    // already consumed by `take_deliverable`), never fatal.
-                                    if matches!(cp.as_slice(), [ValType::I64, ValType::I32])
-                                        && cr.is_empty()
-                                    {
-                                        // Open a fresh window past the current activation (like `Op::Call`),
-                                        // seeded with `(sp, signum)`. `nb`/`need` use the *current* `c`
-                                        // before any cross-module reassignment below.
-                                        let nb = base + c.prog(cur).nslots as usize;
-                                        let need = nb + tm.prog(tfunc).nslots as usize;
-                                        self.open_frame(need)?;
-                                        self.regs[nb] = Reg::from_i64(sp as i64);
-                                        self.regs[nb + 1] = Reg::from_i32(signum);
-                                        // Return linkage resumes at the SAME `pc` so the interrupted op
-                                        // re-runs; the void handler writes no results (`ret_abs` unused —
-                                        // `base` is a harmless placeholder).
-                                        self.stack.push((
-                                            module,
-                                            cur,
-                                            base,
-                                            pc,
-                                            base,
-                                            self.entered,
-                                        ));
-                                        self.entered = self.work;
-                                        if tmod != module {
-                                            module = tmod;
-                                            c = tm;
+                    budget -= 1;
+                    // #1246 default-action terminate: a `SIG_DFL` SIGKILL/SIGTERM/SIGINT delivered to this
+                    // domain set its `term_flag` (the personality's inline kill apply, [`wire_kill`]). Die at
+                    // this op — the step returns the trap, and the exit hook reports term-by-signal from the
+                    // personality's `term_sig` bookkeeping (WIFSIGNALED), exactly like the tree-walker.
+                    // Checked before the async-signal redirect (death beats a caught delivery).
+                    if let Some(tf) = &term_flag {
+                        if tf.load(std::sync::atomic::Ordering::Relaxed) {
+                            return Err(Trap::ThreadFault);
+                        }
+                    }
+                    // #1146 async signal delivery: at this per-op safepoint, if the personality has a caught,
+                    // unmasked signal pending (its cheap `armed` flag) and we are not already
+                    // `MAX_SIG_HANDLER_NEST` deep, redirect this vCPU into the guest handler
+                    // `(i64 sp, i32 signum) -> ()` — a window opened exactly like a `call.dyn`, resolved and
+                    // type-checked through the dispatch table. The interrupted op is NOT advanced (the return
+                    // entry resumes at `pc`, re-running it once the handler returns), matching the tree-walker.
+                    // Same interrupt-at-safepoint shape as `kill`, but non-lethal. (Interruptible-park `-EINTR`
+                    // is a follow-up: no interruptible parks reach this synchronous safepoint path yet.)
+                    if self.sig_handler_stack.len() < super::MAX_SIG_HANDLER_NEST {
+                        if let Some((armed, source)) = &signal_poll {
+                            if armed.load(std::sync::atomic::Ordering::Relaxed) {
+                                // The source owns its own locking (an `Arc<Mutex<Proc>>`); we hold no host lock
+                                // here. A `None` means nothing deliverable (ignored/masked/stopped) — it also
+                                // disarms, so the check idles until the next `raise`/`kill`.
+                                if let Some((fref, signum, sp)) = source.take_deliverable() {
+                                    let slot = (fref as u32 as usize) & (table.len() - 1);
+                                    let ts = table.slot(slot);
+                                    if ts.module != super::TABLE_EMPTY {
+                                        let (tmod, tfunc) = (ts.module as usize, ts.func as usize);
+                                        let tm = resolve!(tmod);
+                                        let (cp, cr) = &tm.sigs[tfunc];
+                                        // `void handler(int)` = `(i64 sp, i32 signum) -> ()` — chibicc threads
+                                        // the data-SP as v0. A mis-typed handler is dropped (the signal was
+                                        // already consumed by `take_deliverable`), never fatal.
+                                        if matches!(cp.as_slice(), [ValType::I64, ValType::I32])
+                                            && cr.is_empty()
+                                        {
+                                            // Open a fresh window past the current activation (like `Op::Call`),
+                                            // seeded with `(sp, signum)`. `nb`/`need` use the *current* `c`
+                                            // before any cross-module reassignment below.
+                                            let nb = base + c.prog(cur).nslots as usize;
+                                            let need = nb + tm.prog(tfunc).nslots as usize;
+                                            self.open_frame(need)?;
+                                            self.regs[nb] = Reg::from_i64(sp as i64);
+                                            self.regs[nb + 1] = Reg::from_i32(signum);
+                                            // Return linkage resumes at the SAME `pc` so the interrupted op
+                                            // re-runs; the void handler writes no results (`ret_abs` unused —
+                                            // `base` is a harmless placeholder).
+                                            self.stack.push((
+                                                module,
+                                                cur,
+                                                base,
+                                                pc,
+                                                base,
+                                                self.entered,
+                                            ));
+                                            self.entered = self.work;
+                                            if tmod != module {
+                                                module = tmod;
+                                                c = tm;
+                                            }
+                                            cur = tfunc;
+                                            enter!();
+                                            base = nb;
+                                            pc = 0;
+                                            self.sig_handler_stack.push(self.stack.len());
+                                            continue;
                                         }
-                                        cur = tfunc;
-                                        enter!();
-                                        base = nb;
-                                        pc = 0;
-                                        self.sig_handler_stack.push(self.stack.len());
-                                        continue;
                                     }
                                 }
                             }
                         }
                     }
+                } else {
+                    budget -= 1;
                 }
                 #[cfg(feature = "callprof")]
                 if module == 0 {
@@ -24858,21 +24907,6 @@ impl Vm {
                     if let Some(v) = r {
                         self.regs[base + *dst as usize] = v;
                     }
-                    pc += 1;
-                }
-                Op::DurableShadowBase { dst } => {
-                    // §12.8 4A.5: this context's shadow-SP word address (its own region base).
-                    self.regs[base + *dst as usize] =
-                        Reg::from_i64(self.durable_region_base as i64);
-                    pc += 1;
-                }
-                Op::VcpuTlsGet { dst } => {
-                    // §12 per-vCPU TLS read: this vCPU's word (seeded to its dense id, guest-overwritable).
-                    self.regs[base + *dst as usize] = Reg::from_i64(self.tls);
-                    pc += 1;
-                }
-                Op::VcpuTlsSet { val } => {
-                    self.tls = r!(*val).i64();
                     pc += 1;
                 }
             }

@@ -411,6 +411,40 @@ int main(void) {
     );
 }
 
+/// #3088 — **a signal a host call raises is delivered before the next op**: the guest raises SIGINT
+/// at itself (a `call.cap`) and reads the handler's flag at once, with no loop to wait in. The
+/// tree-walker's per-op safepoint delivers between the call and the load, so the load reads 2. On
+/// the bytecode engine the call runs inside `run_hot` (as `cap_call`), whose next-op check must see
+/// the personality's `armed` flag and hand the op back to `run_ops`'s delivery; a check that missed
+/// it would read 0 here, where the spinning rows above only see a late delivery as more spins.
+#[test]
+fn c_a_raised_signal_is_delivered_before_the_next_op() {
+    let src = r#"
+long __px_signal(int cap, long signum, long handler);
+long __px_kill(int cap, long pid, long sig);
+long __px_sigaltstack(int cap, long sp, long size);
+static char sigstk[16384];
+static volatile int fired;
+static void handler(int sig) { fired = sig; }
+int main(void) {
+  __px_signal(0, 2, (long)handler);
+  __px_sigaltstack(0, (long)sigstk, 16384);
+  __px_kill(0, 0, 2);                          /* raise SIGINT: the call arms delivery */
+  return fired;                                /* 2: delivered before this load */
+}
+"#;
+    assert_eq!(
+        run_interp_only(src, |_| {}).result,
+        vec![Value::I32(2)],
+        "the tree-walker delivers between the raising call and the next op"
+    );
+    assert_eq!(
+        run_bytecode_only(src, |_| {}).result,
+        vec![Value::I32(2)],
+        "the bytecode engine delivers before the op after the raising call"
+    );
+}
+
 /// #796 L2 — async delivery **honors the mask**: a blocked signal is held (not delivered to a running
 /// loop) until unblocked, then delivered asynchronously. Encodes both checks: `a` (fired while blocked,
 /// must be 0) in the thousands, the post-unblock `fired` (2) in the units → 2. A mask that leaked would

@@ -18,10 +18,11 @@
 #
 # What is gated: kernels whose iteration runs only our own code. Their counts depend on the source and
 # the compiler, not on the runner. A kernel whose iteration runs libc is only reported: glibc picks its
-# `memcpy` by CPU, so its count moves with the runner (`fiber_switch` runs ~500 instructions of it).
+# `memcpy` by CPU, so its count moves with the runner (`fiber_switch` runs ~500 instructions of it;
+# an AMD EPYC runner on glibc 2.43 read it 2 off an Intel Xeon on glibc 2.39, the gated rows equal).
 #
-# The threshold, `TOL` (2%): a count is exact, so a change is never noise. 2% (5 instructions of
-# `alu`'s ~260) is the line between an edit to the hot path that should explain itself and drift
+# The threshold, `TOL` (2%): a count is exact, so a change is never noise. 2% (about 5 instructions
+# of `alu`'s 230) is the line between an edit to the hot path that should explain itself and drift
 # nobody needs to read. It fails in both directions, so the baseline stays tight and a regression back
 # up to a stale number can't hide.
 #
@@ -41,6 +42,7 @@ ROWS=(
   "call_indirect bytecode gate"
   "mem bytecode gate"
   "hostcall bytecode gate"
+  "tls bytecode gate"
   "alu tree-walker gate"
   "fiber_switch bytecode report"
   "fiber_wait bytecode report"
@@ -108,7 +110,7 @@ for row in "${ROWS[@]}"; do
       print s }')
     case $verdict in *past*) [ "$update" = 1 ] || fail=1 ;; esac
   fi
-  summary+=$'\n'"| $kernel | $engine${mode/gate/} | ${was:--} | $now | $verdict |"
+  summary+=$'\n'"| $kernel | $engine$( [ "$mode" = report ] && echo ' (reported)' || true) | ${was:--} | $now | $verdict |"
   echo "$kernel $engine: $now (baseline ${was:--}, $verdict)"
 done
 
