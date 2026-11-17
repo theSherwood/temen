@@ -92,8 +92,8 @@ impl BudgetNode for Allowance {
     }
     fn give_back(&self, unspent: u64) {
         // Only a bounded allowance hands out draws, so only it takes any back, and never more than it
-        // handed out: the sum stays within `i64`.
-        if unspent > 0 {
+        // handed out: the sum stays within `i64`. An unbounded one (`-1`) stays unbounded.
+        if unspent > 0 && self.0.load(Ordering::Relaxed) >= 0 {
             self.0.fetch_add(unspent as i64, Ordering::Relaxed);
         }
     }
@@ -147,9 +147,11 @@ pub struct FuelCell {
     /// The chain the next draw comes from. Locked by a refill, so contexts sharing the cell draw one
     /// at a time.
     src: Mutex<Arc<dyn BudgetNode>>,
-    /// #1991 — `left` came from no draw: the chain was unbounded at every level at the last refill,
-    /// which granted a [`QUANTUM`] to count all the same. None of it goes back to the chain. Written
-    /// by a refill, under `src`'s lock.
+    /// `left` is not the chain's to take back: #1991, the chain was unbounded at every level at the
+    /// last refill, which granted a [`QUANTUM`] drawn from nothing; or #3081, `left` is a spawned
+    /// vCPU's entry its spawn already paid ([`Self::seed_entry`]), which is never refunded. None of it
+    /// goes back to the chain (`settle`, `rearm`, `Drop`). Written by a refill and by the seeding,
+    /// under `src`'s lock; the next refill clears it.
     free: bool,
 }
 
@@ -193,23 +195,39 @@ impl FuelCell {
         Self::drawing(self.chain())
     }
 
-    /// #3081 — pay a spawned vCPU's entry at its spawn, as the interpreters do: exactly one unit from
-    /// the chain ([`BudgetNode::take_exact`]), held in `left` for the vCPU's entry prologue to burn
-    /// without a draw. Its first draw comes at its first back-edge or call, so a vCPU that has not run
-    /// holds no chunk. `false` when the chain is spent: the spawn runs out of fuel. Only on a cell no
-    /// code charges yet.
-    pub(crate) fn pay_entry(&mut self) -> bool {
-        let src = self.src.get_mut().unwrap_or_else(|e| e.into_inner());
-        debug_assert_eq!(self.left, 0, "a cell no code has charged");
-        let free = match src.take_exact(1) {
-            Some(false) => return false,
-            Some(true) => false,
-            // Every level unbounded: nothing was charged, so nothing goes back (#1991).
-            None => true,
-        };
-        self.left = 1;
-        self.free = free;
-        true
+    /// #3081 — pay a spawned vCPU's entry at its spawn, as the interpreters do: exactly one unit,
+    /// taken from this cell's chain ([`BudgetNode::take_exact`]), all or nothing. It touches no cell:
+    /// the vCPU seeds its own with the unit once it runs ([`Self::seed_entry`]). `None` when the chain is
+    /// unbounded (nothing to pay), `Some(false)` when it is spent (the spawn runs out of fuel).
+    pub(crate) fn pay_entry(&self) -> Option<bool> {
+        self.chain().take_exact(1)
+    }
+
+    /// #3081 — seed `cell` with a spawned vCPU's entry, which its spawn already paid
+    /// ([`Self::pay_entry`]), for its prologue to burn without a draw. A paid entry is never
+    /// refunded: the cell holds exactly the unit, marked as none of the chain's (`free`), so
+    /// whether the vCPU burns it or stops first (its run ended before its first charge: a kill check
+    /// or a domain poll comes first in the prologue, or lazy code never ran), nothing goes back. The
+    /// refill that follows the burn clears the mark, so while it is set the cell holds the unit or
+    /// nothing. What a recycled cell held goes back to its chain first, under the lock a refill takes
+    /// and through the raw pointer, as [`Self::settle`] does; a fiber of the cell's earlier vCPU that
+    /// refills it in between races it as any shared charge does (#3080).
+    ///
+    /// Both of the Cranelift JIT's routes seed through it: today's (`os_thread_rt::run_child`) and
+    /// the kernel route's (temen-run's `jit_kernel`), each on the thread's own cell.
+    ///
+    /// # Safety
+    /// `cell` is a live cell no context but this vCPU's (and #3080's fibers) charges.
+    pub unsafe fn seed_entry(cell: *mut FuelCell) {
+        let src = (*cell).src.lock().unwrap_or_else(|e| e.into_inner());
+        let left = core::ptr::addr_of_mut!((*cell).left);
+        let free = core::ptr::addr_of_mut!((*cell).free);
+        let unspent = core::ptr::read_volatile(left);
+        if !core::ptr::read_volatile(free) {
+            src.give_back(unspent);
+        }
+        core::ptr::write_volatile(left, 1);
+        core::ptr::write_volatile(free, true);
     }
 
     /// #2488 — a vCPU that charged this cell has ended: hand back what its draw left, as an ended
@@ -774,6 +792,50 @@ block 2 (v8: i64) {
             "the loop drew a quantum at a time, three times, and the root once"
         );
         assert_eq!(chain.back.load(Ordering::Relaxed), 0, "nothing went back");
+    }
+
+    /// #3081 — a seeded entry is never refunded, and a recycled cell's leftover never adds to the
+    /// next one. A spawn pays a unit from the allowance; the cell holds it, marked `free`. A vCPU that
+    /// never charged it settles and hands back nothing. The cell, recycled, is seeded again: it holds
+    /// one unit, not two. Recycled to a vCPU that is not seeded, its first refill draws as any does
+    /// and clears the mark, so what that draw leaves goes back. An unbounded allowance pays nothing.
+    #[test]
+    fn a_seeded_entry_is_never_refunded() {
+        use super::{fuel_refill, Allowance};
+        let chain = Arc::new(Allowance::new(10));
+        let root = FuelCell::drawing(chain.clone());
+        let mut cell = root.sibling();
+        let cell = &mut *cell as *mut FuelCell;
+        assert_eq!(root.pay_entry(), Some(true));
+        // SAFETY: `cell` is live and nothing else charges it.
+        unsafe { FuelCell::seed_entry(cell) };
+        assert_eq!((unsafe { (*cell).left }, chain.room()), (1, 9));
+        // Its vCPU stops before its first charge: nothing goes back.
+        unsafe { FuelCell::settle(cell) };
+        assert_eq!(
+            (unsafe { (*cell).left }, chain.room()),
+            (0, 9),
+            "the paid unit stays paid"
+        );
+        // Recycled to a seeded vCPU: one unit, not the leftover plus one.
+        assert_eq!(root.pay_entry(), Some(true));
+        unsafe { FuelCell::seed_entry(cell) };
+        assert_eq!((unsafe { (*cell).left }, chain.room()), (1, 8));
+        unsafe { FuelCell::settle(cell) };
+        // Recycled to a vCPU that is not seeded: its first charge draws, and the rest goes back.
+        unsafe { fuel_refill(cell) };
+        assert_eq!(
+            (unsafe { (*cell).left }, chain.room()),
+            (4, 4),
+            "half of 8 drawn"
+        );
+        unsafe { FuelCell::settle(cell) };
+        assert_eq!(chain.room(), 8, "the draw's unburned rest went back");
+        // A spent allowance cannot pay; an unbounded one has nothing to pay.
+        let spent = FuelCell::drawing(Arc::new(Allowance::new(0)));
+        assert_eq!(spent.pay_entry(), Some(false));
+        let unbounded = FuelCell::fixed(u64::MAX);
+        assert_eq!(unbounded.pay_entry(), None);
     }
 
     #[test]
