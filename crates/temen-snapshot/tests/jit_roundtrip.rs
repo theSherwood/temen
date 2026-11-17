@@ -257,3 +257,32 @@ fn codec_refuses_a_tampered_unit() {
         other => panic!("expected a fail-closed refusal, got {other:?}"),
     }
 }
+
+/// #3034 — a `Jit` grant reserves at most `2^MAX_TABLE_LOG2` dispatch-table slots: every engine builds
+/// the table eagerly. The ceiling itself is granted, and its artifact restores.
+#[test]
+fn a_grant_at_the_table_ceiling_is_granted_and_restores() {
+    let module = gate_module();
+    let mut host = Host::new();
+    host.set_jit_validator(validator);
+    host.grant_jit_with_table(Some(SIZE_LOG2), temen_ir::MAX_TABLE_LOG2);
+    let artifact = freeze(&module, &vec![0u8; WINDOW], &host).expect("freeze");
+    let mut thost = Host::new();
+    restore(&artifact, &module, &mut thost).expect("restore");
+    assert_eq!(thost.jit_table_log2(), temen_ir::MAX_TABLE_LOG2);
+}
+
+/// One past the ceiling is an embedder's precondition broken, as a full handle table is.
+#[test]
+#[should_panic(expected = "MAX_TABLE_LOG2")]
+fn a_grant_past_the_table_ceiling_panics() {
+    let mut host = Host::new();
+    host.grant_jit_with_table(Some(SIZE_LOG2), temen_ir::MAX_TABLE_LOG2 + 1);
+}
+
+/// And so does a reservation set past it.
+#[test]
+#[should_panic(expected = "MAX_TABLE_LOG2")]
+fn a_reservation_past_the_table_ceiling_panics() {
+    Host::new().set_jit_table_log2(temen_ir::MAX_TABLE_LOG2 + 1);
+}

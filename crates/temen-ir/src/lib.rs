@@ -7952,6 +7952,12 @@ pub struct Data {
     pub bytes: Vec<u8>,
 }
 
+/// #3034 — the largest `call.dyn` dispatch-table reservation (`log2` slots) a `Jit` grant may carry:
+/// 1,048,576 slots. Every engine builds its table `1 << log2` slots eagerly, so the grant setters
+/// refuse past it (an embedder precondition), a restore refuses an artifact that names more, and an
+/// embedder that would need more for a module declines it.
+pub const MAX_TABLE_LOG2: u8 = 20;
+
 pub mod cfg;
 pub mod dominance;
 pub mod handles;

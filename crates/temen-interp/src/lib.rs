@@ -33236,8 +33236,13 @@ impl Host {
 
     /// Like [`Host::grant_jit`], but also reserve a `call.dyn` table of `2^table_log2`
     /// slots for B2 `install` (the run's root vCPU honours it; pass the **same** value as the
-    /// JIT's `table_reserve_log2`). `0` ⇒ natural size (no install room).
+    /// JIT's `table_reserve_log2`). `0` ⇒ natural size (no install room). Panics past
+    /// [`temen_ir::MAX_TABLE_LOG2`]: every engine builds the table eagerly (#3034).
     pub fn grant_jit_with_table(&mut self, mem_log2: Option<u8>, table_log2: u8) -> i32 {
+        assert!(
+            table_log2 <= temen_ir::MAX_TABLE_LOG2,
+            "a `Jit` grant reserves at most 2^MAX_TABLE_LOG2 dispatch-table slots"
+        );
         let id = self.jit_tables.len() as u32;
         self.jit_tables.push(JitTableState {
             mem_log2: JitMem::Fixed(mem_log2),
@@ -33254,8 +33259,13 @@ impl Host {
     /// Restore the `call.dyn` table reservation (DURABILITY.md §12.5 install-durability): the
     /// thaw path re-establishes it from the artifact (a fresh host defaults to `0`, which would give
     /// the thaw run's dispatch table no padding to re-apply the captured installs into). Monotone
-    /// like the grant path, so a restore that also re-grants never shrinks it.
+    /// like the grant path, so a restore that also re-grants never shrinks it. Panics past
+    /// [`temen_ir::MAX_TABLE_LOG2`], as the grant does.
     pub fn set_jit_table_log2(&mut self, v: u8) {
+        assert!(
+            v <= temen_ir::MAX_TABLE_LOG2,
+            "a `Jit` grant reserves at most 2^MAX_TABLE_LOG2 dispatch-table slots"
+        );
         self.jit_table_log2 = self.jit_table_log2.max(v);
     }
 

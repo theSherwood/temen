@@ -2839,8 +2839,9 @@ fn decode_jit(body: Option<&[u8]>) -> Result<(u8, Vec<DurableJitTable>), Restore
 /// block (v19, #1296); the caller enforces the section-level canonical checks (`at_end`, non-empty).
 fn read_jit_body(jr: &mut Reader) -> Result<(u8, Vec<DurableJitTable>), RestoreError> {
     let table_log2 = jr.u8()?;
-    // #3034 — every engine sizes its dispatch table `1 << table_log2` slots, named by `u32`.
-    if u32::from(table_log2) >= u32::BITS {
+    // #3034 — every engine builds its dispatch table `1 << table_log2` slots eagerly: no grant
+    // reserves more than `MAX_TABLE_LOG2`.
+    if table_log2 > temen_ir::MAX_TABLE_LOG2 {
         return Err(RestoreError::Malformed);
     }
     let nd = jr.count()?;
@@ -3289,8 +3290,8 @@ mod decoder_bounds_tests {
     }
 
     #[test]
-    fn a_dispatch_table_past_u32_slots_is_refused() {
-        for log2 in [32u8, 64, 255] {
+    fn a_dispatch_table_past_the_grant_ceiling_is_refused() {
+        for log2 in [temen_ir::MAX_TABLE_LOG2 + 1, 31, 32, 255] {
             let mut b = vec![log2];
             write_uleb(&mut b, 0); // no domains
             assert!(matches!(
@@ -3298,9 +3299,12 @@ mod decoder_bounds_tests {
                 Err(RestoreError::Malformed)
             ));
         }
-        let mut b = vec![31u8];
+        let mut b = vec![temen_ir::MAX_TABLE_LOG2];
         write_uleb(&mut b, 0);
-        assert!(read_jit_body(&mut Reader::new(&b)).is_ok());
+        assert!(
+            read_jit_body(&mut Reader::new(&b)).is_ok(),
+            "the ceiling itself"
+        );
     }
 }
 
