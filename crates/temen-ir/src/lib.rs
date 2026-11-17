@@ -4735,6 +4735,18 @@ pub const MAX_FIBERS: usize = 1 << 24;
 /// interpreter's continuation is smaller), so a budget reads the same on every engine.
 pub const FIBER_STACK: u64 = 1 << 18;
 
+/// #1944 slice 3 — the most fuel one draw takes: a vCPU refills its counter this much at a time, so
+/// only one safepoint in this many walks the chain.
+pub const FUEL_CHUNK: u64 = 1 << 16;
+
+/// #1944 slice 3 — what one draw takes from a chain with `room` fuel left: up to [`FUEL_CHUNK`], never
+/// more than half of the room (rounded up). Taking at most half keeps one consumer from holding all of
+/// a small budget while its siblings starve; a lone consumer still spends it to the last unit. The one
+/// rule every budget a vCPU draws from follows, the Cranelift JIT's fixed allowance included (#3069).
+pub fn fuel_draw(room: u64) -> u64 {
+    room.div_ceil(2).min(FUEL_CHUNK)
+}
+
 /// #2268 — the runs of page state every fresh window counts as, whatever its geometry: a NULL guard,
 /// the declared prefix, the reserved tail. A window's runs are its mappings where it is real hardware
 /// (the JIT's), and every engine counts them alike (`Budget.maps`).

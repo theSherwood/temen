@@ -22138,9 +22138,7 @@ struct BudgetNode {
 /// under the lock, all or nothing, however many hosts charge at once.
 struct BudgetTree(Mutex<Vec<BudgetNode>>);
 
-/// #1944 slice 3 — the most fuel one draw takes: a vCPU refills its counter this much at a time, so
-/// only one safepoint in this many walks the chain.
-pub const FUEL_CHUNK: u64 = 1 << 16;
+pub use temen_ir::{fuel_draw, FUEL_CHUNK};
 
 /// #2113 — the fuel a run's root is granted for an activation when its embedder names none (owner,
 /// 2026-10-06: "just put large bounds on everything"). One value on every engine.
@@ -22490,11 +22488,9 @@ impl BudgetTree {
         });
     }
 
-    /// #1944 slice 3 — a fuel draw for a consumer of `n`: up to [`FUEL_CHUNK`], never more than half
-    /// of the chain's room (rounded up), charged to `n` and every ancestor. Taking at most half keeps
-    /// one consumer from holding all of a small budget while its siblings starve; a lone consumer
-    /// still spends it to the last unit. `None` when every level is unbounded: there is nothing to
-    /// meter. `Some(0)` when the chain is spent.
+    /// #1944 slice 3 — a fuel draw for a consumer of `n`, [`fuel_draw`] of the chain's room, charged
+    /// to `n` and every ancestor. `None` when every level is unbounded: there is nothing to meter.
+    /// `Some(0)` when the chain is spent.
     fn draw_fuel(&self, n: u32) -> Option<u64> {
         let mut nodes = self.0.lock_unpoisoned();
         if (n as usize) >= nodes.len() {
@@ -22504,11 +22500,33 @@ impl BudgetTree {
         if room < 0 {
             return None;
         }
-        let take = (room as u64).div_ceil(2).min(FUEL_CHUNK);
+        let take = fuel_draw(room as u64);
         Self::each_level(&mut nodes, n, |node| {
             node.used[BUDGET_FUEL] = node.used[BUDGET_FUEL].saturating_add(take as i64);
         });
         Some(take)
+    }
+
+    /// #3081 — take exactly `amount` of fuel for a consumer of `n`, charged to `n` and every ancestor,
+    /// all or nothing, under the one lock a draw takes, so no other consumer meets a room emptied for a
+    /// moment. `None` when every level is unbounded: there is nothing to meter, and nothing is charged.
+    /// `Some(false)`, charging nothing, when the chain has less than `amount` of room.
+    fn take_fuel(&self, n: u32, amount: u64) -> Option<bool> {
+        let mut nodes = self.0.lock_unpoisoned();
+        if (n as usize) >= nodes.len() {
+            return Some(false);
+        }
+        let room = Self::left(&nodes, n, BUDGET_FUEL);
+        if room < 0 {
+            return None;
+        }
+        if (room as u64) < amount {
+            return Some(false);
+        }
+        Self::each_level(&mut nodes, n, |node| {
+            node.used[BUDGET_FUEL] = node.used[BUDGET_FUEL].saturating_add(amount as i64);
+        });
+        Some(true)
     }
 
     /// #1944 slice 3 — give `n` exactly `fuel` of fuel room on its own level, whatever it has burned:
@@ -22629,6 +22647,14 @@ impl NodeRef {
     /// is unbounded (nothing to meter), `Some(0)` when the chain is spent.
     pub fn draw(&self) -> Option<u64> {
         self.tree.draw_fuel(self.node)
+    }
+
+    /// #3081 — take exactly `n` of fuel from the chain, charged to every level, all or nothing: what
+    /// a spawned vCPU's entry costs, paid at the spawn. `None` when every level is unbounded (nothing
+    /// to meter, nothing charged), `Some(false)` when the chain has less than `n` of room (nothing
+    /// charged), `Some(true)` when `n` was charged.
+    pub fn take_exact(&self, n: u64) -> Option<bool> {
+        self.tree.take_fuel(self.node, n)
     }
 
     /// Hand back `unspent`, the rest of a draw its consumer did not burn, to every level.

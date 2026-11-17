@@ -1747,7 +1747,8 @@ pub fn compile_and_run_with_host_interruptible_fast(
 /// entries, taken back-edges and resumes executed — the unit the tree-walker and bytecode engines
 /// charge — so a run either completes or traps `OutOfFuel` at the same safepoint on all three
 /// backends. The caller seeds `fuel` with the budget and reads the remainder back after the call: a
-/// fixed allowance, never refilled (#1944 slice 3).
+/// fixed allowance (#1944 slice 3), from which each vCPU draws a cell of its own as from a budget
+/// chain (#3069), so a threaded run is charged in full.
 ///
 /// # Safety
 /// `cap_thunk`/`cap_ctx` must stay valid for the call and honour the [`CapThunk`] contract.
@@ -1771,7 +1772,7 @@ pub fn compile_and_run_with_host_fuel(
             ..RunOpts::default()
         },
     );
-    *fuel = cell.left;
+    *fuel = cell.can_burn();
     Ok(r?.0)
 }
 
@@ -1893,7 +1894,7 @@ pub fn compile_and_run_capture_reserved_with_host_ex(
 
 /// [`compile_and_run_capture_reserved_with_host`] with a **counted-fuel budget armed** (INTERP_PERF.md
 /// "Fuel unification"): the caller seeds `fuel` with the budget and reads the remainder back after the
-/// call (a fixed allowance, never refilled — #1944 slice 3); the run traps [`TrapKind::OutOfFuel`]
+/// call (a fixed allowance, each vCPU drawing from it — #1944 slice 3, #3069); the run traps [`TrapKind::OutOfFuel`]
 /// when the budget would underflow, at the same IR safepoints (function entries + taken back-edges +
 /// `cont.resume`) the interpreters charge.
 /// This lets the differential fuzzer **assert** cross-engine `OutOfFuel` parity rather than exclude it.
@@ -1927,7 +1928,7 @@ pub fn compile_and_run_capture_reserved_with_host_fuel(
             ..RunOpts::default()
         },
     );
-    *fuel = cell.left;
+    *fuel = cell.can_burn();
     r
 }
 
