@@ -1783,3 +1783,105 @@ fn the_jit_declines_a_nested_record_kind_it_stands_up_no_runtime_for() {
         1
     );
 }
+
+/// #3034 — a child [`NEST_ROOT`] can spawn in [`NEST`]'s place that writes a value outside its own
+/// region into its own shadow-SP word (guest memory), then waits a second on a futex nothing
+/// notifies, so it is live when the freeze lands, and returns [`NEST_TOTAL`].
+fn scribble_nest() -> String {
+    format!(
+        "memory 17 shadow 16448 65536
+func (i64, i64) -> (i64) {{
+block 0 (v0: i64, v1: i64) {{
+  vsa = i64.const {word}
+  vsv = i64.const {val}
+  i64.store vsa vsv
+  va = i64.const 66000
+  vw0 = i32.const 0
+  vto = i64.const 1000000000
+  vw = i32.atomic.wait va vw0 vto
+  vr = i64.const {NEST_TOTAL}
+  return vr
+  }}
+}}
+",
+        word = ARENA.region_base(0),
+        val = std::env::var("SCRIB")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(8)
+    )
+}
+
+/// #3034 — **a child's fault is the child's**, through the engine's own trap path, on every engine.
+/// A live detached child whose own shadow-SP word its guest scribbled traps at its own push check as
+/// the freeze rings it and it unwinds: it ends as a child that trapped `Unreachable` ends. The
+/// parent's run and freeze go on, the child rides the artifact completed with that trap, the
+/// artifact restores, and every engine's thaw answers it from the root's rewound `join` as its
+/// status. The budget nodes the freeze leaves equal those of a run whose child trapped before the
+/// cut ([`TRAP_NEST`]).
+#[test]
+fn a_childs_scribbled_shadow_word_ends_the_child_and_the_parents_freeze_goes_on() {
+    use Engine::*;
+    let unreachable = (Ok(temen_ir::trap_code::UNREACHABLE * 1000), "");
+    let budgets = |src: &str, e: Engine, live: i64| {
+        let (root, child) = nest_modules(src);
+        let (mut host, args) = nest_powerbox(&child, 100, live);
+        let mut win = init_durable_window(1 << PARENT_LOG2, ARENA);
+        arm_freeze_after(&mut win, ARENA, 1);
+        let (r, _, snap) = nest_run(e, &root, &args, &win, &mut host, None)?;
+        Some((r, host, snap, root, child, args))
+    };
+    let mut runs = Vec::new();
+    for e in [Interp, Jit] {
+        let Some((r, host, snap, root, child, args)) = budgets(&scribble_nest(), e, 1) else {
+            continue; // a target without the JIT's child executor
+        };
+        eprintln!(
+            "PROBE {e:?} r {r:?} frozen {:?} captured {}",
+            host.frozen_detached(),
+            host.captured_detached().len()
+        );
+        if std::env::var("PROBEONLY").is_ok() {
+            continue;
+        }
+        assert_eq!(r, Ok(0), "{e:?}: the parent's freeze goes on");
+        assert_eq!(
+            completed_children(&host),
+            [1],
+            "{e:?}: the child rides completed"
+        );
+        assert_eq!(
+            host.frozen_detached()[0].completed_result,
+            Err(temen_ir::trap_code::UNREACHABLE),
+            "{e:?}: answering the push check's trap"
+        );
+        let (_, trapped, ..) = budgets(TRAP_NEST, e, 2).expect("the same engine");
+        let nodes = |h: &Host| {
+            h.capture_durable_budgets()
+                .iter()
+                .map(|n| (n.used.mem, n.used.spawn))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            nodes(&host),
+            nodes(&trapped),
+            "{e:?}: the budget nodes of a child that trapped before the cut"
+        );
+        let art = temen_snapshot::freeze(&root, &snap, &host).expect("serialize");
+        runs.push((e, art, root, child, args));
+    }
+    let engines: Vec<Engine> = runs.iter().map(|r| r.0).collect();
+    let mut wrong = Vec::new();
+    for (froze, art, root, child, args) in &runs {
+        wrong.extend(nest_thaws(
+            art,
+            *froze,
+            root,
+            child,
+            args,
+            &engines,
+            unreachable,
+        ));
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}

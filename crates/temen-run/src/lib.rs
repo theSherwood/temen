@@ -1586,10 +1586,9 @@ pub fn jit_cap_run(
             hg.set_jit_native_ctx(0);
             hg.set_serve_ctx(0);
             hg.set_park_hub(0);
-            let left = jit_durable_leave(&mut cm, m, &mut hg, ended(&r));
+            jit_durable_leave(&mut cm, &mut hg, ended(&r));
             drop(hg);
             *host = Host::from_cell(host_cell);
-            let r = refused_run(r, left);
             return r.map(|(o, bytes)| (o, jit_layout(m, host, bytes, cm.take_tail_out())));
         }
     }
@@ -1639,29 +1638,14 @@ pub fn jit_cap_run(
     // The module dies with this call — leave no dangling registration behind.
     host.set_jit_native_ctx(0);
     host.set_park_hub(0);
-    let left = jit_durable_leave(&mut cm, m, host, ended(&r));
-    refused_run(r, left).map(|(o, bytes)| (o, jit_layout(m, host, bytes, cm.take_tail_out())))
+    jit_durable_leave(&mut cm, host, ended(&r));
+    r.map(|(o, bytes)| (o, jit_layout(m, host, bytes, cm.take_tail_out())))
 }
 
 /// Whether a run ended other than by returning: a trap, an exit or a host unwind. A freeze in such a
 /// run leaves no residue ([`Host::leave_freeze`]).
 fn ended<B>(r: &Result<(JitOutcome, B), temen_jit::JitError>) -> bool {
     !matches!(r, Ok((JitOutcome::Returned(_), _)))
-}
-
-/// #3034 — a run whose freeze left a residue holding a value its guest wrote ends as the push check's
-/// own trap, `Unreachable` ([`Host::leave_freeze`]), as on the tree-walker. An engine fault leaves the
-/// run's outcome, and fails the freeze to the embedder.
-fn refused_run<B>(
-    r: Result<(JitOutcome, B), temen_jit::JitError>,
-    left: Result<(), temen_interp::FreezeFault>,
-) -> Result<(JitOutcome, B), temen_jit::JitError> {
-    match r {
-        Ok((_, b)) if left == Err(temen_interp::FreezeFault::Guest) => {
-            Ok((JitOutcome::Trapped(temen_jit::TrapKind::Unreachable), b))
-        }
-        r => r,
-    }
 }
 
 /// Durable [`jit_cap_run`] (DURABILITY.md §12.8, #1236): a `Host` marked durable makes the run
@@ -1834,11 +1818,9 @@ fn jit_detached_leave(
     cm: &mut CompiledModule,
     host: &mut Host,
     trapped: bool,
-    engine: &mut bool,
 ) -> Vec<temen_interp::FrozenDetached> {
     let mut unreached = Vec::new();
-    let (captured, completed) =
-        detached_left(cm.take_detached_harvest(), &mut unreached, trapped, engine);
+    let (captured, completed) = detached_left(cm.take_detached_harvest(), &mut unreached, trapped);
     if !captured.is_empty() {
         host.set_captured_detached(captured);
     }
@@ -1865,7 +1847,6 @@ fn detached_left(
     harvest: Vec<temen_jit::DetachedHarvest>,
     unreached: &mut Vec<temen_interp::PendingDetached>,
     trapped: bool,
-    engine: &mut bool,
 ) -> (
     Vec<temen_interp::CapturedDetached>,
     Vec<temen_interp::FrozenDetached>,
@@ -1901,8 +1882,7 @@ fn detached_left(
             module: std::sync::Arc::clone(&module),
             pager: None,
         };
-        let (grand_captured, grand_completed) =
-            detached_left(h.children, unreached, trapped, engine);
+        let (grand_captured, grand_completed) = detached_left(h.children, unreached, trapped);
         let outcome = join_outcome(h.outcome);
         let Some(capture) = h.capture else {
             unreached.extend(grand_captured.into_iter().map(pending_detached));
@@ -1930,25 +1910,8 @@ fn detached_left(
             if !grand_captured.is_empty() {
                 c.set_captured_detached(grand_captured);
             }
-            // #2010, #2031 — what its root, fibers and vCPUs left rides its artifact too, through the
-            // one hand-off (#3034). A value its guest wrote is the child's fault: it ends with the
-            // push check's trap and rides as a completed child answering it. An engine fault fails
-            // the whole freeze.
-            match leave_residue(&mut c, &module, capture.residue, grand_completed, trapped) {
-                Ok(()) => {}
-                Err(temen_interp::FreezeFault::Guest) => {
-                    drop(c);
-                    if h.joinable {
-                        completed.push(temen_interp::FrozenDetached {
-                            parent_task: 0,
-                            slot: h.slot,
-                            completed_result: Err(temen_interp::Trap::Unreachable.code()),
-                        });
-                    }
-                    continue;
-                }
-                Err(temen_interp::FreezeFault::Engine) => *engine = true,
-            }
+            // #2010, #2031 — what its root, fibers and vCPUs left rides its artifact too.
+            leave_residue(&mut c, capture.residue, grand_completed, trapped);
             jit_layout(&module, &c, capture.image, capture.tail)
         };
         captured.push(temen_interp::CapturedDetached {
@@ -1989,41 +1952,30 @@ fn pending_detached(c: temen_interp::CapturedDetached) -> temen_interp::PendingD
 
 /// The freeze residue of a durable [`jit_cap_run`], handed to the embedder on the `Host` exactly where
 /// the interp's freeze driver leaves it, so one `temen_snapshot::freeze(module, window, host)` serves
-/// both engines. The whole residue, not just the fibers (#1690), through the one hand-off
-/// ([`Host::leave_freeze`]): none from a run that `trapped`. A child's fault is the child's
-/// ([`detached_left`]); `Err` names the root domain's own fault, or an engine fault anywhere in the
-/// cut, which fails the whole freeze ([`Host::refuse_freeze`]).
-fn jit_durable_leave(
-    cm: &mut CompiledModule,
-    m: &Module,
-    host: &mut Host,
-    trapped: bool,
-) -> Result<(), temen_interp::FreezeFault> {
-    let mut engine = false;
-    let completed = jit_detached_leave(cm, host, trapped, &mut engine);
-    let left = leave_residue(host, m, cm.take_durable_residue(), completed, trapped);
-    if engine {
-        host.refuse_freeze();
-        return Err(temen_interp::FreezeFault::Engine);
-    }
-    left
+/// both engines. The whole residue, not just the fibers (#1690); none from a run that `trapped`. Each
+/// extent in it was checked where the JIT read it (#3034): a guest's fault ended its context as a trap.
+fn jit_durable_leave(cm: &mut CompiledModule, host: &mut Host, trapped: bool) {
+    let completed = jit_detached_leave(cm, host, trapped);
+    leave_residue(host, cm.take_durable_residue(), completed, trapped);
 }
 
 /// A JIT freeze's residue onto `host`, where the interpreter's freeze leaves it: a run root's, or a
 /// captured detached child's on its powerbox (#2010, #2031), with the children it left completed and
-/// unjoined, through the one hand-off ([`Host::leave_freeze`]) against `m`, the program it ran.
+/// unjoined ([`Host::leave_freeze`]). None from a run that `trapped`.
 fn leave_residue(
     host: &mut Host,
-    m: &Module,
     r: temen_jit::DurableResidue,
     completed: Vec<temen_interp::FrozenDetached>,
     trapped: bool,
-) -> Result<(), temen_interp::FreezeFault> {
-    let raw = temen_interp::Residue {
-        detached: completed,
-        ..r.into_raw()
-    };
-    host.leave_freeze(m, 0, raw, trapped)
+) {
+    if trapped {
+        host.drop_freeze();
+    } else {
+        host.leave_freeze(temen_interp::Residue {
+            detached: completed,
+            ..r.into_raw()
+        });
+    }
 }
 
 /// **Code-memory compaction** for a guest-driven `Jit` domain (DESIGN.md §22): rebuild the domain's

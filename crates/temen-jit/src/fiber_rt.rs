@@ -1600,9 +1600,17 @@ pub(crate) unsafe extern "C" fn fiber_resume(
             // first 8 bytes); an empty stack sits exactly at the frame base.
             let flat_sp = slot.shadow_sp.load(Ordering::Relaxed);
             let shadow = (&*current()).table.shadow;
-            let frozen = durable
+            let unwound = durable
                 && flat_sp > shadow.frame_base(slot_idx + 1)
                 && window_is_unwinding(mem_base, shadow);
+            // #3034 — the extent was read out of the fiber's word (guest memory) at its exit swap:
+            // checked here, where it is recorded. One outside its region is the guest's fault, and
+            // the resumer traps `Unreachable` (the freeze driver's flatten: the run's), as the
+            // tree-walker's drive does.
+            let frozen = unwound && temen_ir::thaw::extent_fits(shadow, slot_idx + 1, flat_sp);
+            if unwound && !frozen {
+                crate::VmCtx::at(vm).raise(TrapKind::Unreachable as i64);
+            }
             if frozen {
                 (*current()).frozen.push(crate::FrozenFiber {
                     slot: slot_idx,

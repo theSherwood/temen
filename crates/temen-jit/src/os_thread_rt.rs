@@ -2228,7 +2228,7 @@ fn run_child(a: SpawnArgs) {
         fiber_rt::set_current(p);
     }
 
-    let (result, trap) = if faulted {
+    let (mut result, mut trap) = if faulted {
         env.ctx().raise(TrapKind::MemoryFault as i64);
         (0, TrapKind::MemoryFault as i64)
     } else {
@@ -2249,9 +2249,16 @@ fn run_child(a: SpawnArgs) {
         };
         // A freeze-unwind iff the window is UNWINDING **and** the child actually spilled past its frame
         // base — a child that ran to a genuine finish under an UNWINDING window left its region empty.
-        let froze = !faulted
+        let unwound = !faulted
             && unsafe { fiber_rt::window_is_unwinding(env.mem_base, env.shadow) }
             && extent > dc.shadow.frame_base(dc.ctx);
+        // #3034 — the extent is guest memory, checked as it is read: one outside its region is the
+        // guest's fault, and the thread ends as one that trapped `Unreachable` ends.
+        let froze = unwound && temen_ir::thaw::extent_fits(dc.shadow, dc.ctx, extent);
+        if unwound && !froze {
+            env.ctx().raise(TrapKind::Unreachable as i64);
+            (result, trap) = (0, TrapKind::Unreachable as i64);
+        }
         if froze {
             unsafe {
                 a.done.unwound.store(true, Ordering::Relaxed);
@@ -2735,7 +2742,7 @@ impl Domain {
                 // Attribute any grandchild this child spawns to it (its `parent_task` + per-vCPU table).
                 *lock(&self.cur_task) = p.task;
                 // §12: seed the child's per-vCPU TLS register to its (global) task id, matching the interp.
-                let (result, trap, faulted) =
+                let (mut result, mut trap, faulted) =
                     self.run_child_inline(env, p.code, p.arg0, p.arg1, p.task as i64);
                 *lock(&self.cur_task) = resume_task; // back to the caller between children
                 crate::durable_shadow::seed(resume_region); // and to the caller's region
@@ -2744,9 +2751,16 @@ impl Domain {
                 // ran to a genuine finish under an `UNWINDING` window left its region empty, and is
                 // completed, not frozen: re-running it on thaw would repeat its effects (#1685).
                 let child_sp = fiber_rt::read_shadow_sp(env.mem_base, child_region);
-                let froze = !faulted
+                let unwound = !faulted
                     && fiber_rt::window_is_unwinding(env.mem_base, env.shadow)
                     && child_sp > self.shadow().frame_base(p.ctx);
+                // #3034 — the extent is guest memory, checked as it is read: one outside its region
+                // is the guest's fault, and the child ends as one that trapped `Unreachable` ends.
+                let froze = unwound && temen_ir::thaw::extent_fits(self.shadow(), p.ctx, child_sp);
+                if unwound && !froze {
+                    env.ctx().raise(TrapKind::Unreachable as i64);
+                    (result, trap) = (0, TrapKind::Unreachable as i64);
+                }
 
                 // A child that unwound under the freeze records *itself* as residue (its continuation now
                 // lives in its own region; extent = the live shadow-SP) and keeps its context (re-spawned

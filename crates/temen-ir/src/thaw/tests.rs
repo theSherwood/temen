@@ -330,10 +330,7 @@ fn a_refused_residue_is_handed_back() {
     r.vcpus[1].func = 99;
     let want = r.clone();
     match validate(&module(Some(A)), true, 0, r) {
-        Err(r) => {
-            assert_eq!(r.residue.vcpus, want.vcpus);
-            assert!(!r.guest, "an entry is no value a guest writes");
-        }
+        Err(r) => assert_eq!(r.residue.vcpus, want.vcpus),
         Ok(_) => panic!("admitted"),
     }
 }
@@ -348,5 +345,32 @@ fn an_unsorted_residue_is_admitted_in_seeding_order() {
     assert_eq!(
         admit(&module(Some(A)), r).expect("admitted").into_parts(),
         real()
+    );
+}
+
+/// #3034 — the one rule over a guest-written extent ([`extent_fits`]), as each engine's freeze applies
+/// it where it reads one: the root's context (0), a vCPU's (the top of the pool), a fiber's (its slot
+/// + 1). Each region admits its empty frame base and its end, and nothing outside: not zero, not a
+/// header word, not a neighbour's region, not past the arena.
+#[test]
+fn an_extent_fits_only_inside_its_own_region() {
+    for ctx in [0, 1, MAX_SHADOW_CONTEXTS - 1] {
+        if !A.region_fits(ctx) {
+            continue;
+        }
+        let (base, end) = (A.frame_base(ctx), A.region_base(ctx) + A.stride);
+        assert!(extent_fits(A, ctx, base), "ctx {ctx}: its empty frame base");
+        assert!(extent_fits(A, ctx, end), "ctx {ctx}: a region exactly full");
+        assert!(!extent_fits(A, ctx, 0), "ctx {ctx}: a zero word");
+        assert!(!extent_fits(A, ctx, base - 1), "ctx {ctx}: its header");
+        assert!(!extent_fits(A, ctx, end + 1), "ctx {ctx}: past its end");
+    }
+    assert!(
+        !extent_fits(A, 0, A.frame_base(1)),
+        "the root's word in a fiber's region"
+    );
+    assert!(
+        !extent_fits(ShadowArena::EMPTY, 0, 0),
+        "no arena: no extent"
     );
 }

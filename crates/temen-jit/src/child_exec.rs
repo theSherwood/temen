@@ -370,10 +370,17 @@ impl ChildTask {
             return false;
         };
         let base = self.window.base() as u64;
-        self.vm.ended().is_none()
+        let unwound = self.vm.ended().is_none()
             // SAFETY: the window is live while the task is; its arena holds the freeze word.
             && unsafe { fiber_rt::window_is_unwinding(base, d.shadow) }
-            && self.root_word(d) > d.shadow.frame_base(0)
+            && self.root_word(d) > d.shadow.frame_base(0);
+        // #3034 — the root's extent is guest memory, checked as it is read: one outside its region
+        // is the guest's fault, and the child ends as one that trapped `Unreachable` ends.
+        if unwound && !temen_ir::thaw::extent_fits(d.shadow, 0, self.root_word(d)) {
+            self.vm.raise(TrapKind::Unreachable as i64);
+            return false;
+        }
+        unwound
     }
 
     /// The root's shadow-SP word: as it stood when the root returned, if its vCPUs ran on after it
@@ -3560,6 +3567,8 @@ impl ChildExec {
         if let Some(d) = task.done.durable.as_ref() {
             task.root_word = Some(task.root_word(d));
         }
+        // Before its outcome: a root extent its guest wrote outside its region ends it.
+        let unwound = task.root_unwound();
         let (result, trap) = task.outcome();
         // A trap ends the child's domain: its parked vCPUs observe the shared cell and unwind.
         if trap != 0 {
@@ -3567,7 +3576,7 @@ impl ChildExec {
                 d.wake_own_parked();
             }
         }
-        if !task.root_unwound() {
+        if !unwound {
             // #1936 — the domain ends with its root, as the oracle's does, so its powerbox hears
             // of it now, while the task still counts as live; and its end post once the end is
             // published (#2800).

@@ -342,12 +342,6 @@ pub struct Malformed;
 /// it found it.
 pub struct Refused<D, T> {
     pub residue: alloc::boxed::Box<RawResidue<D, T>>,
-    /// The refused rule reads a value the guest wrote: a root or vCPU **extent** (each context's
-    /// shadow-SP word is guest memory) outside its context's region, or a context that two of them,
-    /// or a fiber and one of them, would share. A freeze that records such a value records the
-    /// guest's own fault; any other refusal of a freeze's own residue is the engine and the pass
-    /// disagreeing.
-    pub guest: bool,
 }
 
 impl<D, T> core::fmt::Debug for Refused<D, T> {
@@ -443,8 +437,16 @@ fn spawn_entry(funcs: &[Func], f: i32) -> bool {
         .is_some_and(|f| f.params == [ValType::I64, ValType::I64] && f.results == [ValType::I64])
 }
 
-/// Whether `sp` is an extent inside context `ctx`'s region: at or past its empty frame base, at most
-/// its end.
+/// #3034 — whether `sp` is an extent inside context `ctx`'s region: at or past its empty frame base,
+/// at most its end. The one rule over a value a guest writes: each context's shadow-SP word is guest
+/// memory, which the transform's push check bounds only at that context's own unwind. An engine's
+/// freeze applies it to every extent it reads out of the window, where it reads it, and a failure is
+/// that context's trap, `Unreachable` (DURABILITY.md §3); the thaw pass applies it to every extent an
+/// artifact carries.
+pub fn extent_fits(a: ShadowArena, ctx: usize, sp: u64) -> bool {
+    in_region(a, ctx, sp)
+}
+
 fn in_region(a: ShadowArena, ctx: usize, sp: u64) -> bool {
     a.region_fits(ctx) && a.frame_base(ctx) <= sp && sp <= a.region_base(ctx) + a.stride
 }
@@ -494,18 +496,10 @@ pub fn validate<'a, D, T>(
     let code = code.into();
     match check(code, Makes::of(code, installs, &raw), root_ctx, &raw) {
         Ok(()) => Ok(Thaw(raw)),
-        Err(fault) => Err(Refused {
+        Err(Malformed) => Err(Refused {
             residue: alloc::boxed::Box::new(raw),
-            guest: fault == Fault::Guest,
         }),
     }
-}
-
-/// Which kind of rule a residue broke ([`Refused::guest`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Fault {
-    Guest,
-    Other,
 }
 
 /// [`validate`]'s checks, over a residue in seeding order.
@@ -514,10 +508,8 @@ fn check<D, T>(
     makes: Makes,
     root_ctx: usize,
     r: &RawResidue<D, T>,
-) -> Result<(), Fault> {
-    let ok = |c: bool| if c { Ok(()) } else { Err(Fault::Other) };
-    // A rule over a guest-written extent.
-    let extent = |c: bool| if c { Ok(()) } else { Err(Fault::Guest) };
+) -> Result<(), Malformed> {
+    let ok = |c: bool| if c { Ok(()) } else { Err(Malformed) };
     let a = code.arena;
 
     // A module without a shadow arena is not freezable (INVARIANTS #16): it has no residue at all.
@@ -569,10 +561,10 @@ fn check<D, T>(
             ok(v.func == 0 && v.args.is_empty() && v.shadow_sp == 0)?;
             continue;
         }
-        let ctx = ShadowContexts::vcpu_of_sp(a, v.shadow_sp).ok_or(Fault::Guest)?;
-        extent(ctx != root_ctx && in_region(a, ctx, v.shadow_sp))?;
+        let ctx = ShadowContexts::vcpu_of_sp(a, v.shadow_sp).ok_or(Malformed)?;
+        ok(ctx != root_ctx && in_region(a, ctx, v.shadow_sp))?;
         ok(spawn_entry(code.funcs, v.func) && v.args.len() == 2)?;
-        extent(held & (1 << ctx) == 0)?;
+        ok(held & (1 << ctx) == 0)?;
         held |= 1 << ctx;
     }
     let mut contexts = ShadowContexts::default();
@@ -580,15 +572,15 @@ fn check<D, T>(
     // The root's extent rides beside every vCPU (the window's shared word holds the last context to
     // run), inside the root's own region. A freeze records it for a lone root too.
     ok(r.vcpus.is_empty() || r.root_sp.is_some())?;
-    extent(r.root_sp.is_none_or(|sp| in_region(a, root_ctx, sp)))?;
+    ok(r.root_sp.is_none_or(|sp| in_region(a, root_ctx, sp)))?;
 
     // ---- Fibers: one record per slot, dense from 0, each slot's context below every live vCPU's and
     // inside the arena (`cont.new`'s own rule). A free slot carries only its generation; a live one
     // an extent inside its own region.
     for (i, f) in r.fibers.iter().enumerate() {
         ok(f.slot == i && ShadowContexts::default().fiber_fits(a, i) && i + 1 != root_ctx)?;
-        // A fiber's context that a vCPU's (guest-written) extent placed a vCPU in.
-        extent(contexts.fiber_fits(a, i))?;
+        // Not a context a vCPU's extent placed a vCPU in.
+        ok(contexts.fiber_fits(a, i))?;
         if f.is_free() {
             ok(f.func == 0 && f.arg0 == 0 && !f.consumed)?;
         } else {

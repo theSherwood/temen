@@ -11609,14 +11609,22 @@ fn freeze_drive(
                 // Not parked: nothing to flatten. A fresh, already-unwound (#1835) or finished slot
                 // still rides (#1684), so the thaw rebuilds the table slot for slot.
                 match &other {
-                    FiberState::Pending { funcref, arg0, .. } => frozen.push(super::FrozenFiber {
-                        slot,
-                        func: *funcref,
-                        arg0: *arg0,
-                        shadow_sp: fiber_sp[slot], // its frame base, or the frames the freeze spilled
-                        generation: 0,
-                        consumed: false,
-                    }),
+                    // Its extent was read out of its word at its last switch: checked here, where
+                    // the freeze records it (#3034).
+                    FiberState::Pending { funcref, arg0, .. } => {
+                        let shadow_sp = fiber_sp[slot]; // its frame base, or the frames the freeze spilled
+                        if !temen_ir::thaw::extent_fits(arena, slot + 1, shadow_sp) {
+                            return Err(Trap::Unreachable);
+                        }
+                        frozen.push(super::FrozenFiber {
+                            slot,
+                            func: *funcref,
+                            arg0: *arg0,
+                            shadow_sp,
+                            generation: 0,
+                            consumed: false,
+                        })
+                    }
                     FiberState::Done | FiberState::Free => {
                         frozen.push(super::FrozenFiber::free(slot, 0))
                     }
@@ -11646,11 +11654,15 @@ fn freeze_drive(
             VcpuStop::Done(_) => {}
             _ => return Err(Trap::FiberFault), // a freeze unwind never spawns / instantiates / blocks
         }
+        // #3034 — the fiber's extent, read out of its context's word (guest memory) and checked as
+        // it is read, as on the tree-walker: one outside its region is the guest's fault, and the
+        // drive traps `Unreachable`, which surfaces as the run's result.
         let shadow_sp = ctx
             .mem
             .as_ref()
             .and_then(|m| m.durable_get_sp(arena.region_base(slot + 1)))
-            .unwrap_or(arena.frame_base(slot + 1));
+            .filter(|&sp| temen_ir::thaw::extent_fits(arena, slot + 1, sp))
+            .ok_or(Trap::Unreachable)?;
         fiber_sp[slot] = shadow_sp;
         frozen.push(super::FrozenFiber {
             slot,
@@ -15205,8 +15217,14 @@ impl SchedCore {
         let mut h = host.lock_unpoisoned();
         // #3034 — every run of this engine starts here, so here is where a thaw residue it does not
         // re-create whole is refused: an entry that can decline did so first ([`run`]); any other
-        // (a reactor's call, a `CoopRun`, a `ThreadRun`) is refused before anything is seeded.
-        if !admits_thaw(&h) {
+        // (a reactor's call, a `CoopRun`, a `ThreadRun`) is refused before anything is seeded. What it
+        // re-creates it admits first for the program it runs: a freeze leaves a residue unsealed.
+        let primary = source.primary();
+        let code = temen_ir::thaw::Code {
+            funcs: primary.lazy.ir.funcs(),
+            arena: primary.shadow.unwrap_or(super::ShadowArena::EMPTY),
+        };
+        if !admits_thaw(&h) || h.admit_residue(code, 0).is_err() {
             return Err(Trap::Malformed);
         }
         reapply_installs(&h, source, &table)?;

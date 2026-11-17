@@ -1,8 +1,8 @@
 //! #3034 — the refusals that stay in front of a thaw's raw stores, behind the thaw pass
-//! ([`temen_ir::thaw::validate`]). No residue the pass refuses reaches them from outside this crate
-//! (a [`Host`]'s residue is seeded only from a [`Thaw`]), so these tests hand the seed hostile values
-//! directly, through the private field, having said so ([`temen_ir::thaw::expect_backstops`]): a hole
-//! in the pass is loud in debug otherwise. Each is refused, in the build CI runs and in release: a
+//! ([`temen_ir::thaw::validate`]). No residue the pass refuses reaches them (every thaw admits its
+//! residue first), so these tests bend the residue after the pass admitted it ([`bend_admitted`]),
+//! having said so ([`temen_ir::thaw::expect_backstops`]): a hole in the pass is loud in debug
+//! otherwise. Each is refused, in the build CI runs and in release: a
 //! fiber slot past the arena is not seeded, and its resume answers `FiberFault`; a vCPU with a join
 //! slot past the table, no context of the pool, or an entry of another signature is not re-created.
 
@@ -78,8 +78,23 @@ fn instrument(src: &str) -> Module {
     inst
 }
 
-/// `inst` frozen at its first safepoint, then thawed with its residue bent by `bend`: the thaw's result.
-fn thawed(inst: &Module, bend: impl FnOnce(&mut Residue)) -> Result<Vec<Value>, Trap> {
+thread_local! {
+    /// What the next thaw on this thread does to its residue once the pass admitted it.
+    static BEND: core::cell::RefCell<Option<Box<dyn FnOnce(&mut Residue)>>> =
+        core::cell::RefCell::new(None);
+}
+
+/// The test hook behind the pass: a thaw's residue, admitted, bent as the test asked
+/// ([`thawed`]). A run admits its residue on the thread that starts it.
+pub(super) fn bend_admitted(r: &mut Residue) {
+    if let Some(bend) = BEND.with(|b| b.borrow_mut().take()) {
+        bend(r);
+    }
+}
+
+/// `inst` frozen at its first safepoint, then thawed with its residue bent by `bend` after the pass
+/// admitted it: the thaw's result.
+fn thawed(inst: &Module, bend: impl FnOnce(&mut Residue) + 'static) -> Result<Vec<Value>, Trap> {
     let mut win = init_durable_window(1 << LOG2, ARENA);
     write_state(&mut win, ARENA, temen_durable::STATE_UNWINDING);
     let mut h = Host::new();
@@ -87,7 +102,7 @@ fn thawed(inst: &Module, bend: impl FnOnce(&mut Residue)) -> Result<Vec<Value>, 
     let mut fuel = 1_000_000u64;
     let (r, mut snap) = run_capture_reserved_with_host(inst, 0, &[], &mut fuel, &win, LOG2, &mut h);
     assert!(r.is_ok(), "the freeze: {r:?}");
-    bend(&mut h.residue);
+    BEND.with(|b| *b.borrow_mut() = Some(Box::new(bend)));
     begin_thaw(&mut snap, ARENA, 0);
     let mut fuel = 1_000_000u64;
     run_capture_reserved_with_host(inst, 0, &[], &mut fuel, &snap, LOG2, &mut h).0
@@ -131,82 +146,19 @@ fn a_vcpu_the_pass_refuses_is_not_re_created() {
     }
 }
 
-/// A parent that may spawn a detached child (an `Instantiator` call on a path it never takes).
-const SPAWNS: &str = "
-func (i32) -> (i64) {
-block 0 (v0: i32) {
-  vz = i32.const 0
-  vc = i32.eq v0 vz
-  br_if vc 1() 2(v0)
-}
-block 1 () {
-  vr = i64.const 1
-  return vr
-}
-block 2 (vi: i32) {
-  vrp = i64.const 0
-  vh = call.cap 6 17 (i64) -> (i32) vi (vrp)
-  vh64 = i64.extend_i32_u vh
-  return vh64
-  }
-}
-";
-
-/// #3034 — a child's fault is the child's: a captured detached child whose residue holds an extent
-/// its guest wrote ends with the push check's trap and rides its parent's cut as a completed child
-/// answering it (`leave_cut`), while the parent's freeze goes on; the child is no longer carried.
-/// Both engines record each extent at its own context's unwind, so no deterministic guest reaches
-/// this through a run: the cut walk is handed the child directly.
+/// #3034 R2.3 — a run carries the cut its vCPUs unwound into only when its root unwound and the run
+/// did not fail: a root that returned while a thread unwound keeps its result, and nothing rides. No
+/// deterministic guest reaches that on the tree-walker (the root cannot return without a poll after
+/// the trigger), so the rule is shown directly.
 #[test]
-fn a_childs_refused_extent_ends_the_child_and_the_parents_freeze_goes_on() {
-    let parent = instrument(SPAWNS);
-    let child = Arc::new(instrument(THREADS));
-    // The child's residue as its freeze left it, its vCPU's extent in a context's header.
-    let real = {
-        let mut win = init_durable_window(1 << LOG2, ARENA);
-        write_state(&mut win, ARENA, temen_durable::STATE_UNWINDING);
-        let mut h = Host::new();
-        h.set_durable(true);
-        let mut fuel = 1_000_000u64;
-        let (r, _) = run_capture_reserved_with_host(&child, 0, &[], &mut fuel, &win, LOG2, &mut h);
-        assert!(r.is_ok(), "the child's freeze: {r:?}");
-        h.take_residue()
-    };
-    assert_eq!(real.vcpus.len(), 1);
-    let mut bad = real;
-    bad.vcpus[0].shadow_sp = ARENA.region_base(3) + 8;
-    let mut ch = Host::new();
-    ch.residue = bad;
-    let mut ph = Host::new();
-    ph.residue.children = vec![1];
-    ph.captured_detached.push(CapturedDetached {
-        parent_task: 0,
-        slot: 0,
-        window: MemLayout::image(vec![0; 1 << LOG2]),
-        reserved_log2: LOG2,
-        host: Arc::new(Mutex::new(ch)),
-        module: Arc::clone(&child),
-        launch: DetachedLaunch {
-            task: 1,
-            digest: [0; 32],
-            lane: -1,
-            names: Vec::new(),
-            pager: None,
-            joinable: true,
-        },
-    });
-    let ph = Arc::new(Mutex::new(ph));
-    assert_eq!(leave_cut(&ph, (&parent).into(), 0, false), Ok(()));
-    let h = ph.lock_unpoisoned();
-    assert!(h.captured_detached().is_empty(), "the child is not carried");
-    assert_eq!(
-        h.frozen_detached(),
-        [FrozenDetached {
-            parent_task: 0,
-            slot: 0,
-            completed_result: Err(Trap::Unreachable.code()),
-        }],
-        "it rides as a completed child answering the trap"
+fn a_root_that_returned_carries_no_cut() {
+    assert!(carries_cut(true, &Ok(vec![Value::I64(0)])));
+    assert!(
+        !carries_cut(false, &Ok(vec![Value::I64(3)])),
+        "the root returned"
     );
-    assert!(!h.freeze_refused());
+    assert!(
+        !carries_cut(true, &Err(Trap::Unreachable)),
+        "the run failed"
+    );
 }

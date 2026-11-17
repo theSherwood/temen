@@ -306,38 +306,36 @@ of it. The checks at each use that predate the pass (#2945) stay only in front o
 or an unchecked index, as a backstop that is loud in debug. Open: whether an artifact may set the
 attestation and the guest-JIT quotas at all, or only narrow what the restoring host grants (#3096).
 
-**A freeze admits its own residue, through the same pass.** Some of what a freeze records it reads
-out of guest memory: each context's **shadow-SP word** (in its region's header), the extent of the
-root and of each spawned vCPU. A guest can write those words. The transform's push check bounds a
-context's word only at that context's own unwind (`sp` below its frames, or a push past its region's
-end, traps `Unreachable`), so a word written later, by a sibling vCPU after that context unwound,
-reaches the freeze unchecked. A fiber's extent is not such an input: the runtime rewrites it at every
-switch. So both engines hand what each domain of the cut unwound to its powerbox through one
-function, `Host::leave_freeze`, which runs the pass:
+**A freeze checks what a guest writes, where it reads it.** A freeze's residue is the engine's own
+state except for one kind of value: each context's **shadow-SP word**, in its region's header, which
+is guest memory. The transform's push check bounds a context's word only at that context's own unwind
+(`sp` below its frames, or a push past its region's end, traps `Unreachable`), so a word can change
+after that. Every engine therefore checks each extent where its freeze reads it out of the window, by
+one rule (`temen_ir::thaw::extent_fits`, the rule the thaw pass applies to an artifact's extents):
 
-- only a root that unwound took a cut: a run whose root returned, trapped or exited during the
-  freeze leaves no residue, and its outcome stands (a thread that unwound under a returning root is
-  dropped);
-- a refused residue is sorted by **whose fault it is**. A value the guest could have written (an
-  extent outside its context's region, two holders of one context, a fiber on a context a vCPU's
-  extent claims) is the **guest's**: the domain ends as the push check's own trap, `Unreachable`, and
-  carries nothing. A detached child's or a twin's fault is the **child's**: it rides its parent's cut
-  as a completed child answering `Unreachable` (an exited twin), and the parent's freeze goes on.
-  Any other refusal is an **engine fault** (an engine recorded a value no run makes): the run has
-  already unwound, so it is over; nothing is carried, a debug build panics
-  (`temen_ir::thaw::backstop`), and the codec refuses to write the freeze, so the embedder's
-  `freeze` answers `FreezeError::ResidueRefused`;
-- a freeze asked for while an installed unit's thread runs is **declined**
-  (`DeclineCause::UnitThread`) and the run goes on: the residue names a function by its index in the
-  program, so it cannot name one of a unit's (#3108). The JIT, which has no freeze census, declines
-  a durable run that hosts a unit's threads whole. A unit's fiber rides: its freeze records the
-  funcref the fiber was made with (the table slot), which the thaw's start resolves through the
-  re-applied table, on every engine.
+| Word | Read and checked at | The guest gets |
+|---|---|---|
+| the root's (context 0, a twin's forking context) | its vCPU's end (TW, the settle that records it); the run root after its unwind (JIT); a detached child's root at its settle (JIT) | that domain ends `Unreachable` |
+| a spawned vCPU's | its own end (TW settle; JIT vCPU harvest and inline children) | the thread traps `Unreachable`, which ends its domain |
+| a fiber's | its flatten by the freeze drive, or its return under the unwind (TW, bytecode); its `Complete` at the exit swap (JIT) | the drive's trap, `Unreachable`, the run's result |
 
-A guest that corrupts a shadow-SP word thus gets `Unreachable`, on every engine, and its cut carries
-nothing; a `freeze` of that powerbox writes the window as the guest left it and no residue. A bug in
-the pass that refused a real freeze would look like one of these refusals; the durable differential
-fuzzing (a frozen and thawed run against the uninterrupted one) is what would show it.
+What the freeze records is the value it checked, so no later write can change it. A guest fault in a
+detached child's domain is that child's trap, through the engine's ordinary end of a trapped child:
+its join answers `Unreachable`, and it rides its parent's artifact as a completed child. Nothing else
+is checked at a freeze. The residue rides on the powerbox unsealed (`Host::leave_freeze`), and
+whatever thaws from it admits it through the pass first: `restore`, the tree-walker's thaw (each
+domain it re-creates, a detached child's and a twin's included), the bytecode engine's and the JIT's.
+A bug that left a value no run makes would surface there, as `Malformed`, where the round-trip rows
+and the durable differential fuzzing look. A run whose root returned or trapped carries no residue,
+though a vCPU of it unwound.
+
+A freeze asked for while an installed unit's thread runs is **declined** (`DeclineCause::UnitThread`)
+at the countdown and freeze-on-quiesce triggers, and the run goes on: neither engine's thaw can
+resolve a thread's entry in a unit (#3108). The JIT, which has no freeze census, declines a durable
+run that hosts a unit's threads whole. A unit's fiber rides: its freeze records the funcref the fiber
+was made with (the table slot), which the thaw's start resolves through the re-applied table, on
+every engine.
+
 A frame-capture design would have had the same boundary, as a parser over attacker-controlled
 frames in the host; this one keeps the structured part small and checks it in one place.
 

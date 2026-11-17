@@ -5884,7 +5884,13 @@ impl CompiledModule {
             // §12.8 4A.5: the root's shadow-SP word lives in its own region (context 0); children no
             // longer share it.
             let root_sp = fiber_rt::read_shadow_sp(mem_base as u64, (*this).shadow.region_base(0));
-            (*this).frozen.root_sp = (root_sp != 0).then_some(root_sp);
+            // #3034 — the root's extent is guest memory, checked as it is read: one outside its region
+            // (a zero word among them) is the guest's fault, and the run ends `Unreachable`.
+            if temen_ir::thaw::extent_fits((*this).shadow, 0, root_sp) {
+                (*this).frozen.root_sp = Some(root_sp);
+            } else {
+                vm.raise(TrapKind::Unreachable as i64);
+            }
             // Slice 3.3: each `thread.spawn` during the freeze *deferred* its child (recording the
             // request, returning the handle) so the root could unwind first — matching the interp,
             // which enqueues a child and runs it only after the spawning vCPU yields. Now that the

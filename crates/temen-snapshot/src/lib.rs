@@ -483,10 +483,6 @@ pub enum FreezeError {
     DetachedUnreached { parent_task: usize, slot: usize },
     /// Detached children nest deeper than [`MAX_DETACHED_DEPTH`].
     DetachedTooDeep,
-    /// #3034 — the freeze's own residue was refused by the thaw pass for a rule no guest value
-    /// breaks: the engine and the pass disagree ([`Host::freeze_refused`]), so no artifact of it is
-    /// written.
-    ResidueRefused,
     /// #1688 — a fork twin the freeze could not carry ([`Host::unreached_twins`]): it never
     /// unwound, it ended after the freeze rang it otherwise than by returning (#2571), or its parent
     /// did not ride. The artifact would be missing a process, so freeze refuses it whole.
@@ -744,9 +740,6 @@ fn freeze_at(
     depth: usize,
     cut: &Cut,
 ) -> Result<Vec<u8>, FreezeError> {
-    if host.freeze_refused() {
-        return Err(FreezeError::ResidueRefused);
-    }
     if let Some(p) = host.unreached_detached().first() {
         return Err(FreezeError::DetachedUnreached {
             parent_task: p.parent_task,

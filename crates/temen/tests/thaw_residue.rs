@@ -1111,60 +1111,54 @@ fn a_root_that_writes_its_own_shadow_sp_word_traps_and_carries_nothing() {
     assert!(h.residue().is_empty(), "the JIT carries nothing");
 }
 
-/// A freeze's hand-off says whose fault a refused residue is (#3034). A value the guest wrote (here an
-/// extent in a context's header: a vCPU rewriting a sibling's word after it unwound, which no guest
-/// reaches deterministically, handed to the hand-off directly) is the guest's: the domain ends with
-/// the push check's own trap, and nothing is carried. Any other refusal (here an entry past the
-/// module) is the engine and the pass disagreeing: nothing is carried, the codec refuses to write
-/// the freeze, and a debug build panics ([`temen_ir::thaw::backstop`]). A residue a run makes is admitted, and one from a run that trapped is dropped.
+/// #3034 — a freeze's residue is the engine's state, not a thaw's input: it sits on the powerbox
+/// unsealed ([`Host::leave_freeze`]), and whatever thaws from it admits it then. Handed one no run
+/// makes (an entry past the module), the tree-walker's in-memory thaw refuses it as `Malformed`, and
+/// so does a restore of the artifact the codec writes from it. The same residue unbent thaws.
 #[test]
-fn a_freezes_refused_residue_names_whose_fault_it_is_and_carries_nothing() {
-    use temen_interp::FreezeFault;
+fn a_freezes_residue_is_admitted_by_whatever_thaws_from_it() {
     let inst = instrument(THREADS);
     let art = frozen(&inst);
-    let real = || {
+    // The restored powerbox with its residue put back as a freeze leaves one, bent by `bend`.
+    let left = |bend: fn(&mut temen_interp::Residue)| {
         let mut h = Host::new();
-        temen_snapshot::restore(&art, &inst, &mut h).expect("restore");
-        h.take_residue()
+        let mut w = temen_snapshot::restore(&art, &inst, &mut h).expect("restore");
+        let mut raw = h.take_residue();
+        bend(&mut raw);
+        h.leave_freeze(raw);
+        begin_thaw(&mut w, TEST_ARENA, 0);
+        (h, w)
     };
-    let mut h = Host::new();
-    assert_eq!(h.leave_freeze(&inst, 0, real(), false), Ok(()));
-    assert_eq!(h.residue().vcpus.len(), 1, "admitted");
-
-    let mut h = Host::new();
-    let mut bad = real();
-    bad.vcpus[0].shadow_sp = TEST_ARENA.region_base(3) + 8;
-    assert_eq!(
-        h.leave_freeze(&inst, 0, bad, false),
-        Err(FreezeFault::Guest)
+    // Its thread waits on a word nothing sets: the uninterrupted run ends as the deadlock ends.
+    let want = interp_run(
+        &inst,
+        &init_durable_window(WINDOW, TEST_ARENA),
+        &mut Host::new(),
     );
-    assert!(h.residue().is_empty() && !h.freeze_refused(), "the guest's");
+    let (mut h, w) = left(|_| {});
+    assert_eq!(
+        interp_run(&inst, &w, &mut h),
+        want,
+        "the residue as the freeze left it"
+    );
 
-    // An engine fault is a hole between an engine and the pass: loud in a debug build (it panics,
-    // having failed the freeze first), the freeze failed in release.
-    let mut h = Host::new();
-    let mut bad = real();
-    bad.vcpus[0].func = 99;
-    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        h.leave_freeze(&inst, 0, bad, false)
-    }));
-    if cfg!(debug_assertions) {
-        assert!(r.is_err(), "loud in debug");
-    } else {
-        assert_eq!(r.ok(), Some(Err(FreezeFault::Engine)));
-    }
-    assert!(h.residue().is_empty() && h.freeze_refused(), "the engine's");
+    let bad: fn(&mut temen_interp::Residue) = |r| r.vcpus[0].func = 99;
+    let (mut h, w) = left(bad);
+    assert_eq!(
+        interp_run(&inst, &w, &mut h),
+        Err(temen_interp::Trap::Malformed),
+        "the tree-walker's thaw admits it first"
+    );
+    let (h, _) = left(bad);
+    let win = temen_snapshot::restore(&art, &inst, &mut Host::new()).expect("restore");
+    let written = temen_snapshot::freeze(&inst, &win, &h).expect("the codec writes what it holds");
     assert!(
         matches!(
-            temen_snapshot::freeze(&inst, &init_durable_window(WINDOW, TEST_ARENA), &h),
-            Err(temen_snapshot::FreezeError::ResidueRefused)
+            temen_snapshot::restore(&written, &inst, &mut Host::new()),
+            Err(RestoreError::Malformed)
         ),
-        "and the codec refuses to write it"
+        "and its restore refuses it"
     );
-
-    let mut h = Host::new();
-    assert_eq!(h.leave_freeze(&inst, 0, real(), true), Ok(()));
-    assert!(h.residue().is_empty(), "a run that trapped leaves none");
 }
 
 /// #3034 — Section 5 gives the restored domain the `Jit` domains its artifact names, whether or not
@@ -1469,60 +1463,6 @@ fn a_freeze_while_a_units_thread_runs_is_declined_and_the_run_goes_on() {
     );
 }
 
-/// R2.3 — only a root that unwound took a cut. The root spawns a thread that waits for a word, then
-/// resumes a fiber (the armed freeze's trigger); the root raises the word and returns 3 without
-/// joining. The root's result stands and nothing is carried: the hand-off admits a residue only when
-/// the root unwound (`froze`), and drops one any other vCPU left.
-#[test]
-fn a_root_that_returns_while_a_thread_triggers_the_freeze_keeps_its_result() {
-    let inst = instrument(
-        r#"
-func () -> (i64) {
-block 0 () {
-  vz = i64.const 0
-  vt = thread.spawn 1 vz vz
-  vaddr = i64.const 66000
-  vone = i32.const 1
-  i32.store vaddr vone
-  vn2 = atomic.notify vaddr vone
-  vr = i64.const 3
-  return vr
-  }
-}
-func (i64, i64) -> (i64) {
-block 0 (v0: i64, v1: i64) {
-  vaddr = i64.const 66000
-  vexp = i32.const 0
-  vinf = i64.const -1
-  vst = i32.atomic.wait vaddr vexp vinf
-  vf = ref.func 2
-  vss = i64.const 4096
-  vk = cont.new vf vss
-  vz2 = i64.const 0
-  va, vb = cont.resume vk vz2
-  return vb
-  }
-}
-func (i64, i64) -> (i64) {
-block 0 (v0: i64, v1: i64) {
-  v2 = i64.const 5
-  v3 = suspend v2
-  return v3
-  }
-}
-"#,
-    );
-    let mut win = init_durable_window(WINDOW, TEST_ARENA);
-    arm_freeze_after(&mut win, TEST_ARENA, 1);
-    let mut h = Host::new();
-    h.set_durable(true);
-    assert_eq!(interp_run(&inst, &win, &mut h), Ok(vec![Value::I64(3)]));
-    assert!(
-        h.residue().is_empty() && !h.freeze_refused(),
-        "nothing is carried"
-    );
-}
-
 /// #3108 — a unit whose `f0` makes a fiber of its own `f1` (`ref.func 1`: the table slot its `f1`
 /// was installed into) and resumes it (it suspends 5), waits 64 times (safepoints), then resumes it
 /// with 2 (it returns 102) and answers `1000 + 102`.
@@ -1630,55 +1570,60 @@ fn a_units_live_fiber_freezes_and_thaws_on_every_engine() {
     let jit_art = temen_snapshot::freeze(&inst, snap.bytes(), &h).expect("freeze");
 
     for (froze, art) in [("tree-walker", &tw_art), ("JIT", &jit_art)] {
-        let restored = || {
-            let mut h = Host::new();
-            h.set_durable(true);
-            h.set_jit_hosts_fibers(true);
-            temen_run::set_jit_durable_policy_confined(&mut h, &inst);
-            let mut w = temen_snapshot::restore(art, &inst, &mut h).expect("restore");
-            begin_thaw(&mut w, TEST_ARENA, 0);
-            (h, w)
-        };
-        let (mut h, w) = restored();
-        assert_eq!(
-            interp_run_with(&inst, &w, jh, &mut h),
-            Ok(vec![Value::I64(1102)]),
-            "frozen on the {froze}, thawed on the tree-walker"
-        );
-        let (mut h, w) = restored();
-        let mut fuel = 10_000_000u64;
-        let bc = temen_interp::bytecode::compile_and_run_capture_reserved_with_host(
-            &inst,
-            0,
-            &[Value::I32(jh)],
-            &mut fuel,
-            &w,
-            SIZE_LOG2,
-            &mut h,
-        )
-        .map(|c| c.0);
-        assert_eq!(
-            bc,
-            Some(Ok(vec![Value::I64(1102)])),
-            "frozen on the {froze}, thawed on the bytecode"
-        );
-        let (mut h, w) = restored();
-        let jit = temen_run::jit_cap_run(
-            &inst,
-            0,
-            &[jh as i64],
-            &MemLayout::image(w),
-            SIZE_LOG2,
-            4,
-            &mut h,
-            None,
-        )
-        .map(|(o, _)| o);
-        assert!(
-            matches!(&jit, Ok(JitOutcome::Returned(v)) if *v == [1102]),
-            "frozen on the {froze}, thawed on the JIT: {jit:?}"
-        );
+        unit_thaws_on_every_engine(&inst, art, jh, froze, 1102);
     }
+}
+
+/// `art` (frozen on `froze`) restored and thawed on all three engines, each answering `want`.
+fn unit_thaws_on_every_engine(inst: &Module, art: &[u8], jh: i32, froze: &str, want: i64) {
+    let restored = || {
+        let mut h = Host::new();
+        h.set_durable(true);
+        h.set_jit_hosts_fibers(true);
+        temen_run::set_jit_durable_policy_confined(&mut h, &inst);
+        let mut w = temen_snapshot::restore(art, &inst, &mut h).expect("restore");
+        begin_thaw(&mut w, TEST_ARENA, 0);
+        (h, w)
+    };
+    let (mut h, w) = restored();
+    assert_eq!(
+        interp_run_with(&inst, &w, jh, &mut h),
+        Ok(vec![Value::I64(want)]),
+        "frozen on the {froze}, thawed on the tree-walker"
+    );
+    let (mut h, w) = restored();
+    let mut fuel = 10_000_000u64;
+    let bc = temen_interp::bytecode::compile_and_run_capture_reserved_with_host(
+        &inst,
+        0,
+        &[Value::I32(jh)],
+        &mut fuel,
+        &w,
+        SIZE_LOG2,
+        &mut h,
+    )
+    .map(|c| c.0);
+    assert_eq!(
+        bc,
+        Some(Ok(vec![Value::I64(want)])),
+        "frozen on the {froze}, thawed on the bytecode"
+    );
+    let (mut h, w) = restored();
+    let jit = temen_run::jit_cap_run(
+        &inst,
+        0,
+        &[jh as i64],
+        &MemLayout::image(w),
+        SIZE_LOG2,
+        4,
+        &mut h,
+        None,
+    )
+    .map(|(o, _)| o);
+    assert!(
+        matches!(&jit, Ok(JitOutcome::Returned(v)) if *v == [want]),
+        "frozen on the {froze}, thawed on the JIT: {jit:?}"
+    );
 }
 
 /// [`interp_run`] with the program's `Jit` handle as its argument.
