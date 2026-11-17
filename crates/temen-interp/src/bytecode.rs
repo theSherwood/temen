@@ -9595,7 +9595,6 @@ struct DispatchParks {
 
 impl DispatchParks {
     /// Whether the op left no flag at all ([`call_park`]'s check of [`Host::parks_left`]).
-    #[cfg(debug_assertions)]
     fn quiet(&self) -> bool {
         !self.stdin
             && self.request.is_none()
