@@ -400,6 +400,9 @@ pub fn run(reps: usize) {
     if on("alias") {
         run_nowake_alias(reps);
     }
+    if on("nowake_fibers") {
+        run_nowake_fibers(reps);
+    }
     if on("pairs") {
         run_pairs(reps);
     }
@@ -720,6 +723,41 @@ fn run_nowake(reps: usize) {
                 1.0,
                 "ns",
             );
+        }
+    }
+}
+
+/// #3078 phase 2 slice 1 — the no-wake costs beside fibers ([`crate::kernel_spike_ir::NOWAKE_FIBERS_IR`]),
+/// on executor 2 interpreting (the kernel route declines a module with fibers until phase 2's later
+/// slices): `k` fibers parked for good on another word, and `k` fibers that waited on the measured
+/// word and left before the loop. A fiber's wait that never counted out kept the second on the slow
+/// path for the rest of the run.
+fn run_nowake_fibers(reps: usize) {
+    println!("\nno wake beside fibers, executor 2 interpreting (ns per op):");
+    let m = parse(crate::kernel_spike_ir::NOWAKE_FIBERS_IR);
+    for (mode, what) in [(0i64, "notify, none"), (1, "wait, not-equal")] {
+        for (same, where_) in [
+            (0i64, "parked on another word"),
+            (1, "waited here and left"),
+        ] {
+            for k in [0i64, 100, 1_000] {
+                if same == 1 && k == 0 {
+                    continue;
+                }
+                let args = move |n| vec![n, k, mode, same];
+                let mut lanes = [("x2-interp", x2_interp(&m, Host::new))];
+                let label = format!("{what}, K = {k} {where_}");
+                per_iter(
+                    &label,
+                    &mut lanes,
+                    args,
+                    (1_000, 2_001_000),
+                    1.0,
+                    reps,
+                    1.0,
+                    "ns",
+                );
+            }
         }
     }
 }

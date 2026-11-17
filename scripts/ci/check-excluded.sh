@@ -19,7 +19,7 @@
 # excluded crates have their own CI job pinned to a channel (`fuzz` builds on a dated nightly), so
 # pinning here makes this check compile what that job compiles:
 #
-#   TEMEN_CHECK_TOOLCHAIN=1.97.0 TEMEN_CHECK_TOOLCHAIN_fuzz=nightly-2026-07-01 \
+#   TEMEN_CHECK_TOOLCHAIN=<ci.yml's RUST_STABLE> TEMEN_CHECK_TOOLCHAIN_fuzz=<ci.yml's RUST_NIGHTLY> \
 #     scripts/ci/check-excluded.sh
 #
 # Both unset means the default toolchain, which is what you want locally. (CI sets both, because a

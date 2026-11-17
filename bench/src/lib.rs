@@ -6,3 +6,12 @@
 
 pub mod capture;
 pub mod futamura;
+
+/// #3068 — the `+<toolchain>` argument for a step that needs a nightly (`-Z build-std` for the
+/// tier-3 wasm64 target): `TEMEN_RUST_TOOLCHAIN`, which CI sets to its dated pin (`RUST_NIGHTLY`),
+/// or `nightly`. A dated toolchain is not named `nightly`, so a literal `+nightly` under a pin
+/// would install and use the current one.
+pub fn nightly_arg() -> String {
+    let toolchain = std::env::var("TEMEN_RUST_TOOLCHAIN").unwrap_or_else(|_| "nightly".into());
+    format!("+{toolchain}")
+}

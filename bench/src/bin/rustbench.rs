@@ -235,7 +235,7 @@ fn build_wasm64(src_text: &str) -> Option<PathBuf> {
     std::fs::write(proj.join("src/lib.rs"), src_text).ok()?;
     let ok = Command::new("cargo")
         .args([
-            "+nightly",
+            temen_bench_vs_wasmtime::nightly_arg().as_str(),
             "build",
             "-Zbuild-std=core,alloc",
             "--target=wasm64-unknown-unknown",
@@ -258,7 +258,7 @@ fn main() {
         return;
     }
     let have_nightly = Command::new("rustc")
-        .args(["+nightly", "--version"])
+        .args([temen_bench_vs_wasmtime::nightly_arg().as_str(), "--version"])
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false);
