@@ -2,11 +2,11 @@
 # `scripts/ci/ir-guard.sh`, which says how they are counted. Re-record with `--update`.
 rustc: rustc 1.97.0 (2d8144b78 2026-07-07)
 # kernel engine gate|report instructions
-alu bytecode gate 289.0
-call bytecode gate 627.0
-call_indirect bytecode gate 746.0
-mem bytecode gate 603.0
-hostcall bytecode gate 825.0
+alu bytecode gate 230.0
+call bytecode gate 525.0
+call_indirect bytecode gate 637.0
+mem bytecode gate 502.0
+hostcall bytecode gate 750.0
 alu tree-walker gate 596.0
-fiber_switch bytecode report 1975.0
-fiber_wait bytecode report 6700.0
+fiber_switch bytecode report 2154.0
+fiber_wait bytecode report 6973.0
