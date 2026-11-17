@@ -21,7 +21,7 @@
 //! on this thread meanwhile (executor 2's `Next::Carry`); if that runs emitted code, it runs on a
 //! context of its own with a hook of its own, and reaches this one through no pointer.
 
-use crate::{mem, slot_record, CompiledModule, FuelCell, TrapKind, VmCtx};
+use crate::{mem, slot_record, CompiledModule, FuelCell, JitFrameLoc, TrapKind, VmCtx};
 use std::sync::atomic::AtomicI64;
 pub use temen_ir::seams::NativeStop;
 
@@ -112,6 +112,12 @@ pub struct KernelRun {
     /// The cell `cm`'s instance was compiled with, which arms its fuel checks: no vCPU charges it
     /// (each is handed its own, [`Self::run_vcpu`]), but the code holds its address.
     _armed: Option<Box<FuelCell>>,
+    /// #2958 slice 6 — the trap-time capture (`pc`, return addresses, fiber) of the first vCPU to end
+    /// in a trap, the root's or a spawned one's, which [`Self::run_vcpu`] takes on the vCPU's own
+    /// thread before the thread-local is lost with it ([`Self::trap_backtrace`]). First wins, as the
+    /// JIT's own hub's does (`publish_trap_capture`): when two vCPUs trap at once, any trapping frame's
+    /// chain is a valid kill backtrace (#2499). A leaf lock, held for one `get_or_insert`.
+    trap: std::sync::Mutex<Option<(usize, Vec<usize>, i64)>>,
 }
 
 // SAFETY: the compiled code is finalized and only read; the window is shared by design (the guest's
@@ -151,6 +157,7 @@ impl KernelRun {
             window,
             root,
             _armed: armed,
+            trap: std::sync::Mutex::new(None),
         };
         Some(Some((run, ro)))
     }
@@ -174,6 +181,18 @@ impl KernelRun {
             return None;
         }
         self.window.read_low(snap)
+    }
+
+    /// #2958 slice 6 — the run's trap-time backtrace, innermost frame first, and the fiber that was
+    /// running (`-1` for none), from the first vCPU that ended in a trap ([`Self::run_vcpu`]): empty and
+    /// `None` when none did, or its code carried no `-g`. Read once every vCPU has gone; it takes the
+    /// capture.
+    pub fn trap_backtrace(&self) -> (Vec<JitFrameLoc>, Option<i64>) {
+        let cap = self.trap.lock().unwrap_or_else(|e| e.into_inner()).take();
+        match cap {
+            Some((pc, rets, fiber)) => (self.cm.trap_backtrace(pc, &rets), Some(fiber)),
+            None => (Vec::new(), None),
+        }
     }
 
     /// The window's backed size, its declared memory.
@@ -217,6 +236,8 @@ impl KernelRun {
         crate::vcpu_tls::seed(tls);
         crate::vcpu_tls::set_serve_handlers(0);
         crate::durable_shadow::seed(cm.shadow.region_base(0));
+        // A capture an earlier run left on this thread is no trap of this vCPU's.
+        drop(mem::take_trap_frame());
         let mut results;
         let faulted = match entry {
             VcpuEntry::Root(args) => {
@@ -267,7 +288,20 @@ impl KernelRun {
         if faulted {
             vm.raise(mem::FAULT_TRAP);
         }
-        match vm.ended() {
+        // This vCPU's own trap-time capture, taken on its thread, which may end with it: kept for the
+        // run's backtrace if the vCPU ended in a trap, first wins. A vCPU stopped by another's end
+        // made none.
+        let capture = mem::take_trap_frame();
+        let ended = vm.ended();
+        if let (Some(cap), Some(code)) = (capture, ended) {
+            if TrapKind::from_code(code as u32).is_some() {
+                self.trap
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get_or_insert(cap);
+            }
+        }
+        match ended {
             Some(code) => Err(code),
             None => Ok(results),
         }

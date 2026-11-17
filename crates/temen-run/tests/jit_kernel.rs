@@ -3693,3 +3693,267 @@ fn a_region_posts_signal_wakes_its_waiter_on_every_route() {
         assert_eq!(answer, Ok(vec![101]), "{route}");
     }
 }
+
+// ----- #2958 slice 6: a memoryless program, the trap backtrace, a thread's entry charge ----------
+
+/// A module with no memory whose root spawns `n` threads, each counting its argument (1,000) down
+/// with a taken back-edge per step, then joins them and sums what they return.
+fn memoryless(n: usize) -> temen_ir::Module {
+    let mut body =
+        String::from("  vn = i64.const 1000\n  vz = i64.const 0\n  vacc0 = i64.const 0\n");
+    for i in 0..n {
+        body += &format!("  vh{i} = thread.spawn 1 vn vz\n");
+    }
+    for i in 0..n {
+        let j = i + 1;
+        body += &format!("  vs{i}, vv{i} = thread.join vh{i}\n  vacc{j} = i64.add vacc{i} vv{i}\n");
+    }
+    module(&format!(
+        "func () -> (i64) {{
+block 0 () {{
+{body}  return vacc{n}
+  }}
+}}
+func (i64, i64) -> (i64) {{
+block 0 (vn: i64, vacc: i64) {{
+  br 1(vn, vacc)
+}}
+block 1 (vi: i64, va: i64) {{
+  vone = i64.const 1
+  vj = i64.sub vi vone
+  vb = i64.add va vi
+  vz = i64.eqz vj
+  br_if vz 2(vb) 1(vj, vb)
+}}
+block 2 (vr: i64) {{
+  return vr
+  }}
+}}
+"
+    ))
+}
+
+/// #2958 slice 6 — a module with no memory runs its threads as kernel tasks: the `no window` clause is
+/// gone. Every thread tiers up at its entry over the run's native window, which a kernel run starts
+/// for any module (a spawn asks `Domain::native` before `tierup_servable`), so the run counts one
+/// vCPU per thread beside the root's, and answers as the oracle and today's route do, with the
+/// oracle's fuel left.
+#[test]
+fn a_memoryless_programs_threads_run_as_kernel_tasks() {
+    for n in [1, 3] {
+        let m = memoryless(n);
+        let want = Ok(vec![n as i64 * 500_500]);
+        assert_eq!(oracle(&m), want, "the oracle, {n} threads");
+        assert_eq!(today(&m), want, "today's route, {n} threads");
+        let km = m.clone();
+        let (o, vcpus) = bounded("the kernel route", move || {
+            jit_kernel::run_fresh(&km, 0, &[], None).expect("in the kernel's scope")
+        });
+        assert_eq!(
+            vcpus,
+            n as u64 + 1,
+            "the root and each thread ran as kernel tasks"
+        );
+        assert_eq!(result(o), want, "the kernel route, {n} threads");
+        let [oracle, _, kernel] = fueled(&m, 1_000_000);
+        assert_eq!(
+            kernel, oracle,
+            "the oracle's answer and fuel left, {n} threads"
+        );
+    }
+}
+
+/// #2958 slice 6 — a module with no memory that maps, protects and unmaps a page of its reserved
+/// window beside a spawned thread answers each page op as the oracle does on both routes: `-EINVAL`
+/// for each, a module with no memory having no window a page op may change, on every engine.
+#[test]
+fn a_memoryless_programs_page_ops_answer_as_the_oracle_on_both_routes() {
+    fn make(h: i32) -> temen_ir::Module {
+        module(&format!(
+            "func () -> (i64) {{
+block 0 () {{
+  vc = i32.const {h}
+  va = i64.const 1048576
+  vl = i64.const 4096
+  vrw = i64.const 3
+  vm = call.cap 5 0 (i64, i64, i64) -> (i64) vc(va, vl, vrw)
+  vro = i64.const 1
+  vp = call.cap 5 2 (i64, i64, i64) -> (i64) vc(va, vl, vro)
+  vu = call.cap 5 1 (i64, i64) -> (i64) vc(va, vl)
+  vz = i64.const 0
+  vh = thread.spawn 1 vz vz
+  vst, vv = thread.join vh
+  vk = i64.const 1000
+  vm1 = i64.mul vm vk
+  vp1 = i64.add vm1 vp
+  vp2 = i64.mul vp1 vk
+  vr = i64.add vp2 vu
+  return vr
+  }}
+}}
+func (i64, i64) -> (i64) {{
+block 0 (va0: i64, vb0: i64) {{
+  return va0
+  }}
+}}
+"
+        ))
+    }
+    // `map`, `protect` and `unmap` each answer -22, packed as three decimal fields.
+    let want: Answer = Ok(vec![-22_022_022]);
+    for (route, got) in granted(make, Host::grant_memory) {
+        assert_eq!(got, want, "{route}");
+    }
+}
+
+/// A root that spawns a worker and joins it; `who` (`"root"` after the join, or the `"worker"`)
+/// divides by zero. Under `-g`, the root's position is line 30 and the worker's line 70, as
+/// `temen/tests/multivcpu_trap_origin.rs` writes it.
+fn div0(who: &str, debug: bool) -> temen_ir::Module {
+    let (root_div, worker_div) = match who {
+        "root" => ("  vq = i64.div_s v3 v1\n  return vq\n", "  return v1\n"),
+        _ => (
+            "  return v3\n",
+            "  v2 = i64.const 0\n  v3 = i64.div_s v1 v2\n  return v3\n",
+        ),
+    };
+    let debug = match debug {
+        true => {
+            "debug.file 0 \"t.c\"\ndebug.fname 0 \"root\"\ndebug.fname 1 \"worker\"\n\
+                 debug.loc 0 0 1 0 30 3\ndebug.loc 1 0 1 0 70 3\n"
+        }
+        false => "",
+    };
+    module(&format!(
+        "func () -> (i64) {{
+block 0 () {{
+  v0 = i64.const 4096
+  v1 = i64.const 0
+  v2 = thread.spawn 1 v0 v1
+  v3_st, v3 = thread.join v2
+{root_div}  }}
+}}
+func (i64, i64) -> (i64) {{
+block 0 (v0: i64, v1: i64) {{
+{worker_div}  }}
+}}
+{debug}"
+    ))
+}
+
+/// A kernel run of `m`, as an embedder's `jit_kernel::run` ends it, on this thread.
+fn kernel_end(m: &temen_ir::Module) -> jit_kernel::KernelEnd {
+    let mut host = Host::new();
+    let admitted = jit_kernel::admit(m, &host, false).expect("in the kernel's scope");
+    let end = jit_kernel::run(admitted, fresh_start(u64::MAX), &mut host).expect("compiles");
+    assert!(end.vcpus >= 1, "it ran as kernel tasks");
+    end
+}
+
+/// The oracle's trap origin for `m`: its innermost frame as `(func, line)`, and the trapping fiber.
+fn oracle_origin(m: &temen_ir::Module) -> (Option<(u32, u32)>, Option<i64>) {
+    let mut fuel = temen_interp::DEFAULT_FUEL;
+    let (res, bt, fiber) = temen_interp::run_traced(m, 0, &[], &mut fuel);
+    assert_eq!(res, Err(Trap::DivByZero), "the oracle traps");
+    let at = bt.first().map(|&pc| {
+        let s = temen_interp::source_loc(m, pc).expect("a -g frame resolves");
+        (pc.func, s.line)
+    });
+    (at, fiber)
+}
+
+/// #2958 slice 6 — a trap's backtrace on the kernel route names where it trapped, as the oracle's
+/// (`run_traced`) does: a spawned worker's division (func 1, line 70), not the root's join, and the
+/// root's own (func 0, line 30), each with no fiber (`-1`). The kernel route takes the capture on the
+/// trapping vCPU's own thread, which ends with it.
+#[test]
+fn a_trap_backtrace_on_the_kernel_route_names_the_oracles_origin() {
+    for (who, func, line) in [("worker", 1, 70), ("root", 0, 30)] {
+        let m = div0(who, true);
+        let (at, fiber) = oracle_origin(&m);
+        assert_eq!(at, Some((func, line)), "the oracle: the {who}'s division");
+        let km = m.clone();
+        let end = bounded("the kernel route", move || kernel_end(&km));
+        assert_eq!(end.result, Err(Trap::DivByZero), "the kernel route traps");
+        let first = end.backtrace.first().map(|f| (f.func, f.line));
+        assert_eq!(
+            first, at,
+            "the {who}'s trap: the kernel route vs the oracle"
+        );
+        assert_eq!(
+            end.trap_fiber, fiber,
+            "the trapping fiber, the {who}'s trap"
+        );
+    }
+}
+
+/// #2958 slice 6 — an embedder's JIT run (`jit_run`) folds the kernel route's backtrace into its
+/// error as it does today's: a worker's trap names `t.c:70`. The run asserts its route.
+#[test]
+fn a_jit_runs_trap_message_carries_the_kernel_routes_backtrace() {
+    let msg = bounded("the kernel route", || {
+        let inst = temen_run::instantiate(div0("worker", true)).expect("instantiate");
+        let before = jit_kernel::kernel_runs();
+        let ran = inst.run_with_caps_and_host(
+            temen_run::Backend::Jit,
+            &temen_run::RunConfig::default(),
+            &[],
+            None,
+        );
+        assert_eq!(jit_kernel::kernel_runs() - before, 1, "the kernel route");
+        match ran {
+            Ok(_) => panic!("the worker traps"),
+            Err(e) => e,
+        }
+    });
+    assert!(msg.contains("DivByZero"), "{msg}");
+    assert!(msg.contains("t.c:70"), "the worker's line: {msg}");
+}
+
+/// #2958 slice 6 — a run's backtrace is its own. A kernel run whose root traps under `-g` leaves no
+/// capture on the caller's thread: a run of today's route after it on the same thread, whose trap
+/// (an inert capability's `CapFault`, raised in host code) makes no capture of its own, reports no
+/// trapping fiber, where it read the kernel run's left-over capture before (#2958 finding e). Then a
+/// kernel run whose trap leaves no capture (no `-g`), and a clean one, report nothing either.
+#[test]
+fn a_runs_backtrace_is_never_an_earlier_kernel_runs() {
+    let inert = module(
+        "func () -> (i64) {
+block 0 () {
+  vc = i32.const 0
+  vr = call.cap 7 0 () -> (i64) vc()
+  return vr
+  }
+}
+",
+    );
+    let (traced, bare, clean) = (div0("root", true), div0("root", false), memoryless(1));
+    bounded("the kernel route, then today's", move || {
+        let first = kernel_end(&traced);
+        assert!(!first.backtrace.is_empty(), "the traced run's backtrace");
+        let mut cm = temen_jit::CompiledModule::compile(
+            &inert,
+            0,
+            temen_jit::INERT_CAP_THUNK,
+            core::ptr::null_mut(),
+            temen_ir::DEFAULT_RESERVED_LOG2,
+            None,
+            None,
+            None,
+            None,
+            None,
+            0,
+        )
+        .expect("compiles");
+        let (o, _) = cm.run(&[], None, None).expect("runs");
+        assert_eq!(o, JitOutcome::Trapped(temen_jit::TrapKind::CapFault));
+        assert_eq!(cm.last_trap_fiber(), None, "today's run made no capture");
+        let second = kernel_end(&bare);
+        assert_eq!(second.result, Err(Trap::DivByZero));
+        assert!(second.backtrace.is_empty(), "{:?}", second.backtrace);
+        assert_eq!(second.trap_fiber, None, "no capture of its own");
+        let third = kernel_end(&clean);
+        assert!(third.result.is_ok());
+        assert!(third.backtrace.is_empty() && third.trap_fiber.is_none());
+    });
+}

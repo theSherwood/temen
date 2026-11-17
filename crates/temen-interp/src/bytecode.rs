@@ -8933,7 +8933,6 @@ fn image_parks(host: &Host, m: &Module, census: &ImageCensus) -> Parks {
 ///   with no kernel (the phase that runs every JIT program on the kernel, after phase 2);
 /// - **`durable`**: executor 2 has no freeze driver (#2533; the phase that ports freeze);
 /// - **`bytecode`**: the rules need the module's bytecode compile ([`admits_for`]; slice 7);
-/// - **`no window`**: a thread of a module with no memory interprets ([`tierup_servable`]; slice 6);
 /// - **`fibers`**: a fiber's park runs on the engine's fiber runtime, whose futex core its vCPU
 ///   waits share (phase 2);
 /// - **`gc.roots`**: the rules scan an interpreted task's frames, not native ones (a later phase,
@@ -8977,10 +8976,6 @@ pub fn native_scope(m: &Module, host: &Host) -> Result<(), &'static str> {
     }
     if !admits_for(m, true) {
         return Err("bytecode");
-    }
-    let spawns = m.funcs.iter().any(|f| f.uses_concurrency_besides_wait());
-    if m.memory.is_none() && spawns {
-        return Err("no window");
     }
     if m.funcs.iter().any(temen_ir::Func::uses_fibers) {
         return Err("fibers");
@@ -18181,7 +18176,8 @@ impl CoopRun {
 ///   item 3). A window still on a non-flat backing (an allocation failure) stays interpreted,
 ///   fail-closed.
 ///
-/// A memory-less run has no window to serve — no bitmap.
+/// A memory-less run has no window to serve — no bitmap (#3083: the browser's tier). A native tier's
+/// run is asked about its own window first, which it always has (#2958 slice 6).
 fn tierup_servable(cand: Option<&Mem>, root: Option<&Mem>) -> bool {
     match (cand, root) {
         (Some(c), Some(r)) => {
