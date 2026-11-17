@@ -1218,3 +1218,63 @@ fn a_freezes_refused_residue_is_unreachable_and_carries_nothing() {
     assert!(h.residue().is_empty(), "a run that trapped leaves none");
 }
 
+/// #3034 — Section 5 gives the restored domain the `Jit` domains its artifact names, whether or not
+/// the restoring host grants one (#3096 A1 ties it to the re-granted grant). With one, the pass admits
+/// every record kind, since code installed through it may make any (the record-kind rule above): a
+/// fiber in a module with no `cont.new` restores. The tree-walker re-creates it; the JIT, which stood
+/// up no fiber runtime for the module (no `cont.*`, no fiber-hosting grant), declines the residue
+/// whole and leaves it, where on `f2aff3d` it would have skipped the fiber.
+#[test]
+fn a_jit_domain_from_section_5_admits_every_kind_and_the_jit_declines_what_it_cannot_host() {
+    let inst = instrument(THREADS);
+    let art = {
+        let mut win = init_durable_window(WINDOW, TEST_ARENA);
+        write_state(&mut win, TEST_ARENA, STATE_UNWINDING);
+        let mut h = Host::new();
+        h.set_durable(true);
+        h.grant_jit_with_table(Some(SIZE_LOG2), 0);
+        let mut fuel = 1_000_000u64;
+        let (r, snap) =
+            run_capture_reserved_with_host(&inst, 0, &[], &mut fuel, &win, SIZE_LOG2, &mut h);
+        assert!(r.is_ok(), "the freeze: {r:?}");
+        temen_snapshot::freeze(&inst, &snap, &h).expect("freeze")
+    };
+    let grafted = bent(&art, |r| {
+        r.fibers.push(FrozenFiber {
+            slot: 0,
+            func: 1,
+            arg0: 0,
+            shadow_sp: TEST_ARENA.frame_base(1),
+            generation: 1,
+            consumed: false,
+        })
+    });
+    // The restoring host grants no `Jit`; Section 5 gives it the domain all the same.
+    let mut h = Host::new();
+    let mut win = temen_snapshot::restore(&grafted, &inst, &mut h).expect("admitted");
+    assert!(h.installs_code(), "from Section 5");
+    assert_eq!(h.residue().fibers.len(), 1);
+    begin_thaw(&mut win, TEST_ARENA, 0);
+    h.set_durable(true);
+    let r = temen_run::jit_cap_run(
+        &inst,
+        0,
+        &[],
+        &MemLayout::image(win),
+        SIZE_LOG2,
+        0,
+        &mut h,
+        None,
+    );
+    assert!(
+        matches!(
+            r,
+            Err(JitError::Unsupported(
+                "durable JIT thaw: a record kind this run stands up no runtime for"
+            ))
+        ),
+        "the JIT declines: {:?}",
+        r.as_ref().map(|(o, _)| o)
+    );
+    assert_eq!(h.residue().fibers.len(), 1, "and leaves the residue");
+}

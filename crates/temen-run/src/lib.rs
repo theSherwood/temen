@@ -1675,6 +1675,19 @@ fn jit_durable_enter(
             "durable JIT thaw: a detached child or fork twin the JIT cannot re-create",
         ));
     }
+    // #3034 — nor a kind of record this instance stood up no runtime for: the pass admits one that
+    // code installed through a `Jit` grant made, which this instance hosts only under the grant's
+    // hosting (#3104).
+    let [fibers, vcpus, detached] = cm.reseeds();
+    let r = host.residue();
+    if (!fibers && !r.fibers.is_empty())
+        || (!vcpus && !r.vcpus.is_empty())
+        || (!detached && !(r.detached.is_empty() && r.live_detached.is_empty()))
+    {
+        return Err(temen_jit::JitError::Unsupported(
+            "durable JIT thaw: a record kind this run stands up no runtime for",
+        ));
+    }
     let thaw = jit_thaw(host, m, 0).ok_or(temen_jit::JitError::Unsupported(
         "durable JIT thaw: a residue the thaw pass refuses",
     ))?;

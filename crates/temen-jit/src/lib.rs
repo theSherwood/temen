@@ -5085,6 +5085,13 @@ impl CompiledModule {
         Ok(())
     }
 
+    /// #3034 — the record kinds a thaw run of this instance re-creates: fibers (it stood up a fiber
+    /// runtime), vCPUs (a thread domain) and detached children (a nursery). An embedder declines a
+    /// residue with another kind whole, before it takes it.
+    pub fn reseeds(&self) -> [bool; 3] {
+        [self.fibers, self.threads, self.makes_nursery()]
+    }
+
     /// The residue the last durable run's freeze produced (empty unless a freeze caught something);
     /// taken, so a later run starts clean.
     pub fn take_durable_residue(&mut self) -> DurableResidue {

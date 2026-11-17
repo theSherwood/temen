@@ -319,8 +319,13 @@ impl<D, T> From<Refused<D, T>> for Malformed {
 /// The record kinds the code of a domain of `m` can make (#3034): a fiber needs a `cont.new`, a vCPU
 /// a `thread.spawn`, and a detached child an `Instantiator` call. `installs` says the domain holds a
 /// `Jit` grant: code installed through it runs in the domain's frames and may make any of them
-/// (DESIGN.md §22), and the engines re-create what it made (the JIT hosts an installed unit's fibers
-/// and threads only under the grant's hosting, and its nursery under any install table).
+/// (DESIGN.md §22). An engine that stood up no runtime for a kind its residue holds declines the thaw
+/// whole (`temen_run`'s JIT hosts an installed unit's fibers and threads only under the grant's
+/// hosting, #3104).
+///
+/// `installs` is read from the restored domain, whose `Jit` domains come from the artifact's
+/// Section 5 whether or not the restoring host grants one: a forged Section 5 turns this rule off for
+/// every kind. Tying it to the re-granted grant is #3096 A1.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Makes {
     fibers: bool,
