@@ -147,9 +147,11 @@ pub struct FuelCell {
     /// The chain the next draw comes from. Locked by a refill, so contexts sharing the cell draw one
     /// at a time.
     src: Mutex<Arc<dyn BudgetNode>>,
-    /// #1991 — `left` came from no draw: the chain was unbounded at every level at the last refill,
-    /// which granted a [`QUANTUM`] to count all the same. None of it goes back to the chain. Written
-    /// by a refill, under `src`'s lock.
+    /// `left` is not the chain's to take back: #1991, the chain was unbounded at every level at the
+    /// last refill, which granted a [`QUANTUM`] drawn from nothing; or #3081, `left` is a spawned
+    /// vCPU's entry its spawn already paid ([`Self::seed_entry`]), which is never refunded. None of it
+    /// goes back to the chain (`settle`, `rearm`, `Drop`). Written by a refill and by the seeding,
+    /// under `src`'s lock; the next refill clears it.
     free: bool,
 }
 
@@ -201,40 +203,28 @@ impl FuelCell {
         self.chain().take_exact(1)
     }
 
-    /// #3081 — hand `cell` a spawned vCPU's paid entry, for its prologue to burn without a draw:
-    /// what the cell holds goes back to its chain first (a recycled cell can hold a draw a fiber of
-    /// its earlier vCPU made after it settled), then it holds exactly the unit, and `granted` is
-    /// marked as no refill's ([`Self::keep_unburned_entry`] reads both). Under the lock a refill
-    /// takes, and through the raw pointer, as [`Self::settle`] does; a fiber charging the cell
-    /// meanwhile races it as any shared charge does (#3080).
+    /// #3081 — seed `cell` with a spawned vCPU's entry, which its spawn already paid
+    /// ([`Self::pay_entry`]), for its prologue to burn without a draw. A paid entry is never
+    /// refunded: the cell holds exactly the unit, marked as none of the chain's (`free`), so
+    /// whether the vCPU burns it or stops first (its run ended before its first charge: a kill check
+    /// or a domain poll comes first in the prologue, or lazy code never ran), nothing goes back. The
+    /// refill that follows the burn clears the mark, so while it is set the cell holds the unit or
+    /// nothing. What a recycled cell held goes back to its chain first, under the lock a refill takes
+    /// and through the raw pointer, as [`Self::settle`] does; a fiber of the cell's earlier vCPU that
+    /// refills it in between races it as any shared charge does (#3080).
     ///
     /// # Safety
-    /// `cell` is a live cell.
-    pub(crate) unsafe fn credit_entry(cell: *mut FuelCell) {
+    /// `cell` is a live cell no context but this vCPU's (and #3080's fibers) charges.
+    pub(crate) unsafe fn seed_entry(cell: *mut FuelCell) {
         let src = (*cell).src.lock().unwrap_or_else(|e| e.into_inner());
         let left = core::ptr::addr_of_mut!((*cell).left);
+        let free = core::ptr::addr_of_mut!((*cell).free);
         let unspent = core::ptr::read_volatile(left);
-        if !(*cell).free {
+        if !core::ptr::read_volatile(free) {
             src.give_back(unspent);
         }
         core::ptr::write_volatile(left, 1);
-        core::ptr::write_volatile(core::ptr::addr_of_mut!((*cell).granted), NO_REFILL);
-    }
-
-    /// #3081 — the vCPU [`Self::credit_entry`] credited has left guest code: if it never charged its
-    /// entry (it started after its domain ended, so its code never ran, or polled the end first), the
-    /// unit stays burned, as the spawn paid it on the oracle, and does not go back with the cell. A
-    /// cell that still holds exactly the unit, with no refill since, charged nothing.
-    ///
-    /// # Safety
-    /// `cell` is a live cell.
-    pub(crate) unsafe fn keep_unburned_entry(cell: *mut FuelCell) {
-        let _src = (*cell).src.lock().unwrap_or_else(|e| e.into_inner());
-        let left = core::ptr::addr_of_mut!((*cell).left);
-        let granted = core::ptr::read_volatile(core::ptr::addr_of!((*cell).granted));
-        if granted == NO_REFILL && core::ptr::read_volatile(left) == 1 {
-            core::ptr::write_volatile(left, 0);
-        }
+        core::ptr::write_volatile(free, true);
     }
 
     /// #2488 — a vCPU that charged this cell has ended: hand back what its draw left, as an ended
@@ -417,10 +407,6 @@ fn compile_refill_trampoline() -> Result<(crate::OwnedJit, usize), crate::JitErr
 unsafe extern "C" fn fuel_remaining(cell: *const FuelCell) -> i64 {
     (*cell).can_burn().min(i64::MAX as u64) as i64
 }
-
-/// [`FuelCell::granted`] when no refill has run since [`FuelCell::credit_entry`]: no draw grants it,
-/// since none is more than a chunk.
-const NO_REFILL: u64 = u64::MAX;
 
 /// Word offsets compiled code uses.
 pub(crate) const REFILL_OFF: i32 = 8;
