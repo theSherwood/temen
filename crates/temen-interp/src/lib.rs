@@ -28571,7 +28571,7 @@ impl Host {
     pub fn take_thaw(&mut self, m: &Module) -> Result<Thaw, temen_ir::thaw::Malformed> {
         let installs = self.installs_code();
         temen_ir::thaw::validate(m, installs, 0, self.take_residue()).map_err(|r| {
-            self.residue = r.0;
+            self.residue = *r.0;
             temen_ir::thaw::Malformed
         })
     }

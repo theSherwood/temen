@@ -119,7 +119,8 @@ fn a_fiber_slot_past_the_arena_is_not_seeded() {
 fn a_vcpu_the_pass_refuses_is_not_re_created() {
     let inst = instrument(THREADS);
     let ebadf = 2000 + 100 * i64::from(temen_ir::errno::EBADF as u32);
-    let cases: [(fn(&mut Residue), Result<Vec<Value>, Trap>); 3] = [
+    type Case = (fn(&mut Residue), Result<Vec<Value>, Trap>);
+    let cases: [Case; 3] = [
         (
             |r| r.vcpus[0].slot = temen_ir::handles::SLOTS,
             Ok(vec![Value::I64(ebadf)]),

@@ -1064,7 +1064,7 @@ fn a_durable_runs_eleventh_live_fiber_faults_alike_on_every_engine() {
             None,
         )
         .map(|(o, _)| o);
-        let want_tw = want.clone().map(|v| vec![Value::I64(v)]);
+        let want_tw = want.map(|v| vec![Value::I64(v)]);
         assert_eq!(tw, want_tw, "tree-walker, {n} fibers");
         assert_eq!(bc, Some(want_tw), "bytecode, {n} fibers");
         match (want, jit) {

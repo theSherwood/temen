@@ -242,7 +242,8 @@ fn a_record_kind_the_domains_code_cannot_make_is_refused() {
             term: crate::Terminator::Unreachable,
         }]
     };
-    let kinds: &[(&str, fn(&mut Raw), Inst)] = &[
+    type Kind = (&'static str, fn(&mut Raw), Inst);
+    let kinds: &[Kind] = &[
         (
             "fibers",
             |r| r.fibers.clear(),

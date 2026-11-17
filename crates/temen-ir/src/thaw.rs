@@ -302,7 +302,7 @@ pub struct Malformed;
 
 /// A residue [`validate`] refused, handed back whole: a caller that declines the thaw leaves it where
 /// it found it.
-pub struct Refused<D, T>(pub RawResidue<D, T>);
+pub struct Refused<D, T>(pub alloc::boxed::Box<RawResidue<D, T>>);
 
 impl<D, T> core::fmt::Debug for Refused<D, T> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -414,7 +414,7 @@ pub fn validate<'a, D, T>(
     let code = code.into();
     match check(code, Makes::of(code, installs), root_ctx, &raw) {
         Ok(()) => Ok(Thaw(raw)),
-        Err(Malformed) => Err(Refused(raw)),
+        Err(Malformed) => Err(Refused(alloc::boxed::Box::new(raw))),
     }
 }
 
