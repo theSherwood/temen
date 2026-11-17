@@ -641,3 +641,42 @@ fn jit_fuel_a_threads_entry_runs_out_alike_on_every_engine() {
     let fifty = spawning(50);
     assert_eq!(assert_four_way(&fifty, 100), (Ended::Returned(350), 51));
 }
+
+/// The root spawns `n` threads, each counting `steps` down as [`COUNTING_THREAD`]'s does, joins them
+/// and returns the sum of their counts.
+fn counting_threads(n: usize, steps: u64) -> String {
+    let mut body = format!("  vn = i64.const {steps}\n  vacc0 = i64.const 0\n");
+    for i in 0..n {
+        body += &format!("  vh{i} = thread.spawn 1 vn vn\n");
+    }
+    for i in 0..n {
+        let j = i + 1;
+        body += &format!("  vs{i}, vv{i} = thread.join vh{i}\n  vacc{j} = i64.add vacc{i} vv{i}\n");
+    }
+    let thread = COUNTING_THREAD
+        .split_once("func (i64, i64)")
+        .expect("the counting thread's function")
+        .1;
+    format!(
+        "memory 16
+func () -> (i64) {{
+block 0 () {{
+{body}  return vacc{n}
+  }}
+}}
+func (i64, i64){thread}"
+    )
+}
+
+/// **Threads that count at once are each charged in full, on a fixed allowance too** (#3069). Eight
+/// threads counting 200,000 down cost the root's entry plus 200,000 each: 1,600,001 on every engine.
+/// The JIT's fixed allowance was one cell its vCPUs charged with plain loads and stores, so two
+/// charges that overlapped counted as one, and this run charged 30% to 53% of its cost. Each vCPU now
+/// charges a cell of its own, drawn from the allowance as from a chain.
+#[test]
+fn jit_fuel_charges_threads_counting_at_once_in_full() {
+    assert_eq!(
+        assert_three_way(&counting_threads(8, 200_000), 1 << 40),
+        (Ended::Returned(1_600_000), 1_600_001)
+    );
+}
