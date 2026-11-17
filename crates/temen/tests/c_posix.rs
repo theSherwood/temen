@@ -417,6 +417,9 @@ int main(void) {
 /// the bytecode engine the call runs inside `run_hot` (as `cap_call`), whose next-op check must see
 /// the personality's `armed` flag and hand the op back to `run_ops`'s delivery; a check that missed
 /// it would read 0 here, where the spinning rows above only see a late delivery as more spins.
+/// There is no Cranelift JIT row: the JIT polls signals only at function entries and taken
+/// back-edges, so it runs this load first and returns 0 (#3121, a difference from the oracle that
+/// predates #3088).
 #[test]
 fn c_a_raised_signal_is_delivered_before_the_next_op() {
     let src = r#"
@@ -442,6 +445,11 @@ int main(void) {
         run_bytecode_only(src, |_| {}).result,
         vec![Value::I32(2)],
         "the bytecode engine delivers before the op after the raising call"
+    );
+    assert_eq!(
+        run_bytecode_parallel_only(src, |_| {}).result,
+        vec![Value::I32(2)],
+        "the parallel bytecode driver delivers before the op after the raising call"
     );
 }
 

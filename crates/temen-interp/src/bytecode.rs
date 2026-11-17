@@ -750,7 +750,12 @@ macro_rules! hot_ops {
             | Op::TailCallIndirect { .. }
     };
 }
-/// #3088 — the ops [`Vm::run_ops`] runs; see [`hot_ops`].
+/// #3088 — the ops [`Vm::run_ops`] runs; [`hot_ops`] gives the rule. Five of them fit neither of its
+/// cold cases (calling out, or handing the step to the driver), and are cold for a reason each:
+/// - `SetJmp`, `LongJmp`: large (they save or restore a register window through the setjmp table)
+///   and rare.
+/// - `Eval`: runs the op through the oracle's own evaluator (`eval_inst`), outside this engine.
+/// - `Unreachable`, `CapFault`: traps, paid at most once per run.
 macro_rules! cold_ops {
     () => {
         Op::SvcPoll { .. }
@@ -22409,9 +22414,10 @@ type Watch<'a> = Option<(
 
 /// #3088 — whether one of the per-op checks has something to do before the next op: the budget is
 /// spent (suspend), the domain was killed (`term_flag`), or a caught signal is pending (`armed`) and
-/// the vCPU is under `MAX_SIG_HANDLER_NEST` handlers deep (`nest`, read only then). The one definition both loops
-/// use: [`Vm::run_hot`] hands back on it, and [`Vm::run_ops`] runs its check block only when it
-/// holds. A new per-op check goes here and in that block; one added to the block alone never fires.
+/// the vCPU is under `MAX_SIG_HANDLER_NEST` handlers deep (`nest`, read only then). The one
+/// definition both loops use: [`Vm::run_hot`] hands back on it, and [`Vm::run_ops`] runs its check
+/// block only when it holds. A new per-op check goes here and in that block; one added to the block
+/// alone never fires on its own (only when another check is already due, as under `budget = 1`).
 macro_rules! checks_due {
     ($budget:expr, $watch:expr, $nest:expr) => {
         $budget == 0
@@ -23011,10 +23017,9 @@ impl Vm {
     }
 
     /// §2.2 / #2164 — the fault arm of `paged!` (in [`Self::run_hot`] and [`Self::run_ops`]) in a
-    /// demand-paged child: a
-    /// recoverable fault becomes [`Outcome::PageFault`] with the cursor left at the op, `at`; any
-    /// other trap stands. Out of line and cold, so the memory ops keep only their branch on the
-    /// error in the op loop.
+    /// demand-paged child: a recoverable fault becomes [`Outcome::PageFault`] with the cursor left
+    /// at the op, `at`; any other trap stands. Out of line and cold, so the memory ops keep only
+    /// their branch on the error in the op loop.
     #[cold]
     #[inline(never)]
     fn page_fault_or_trap(
@@ -23440,10 +23445,10 @@ impl Vm {
         Ok(())
     }
 
-    /// #3088 — the op loop for the ops that never leave the engine ([`hot_ops`]), in a function of its
+    /// #3088 — the op loop for the hot ops ([`hot_ops`] says which and why), in a function of its
     /// own. LLVM allocates registers over a whole function, so in one shared loop every op's cost
     /// depended on how every other arm was written: an arm the loop never reached moved an `alu` loop
-    /// by 12%. No arm here calls out of the engine, so the hot ops' code depends only on the hot ops,
+    /// by 12%. Here only the hot ops' arms share the function, so their code depends only on them,
     /// and `scripts/ci/ir-guard.sh` holds what they cost.
     ///
     /// [`Vm::run_ops`] enters it at one of its ops, charged and checked. It runs ops, making
@@ -24247,7 +24252,8 @@ impl Vm {
         loop {
             if !std::mem::take(&mut checked) {
                 // #3088 — the per-op checks run only when [`checks_due`] says one has something to do,
-                // the one predicate `run_hot` stops on too: a check added here and not there never fires.
+                // the one predicate `run_hot` stops on too: a check added here and not there never
+                // fires on its own.
                 if checks_due!(budget, rcx.watch, self.sig_handler_stack) {
                     if budget == 0 {
                         // Pause at this op boundary: persist the cursor so a later `resume` continues here.
@@ -24346,7 +24352,7 @@ impl Vm {
                 "the ops a run reads are its current function's"
             );
             match &ops[pc] {
-                // The ops that never leave the engine run in [`Vm::run_hot`] (#3088).
+                // The hot ops ([`hot_ops`]) run in [`Vm::run_hot`] (#3088).
                 hot_ops!() => {
                     let mut at = Cursor {
                         module,

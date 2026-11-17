@@ -981,11 +981,12 @@ fn ir_once(kernel: &str, engine: &str, n: i32) {
         "alu" => vec![Value::I32((1..=n).fold(0i32, |a, i| a.wrapping_add(i)))],
         // One `+1` per iteration: a call, an indirect call, a store and a load, a host call.
         "call" | "call_indirect" | "mem" | "hostcall" => vec![Value::I32(n)],
-        // The root vCPU's TLS word is seeded to its dense id, 0.
-        "tls" => vec![Value::I32(0)],
+        // The word, set to 1, read once per iteration.
+        "tls" => vec![Value::I32(n)],
         // The fiber's count after its `n`th suspend.
         "fiber_switch" => vec![Value::I64(n as i64)],
-        // The fiber only parks (never suspends with a value), so each resume yields 0.
+        // The fiber only parks (never suspends with a value), so each resume yields 0. This answer
+        // does not count iterations; the row is reported, not gated.
         "fiber_wait" => vec![Value::I64(0)],
         _ => unreachable!(),
     };
@@ -993,10 +994,13 @@ fn ir_once(kernel: &str, engine: &str, n: i32) {
 }
 
 /// Each iteration reads the vCPU's TLS word (`vcpu.tls.get`), which every thread-local access in
-/// the C, LLVM and Nim frontends lowers to.
+/// the C, LLVM and Nim frontends lowers to. The word is set to 1 first, so the sum of the reads is
+/// the iteration count.
 const TLS: &str = r#"
 func (i32) -> (i32) {
 block 0 (v0: i32) {
+  v10 = i64.const 1
+  vcpu.tls.set v10
   v1 = i32.const 0
   br 1(v0, v1)
 }
