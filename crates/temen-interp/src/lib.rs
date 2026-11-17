@@ -24074,6 +24074,13 @@ impl Completions {
         *self.notify.lock_unpoisoned() = f;
     }
 
+    /// Whether a wake hook is installed ([`Completions::set_notify`]): on executor 2, a parking task
+    /// installs it before its park's last look, so a store no run has parked on has none. A
+    /// read-only observable, for a harness that must answer a call only once its task has parked.
+    pub fn listening(&self) -> bool {
+        self.notify.lock_unpoisoned().is_some()
+    }
+
     /// F3 (FIBER_PARK.md) — register the calling JIT fiber's wait cell for punt `id`, under the
     /// store's lock: an answer already in fills the cell at once, so a completion that raced the
     /// park is never stranded.
@@ -26215,10 +26222,6 @@ pub enum OpParks {
 /// are half the key, so `self.schema` names are canonical). The `Host::iface_intern` element.
 type IfaceKey = (Arc<[String]>, Arc<[FuncType]>);
 
-/// The host: the **host-owned handle table** (the powerbox) plus deterministic mock
-/// capability state (captured stdio, a monotonic clock). Construct with [`Host::new`],
-/// `grant_*` the initial capabilities, then pass to [`run_with_host`]; afterwards read
-/// back `stdout`/`stderr`. Deterministic by design so it serves as a §18 oracle.
 /// #3037 — the facts of a [`Host`] executor 2's rules read under the run lock, without the `Host`'s
 /// own lock, in one shared object: the `Host` writes them, a domain's
 /// [`DomainHost`](bytecode::DomainHost) holds the same `Arc`, so no setter can leave a copy stale.
@@ -26241,6 +26244,10 @@ impl HostFacts {
     }
 }
 
+/// The host: the **host-owned handle table** (the powerbox) plus deterministic mock
+/// capability state (captured stdio, a monotonic clock). Construct with [`Host::new`],
+/// `grant_*` the initial capabilities, then pass to [`run_with_host`]; afterwards read
+/// back `stdout`/`stderr`. Deterministic by design so it serves as a §18 oracle.
 pub struct Host {
     table: Vec<Slot>, // CAP slots, host-owned
     /// Bytes a `Stream{In}` handle's `read` draws from.

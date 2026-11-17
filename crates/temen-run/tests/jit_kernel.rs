@@ -3255,17 +3255,16 @@ block 0 () {{
 
 /// #2958 slice 5 — a punted host call parks its task through the kernel's rules until the pool's
 /// answer comes, from the root and from a spawned thread, the gate opened before the run (the
-/// answer may beat the park) or only once the job runs (the call is outstanding first): `42` on
-/// every route, the oracle's.
+/// answer may beat the park) or each lane's ticket opened only once its job has reached the gate:
+/// `42` on every route, the oracle's. What the second half forces is "the call was punted and its
+/// job started, then the answer"; it does not force the task asleep first (the park usually wins
+/// the race, but nothing here observes it). That order is forced on the kernel route alone, by
+/// [`a_punted_call_answered_after_its_park_listened_answers_on_the_kernel_route`].
 #[test]
 fn a_punted_call_parks_until_its_answer_on_every_route() {
     static EARLY: Gate = Gate::new();
     static LATE: Gate = Gate::new();
     EARLY.open();
-    // Each lane's job reaches the gate in turn, and its ticket opens only then: every lane's call is
-    // outstanding before its answer can come.
-    let opener =
-        std::thread::spawn(|| std::iter::from_fn(|| LATE.open_next().then_some(())).count());
     for thread in [false, true] {
         let early: fn(i32) -> temen_ir::Module = match thread {
             false => |h| calls_punted(h, false),
@@ -3279,6 +3278,11 @@ fn a_punted_call_parks_until_its_answer_on_every_route() {
             Ok(vec![42]),
         );
     }
+    // Each lane's job reaches the gate in turn, and its ticket opens only then: every lane's call is
+    // outstanding before its answer can come. The opener starts with these lanes, so each ticket's
+    // wait is bounded from its own lane's start.
+    let opener =
+        std::thread::spawn(|| std::iter::from_fn(|| LATE.open_next().then_some(())).count());
     all_answer(
         |h| calls_punted(h, true),
         |h| grant_punting(h, &LATE),
@@ -3288,8 +3292,50 @@ fn a_punted_call_parks_until_its_answer_on_every_route() {
     );
     LATE.finish();
     let opened = opener.join().expect("the opener");
-    assert!(opened >= 1, "a job reached the gate");
-    assert!(LATE.passed(opened as u32), "each opened job passed");
+    assert_eq!(opened, 3, "each lane's job reached the gate");
+    assert!(LATE.passed(3), "each opened job passed");
+}
+
+/// #2958 slice 5 — the order the row above cannot force, on the kernel route: a punted call answered
+/// only once its task's park has registered for it. The job waits at its gate, and the harness opens
+/// it only once the job has reached it and the domain's completions store has a wake hook, which the
+/// park installs before its last look ([`temen_interp::Completions::listening`]; a fresh `Host`'s
+/// store has none). So the answer posts after the park has listened, and the wake must come through
+/// that hook. From the root and from a spawned thread: `42`.
+#[test]
+fn a_punted_call_answered_after_its_park_listened_answers_on_the_kernel_route() {
+    static PARKED: Gate = Gate::new();
+    for (k, thread) in [false, true].into_iter().enumerate() {
+        let mut host = Host::new();
+        let job = grant_punting(&mut host, &PARKED);
+        let comps = host.completions();
+        let m = calls_punted(job, thread);
+        let opener = std::thread::spawn(move || {
+            if !PARKED.reached(k as u32 + 1) {
+                return false;
+            }
+            let until = Instant::now() + PROMPT;
+            while !comps.listening() {
+                if Instant::now() >= until {
+                    return false;
+                }
+                std::thread::yield_now();
+            }
+            PARKED.open_next()
+        });
+        let answer = bounded("the kernel route", move || {
+            let admitted = jit_kernel::admit(&m, &host, false).expect("in the kernel's scope");
+            let end =
+                jit_kernel::run(admitted, fresh_start(u64::MAX), &mut host).expect("compiles");
+            assert!(end.vcpus >= 1, "it ran as kernel tasks");
+            end.result.map(|v| v.to_vec())
+        });
+        assert!(
+            opener.join().expect("the opener"),
+            "thread {thread}: the job reached its gate after the park listened"
+        );
+        assert_eq!(answer, Ok(vec![42]), "thread {thread}");
+    }
 }
 
 /// #2958 slice 5, condition 4 — a punted job may outlive its run: its job owns its inputs (an
@@ -3442,9 +3488,10 @@ block 0 () {{
 /// #2958 slice 5, Q5 — a punted call's answer by the shape of its declared results (none, one `i64`,
 /// one `i32`, two) and by who answers it (the offload pool, or the embedder), on every engine. The
 /// tree-walker decides: only an `[i64]` reply parks on the embedder's answer, and no punt answers two
-/// results. The kernel route gives its answer for an `[i64]` call, and declines every other shape
-/// whoever answers it (`punt shape`, #3072): its thunk cannot tell a call's result types apart, and
-/// an offloadable procedure's call is the same call as a host-answered one's to it. The other engines' present answers are pinned with their issue (#3071), so a fix
+/// results. The kernel route gives the oracle's answer for every shape but one, which it declines
+/// whoever answers it (`punt shape`, #3072): a single result that is not an `i64`. Its thunk tells
+/// calls apart by their result count, not their types, and an offloadable procedure's call is the
+/// same call to it as a host-answered one's. The other engines' present answers are pinned with their issue (#3071), so a fix
 /// shows up as a row to change. A host-answered call that declines is run with no answerer: its
 /// decline comes after the request is filed, so an embedder that answered at once could beat it on
 /// every engine (#3071).
@@ -3505,7 +3552,7 @@ fn a_punted_calls_answer_by_its_shape_on_every_engine() {
             |h| punt_shaped(h, ""),
             pool,
             false,
-            [Some(ok(0)), Some(ok(0)), None, Some(ok(0))],
+            [Some(ok(0)), Some(ok(0)), Some(ok(0)), Some(ok(0))],
         ),
         (
             "",
@@ -3513,7 +3560,7 @@ fn a_punted_calls_answer_by_its_shape_on_every_engine() {
             |h| punt_shaped(h, ""),
             embedder,
             false,
-            [Some(cf()), Some(cf()), None, Some(cf())],
+            [Some(cf()), Some(cf()), Some(cf()), Some(cf())],
         ),
         (
             "i64",
@@ -3555,7 +3602,7 @@ fn a_punted_calls_answer_by_its_shape_on_every_engine() {
             |h| punt_shaped(h, "i64, i64"),
             pool,
             false,
-            [Some(cf()), Some(cf()), None, Some(ok(42))],
+            [Some(cf()), Some(cf()), Some(cf()), Some(ok(42))],
         ),
         (
             "i64, i64",
@@ -3563,7 +3610,7 @@ fn a_punted_calls_answer_by_its_shape_on_every_engine() {
             |h| punt_shaped(h, "i64, i64"),
             embedder,
             false,
-            [Some(cf()), Some(cf()), None, Some(cf())],
+            [Some(cf()), Some(cf()), Some(cf()), Some(cf())],
         ),
     ];
     let cfg = |keep: bool| temen_run::RunConfig {

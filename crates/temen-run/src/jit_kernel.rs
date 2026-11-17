@@ -483,12 +483,15 @@ type CallPayload = Option<CallPark>;
 
 /// #2958 slice 5 — hand `park`, what a call the vCPU on `vm` just made left it to do
 /// ([`temen_interp::bytecode::call_park`]), to its task's rules ([`EmittedCall::park_call`]): `None`
-/// when `vm` is no kernel vCPU's. The caller holds no `Host` lock, and is the cap thunk of code
-/// running on `vm`.
-pub(crate) fn park_call(vm: &temen_jit::VmCtx, park: CallPark) -> Option<[i64; 2]> {
+/// when `vm` is no kernel vCPU's.
+///
+/// # Safety
+/// As [`temen_jit::kernel_rt::park_call`]'s: the caller is the cap thunk of code running on `vm`, on
+/// `vm`'s own thread, inside the guarded call its vCPU runs (`KernelRun::run_vcpu`), and holds no
+/// other reference to the hook and no `Host` lock.
+pub(crate) unsafe fn park_call(vm: &temen_jit::VmCtx, park: CallPark) -> Option<[i64; 2]> {
     let mut payload: CallPayload = Some(park);
-    // SAFETY: the cap thunk calls this on `vm`'s own thread, inside the guarded call its vCPU runs
-    // (`KernelRun::run_vcpu`), and holds no other reference to the hook.
+    // SAFETY: this function's own contract is the callee's.
     unsafe { temen_jit::kernel_rt::park_call(vm, &mut payload) }
 }
 

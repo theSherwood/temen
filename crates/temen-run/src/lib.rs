@@ -301,7 +301,9 @@ impl HostParkReq {
             HostParkReq::Kernel(park) => {
                 // A rewound park runs the op again once its task can run; a wake is the op's last act.
                 let rewound = !matches!(park, temen_interp::bytecode::CallPark::Done(_));
-                return jit_kernel::park_call(vm, park).is_some()
+                // SAFETY: `vm` is the live call's context and the caller holds no lock (this
+                // function's contract), on the cap thunk's own thread.
+                return unsafe { jit_kernel::park_call(vm, park) }.is_some()
                     && rewound
                     && vm.ended().is_none();
             }
@@ -337,7 +339,9 @@ unsafe fn cap_wait(
     // answer; a run that ends meanwhile leaves it unclaimed, as here.
     if vm.on_kernel() {
         let park = temen_interp::bytecode::CallPark::CapPending(id);
-        return jit_kernel::park_call(vm, park).map_or(0, |[r, _]| r);
+        // SAFETY: `vm` is the live call's context and the caller holds no lock (this function's
+        // contract), on the cap thunk's own thread.
+        return unsafe { jit_kernel::park_call(vm, park) }.map_or(0, |[r, _]| r);
     }
     if fiber {
         return fiber_cap_wait(comps, id, vm);
