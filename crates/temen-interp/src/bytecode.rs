@@ -9650,7 +9650,7 @@ impl DispatchParks {
         let spawn = matches!(request, Some(super::ParkEvent::SpawnSelf { .. }))
             .then(|| p.take_spawn_plan())
             .flatten();
-        let parks = Self {
+        Self {
             stdin: p.take_stdin_parked(),
             request,
             spawn,
@@ -9665,8 +9665,7 @@ impl DispatchParks {
             // wakers executor 2's parked tasks registered on the pipe, #2757,
             // [`super::PipeProbe::listen`]), but they are per-op too, so they drain here as well.
             woke: p.take_pipe_wake().is_some() | p.take_pipe_wake_writers().is_some(),
-        };
-        parks
+        }
     }
 
     /// #2550 — what the op these flags describe leaves its caller to do: the one park decision of
