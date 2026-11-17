@@ -95,7 +95,7 @@ fn thawed(inst: &Module, bend: impl FnOnce(&mut Residue)) -> Result<Vec<Value>, 
 
 #[test]
 fn a_fiber_slot_past_the_arena_is_not_seeded() {
-    temen_ir::thaw::expect_backstops();
+    let _backstops = temen_ir::thaw::expect_backstops();
     let r = thawed(&instrument(FIBERS), |r| {
         let f = r.fibers[0];
         r.fibers = (0..11)
@@ -114,7 +114,7 @@ fn a_fiber_slot_past_the_arena_is_not_seeded() {
 /// another signature ends the thread `ThreadFault`, which its join passes to the root.
 #[test]
 fn a_vcpu_the_pass_refuses_is_not_re_created() {
-    temen_ir::thaw::expect_backstops();
+    let _backstops = temen_ir::thaw::expect_backstops();
     let inst = instrument(THREADS);
     let ebadf = 2000 + 100 * temen_ir::errno::EBADF;
     type Case = (fn(&mut Residue), Result<Vec<Value>, Trap>);

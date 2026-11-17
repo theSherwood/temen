@@ -1463,7 +1463,10 @@ fn a_freeze_while_a_units_thread_runs_is_declined_and_the_run_goes_on() {
         None,
     )
     .map(|(o, _)| o);
-    assert!(matches!(jit, Err(JitError::Unsupported(_))), "JIT: {jit:?}");
+    assert!(
+        matches!(jit, Err(JitError::Unsupported(m)) if m.contains("hosting a unit's threads")),
+        "JIT: {jit:?}"
+    );
 }
 
 /// R2.3 — only a root that unwound took a cut. The root spawns a thread that waits for a word, then

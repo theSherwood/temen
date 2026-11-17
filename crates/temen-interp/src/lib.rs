@@ -9887,8 +9887,7 @@ impl VCpu {
             children: &self.domain.children,
             host: &self.domain.host,
             registry: &self.domain.registry,
-            unit_thread: self.spawn_residue.is_some()
-                && self.frames.first().is_some_and(|f| f.module != 0),
+            unit_thread: self.unit_thread,
         }
     }
 }
@@ -13626,6 +13625,10 @@ struct VCpu {
     /// (#1917). `None` on a domain's main vCPU, whose entry/args the thaw caller supplies.
     /// (slice 3.2.1)
     spawn_residue: Option<(FuncIdx, Vec<i64>, usize)>,
+    /// #3034 — a `thread.spawn` child whose entry is an installed §22 unit's function, which no thaw
+    /// can re-create ([`DeclineCause::UnitThread`], #3108). Set at the spawn: the vCPU's frames are a
+    /// fiber's while it runs one.
+    unit_thread: bool,
     /// #2695 step 2 — the call this vCPU answers: an activation of a resting domain
     /// ([`activation`]). Its return replies, and, as a thread's does, its end ends nothing else.
     answers: Option<Answers>,
@@ -13856,6 +13859,7 @@ impl VCpu {
             durable_sp_ctx: 0,
             frozen: Vec::new(),
             spawn_residue: None,
+            unit_thread: false,
             answers: None,
             vcpu_ctx: 0,
             dstate: STATE_NORMAL,
@@ -13930,6 +13934,7 @@ impl VCpu {
             durable_sp_ctx: self.durable_sp_ctx,
             frozen: Vec::new(),
             spawn_residue: None,
+            unit_thread: false,
             answers: None,
             vcpu_ctx: self.vcpu_ctx,
             dstate: self.dstate,
@@ -14009,6 +14014,7 @@ impl VCpu {
             durable_sp_ctx: 0,
             frozen: Vec::new(),
             spawn_residue: None,
+            unit_thread: false,
             answers: None,
             vcpu_ctx: 0,
             dstate: STATE_NORMAL,
@@ -15045,6 +15051,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
         durable_sp_ctx, // §12.8 4A.5: active spill context, maintained at fiber switches
         frozen, // freeze-unwind of an active-chain fiber pushes here (slice 3.2); also `freeze_drive`
         spawn_residue: _,
+        unit_thread: _,
         vcpu_ctx,  // §12.8 4A.5: this vCPU's root shadow context, for `durable.shadow_base`
         dstate: _, // swapped at the dispatch boundary, not inside `run_inner`
         wait_indefinite: _, // #1584 — set at the futex park site, read by the quiesce gate
@@ -18629,6 +18636,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         child.parent_task = parent_id; // slice 3.4: who spawned it (nested-spawn thaw)
                         child.tls = vcpu_id; // §12: its id in its domain (#1775)
                         child.spawn_residue = Some((entry, vec![a0, a1], slot));
+                        child.unit_thread = cmodule != 0;
                         child.debug = cdebug.map(|sh| Box::new(DebugCtx::new(sh)));
                         child.live = live;
                         Box::new(child)

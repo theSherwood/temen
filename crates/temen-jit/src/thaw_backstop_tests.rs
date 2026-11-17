@@ -76,7 +76,6 @@ fn thawed(m: &IrModule, bend: impl FnOnce(&mut DurableResidue)) -> JitOutcome {
     let (o, snap) = cm.run(&[], Some(&win), Some(SNAP_CAP)).expect("the freeze");
     assert!(matches!(o, JitOutcome::Returned(_)), "the freeze: {o:?}");
     let mut residue = cm.take_durable_residue();
-    assert_eq!(residue.vcpus.len(), 1, "the parked child rides");
     bend(&mut residue);
     let mut snap = snap;
     temen_durable::begin_thaw(&mut snap, ARENA, 0);
@@ -96,9 +95,12 @@ fn thawed(m: &IrModule, bend: impl FnOnce(&mut DurableResidue)) -> JitOutcome {
 /// another signature ends the thread `ThreadFault`, which its join passes to the root.
 #[test]
 fn a_vcpu_the_pass_refuses_is_not_re_created() {
-    temen_ir::thaw::expect_backstops();
+    let _backstops = temen_ir::thaw::expect_backstops();
     let m = instrument(THREADS);
     let ebadf = 2000 + 100 * temen_ir::errno::EBADF;
+    thawed(&m, |r| {
+        assert_eq!(r.vcpus.len(), 1, "the parked child rides")
+    });
     let slot = thawed(&m, |r| r.vcpus[0].slot = temen_ir::handles::SLOTS);
     assert!(
         matches!(&slot, JitOutcome::Returned(v) if *v == [ebadf]),
@@ -117,4 +119,108 @@ fn a_vcpu_the_pass_refuses_is_not_re_created() {
             "{what}: {o:?}"
         );
     }
+}
+
+/// The root makes a fiber, resumes it (it suspends 42), then resumes handle 10, one it never made.
+const FIBERS: &str = "
+func () -> (i64) {
+block 0 () {
+  v0 = ref.func 1
+  v1 = i64.const 4096
+  v2 = cont.new v0 v1
+  v3 = i64.const 0
+  v4, v5 = cont.resume v2 v3
+  v6 = i64.const 7
+  vten = i64.const 10
+  v7, v8 = cont.resume vten v6
+  return v8
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (v0: i64, v1: i64) {
+  v2 = i64.const 42
+  v3 = suspend v2
+  v4 = i64.const 100
+  v5 = i64.add v3 v4
+  return v5
+  }
+}
+";
+
+/// A fiber slot past the arena is not seeded (the seed stops there, as `cont.new` refuses one), and
+/// the resume of handle 10 answers `FiberFault`, as on the tree-walker.
+#[test]
+fn a_fiber_slot_past_the_arena_is_not_seeded() {
+    let _backstops = temen_ir::thaw::expect_backstops();
+    let o = thawed(&instrument(FIBERS), |r| {
+        let f = r.fibers[0];
+        r.fibers = (0..11)
+            .map(|slot| FrozenFiber {
+                slot,
+                shadow_sp: f.shadow_sp + slot as u64 * ARENA.stride,
+                ..f
+            })
+            .collect();
+    });
+    assert!(
+        matches!(o, JitOutcome::Trapped(TrapKind::FiberFault)),
+        "{o:?}"
+    );
+}
+
+/// A module with no arena has no root region and no thaw words (INVARIANTS #16): a vCPU record seeded
+/// into its run (here a finished one, so no context is asked for) does not reach the root's stores,
+/// which would land at window offsets 0 and 8.
+#[test]
+fn a_vcpu_record_without_an_arena_writes_no_thaw_word() {
+    let _backstops = temen_ir::thaw::expect_backstops();
+    let real = {
+        let m = instrument(THREADS);
+        let mut win = init_durable_window(1 << LOG2, ARENA);
+        write_state(&mut win, ARENA, temen_durable::STATE_UNWINDING);
+        let mut cm = compiled(&m);
+        cm.durable = true;
+        cm.run(&[], Some(&win), Some(SNAP_CAP)).expect("the freeze");
+        cm.take_durable_residue()
+    };
+    let src = "
+func () -> (i64) {
+block 0 () {
+  vz = i64.const 0
+  vt = thread.spawn 1 vz vz
+  vr_st, vr = thread.join vt
+  return vr
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, varg: i64) {
+  v5 = i64.const 5
+  return v5
+  }
+}
+";
+    let mut m = temen_text::parse_module(src).expect("parse");
+    m.memory = Some(temen_ir::Memory {
+        size_log2: LOG2,
+        shadow: None,
+    });
+    let mut cm = compiled(&m);
+    cm.durable = true;
+    cm.seed.vcpus = real
+        .vcpus
+        .into_iter()
+        .map(|v| FrozenVCpu {
+            completed_result: Some(5),
+            ..v
+        })
+        .collect();
+    cm.seed.root_sp = real.root_sp;
+    cm.seed.children = Some(real.children);
+    let win = vec![0u8; 1 << LOG2];
+    let (_, out) = cm.run(&[], Some(&win), Some(SNAP_CAP)).expect("the run");
+    assert_eq!(
+        out[..16],
+        [0; 16],
+        "nothing is stored at window offsets 0 and 8"
+    );
 }

@@ -296,28 +296,42 @@ impl<D, T> Thaw<D, T> {
     }
 }
 
-/// Whether a test hands a thaw's seed hostile values on purpose ([`expect_backstops`]).
-static BACKSTOPS_EXPECTED: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(false);
+/// How many tests hand a thaw's seed hostile values on purpose right now ([`expect_backstops`]).
+static BACKSTOPS_EXPECTED: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
 
 /// #3034 — a refusal behind the pass, in front of a raw host store or an unchecked index: an engine's
 /// seed refuses `what` there whatever residue reaches it. A residue the pass admitted never does, so
-/// reaching one is a hole in the pass, loud in a debug build (it panics) unless a test hands a seed
-/// hostile values on purpose ([`expect_backstops`]). In release it does nothing: the refusal is the
-/// caller's. An engine's own freeze that the pass refuses for no guest value is the same hole seen
-/// from the other side, and is as loud.
+/// reaching one is a hole in the pass, loud in a debug build (it panics) unless a test is handing a
+/// seed hostile values on purpose ([`expect_backstops`]). In release it does nothing: the refusal is
+/// the caller's.
 pub fn backstop(what: &str) {
-    if cfg!(debug_assertions) && !BACKSTOPS_EXPECTED.load(core::sync::atomic::Ordering::Relaxed) {
+    if cfg!(debug_assertions) && BACKSTOPS_EXPECTED.load(core::sync::atomic::Ordering::Relaxed) == 0
+    {
         panic!("{what}");
     }
 }
 
-/// Say that this process hands thaw seeds hostile values on purpose, so a refusal behind the pass
-/// is the behaviour under test rather than a hole in it ([`backstop`]). A test hook: process-wide, set
-/// by the crates' backstop tests only.
+/// Say that this test hands thaw seeds hostile values on purpose, so a refusal behind the pass is the
+/// behaviour under test rather than a hole in it ([`backstop`]), for as long as the guard lives. A test
+/// hook. The seeds run on the engines' own threads, so the switch is the process's, not the calling
+/// thread's: it is scoped in time, and a test running beside one in the same binary is quiet only
+/// while that guard is held.
 #[doc(hidden)]
-pub fn expect_backstops() {
-    BACKSTOPS_EXPECTED.store(true, core::sync::atomic::Ordering::Relaxed);
+#[must_use = "the backstops are expected only while the guard is held"]
+pub fn expect_backstops() -> BackstopsExpected {
+    BACKSTOPS_EXPECTED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    BackstopsExpected(())
+}
+
+/// The guard [`expect_backstops`] returns: dropping it makes the backstops loud again.
+#[doc(hidden)]
+pub struct BackstopsExpected(());
+
+impl Drop for BackstopsExpected {
+    fn drop(&mut self) {
+        BACKSTOPS_EXPECTED.fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 /// The residue names a value no run of the module could have made.
