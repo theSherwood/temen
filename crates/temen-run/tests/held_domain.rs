@@ -1395,28 +1395,49 @@ fn nested_outer(on: Executor, loan: u64) -> (Reply, u64) {
     })
 }
 
-/// #3069 — a nested activation on a loan can burn all of it: the waiting caller hands back what its
-/// draw left before the call, as it cannot run meanwhile. Each activation draws a cell of its own
-/// from the loan, so a kept draw stranded half the loan, and the least loan was twice the cost.
-/// The JIT alone: the interpreters charge an activation no entry and the nested call nothing to the
-/// outer loan, so their least loan here is not the JIT's (#3093).
-///
-/// The read-back is ordered: `outer()` can call in, so it is carried (it may leave the caller's
-/// thread), and its end reads its cell's `can_burn` (`HeldSite::carry`'s `done`). `kept()` never
-/// parks, so it runs inline, on `outer()`'s own stack inside its `call.cap`: its context, and with it
-/// its cell, drops as that `call.cap` returns, handing back what it drew before `outer()` runs on,
-/// let alone ends.
+/// What `outer()` of [`nested_counter`] costs on the JIT: two entries and the inner loop's 99
+/// back-edges.
+const NESTED_COST: u64 = 101;
+
+// #3069 — a nested activation on a loan can burn all of it: the waiting caller hands back what its
+// draw left before the call, as it cannot run meanwhile. Each activation draws a cell of its own
+// from the loan, so a kept draw stranded half the loan, and the least loan was twice the cost.
+// The JIT alone: the interpreters charge an activation no entry and the nested call nothing to the
+// outer loan, so their least loan here is not the JIT's (#3093).
+//
+// Three tests, one held JIT run each, on purpose: two JIT runs in one process trip #3032's ASan
+// report in a child task's fiber entry, and the ASan lane runs each test of this binary in a process
+// of its own for that reason. Don't fold them into one test until #3032 is fixed.
+//
+// The read-back is ordered: `outer()` can call in, so it is carried (it may leave the caller's
+// thread), and its end reads its cell's `can_burn` (`HeldSite::carry`'s `done`). `kept()` never
+// parks, so it runs inline, on `outer()`'s own stack inside its `call.cap`: its context, and with it
+// its cell, drops as that `call.cap` returns, handing back what it drew before `outer()` runs on,
+// let alone ends.
+
+/// On a large loan, the nested call costs [`NESTED_COST`].
+#[test]
+fn a_nested_activation_on_the_jit_costs_its_safepoints() {
+    assert_eq!(
+        nested_outer(Executor::Jit, 1_000_000),
+        (Reply::Results(vec![42]), NESTED_COST)
+    );
+}
+
+/// A loan of exactly the cost completes and burns all of it.
 #[test]
 fn a_nested_activation_on_the_jit_can_burn_its_whole_loan() {
-    let (done, cost) = nested_outer(Executor::Jit, 1_000_000);
-    assert_eq!(done, Reply::Results(vec![42]));
-    assert_eq!(cost, 101, "two entries and the inner loop's 99 back-edges");
     assert_eq!(
-        nested_outer(Executor::Jit, cost),
-        (Reply::Results(vec![42]), cost)
+        nested_outer(Executor::Jit, NESTED_COST),
+        (Reply::Results(vec![42]), NESTED_COST)
     );
+}
+
+/// A loan one short runs out, having burned all of it.
+#[test]
+fn a_nested_activation_on_the_jit_one_short_runs_out() {
     assert_eq!(
-        nested_outer(Executor::Jit, cost - 1),
-        (Reply::Failed(CAP_REVOKED), cost - 1)
+        nested_outer(Executor::Jit, NESTED_COST - 1),
+        (Reply::Failed(CAP_REVOKED), NESTED_COST - 1)
     );
 }
