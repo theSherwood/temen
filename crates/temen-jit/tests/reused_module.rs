@@ -395,6 +395,9 @@ impl temen_jit::BudgetNode for CountsFibers {
         Some(u64::MAX)
     }
     fn give_back(&self, _unspent: u64) {}
+    fn take_exact(&self, _n: u64) -> Option<bool> {
+        Some(true)
+    }
     fn room(&self) -> i64 {
         i64::MAX
     }

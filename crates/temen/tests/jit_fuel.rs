@@ -69,8 +69,8 @@ block 2 (v4: i32) {
 fn jit_fuel(src: &str, args: &[i64], budget: u64) -> (JitOutcome, u64) {
     let m = parse_module(src).expect("parse");
     verify_module(&m).expect("verify");
-    // The guest decrements this cell in place through the baked address; after the run returns we read
-    // the remainder back (no concurrent access — a single guest thread owns the budget).
+    // A fixed allowance: each vCPU draws a cell of its own from it, and once the run has joined them
+    // all the entry reads back what none of them burned (#3069).
     let mut cell: u64 = budget;
     let outcome = compile_and_run_with_host_fuel(
         &m,
@@ -636,8 +636,345 @@ fn jit_fuel_a_threads_entry_runs_out_alike_on_every_engine() {
     // Paying an entry keeps none of the draw that paid it: 50 threads spawned before the first join
     // complete on twice their cost, the chunk rule's least budget, where each one holding a chunk
     // while it waited ran the root out. Below 100 the engines split by that rule (#3011): the
-    // tree-walker and the kernel route, whose waiting root holds half the room it drew, run out; the
-    // bytecode engine and today's JIT complete on the exact cost, 51.
+    // tree-walker, the JIT and the kernel route, whose waiting root holds half the room it drew, run
+    // out; the bytecode engine completes on the exact cost, 51. The JIT's vCPUs shared one cell on a
+    // fixed allowance and completed on 51 too, charging what overlapping charges did not lose (#3069).
+    // Its spawn pays each entry with an exact take of one unit, as the interpreters' does (#3081), so
+    // no thread holds a draw while others pay theirs: this holds in any schedule of its OS threads.
     let fifty = spawning(50);
     assert_eq!(assert_four_way(&fifty, 100), (Ended::Returned(350), 51));
+}
+
+/// The root spawns `n` threads, each counting `steps` down as [`COUNTING_THREAD`]'s does, joins them
+/// and returns the sum of their counts.
+fn counting_threads(n: usize, steps: u64) -> String {
+    let mut body = format!("  vn = i64.const {steps}\n  vacc0 = i64.const 0\n");
+    for i in 0..n {
+        body += &format!("  vh{i} = thread.spawn 1 vn vn\n");
+    }
+    for i in 0..n {
+        let j = i + 1;
+        body += &format!("  vs{i}, vv{i} = thread.join vh{i}\n  vacc{j} = i64.add vacc{i} vv{i}\n");
+    }
+    let thread = COUNTING_THREAD
+        .split_once("func (i64, i64)")
+        .expect("the counting thread's function")
+        .1;
+    format!(
+        "memory 16
+func () -> (i64) {{
+block 0 () {{
+{body}  return vacc{n}
+  }}
+}}
+func (i64, i64){thread}"
+    )
+}
+
+/// **Threads that count at once are each charged in full, on a fixed allowance too** (#3069). Eight
+/// threads counting 200,000 down cost the root's entry plus 200,000 each: 1,600,001 on every engine.
+/// The JIT's fixed allowance was one cell its vCPUs charged with plain loads and stores, so two
+/// charges that overlapped counted as one, and this run charged 30% to 53% of its cost. Each vCPU now
+/// charges a cell of its own, drawn from the allowance as from a chain.
+#[test]
+fn jit_fuel_charges_threads_counting_at_once_in_full() {
+    assert_eq!(
+        assert_three_way(&counting_threads(8, 200_000), 1 << 40),
+        (Ended::Returned(1_600_000), 1_600_001)
+    );
+}
+
+// #3081 — a spawned thread's entry is paid at its spawn, exactly one unit, on every engine.
+
+/// The root spawns a thread that only returns, and returns 7 without joining it.
+const UNJOINED_THREAD: &str = "memory 16
+func () -> (i64) {
+block 0 () {
+  vz = i64.const 7
+  vh = thread.spawn 1 vz vz
+  return vz
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (va: i64, vb: i64) {
+  return va
+  }
+}
+";
+
+/// **A thread's entry is paid as its spawn completes, not when it starts** (#3081). The root's entry
+/// takes a budget of 1, so its spawn cannot pay the thread's and the run runs out of fuel on the
+/// spawner, on every engine. The JIT paid the entry in the thread's own prologue, once it ran, and
+/// the root returned 7 before that. With 2, every engine completes and spends all of it.
+#[test]
+fn jit_fuel_an_unjoined_threads_entry_is_paid_at_its_spawn() {
+    assert_eq!(assert_three_way(UNJOINED_THREAD, 1), (Ended::OutOfFuel, 1));
+    assert_eq!(
+        assert_three_way(UNJOINED_THREAD, 2),
+        (Ended::Returned(7), 2)
+    );
+}
+
+/// The root spawns a thread that enters, sets a flag, notifies it and waits to be released. The root
+/// waits for the flag, counts 20,000 down (19,999 taken back-edges), releases the thread and joins it:
+/// 20,001 in all, with the thread's entry and the root's.
+const PARKED_THREAD: &str = "memory 16
+func () -> (i64) {
+block 0 () {
+  vflag = i64.const 16384
+  vz = i64.const 0
+  vh = thread.spawn 1 vz vz
+  vexp = i32.const 0
+  vinf = i64.const -1
+  vw = i32.atomic.wait vflag vexp vinf
+  vn = i64.const 20000
+  br 1(vn, vh)
+}
+block 1 (vi: i64, vh1: i32) {
+  vone = i64.const 1
+  vj = i64.sub vi vone
+  vdone = i64.eqz vj
+  br_if vdone 2(vh1) 1(vj, vh1)
+}
+block 2 (vh2: i32) {
+  vgo = i64.const 16388
+  vset = i32.const 1
+  i32.atomic.store vgo vset
+  vcnt = i32.const 1
+  vw2 = atomic.notify vgo vcnt
+  vs, vv = thread.join vh2
+  return vv
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (va: i64, vb: i64) {
+  vflag = i64.const 16384
+  vset = i32.const 1
+  i32.atomic.store vflag vset
+  vcnt = i32.const 1
+  vw = atomic.notify vflag vcnt
+  vgo = i64.const 16388
+  vexp = i32.const 0
+  vinf = i64.const -1
+  vw2 = i32.atomic.wait vgo vexp vinf
+  v7 = i64.const 7
+  return v7
+  }
+}
+";
+
+/// **A parked thread holds none of the root's fuel** (#3081). Its entry was paid at the spawn, so it
+/// parks holding nothing, and the root can burn the whole rest of the budget: the least budget is the
+/// exact cost, 20,001, on every engine. A thread that paid its own entry from a draw kept the rest of
+/// that draw while it waited, out of the root's reach.
+#[test]
+fn jit_fuel_a_parked_thread_holds_none_of_the_roots_fuel() {
+    assert_eq!(
+        assert_three_way(PARKED_THREAD, 20_001),
+        (Ended::Returned(7), 20_001)
+    );
+    assert_eq!(
+        assert_three_way(PARKED_THREAD, 20_000),
+        (Ended::OutOfFuel, 20_000)
+    );
+}
+
+/// Thread A makes a fiber that counts back-edges and suspends after each 3, and returns its handle.
+/// The root joins A, resumes the fiber once (it charges A's cell, wherever it runs, and refills it
+/// after A ended), spawns a thread that only returns and joins it, then resumes the fiber to its end.
+const A_FIBER_OUTLIVES_ITS_VCPU: &str = "memory 16
+func () -> (i64) {
+block 0 () {
+  vz = i64.const 0
+  va = thread.spawn 1 vz vz
+  vas, vk = thread.join va
+  vs1, vv1 = cont.resume vk vz
+  vc = thread.spawn 3 vz vz
+  vcs, vcv = thread.join vc
+  vs2, vv2 = cont.resume vk vz
+  vs3, vv3 = cont.resume vk vz
+  vr = i64.add vv1 vv2
+  vr2 = i64.add vr vv3
+  vr3 = i64.add vr2 vcv
+  return vr3
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (va: i64, vb: i64) {
+  vf = ref.func 2
+  vk = cont.new vf va
+  return vk
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, varg: i64) {
+  vz = i64.const 0
+  br 1(vz, vz)
+}
+block 1 (vi: i64, vround: i64) {
+  vone = i64.const 1
+  vj = i64.add vi vone
+  vthree = i64.const 3
+  vat = i64.rem_u vj vthree
+  vpause = i64.eqz vat
+  br_if vpause 2(vj, vround) 1(vj, vround)
+}
+block 2 (vj2: i64, vr: i64) {
+  vx = suspend vj2
+  vone2 = i64.const 1
+  vr2 = i64.add vr vone2
+  vtwo = i64.const 2
+  vdone = i64.eq vr2 vtwo
+  br_if vdone 3(vj2) 1(vj2, vr2)
+}
+block 3 (vend: i64) {
+  return vend
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (va: i64, vb: i64) {
+  v7 = i64.const 7
+  return v7
+  }
+}
+";
+
+/// **A spawn's entry throws away nothing a recycled cell held** (PR #3091's review). The spawned
+/// thread takes the context A left, whose cell A's fiber refilled after A ended. Seeding its paid
+/// entry hands what that cell held back to the chain first, then holds the unit, so nothing the
+/// chain was charged for is thrown away, and
+/// every engine charges alike, the root's entry, A's, the thread's, the fiber's three resumes and its
+/// five taken back-edges. The first version of #3081's payment assumed the cell empty: a debug
+/// build aborted in `thread_spawn`, and a release build dropped the fiber's draw.
+#[test]
+fn jit_fuel_a_spawn_keeps_what_a_fiber_left_in_a_recycled_cell() {
+    // With slack: near the limit the JIT's fiber draws from its creator's cell, not the resumer's
+    // (#3080), so where the run runs out there follows which cell holds a draw, not this fix.
+    assert_eq!(
+        assert_three_way(A_FIBER_OUTLIVES_ITS_VCPU, 1 << 40),
+        (Ended::Returned(3 + 6 + 6 + 7), 11)
+    );
+}
+
+/// Thread A makes a fiber that suspends forever, publishes its handle and waits to be released;
+/// thread B resumes the fiber in a loop. The root fills the domain's handle table (1024 slots: A, B
+/// and 1022 threads that wait forever), releases A, gives it time to end, so the context A leaves
+/// waits for the next spawn, and spawns once more: the table refuses it (`ThreadFault`).
+const A_REFUSED_SPAWN_UNDER_A_RUNNING_FIBER: &str = "memory 16
+func () -> (i64) {
+block 0 () {
+  vz = i64.const 0
+  va = thread.spawn 1 vz vz
+  br 1()
+}
+block 1 () {
+  vat = i64.const 16392
+  vk1 = i64.atomic.load vat
+  vnone = i64.eqz vk1
+  br_if vnone 1() 2(vk1)
+}
+block 2 (vk2: i64) {
+  vone = i64.const 1
+  vk = i64.sub vk2 vone
+  vz2 = i64.const 0
+  vb = thread.spawn 2 vk vz2
+  vn = i64.const 1022
+  br 3(vn)
+}
+block 3 (vi: i64) {
+  vz3 = i64.const 0
+  vp = thread.spawn 3 vz3 vz3
+  vone3 = i64.const 1
+  vj = i64.sub vi vone3
+  vfull = i64.eqz vj
+  br_if vfull 4() 3(vj)
+}
+block 4 () {
+  vgo = i64.const 16388
+  vset = i32.const 1
+  i32.atomic.store vgo vset
+  vcnt = i32.const 1
+  vw = atomic.notify vgo vcnt
+  vspin = i64.const 2000000
+  br 5(vspin)
+}
+block 5 (vs: i64) {
+  vone5 = i64.const 1
+  vt = i64.sub vs vone5
+  vdone = i64.eqz vt
+  br_if vdone 6() 5(vt)
+}
+block 6 () {
+  vz6 = i64.const 0
+  vr = thread.spawn 3 vz6 vz6
+  vr64 = i64.extend_i32_s vr
+  return vr64
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (va: i64, vb: i64) {
+  vf = ref.func 4
+  vk = cont.new vf va
+  vone = i64.const 1
+  vk1 = i64.add vk vone
+  vat = i64.const 16392
+  i64.atomic.store vat vk1
+  vgo = i64.const 16388
+  vexp = i32.const 0
+  vinf = i64.const -1
+  vw = i32.atomic.wait vgo vexp vinf
+  vr = i64.extend_i32_s vw
+  return vr
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vk: i64, vb: i64) {
+  br 1(vk)
+}
+block 1 (vk1: i64) {
+  vz = i64.const 0
+  vs, vv = cont.resume vk1 vz
+  br 1(vk1)
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (va: i64, vb: i64) {
+  vaddr = i64.const 16384
+  vexp = i32.const 0
+  vinf = i64.const -1
+  vw = i32.atomic.wait vaddr vexp vinf
+  vr = i64.extend_i32_s vw
+  return vr
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, varg: i64) {
+  vz = i64.const 0
+  br 1(vz)
+}
+block 1 (vi: i64) {
+  vx = suspend vi
+  vone = i64.const 1
+  vj = i64.add vi vone
+  br 1(vj)
+  }
+}
+";
+
+/// **A refused spawn frees no context** (PR #3091's review). A's context waits for the next spawn
+/// while A's fiber, which B resumes, goes on charging its cell. The first version of #3081's payment
+/// took a context on the spawner and freed it when the table refused the handle, under the running
+/// fiber. The protection is structural: the spawner now pays on the domain's chain and touches no
+/// context, so a context is freed only as the run ends. This row does not catch the free: on that
+/// version a debug build aborts first on its assertion that a recycled cell is empty, and a release
+/// build under ASan reports nothing, since ASan does not see the JIT's code touch the freed cell. It
+/// pins the run's end alike on the tree-walker and the JIT, with that context in the pool.
+#[test]
+fn jit_fuel_a_refused_spawn_frees_no_context_a_fiber_charges() {
+    let m = parse_module(A_REFUSED_SPAWN_UNDER_A_RUNNING_FIBER).expect("parse");
+    verify_module(&m).expect("verify");
+    let mut tw_left = 1u64 << 40;
+    assert_eq!(run(&m, 0, &[], &mut tw_left), Err(Trap::ThreadFault));
+    let (jit, _) = jit_fuel(A_REFUSED_SPAWN_UNDER_A_RUNNING_FIBER, &[], 1 << 40);
+    assert_eq!(jit, JitOutcome::Trapped(TrapKind::ThreadFault));
 }

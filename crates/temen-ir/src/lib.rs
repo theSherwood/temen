@@ -4740,6 +4740,34 @@ pub const MAX_FIBERS: usize = 1 << 24;
 /// interpreter's continuation is smaller), so a budget reads the same on every engine.
 pub const FIBER_STACK: u64 = 1 << 18;
 
+/// #1944 slice 3 — the most fuel one draw takes: a vCPU refills its counter this much at a time, so
+/// only one safepoint in this many walks the chain.
+pub const FUEL_CHUNK: u64 = 1 << 16;
+
+/// How many ops a vCPU runs on a worker before it yields it to the next runnable vCPU: the real
+/// pool's preemption quantum. Without it a vCPU kept its worker until it parked, so guest threads
+/// that spin on each other livelocked once they outnumbered the workers: the spinners held every
+/// worker, and the thread they waited for never ran (#2202, nimony's `tallocpool` on four workers).
+/// A vCPU in a bounded lane keeps its lanes across the yield (#2237, `temen_interp`'s `dispatch`).
+/// The Cranelift JIT hands an unmetered vCPU this much fuel per refill, so its pool tasks yield alike.
+///
+/// Its size is the price of one preemption at a bad moment: a thread that spins on one that lost
+/// its worker (a lock holder, or the next in a fair ticket lock's queue) burns up to a quantum
+/// before that thread runs again. Measured on nimony's thread pool, five vCPUs on two workers:
+/// `1 << 20` ran it in 0.16 s or 35 s depending on where preemptions landed, `1 << 16` in 3.3 s
+/// every time. A vCPU running alone yields too, and the round trip costs nothing measurable: a
+/// 20M-iteration loop took ~1 s at `u64::MAX`, `1 << 20` and `1 << 16` alike. The bytecode
+/// engine's cooperative quantum is a separate knob, sized for its deterministic interleaving.
+pub const POOL_QUANTUM: u64 = 1 << 16;
+
+/// #1944 slice 3 — what one draw takes from a chain with `room` fuel left: up to [`FUEL_CHUNK`], never
+/// more than half of the room (rounded up). Taking at most half keeps one consumer from holding all of
+/// a small budget while its siblings starve; a lone consumer still spends it to the last unit. The one
+/// rule every budget a vCPU draws from follows, the Cranelift JIT's fixed allowance included (#3069).
+pub fn fuel_draw(room: u64) -> u64 {
+    room.div_ceil(2).min(FUEL_CHUNK)
+}
+
 /// #2268 — the runs of page state every fresh window counts as, whatever its geometry: a NULL guard,
 /// the declared prefix, the reserved tail. A window's runs are its mappings where it is real hardware
 /// (the JIT's), and every engine counts them alike (`Budget.maps`).
