@@ -750,7 +750,7 @@ pub use temen_ir::thaw::{FrozenFiber, FrozenVCpu};
 
 /// #3034 — a thaw seed for this engine: a residue the thaw pass admitted
 /// ([`temen_ir::thaw::validate`]), each live detached child's payload built for this runtime. It
-/// carries no fork twins: this engine does not re-create them (#3100), so a thaw holding one is
+/// carries no fork twins: this engine does not re-create them (#3098), so a thaw holding one is
 /// refused ([`CompiledModule::set_durable`]) and the embedder thaws on the tree-walker.
 pub type JitThaw = temen_ir::thaw::Thaw<JitDetached, ()>;
 
@@ -2227,7 +2227,7 @@ pub(crate) struct Seeded {
 }
 
 /// Take `thaw` apart for this runtime. `Err` (it, untouched) for one holding a fork twin, which this
-/// engine does not re-create (#3100): the caller refuses the thaw whole, never part of it (#1690).
+/// engine does not re-create (#3098): the caller refuses the thaw whole, never part of it (#1690).
 pub(crate) fn seeded(thaw: JitThaw) -> Result<Seeded, Box<JitThaw>> {
     if !thaw.parts().twins.is_empty() || !thaw.parts().exited_twins.is_empty() {
         return Err(Box::new(thaw));

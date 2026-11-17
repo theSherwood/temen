@@ -1764,7 +1764,7 @@ fn relaunch_payload(host: &mut Host, l: temen_interp::LiveDetached) -> temen_jit
 /// #2438 — and none is demand-paged: a durable JIT run pages no child, so its relaunch re-links no
 /// pager (#2489). A paged artifact thaws on the interpreter, where it was frozen.
 fn jit_relaunches(host: &Host) -> bool {
-    // #3034 — and no fork twin, live or exited, at any depth: the JIT does not re-create one (#3100).
+    // #3034 — and no fork twin, live or exited, at any depth: the JIT does not re-create one (#3098).
     // Nor a serve loop's frozen handlers (#1676), which only the tree-walker's serve loop adopts.
     host.thawed_twins().is_empty()
         && host.frozen_twins().is_empty()

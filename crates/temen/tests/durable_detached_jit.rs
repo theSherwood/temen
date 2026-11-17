@@ -380,7 +380,7 @@ fn an_interpreter_frozen_detached_child_thaws_on_the_jit() {
 /// #3034 — the same run, frozen on each engine, records the live detached child's own task id
 /// differently: the tree-walker its scheduler id, the JIT 0 (each child the root of its own domain).
 /// The thaw pass admits both, and each engine thaws the other's artifact to the uninterrupted total.
-/// The two artifacts differ for one run, which INVARIANTS #9 does not allow: #PARITY-ISSUE. This row
+/// The two artifacts differ for one run, which INVARIANTS #9 does not allow: #3099. This row
 /// pins the difference until that issue removes it.
 #[test]
 fn each_engine_thaws_the_others_detached_artifact_though_they_record_its_task_differently() {
@@ -436,7 +436,7 @@ fn each_engine_thaws_the_others_detached_artifact_though_they_record_its_task_di
         0,
         "the tree-walker records the child's scheduler id"
     );
-    assert_eq!(task(&jart), 0, "the JIT records 0 (#PARITY-ISSUE)");
+    assert_eq!(task(&jart), 0, "the JIT records 0 (#3099)");
 
     let restore = |art: &[u8]| {
         let mut h = Host::new();
