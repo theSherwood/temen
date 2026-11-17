@@ -305,6 +305,24 @@ re-creates less than all of it declines the thaw whole to the tree-walker rather
 of it. The checks at each use that predate the pass (#2945) stay only in front of a raw host store
 or an unchecked index, as a backstop that is loud in debug. Open: whether an artifact may set the
 attestation and the guest-JIT quotas at all, or only narrow what the restoring host grants (#3096).
+
+**A freeze admits its own residue, through the same pass.** Some of what a freeze records it reads
+out of guest memory: each context's **shadow-SP word** (in its region's header), the extent of the
+root and of each spawned vCPU. A guest can write those words. The transform's push check bounds a
+context's word only at that context's own unwind (`sp` below its frames, or a push past its region's
+end, traps `Unreachable`), so a word written later, by a sibling vCPU after that context unwound,
+reaches the freeze unchecked. A fiber's extent is not such an input: the runtime rewrites it at every
+switch. So both engines hand what each domain of the cut unwound to its powerbox through one
+function, `Host::leave_freeze`, which runs the pass:
+
+- a run that trapped (or exited) during the freeze leaves no residue: its outcome is the trap;
+- a residue the pass refuses ends the run as the push check's own trap, `Unreachable`, and leaves no
+  residue — the cut is all-or-nothing, so one refused domain refuses all of it.
+
+A guest that corrupts a shadow-SP word thus gets `Unreachable`, on every engine, and its cut carries
+nothing; a `freeze` of that powerbox writes the window as the guest left it and no residue. A bug in
+the pass that refused a real freeze would look like the same trap: the durable differential fuzzing
+(a frozen and thawed run against the uninterrupted one) is what would show it.
 A frame-capture design would have had the same boundary, as a parser over attacker-controlled
 frames in the host; this one keeps the structured part small and checks it in one place.
 

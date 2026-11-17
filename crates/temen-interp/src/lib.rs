@@ -4010,6 +4010,26 @@ fn drive_over_cell(
         if let (true, Ok(_), Some(t)) = (rested, &out.result, s.dead.get(&s.root_domain)) {
             out.result = Err(*t);
         }
+        // #3034 — the freeze hands what each domain of the cut unwound to its powerbox through the one
+        // hand-off ([`Host::leave_freeze`]): none from a run that trapped, and a residue the pass
+        // refuses ends the run `Unreachable` with none, the cut being all-or-nothing (INVARIANTS #9c).
+        // Whenever a freeze was in flight: some vCPU unwound for it, though the root may have
+        // trapped before it could.
+        if !s.unwound.is_empty() {
+            let arena = out
+                .mem
+                .as_ref()
+                .map_or(ShadowArena::EMPTY, |m| m.shadow_arena());
+            let code = temen_ir::thaw::Code {
+                funcs: &funcs,
+                arena,
+            };
+            let trapped = out.result.is_err();
+            if leave_cut(&host_shared, code, 0, trapped).is_err() {
+                drop_cut(&host_shared);
+                out.result = Err(Trap::Unreachable);
+            }
+        }
         (out, s.trap_origin.take(), std::mem::take(&mut s.twin_traps))
     };
     LAST_TWIN_TRAPS.with(|c| *c.borrow_mut() = twin_traps);
@@ -4033,6 +4053,63 @@ fn drive_over_cell(
     LAST_CAPTURE_BACKTRACE.with(|c| *c.borrow_mut() = origin.bt.clone());
     LAST_CAPTURE_FAULT.with(|c| *c.borrow_mut() = origin.fault);
     (out.result, origin.bt, origin.fiber)
+}
+
+/// #3034 — [`Host::leave_freeze`] for each domain of a tree-walker cut: `host`'s, then each captured
+/// detached child's (against its own module) and each live fork twin's (in its forking context), with
+/// theirs. `Err` if any domain's residue is refused.
+fn leave_cut(
+    host: &Arc<Mutex<Host>>,
+    code: temen_ir::thaw::Code<'_>,
+    root_ctx: usize,
+    trapped: bool,
+) -> Result<(), Trap> {
+    let (children, twins) = {
+        let mut h = host.lock_unpoisoned();
+        let raw = h.take_residue();
+        let own = h.leave_freeze(code, root_ctx, raw, trapped);
+        let children: Vec<_> = h
+            .captured_detached()
+            .iter()
+            .map(|c| (Arc::clone(&c.host), Arc::clone(&c.module)))
+            .collect();
+        let twins: Vec<_> = h
+            .captured_twins()
+            .iter()
+            .map(|t| (Arc::clone(&t.host), t.launch.ctx as usize))
+            .collect();
+        own?;
+        (children, twins)
+    };
+    for (child, module) in children {
+        leave_cut(&child, (&*module).into(), 0, trapped)?;
+    }
+    for (twin, ctx) in twins {
+        leave_cut(&twin, code, ctx, trapped)?;
+    }
+    Ok(())
+}
+
+/// [`Host::drop_freeze`] for each domain of a cut [`leave_cut`] refused.
+fn drop_cut(host: &Arc<Mutex<Host>>) {
+    let (children, twins) = {
+        let h = host.lock_unpoisoned();
+        let c: Vec<_> = h
+            .captured_detached()
+            .iter()
+            .map(|c| Arc::clone(&c.host))
+            .collect();
+        let t: Vec<_> = h
+            .captured_twins()
+            .iter()
+            .map(|t| Arc::clone(&t.host))
+            .collect();
+        (c, t)
+    };
+    for d in children.iter().chain(twins.iter()) {
+        drop_cut(d);
+    }
+    host.lock_unpoisoned().drop_freeze();
 }
 
 /// Like [`run`], but seed the window with `init_mem` (its low bytes) and return the final
@@ -28441,6 +28518,51 @@ impl Host {
         let installs = self.installs_code();
         self.set_thaw(temen_ir::thaw::validate(m, installs, 0, raw)?);
         Ok(())
+    }
+
+    /// #3034 — a freeze's hand-off of what this domain unwound to its powerbox: the one both engines
+    /// take, the tree-walker's freeze driver for each domain of the cut and the JIT's for each domain
+    /// it harvested. A freeze admits its own residue as a thaw does ([`temen_ir::thaw::validate`]),
+    /// against `code`, the code the domain ran, from shadow context `root_ctx`.
+    ///
+    /// A run that `trapped` leaves none: the outcome is the trap. A residue the pass refuses is one
+    /// the guest wrote: each context's shadow-SP word is guest memory, which the transform's push
+    /// check bounds only at that context's own unwind (DURABILITY.md §3). It ends the run as that
+    /// check's own trap, `Unreachable`, and leaves none. Either way nothing is carried: the residue,
+    /// the captured detached children and twins, and the frozen serve handlers go.
+    pub fn leave_freeze<'a>(
+        &mut self,
+        code: impl Into<temen_ir::thaw::Code<'a>>,
+        root_ctx: usize,
+        raw: Residue,
+        trapped: bool,
+    ) -> Result<(), Trap> {
+        let installs = self.installs_code();
+        match (
+            trapped,
+            temen_ir::thaw::validate(code, installs, root_ctx, raw),
+        ) {
+            (false, Ok(thaw)) => {
+                self.set_thaw(thaw);
+                Ok(())
+            }
+            (true, _) => {
+                self.drop_freeze();
+                Ok(())
+            }
+            (false, Err(_)) => {
+                self.drop_freeze();
+                Err(Trap::Unreachable)
+            }
+        }
+    }
+
+    /// Everything a freeze left for the codec on this powerbox, gone: no artifact carries it.
+    pub fn drop_freeze(&mut self) {
+        self.residue = Residue::default();
+        self.captured_detached.clear();
+        self.captured_twins.clear();
+        self.frozen_handlers.clear();
     }
 
     /// #3034 — the residue this powerbox holds, admitted for a run of `m` and taken: what an engine

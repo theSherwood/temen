@@ -16,7 +16,7 @@
 use alloc::vec::Vec;
 
 use crate::durable_abi::{ShadowArena, ShadowContexts, MAX_SHADOW_CONTEXTS};
-use crate::{cap_id, handles, trap_code, Inst, Module, ValType};
+use crate::{cap_id, handles, trap_code, Func, Inst, Module, ValType};
 
 /// The largest task id, pid or ticket a thaw accepts: room for every `+ 1` a run makes after it.
 pub const TASK_MAX: u64 = i64::MAX as u64;
@@ -329,10 +329,11 @@ struct Makes {
 }
 
 impl Makes {
-    fn of(m: &Module, installs: bool) -> Makes {
+    fn of(code: Code<'_>, installs: bool) -> Makes {
         let site = |p: fn(&Inst) -> bool| {
             installs
-                || m.funcs
+                || code
+                    .funcs
                     .iter()
                     .any(|f| f.blocks.iter().any(|b| b.insts.iter().any(p)))
         };
@@ -353,10 +354,10 @@ pub fn surfaced_trap(code: TrapCode) -> bool {
 }
 
 /// Whether `f` is a module function `thread.spawn` can name: `(i64, i64) -> (i64)`.
-fn spawn_entry(m: &Module, f: i32) -> bool {
+fn spawn_entry(funcs: &[Func], f: i32) -> bool {
     usize::try_from(f)
         .ok()
-        .and_then(|f| m.funcs.get(f))
+        .and_then(|f| funcs.get(f))
         .is_some_and(|f| f.params == [ValType::I64, ValType::I64] && f.results == [ValType::I64])
 }
 
@@ -371,12 +372,32 @@ fn issued(children: &[u32], slot: usize) -> bool {
     children.get(slot).is_some_and(|&g| g != 0)
 }
 
-/// Admit `raw`, the residue of a domain of `m` whose root runs in shadow context `root_ctx` (`0`, or a
-/// fork twin's forking context), or refuse it, handing it back. `installs`: the domain holds a `Jit`
-/// grant ([`Makes`]). The one check every engine's thaw goes through (#3034); the ranges are the ones
-/// a freeze writes.
-pub fn validate<D, T>(
-    m: &Module,
+/// The code a residue is admitted against: a module's functions and its shadow arena. A [`Module`]
+/// is one; an engine's freeze, which holds the functions it runs rather than their module, builds one.
+#[derive(Clone, Copy, Debug)]
+pub struct Code<'a> {
+    pub funcs: &'a [Func],
+    pub arena: ShadowArena,
+}
+
+impl<'a> From<&'a Module> for Code<'a> {
+    fn from(m: &'a Module) -> Code<'a> {
+        Code {
+            funcs: &m.funcs,
+            arena: m
+                .memory
+                .and_then(|mem| mem.shadow)
+                .unwrap_or(ShadowArena::EMPTY),
+        }
+    }
+}
+
+/// Admit `raw`, the residue of a domain running `code` whose root runs in shadow context `root_ctx`
+/// (`0`, or a fork twin's forking context), or refuse it, handing it back. `installs`: the domain holds
+/// a `Jit` grant ([`Makes`]). The one check every engine's thaw, and every freeze's hand-off of what it
+/// unwound, goes through (#3034); the ranges are the ones a freeze writes.
+pub fn validate<'a, D, T>(
+    code: impl Into<Code<'a>>,
     installs: bool,
     root_ctx: usize,
     mut raw: RawResidue<D, T>,
@@ -385,7 +406,8 @@ pub fn validate<D, T>(
     // that hands its residue over in memory records them in the order they unwound.
     raw.fibers.sort_by_key(|f| f.slot);
     raw.vcpus.sort_by_key(|v| v.task);
-    match check(m, Makes::of(m, installs), root_ctx, &raw) {
+    let code = code.into();
+    match check(code, Makes::of(code, installs), root_ctx, &raw) {
         Ok(()) => Ok(Thaw(raw)),
         Err(Malformed) => Err(Refused(raw)),
     }
@@ -393,16 +415,13 @@ pub fn validate<D, T>(
 
 /// [`validate`]'s checks, over a residue in seeding order.
 fn check<D, T>(
-    m: &Module,
+    code: Code<'_>,
     makes: Makes,
     root_ctx: usize,
     r: &RawResidue<D, T>,
 ) -> Result<(), Malformed> {
     let ok = |c: bool| if c { Ok(()) } else { Err(Malformed) };
-    let a = m
-        .memory
-        .and_then(|mem| mem.shadow)
-        .unwrap_or(ShadowArena::EMPTY);
+    let a = code.arena;
 
     // A module without a shadow arena is not freezable (INVARIANTS #16): it has no residue at all.
     if !a.region_fits(root_ctx) {
@@ -455,7 +474,7 @@ fn check<D, T>(
         }
         let ctx = ShadowContexts::vcpu_of_sp(a, v.shadow_sp).ok_or(Malformed)?;
         ok(ctx != root_ctx && in_region(a, ctx, v.shadow_sp))?;
-        ok(spawn_entry(m, v.func) && v.args.len() == 2)?;
+        ok(spawn_entry(code.funcs, v.func) && v.args.len() == 2)?;
         ok(held & (1 << ctx) == 0)?;
         held |= 1 << ctx;
     }
@@ -492,7 +511,7 @@ fn check<D, T>(
     // ---- Fork twins: a pid a fork returns; a live one re-enters a module function in a context
     // the forking vCPU could hold.
     for t in &r.twins {
-        ok(t.pid >= 1 && t.pid <= TASK_MAX && (t.entry as usize) < m.funcs.len())?;
+        ok(t.pid >= 1 && t.pid <= TASK_MAX && (t.entry as usize) < code.funcs.len())?;
         let ctx = t.ctx as usize;
         ok(ctx < MAX_SHADOW_CONTEXTS && a.region_fits(ctx))?;
     }

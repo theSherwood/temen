@@ -1076,3 +1076,145 @@ fn a_durable_runs_eleventh_live_fiber_faults_alike_on_every_engine() {
         }
     }
 }
+
+// ---- #3034: a freeze admits its own residue, through the one hand-off both engines take
+// (`Host::leave_freeze`). Each context's shadow-SP word is guest memory, which the transform's push
+// check bounds only at that context's own unwind.
+
+/// Root spawns a thread, writes `val` at `addr`, raises the word at 66000 and joins it; the thread
+/// waits for the word, then resumes a fiber, which triggers the freeze.
+fn scribbling(addr: u64, val: i64) -> String {
+    format!(
+        "func () -> (i64) {{
+block 0 () {{
+  vz = i64.const 0
+  vt = thread.spawn 1 vz vz
+  vsa = i64.const {addr}
+  vsv = i64.const {val}
+  i64.store vsa vsv
+  vaddr = i64.const 66000
+  vone = i32.const 1
+  i32.store vaddr vone
+  vn2 = atomic.notify vaddr vone
+  vst, vres = thread.join vt
+  return vres
+  }}
+}}
+func (i64, i64) -> (i64) {{
+block 0 (v0: i64, v1: i64) {{
+  vaddr = i64.const 66000
+  vexp = i32.const 0
+  vinf = i64.const -1
+  vst = i32.atomic.wait vaddr vexp vinf
+  vf = ref.func 2
+  vss = i64.const 4096
+  vk = cont.new vf vss
+  vz2 = i64.const 0
+  va, vb = cont.resume vk vz2
+  return vb
+  }}
+}}
+func (i64, i64) -> (i64) {{
+block 0 (v0: i64, v1: i64) {{
+  v2 = i64.const 5
+  v3 = suspend v2
+  return v3
+  }}
+}}
+"
+    )
+}
+
+/// A root that writes its own shadow-SP word below its frames traps at its own unwind, at the push
+/// check (`Unreachable`), while the thread it spawned has already unwound. The run's outcome is the
+/// trap and nothing is carried, on both engines. On `f2aff3d` the tree-walker kept the thread's and
+/// the fiber's records (a `freeze` then wrote an artifact the restore refuses), and the JIT reached
+/// a debug assert in its hand-off (`Unsupported` in release, after the run had unwound).
+///
+/// What a `freeze` of that host writes: the window as the guest left it and its handles, with no
+/// residue. Its restore seeds nothing, and its thaw rewinds the root from the word the guest wrote,
+/// which faults (`MemoryFault`).
+#[test]
+fn a_root_that_writes_its_own_shadow_sp_word_traps_and_carries_nothing() {
+    let inst = instrument(&scribbling(TEST_ARENA.region_base(0), 100));
+    let armed = || {
+        let mut w = init_durable_window(WINDOW, TEST_ARENA);
+        arm_freeze_after(&mut w, TEST_ARENA, 1);
+        w
+    };
+    let mut h = Host::new();
+    h.set_durable(true);
+    let mut fuel = 10_000_000u64;
+    let (r, snap) =
+        run_capture_reserved_with_host(&inst, 0, &[], &mut fuel, &armed(), SIZE_LOG2, &mut h);
+    assert_eq!(r, Err(temen_interp::Trap::Unreachable), "tree-walker");
+    assert!(h.residue().is_empty(), "the tree-walker carries nothing");
+    let art = temen_snapshot::freeze(&inst, &snap, &h).expect("the window and handles");
+    assert!(
+        decode_residue(&art).expect("decode").is_empty(),
+        "no residue"
+    );
+    let mut th = Host::new();
+    let mut w = temen_snapshot::restore(&art, &inst, &mut th).expect("restores");
+    assert!(th.residue().is_empty(), "and seeds none");
+    begin_thaw(&mut w, TEST_ARENA, 0);
+    assert_eq!(
+        interp_run(&inst, &w, &mut th),
+        Err(temen_interp::Trap::MemoryFault),
+        "its thaw rewinds the root from the word the guest wrote"
+    );
+
+    let mut h = Host::new();
+    h.set_durable(true);
+    let r = temen_run::jit_cap_run(
+        &inst,
+        0,
+        &[],
+        &MemLayout::image(armed()),
+        SIZE_LOG2,
+        0,
+        &mut h,
+        None,
+    );
+    assert!(
+        matches!(
+            r,
+            Ok((JitOutcome::Trapped(temen_jit::TrapKind::Unreachable), _))
+        ),
+        "JIT: {:?}",
+        r.as_ref().map(|(o, _)| o)
+    );
+    assert!(h.residue().is_empty(), "the JIT carries nothing");
+}
+
+/// A residue the pass refuses, handed off by a freeze, ends the run as the push check's own trap and
+/// carries nothing: the case where a vCPU rewrites a sibling's word after the sibling unwound (every
+/// unwind clean, the extent bad), which no guest reaches deterministically, handed to the hand-off
+/// directly. A residue a run makes is admitted, and one from a run that trapped is dropped.
+#[test]
+fn a_freezes_refused_residue_is_unreachable_and_carries_nothing() {
+    let inst = instrument(THREADS);
+    let art = frozen(&inst);
+    let real = || {
+        let mut h = Host::new();
+        temen_snapshot::restore(&art, &inst, &mut h).expect("restore");
+        h.take_residue()
+    };
+    let mut h = Host::new();
+    assert_eq!(h.leave_freeze(&inst, 0, real(), false), Ok(()));
+    assert_eq!(h.residue().vcpus.len(), 1, "admitted");
+
+    let mut h = Host::new();
+    let mut bad = real();
+    bad.vcpus[0].shadow_sp = TEST_ARENA.region_base(3) + 8; // in a context's header
+    assert_eq!(
+        h.leave_freeze(&inst, 0, bad, false),
+        Err(temen_interp::Trap::Unreachable)
+    );
+    assert!(h.residue().is_empty(), "nothing is carried");
+
+    let mut h = Host::new();
+    assert_eq!(h.leave_freeze(&inst, 0, real(), true), Ok(()));
+    assert!(h.residue().is_empty(), "a run that trapped leaves none");
+}
+
