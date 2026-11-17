@@ -3328,7 +3328,15 @@ fn a_punted_calls_answer_by_its_shape_on_every_engine() {
     // (shape, owner, its program and grant, whether the embedder answers, and the answers of the
     // tree-walker, the bytecode engine, the kernel route (`None`: declined, `punt shape`) and
     // today's route.
-    let rows: [(&str, &str, Make, Grant, bool, [Option<Answer>; 4]); 8] = [
+    type Row = (
+        &'static str,
+        &'static str,
+        Make,
+        Grant,
+        bool,
+        [Option<Answer>; 4],
+    );
+    let rows: [Row; 8] = [
         (
             "",
             "pool",
