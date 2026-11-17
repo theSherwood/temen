@@ -12832,10 +12832,11 @@ fn emit_signal_check(b: &mut FunctionBuilder, lower: &Lower) -> Result<(), JitEr
 /// cost), so `fiber_rt::make_fiber` refunds that prologue's charge.
 ///
 /// Distinct from [`emit_epoch_check`] in two ways: (1) it is the **guest's own** budget, not written
-/// by the host from another thread, so a plain (non-atomic) load/store is enough — and cheaper. A
-/// domain's vCPUs share the cell, so their plain stores race and their charge is approximate (and
-/// vCPUs running at once contend for its cache line, #2488); after a refill the check charges from
-/// the allowance it granted, so a sibling's stale `0` in `left` is never read as a spent chain; (2)
+/// by the host from another thread, so a plain (non-atomic) load/store is enough — and cheaper.
+/// Each vCPU charges a cell of its own (#2488, #3069), but a fiber charges its creator's wherever it
+/// is resumed, so two threads can still share one and lose a charge (#3080); after a refill the
+/// check charges from the allowance it granted, so another's stale `0` in `left` is never read as a
+/// spent chain; (2)
 /// the store of `fuel-1` back to the same address it just loaded creates a store⇒load dependency that
 /// stops Cranelift's alias analysis from treating the load as loop-invariant and hoisting it out (the
 /// reason `emit_epoch_check` needs an *atomic* load to achieve the same). Trap when the loaded value

@@ -18489,8 +18489,8 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         .as_ref()
                         .map_or_else(|| fuel.for_thread(), |a| a.home.for_thread());
                     // Fuel unification (#2977): a stack's first entry costs one, a thread's as the
-                    // root's (`drive_over_cell`) and as the JIT's child prologue charges it. Paid on
-                    // the child's fuel as the spawn completes, so a freeze after the spawn has paid it
+                    // root's (`drive_over_cell`). Paid on the child's fuel as the spawn completes, as
+                    // the Cranelift JIT's spawn pays it from the chain (#3081), so a freeze after the spawn has paid it
                     // and a thaw, which re-creates the thread through `seed_thread`, pays nothing.
                     // Out of fuel ends the run, as a thread's own `OutOfFuel` does.
                     child_fuel.pay_entry()?;

@@ -1788,9 +1788,8 @@ impl HeldSite {
             Some((_, n_params, _)) if n_params == args.len() => {}
             _ => return Err(ServeRefused::NoHandler),
         }
-        // A caller inside the run is one of its own: its gate waits park in the run's hub, its pool
-        // carries its parks, and an activation may share its fixed cell, which only the run's
-        // teardown frees (`activation_ctx`). Spawns wire live offers within a run and a held run
+        // A caller inside the run is one of its own: its gate waits park in the run's hub, and its
+        // pool carries its parks (`activation_ctx` gives the activation a cell of its own). Spawns wire live offers within a run and a held run
         // forks no twin, so no other caller should reach here; one that does is refused, in every
         // build, before anything of it is used (#2993).
         if let HeldCaller::Inside(vm) = &caller {
@@ -1870,7 +1869,7 @@ impl HeldSite {
         h.done = Some(Box::new({
             let (slot, vm) = (Arc::clone(&slot), Arc::clone(vm));
             move |end| {
-                // SAFETY: the context `vm` holds its cell's owner, or charges its run's (#3000).
+                // SAFETY: the context `vm` holds its cell's owner (#3000, #3069).
                 let left = unsafe { vm.fuel.as_ref() }.map_or(0, crate::FuelCell::can_burn);
                 *lock(&slot) = Some((end, left));
             }
@@ -1928,8 +1927,8 @@ impl HeldSite {
 /// #3000 — the context of an activation of `root`'s domain for `caller`: a vCPU context of the
 /// domain, and the one place that picks the cell it charges. A cell of its own, which the context
 /// owns: holding the embedder's loan, drawing on the inside caller's chain (a fixed allowance's too,
-/// #3069), or, for a caller that charges no cell, an unbounded one, as the domain's code charges one
-/// whatever it runs for.
+/// #3069) once the waiting caller has handed back what its draw left, or, for a caller that charges
+/// no cell, an unbounded one, as the domain's code charges one whatever it runs for.
 ///
 /// # Safety
 /// `Inside`'s context is the caller's live one.
@@ -1939,7 +1938,13 @@ unsafe fn activation_ctx(root: &VmCtx, caller: &HeldCaller<'_>) -> VmCtx {
         HeldCaller::Outside(lent) => SharedCell::fixed(**lent),
         HeldCaller::Inside(vm) => match vm.fuel.as_ref() {
             None => SharedCell::fixed(u64::MAX),
-            Some(c) => SharedCell::sibling_of(c),
+            Some(c) => {
+                // The caller waits in this call and burns nothing until it returns: what its draw
+                // left goes back to the chain first, so the activation can draw it (the caller's
+                // next safepoint draws again). Kept, it would be fuel neither could reach.
+                crate::FuelCell::settle(vm.fuel);
+                SharedCell::sibling_of(c)
+            }
         },
     };
     let mut ctx = root.vcpu(cell.get());
@@ -2232,7 +2237,7 @@ fn cores() -> usize {
 /// waits, gets a worker ([`ChildExec::find_worker`]): a free one, or a new one up to the pool's cap.
 /// Only a full pool, every worker busy, gives it this one: the task parks as runnable, at the back
 /// of the queue, whatever fiber its quantum ended in ([`fiber_rt::ParkOn::Yield`]). Outside a
-/// residency (a run's root, a 1:1 vCPU of a child sharing its cell) there is no quantum to end.
+/// residency (a run's root, a 1:1 vCPU) there is no quantum to end.
 #[inline(never)] // R2 (#1466): a TLS read on a task's fiber stack
 pub(crate) fn quantum_end() {
     let exec = RUNNING_FOR.with(Cell::get);

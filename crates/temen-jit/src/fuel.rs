@@ -92,8 +92,8 @@ impl BudgetNode for Allowance {
     }
     fn give_back(&self, unspent: u64) {
         // Only a bounded allowance hands out draws, so only it takes any back, and never more than it
-        // handed out: the sum stays within `i64`.
-        if unspent > 0 {
+        // handed out: the sum stays within `i64`. An unbounded one (`-1`) stays unbounded.
+        if unspent > 0 && self.0.load(Ordering::Relaxed) >= 0 {
             self.0.fetch_add(unspent as i64, Ordering::Relaxed);
         }
     }
@@ -193,23 +193,26 @@ impl FuelCell {
         Self::drawing(self.chain())
     }
 
-    /// #3081 — pay a spawned vCPU's entry at its spawn, as the interpreters do: exactly one unit from
-    /// the chain ([`BudgetNode::take_exact`]), held in `left` for the vCPU's entry prologue to burn
-    /// without a draw. Its first draw comes at its first back-edge or call, so a vCPU that has not run
-    /// holds no chunk. `false` when the chain is spent: the spawn runs out of fuel. Only on a cell no
-    /// code charges yet.
-    pub(crate) fn pay_entry(&mut self) -> bool {
-        let src = self.src.get_mut().unwrap_or_else(|e| e.into_inner());
-        debug_assert_eq!(self.left, 0, "a cell no code has charged");
-        let free = match src.take_exact(1) {
-            Some(false) => return false,
-            Some(true) => false,
-            // Every level unbounded: nothing was charged, so nothing goes back (#1991).
-            None => true,
-        };
-        self.left = 1;
-        self.free = free;
-        true
+    /// #3081 — pay a spawned vCPU's entry at its spawn, as the interpreters do: exactly one unit,
+    /// taken from this cell's chain ([`BudgetNode::take_exact`]), all or nothing. It touches no cell:
+    /// the vCPU [`Self::credit`]s its own with the unit once it runs. `None` when the chain is
+    /// unbounded (nothing to pay), `Some(false)` when it is spent (the spawn runs out of fuel).
+    pub(crate) fn pay_entry(&self) -> Option<bool> {
+        self.chain().take_exact(1)
+    }
+
+    /// #3081 — add `n` the chain was already charged for to `cell`'s `left`: a spawned vCPU's paid
+    /// entry, for its prologue to burn without a draw. Added, never assigned: a recycled cell can
+    /// hold a draw a fiber of its earlier vCPU made after it settled. Under the lock a refill takes,
+    /// and through the raw pointer, as [`Self::settle`] does; a fiber charging the cell meanwhile
+    /// races it as any shared charge does (#3080).
+    ///
+    /// # Safety
+    /// `cell` is a live cell.
+    pub(crate) unsafe fn credit(cell: *mut FuelCell, n: u64) {
+        let _src = (*cell).src.lock().unwrap_or_else(|e| e.into_inner());
+        let left = core::ptr::addr_of_mut!((*cell).left);
+        core::ptr::write_volatile(left, core::ptr::read_volatile(left).saturating_add(n));
     }
 
     /// #2488 — a vCPU that charged this cell has ended: hand back what its draw left, as an ended

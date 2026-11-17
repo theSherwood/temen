@@ -1367,3 +1367,50 @@ mod unit_children {
         super::a_killed_unit_childs_parked_call_ends_before_its_parent(temen_interp::Executor::Jit);
     }
 }
+
+/// [`self_caller`] whose `outer()` calls `kept()` through the offer over the domain itself, and
+/// whose `kept()` counts 100 down: a nested activation with work of its own.
+fn nested_counter() -> String {
+    let s = self_caller().replacen(
+        "  vr = call.cap 268435456 1 () -> (i64) vme ()\n",
+        "  vr = call.cap 268435456 6 () -> (i64) vme ()\n",
+        1,
+    );
+    let kept = "func () -> (i64) {\nblock 0 () {\n  vk = i64.const 16504\n  vv = i32.load vk\n  vr = i64.extend_i32_s vv\n  return vr\n  }\n}\n";
+    let counts = "func () -> (i64) {\nblock 0 () {\n  vn = i64.const 100\n  br 1(vn)\n}\nblock 1 (vi: i64) {\n  vone = i64.const 1\n  vj = i64.sub vi vone\n  vd = i64.eqz vj\n  br_if vd 2(vj) 1(vj)\n}\nblock 2 (vr: i64) {\n  vk = i64.const 42\n  return vk\n  }\n}\n";
+    assert!(s.contains(kept), "the fixture's kept()");
+    s.replacen(kept, counts, 1)
+}
+
+/// `outer()` of [`nested_counter`] on a loan of `loan`: its reply and what it burned.
+fn nested_outer(on: Executor, loan: u64) -> (Reply, u64) {
+    bounded(move || {
+        let m = module(&nested_counter());
+        let (host, args) = child_host(&m, GIVER);
+        let (d, _) = hold(on, m, 0, &args, host);
+        assert_eq!(call(&d, 5, &[]), Reply::Results(vec![1]), "the child gave");
+        let mut fuel = loan;
+        let reply = d.call(0, 2, &[], &mut fuel);
+        (reply, loan - fuel)
+    })
+}
+
+/// #3069 — a nested activation on a loan can burn all of it: the waiting caller hands back what its
+/// draw left before the call, as it cannot run meanwhile. Each activation draws a cell of its own
+/// from the loan, so a kept draw stranded half the loan, and the least loan was twice the cost.
+/// The JIT alone: the interpreters charge an activation no entry and the nested call nothing to the
+/// outer loan, so their least loan here is not the JIT's (#3093).
+#[test]
+fn a_nested_activation_on_the_jit_can_burn_its_whole_loan() {
+    let (done, cost) = nested_outer(Executor::Jit, 1_000_000);
+    assert_eq!(done, Reply::Results(vec![42]));
+    assert_eq!(cost, 101, "two entries and the inner loop's 99 back-edges");
+    assert_eq!(
+        nested_outer(Executor::Jit, cost),
+        (Reply::Results(vec![42]), cost)
+    );
+    assert_eq!(
+        nested_outer(Executor::Jit, cost - 1),
+        (Reply::Failed(CAP_REVOKED), cost - 1)
+    );
+}

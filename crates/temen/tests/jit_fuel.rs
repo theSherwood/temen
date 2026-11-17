@@ -69,8 +69,8 @@ block 2 (v4: i32) {
 fn jit_fuel(src: &str, args: &[i64], budget: u64) -> (JitOutcome, u64) {
     let m = parse_module(src).expect("parse");
     verify_module(&m).expect("verify");
-    // The guest decrements this cell in place through the baked address; after the run returns we read
-    // the remainder back (no concurrent access — a single guest thread owns the budget).
+    // A fixed allowance: each vCPU draws a cell of its own from it, and once the run has joined them
+    // all the entry reads back what none of them burned (#3069).
     let mut cell: u64 = budget;
     let outcome = compile_and_run_with_host_fuel(
         &m,
@@ -777,4 +777,201 @@ fn jit_fuel_a_parked_thread_holds_none_of_the_roots_fuel() {
         assert_three_way(PARKED_THREAD, 20_000),
         (Ended::OutOfFuel, 20_000)
     );
+}
+
+/// Thread A makes a fiber that counts back-edges and suspends after each 3, and returns its handle.
+/// The root joins A, resumes the fiber once (it charges A's cell, wherever it runs, and refills it
+/// after A ended), spawns a thread that only returns and joins it, then resumes the fiber to its end.
+const A_FIBER_OUTLIVES_ITS_VCPU: &str = "memory 16
+func () -> (i64) {
+block 0 () {
+  vz = i64.const 0
+  va = thread.spawn 1 vz vz
+  vas, vk = thread.join va
+  vs1, vv1 = cont.resume vk vz
+  vc = thread.spawn 3 vz vz
+  vcs, vcv = thread.join vc
+  vs2, vv2 = cont.resume vk vz
+  vs3, vv3 = cont.resume vk vz
+  vr = i64.add vv1 vv2
+  vr2 = i64.add vr vv3
+  vr3 = i64.add vr2 vcv
+  return vr3
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (va: i64, vb: i64) {
+  vf = ref.func 2
+  vk = cont.new vf va
+  return vk
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, varg: i64) {
+  vz = i64.const 0
+  br 1(vz, vz)
+}
+block 1 (vi: i64, vround: i64) {
+  vone = i64.const 1
+  vj = i64.add vi vone
+  vthree = i64.const 3
+  vat = i64.rem_u vj vthree
+  vpause = i64.eqz vat
+  br_if vpause 2(vj, vround) 1(vj, vround)
+}
+block 2 (vj2: i64, vr: i64) {
+  vx = suspend vj2
+  vone2 = i64.const 1
+  vr2 = i64.add vr vone2
+  vtwo = i64.const 2
+  vdone = i64.eq vr2 vtwo
+  br_if vdone 3(vj2) 1(vj2, vr2)
+}
+block 3 (vend: i64) {
+  return vend
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (va: i64, vb: i64) {
+  v7 = i64.const 7
+  return v7
+  }
+}
+";
+
+/// **A spawn charges a recycled context's cell only by adding to it** (PR #3091's review). The
+/// spawned thread takes the context A left, whose cell A's fiber refilled after A ended. Its paid
+/// entry is added to what that cell holds, so nothing the chain was charged for is thrown away, and
+/// every engine charges alike, the root's entry, A's, the thread's, the fiber's three resumes and its
+/// five taken back-edges. The first version of #3081's payment assumed the cell empty: a debug
+/// build aborted in `thread_spawn`, and a release build dropped the fiber's draw.
+#[test]
+fn jit_fuel_a_spawn_keeps_what_a_fiber_left_in_a_recycled_cell() {
+    // With slack: near the limit the JIT's fiber draws from its creator's cell, not the resumer's
+    // (#3080), so where the run runs out there follows which cell holds a draw, not this fix.
+    assert_eq!(
+        assert_three_way(A_FIBER_OUTLIVES_ITS_VCPU, 1 << 40),
+        (Ended::Returned(3 + 6 + 6 + 7), 11)
+    );
+}
+
+/// Thread A makes a fiber that suspends forever, publishes its handle and waits to be released;
+/// thread B resumes the fiber in a loop. The root fills the domain's handle table (1024 slots: A, B
+/// and 1022 threads that wait forever), releases A, gives it time to end, so the context A leaves
+/// waits for the next spawn, and spawns once more: the table refuses it (`ThreadFault`).
+const A_REFUSED_SPAWN_UNDER_A_RUNNING_FIBER: &str = "memory 16
+func () -> (i64) {
+block 0 () {
+  vz = i64.const 0
+  va = thread.spawn 1 vz vz
+  br 1()
+}
+block 1 () {
+  vat = i64.const 16392
+  vk1 = i64.atomic.load vat
+  vnone = i64.eqz vk1
+  br_if vnone 1() 2(vk1)
+}
+block 2 (vk2: i64) {
+  vone = i64.const 1
+  vk = i64.sub vk2 vone
+  vz2 = i64.const 0
+  vb = thread.spawn 2 vk vz2
+  vn = i64.const 1022
+  br 3(vn)
+}
+block 3 (vi: i64) {
+  vz3 = i64.const 0
+  vp = thread.spawn 3 vz3 vz3
+  vone3 = i64.const 1
+  vj = i64.sub vi vone3
+  vfull = i64.eqz vj
+  br_if vfull 4() 3(vj)
+}
+block 4 () {
+  vgo = i64.const 16388
+  vset = i32.const 1
+  i32.atomic.store vgo vset
+  vcnt = i32.const 1
+  vw = atomic.notify vgo vcnt
+  vspin = i64.const 2000000
+  br 5(vspin)
+}
+block 5 (vs: i64) {
+  vone5 = i64.const 1
+  vt = i64.sub vs vone5
+  vdone = i64.eqz vt
+  br_if vdone 6() 5(vt)
+}
+block 6 () {
+  vz6 = i64.const 0
+  vr = thread.spawn 3 vz6 vz6
+  vr64 = i64.extend_i32_s vr
+  return vr64
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (va: i64, vb: i64) {
+  vf = ref.func 4
+  vk = cont.new vf va
+  vone = i64.const 1
+  vk1 = i64.add vk vone
+  vat = i64.const 16392
+  i64.atomic.store vat vk1
+  vgo = i64.const 16388
+  vexp = i32.const 0
+  vinf = i64.const -1
+  vw = i32.atomic.wait vgo vexp vinf
+  vr = i64.extend_i32_s vw
+  return vr
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vk: i64, vb: i64) {
+  br 1(vk)
+}
+block 1 (vk1: i64) {
+  vz = i64.const 0
+  vs, vv = cont.resume vk1 vz
+  br 1(vk1)
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (va: i64, vb: i64) {
+  vaddr = i64.const 16384
+  vexp = i32.const 0
+  vinf = i64.const -1
+  vw = i32.atomic.wait vaddr vexp vinf
+  vr = i64.extend_i32_s vw
+  return vr
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, varg: i64) {
+  vz = i64.const 0
+  br 1(vz)
+}
+block 1 (vi: i64) {
+  vx = suspend vi
+  vone = i64.const 1
+  vj = i64.add vi vone
+  br 1(vj)
+  }
+}
+";
+
+/// **A refused spawn frees no context** (PR #3091's review). A's context waits for the next spawn
+/// while A's fiber, which B resumes, goes on charging its cell. The refused spawn must leave it
+/// alone: the first version of #3081's payment took a context on the spawner and freed it when the
+/// table refused the handle, under the running fiber. Now the spawner pays on the domain's chain
+/// and touches no context, so a context is freed only as the run ends. The tree-walker and the JIT
+/// end the run on the refusal. A use after free here shows only under a sanitizer.
+#[test]
+fn jit_fuel_a_refused_spawn_frees_no_context_a_fiber_charges() {
+    let m = parse_module(A_REFUSED_SPAWN_UNDER_A_RUNNING_FIBER).expect("parse");
+    verify_module(&m).expect("verify");
+    let mut tw_left = 1u64 << 40;
+    assert_eq!(run(&m, 0, &[], &mut tw_left), Err(Trap::ThreadFault));
+    let (jit, _) = jit_fuel(A_REFUSED_SPAWN_UNDER_A_RUNNING_FIBER, &[], 1 << 40);
+    assert_eq!(jit, JitOutcome::Trapped(TrapKind::ThreadFault));
 }

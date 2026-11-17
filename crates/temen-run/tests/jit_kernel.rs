@@ -249,8 +249,8 @@ fn fueled(m: &temen_ir::Module, budget: u64) -> [(Result<Vec<i64>, Trap>, u64); 
 
 /// Fuel on the kernel route is exact: a threaded run that completes leaves exactly the oracle's
 /// fuel, every vCPU's unburned draw handed back. Each spawned thread's entry costs one on every
-/// engine (#2977), as the root's does. (Today's JIT is no reference here: its threads share one
-/// fixed cell, whose plain decrements race when they run at once.)
+/// engine (#2977), as the root's does. Today's JIT too: each of its threads charges a cell of its own,
+/// drawn from its fixed allowance as from a chain (#3069).
 #[test]
 fn a_threaded_run_with_fuel_to_spare_leaves_the_oracles_fuel() {
     let src = "memory 16
@@ -286,7 +286,10 @@ block 2 (vr: i64) {
     for _ in 0..20 {
         let [oracle, today, kernel] = fueled(&m, 1_000_000);
         assert_eq!(oracle.0, Ok(vec![2 * 500_500]));
-        assert_eq!(today.0, oracle.0, "today's JIT: the oracle's answer");
+        assert_eq!(
+            today, oracle,
+            "today's JIT: the oracle's answer and fuel left"
+        );
         assert_eq!(kernel.0, oracle.0, "the kernel route: the oracle's answer");
         assert_eq!(kernel.1, oracle.1, "the oracle's fuel left");
     }

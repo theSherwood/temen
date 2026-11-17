@@ -2007,10 +2007,10 @@ struct SpawnArgs {
     /// §12.8 4A.5 stage (ii): present on a concurrent durable child (see [`DurableChild`]).
     durable_child: Option<DurableChild>,
     done: std::sync::Arc<Done>,
-    /// #3081 — the context it runs on, its cell holding the entry its spawn paid
-    /// ([`crate::FuelCell::pay_entry`]); `None` for a thawed vCPU, which pays no entry and takes a
-    /// context as it starts.
-    own: Option<Box<VcpuCtx>>,
+    /// #3081 — its spawn paid its entry from the domain's chain ([`crate::FuelCell::pay_entry`]):
+    /// the vCPU credits its own cell with that unit once it has a lane. `false` for a thaw, which
+    /// pays no entry, and when the chain is unbounded.
+    paid_entry: bool,
     /// The owning [`Domain`] — so this vCPU can drop its §15 concurrent-live count when it finishes.
     /// The domain outlives every spawned thread (`run_inner` joins them at run end), so the pointer
     /// stays valid for the thread's lifetime.
@@ -2101,10 +2101,7 @@ fn run_child(a: SpawnArgs) {
     // SAFETY: `a.dom` is the run's live `Domain` (joined at run end).
     let dom = unsafe { &*a.dom };
     // #2488 — this vCPU enters guest code on a context of its own, charging a fuel cell of its own.
-    let own = match a.own {
-        Some(own) => own,
-        None => dom.take_vcpu_ctx(&a.env),
-    };
+    let mut own = dom.take_vcpu_ctx(&a.env);
     let env = Env {
         vm: &own.vm as *const crate::VmCtx as u64,
         ..a.env
@@ -2191,6 +2188,12 @@ fn run_child(a: SpawnArgs) {
     // already raised its own end, which outranks this one.
     if !got_lane {
         env.ctx().raise(TrapKind::ThreadFault as i64);
+    }
+    // #3081 — the entry its spawn paid, for its prologue to burn. Only once it will run guest code:
+    // a vCPU refused a lane keeps the unit paid, as the oracle's does, and hands back nothing.
+    if let Some(cell) = own.cell.as_deref_mut().filter(|_| got_lane && a.paid_entry) {
+        // SAFETY: the vCPU's own live cell.
+        unsafe { crate::FuelCell::credit(cell, 1) };
     }
     // SAFETY: `child_entry` honours the `Entry` ABI; `call` outlives the run; a guest fault in the
     // window range unwinds back here (this vCPU's stack is abandoned — the domain is being killed).
@@ -2407,16 +2410,13 @@ pub(crate) unsafe extern "C" fn thread_spawn(
         None
     };
     // #3081 — its entry is paid here, as the spawn completes on the interpreters: exactly one unit
-    // from the domain's chain, which the new vCPU's cell holds for its prologue to burn, so the vCPU
-    // holds no draw before it runs. A spawn that cannot pay runs the spawner out of fuel, as the
-    // oracle's does, after the durable context is reserved and before any other refusal (its order).
-    let mut own = dom.take_vcpu_ctx(&env);
-    if !own
-        .cell
-        .as_deref_mut()
-        .is_none_or(crate::FuelCell::pay_entry)
-    {
-        dom.put_vcpu_ctx(own);
+    // from the domain's chain, so the vCPU holds no draw before it runs. No context is taken here:
+    // the vCPU credits its own cell with the unit as it starts. A spawn that cannot pay runs the
+    // spawner out of fuel, as the oracle's does, after the durable context is reserved and before
+    // any other refusal (its order). A refusal after it keeps the unit paid, as the oracle's does.
+    // SAFETY: a non-null `fuel` is the run's live cell, which outlives the run's vCPUs.
+    let paid = unsafe { env.ctx().fuel.as_ref() }.and_then(crate::FuelCell::pay_entry);
+    if paid == Some(false) {
         if let Some(dc) = &durable_child {
             if let Some(table) = dom.fiber_table() {
                 table.free_vcpu_context(dc.ctx);
@@ -2425,6 +2425,7 @@ pub(crate) unsafe extern "C" fn thread_spawn(
         vm.raise(TrapKind::OutOfFuel as i64);
         return -1;
     }
+    let paid_entry = paid == Some(true);
     let done = Done::new(None);
     let handle = {
         let mut t = lock(&dom.threads);
@@ -2452,11 +2453,6 @@ pub(crate) unsafe extern "C" fn thread_spawn(
             })
             .flatten();
         let Some(handle) = issued else {
-            // The entry stays paid, as the oracle's does when a later refusal ends the run.
-            if let Some(cell) = own.cell.as_deref_mut() {
-                cell.left = 0;
-            }
-            drop(own);
             if !at_ceiling && !unfunded {
                 dom.vcpu_ended(); // the charge it took
             }
@@ -2488,7 +2484,7 @@ pub(crate) unsafe extern "C" fn thread_spawn(
             vcpu_id,
             durable_child,
             done,
-            own: Some(own),
+            paid_entry,
             dom,
         };
         let jh = std::thread::Builder::new()
@@ -2975,7 +2971,7 @@ impl Domain {
                     thaw_extent: Some(r.shadow_sp), // rewind from the restored extent
                 }),
                 done: std::sync::Arc::clone(&r.done),
-                own: None,
+                paid_entry: false,
                 dom: self as *const Domain,
             };
             match std::thread::Builder::new()
