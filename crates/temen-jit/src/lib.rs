@@ -1747,7 +1747,8 @@ pub fn compile_and_run_with_host_interruptible_fast(
 /// entries, taken back-edges and resumes executed — the unit the tree-walker and bytecode engines
 /// charge — so a run either completes or traps `OutOfFuel` at the same safepoint on all three
 /// backends. The caller seeds `fuel` with the budget and reads the remainder back after the call: a
-/// fixed allowance, never refilled (#1944 slice 3).
+/// fixed allowance (#1944 slice 3), from which each vCPU draws a cell of its own as from a budget
+/// chain (#3069), so a threaded run is charged in full.
 ///
 /// # Safety
 /// `cap_thunk`/`cap_ctx` must stay valid for the call and honour the [`CapThunk`] contract.
@@ -1771,7 +1772,7 @@ pub fn compile_and_run_with_host_fuel(
             ..RunOpts::default()
         },
     );
-    *fuel = cell.left;
+    *fuel = cell.can_burn();
     Ok(r?.0)
 }
 
@@ -1893,7 +1894,7 @@ pub fn compile_and_run_capture_reserved_with_host_ex(
 
 /// [`compile_and_run_capture_reserved_with_host`] with a **counted-fuel budget armed** (INTERP_PERF.md
 /// "Fuel unification"): the caller seeds `fuel` with the budget and reads the remainder back after the
-/// call (a fixed allowance, never refilled — #1944 slice 3); the run traps [`TrapKind::OutOfFuel`]
+/// call (a fixed allowance, each vCPU drawing from it — #1944 slice 3, #3069); the run traps [`TrapKind::OutOfFuel`]
 /// when the budget would underflow, at the same IR safepoints (function entries + taken back-edges +
 /// `cont.resume`) the interpreters charge.
 /// This lets the differential fuzzer **assert** cross-engine `OutOfFuel` parity rather than exclude it.
@@ -1927,7 +1928,7 @@ pub fn compile_and_run_capture_reserved_with_host_fuel(
             ..RunOpts::default()
         },
     );
-    *fuel = cell.left;
+    *fuel = cell.can_burn();
     r
 }
 
@@ -12831,10 +12832,11 @@ fn emit_signal_check(b: &mut FunctionBuilder, lower: &Lower) -> Result<(), JitEr
 /// cost), so `fiber_rt::make_fiber` refunds that prologue's charge.
 ///
 /// Distinct from [`emit_epoch_check`] in two ways: (1) it is the **guest's own** budget, not written
-/// by the host from another thread, so a plain (non-atomic) load/store is enough — and cheaper. A
-/// domain's vCPUs share the cell, so their plain stores race and their charge is approximate (and
-/// vCPUs running at once contend for its cache line, #2488); after a refill the check charges from
-/// the allowance it granted, so a sibling's stale `0` in `left` is never read as a spent chain; (2)
+/// by the host from another thread, so a plain (non-atomic) load/store is enough — and cheaper.
+/// Each vCPU charges a cell of its own (#2488, #3069), but a fiber charges its creator's wherever it
+/// is resumed, so two threads can still share one and lose a charge (#3080); after a refill the
+/// check charges from the allowance it granted, so another's stale `0` in `left` is never read as a
+/// spent chain; (2)
 /// the store of `fuel-1` back to the same address it just loaded creates a store⇒load dependency that
 /// stops Cranelift's alias analysis from treating the load as loop-invariant and hoisting it out (the
 /// reason `emit_epoch_check` needs an *atomic* load to achieve the same). Trap when the loaded value
@@ -12872,8 +12874,8 @@ fn emit_fuel_check(b: &mut FunctionBuilder, lower: &Lower) {
         .ins()
         .load(I64, MemFlags::trusted(), addr, crate::fuel::REFILL_OFF);
     b.ins().call_indirect(sig, refill, &[addr]);
-    // What the refill granted, not a reload of `left`: a sibling vCPU's plain store may have put a
-    // stale `0` there since (see `fuel_refill`).
+    // What the refill granted, not a reload of `left`: another context's plain store (#3080) may
+    // have put a stale `0` there since (see `fuel_refill`).
     let drawn = b
         .ins()
         .load(I64, MemFlags::trusted(), addr, crate::fuel::GRANTED_OFF);

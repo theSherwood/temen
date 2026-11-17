@@ -2807,6 +2807,9 @@ impl temen_jit::BudgetNode for HostNode {
     fn give_back(&self, unspent: u64) {
         self.0.give_back(unspent)
     }
+    fn take_exact(&self, n: u64) -> Option<bool> {
+        self.0.take_exact(n)
+    }
     fn room(&self) -> i64 {
         self.0.fuel_room()
     }
