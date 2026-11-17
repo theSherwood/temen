@@ -24,8 +24,8 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// What an unmetered chain hands a cell at each refill: as many safepoints as the interpreter's pool
-/// runs a vCPU for before its quantum ends (`temen_interp`'s `POOL_QUANTUM`, and [`temen_ir::FUEL_CHUNK`]).
-pub(crate) const QUANTUM: u64 = 1 << 16;
+/// runs a vCPU for before its quantum ends.
+pub(crate) const QUANTUM: u64 = temen_ir::POOL_QUANTUM;
 
 /// A domain's node in the embedder's budget chain (temen-run's, over a `temen_interp` budget node):
 /// where a [`FuelCell`] draws its next chunk, and what a domain's vCPUs (#2001) and fibers (#2112)
@@ -742,9 +742,11 @@ block 2 (v8: i64) {
             "the root's cell paid the root's safepoints only, not the loop's: {root_burned}"
         );
         let vcpu_burned = CHUNK - chain.back.load(Ordering::Relaxed);
-        assert!(
-            (n as u64..n as u64 + 10).contains(&vcpu_burned),
-            "the vCPU's cell paid the loop and handed back the rest: {vcpu_burned}"
+        assert_eq!(
+            vcpu_burned,
+            n as u64 - 1,
+            "the vCPU's cell paid the loop's back-edges and handed back the rest; its entry was paid \
+             at the spawn, outside the chunk (#3081)"
         );
     }
 
@@ -797,17 +799,19 @@ mod loom_tests {
     use super::{Allowance, BudgetNode};
     use loom::sync::Arc;
 
-    /// Two vCPUs draw from a small allowance at once, each burning one unit of what it drew and
-    /// handing the rest back, then drawing again. Every interleaving hands out no more than the
-    /// allowance holds, and what is left at the end is the allowance less exactly what they burned.
+    /// Two vCPUs each pay an entry with an exact take and then draw from a small allowance at once,
+    /// each burning one unit of what it drew and handing the rest back, then drawing again. Every
+    /// interleaving hands out no more than the allowance holds, and what is left at the end is the
+    /// allowance less exactly what they burned.
     #[test]
     fn loom_an_allowance_hands_out_no_more_than_it_holds() {
         loom::model(|| {
-            const N: u64 = 5;
+            const N: u64 = 6;
             let a = Arc::new(Allowance::new(N));
             let vcpu = |a: Arc<Allowance>| {
                 move || {
-                    let mut burned = 0;
+                    assert_eq!(a.take_exact(1), Some(true), "an entry fits");
+                    let mut burned = 1;
                     for _ in 0..2 {
                         match a.draw() {
                             Some(0) => {}
@@ -827,10 +831,9 @@ mod loom_tests {
             let burned = here + t.join().unwrap();
             assert!(a.room() >= 0);
             assert_eq!(a.room() as u64, N - burned);
-            assert_eq!(
-                burned, 4,
-                "five units are enough for both vCPUs' four burns"
-            );
+            // A draw can meet a room the other vCPU's draw holds for a moment (the chunk rule), so
+            // not every draw finds fuel; both entries always do, and nothing is lost or made.
+            assert!((2..=N).contains(&burned), "{burned}");
         });
     }
 }

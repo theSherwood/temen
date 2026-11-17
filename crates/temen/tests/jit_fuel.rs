@@ -639,6 +639,8 @@ fn jit_fuel_a_threads_entry_runs_out_alike_on_every_engine() {
     // tree-walker, the JIT and the kernel route, whose waiting root holds half the room it drew, run
     // out; the bytecode engine completes on the exact cost, 51. The JIT's vCPUs shared one cell on a
     // fixed allowance and completed on 51 too, charging what overlapping charges did not lose (#3069).
+    // Its spawn pays each entry with an exact take of one unit, as the interpreters' does (#3081), so
+    // no thread holds a draw while others pay theirs: this holds in any schedule of its OS threads.
     let fifty = spawning(50);
     assert_eq!(assert_four_way(&fifty, 100), (Ended::Returned(350), 51));
 }

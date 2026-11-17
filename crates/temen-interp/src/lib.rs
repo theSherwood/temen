@@ -5849,20 +5849,7 @@ pub fn pool_workers() -> usize {
         .clamp(1, MAX_WORKERS)
 }
 
-/// How many ops a vCPU runs on a worker before it yields it to the next runnable vCPU: the real
-/// pool's preemption quantum. Without it a vCPU kept its worker until it parked, so guest threads
-/// that spin on each other livelocked once they outnumbered the workers: the spinners held every
-/// worker, and the thread they waited for never ran (#2202, nimony's `tallocpool` on four workers).
-/// A vCPU in a bounded lane keeps its lanes across the yield (#2237, see [`dispatch`]).
-///
-/// Its size is the price of one preemption at a bad moment: a thread that spins on one that lost
-/// its worker (a lock holder, or the next in a fair ticket lock's queue) burns up to a quantum
-/// before that thread runs again. Measured on nimony's thread pool, five vCPUs on two workers:
-/// `1 << 20` ran it in 0.16 s or 35 s depending on where preemptions landed, `1 << 16` in 3.3 s
-/// every time. A vCPU running alone yields too, and the round trip costs nothing measurable: a
-/// 20M-iteration loop took ~1 s at `u64::MAX`, `1 << 20` and `1 << 16` alike. The bytecode
-/// engine's cooperative quantum is a separate knob, sized for its deterministic interleaving.
-const POOL_QUANTUM: u64 = 1 << 16;
+use temen_ir::POOL_QUANTUM;
 
 /// A task identifier (a spawned vCPU). Distinct from the per-vCPU join *handle* (an index into the
 /// spawner's child table); the executor keys results/waiters by `TaskId`.
