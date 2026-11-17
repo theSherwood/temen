@@ -10278,7 +10278,7 @@ fn new_fiber(
     let charge = host.with(|h| h.fiber_charge()).ok_or(Trap::FiberFault)?;
     fibers
         .with(|f, fsp, meta| {
-            if f.len() + 1 >= super::MAX_FIBERS || !fiber_fits(durable, arena, f.len()) {
+            if f.len() + 1 >= super::MAX_FIBERS {
                 return None;
             }
             let h = f.len();
@@ -10704,7 +10704,7 @@ fn serve(
             continue;
         }
         // A full registry is backpressure to the dispatch, as on the oracle, not a trap.
-        let Some(k) = handler_slot(fibers, mem, durable) else {
+        let Some(k) = handler_slot(fibers, mem) else {
             refuse(host, super::EAGAIN);
             continue;
         };
@@ -10734,20 +10734,10 @@ fn serve(
         .then_some(VcpuStop::SvcWait))
 }
 
-/// #3101 — whether a new fiber in slot `k` may be made: in a durable run it needs a shadow
-/// context of its own inside the arena, as the oracle's registry requires of every fiber, a handler's
-/// included ([`super::ShadowContexts::fiber_fits`]). This engine runs no vCPU durably, so no context
-/// is a vCPU's. Without it a run made fibers the oracle refuses (`FiberFault`), and froze an artifact
-/// a restore refuses.
-fn fiber_fits(durable: bool, arena: super::ShadowArena, k: usize) -> bool {
-    !durable || super::ShadowContexts::default().fiber_fits(arena, k)
-}
-
 /// #2742 — a fiber slot for a new handler, `Running` from the start, as [`serve`] builds the
 /// handler's first frame itself: a finished handler's, or a new one. `None` when the registry is
-/// full, or a durable run's arena is. A handler is mechanism, charged to nothing (#2112), as on the
-/// oracle.
-fn handler_slot(fibers: &mut FiberCell, mem: &Option<Mem>, durable: bool) -> Option<usize> {
+/// full. A handler is mechanism, charged to nothing (#2112), as on the oracle.
+fn handler_slot(fibers: &mut FiberCell, mem: &Option<Mem>) -> Option<usize> {
     let arena = mem
         .as_ref()
         .map_or(super::ShadowArena::EMPTY, |m| m.shadow_arena());
@@ -10762,7 +10752,7 @@ fn handler_slot(fibers: &mut FiberCell, mem: &Option<Mem>, durable: bool) -> Opt
             meta[k].charge = LiveFiber::none();
             return Some(k);
         }
-        if f.len() + 1 >= super::MAX_FIBERS || !fiber_fits(durable, arena, f.len()) {
+        if f.len() + 1 >= super::MAX_FIBERS {
             return None;
         }
         let k = f.len();
