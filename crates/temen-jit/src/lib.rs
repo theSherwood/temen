@@ -3646,12 +3646,7 @@ impl CompiledModule {
     #[cfg(fiber_rt)]
     fn begin_fibers(&self) -> Option<RunFibers> {
         self.builds_fiber_table.then(|| {
-            let table = Arc::new(fiber_rt::SharedFiberTable::new(
-                temen_ir::MAX_FIBERS,
-                self.shadow,
-                self.node.clone(),
-            ));
-            table.reserve(self.fiber_slots_hint);
+            let table = self.run_fiber_table(self.node.clone());
             let root = self.fiber_cfg.map(|(type_id, mask)| {
                 let mut rt = Box::new(fiber_rt::FiberRuntime::new(
                     Arc::clone(&table),
@@ -3669,6 +3664,22 @@ impl CompiledModule {
                 prev: None,
             }
         })
+    }
+
+    /// #3020 — a run's fiber table, its fibers charged to `node`: the run's own ([`Self::begin_fibers`]),
+    /// or a kernel run's (`kernel_rt::KernelRun::new`).
+    #[cfg(fiber_rt)]
+    pub(crate) fn run_fiber_table(
+        &self,
+        node: Option<std::sync::Arc<dyn BudgetNode>>,
+    ) -> Arc<fiber_rt::SharedFiberTable> {
+        let table = Arc::new(fiber_rt::SharedFiberTable::new(
+            temen_ir::MAX_FIBERS,
+            self.shadow,
+            node,
+        ));
+        table.reserve(self.fiber_slots_hint);
+        table
     }
 
     /// The backtraces of the fibers `table` holds parked, for [`Self::fiber_backtrace`] once its run

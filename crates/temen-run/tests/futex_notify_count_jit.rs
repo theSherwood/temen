@@ -60,7 +60,10 @@ fn both(m: &temen_ir::Module, declined: Option<&'static str>) -> (i64, i64) {
             .expect("jit run");
             Some(first(jo))
         }
-        Route::Kernel => jit_kernel::expect_kernel(m, 0, &[], None, declined).map(first),
+        Route::Kernel => {
+            jit_kernel::expect_kernel(m, 0, &[], None, jit_kernel::lane_fuel(m), declined)
+                .map(first)
+        }
     });
     let jit = jits.next().expect("today's route");
     for other in jits {
@@ -337,7 +340,7 @@ block 2 () {
 #[test]
 fn a_notify_of_one_wakes_the_oldest_of_a_fiber_and_a_vcpu_on_both_engines() {
     let m = module(NOTIFY_ONE_OF_A_FIBER_AND_A_VCPU);
-    let (interp, jit) = both(&m, Some("fibers"));
+    let (interp, jit) = both(&m, Some("fiber parks"));
     assert_eq!(
         interp, 110,
         "the oracle: one claimed, and it is the older waiter — the fiber"

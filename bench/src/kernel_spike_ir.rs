@@ -530,3 +530,147 @@ block 0 (vw: i64, varg: i64) {
   }
 }
 "#;
+
+/// #3078 slice 2 — exit row 1: `w` threads, each resuming a fiber of its own `n` times, the fiber
+/// `suspend`ing each time; the root joins them all. Entry `(n, w)`; answers `w * n`. No fiber parks,
+/// so the kernel route admits it unmetered.
+pub const FIBER_ROUNDTRIP_IR: &str = r#"memory 16
+func (i64, i64) -> (i64) {
+block 0 (vn: i64, vw: i64) {
+  vz = i64.const 0
+  br 1(vn, vw, vz)
+}
+block 1 (vn1: i64, vw1: i64, vi1: i64) {
+  vmore1 = i64.lt_u vi1 vw1
+  br_if vmore1 2(vn1, vw1, vi1) 3(vw1)
+}
+block 2 (vn2: i64, vw2: i64, vi2: i64) {
+  vz2 = i64.const 0
+  vh2 = thread.spawn 1 vn2 vz2
+  veight2 = i64.const 8
+  voff2 = i64.mul vi2 veight2
+  vbase2 = i64.const 16384
+  vat2 = i64.add vbase2 voff2
+  vh642 = i64.extend_i32_s vh2
+  i64.store vat2 vh642
+  vone2 = i64.const 1
+  vnext2 = i64.add vi2 vone2
+  br 1(vn2, vw2, vnext2)
+}
+block 3 (vw3: i64) {
+  vz3 = i64.const 0
+  br 4(vw3, vz3, vz3)
+}
+block 4 (vw4: i64, vj4: i64, vacc4: i64) {
+  vmore4 = i64.lt_u vj4 vw4
+  br_if vmore4 5(vw4, vj4, vacc4) 6(vacc4)
+}
+block 5 (vw5: i64, vj5: i64, vacc5: i64) {
+  veight5 = i64.const 8
+  voff5 = i64.mul vj5 veight5
+  vbase5 = i64.const 16384
+  vat5 = i64.add vbase5 voff5
+  vh5 = i64.load vat5
+  vh325 = i32.wrap_i64 vh5
+  vst5, vv5 = thread.join vh325
+  vacc25 = i64.add vacc5 vv5
+  vone5 = i64.const 1
+  vnext5 = i64.add vj5 vone5
+  br 4(vw5, vnext5, vacc25)
+}
+block 6 (vr6: i64) {
+  return vr6
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vn: i64, vb: i64) {
+  vf = ref.func 2
+  vz = i64.const 0
+  vk = cont.new vf vz
+  br 1(vn, vk, vz)
+}
+block 1 (vn1: i64, vk1: i64, vi1: i64) {
+  vmore1 = i64.lt_u vi1 vn1
+  br_if vmore1 2(vn1, vk1, vi1) 3(vn1)
+}
+block 2 (vn2: i64, vk2: i64, vi2: i64) {
+  vz2 = i64.const 0
+  vs2, vv2 = cont.resume vk2 vz2
+  vone2 = i64.const 1
+  vnext2 = i64.add vi2 vone2
+  br 1(vn2, vk2, vnext2)
+}
+block 3 (vr3: i64) {
+  return vr3
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, varg: i64) {
+  br 1()
+}
+block 1 () {
+  vz = i64.const 0
+  vx = suspend vz
+  br 1()
+  }
+}
+"#;
+
+/// #3078 slice 2 — exit row 4: a thread makes `k` fibers and leaves each suspended, then makes `n`
+/// `memory.notify`s on a word nothing waits on; the root joins it. Entry `(n, k)`; answers 0.
+pub const NOWAKE_SUSPENDED_IR: &str = r#"memory 16
+func (i64, i64) -> (i64) {
+block 0 (vn: i64, vk: i64) {
+  vh = thread.spawn 1 vn vk
+  vst, vv = thread.join vh
+  return vv
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vn: i64, vk: i64) {
+  vz = i64.const 0
+  br 1(vn, vk, vz)
+}
+block 1 (vn1: i64, vk1: i64, vi1: i64) {
+  vmore1 = i64.lt_u vi1 vk1
+  br_if vmore1 2(vn1, vk1, vi1) 3(vn1)
+}
+block 2 (vn2: i64, vk2: i64, vi2: i64) {
+  vf2 = ref.func 2
+  vz2 = i64.const 0
+  vh2 = cont.new vf2 vz2
+  vs2, vv2 = cont.resume vh2 vz2
+  vone2 = i64.const 1
+  vnext2 = i64.add vi2 vone2
+  br 1(vn2, vk2, vnext2)
+}
+block 3 (vn3: i64) {
+  vz3 = i64.const 0
+  br 4(vn3, vz3, vz3)
+}
+block 4 (vn4: i64, vi4: i64, vacc4: i64) {
+  vmore4 = i64.lt_u vi4 vn4
+  br_if vmore4 5(vn4, vi4, vacc4) 6(vacc4)
+}
+block 5 (vn5: i64, vi5: i64, vacc5: i64) {
+  vq5 = i64.const 16400
+  vc5 = i32.const 1
+  vw5 = atomic.notify vq5 vc5
+  vw645 = i64.extend_i32_u vw5
+  vacc25 = i64.add vacc5 vw645
+  vone5 = i64.const 1
+  vnext5 = i64.add vi5 vone5
+  br 4(vn5, vnext5, vacc25)
+}
+block 6 (vr6: i64) {
+  return vr6
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, varg: i64) {
+  vz = i64.const 0
+  vx = suspend vz
+  return vz
+  }
+}
+"#;

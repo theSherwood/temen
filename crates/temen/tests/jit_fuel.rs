@@ -565,7 +565,7 @@ fn on_the_kernel_route(src: &str, budget: u64) -> (Ended, u64) {
     let m = parse_module(src).expect("parse");
     verify_module(&m).expect("verify");
     let mut host = temen_interp::Host::new();
-    let admitted = jit_kernel::admit(&m, &host, false).expect("in the kernel's scope");
+    let admitted = jit_kernel::admit(&m, &host, false, budget).expect("in the kernel's scope");
     let start = jit_kernel::Start {
         entry: 0,
         args: &[],
@@ -977,4 +977,41 @@ fn jit_fuel_a_refused_spawn_frees_no_context_a_fiber_charges() {
     assert_eq!(run(&m, 0, &[], &mut tw_left), Err(Trap::ThreadFault));
     let (jit, _) = jit_fuel(A_REFUSED_SPAWN_UNDER_A_RUNNING_FIBER, &[], 1 << 40);
     assert_eq!(jit, JitOutcome::Trapped(TrapKind::ThreadFault));
+}
+
+/// #3078 slice 2 — where the kernel route stands on a fiber's fuel. A fiber charges its creator
+/// vCPU's cell wherever it runs (#3080), so a fiber resumed on another vCPU can lose charges to its
+/// creator's at once: the kernel route declines every metered run of a module that uses fibers
+/// (`fiber fuel`) rather than diverge (INVARIANTS #9). Fiber-only modules keep their single-vCPU path
+/// (`fiber only`), and fibers that wait keep today's route (`fiber parks`). #3080's fix gives each
+/// row here its metered kernel lane.
+#[test]
+fn jit_fuel_the_kernel_route_declines_every_metered_fiber_run() {
+    use temen_run::jit_kernel;
+    let declined = |src: &str| {
+        let m = parse_module(src).expect("parse");
+        verify_module(&m).expect("verify");
+        jit_kernel::admit(&m, &temen_interp::Host::new(), false, 1 << 40).err()
+    };
+    assert_eq!(declined(A_FIBER_OUTLIVES_ITS_VCPU), Some("fiber fuel"));
+    assert_eq!(
+        declined(A_REFUSED_SPAWN_UNDER_A_RUNNING_FIBER),
+        Some("fiber parks")
+    );
+    assert_eq!(declined(&fibers_suspending(3, 2)), Some("fiber only"));
+    assert_eq!(declined(&busy_poll(Some(3))), Some("fiber only"));
+}
+
+/// #3078 slice 2 — finding 0a: a fiber thread A made runs on A's context after A has ended, so a
+/// kernel run keeps every vCPU's context until it ends. Unmetered (`fiber fuel`), the kernel route
+/// answers the oracle's result. Without the run's pool the fiber reads freed heap: the ASan lane
+/// (`asan-held`, which runs `temen-run`'s `jit_kernel` fiber rows) reports it.
+#[test]
+fn jit_fuel_a_fiber_outliving_its_vcpu_runs_on_the_kernel_route_unmetered() {
+    use temen_run::jit_kernel;
+    let m = parse_module(A_FIBER_OUTLIVES_ITS_VCPU).expect("parse");
+    verify_module(&m).expect("verify");
+    let (got, vcpus) = jit_kernel::run_fresh(&m, 0, &[], None, u64::MAX).expect("in scope");
+    assert!(vcpus >= 3, "the root, A and the thread ran as kernel tasks");
+    assert_eq!(got, JitOutcome::Returned(vec![3 + 6 + 6 + 7]));
 }

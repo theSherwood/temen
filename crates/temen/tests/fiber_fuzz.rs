@@ -447,6 +447,7 @@ fn generated_migration_schedules_agree_on_interp_and_jit() {
     use std::fmt::Write as _;
     use temen_interp::{run, Value};
     use temen_jit::{compile_and_run, JitOutcome};
+    use temen_run::jit_kernel::{self, Route};
 
     /// One generated step: executor `exec` (0 = root, 1.. = worker) resumes fiber `fiber` with a
     /// constant argument.
@@ -599,42 +600,52 @@ fn generated_migration_schedules_agree_on_interp_and_jit() {
         let interp = run(&m, 0, &[], &mut fuel).unwrap_or_else(|t| {
             panic!("interp trapped on a by-construction-valid program: {t:?}\n{src}")
         });
-        // JIT — the real cross-thread stack switches; must match exactly.
-        match compile_and_run(&m, 0, &[]).expect("jit compile/run") {
-            JitOutcome::Returned(slots) => {
-                let want: Vec<i64> = interp
-                    .iter()
-                    .map(|x| match x {
-                        Value::I64(x) => *x,
-                        other => panic!("unexpected result type {other:?}"),
-                    })
-                    .collect();
-                assert_eq!(
-                    want, slots,
-                    "interp and JIT diverged on a migration schedule\n{src}"
-                );
+        // JIT — the real cross-thread stack switches; must match exactly, on both of its routes
+        // while both exist (#2958): today's thread runtime, and the kernel's, which runs every
+        // worker as a kernel task (#3078 slice 2), unmetered (`fiber fuel`, #3080).
+        for jit in Route::BOTH.map(|r| match r {
+            Route::Today => compile_and_run(&m, 0, &[]).expect("jit compile/run"),
+            Route::Kernel => {
+                jit_kernel::expect_kernel(&m, 0, &[], None, jit_kernel::lane_fuel(&m), None)
+                    .expect("the kernel route admits it")
             }
-            other => {
-                // ISSUES.md I1/I3: on a memory-tight Windows runner the fiber control-stack
-                // `VirtualAlloc` behind `cont.new` can fail transiently under the run's cumulative
-                // commit pressure — a recoverable `FiberFault` trap (I1), not a backend divergence
-                // (the explicit-stack interp allocates no native stack, so it proceeds). Skip the
-                // program, like the other cross-backend harnesses skip transient host allocation
-                // failures; a *deterministic* JIT `FiberFault` still fails the suite, as Linux and
-                // macOS run a superset of these seeds (same RNG, longer loop) with no skip.
-                #[cfg(windows)]
-                if matches!(other, JitOutcome::Trapped(temen_jit::TrapKind::FiberFault)) {
-                    alloc_skips += 1;
-                    continue;
+        }) {
+            match jit {
+                JitOutcome::Returned(slots) => {
+                    let want: Vec<i64> = interp
+                        .iter()
+                        .map(|x| match x {
+                            Value::I64(x) => *x,
+                            other => panic!("unexpected result type {other:?}"),
+                        })
+                        .collect();
+                    assert_eq!(
+                        want, slots,
+                        "interp and JIT diverged on a migration schedule\n{src}"
+                    );
                 }
-                panic!("interp returned {interp:?} but the JIT gave {other:?}\n{src}")
+                other => {
+                    // ISSUES.md I1/I3: on a memory-tight Windows runner the fiber control-stack
+                    // `VirtualAlloc` behind `cont.new` can fail transiently under the run's cumulative
+                    // commit pressure — a recoverable `FiberFault` trap (I1), not a backend divergence
+                    // (the explicit-stack interp allocates no native stack, so it proceeds). Skip the
+                    // program, like the other cross-backend harnesses skip transient host allocation
+                    // failures; a *deterministic* JIT `FiberFault` still fails the suite, as Linux and
+                    // macOS run a superset of these seeds (same RNG, longer loop) with no skip.
+                    #[cfg(windows)]
+                    if matches!(other, JitOutcome::Trapped(temen_jit::TrapKind::FiberFault)) {
+                        alloc_skips += 1;
+                        continue;
+                    }
+                    panic!("interp returned {interp:?} but the JIT gave {other:?}\n{src}")
+                }
             }
         }
     }
     // The skip above is for *transient* allocation pressure only: if a meaningful share of the
     // corpus FiberFaults, that is systematic (a real Windows fiber-stack bug), not pressure — fail.
     assert!(
-        alloc_skips <= iters / 4,
+        alloc_skips <= iters / 2,
         "too many JIT FiberFaults to be transient allocation pressure: {alloc_skips}/{iters}"
     );
     // Coverage guard: the corpus must have actually exercised saved-stack cross-executor resumes

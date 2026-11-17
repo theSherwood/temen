@@ -35,8 +35,12 @@ use temen_jit::{CompiledModule, FuelCell, JitOutcome, TrapKind};
 /// A program [`admit`] admitted: only a [`run`] of it takes the kernel's route.
 pub struct Admitted<'m>(&'m Module);
 
-/// Whether `m`, under `host`, runs its vCPUs as the kernel's tasks:
-/// `temen_interp::bytecode::native_scope`, plus the start's own clause:
+/// Whether `m`, under `host`, runs its vCPUs as the kernel's tasks, on a run granted `fuel`:
+/// `temen_interp::bytecode::native_scope`, plus the start's own clauses:
+/// - **`fiber fuel`**: the run is metered ([`metered`]) and `m` uses fibers. A fiber's code charges
+///   its creator vCPU's fuel cell wherever it runs, so a fiber resumed on another vCPU loses charges
+///   to its creator's at once, where the oracle charges the vCPU that runs it (#3080, which removes
+///   this clause);
 /// - **`kept code`**: the embedder keeps the run's compile for later runs (a `JitCodeCache`,
 ///   #2389), whose shared code the kernel route does not instance yet (#2981).
 ///
@@ -47,12 +51,22 @@ pub fn admit<'m>(
     m: &'m Module,
     host: &Host,
     kept_code: bool,
+    fuel: u64,
 ) -> Result<Admitted<'m>, &'static str> {
     temen_interp::bytecode::native_scope(m, host)?;
+    if metered(host, fuel) && m.funcs.iter().any(temen_ir::Func::uses_fibers) {
+        return Err("fiber fuel");
+    }
     if kept_code {
         return Err("kept code");
     }
     Ok(Admitted(m))
+}
+
+/// Whether a run granted `fuel` under `host` is metered: its own grant, or a level of its chain
+/// above it, bounds it. Its code is then compiled with fuel checks ([`run`]).
+fn metered(host: &Host, fuel: u64) -> bool {
+    fuel != u64::MAX || crate::run_node(host).is_some_and(|n| n.room() >= 0)
 }
 
 /// How a kernel run ended.
@@ -99,8 +113,9 @@ impl KernelEnd {
     }
 }
 
-/// A run of `m`'s `entry(args)` on the kernel's route over a fresh host, with the default fuel, as
-/// the JIT's own entries answer it, and how many vCPUs ran as kernel tasks. `Err` names the clause
+/// A run of `m`'s `entry(args)` on the kernel's route over a fresh host, granted `fuel`
+/// ([`temen_interp::DEFAULT_FUEL`] as the JIT's own entries grant; `u64::MAX` unmetered), as the
+/// JIT's own entries answer it, and how many vCPUs ran as kernel tasks. `Err` names the clause
 /// that declines it, and nothing ran. For the suites that run each case on both routes while both
 /// exist (#2958): today's route is the direct `temen_jit` entry they always used.
 pub fn run_fresh(
@@ -108,16 +123,17 @@ pub fn run_fresh(
     entry: u32,
     args: &[i64],
     kill: Option<&Arc<temen_jit::Interrupt>>,
+    fuel: u64,
 ) -> Result<(JitOutcome, u64), &'static str> {
     let mut host = Host::new();
-    let admitted = admit(m, &host, false)?;
+    let admitted = admit(m, &host, false, fuel)?;
     let start = Start {
         entry,
         args,
         init_mem: &[],
         init: None,
         reserved_log2: temen_ir::DEFAULT_RESERVED_LOG2,
-        fuel: temen_interp::DEFAULT_FUEL,
+        fuel,
         snapshot_cap: None,
         kill,
     };
@@ -139,8 +155,8 @@ impl Route {
     pub const BOTH: [Route; 2] = [Route::Today, Route::Kernel];
 }
 
-/// Test-facing: run `m`'s `entry(args)` on the kernel route ([`run_fresh`]) and check the route a
-/// case expects of it: `declined` names the clause that must decline it, `None` that it must run
+/// Test-facing: run `m`'s `entry(args)` on the kernel route ([`run_fresh`], granted `fuel`) and
+/// check the route a case expects of it: `declined` names the clause that must decline it, `None` that it must run
 /// as kernel tasks. `None` back when it was declined, as expected.
 #[doc(hidden)]
 pub fn expect_kernel(
@@ -148,9 +164,10 @@ pub fn expect_kernel(
     entry: u32,
     args: &[i64],
     kill: Option<&Arc<temen_jit::Interrupt>>,
+    fuel: u64,
     declined: Option<&'static str>,
 ) -> Option<JitOutcome> {
-    match (run_fresh(m, entry, args, kill), declined) {
+    match (run_fresh(m, entry, args, kill, fuel), declined) {
         (Ok((o, vcpus)), None) => {
             assert!(vcpus >= 1, "the run's vCPUs ran as kernel tasks");
             Some(o)
@@ -161,6 +178,17 @@ pub fn expect_kernel(
         }
         (Ok(_), Some(want)) => panic!("expected `{want}` to decline it; it ran on the kernel"),
         (Err(clause), None) => panic!("expected the kernel route; `{clause}` declined it"),
+    }
+}
+
+/// Test-facing: the fuel a suite's kernel lane grants `m`: the default, or for a module that uses
+/// fibers none at all, which `fiber fuel` declines metered until #3080. The one place the suites
+/// read it, so #3080's fix gives every fiber row its metered lane here.
+#[doc(hidden)]
+pub fn lane_fuel(m: &Module) -> u64 {
+    match m.funcs.iter().any(temen_ir::Func::uses_fibers) {
+        true => u64::MAX,
+        false => temen_interp::DEFAULT_FUEL,
     }
 }
 
@@ -214,7 +242,7 @@ pub fn run(
         return Err(temen_jit::JitError::Unsupported("entry arity"));
     }
     // Fuel checks are compiled in when the run's chain meters: its own grant, or a level above it.
-    let metered = start.fuel != u64::MAX || crate::run_node(host).is_some_and(|n| n.room() >= 0);
+    let metered = metered(host, start.fuel);
     // The compiled instance's cell, which no vCPU charges (each has its own, `tier_run`): it only
     // arms the compile's fuel checks, and lives as long as the code (`KernelRun::new`).
     let mut armed = metered.then(|| FuelCell::fixed(0));
@@ -244,7 +272,7 @@ pub fn run(
     let mut cm = cm;
     cm.set_restore(layout.and_then(crate::jit_restore));
     let init_mem = layout.map_or(start.init_mem, |l| l.bytes());
-    let (kr, ro) = match KernelRun::new(cm, armed, init_mem) {
+    let (kr, ro) = match KernelRun::new(cm, armed, init_mem, crate::run_node(host)) {
         Some(Some(started)) => started,
         Some(None) => return Ok(KernelEnd::refused()),
         None => return Err(temen_jit::JitError::Unsupported("kernel window")),
@@ -483,13 +511,20 @@ type CallPayload = Option<CallPark>;
 
 /// #2958 slice 5 — hand `park`, what a call the vCPU on `vm` just made left it to do
 /// ([`temen_interp::bytecode::call_park`]), to its task's rules ([`EmittedCall::park_call`]): `None`
-/// when `vm` is no kernel vCPU's.
+/// when `vm` is no kernel vCPU's. A park in a fiber traps `Malformed` (`fiber parks`).
 ///
 /// # Safety
 /// As [`temen_jit::kernel_rt::park_call`]'s: the caller is the cap thunk of code running on `vm`, on
 /// `vm`'s own thread, inside the guarded call its vCPU runs (`KernelRun::run_vcpu`), and holds no
 /// other reference to the hook and no `Host` lock.
 pub(crate) unsafe fn park_call(vm: &temen_jit::VmCtx, park: CallPark) -> Option<[i64; 2]> {
+    // #3078 slice 2 — a park made in a fiber is the fiber's, which the kernel does not take yet:
+    // `native_scope`'s `fiber parks` declines every module that could make one, so reaching one is
+    // a bug in that predicate, and it fails closed. A region post's wake parks nothing.
+    if !matches!(park, CallPark::Done(_)) && temen_jit::kernel_rt::in_fiber(vm) {
+        vm.raise(Trap::Malformed.code());
+        return Some([0, 0]);
+    }
     let mut payload: CallPayload = Some(park);
     // SAFETY: this function's own contract is the callee's.
     unsafe { temen_jit::kernel_rt::park_call(vm, &mut payload) }
@@ -525,7 +560,7 @@ block 0 () {
         let m = temen_text::parse_module(SERVES).expect("parse");
         temen_verify::verify_module(&m).expect("verify");
         let mut host = Host::new();
-        assert_eq!(admit(&m, &host, false).err(), Some("jit cap"));
+        assert_eq!(admit(&m, &host, false, u64::MAX).err(), Some("jit cap"));
         let start = Start {
             entry: 0,
             args: &[],
@@ -538,5 +573,86 @@ block 0 () {
         };
         let end = run(Admitted(&m), start, &mut host).expect("compiles");
         assert_eq!(end.result, Err(Trap::Malformed));
+    }
+
+    /// A threaded module whose fiber makes `park` (a body defining `vr`), run past `admit` granted
+    /// no fuel: the kernel route's answer.
+    fn a_fiber_parks_past_admit(park: &str, mut host: Host) -> Result<Vec<i64>, Trap> {
+        let src = format!(
+            "memory 16
+func () -> (i64) {{
+block 0 () {{
+  vz = i64.const 0
+  vt = thread.spawn 1 vz vz
+  vts, vtv = thread.join vt
+  vf = ref.func 2
+  vk = cont.new vf vz
+  vs, vv = cont.resume vk vz
+  return vv
+  }}
+}}
+func (i64, i64) -> (i64) {{
+block 0 (va: i64, vb: i64) {{
+  return va
+  }}
+}}
+func (i64, i64) -> (i64) {{
+block 0 (vsp: i64, varg: i64) {{
+  vz = i64.const 0
+{park}
+  return vr
+  }}
+}}
+"
+        );
+        let m = temen_text::parse_module(&src).expect("parse");
+        temen_verify::verify_module(&m).expect("verify");
+        assert_eq!(admit(&m, &host, false, u64::MAX).err(), Some("fiber parks"));
+        let start = Start {
+            entry: 0,
+            args: &[],
+            init_mem: &[],
+            init: None,
+            reserved_log2: temen_ir::DEFAULT_RESERVED_LOG2,
+            fuel: u64::MAX,
+            snapshot_cap: None,
+            kill: None,
+        };
+        run(Admitted(&m), start, &mut host)
+            .expect("compiles")
+            .result
+    }
+
+    /// #3078 slice 2 — the three backstops `fiber parks` keeps unreachable: a futex wait, a rewound
+    /// call park (an empty pipe's read) and a punted call's park, each made in a fiber, trap the
+    /// domain `Malformed` instead of parking the fiber's task. Run past `admit`, each meets the native
+    /// tier's assertion first in a build with debug assertions.
+    #[test]
+    #[cfg_attr(debug_assertions, should_panic(expected = "a native tier's image"))]
+    fn a_futex_wait_in_a_fiber_run_past_admit_meets_the_backstop() {
+        let wait = "  vq = i64.const 16400\n  vzw = i32.const 0\n  vto = i64.const -1\n  vw = i32.atomic.wait vq vzw vto\n  vr = i64.extend_i32_u vw";
+        assert_eq!(
+            a_fiber_parks_past_admit(wait, Host::new()),
+            Err(Trap::Malformed)
+        );
+    }
+
+    #[test]
+    #[cfg_attr(debug_assertions, should_panic(expected = "a native tier's image"))]
+    fn a_pipe_read_in_a_fiber_run_past_admit_meets_the_backstop() {
+        let mut host = Host::new();
+        let (_, read) = host.grant_pipe();
+        let park = format!("  vc = i32.const {read}\n  vr = call.cap 0 0 (i64) -> (i64) vc(vz)");
+        assert_eq!(a_fiber_parks_past_admit(&park, host), Err(Trap::Malformed));
+    }
+
+    #[test]
+    #[cfg_attr(debug_assertions, should_panic(expected = "a native tier's image"))]
+    fn a_punted_call_in_a_fiber_run_past_admit_meets_the_backstop() {
+        let mut host = Host::new();
+        let requests = temen_interp::CapRequests::default();
+        let proc = host.grant_host_proc(temen_interp::HostProcGrant::declared("later", &requests));
+        let park = format!("  vc = i32.const {proc}\n  vr = call.cap 13 0 (i64) -> (i64) vc(vz)");
+        assert_eq!(a_fiber_parks_past_admit(&park, host), Err(Trap::Malformed));
     }
 }
