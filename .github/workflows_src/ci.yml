@@ -43,6 +43,13 @@ env:
   # Pin stable so a channel roll can't silently introduce new clippy/rustc lints
   # under -D warnings (bump deliberately, same posture as the nightly-pinned fuzz job).
   RUST_STABLE: "1.97.0"
+  # #3068 — the one nightly every nightly lane builds on (the sanitizers, miri, the wasm and build-std
+  # lanes, fuzz). A lane on the current nightly fails on whatever lint or deprecation landed that
+  # day, under `-D warnings`, on a commit that did not change. Bump it deliberately, in a PR that
+  # fixes what the new nightly flags. A dated toolchain is not named `nightly`: every step names it
+  # through this value (`cargo +"$RUST_NIGHTLY"`), and code a lane runs that picks a nightly reads
+  # `TEMEN_RUST_TOOLCHAIN`, set from it at that step. Keep in step with the same var in pages.yml.
+  RUST_NIGHTLY: "nightly-2026-11-16"
   # Part of every Swatinem/rust-cache key, which hashes `RUST*`/`CARGO*` env vars. The key covers
   # Cargo.lock and the member manifests but NOT the root `Cargo.toml`, so a `[profile]` edit there,
   # which rebuilds every dependency, still restores the old cache as a full match, and a full match
@@ -389,14 +396,14 @@ jobs:
           ]
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      # Pinned to a dated nightly, unlike the other nightly lanes (ISSUES.md I18): this job's first
-      # step *builds cargo-fuzz from source*, so its health depends on `latest nightly × cargo-fuzz's
-      # locked dep tree` compiling at 07:00 UTC — which broke for 5 straight nights (Jun 4-9, rustix
-      # vs a new reserved attribute) and silently produced zero fuzz coverage. The fuzz *targets*
-      # need nightly features, not the newest nightly. Bump the date deliberately (with the
-      # cargo-fuzz version) rather than riding the channel.
+      # On the workflow's dated nightly (`RUST_NIGHTLY`), as every nightly lane is since #3068. This
+      # was the first lane pinned (ISSUES.md I18): its first step *builds cargo-fuzz from source*, so
+      # on the channel its health depended on `latest nightly × cargo-fuzz's locked dep tree`
+      # compiling at 07:00 UTC — which broke for 5 straight nights (Jun 4-9, rustix vs a new reserved
+      # attribute) and silently produced zero fuzz coverage. The fuzz *targets* need nightly
+      # features, not the newest nightly. A bump of the pin has to build cargo-fuzz too.
       - uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2 # nightly
-        with: { toolchain: nightly-2026-07-01 }
+        with: { toolchain: "${{ env.RUST_NIGHTLY }}" }
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with: { workspaces: fuzz }
       - run: cargo install cargo-fuzz --locked
@@ -485,7 +492,7 @@ jobs:
       # The fuzz crate needs nightly; pin the same dated nightly the `fuzz` job builds with so this
       # check reflects what that job actually compiles (and can't spuriously break on a channel roll).
       - uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2 # nightly
-        with: { toolchain: nightly-2026-07-01 }
+        with: { toolchain: "${{ env.RUST_NIGHTLY }}" }
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           workspaces: |
@@ -503,7 +510,7 @@ jobs:
           # Pin explicitly rather than inheriting: installing two toolchains above leaves *nightly*
           # as the runner default, which is not what the stable crates should build with.
           TEMEN_CHECK_TOOLCHAIN: ${{ env.RUST_STABLE }}
-          TEMEN_CHECK_TOOLCHAIN_fuzz: nightly-2026-07-01
+          TEMEN_CHECK_TOOLCHAIN_fuzz: ${{ env.RUST_NIGHTLY }}
         run: scripts/ci/check-excluded.sh
 
   webgpu:
@@ -619,15 +626,18 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with: { toolchain: "${{ env.RUST_STABLE }}" }
-      # The harness shells out to `cargo +nightly rustc -Zbuild-std …`, so nightly + rust-src must be
-      # present. rust-src is the component the overlay patches.
+      # The harness shells out to `cargo +<nightly> rustc -Zbuild-std …`, so the pinned nightly +
+      # rust-src must be present. rust-src is the component the overlay patches. The overlay script
+      # and the harness take the toolchain's name from `TEMEN_RUST_TOOLCHAIN` (#3068).
       - name: install nightly + rust-src (for -Zbuild-std)
-        run: rustup toolchain install nightly --profile minimal --component rust-src
+        run: rustup toolchain install "$RUST_NIGHTLY" --profile minimal --component rust-src
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with: { workspaces: crates/temen-llvm }
       - name: apply the temen std overlay to nightly's rust-src
+        env: { TEMEN_RUST_TOOLCHAIN: "${{ env.RUST_NIGHTLY }}" }
         run: crates/temen-llvm/rust-temen/apply-overlay.sh
       - name: std_guest suite (lean + threads specs)
+        env: { TEMEN_RUST_TOOLCHAIN: "${{ env.RUST_NIGHTLY }}" }
         working-directory: crates/temen-llvm
         # Single-threaded: the tests already run serially, and forcing one thread keeps the build-std
         # timeout accounting per-test rather than racing several `rustc` builds at once.
@@ -790,9 +800,9 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2 # nightly
-        with: { components: miri }
+        with: { toolchain: "${{ env.RUST_NIGHTLY }}", components: miri }
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-      - run: cargo +nightly miri test -p temen-mem
+      - run: cargo +"$RUST_NIGHTLY" miri test -p temen-mem
         env:
           # Miri's weak-memory emulation ICEs on the differential test's mixed-size atomic accesses
           # ("partially overlapping store buffer when previous write was atomic" — a Miri bug, not ours).
@@ -825,7 +835,7 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2 # nightly
-        with: { components: rust-src }
+        with: { toolchain: "${{ env.RUST_NIGHTLY }}", components: rust-src }
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: cargo test -p temen-fiber (ASan + asan feature)
         run: cargo test -p temen-fiber --features asan -Z build-std --target x86_64-unknown-linux-gnu
@@ -844,7 +854,7 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2 # nightly
-        with: { components: rust-src }
+        with: { toolchain: "${{ env.RUST_NIGHTLY }}", components: rust-src }
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: cargo test -p temen-mem (TSan)
         run: cargo test -p temen-mem --tests -Z build-std --target x86_64-unknown-linux-gnu
@@ -955,7 +965,7 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2 # nightly
-        with: { components: rust-src }
+        with: { toolchain: "${{ env.RUST_NIGHTLY }}", components: rust-src }
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           workspaces: |
@@ -984,7 +994,7 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2 # nightly
-        with: { components: rust-src }
+        with: { toolchain: "${{ env.RUST_NIGHTLY }}", components: rust-src }
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with: { workspaces: crates/temen-llvm }
       - name: install LLVM/clang (build tools for the temen-llvm test harness)
@@ -1011,7 +1021,7 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2 # nightly
-        with: { components: rust-src }
+        with: { toolchain: "${{ env.RUST_NIGHTLY }}", components: rust-src }
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: held domains under ASan, each test in a process of its own
         # One process per test until #3032 is settled: two JIT runs in one process report a
@@ -1070,7 +1080,7 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2 # nightly
-        with: { components: rust-src }
+        with: { toolchain: "${{ env.RUST_NIGHTLY }}", components: rust-src }
       # Three workspaces: `browser` (the wasm engine), the root (temen-run's `prep_temen`/`build_image`),
       # and the workspace-excluded `crates/temen-llvm` (`temen-llvm-translate`). The latter two build the
       # Postgres regenerate half below; caching them is what keeps a warm run's re-translate at ~30s
@@ -1163,7 +1173,7 @@ jobs:
             -Clink-arg=--export=__stack_pointer -Clink-arg=--export=__tls_base \
             -Clink-arg=--export=__tls_size -Clink-arg=--export=__tls_align \
             -Clink-arg=--export=__wasm_init_tls" \
-            cargo +nightly build -Z build-std=std,panic_abort --release --lib --target wasm32-unknown-unknown
+            cargo +"$RUST_NIGHTLY" build -Z build-std=std,panic_abort --release --lib --target wasm32-unknown-unknown
           node browser-test.mjs
           # The `webgpu` capability in real Chromium (#2665): the engine serves the protocol temen
           # serves natively, against `navigator.gpu`. `render.temen`, the exact-pixel program the native
@@ -1420,7 +1430,7 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2 # nightly
-        with: { components: rust-src }
+        with: { toolchain: "${{ env.RUST_NIGHTLY }}", components: rust-src }
       # One workspace, unlike `browser-real`'s three: there is no Postgres regenerate half here, so the
       # root and `crates/temen-llvm` caches that job restores would be dead weight in this one.
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
@@ -1440,7 +1450,7 @@ jobs:
             -Clink-arg=--export=__stack_pointer -Clink-arg=--export=__tls_base \
             -Clink-arg=--export=__tls_size -Clink-arg=--export=__tls_align \
             -Clink-arg=--export=__wasm_init_tls" \
-            cargo +nightly build -Z build-std=std,panic_abort --release --lib --target wasm32-unknown-unknown
+            cargo +"$RUST_NIGHTLY" build -Z build-std=std,panic_abort --release --lib --target wasm32-unknown-unknown
       - name: nim card · worker reuse · prewarm gate
         working-directory: browser
         run: |
@@ -1624,11 +1634,13 @@ jobs:
       - name: install workload toolchains
         run: |
           rustup target add wasm32-unknown-unknown
-          rustup toolchain install nightly --profile minimal --component rust-src
+          rustup toolchain install "$RUST_NIGHTLY" --profile minimal --component rust-src
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with: { workspaces: bench }
       # `env -u RUSTFLAGS`: as in the `bench` job, so `bench/.cargo/config.toml` applies (#2779).
+      # `TEMEN_RUST_TOOLCHAIN`: the nightly its wasm64 lane builds with (#3068).
       - name: rustbench
+        env: { TEMEN_RUST_TOOLCHAIN: "${{ env.RUST_NIGHTLY }}" }
         working-directory: bench
         run: env -u RUSTFLAGS cargo run --release --bin rustbench
 

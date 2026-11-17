@@ -22,6 +22,15 @@ fn lane_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("rust-temen")
 }
 
+/// #3068 — the `+<toolchain>` argument for the lane's nightly: `TEMEN_RUST_TOOLCHAIN`, the name
+/// `apply-overlay.sh` patches the `rust-src` of, which CI sets to its dated pin; or `nightly`. A
+/// dated toolchain is not named `nightly`, so a literal `+nightly` under a pin would probe and
+/// build with the current one, whose `rust-src` the overlay never touched.
+fn nightly_arg() -> String {
+    let toolchain = std::env::var("TEMEN_RUST_TOOLCHAIN").unwrap_or_else(|_| "nightly".into());
+    format!("+{toolchain}")
+}
+
 /// The nightly sysroot's `rust-src` std tree, or `None` if nightly/rust-src is absent.
 fn nightly_std_src() -> Option<PathBuf> {
     // #906 (second occurrence) — this probe runs through the rustup shim (`rustc +nightly`),
@@ -33,7 +42,7 @@ fn nightly_std_src() -> Option<PathBuf> {
     static PROBE: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
     fn probe() -> Option<PathBuf> {
         let mut cmd = Command::new("rustc");
-        cmd.args(["+nightly", "--print", "sysroot"])
+        cmd.args([nightly_arg().as_str(), "--print", "sysroot"])
             .stdout(std::process::Stdio::piped());
         #[cfg(unix)]
         std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
@@ -98,7 +107,7 @@ fn build_std_bin_ll_target(name: &str, src: &str, target_file: &str) -> Option<P
         .env("RUSTC_BOOTSTRAP", "1")
         .env("CARGO_TARGET_DIR", work.join("target"))
         .args([
-            "+nightly",
+            nightly_arg().as_str(),
             "rustc",
             "-Zbuild-std=core,alloc,std,panic_abort",
             "-Zjson-target-spec",
