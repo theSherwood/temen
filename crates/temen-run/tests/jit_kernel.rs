@@ -4022,6 +4022,57 @@ block 0 () {
     });
 }
 
+/// #2958 slice 6 — a capture another producer left on the caller's thread is never a kernel run's. A
+/// held domain's call runs its handler inline on the caller's thread (`HeldSite::activate`), and a
+/// handler that traps under `-g` leaves its capture there, which nothing takes. The kernel route's
+/// root runs on that same thread: a run whose trap makes no capture (a division without `-g`)
+/// reports no fiber and no backtrace, not the handler's.
+#[test]
+fn a_held_handlers_capture_is_never_a_kernel_runs() {
+    let held = std::sync::Arc::new(module(
+        "type 0 func () -> (i64)
+type 1 interface { boom: 0 }
+export 0 interface \"svc\" 1 { boom: 1 }
+func () -> (i64) {
+block 0 () {
+  vr = i64.const 1
+  return vr
+  }
+}
+func () -> (i64) {
+block 0 () {
+  v0 = i64.const 1
+  v1 = i64.const 0
+  v2 = i64.div_s v0 v1
+  return v2
+  }
+}
+debug.file 0 \"h.c\"
+debug.fname 1 \"boom\"
+debug.loc 1 0 2 0 50 3
+",
+    ));
+    let bare = div0("root", false);
+    bounded("a held call, then the kernel route", move || {
+        let mut host = Host::new();
+        host.set_self_module(&held);
+        let (d, results) =
+            temen_run::hold(temen_interp::Executor::Jit, held, 0, &[], u64::MAX, host)
+                .unwrap_or_else(|(t, _)| panic!("the entry ends in {t:?}"));
+        assert_eq!(d.executor(), temen_interp::Executor::Jit, "held on the JIT");
+        assert_eq!(results, vec![temen_interp::Value::I64(1)]);
+        let mut fuel = 1_000_000;
+        let reply = d.call(0, 0, &[], &mut fuel);
+        // The handler's trap ends the domain (`CAP_REVOKED`, -9).
+        assert_eq!(reply, temen_interp::Reply::Failed(-9), "the handler traps");
+        assert_eq!(d.end().1, Some(Trap::DivByZero));
+        let end = kernel_end(&bare);
+        assert_eq!(end.result, Err(Trap::DivByZero));
+        assert!(end.backtrace.is_empty(), "{:?}", end.backtrace);
+        assert_eq!(end.trap_fiber, None, "no capture of its own");
+    });
+}
+
 /// The open-ended kinds the `cap` clause declines where no handle can change the answer, each
 /// `(type_id, op)`: an id `cap_id` leaves unassigned (3 and 9 retired, 15, 17, and the last below the
 /// guest ids), under which nothing is ever granted, so every call on one is a `CapFault`; and a
@@ -4363,6 +4414,7 @@ fn spawn_rows(m: &temen_ir::Module, budget: u64) -> [(&'static str, &'static str
         let mut host = Host::new();
         let admitted = jit_kernel::admit(&km, &host, false).expect("in the kernel's scope");
         let end = jit_kernel::run(admitted, fresh_start(budget), &mut host).expect("compiles");
+        assert!(end.vcpus >= 1, "it ran as kernel tasks");
         let r = end.result;
         (ended(r.is_ok(), r.err()), budget - host.fuel_left())
     });
@@ -4375,6 +4427,53 @@ fn spawn_rows(m: &temen_ir::Module, budget: u64) -> [(&'static str, &'static str
         ("the kernel route", kernel.0, kernel.1),
         ("today's route", today.0, today.1),
     ]
+}
+
+/// #2958 slice 6 — executor 2's root burns on from the draw that paid its entry, as the oracle's and
+/// the pump's do. 60 taken back-edges at budget 100 complete with 39 left on all three. Before, the
+/// rules paid the root's entry from a draw of half the room and kept it, while the root's task stepped
+/// on a fresh hand: it ran out at its 51st back-edge with 49 stranded.
+#[test]
+fn executor_2s_root_burns_on_from_its_entrys_draw() {
+    let m = module(
+        "func () -> (i64) {
+block 0 () {
+  vn = i64.const 61
+  br 1(vn)
+}
+block 1 (vi: i64) {
+  vone = i64.const 1
+  vj = i64.sub vi vone
+  vz = i64.eqz vj
+  br_if vz 2() 1(vj)
+}
+block 2 () {
+  vr = i64.const 7
+  return vr
+  }
+}
+",
+    );
+    let mut l = 100;
+    let tree = temen_interp::run(&m, 0, &[], &mut l).map(|_| l);
+    let mut l = 100;
+    let pump = temen_interp::bytecode::compile_and_run(&m, 0, &[], &mut l)
+        .expect("in its subset")
+        .map(|_| l);
+    let mut l = 100;
+    let (x2, _) = temen_interp::bytecode::compile_and_run_capture_over_parallel(
+        &m,
+        0,
+        &[],
+        &mut l,
+        &[],
+        None,
+    )
+    .expect("in its subset");
+    let x2 = x2.map(|_| l);
+    assert_eq!(tree, Ok(39), "the oracle");
+    assert_eq!(pump, tree, "the pump");
+    assert_eq!(x2, tree, "executor 2");
 }
 
 /// #2958 slice 6, #3081 — every engine's spawn pays a thread's entry by one rule: one unit taken from
@@ -4412,7 +4511,7 @@ type Grant = fn(&mut Host) -> i32;
 /// past the ops the table lists (0–5).
 const PAST_LAST: [(u32, u32, Grant, Result<i64, &str>); 6] = [
     (1, 1, Host::grant_exit, Err("CapFault")),
-    (2, 1, Host::grant_clock, Ok(0)),
+    (2, 1, clock_grant, Ok(CLOCK_AT)),
     (5, 6, Host::grant_memory, Ok(-22)),
     (14, 4, budget_grant, Ok(-22)),
     (4, 8, grant_region, Ok(-22)),
@@ -4421,6 +4520,15 @@ const PAST_LAST: [(u32, u32, Grant, Result<i64, &str>); 6] = [
 
 fn budget_grant(h: &mut Host) -> i32 {
     h.grant_budget(-1, -1, -1)
+}
+
+/// What [`clock_grant`]'s clock reads first: not `0`, which is also the zeroed result slot a call
+/// that served nothing leaves, so `Ok(CLOCK_AT)` can only be the clock's `now`.
+const CLOCK_AT: i64 = 4_242;
+
+fn clock_grant(h: &mut Host) -> i32 {
+    h.clock_ns = CLOCK_AT;
+    h.grant_clock()
 }
 
 /// #2958 slice 6 — an op past a built-in interface's last, on a genuine handle of that interface,

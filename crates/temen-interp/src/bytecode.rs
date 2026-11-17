@@ -19318,6 +19318,19 @@ impl Threads {
             e.fuel.for_thread(),
         )
     }
+
+    /// The root's thread's view and hand: the fuel [`SchedCore::new`] paid the root's entry from,
+    /// with what its draw left, as the oracle's root burns on from its entry's draw. The rules keep a
+    /// fresh hand of the domain's fuel. A fresh hand for the root would strand that draw with the
+    /// rules until the run ends, and the root run out of fuel early.
+    fn root_hand(&mut self) -> (Option<Mem>, Fuel) {
+        let e = &mut self.core.domains[0];
+        let rules = e.fuel.for_thread();
+        (
+            e.mem.as_ref().map(Mem::fork_for_thread),
+            std::mem::replace(&mut e.fuel, rules),
+        )
+    }
 }
 
 /// A run on executor 2: the domain its tasks run, the root's powerbox cell, the shared state, how
@@ -19549,8 +19562,8 @@ pub enum CallEntry {
     /// The run's root task's entry.
     Root,
     /// The entry of a task that is not the run's root. On a native tier that is always a
-    /// `thread.spawn` child, whose spawn paid its entry, one unit taken from its node ([`thread_task`],
-    /// #3081), so the tier's code starts its fuel holding that unit for its entry's own charge. That
+    /// `thread.spawn` child, whose entry its spawn alone charges ([`thread_task`], #3081), so the
+    /// tier's code starts its fuel holding a credit of one unit for its entry's own charge. That
     /// holds only because [`kernel_op`] declines every other way a task is made (`§14 children`,
     /// `process`): the PR that removes `§14 children` must revisit it, as a child's entry is not
     /// paid that way (#3012).
@@ -20163,14 +20176,14 @@ impl ThreadRun {
 
     /// Start the root on a thread of its own, for the opener to watch the run ([`Self::watch`]).
     fn start_root(self: &std::sync::Arc<Self>) {
-        let (view, hand) = self.state.lock_unpoisoned().hand(0);
+        let (view, hand) = self.state.lock_unpoisoned().root_hand();
         let r = std::sync::Arc::clone(self);
         self.start_thread(move || run_task_thread(r, 0, view, hand), None);
     }
 
     /// Run the root on this thread, the opener's ([`ThreadPlatform::opener`]).
     fn run_root_here(self: &std::sync::Arc<Self>) {
-        let (view, hand) = self.state.lock_unpoisoned().hand(0);
+        let (view, hand) = self.state.lock_unpoisoned().root_hand();
         run_task_thread(std::sync::Arc::clone(self), 0, view, hand);
     }
 
