@@ -377,6 +377,105 @@ fn an_interpreter_frozen_detached_child_thaws_on_the_jit() {
     }
 }
 
+/// #3034 — the same run, frozen on each engine, records the live detached child's own task id
+/// differently: the tree-walker its scheduler id, the JIT 0 (each child the root of its own domain).
+/// The thaw pass admits both, and each engine thaws the other's artifact to the uninterrupted total.
+/// The two artifacts differ for one run, which INVARIANTS #9 does not allow: #PARITY-ISSUE. This row
+/// pins the difference until that issue removes it.
+#[test]
+fn each_engine_thaws_the_others_detached_artifact_though_they_record_its_task_differently() {
+    let parent = parent();
+    let child = instrument(CHILD);
+    let frozen_win = || {
+        let mut w = init_durable_window(1 << PARENT_LOG2, ARENA);
+        write_state(&mut w, ARENA, STATE_UNWINDING);
+        w
+    };
+
+    // The tree-walker's artifact.
+    let (mut ihost, args) = powerbox(&child);
+    let iargs: Vec<Value> = args.iter().map(|&a| Value::I32(a as i32)).collect();
+    let mut fuel = 50_000_000u64;
+    let (fr, isnap) = run_capture_reserved_with_host(
+        &parent,
+        0,
+        &iargs,
+        &mut fuel,
+        &frozen_win(),
+        PARENT_LOG2,
+        &mut ihost,
+    );
+    assert!(fr.is_ok(), "the tree-walker froze: {fr:?}");
+    let iart = temen_snapshot::freeze(&parent, &isnap, &ihost).expect("serialize");
+
+    // The JIT's artifact.
+    let (mut jhost, jargs) = powerbox(&child);
+    let jsnap = match temen_run::jit_cap_run(
+        &parent,
+        0,
+        &jargs,
+        &MemLayout::image(frozen_win()),
+        PARENT_LOG2,
+        0,
+        &mut jhost,
+        None,
+    ) {
+        Ok((_, snap)) => snap,
+        Err(JitError::Unsupported(_)) => return, // a target without the child executor
+        Err(e) => panic!("JIT freeze failed: {e:?}"),
+    };
+    let jart = temen_snapshot::freeze(&parent, jsnap.bytes(), &jhost).expect("serialize");
+
+    let task = |art: &[u8]| {
+        let r = temen_snapshot::decode_residue(art).expect("decode");
+        assert_eq!(r.live_detached.len(), 1, "one live child rides");
+        r.live_detached[0].task
+    };
+    assert_ne!(
+        task(&iart),
+        0,
+        "the tree-walker records the child's scheduler id"
+    );
+    assert_eq!(task(&jart), 0, "the JIT records 0 (#PARITY-ISSUE)");
+
+    let restore = |art: &[u8]| {
+        let mut h = Host::new();
+        h.set_durable(true);
+        h.grant_durable_module(&child);
+        let mut w = temen_snapshot::restore(art, &parent, &mut h).expect("restore");
+        begin_thaw(&mut w, ARENA, 0);
+        (h, w)
+    };
+    // The JIT's artifact on the tree-walker.
+    let (mut h, w) = restore(&jart);
+    let mut fuel = 50_000_000u64;
+    let (r, _) =
+        run_capture_reserved_with_host(&parent, 0, &iargs, &mut fuel, &w, PARENT_LOG2, &mut h);
+    assert_eq!(
+        r,
+        Ok(vec![Value::I64(4950)]),
+        "the JIT's artifact on the tree-walker"
+    );
+    // The tree-walker's artifact on the JIT.
+    let (mut h, w) = restore(&iart);
+    let (o, _) = temen_run::jit_cap_run(
+        &parent,
+        0,
+        &args,
+        &MemLayout::image(w.to_vec()),
+        PARENT_LOG2,
+        0,
+        &mut h,
+        None,
+    )
+    .expect("JIT thaw");
+    assert_eq!(
+        returned(o),
+        vec![4950],
+        "the tree-walker's artifact on the JIT"
+    );
+}
+
 /// #2010 — the root of a depth-2 durable tree: `v0` its `Instantiator`, `v1` the [`NEST`] module,
 /// `v2` a `Budget` whose `spawn` room falls to 2 once the tree has settled ([`nest_powerbox`]),
 /// `v3` freeze authority over detached progeny, `v4` a settle time in ms, `v5` its stdout, and

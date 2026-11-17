@@ -304,7 +304,7 @@ residue reaches an engine (`Host::set_thaw`, `CompiledModule::set_durable`), and
 re-creates less than all of it declines the thaw whole to the tree-walker rather than thawing part
 of it. The checks at each use that predate the pass (#2945) stay only in front of a raw host store
 or an unchecked index, as a backstop that is loud in debug. Open: whether an artifact may set the
-attestation and the guest-JIT quotas at all, or only narrow what the restoring host grants (#3101).
+attestation and the guest-JIT quotas at all, or only narrow what the restoring host grants (#3096).
 A frame-capture design would have had the same boundary, as a parser over attacker-controlled
 frames in the host; this one keeps the structured part small and checks it in one place.
 
