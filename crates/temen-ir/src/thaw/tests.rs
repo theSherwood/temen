@@ -349,9 +349,9 @@ fn an_unsorted_residue_is_admitted_in_seeding_order() {
 }
 
 /// #3034 — the one rule over a guest-written extent ([`extent_fits`]), as each engine's freeze applies
-/// it where it reads one: the root's context (0), a vCPU's (the top of the pool), a fiber's (its slot
-/// + 1). Each region admits its empty frame base and its end, and nothing outside: not zero, not a
-/// header word, not a neighbour's region, not past the arena.
+/// it where it reads one: the root's context (0), a vCPU's (the top of the pool), a fiber's (one past
+/// its slot). Each region admits its empty frame base and its end, and nothing outside: not zero, not
+/// a header word, not a neighbour's region, not past the arena.
 #[test]
 fn an_extent_fits_only_inside_its_own_region() {
     for ctx in [0, 1, MAX_SHADOW_CONTEXTS - 1] {

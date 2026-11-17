@@ -319,9 +319,16 @@ one rule (`temen_ir::thaw::extent_fits`, the rule the thaw pass applies to an ar
 | a spawned vCPU's | its own end (TW settle; JIT vCPU harvest and inline children) | the thread traps `Unreachable`, which ends its domain |
 | a fiber's | its flatten by the freeze drive, or its return under the unwind (TW, bytecode); its `Complete` at the exit swap (JIT) | the drive's trap, `Unreachable`, the run's result |
 
-What the freeze records is the value it checked, so no later write can change it. A guest fault in a
-detached child's domain is that child's trap, through the engine's ordinary end of a trapped child:
-its join answers `Unreachable`, and it rides its parent's artifact as a completed child. Nothing else
+What the freeze records is the value it checked, so no later write can change it.
+
+**Whose a trap in the cut is** (owner decision 25, #2949). A detached child's own trap during the
+cut, a guest fault above or any other its code or its own checks raise, in its root or a thread of
+its domain, is the child's: it ends as a trapped child ends, its join answers the trap, it rides its
+parent's artifact as a completed child, and the parent's freeze goes on, on every engine. A member
+the engine **could not freeze** (a park its thaw cannot re-derive, a live child nothing can reach) is
+a refusal: it fails the run, raised where it is refused (`VCpu::freeze_refused`), because an artifact
+without it would look whole and not be (INVARIANTS #9c, #1689). A trap of the root domain's own
+vCPUs ends the run as any trap of its does; a fork twin's is its own. Nothing else
 is checked at a freeze. The residue rides on the powerbox unsealed (`Host::leave_freeze`), and
 whatever thaws from it admits it through the pass first: `restore`, the tree-walker's thaw (each
 domain it re-creates, a detached child's and a twin's included), the bytecode engine's and the JIT's.

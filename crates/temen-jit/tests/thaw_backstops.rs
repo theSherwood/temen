@@ -1,13 +1,26 @@
 //! #3034 — the refusals that stay in front of a JIT thaw's raw stores, behind the thaw pass
 //! ([`temen_ir::thaw::validate`]). Only the pass builds a [`JitThaw`], so no hostile value reaches
-//! them from outside this crate: these tests freeze a real run, bend one value of its residue, and
-//! set it as the next run's seed directly, having said so ([`temen_ir::thaw::expect_backstops`]): a
-//! hole in the pass is loud in debug otherwise. Each is refused, in the build CI runs and in release,
-//! as the tree-walker refuses it (`temen-interp`'s `thaw_backstop_tests`).
+//! them through the API: these tests freeze a real run, bend one value of its residue, and seed the
+//! next run with it through this crate's test hook (`CompiledModule::seed_unadmitted`, the
+//! `thaw-backstop-tests` feature), having said so ([`temen_ir::thaw::expect_backstops`]): a hole in the
+//! pass is loud in debug otherwise. Each is refused, in the build CI runs and in release, as the
+//! tree-walker refuses it (`temen-interp`'s `tests/thaw_backstops.rs`).
+//!
+//! Every row here takes the backstop guard, and no other row is in this binary: the guard quiets the
+//! backstops process-wide while it is held.
+#![cfg(any(
+    all(unix, any(target_arch = "x86_64", target_arch = "aarch64")),
+    all(windows, target_arch = "x86_64")
+))]
 
-use super::*;
 use temen_durable::{init_durable_window, transform_module_assume_confined, write_state};
 use temen_ir::durable_abi::ShadowArena;
+use temen_ir::thaw::{FrozenFiber, FrozenVCpu};
+use temen_ir::Module as IrModule;
+use temen_jit::{CompiledModule, DurableResidue, JitOutcome, JitThaw, TrapKind, INERT_CAP_THUNK};
+
+/// The capture buffer each run hands back its window in.
+const SNAP_CAP: usize = 1 << 18;
 
 const ARENA: ShadowArena = ShadowArena::new(16448, 65536);
 const LOG2: u8 = 17;
@@ -53,7 +66,7 @@ fn compiled(m: &IrModule) -> CompiledModule {
     CompiledModule::compile(
         m,
         0,
-        empty_cap_thunk,
+        INERT_CAP_THUNK,
         core::ptr::null_mut(),
         LOG2,
         None,
@@ -72,7 +85,7 @@ fn thawed(m: &IrModule, bend: impl FnOnce(&mut DurableResidue)) -> JitOutcome {
     let mut win = init_durable_window(1 << LOG2, ARENA);
     write_state(&mut win, ARENA, temen_durable::STATE_UNWINDING);
     let mut cm = compiled(m);
-    cm.durable = true;
+    cm.set_durable(JitThaw::none()).expect("durable");
     let (o, snap) = cm.run(&[], Some(&win), Some(SNAP_CAP)).expect("the freeze");
     assert!(matches!(o, JitOutcome::Returned(_)), "the freeze: {o:?}");
     let mut residue = cm.take_durable_residue();
@@ -80,11 +93,7 @@ fn thawed(m: &IrModule, bend: impl FnOnce(&mut DurableResidue)) -> JitOutcome {
     let mut snap = snap;
     temen_durable::begin_thaw(&mut snap, ARENA, 0);
     let mut cm = compiled(m);
-    cm.seed.vcpus = residue.vcpus;
-    cm.seed.fibers = residue.fibers;
-    cm.seed.root_sp = residue.root_sp;
-    cm.seed.children = Some(residue.children);
-    cm.durable = true;
+    cm.seed_unadmitted(residue);
     cm.run(&[], Some(&snap), Some(SNAP_CAP))
         .expect("the thaw")
         .0
@@ -179,7 +188,7 @@ fn a_vcpu_record_without_an_arena_writes_no_thaw_word() {
         let mut win = init_durable_window(1 << LOG2, ARENA);
         write_state(&mut win, ARENA, temen_durable::STATE_UNWINDING);
         let mut cm = compiled(&m);
-        cm.durable = true;
+        cm.set_durable(JitThaw::none()).expect("durable");
         cm.run(&[], Some(&win), Some(SNAP_CAP)).expect("the freeze");
         cm.take_durable_residue()
     };
@@ -205,17 +214,18 @@ block 0 (vsp: i64, varg: i64) {
         shadow: None,
     });
     let mut cm = compiled(&m);
-    cm.durable = true;
-    cm.seed.vcpus = real
-        .vcpus
-        .into_iter()
-        .map(|v| FrozenVCpu {
-            completed_result: Some(5),
-            ..v
-        })
-        .collect();
-    cm.seed.root_sp = real.root_sp;
-    cm.seed.children = Some(real.children);
+    cm.seed_unadmitted(DurableResidue {
+        vcpus: real
+            .vcpus
+            .into_iter()
+            .map(|v| FrozenVCpu {
+                completed_result: Some(5),
+                ..v
+            })
+            .collect(),
+        fibers: Vec::new(),
+        ..real
+    });
     let win = vec![0u8; 1 << LOG2];
     let (_, out) = cm.run(&[], Some(&win), Some(SNAP_CAP)).expect("the run");
     assert_eq!(

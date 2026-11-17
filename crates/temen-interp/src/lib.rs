@@ -2727,8 +2727,8 @@ fn drive_arc(
     if host.admit_residue(code, 0).is_err() {
         return (Err(Trap::Malformed), Vec::new(), None);
     }
-    #[cfg(test)]
-    thaw_backstop_tests::bend_admitted(&mut host.residue);
+    #[cfg(feature = "thaw-backstop-tests")]
+    thaw_backstop::bend_admitted(&mut host.residue);
     let thaw = ThawResidue::take(host, 0);
     let handoff = host.handoff();
     // The powerbox is **shared** by every vCPU of the run (so spawned threads inherit it): move the
@@ -3853,20 +3853,24 @@ fn drive_over_cell(
                 // unreached, never written as if it had unwound. So is one that ran to its end while
                 // its domain was held for its own paged children (#2455): it did not unwind.
                 // #1688 — one rung between its last poll and its return returned: its result rides as
-                // a completed child's does. Never a trap: that may be the run's end reaping it where it
-                // parked.
-                let (unwound, withheld, out) = {
+                // a completed child's does. A trap only when it was the child's own: any other may
+                // be the run's end reaping it where it parked.
+                // Owner decision 25 (#2949) — one a trap of its own ended during the cut rides that
+                // trap as a completed child's outcome: its join answers it.
+                let dom = p.host.lock_unpoisoned().domain_id() as usize;
+                let (unwound, withheld, own_trap, out) = {
                     let mut s = sched.lock();
                     let withheld = s.withheld.remove(&p.child_task).map(|w| w.outcome);
                     (
                         s.unwound.contains(&p.child_task),
                         withheld.is_some(),
+                        s.own_trap_domains.contains(&dom),
                         withheld.or_else(|| s.results.remove(&p.child_task)),
                     )
                 };
                 let m = match out {
                     Some(o) if unwound => o.mem.filter(|_| o.result.is_ok()),
-                    Some(o) if !withheld && o.result.is_ok() => {
+                    Some(o) if !withheld && (o.result.is_ok() || own_trap) => {
                         // #2465 — one its spawner detached leaves nothing anyone can join.
                         if p.joinable {
                             owner
@@ -4009,10 +4013,10 @@ fn drive_over_cell(
         // synthesizes the root's outcome — the domain's ending trap, with its `mem`/`fuel`
         // residue — when a sibling's trap/exit killed it while parked or running.
         let mut out = s.results.remove(&root_id).expect("root vCPU finished");
-        // #1689 — a freeze is all-or-nothing (INVARIANTS #9c): a vCPU that failed once the freeze
-        // was in flight — a §14 child's backstop refusal, say — fails the run, though the root
-        // itself unwound `Ok` before it. Otherwise the residue already recorded looks like a whole
-        // freeze.
+        // #1689, owner decision 25 (#2949) — a freeze is all-or-nothing (INVARIANTS #9c): a member
+        // it could not carry — a §14 child's refusal, say — fails the run, though the root itself
+        // unwound `Ok` before it ([`Sched::freeze_fault`]). Otherwise the residue already recorded
+        // looks like a whole freeze. A detached child's own trap is not that: it rides as the child's.
         if let (true, Ok(_), Some(t)) = (froze, &out.result, s.freeze_fault) {
             out.result = Err(t);
         }
@@ -7624,9 +7628,17 @@ struct Sched {
     /// `results`, so to its spawner, which runs on, it reads as running, as the spawner's own cut will
     /// record it; the harvest takes it, and a `kill` ends it ([`kill_withheld`]).
     withheld: BTreeMap<TaskId, Withheld>,
-    /// #1689 — the first trap of any vCPU (a fork twin's excepted) that finished once the freeze was
-    /// in flight. `drive` fails the run with it: a freeze with a failed member is not a freeze.
+    /// #1689, owner decision 25 (#2949) — the first trap that fails a freeze in flight: a member the
+    /// freeze could not carry, raised where it was refused ([`VCpu::freeze_refused`]), or a vCPU of
+    /// the run's root domain. `drive` fails the run with it: a freeze with a member it could not
+    /// carry is not a freeze. A detached child's own trap (or a fork twin's) is that child's, and
+    /// rides the cut as its join's answer.
     freeze_fault: Option<Trap>,
+    /// Owner decision 25 (#2949) — each domain other than the run's root's that a trap of its own ended
+    /// while a freeze was in flight: a vCPU of it ended `Err` before anything else ended the domain
+    /// (a kill, the run's teardown). The harvest files such a detached child as a completed child
+    /// answering its trap, rather than as unreached.
+    own_trap_domains: BTreeSet<usize>,
     /// #2695 step 2 — each domain resting after its entry returned ([`HeldDomain`]), by
     /// [`Domain::id`]: what its activations run over ([`activation`]). Kept, dead or not, until
     /// the run ends.
@@ -10428,6 +10440,7 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 if bounded {
                     release_lanes(sched, &lanes(&v));
                 }
+                v.freeze_refused |= detached_live_refused;
                 let result = if detached_live_refused {
                     Err(Trap::ThreadFault)
                 } else if froze {
@@ -10503,6 +10516,7 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 // is dropped — its domain key, its powerbox (the dying domain's queue), and the tickets
                 // of dispatches it admitted but never replied (their cross-domain callers wake, D37).
                 let key = v.domain.id;
+                let freeze_refused = v.freeze_refused;
                 // #2695 step 2 — a held root whose entry returned rests: its domain lives on, and
                 // each call into it runs as an activation ([`activation`]). An activation is not its
                 // domain's main either. Neither ends the domain, as a thread's end does not.
@@ -10643,9 +10657,17 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 // #2455 — a child that unwound while its spawner's domain is held is withheld from the
                 // spawner, which runs on: until the hold releases, it reads as still running.
                 let withhold = froze && spawner_domain.is_some_and(|d| s.held.contains_key(&d));
+                // #1689, owner decision 25 (#2949) — a member the freeze could not carry fails the run,
+                // raised where it was refused; a trap of the root domain's own vCPUs ends the run
+                // anyway. A detached child's own trap is the child's: its join answers it, and the
+                // cut files it as a completed child. A fork twin's is its own as well.
                 if s.froze && !s.forked_twins.contains_key(&id) {
                     if let Err(t) = &outcome.result {
-                        s.freeze_fault.get_or_insert(*t);
+                        if freeze_refused || key == s.root_domain {
+                            s.freeze_fault.get_or_insert(*t);
+                        } else if !s.dead.contains_key(&key) {
+                            s.own_trap_domains.insert(key);
+                        }
                     }
                 }
                 // (Never during a freeze unwind: servers are quiesced by freeze-on-quiesce, not run.)
@@ -12552,6 +12574,33 @@ pub type LiveDetached = temen_ir::thaw::LiveDetached<ThawedDetached>;
 /// A live fork twin of a thaw residue: the admitted keys and the restored domain.
 pub type LiveTwin = temen_ir::thaw::LiveTwin<ThawedTwin>;
 
+/// #3034 — test infrastructure only (the `thaw-backstop-tests` feature, which no product build turns
+/// on): bend the residue of the next tree-walker thaw started on this thread once the pass admitted
+/// it, so a test reaches the refusals behind the pass (`tests/thaw_backstops.rs`).
+#[cfg(feature = "thaw-backstop-tests")]
+#[doc(hidden)]
+pub mod thaw_backstop {
+    use super::Residue;
+
+    type Bend = Box<dyn FnOnce(&mut Residue)>;
+
+    std::thread_local! {
+        static BEND: core::cell::RefCell<Option<Bend>> = const { core::cell::RefCell::new(None) };
+    }
+
+    /// Bend the next thaw's admitted residue on this thread (a run admits its residue on the
+    /// thread that starts it).
+    pub fn bend_next_thaw(bend: impl FnOnce(&mut Residue) + 'static) {
+        BEND.with(|b| *b.borrow_mut() = Some(Box::new(bend)));
+    }
+
+    pub(crate) fn bend_admitted(r: &mut Residue) {
+        if let Some(bend) = BEND.with(|b| b.borrow_mut().take()) {
+            bend(r);
+        }
+    }
+}
+
 /// The thaw residue a domain's powerbox holds at rest: what its last freeze left, or what a restore
 /// admitted ([`Host::set_thaw`]); taken by the next run.
 pub type Residue = temen_ir::thaw::RawResidue<ThawedDetached, ThawedTwin>;
@@ -13594,6 +13643,10 @@ struct VCpu {
     /// can re-create ([`DeclineCause::UnitThread`], #3108). Set at the spawn: the vCPU's frames are a
     /// fiber's while it runs one.
     unit_thread: bool,
+    /// #1689, owner decision 25 (#2949) — the freeze could not carry this vCPU (a refusal: a park its
+    /// thaw cannot re-derive, a live child nothing can reach). Its end fails the run
+    /// ([`Sched::freeze_fault`]); a trap of its own does not, unless its domain is the run's root's.
+    freeze_refused: bool,
     /// #2695 step 2 — the call this vCPU answers: an activation of a resting domain
     /// ([`activation`]). Its return replies, and, as a thread's does, its end ends nothing else.
     answers: Option<Answers>,
@@ -13825,6 +13878,7 @@ impl VCpu {
             frozen: Vec::new(),
             spawn_residue: None,
             unit_thread: false,
+            freeze_refused: false,
             answers: None,
             vcpu_ctx: 0,
             dstate: STATE_NORMAL,
@@ -13900,6 +13954,7 @@ impl VCpu {
             frozen: Vec::new(),
             spawn_residue: None,
             unit_thread: false,
+            freeze_refused: false,
             answers: None,
             vcpu_ctx: self.vcpu_ctx,
             dstate: self.dstate,
@@ -13980,6 +14035,7 @@ impl VCpu {
             frozen: Vec::new(),
             spawn_residue: None,
             unit_thread: false,
+            freeze_refused: false,
             answers: None,
             vcpu_ctx: 0,
             dstate: STATE_NORMAL,
@@ -14202,6 +14258,7 @@ impl VCpu {
                     .fiber_park(&self.domain.registry, slot)
                     .is_some_and(reissues)
             {
+                self.freeze_refused = true;
                 return Err(Trap::FiberFault);
             }
         }
@@ -15021,6 +15078,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
         frozen, // freeze-unwind of an active-chain fiber pushes here (slice 3.2); also `freeze_drive`
         spawn_residue: _,
         unit_thread: _,
+        freeze_refused: _,
         vcpu_ctx,  // §12.8 4A.5: this vCPU's root shadow context, for `durable.shadow_base`
         dstate: _, // swapped at the dispatch boundary, not inside `run_inner`
         wait_indefinite: _, // #1584 — set at the futex park site, read by the quiesce gate
@@ -44853,7 +44911,7 @@ mod detached_freeze_tests;
 mod freeze_census_tests;
 
 #[cfg(test)]
-mod thaw_backstop_tests;
+mod freeze_cut_tests;
 
 #[cfg(test)]
 mod take_from_cell_tests {

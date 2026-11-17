@@ -23,6 +23,10 @@ stack-check = []
 # reject it, and reports the mutants it accepted. Test infrastructure only: the `temen` tests and
 # the `validator_mutants` fuzz target turn it on, and no product build does.
 validator-mutants = []
+# #3034 — test infrastructure only: seed a durable thaw with a residue the pass did not admit, for the
+# backstop rows behind the pass (`tests/thaw_backstops.rs`). This crate's own tests turn it on (the
+# self dev-dependency below), so those rows run in every `cargo test`; no product build does.
+thaw-backstop-tests = []
 
 [dev-dependencies]
 # Parse hand-written text IR in the `stack-check` guard test (temen-text → temen-ir; no dep cycle).
@@ -30,9 +34,11 @@ temen-text = { path = "../temen-text" }
 # The bulk-memory differential test (`bulk_mem.rs`) cross-checks the JIT against both interpreters.
 # It does not depend on temen-jit, so there is no cycle.
 temen-interp = { path = "../temen-interp" }
-# #3034 — the thaw backstop tests (`src/thaw_backstop_tests.rs`) instrument a durable module to freeze
-# and thaw. Depends on `temen-ir` and `temen-verify` alone, so no cycle.
+# #3034 — the thaw backstop rows (`tests/thaw_backstops.rs`) instrument a durable module to freeze and
+# thaw, through this crate's test hook. temen-durable depends on `temen-ir` and `temen-verify` alone,
+# so no cycle.
 temen-durable = { path = "../temen-durable" }
+temen-jit = { path = ".", features = ["thaw-backstop-tests"] }
 # #2481 — the **second decoder** the hand-rolled machine-code validator (`validate`) is cross-checked
 # against: a test compiles real modules and asserts our decoder's instruction boundaries and
 # control-flow classification agree with iced-x86's. Pure Rust and **dev-only**, so it is never in

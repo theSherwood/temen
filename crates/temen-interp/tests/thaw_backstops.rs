@@ -1,16 +1,21 @@
 //! #3034 — the refusals that stay in front of a thaw's raw stores, behind the thaw pass
 //! ([`temen_ir::thaw::validate`]). No residue the pass refuses reaches them (every thaw admits its
-//! residue first), so these tests bend the residue after the pass admitted it ([`bend_admitted`]),
-//! having said so ([`temen_ir::thaw::expect_backstops`]): a hole in the pass is loud in debug
-//! otherwise. Each is refused, in the build CI runs and in release: a
-//! fiber slot past the arena is not seeded, and its resume answers `FiberFault`; a vCPU with a join
-//! slot past the table, no context of the pool, or an entry of another signature is not re-created.
+//! residue first), so these tests bend the residue after the pass admitted it
+//! ([`temen_interp::thaw_backstop`]), having said so ([`temen_ir::thaw::expect_backstops`]): a hole in
+//! the pass is loud in debug otherwise. Each is refused, in the build CI runs and in release: a fiber
+//! slot past the arena is not seeded, and its resume answers `FiberFault`; a vCPU with a join slot
+//! past the table, no context of the pool, or an entry of another signature is not re-created.
+//!
+//! Every row here takes the backstop guard, and no other row is in this binary: the guard quiets the
+//! backstops process-wide while it is held.
 
-use super::*;
 use temen_durable::{
     begin_thaw, init_durable_window, transform_module_assume_confined, write_state,
 };
+use temen_interp::thaw_backstop::bend_next_thaw;
+use temen_interp::{run_capture_reserved_with_host, FrozenFiber, Host, Residue, Trap, Value};
 use temen_ir::durable_abi::ShadowArena;
+use temen_ir::Module;
 
 const ARENA: ShadowArena = ShadowArena::new(16448, 65536);
 const LOG2: u8 = 17;
@@ -78,20 +83,6 @@ fn instrument(src: &str) -> Module {
     inst
 }
 
-thread_local! {
-    /// What the next thaw on this thread does to its residue once the pass admitted it.
-    static BEND: core::cell::RefCell<Option<Box<dyn FnOnce(&mut Residue)>>> =
-        core::cell::RefCell::new(None);
-}
-
-/// The test hook behind the pass: a thaw's residue, admitted, bent as the test asked
-/// ([`thawed`]). A run admits its residue on the thread that starts it.
-pub(super) fn bend_admitted(r: &mut Residue) {
-    if let Some(bend) = BEND.with(|b| b.borrow_mut().take()) {
-        bend(r);
-    }
-}
-
 /// `inst` frozen at its first safepoint, then thawed with its residue bent by `bend` after the pass
 /// admitted it: the thaw's result.
 fn thawed(inst: &Module, bend: impl FnOnce(&mut Residue) + 'static) -> Result<Vec<Value>, Trap> {
@@ -102,7 +93,7 @@ fn thawed(inst: &Module, bend: impl FnOnce(&mut Residue) + 'static) -> Result<Ve
     let mut fuel = 1_000_000u64;
     let (r, mut snap) = run_capture_reserved_with_host(inst, 0, &[], &mut fuel, &win, LOG2, &mut h);
     assert!(r.is_ok(), "the freeze: {r:?}");
-    BEND.with(|b| *b.borrow_mut() = Some(Box::new(bend)));
+    bend_next_thaw(bend);
     begin_thaw(&mut snap, ARENA, 0);
     let mut fuel = 1_000_000u64;
     run_capture_reserved_with_host(inst, 0, &[], &mut fuel, &snap, LOG2, &mut h).0
@@ -144,21 +135,4 @@ fn a_vcpu_the_pass_refuses_is_not_re_created() {
     for (bend, want) in cases {
         assert_eq!(thawed(&inst, bend), want);
     }
-}
-
-/// #3034 R2.3 — a run carries the cut its vCPUs unwound into only when its root unwound and the run
-/// did not fail: a root that returned while a thread unwound keeps its result, and nothing rides. No
-/// deterministic guest reaches that on the tree-walker (the root cannot return without a poll after
-/// the trigger), so the rule is shown directly.
-#[test]
-fn a_root_that_returned_carries_no_cut() {
-    assert!(carries_cut(true, &Ok(vec![Value::I64(0)])));
-    assert!(
-        !carries_cut(false, &Ok(vec![Value::I64(3)])),
-        "the root returned"
-    );
-    assert!(
-        !carries_cut(true, &Err(Trap::Unreachable)),
-        "the run failed"
-    );
 }

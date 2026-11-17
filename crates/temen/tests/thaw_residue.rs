@@ -1580,21 +1580,21 @@ fn unit_thaws_on_every_engine(inst: &Module, art: &[u8], jh: i32, froze: &str, w
         let mut h = Host::new();
         h.set_durable(true);
         h.set_jit_hosts_fibers(true);
-        temen_run::set_jit_durable_policy_confined(&mut h, &inst);
-        let mut w = temen_snapshot::restore(art, &inst, &mut h).expect("restore");
+        temen_run::set_jit_durable_policy_confined(&mut h, inst);
+        let mut w = temen_snapshot::restore(art, inst, &mut h).expect("restore");
         begin_thaw(&mut w, TEST_ARENA, 0);
         (h, w)
     };
     let (mut h, w) = restored();
     assert_eq!(
-        interp_run_with(&inst, &w, jh, &mut h),
+        interp_run_with(inst, &w, jh, &mut h),
         Ok(vec![Value::I64(want)]),
         "frozen on the {froze}, thawed on the tree-walker"
     );
     let (mut h, w) = restored();
     let mut fuel = 10_000_000u64;
     let bc = temen_interp::bytecode::compile_and_run_capture_reserved_with_host(
-        &inst,
+        inst,
         0,
         &[Value::I32(jh)],
         &mut fuel,
@@ -1610,7 +1610,7 @@ fn unit_thaws_on_every_engine(inst: &Module, art: &[u8], jh: i32, froze: &str, w
     );
     let (mut h, w) = restored();
     let jit = temen_run::jit_cap_run(
-        &inst,
+        inst,
         0,
         &[jh as i64],
         &MemLayout::image(w),

@@ -11,6 +11,10 @@ publish = false
 # interpreter path compiles byte-identical; on → `Op::Call` increments a thread-local counter the
 # host reads back (see `callprof_*`). Never enabled in a shipped build.
 callprof = []
+# #3034 — test infrastructure only: a hook that bends a thaw's residue after the pass admitted it, for
+# the backstop rows behind the pass (`tests/thaw_backstops.rs`). This crate's own tests turn it on
+# (the self dev-dependency below), so those rows run in every `cargo test`; no product build does.
+thaw-backstop-tests = []
 
 [dependencies]
 temen-ir.workspace = true
@@ -41,6 +45,8 @@ page_size = "0.6"
 # parser (only depends on `temen-ir`), so it keeps the test crate Miri-buildable — unlike the `temen`
 # integration-test crate, which pulls in the Cranelift JIT that Miri can't compile.
 [dev-dependencies]
+# #3034 — this crate with its backstop test hook, for `tests/thaw_backstops.rs` (see the feature).
+temen-interp = { path = ".", features = ["thaw-backstop-tests"] }
 temen-text.workspace = true
 # Test-only: instrument durable modules for the #1361 detached-child freeze/thaw tests
 # (`src/detached_freeze_tests.rs`), which need this crate's own test build — the only one where a

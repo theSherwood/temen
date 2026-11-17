@@ -1793,7 +1793,7 @@ fn scribble_nest() -> String {
 func (i64, i64) -> (i64) {{
 block 0 (v0: i64, v1: i64) {{
   vsa = i64.const {word}
-  vsv = i64.const {val}
+  vsv = i64.const 8
   i64.store vsa vsv
   va = i64.const 66000
   vw0 = i32.const 0
@@ -1804,11 +1804,7 @@ block 0 (v0: i64, v1: i64) {{
   }}
 }}
 ",
-        word = ARENA.region_base(0),
-        val = std::env::var("SCRIB")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(8)
+        word = ARENA.region_base(0)
     )
 }
 
@@ -1836,14 +1832,6 @@ fn a_childs_scribbled_shadow_word_ends_the_child_and_the_parents_freeze_goes_on(
         let Some((r, host, snap, root, child, args)) = budgets(&scribble_nest(), e, 1) else {
             continue; // a target without the JIT's child executor
         };
-        eprintln!(
-            "PROBE {e:?} r {r:?} frozen {:?} captured {}",
-            host.frozen_detached(),
-            host.captured_detached().len()
-        );
-        if std::env::var("PROBEONLY").is_ok() {
-            continue;
-        }
         assert_eq!(r, Ok(0), "{e:?}: the parent's freeze goes on");
         assert_eq!(
             completed_children(&host),

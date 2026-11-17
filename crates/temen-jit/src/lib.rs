@@ -2040,9 +2040,6 @@ impl FreezeController {
     }
 }
 
-#[cfg(all(test, fiber_rt))]
-mod thaw_backstop_tests;
-
 #[cfg(test)]
 mod freeze_controller_tests {
     use super::*;
@@ -5086,6 +5083,19 @@ impl CompiledModule {
         self.seed.detached = detached;
         self.durable = true;
         Ok(())
+    }
+
+    /// #3034 — test infrastructure only (the `thaw-backstop-tests` feature, which no product build
+    /// turns on): make the next run a durable thaw seeded with `residue` as it stands, without the
+    /// pass, so a test reaches the refusals behind it (`tests/thaw_backstops.rs`).
+    #[cfg(feature = "thaw-backstop-tests")]
+    #[doc(hidden)]
+    pub fn seed_unadmitted(&mut self, residue: DurableResidue) {
+        self.seed.fibers = residue.fibers;
+        self.seed.vcpus = residue.vcpus;
+        self.seed.root_sp = residue.root_sp;
+        self.seed.children = Some(residue.children);
+        self.durable = true;
     }
 
     /// #3034 — the record kinds a thaw run of this instance re-creates: fibers (it stood up a fiber
