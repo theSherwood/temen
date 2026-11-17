@@ -9613,6 +9613,19 @@ impl DispatchParks {
             && region.is_none()
     }
 
+    /// Whether `p` holds none of the flags [`Self::take`] drains, read one by one without draining:
+    /// the debug check that [`Host::parks_left`] misses none of them.
+    fn none_left(p: &Host) -> bool {
+        !p.stdin_parked
+            && p.park_request.load(std::sync::atomic::Ordering::Relaxed) == 0
+            && p.pipe_read_parked.is_none()
+            && p.pipe_write_parked.is_none()
+            && !p.sig_interrupt
+            && p.region_wake.is_none()
+            && p.pipe_wake.is_none()
+            && p.pipe_wake_writers.is_none()
+    }
+
     /// Drain every per-op flag from `p`. Call ONLY inside the dispatch's own lock scope.
     fn take(p: &mut Host) -> Self {
         let request = p.take_park_request();
@@ -23048,7 +23061,25 @@ impl Vm {
             // only ever means "the op *this* dispatch just ran wants to park", so one
             // left set would misfire on a later, unrelated op. The wake flags need no
             // action here: see [`DispatchParks::take`].
-            (r, DispatchParks::take(p))
+            // #2958 slice 5 — drain only when the call left a flag: `!parks_left()` is exactly
+            // "`DispatchParks::take` would find nothing". `take` drains, and `parks_left` covers:
+            // - the stdin park (`stdin_parked`): its `stdin_parked` term;
+            // - the personality request (`park_request`), and the spawn plan taken only with a
+            //   `SpawnSelf` request: `transients_left`'s `park_request` term;
+            // - both pipe parks (`pipe_read_parked`, `pipe_write_parked`), the region wake
+            //   (`region_wake`) and both pipe wakes (`pipe_wake`, `pipe_wake_writers`):
+            //   `transients_left`'s terms, one each;
+            // - the interrupt latch (`sig_interrupt`): its `sig_interrupt` term.
+            // The read is under this dispatch's own hold of the `Host`, the hold the call that could
+            // leave a flag ran in, so no other vCPU's dispatch can leave or clear one between the
+            // call and the read (#1173). Most calls leave none: they copy one null pointer out of
+            // this closure, and the box is made only by a call that parks or wakes.
+            let parks = p.parks_left().then(|| Box::new(DispatchParks::take(p)));
+            debug_assert!(
+                parks.is_some() || DispatchParks::none_left(p),
+                "a flag `parks_left` missed"
+            );
+            (r, parks)
         });
         // #2645 — an unlocked host procedure runs now, the domain's host let go: on the
         // parallel driver its other tasks make their host calls meanwhile. It raised no
@@ -23109,6 +23140,20 @@ impl Vm {
             pc += 1;
             return Ok(Ok(pc));
         }
+        // A call that left no flag drained nothing and is done: its results, the next op, and the
+        // #1198 stop yield (the same as `CallPark::Done(None)` below).
+        let Some(parks) = parks else {
+            self.set_results(base + *dst as usize, res, results);
+            pc += 1;
+            if signal_poll.as_ref().is_some_and(|(_, s)| s.stopped()) {
+                self.module = module;
+                self.cur = cur;
+                self.base = base;
+                self.pc = pc;
+                return Ok(Err(Outcome::Suspended));
+            }
+            return Ok(Ok(pc));
+        };
         // A `call.import` dispatch carries the `CAP_IMPORT_TYPE_ID` sentinel — read
         // the `(type_id, op)` it reaches, a grouped binding's through its remap
         // ([`Host::import_target`], the dispatch's own translation), so an imported stdin
@@ -23131,7 +23176,7 @@ impl Vm {
         // `posix_spawn`, a blocking `waitpid`) is the cooperative driver's; `fork`,
         // `execve` and `posix_spawn` advance past the op, `waitpid` rewinds it.
         let read = eff_tid == super::cap_id::STREAM && eff_op == 0;
-        let decided = parks.decide(read, |f| match f {
+        let decided = (*parks).decide(read, |f| match f {
             ParkFact::Interrupted(sig) => {
                 (sig && !host.with(|p| p.signal_restart())) || host.with(|p| p.park_interrupted())
             }
