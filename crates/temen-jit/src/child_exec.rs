@@ -157,6 +157,10 @@ pub(crate) struct ChildTask {
     /// never resumed again, until the last of them ends, and only then frees its window and
     /// powerbox ([`ChildExec::finish`]).
     retiring: bool,
+    /// #3034 — a durable root's shadow-SP word as it stood when the root returned while its vCPUs ran
+    /// on ([`ChildExec::settle`]): its extent if it unwound, as the oracle records it at the unwind.
+    /// The word is guest memory, and a vCPU of the child may write it before the last of them ends.
+    root_word: Option<u64>,
     /// What a thawed durable child's capture left beside its image: its fibers (#2031) and its
     /// `thread.spawn` vCPUs with its root's extent (#2010), re-created when it is filed
     /// ([`ChildExec::spawn`]). Empty for a fresh spawn.
@@ -312,6 +316,7 @@ impl ChildTask {
             children,
             holds_lanes: false,
             retiring: false,
+            root_word: None,
             thaw: crate::DurableResidue::default(),
         })
     }
@@ -366,11 +371,18 @@ impl ChildTask {
         };
         let base = self.window.base() as u64;
         self.vm.ended().is_none()
-            // SAFETY: the window is live while the task is; its arena holds the freeze word and, in
-            // context 0's region, the root's shadow-SP word.
+            // SAFETY: the window is live while the task is; its arena holds the freeze word.
             && unsafe { fiber_rt::window_is_unwinding(base, d.shadow) }
-            && unsafe { fiber_rt::read_shadow_sp(base, d.shadow.region_base(0)) }
-                > d.shadow.frame_base(0)
+            && self.root_word(d) > d.shadow.frame_base(0)
+    }
+
+    /// The root's shadow-SP word: as it stood when the root returned, if its vCPUs ran on after it
+    /// ([`Self::root_word`]'s field), else as it stands.
+    fn root_word(&self, d: &crate::instantiator_rt::DurableCell) -> u64 {
+        // SAFETY: the window is live while the task is; context 0's region holds the root's word.
+        self.root_word.unwrap_or_else(|| unsafe {
+            fiber_rt::read_shadow_sp(self.window.base() as u64, d.shadow.region_base(0))
+        })
     }
 
     /// Open the window for the host's read of it: the guest may have closed pages through the Memory
@@ -423,9 +435,7 @@ impl ChildTask {
         // #1684 — and every slot nobody flattened, so a thaw rebuilds the table slot for slot.
         let flattened: Vec<usize> = fibers.iter().map(|f| f.slot).collect();
         fibers.extend(self.rt.table().unflattened_for_freeze(&flattened));
-        // SAFETY: as `root_unwound`, which read the same word.
-        let root_sp =
-            unsafe { fiber_rt::read_shadow_sp(self.window.base() as u64, d.shadow.region_base(0)) };
+        let root_sp = self.root_word(d);
         Some(crate::DetachedCapture {
             image,
             tail,
@@ -3547,6 +3557,9 @@ impl ChildExec {
     /// they have ended is what its parent's join is owed.
     fn settle(&self, task: &mut ChildTask) {
         task.retiring = true;
+        if let Some(d) = task.done.durable.as_ref() {
+            task.root_word = Some(task.root_word(d));
+        }
         let (result, trap) = task.outcome();
         // A trap ends the child's domain: its parked vCPUs observe the shared cell and unwind.
         if trap != 0 {

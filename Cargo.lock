@@ -882,6 +882,7 @@ dependencies = [
  "iced-x86",
  "libc",
  "loom",
+ "temen-durable",
  "temen-encode",
  "temen-fiber",
  "temen-interp",

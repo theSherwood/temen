@@ -30,6 +30,9 @@ temen-text = { path = "../temen-text" }
 # The bulk-memory differential test (`bulk_mem.rs`) cross-checks the JIT against both interpreters.
 # It does not depend on temen-jit, so there is no cycle.
 temen-interp = { path = "../temen-interp" }
+# #3034 — the thaw backstop tests (`src/thaw_backstop_tests.rs`) instrument a durable module to freeze
+# and thaw. Depends on `temen-ir` and `temen-verify` alone, so no cycle.
+temen-durable = { path = "../temen-durable" }
 # #2481 — the **second decoder** the hand-rolled machine-code validator (`validate`) is cross-checked
 # against: a test compiles real modules and asserts our decoder's instruction boundaries and
 # control-flow classification agree with iced-x86's. Pure Rust and **dev-only**, so it is never in

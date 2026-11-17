@@ -2040,6 +2040,9 @@ impl FreezeController {
     }
 }
 
+#[cfg(all(test, fiber_rt))]
+mod thaw_backstop_tests;
+
 #[cfg(test)]
 mod freeze_controller_tests {
     use super::*;
@@ -10702,6 +10705,22 @@ fn fiber_func_type() -> FuncType {
     FuncType {
         params: vec![ValType::I64, ValType::I64],
         results: vec![ValType::I64],
+    }
+}
+
+/// #3034 — the record kinds a durable §14 child running `m` re-creates at a thaw, as
+/// [`CompiledModule::reseeds`] says for a root: fibers when its code uses `cont.*` or `gc.roots` (it
+/// then has the fiber runtime), vCPUs (a durable child always stands up a domain), and detached
+/// children when it holds an `Instantiator` (its nursery).
+pub fn child_reseeds(m: &IrModule) -> [bool; 3] {
+    #[cfg(fiber_rt)]
+    {
+        [module_uses_fibers(m), true, module_uses_instantiator(m)]
+    }
+    #[cfg(not(fiber_rt))]
+    {
+        let _ = m;
+        [false; 3]
     }
 }
 

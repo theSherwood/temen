@@ -2951,12 +2951,9 @@ fn seed_domain(s: &mut Sched, sched: &Arc<Scheduler>, mut root: Box<VCpu>, resid
             // #3034 — the thaw pass admitted each slot's context as one `cont.new` hands out
             // ([`ShadowContexts::fiber_fits`]). The refusal stays in front of the swap's stores at
             // `region_base(slot + 1)`: a slot past it is not seeded, and its resume answers
-            // `FiberFault`, as the JIT's seed does. A hole in the pass is loud in debug.
+            // `FiberFault`, as the JIT's seed does. A hole in the pass is loud in debug ([`temen_ir::thaw::backstop`]).
             if !root.domain.registry.seed_fits(arena) {
-                debug_assert!(
-                    false,
-                    "the thaw pass admits only a fiber slot inside the arena"
-                );
+                temen_ir::thaw::backstop("the thaw pass admits only a fiber slot inside the arena");
                 break;
             }
             let got = if ff.is_free() {
@@ -3153,7 +3150,7 @@ fn seed_thread(
         .is_some_and(|f| f.params == [ValType::I64, ValType::I64] && f.results == [ValType::I64]);
     let ctx = ShadowContexts::vcpu_of_sp(p.arena(), ff.shadow_sp).filter(|_| entry_ok);
     if !slot_ok {
-        debug_assert!(false, "the thaw pass admits only a join slot of the table");
+        temen_ir::thaw::backstop("the thaw pass admits only a join slot of the table");
         s.results
             .insert(cid, Outcome::ended(Err(Trap::ThreadFault)));
         return;
@@ -3183,10 +3180,7 @@ fn seed_thread(
         return;
     }
     let Some(ctx) = ctx else {
-        debug_assert!(
-            false,
-            "the thaw pass admits only a vCPU's context and a spawn entry"
-        );
+        temen_ir::thaw::backstop("the thaw pass admits only a vCPU's context and a spawn entry");
         s.results
             .insert(cid, Outcome::ended(Err(Trap::ThreadFault)));
         return;
@@ -4011,10 +4005,10 @@ fn drive_over_cell(
             out.result = Err(*t);
         }
         // #3034 — the freeze hands what each domain of the cut unwound to its powerbox through the one
-        // hand-off ([`Host::leave_freeze`]): none from a run that trapped, and a residue the pass
-        // refuses ends the run `Unreachable` with none, the cut being all-or-nothing (INVARIANTS #9c).
-        // Whenever a freeze was in flight: some vCPU unwound for it, though the root may have
-        // trapped before it could.
+        // hand-off ([`Host::leave_freeze`]). Only a root that unwound took a cut: a run whose root
+        // returned or trapped leaves none. A value the guest wrote ends the run as the push check's
+        // trap, `Unreachable`; an engine fault fails the freeze to the embedder, the run's own
+        // outcome standing, and its codec then refuses to write it.
         if !s.unwound.is_empty() {
             let arena = out
                 .mem
@@ -4024,10 +4018,17 @@ fn drive_over_cell(
                 funcs: &funcs,
                 arena,
             };
-            let trapped = out.result.is_err();
-            if leave_cut(&host_shared, code, 0, trapped).is_err() {
-                drop_cut(&host_shared);
-                out.result = Err(Trap::Unreachable);
+            let trapped = !froze || out.result.is_err();
+            match leave_cut(&host_shared, code, 0, trapped) {
+                Ok(()) => {}
+                Err(FreezeFault::Guest) => {
+                    drop_cut(&host_shared);
+                    out.result = Err(Trap::Unreachable);
+                }
+                Err(FreezeFault::Engine) => {
+                    drop_cut(&host_shared);
+                    host_shared.lock_unpoisoned().refuse_freeze();
+                }
             }
         }
         (out, s.trap_origin.take(), std::mem::take(&mut s.twin_traps))
@@ -4055,39 +4056,60 @@ fn drive_over_cell(
     (out.result, origin.bt, origin.fiber)
 }
 
-/// #3034 — [`Host::leave_freeze`] for each domain of a tree-walker cut: `host`'s, then each captured
-/// detached child's (against its own module) and each live fork twin's (in its forking context), with
-/// theirs. `Err` if any domain's residue is refused.
+/// #3034 — [`Host::leave_freeze`] for each domain of a tree-walker cut: each captured detached child's
+/// (against its own module) and each live fork twin's (in its forking context), with theirs, then
+/// `host`'s. A child's fault is the child's: one whose residue holds a value its guest wrote ends with
+/// the push check's trap, `Unreachable`, and rides as a completed child (or an exited twin) answering
+/// it, as one that trapped before the cut rides. `Err` names the fault of `host`'s own domain, or an
+/// engine fault anywhere in its cut, which fails the whole freeze.
 fn leave_cut(
     host: &Arc<Mutex<Host>>,
     code: temen_ir::thaw::Code<'_>,
     root_ctx: usize,
     trapped: bool,
-) -> Result<(), Trap> {
+) -> Result<(), FreezeFault> {
+    let unreachable = Err(Trap::Unreachable.code());
     let (children, twins) = {
         let mut h = host.lock_unpoisoned();
-        let raw = h.take_residue();
-        let own = h.leave_freeze(code, root_ctx, raw, trapped);
-        let children: Vec<_> = h
-            .captured_detached()
-            .iter()
-            .map(|c| (Arc::clone(&c.host), Arc::clone(&c.module)))
-            .collect();
-        let twins: Vec<_> = h
-            .captured_twins()
-            .iter()
-            .map(|t| (Arc::clone(&t.host), t.launch.ctx as usize))
-            .collect();
-        own?;
-        (children, twins)
+        (
+            std::mem::take(&mut h.captured_detached),
+            std::mem::take(&mut h.captured_twins),
+        )
     };
-    for (child, module) in children {
-        leave_cut(&child, (&*module).into(), 0, trapped)?;
+    let (mut kept, mut ended) = (Vec::new(), Vec::new());
+    for c in children {
+        match leave_cut(&c.host, (&*c.module).into(), 0, trapped) {
+            Ok(()) => kept.push(c),
+            Err(FreezeFault::Guest) => {
+                if c.launch.joinable {
+                    ended.push(FrozenDetached {
+                        parent_task: c.parent_task,
+                        slot: c.slot,
+                        completed_result: unreachable,
+                    });
+                }
+            }
+            Err(FreezeFault::Engine) => return Err(FreezeFault::Engine),
+        }
     }
-    for (twin, ctx) in twins {
-        leave_cut(&twin, code, ctx, trapped)?;
+    let (mut kept_twins, mut exited) = (Vec::new(), Vec::new());
+    for t in twins {
+        match leave_cut(&t.host, code, t.launch.ctx as usize, trapped) {
+            Ok(()) => kept_twins.push(t),
+            Err(FreezeFault::Guest) => exited.push(FrozenTwin {
+                pid: t.pid,
+                outcome: unreachable,
+            }),
+            Err(FreezeFault::Engine) => return Err(FreezeFault::Engine),
+        }
     }
-    Ok(())
+    let mut h = host.lock_unpoisoned();
+    h.captured_detached = kept;
+    h.captured_twins = kept_twins;
+    let mut raw = h.take_residue();
+    raw.detached.extend(ended);
+    raw.exited_twins.extend(exited);
+    h.leave_freeze(code, root_ctx, raw, trapped)
 }
 
 /// [`Host::drop_freeze`] for each domain of a cut [`leave_cut`] refused.
@@ -9853,6 +9875,9 @@ struct Seat<'a> {
     children: &'a Arc<Mutex<Children>>,
     host: &'a Arc<Mutex<Host>>,
     registry: &'a Arc<FiberRegistry>,
+    /// #3034 — it is a `thread.spawn` child whose entry is an installed §22 unit's function
+    /// ([`DeclineCause::UnitThread`]).
+    unit_thread: bool,
 }
 
 impl VCpu {
@@ -9862,6 +9887,8 @@ impl VCpu {
             children: &self.domain.children,
             host: &self.domain.host,
             registry: &self.domain.registry,
+            unit_thread: self.spawn_residue.is_some()
+                && self.frames.first().is_some_and(|f| f.module != 0),
         }
     }
 }
@@ -9961,6 +9988,9 @@ fn freeze_census(
             }
         }
         for seat in me.into_iter().chain(others.iter()) {
+            if seat.unit_thread {
+                return declined(DeclineCause::UnitThread, seat.id, None);
+            }
             let root_domain = Arc::ptr_eq(seat.host, root);
             if !root_domain && !hosts.iter().any(|(_, h)| Arc::ptr_eq(h, seat.host)) {
                 hosts.push((seat.id, Arc::clone(seat.host)));
@@ -12552,6 +12582,16 @@ pub type LiveTwin = temen_ir::thaw::LiveTwin<ThawedTwin>;
 /// admitted ([`Host::set_thaw`]); taken by the next run.
 pub type Residue = temen_ir::thaw::RawResidue<ThawedDetached, ThawedTwin>;
 
+/// #3034 — why a freeze's hand-off refused a domain's residue ([`Host::leave_freeze`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FreezeFault {
+    /// A value the guest wrote: the domain ends with the push check's own trap, `Unreachable`.
+    Guest,
+    /// The engine and the thaw pass disagree: the freeze fails to the embedder, whose codec refuses
+    /// to write it ([`Host::freeze_refused`]).
+    Engine,
+}
+
 /// #3034 — a domain's serve state as a snapshot carries it (DURABILITY.md §13.4, #1676, #1901), for
 /// [`Host::set_serve`]: the dispatches queued and the replies settled, the ticket counter, the
 /// abandoned reply waits `(context, ticket)`, and the frozen handlers `(fiber slot, ticket)`.
@@ -14845,6 +14885,8 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
     // This domain's shadow arena is a property of its window, fixed for the run — read once so the
     // placement calls below never re-borrow `v` while a frame or the registry is borrowed mutably.
     let arena = v.arena();
+    // Whether it is a unit's thread, for a freeze census it triggers ([`Seat::unit_thread`]).
+    let unit_thread = v.seat().unit_thread;
     let mut budget = quantum; // instructions left before a forced `Yield`
                               // A timed `svc.wait`'s deadline fired (I38): consumed by the rewound serve arm below, which
                               // returns its count instead of re-parking. Only ever set in the same `run_inner` call that
@@ -15060,6 +15102,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 children: &*children,
                 host: &*host,
                 registry: &*registry,
+                unit_thread,
             }
         };
     }
@@ -23540,6 +23583,10 @@ pub enum DeclineCause {
     ForkTwin,
     /// A vCPU is parked at a site whose [`FreezeRule`] is still `Decline` (#1898).
     Parked(ParkSite),
+    /// #3034 — a `thread.spawn` child runs an installed §22 unit's function: its residue names the
+    /// function by its index in the unit, but not the unit, so no thaw could re-create it (one would
+    /// run a function of module 0 by that index).
+    UnitThread,
 }
 
 /// #1671 — a freeze the run **declined**. At the instant a freeze trigger fires, a census asks
@@ -26781,6 +26828,8 @@ pub struct Host {
     /// #1361 step 3 — the harvested form (see [`CapturedDetached`]): each live detached child's
     /// unwound window + powerbox, for the codec to embed as a sub-artifact.
     captured_detached: Vec<CapturedDetached>,
+    /// #3034 — the last freeze's residue was refused for an engine fault ([`Host::freeze_refused`]).
+    freeze_refused: bool,
     /// #1688 — this domain's fork twins a freeze carried, each a domain of its own (see
     /// [`CapturedTwin`]), for the codec to embed under their pids.
     captured_twins: Vec<CapturedTwin>,
@@ -27437,6 +27486,7 @@ impl Host {
             residue: Residue::default(),
             pending_detached: Vec::new(),
             captured_detached: Vec::new(),
+            freeze_refused: false,
             captured_twins: Vec::new(),
             unreached_twins: Vec::new(),
             freeze_declined: None,
@@ -28525,18 +28575,19 @@ impl Host {
     /// it harvested. A freeze admits its own residue as a thaw does ([`temen_ir::thaw::validate`]),
     /// against `code`, the code the domain ran, from shadow context `root_ctx`.
     ///
-    /// A run that `trapped` leaves none: the outcome is the trap. A residue the pass refuses is one
-    /// the guest wrote: each context's shadow-SP word is guest memory, which the transform's push
-    /// check bounds only at that context's own unwind (DURABILITY.md §3). It ends the run as that
-    /// check's own trap, `Unreachable`, and leaves none. Either way nothing is carried: the residue,
-    /// the captured detached children and twins, and the frozen serve handlers go.
+    /// A run that `trapped` leaves none: the outcome is the trap. A residue the pass refuses leaves
+    /// none either, and says whose fault it is ([`FreezeFault`]): the guest's, when the refused rule
+    /// reads a value the guest wrote (each context's shadow-SP word is guest memory, which the
+    /// transform's push check bounds only at that context's own unwind, DURABILITY.md §3); otherwise
+    /// the engine's, which marks this powerbox so the codec refuses to write it
+    /// ([`Host::freeze_refused`]).
     pub fn leave_freeze<'a>(
         &mut self,
         code: impl Into<temen_ir::thaw::Code<'a>>,
         root_ctx: usize,
         raw: Residue,
         trapped: bool,
-    ) -> Result<(), Trap> {
+    ) -> Result<(), FreezeFault> {
         let installs = self.installs_code();
         match (
             trapped,
@@ -28550,15 +28601,38 @@ impl Host {
                 self.drop_freeze();
                 Ok(())
             }
-            (false, Err(_)) => {
+            (false, Err(r)) => {
                 self.drop_freeze();
-                Err(Trap::Unreachable)
+                if r.guest {
+                    Err(FreezeFault::Guest)
+                } else {
+                    self.refuse_freeze();
+                    temen_ir::thaw::backstop(
+                        "a freeze's residue the thaw pass refuses for no guest value",
+                    );
+                    Err(FreezeFault::Engine)
+                }
             }
         }
     }
 
+    /// #3034 — whether this powerbox's last freeze left a residue the thaw pass refused for a rule
+    /// no guest value breaks: the engine and the pass disagree, and no artifact of it may be
+    /// written. Cleared by the next freeze's hand-off.
+    pub fn freeze_refused(&self) -> bool {
+        self.freeze_refused
+    }
+
+    /// #3034 — fail this powerbox's freeze for an engine fault in its cut ([`FreezeFault::Engine`]):
+    /// nothing is carried, and the codec refuses to write it ([`Host::freeze_refused`]).
+    pub fn refuse_freeze(&mut self) {
+        self.drop_freeze();
+        self.freeze_refused = true;
+    }
+
     /// Everything a freeze left for the codec on this powerbox, gone: no artifact carries it.
     pub fn drop_freeze(&mut self) {
+        self.freeze_refused = false;
         self.residue = Residue::default();
         self.captured_detached.clear();
         self.captured_twins.clear();
@@ -28571,7 +28645,7 @@ impl Host {
     pub fn take_thaw(&mut self, m: &Module) -> Result<Thaw, temen_ir::thaw::Malformed> {
         let installs = self.installs_code();
         temen_ir::thaw::validate(m, installs, 0, self.take_residue()).map_err(|r| {
-            self.residue = *r.0;
+            self.residue = *r.residue;
             temen_ir::thaw::Malformed
         })
     }

@@ -10274,7 +10274,6 @@ fn new_fiber(
         .as_ref()
         .map_or(super::ShadowArena::EMPTY, |m| m.shadow_arena());
     let func = (funcref as u32 as usize & source.primary().table_mask) as i32;
-    let durable = host.with(|h| h.is_durable());
     let charge = host.with(|h| h.fiber_charge()).ok_or(Trap::FiberFault)?;
     fibers
         .with(|f, fsp, meta| {
@@ -15204,6 +15203,12 @@ impl SchedCore {
         bell: Option<super::Bell>,
     ) -> Result<SchedCore, Trap> {
         let mut h = host.lock_unpoisoned();
+        // #3034 — every run of this engine starts here, so here is where a thaw residue it does not
+        // re-create whole is refused: an entry that can decline did so first ([`run`]); any other
+        // (a reactor's call, a `CoopRun`, a `ThreadRun`) is refused before anything is seeded.
+        if !admits_thaw(&h) {
+            return Err(Trap::Malformed);
+        }
         reapply_installs(&h, source, &table)?;
         // Fuel unification: the root's entry is paid as its task is made, as a thread's is
         // ([`entry_task`]). Gated exactly as the tree-walker's `drive` (`super::drive_arc`): a durable
@@ -15232,12 +15237,7 @@ impl SchedCore {
         // (cleared) from the host; empty for a freeze or ordinary run.
         let mut fibers = FiberTables::default();
         {
-            // Only the fibers: every durable entry onto this engine declined a residue with more
-            // ([`admits_thaw`]), and what is left stays on the host rather than being dropped.
-            debug_assert!(
-                admits_thaw(&h),
-                "a thaw residue this engine does not re-create"
-            );
+            // Only the fibers: a residue with more was refused above ([`admits_thaw`]).
             let mut seed = h.take_frozen_fibers();
             seed.sort_by_key(|f| f.slot);
             for (expected, ff) in seed.into_iter().enumerate() {

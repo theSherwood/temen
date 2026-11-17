@@ -330,7 +330,10 @@ fn a_refused_residue_is_handed_back() {
     r.vcpus[1].func = 99;
     let want = r.clone();
     match validate(&module(Some(A)), true, 0, r) {
-        Err(Refused(back)) => assert_eq!(back.vcpus, want.vcpus),
+        Err(r) => {
+            assert_eq!(r.residue.vcpus, want.vcpus);
+            assert!(!r.guest, "an entry is no value a guest writes");
+        }
         Ok(_) => panic!("admitted"),
     }
 }

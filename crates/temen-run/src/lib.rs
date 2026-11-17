@@ -1511,6 +1511,15 @@ pub fn jit_cap_run(
     // must run the serialized (locked-`Host`) thunk, even if the top-level module itself uses no
     // concurrency op. Read before any `mem::take`.
     let hosts_threads = host.jit_hosts_threads();
+    // #3034 — a durable run whose units may spawn threads is the tree-walker's: a unit's thread
+    // cannot be frozen (its residue names a function of the unit, not the unit), and the tree-walker's
+    // freeze census declines a freeze while one runs (`DeclineCause::UnitThread`). The JIT has no
+    // census, so it declines the run whole rather than reach a freeze it would have to refuse.
+    if durable && hosts_threads {
+        return Err(temen_jit::JitError::Unsupported(
+            "durable JIT run hosting a unit's threads: the tree-walker declines their freezes",
+        ));
+    }
     // A guest whose workers make concurrent `call.cap`s (threaded `Jit.compile`, DESIGN.md §22) runs
     // the **serialized** thunk over a per-domain `Mutex<Host>`; a single-threaded guest keeps the
     // unlocked `cap_thunk` + raw `Host` path verbatim (zero lock cost). The guest-facing iface is
@@ -1577,10 +1586,10 @@ pub fn jit_cap_run(
             hg.set_jit_native_ctx(0);
             hg.set_serve_ctx(0);
             hg.set_park_hub(0);
-            let refused = jit_durable_leave(&mut cm, m, &mut hg, ended(&r));
+            let left = jit_durable_leave(&mut cm, m, &mut hg, ended(&r));
             drop(hg);
             *host = Host::from_cell(host_cell);
-            let r = refused_run(r, refused);
+            let r = refused_run(r, left);
             return r.map(|(o, bytes)| (o, jit_layout(m, host, bytes, cm.take_tail_out())));
         }
     }
@@ -1630,8 +1639,8 @@ pub fn jit_cap_run(
     // The module dies with this call — leave no dangling registration behind.
     host.set_jit_native_ctx(0);
     host.set_park_hub(0);
-    let refused = jit_durable_leave(&mut cm, m, host, ended(&r));
-    refused_run(r, refused).map(|(o, bytes)| (o, jit_layout(m, host, bytes, cm.take_tail_out())))
+    let left = jit_durable_leave(&mut cm, m, host, ended(&r));
+    refused_run(r, left).map(|(o, bytes)| (o, jit_layout(m, host, bytes, cm.take_tail_out())))
 }
 
 /// Whether a run ended other than by returning: a trap, an exit or a host unwind. A freeze in such a
@@ -1640,14 +1649,17 @@ fn ended<B>(r: &Result<(JitOutcome, B), temen_jit::JitError>) -> bool {
     !matches!(r, Ok((JitOutcome::Returned(_), _)))
 }
 
-/// #3034 — a run whose freeze left a residue the thaw pass refuses ends as the push check's own trap,
-/// `Unreachable` ([`Host::leave_freeze`]), as on the tree-walker.
+/// #3034 — a run whose freeze left a residue holding a value its guest wrote ends as the push check's
+/// own trap, `Unreachable` ([`Host::leave_freeze`]), as on the tree-walker. An engine fault leaves the
+/// run's outcome, and fails the freeze to the embedder.
 fn refused_run<B>(
     r: Result<(JitOutcome, B), temen_jit::JitError>,
-    refused: bool,
+    left: Result<(), temen_interp::FreezeFault>,
 ) -> Result<(JitOutcome, B), temen_jit::JitError> {
     match r {
-        Ok((_, b)) if refused => Ok((JitOutcome::Trapped(temen_jit::TrapKind::Unreachable), b)),
+        Ok((_, b)) if left == Err(temen_interp::FreezeFault::Guest) => {
+            Ok((JitOutcome::Trapped(temen_jit::TrapKind::Unreachable), b))
+        }
         r => r,
     }
 }
@@ -1678,12 +1690,7 @@ fn jit_durable_enter(
     // #3034 — nor a kind of record this instance stood up no runtime for: the pass admits one that
     // code installed through a `Jit` grant made, which this instance hosts only under the grant's
     // hosting (#3104).
-    let [fibers, vcpus, detached] = cm.reseeds();
-    let r = host.residue();
-    if (!fibers && !r.fibers.is_empty())
-        || (!vcpus && !r.vcpus.is_empty())
-        || (!detached && !(r.detached.is_empty() && r.live_detached.is_empty()))
-    {
+    if !reseeds(cm.reseeds(), host.residue()) {
         return Err(temen_jit::JitError::Unsupported(
             "durable JIT thaw: a record kind this run stands up no runtime for",
         ));
@@ -1798,10 +1805,22 @@ fn jit_relaunches(host: &Host) -> bool {
         && host.frozen_handlers().is_empty()
         && host.thawed_detached().iter().all(|td| {
             let c = &td.payload.host;
-            host.durable_module_by_digest(&td.payload.digest).is_some()
+            // Nor, in a child, a kind of record its code stands up no runtime for: the pass admits
+            // one that code installed through a `Jit` grant made (#3104).
+            host.durable_module_by_digest(&td.payload.digest)
+                .is_some_and(|m| reseeds(temen_jit::child_reseeds(&m), c.residue()))
                 && td.payload.pager.is_none()
                 && jit_relaunches(c)
         })
+}
+
+/// #3034 — whether a JIT domain that re-creates the record kinds `[fibers, vcpus, detached]` re-creates
+/// all of `r`.
+fn reseeds(kinds: [bool; 3], r: &temen_interp::Residue) -> bool {
+    let [fibers, vcpus, detached] = kinds;
+    (fibers || r.fibers.is_empty())
+        && (vcpus || r.vcpus.is_empty())
+        && (detached || (r.detached.is_empty() && r.live_detached.is_empty()))
 }
 
 /// #1361 step 4 — the durable detached children a JIT freeze reached, onto the `Host` where the
@@ -1815,11 +1834,11 @@ fn jit_detached_leave(
     cm: &mut CompiledModule,
     host: &mut Host,
     trapped: bool,
-    refused: &mut bool,
+    engine: &mut bool,
 ) -> Vec<temen_interp::FrozenDetached> {
     let mut unreached = Vec::new();
     let (captured, completed) =
-        detached_left(cm.take_detached_harvest(), &mut unreached, trapped, refused);
+        detached_left(cm.take_detached_harvest(), &mut unreached, trapped, engine);
     if !captured.is_empty() {
         host.set_captured_detached(captured);
     }
@@ -1846,7 +1865,7 @@ fn detached_left(
     harvest: Vec<temen_jit::DetachedHarvest>,
     unreached: &mut Vec<temen_interp::PendingDetached>,
     trapped: bool,
-    refused: &mut bool,
+    engine: &mut bool,
 ) -> (
     Vec<temen_interp::CapturedDetached>,
     Vec<temen_interp::FrozenDetached>,
@@ -1883,7 +1902,7 @@ fn detached_left(
             pager: None,
         };
         let (grand_captured, grand_completed) =
-            detached_left(h.children, unreached, trapped, refused);
+            detached_left(h.children, unreached, trapped, engine);
         let outcome = join_outcome(h.outcome);
         let Some(capture) = h.capture else {
             unreached.extend(grand_captured.into_iter().map(pending_detached));
@@ -1912,9 +1931,24 @@ fn detached_left(
                 c.set_captured_detached(grand_captured);
             }
             // #2010, #2031 — what its root, fibers and vCPUs left rides its artifact too, through the
-            // one hand-off. One the thaw pass refuses fails the run, the cut being all-or-nothing
-            // (#3034).
-            *refused |= leave_residue(&mut c, &module, capture.residue, grand_completed, trapped);
+            // one hand-off (#3034). A value its guest wrote is the child's fault: it ends with the
+            // push check's trap and rides as a completed child answering it. An engine fault fails
+            // the whole freeze.
+            match leave_residue(&mut c, &module, capture.residue, grand_completed, trapped) {
+                Ok(()) => {}
+                Err(temen_interp::FreezeFault::Guest) => {
+                    drop(c);
+                    if h.joinable {
+                        completed.push(temen_interp::FrozenDetached {
+                            parent_task: 0,
+                            slot: h.slot,
+                            completed_result: Err(temen_interp::Trap::Unreachable.code()),
+                        });
+                    }
+                    continue;
+                }
+                Err(temen_interp::FreezeFault::Engine) => *engine = true,
+            }
             jit_layout(&module, &c, capture.image, capture.tail)
         };
         captured.push(temen_interp::CapturedDetached {
@@ -1956,40 +1990,40 @@ fn pending_detached(c: temen_interp::CapturedDetached) -> temen_interp::PendingD
 /// The freeze residue of a durable [`jit_cap_run`], handed to the embedder on the `Host` exactly where
 /// the interp's freeze driver leaves it, so one `temen_snapshot::freeze(module, window, host)` serves
 /// both engines. The whole residue, not just the fibers (#1690), through the one hand-off
-/// ([`Host::leave_freeze`]): none from a run that `trapped`. `true` if the thaw pass refused a domain's
-/// residue: the run then ends `Unreachable`, and nothing is carried.
-fn jit_durable_leave(cm: &mut CompiledModule, m: &Module, host: &mut Host, trapped: bool) -> bool {
-    let mut refused = false;
-    let completed = jit_detached_leave(cm, host, trapped, &mut refused);
-    refused |= leave_residue(
-        host,
-        m,
-        cm.take_durable_residue(),
-        completed,
-        trapped || refused,
-    );
-    if refused {
-        host.drop_freeze();
+/// ([`Host::leave_freeze`]): none from a run that `trapped`. A child's fault is the child's
+/// ([`detached_left`]); `Err` names the root domain's own fault, or an engine fault anywhere in the
+/// cut, which fails the whole freeze ([`Host::refuse_freeze`]).
+fn jit_durable_leave(
+    cm: &mut CompiledModule,
+    m: &Module,
+    host: &mut Host,
+    trapped: bool,
+) -> Result<(), temen_interp::FreezeFault> {
+    let mut engine = false;
+    let completed = jit_detached_leave(cm, host, trapped, &mut engine);
+    let left = leave_residue(host, m, cm.take_durable_residue(), completed, trapped);
+    if engine {
+        host.refuse_freeze();
+        return Err(temen_interp::FreezeFault::Engine);
     }
-    refused
+    left
 }
 
 /// A JIT freeze's residue onto `host`, where the interpreter's freeze leaves it: a run root's, or a
 /// captured detached child's on its powerbox (#2010, #2031), with the children it left completed and
-/// unjoined, through the one hand-off ([`Host::leave_freeze`]) against `m`, the program it ran. `true`
-/// if the thaw pass refused it.
+/// unjoined, through the one hand-off ([`Host::leave_freeze`]) against `m`, the program it ran.
 fn leave_residue(
     host: &mut Host,
     m: &Module,
     r: temen_jit::DurableResidue,
     completed: Vec<temen_interp::FrozenDetached>,
     trapped: bool,
-) -> bool {
+) -> Result<(), temen_interp::FreezeFault> {
     let raw = temen_interp::Residue {
         detached: completed,
         ..r.into_raw()
     };
-    host.leave_freeze(m, 0, raw, trapped).is_err()
+    host.leave_freeze(m, 0, raw, trapped)
 }
 
 /// **Code-memory compaction** for a guest-driven `Jit` domain (DESIGN.md §22): rebuild the domain's

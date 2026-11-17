@@ -296,13 +296,45 @@ impl<D, T> Thaw<D, T> {
     }
 }
 
+/// Whether a test hands a thaw's seed hostile values on purpose ([`expect_backstops`]).
+static BACKSTOPS_EXPECTED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// #3034 — a refusal behind the pass, in front of a raw host store or an unchecked index: an engine's
+/// seed refuses `what` there whatever residue reaches it. A residue the pass admitted never does, so
+/// reaching one is a hole in the pass, loud in a debug build (it panics) unless a test hands a seed
+/// hostile values on purpose ([`expect_backstops`]). In release it does nothing: the refusal is the
+/// caller's. An engine's own freeze that the pass refuses for no guest value is the same hole seen
+/// from the other side, and is as loud.
+pub fn backstop(what: &str) {
+    if cfg!(debug_assertions) && !BACKSTOPS_EXPECTED.load(core::sync::atomic::Ordering::Relaxed) {
+        panic!("{what}");
+    }
+}
+
+/// Say that this process hands thaw seeds hostile values on purpose, so a refusal behind the pass
+/// is the behaviour under test rather than a hole in it ([`backstop`]). A test hook: process-wide, set
+/// by the crates' backstop tests only.
+#[doc(hidden)]
+pub fn expect_backstops() {
+    BACKSTOPS_EXPECTED.store(true, core::sync::atomic::Ordering::Relaxed);
+}
+
 /// The residue names a value no run of the module could have made.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Malformed;
 
 /// A residue [`validate`] refused, handed back whole: a caller that declines the thaw leaves it where
 /// it found it.
-pub struct Refused<D, T>(pub alloc::boxed::Box<RawResidue<D, T>>);
+pub struct Refused<D, T> {
+    pub residue: alloc::boxed::Box<RawResidue<D, T>>,
+    /// The refused rule reads a value the guest wrote: a root or vCPU **extent** (each context's
+    /// shadow-SP word is guest memory) outside its context's region, or a context that two of them,
+    /// or a fiber and one of them, would share. A freeze that records such a value records the
+    /// guest's own fault; any other refusal of a freeze's own residue is the engine and the pass
+    /// disagreeing.
+    pub guest: bool,
+}
 
 impl<D, T> core::fmt::Debug for Refused<D, T> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -335,26 +367,50 @@ struct Makes {
 }
 
 impl Makes {
-    fn of(code: Code<'_>, installs: bool) -> Makes {
-        let site = |p: fn(&Inst) -> bool| {
-            installs
-                || code
-                    .funcs
-                    .iter()
-                    .any(|f| f.blocks.iter().any(|b| b.insts.iter().any(p)))
+    /// Which of the kinds `r` holds the code can make. Only those are looked for, in one pass that
+    /// stops once each is found, and an empty residue costs nothing.
+    fn of<D, T>(code: Code<'_>, installs: bool, r: &RawResidue<D, T>) -> Makes {
+        let want = Makes {
+            fibers: !r.fibers.is_empty(),
+            vcpus: !r.vcpus.is_empty(),
+            detached: !(r.detached.is_empty() && r.live_detached.is_empty()),
         };
-        Makes {
-            // A serve op runs each dispatch as a handler fiber of the serving task (#2742); a durable
-            // domain reaches one only by a direct `call.cap` (an import never binds to one).
-            fibers: site(|i| match i {
-                Inst::ContNew { .. } => true,
-                Inst::CapCall(c) => crate::durable_abi::is_serve_op(c.type_id, c.op),
-                _ => false,
-            }),
-            vcpus: site(|i| matches!(i, Inst::ThreadSpawn { .. })),
-            detached: site(|i| matches!(i, Inst::CapCall(c) if c.type_id == cap_id::INSTANTIATOR)),
+        if installs || want == Makes::NONE {
+            return want;
         }
+        let mut got = Makes::NONE;
+        for i in code
+            .funcs
+            .iter()
+            .flat_map(|f| &f.blocks)
+            .flat_map(|b| &b.insts)
+        {
+            match i {
+                Inst::ContNew { .. } => got.fibers = true,
+                // A serve op runs each dispatch as a handler fiber of the serving task (#2742); a
+                // durable domain reaches one only by a direct `call.cap` (an import never binds to one).
+                Inst::CapCall(c) if crate::durable_abi::is_serve_op(c.type_id, c.op) => {
+                    got.fibers = true
+                }
+                Inst::ThreadSpawn { .. } => got.vcpus = true,
+                Inst::CapCall(c) if c.type_id == cap_id::INSTANTIATOR => got.detached = true,
+                _ => continue,
+            }
+            if (got.fibers || !want.fibers)
+                && (got.vcpus || !want.vcpus)
+                && (got.detached || !want.detached)
+            {
+                break;
+            }
+        }
+        got
     }
+
+    const NONE: Makes = Makes {
+        fibers: false,
+        vcpus: false,
+        detached: false,
+    };
 }
 
 /// Whether `code` is a trap's wire code as a join outcome carries it: one a guest can see
@@ -418,11 +474,24 @@ pub fn validate<'a, D, T>(
     // that hands its residue over in memory records them in the order they unwound.
     raw.fibers.sort_by_key(|f| f.slot);
     raw.vcpus.sort_by_key(|v| v.task);
-    let code = code.into();
-    match check(code, Makes::of(code, installs), root_ctx, &raw) {
-        Ok(()) => Ok(Thaw(raw)),
-        Err(Malformed) => Err(Refused(alloc::boxed::Box::new(raw))),
+    if raw.is_empty() {
+        return Ok(Thaw(raw));
     }
+    let code = code.into();
+    match check(code, Makes::of(code, installs, &raw), root_ctx, &raw) {
+        Ok(()) => Ok(Thaw(raw)),
+        Err(fault) => Err(Refused {
+            residue: alloc::boxed::Box::new(raw),
+            guest: fault == Fault::Guest,
+        }),
+    }
+}
+
+/// Which kind of rule a residue broke ([`Refused::guest`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Fault {
+    Guest,
+    Other,
 }
 
 /// [`validate`]'s checks, over a residue in seeding order.
@@ -431,8 +500,10 @@ fn check<D, T>(
     makes: Makes,
     root_ctx: usize,
     r: &RawResidue<D, T>,
-) -> Result<(), Malformed> {
-    let ok = |c: bool| if c { Ok(()) } else { Err(Malformed) };
+) -> Result<(), Fault> {
+    let ok = |c: bool| if c { Ok(()) } else { Err(Fault::Other) };
+    // A rule over a guest-written extent.
+    let extent = |c: bool| if c { Ok(()) } else { Err(Fault::Guest) };
     let a = code.arena;
 
     // A module without a shadow arena is not freezable (INVARIANTS #16): it has no residue at all.
@@ -484,10 +555,10 @@ fn check<D, T>(
             ok(v.func == 0 && v.args.is_empty() && v.shadow_sp == 0)?;
             continue;
         }
-        let ctx = ShadowContexts::vcpu_of_sp(a, v.shadow_sp).ok_or(Malformed)?;
-        ok(ctx != root_ctx && in_region(a, ctx, v.shadow_sp))?;
+        let ctx = ShadowContexts::vcpu_of_sp(a, v.shadow_sp).ok_or(Fault::Guest)?;
+        extent(ctx != root_ctx && in_region(a, ctx, v.shadow_sp))?;
         ok(spawn_entry(code.funcs, v.func) && v.args.len() == 2)?;
-        ok(held & (1 << ctx) == 0)?;
+        extent(held & (1 << ctx) == 0)?;
         held |= 1 << ctx;
     }
     let mut contexts = ShadowContexts::default();
@@ -495,13 +566,15 @@ fn check<D, T>(
     // The root's extent rides beside every vCPU (the window's shared word holds the last context to
     // run), inside the root's own region. A freeze records it for a lone root too.
     ok(r.vcpus.is_empty() || r.root_sp.is_some())?;
-    ok(r.root_sp.is_none_or(|sp| in_region(a, root_ctx, sp)))?;
+    extent(r.root_sp.is_none_or(|sp| in_region(a, root_ctx, sp)))?;
 
     // ---- Fibers: one record per slot, dense from 0, each slot's context below every live vCPU's and
     // inside the arena (`cont.new`'s own rule). A free slot carries only its generation; a live one
     // an extent inside its own region.
     for (i, f) in r.fibers.iter().enumerate() {
-        ok(f.slot == i && contexts.fiber_fits(a, i) && i + 1 != root_ctx)?;
+        ok(f.slot == i && ShadowContexts::default().fiber_fits(a, i) && i + 1 != root_ctx)?;
+        // A fiber's context that a vCPU's (guest-written) extent placed a vCPU in.
+        extent(contexts.fiber_fits(a, i))?;
         if f.is_free() {
             ok(f.func == 0 && f.arg0 == 0 && !f.consumed)?;
         } else {

@@ -1934,10 +1934,7 @@ pub(crate) unsafe fn seed_frozen_fibers(
         if !r.table.seed_fits() {
             // #3034 — the thaw pass admitted each slot's context; this refusal stays in front of the
             // raw stores at `region_base(slot + 1)`, loud in debug.
-            debug_assert!(
-                false,
-                "the thaw pass admits only a fiber slot inside the arena"
-            );
+            temen_ir::thaw::backstop("the thaw pass admits only a fiber slot inside the arena");
             break;
         }
         if f.is_free() {

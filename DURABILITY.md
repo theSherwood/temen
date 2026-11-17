@@ -315,14 +315,27 @@ reaches the freeze unchecked. A fiber's extent is not such an input: the runtime
 switch. So both engines hand what each domain of the cut unwound to its powerbox through one
 function, `Host::leave_freeze`, which runs the pass:
 
-- a run that trapped (or exited) during the freeze leaves no residue: its outcome is the trap;
-- a residue the pass refuses ends the run as the push check's own trap, `Unreachable`, and leaves no
-  residue — the cut is all-or-nothing, so one refused domain refuses all of it.
+- only a root that unwound took a cut: a run whose root returned, trapped or exited during the
+  freeze leaves no residue, and its outcome stands (a thread that unwound under a returning root is
+  dropped);
+- a refused residue is sorted by **whose fault it is**. A value the guest could have written (an
+  extent outside its context's region, two holders of one context, a fiber on a context a vCPU's
+  extent claims) is the **guest's**: the domain ends as the push check's own trap, `Unreachable`, and
+  carries nothing. A detached child's or a twin's fault is the **child's**: it rides its parent's cut
+  as a completed child answering `Unreachable` (an exited twin), and the parent's freeze goes on.
+  Any other refusal is an **engine fault** (an engine recorded a value no run makes): the run has
+  already unwound, so it is over; nothing is carried, a debug build panics
+  (`temen_ir::thaw::backstop`), and the codec refuses to write the freeze, so the embedder's
+  `freeze` answers `FreezeError::ResidueRefused`;
+- a freeze asked for while an installed unit's thread runs is **declined**
+  (`DeclineCause::UnitThread`) and the run goes on: the residue names a function by its index in the
+  program, so it cannot name one of a unit's (#3108). The JIT, which has no freeze census, declines
+  a durable run that hosts a unit's threads whole.
 
 A guest that corrupts a shadow-SP word thus gets `Unreachable`, on every engine, and its cut carries
 nothing; a `freeze` of that powerbox writes the window as the guest left it and no residue. A bug in
-the pass that refused a real freeze would look like the same trap: the durable differential fuzzing
-(a frozen and thawed run against the uninterrupted one) is what would show it.
+the pass that refused a real freeze would look like one of these refusals; the durable differential
+fuzzing (a frozen and thawed run against the uninterrupted one) is what would show it.
 A frame-capture design would have had the same boundary, as a parser over attacker-controlled
 frames in the host; this one keeps the structured part small and checks it in one place.
 

@@ -1712,3 +1712,74 @@ fn a_joined_child_below_a_live_one_stays_spent_across_a_thaw_on_every_engine() {
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
+
+/// #3034 — the JIT declines a cut whose **nested** domain holds a kind of record its code stands up
+/// no runtime for, before it consumes anything, as it declines one at the root. Here the live child's
+/// powerbox holds a `Jit` domain, so the thaw pass admits a fiber in it though [`CHILD`] has no
+/// `cont.*` (code installed through the grant may make one); the JIT's child, compiled without the
+/// fiber runtime, would have answered it `FiberFault` where the tree-walker re-creates it.
+#[test]
+fn the_jit_declines_a_nested_record_kind_it_stands_up_no_runtime_for() {
+    let parent = parent();
+    let child = instrument(CHILD);
+    let (mut fhost, args) = powerbox(&child);
+    let iargs: Vec<Value> = args.iter().map(|&a| Value::I32(a as i32)).collect();
+    let mut win = init_durable_window(1 << PARENT_LOG2, ARENA);
+    write_state(&mut win, ARENA, STATE_UNWINDING);
+    let mut fuel = 50_000_000u64;
+    let (r, snap) = run_capture_reserved_with_host(
+        &parent,
+        0,
+        &iargs,
+        &mut fuel,
+        &win,
+        PARENT_LOG2,
+        &mut fhost,
+    );
+    assert!(r.is_ok(), "the freeze: {r:?}");
+    let art = temen_snapshot::freeze(&parent, &snap, &fhost).expect("serialize");
+
+    let mut h = Host::new();
+    h.set_durable(true);
+    h.grant_durable_module(&child);
+    let mut w = temen_snapshot::restore(&art, &parent, &mut h).expect("restore");
+    begin_thaw(&mut w, ARENA, 0);
+    // The live child's powerbox gains a `Jit` domain and a fiber, through the pass.
+    let mut residue = h.take_residue();
+    assert_eq!(residue.live_detached.len(), 1, "the child rides live");
+    {
+        let c = &mut residue.live_detached[0].payload.host;
+        c.grant_jit_with_table(Some(17), 0);
+        let mut own = c.take_residue();
+        own.fibers.push(temen_interp::FrozenFiber {
+            slot: 0,
+            func: 0,
+            arg0: 0,
+            shadow_sp: ARENA.frame_base(1),
+            generation: 1,
+            consumed: false,
+        });
+        c.admit_thaw(&child, own).expect("admitted under the grant");
+    }
+    h.admit_thaw(&parent, residue).expect("the cut");
+    let r = temen_run::jit_cap_run(
+        &parent,
+        0,
+        &args,
+        &MemLayout::image(w.to_vec()),
+        PARENT_LOG2,
+        0,
+        &mut h,
+        None,
+    );
+    assert!(
+        matches!(r, Err(JitError::Unsupported(_))),
+        "the JIT declines: {:?}",
+        r.as_ref().map(|(o, _)| o)
+    );
+    assert_eq!(h.thawed_detached().len(), 1, "and leaves the cut");
+    assert_eq!(
+        h.thawed_detached()[0].payload.host.residue().fibers.len(),
+        1
+    );
+}

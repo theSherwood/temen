@@ -2867,15 +2867,15 @@ impl Domain {
                 .filter(|_| slot_ok);
             // #3034 — the thaw pass admitted every record ([`temen_ir::thaw::validate`]); these
             // refusals stay in front of the raw stores at `region_base(ctx)`, the table slot run and
-            // the `pin`, loud in debug.
-            debug_assert!(
-                slot_ok,
-                "the thaw pass admits only a join slot of the table"
-            );
-            debug_assert!(
-                v.completed_result.is_some() || start.is_some(),
-                "the thaw pass admits only a vCPU's context and a spawn entry"
-            );
+            // the `pin`, loud in debug ([`temen_ir::thaw::backstop`]).
+            if !slot_ok {
+                temen_ir::thaw::backstop("the thaw pass admits only a join slot of the table");
+            }
+            if v.completed_result.is_none() && start.is_none() {
+                temen_ir::thaw::backstop(
+                    "the thaw pass admits only a vCPU's context and a spawn entry",
+                );
+            }
             let ended = match v.completed_result {
                 Some(_) if !slot_ok => Some((0, TrapKind::ThreadFault as i64)),
                 Some(r) => Some((r, 0)),
@@ -2997,10 +2997,7 @@ impl Domain {
             fiber_rt::write_shadow_sp(env.mem_base, self.shadow().region_base(0), root_sp);
             fiber_rt::window_set_rewinding(env.mem_base, self.shadow(), 0); // the root's own (ctx 0) thaw word
         } else {
-            debug_assert!(
-                false,
-                "the thaw pass admits no vCPU residue without an arena"
-            );
+            temen_ir::thaw::backstop("the thaw pass admits no vCPU residue without an arena");
         }
 
         *lock(&self.cur_task) = 0; // the root runs next (its joins resolve in its table)

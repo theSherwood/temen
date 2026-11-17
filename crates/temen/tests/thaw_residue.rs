@@ -340,6 +340,18 @@ fn a_fork_twin_is_declined_whole_by_the_engines_that_do_not_recreate_one() {
     );
     assert_eq!(h.thawed_twins().len(), 1, "and leaves the residue whole");
 
+    // A reactor's pump run, which takes its powerbox by value and cannot decline: refused before it
+    // seeds anything (on `398fd06` it reached the seeding's debug assert, a partial thaw in release).
+    let (h, _) = restored();
+    let mut reactor = temen_interp::bytecode::Reactor::open(&inst).expect("opens");
+    assert!(
+        matches!(
+            reactor.coop_call(0, &[], 1_000_000, h, None, None),
+            Err(temen_interp::Trap::Malformed)
+        ),
+        "a pump run refuses the residue"
+    );
+
     let (mut h, win) = restored();
     let r = temen_run::jit_cap_run(
         &inst,
@@ -1099,12 +1111,15 @@ fn a_root_that_writes_its_own_shadow_sp_word_traps_and_carries_nothing() {
     assert!(h.residue().is_empty(), "the JIT carries nothing");
 }
 
-/// A residue the pass refuses, handed off by a freeze, ends the run as the push check's own trap and
-/// carries nothing: the case where a vCPU rewrites a sibling's word after the sibling unwound (every
-/// unwind clean, the extent bad), which no guest reaches deterministically, handed to the hand-off
-/// directly. A residue a run makes is admitted, and one from a run that trapped is dropped.
+/// A freeze's hand-off says whose fault a refused residue is (#3034). A value the guest wrote (here an
+/// extent in a context's header: a vCPU rewriting a sibling's word after it unwound, which no guest
+/// reaches deterministically, handed to the hand-off directly) is the guest's: the domain ends with
+/// the push check's own trap, and nothing is carried. Any other refusal (here an entry past the
+/// module) is the engine and the pass disagreeing: nothing is carried, the codec refuses to write
+/// the freeze, and a debug build panics ([`temen_ir::thaw::backstop`]). A residue a run makes is admitted, and one from a run that trapped is dropped.
 #[test]
-fn a_freezes_refused_residue_is_unreachable_and_carries_nothing() {
+fn a_freezes_refused_residue_names_whose_fault_it_is_and_carries_nothing() {
+    use temen_interp::FreezeFault;
     let inst = instrument(THREADS);
     let art = frozen(&inst);
     let real = || {
@@ -1118,12 +1133,34 @@ fn a_freezes_refused_residue_is_unreachable_and_carries_nothing() {
 
     let mut h = Host::new();
     let mut bad = real();
-    bad.vcpus[0].shadow_sp = TEST_ARENA.region_base(3) + 8; // in a context's header
+    bad.vcpus[0].shadow_sp = TEST_ARENA.region_base(3) + 8;
     assert_eq!(
         h.leave_freeze(&inst, 0, bad, false),
-        Err(temen_interp::Trap::Unreachable)
+        Err(FreezeFault::Guest)
     );
-    assert!(h.residue().is_empty(), "nothing is carried");
+    assert!(h.residue().is_empty() && !h.freeze_refused(), "the guest's");
+
+    // An engine fault is a hole between an engine and the pass: loud in a debug build (it panics,
+    // having failed the freeze first), the freeze failed in release.
+    let mut h = Host::new();
+    let mut bad = real();
+    bad.vcpus[0].func = 99;
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        h.leave_freeze(&inst, 0, bad, false)
+    }));
+    if cfg!(debug_assertions) {
+        assert!(r.is_err(), "loud in debug");
+    } else {
+        assert_eq!(r.ok(), Some(Err(FreezeFault::Engine)));
+    }
+    assert!(h.residue().is_empty() && h.freeze_refused(), "the engine's");
+    assert!(
+        matches!(
+            temen_snapshot::freeze(&inst, &init_durable_window(WINDOW, TEST_ARENA), &h),
+            Err(temen_snapshot::FreezeError::ResidueRefused)
+        ),
+        "and the codec refuses to write it"
+    );
 
     let mut h = Host::new();
     assert_eq!(h.leave_freeze(&inst, 0, real(), true), Ok(()));
@@ -1189,4 +1226,282 @@ fn a_jit_domain_from_section_5_admits_every_kind_and_the_jit_declines_what_it_ca
         r.as_ref().map(|(o, _)| o)
     );
     assert_eq!(h.residue().fibers.len(), 1, "and leaves the residue");
+}
+
+/// A twin's vCPU may not hold the context the twin's root runs in. The twin carries the frozen
+/// [`THREADS`] residue (its thread in the arena's top context, 10), its root's extent moved into the
+/// twin's own context: refused for a twin in context 10, admitted for one in context 5.
+#[test]
+fn a_twins_vcpu_in_the_twins_root_context_is_refused() {
+    let inst = instrument(THREADS);
+    let art = frozen(&inst);
+    let at = |ctx: usize| {
+        bent(&art, move |r| {
+            let sp = r.root_sp.expect("a root extent");
+            r.root_sp = Some(sp - TEST_ARENA.region_base(0) + TEST_ARENA.region_base(ctx));
+        })
+    };
+    assert_eq!(decode_residue(&art).expect("decode").vcpus.len(), 1);
+    assert!(
+        temen_snapshot::restore(&with_twin_of(&art, &at(5), 5), &inst, &mut Host::new()).is_ok(),
+        "the control"
+    );
+    assert_refused(
+        "a twin's vCPU in the twin's own context",
+        &inst,
+        &with_twin_of(&art, &at(10), 10),
+    );
+}
+
+/// Makes `n` fibers one after another, each run to its end, and returns their count. A durable run
+/// may make any number: a finished fiber gives its context back. Bytecode does not reuse a finished
+/// slot as the oracle does (its handles differ, #3101), so the arena bound `a4f45ed` gave its
+/// `cont.new` counted lifetime fibers there and faulted the eleventh; it was taken out.
+#[test]
+fn a_durable_run_makes_and_finishes_more_fibers_than_contexts_on_every_engine() {
+    let inst = instrument(
+        r#"
+func () -> (i64) {
+block 0 () {
+  vz = i64.const 0
+  br 1(vz)
+}
+block 1 (vi: i64) {
+  vn = i64.const 30
+  vc = i64.lt_s vi vn
+  br_if vc 2(vi) 3(vi)
+}
+block 2 (vj: i64) {
+  vf = ref.func 1
+  vss = i64.const 4096
+  vk = cont.new vf vss
+  vz2 = i64.const 0
+  vs, vv = cont.resume vk vz2
+  vone = i64.const 1
+  vj1 = i64.add vj vone
+  br 1(vj1)
+}
+block 3 (vr: i64) {
+  return vr
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (v0: i64, v1: i64) {
+  v2 = i64.const 5
+  return v2
+  }
+}
+"#,
+    );
+    let win = init_durable_window(WINDOW, TEST_ARENA);
+    let want = Ok(vec![Value::I64(30)]);
+    assert_eq!(
+        interp_run(&inst, &win, &mut Host::new()),
+        want,
+        "tree-walker"
+    );
+    let mut h = Host::new();
+    h.set_durable(true);
+    let mut fuel = 10_000_000u64;
+    let bc = temen_interp::bytecode::compile_and_run_capture_reserved_with_host(
+        &inst,
+        0,
+        &[],
+        &mut fuel,
+        &win,
+        SIZE_LOG2,
+        &mut h,
+    )
+    .map(|c| c.0);
+    assert_eq!(bc, Some(want), "bytecode");
+    let mut h = Host::new();
+    h.set_durable(true);
+    let jit = temen_run::jit_cap_run(
+        &inst,
+        0,
+        &[],
+        &MemLayout::image(win),
+        SIZE_LOG2,
+        0,
+        &mut h,
+        None,
+    )
+    .map(|(o, _)| o);
+    assert!(
+        matches!(&jit, Ok(JitOutcome::Returned(v)) if *v == [30]),
+        "JIT: {jit:?}"
+    );
+}
+
+/// R2.1 — a unit's thread cannot be frozen: its residue would name a function of the unit, which a
+/// thaw resolves against the program. The unit `f0` spawns its own `f1` and joins it; `f1` waits 64
+/// times on a word that never matches (each wait a safepoint), then returns 7.
+const UNIT_SPAWNS: &str = "memory 17 shadow 16448 65536
+func () -> (i32) {
+block 0 () {
+  vsp = i64.const 0
+  varg = i64.const 0
+  vt = thread.spawn 1 vsp varg
+  vr_st, vr = thread.join vt
+  vr32 = i32.wrap_i64 vr
+  return vr32
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, varg: i64) {
+  vz = i64.const 0
+  br 1(vz)
+}
+block 1 (vi: i64) {
+  va = i64.const 66000
+  vx = i32.const 99
+  vto = i64.const 0
+  vw = i32.atomic.wait va vx vto
+  vone = i64.const 1
+  vi2 = i64.add vi vone
+  vlim = i64.const 64
+  vmore = i64.ne vi2 vlim
+  br_if vmore 1(vi2) 2()
+}
+block 2 () {
+  v7 = i64.const 7
+  return v7
+  }
+}
+";
+
+/// R2.1 — the program compiles the unit from its window, installs it and calls it; the unit's thread
+/// is live when the freeze is asked for. The tree-walker's census declines that freeze
+/// (`DeclineCause::UnitThread`) and the run goes on to the unit's 7; the JIT, which has no census,
+/// declines a durable run that hosts a unit's threads whole. Before #3034 the freeze was taken and
+/// its thaw ran the program's function of the unit function's index (#3108). The bytecode does not
+/// run this program to its result (#3110), so it reaches no freeze here.
+#[test]
+fn a_freeze_while_a_units_thread_runs_is_declined_and_the_run_goes_on() {
+    const BLOB_AT: usize = 0x1_1000;
+    let unit = temen_text::parse_module(UNIT_SPAWNS).expect("parse");
+    temen_verify::verify_module(&unit).expect("verify");
+    let blob = temen_encode::encode_module(&unit);
+    // The second function only taints the entry signature the durable install fence asks for.
+    let inst = instrument(&format!(
+        "func (i32) -> (i64) {{
+block 0 (v0: i32) {{
+  v1 = i64.const {BLOB_AT}
+  v2 = i64.const {len}
+  v3 = call.cap 11 0 (i64, i64) -> (i64) v0 (v1, v2)
+  v4 = call.cap 11 3 (i64) -> (i64) v0 (v3)
+  v5 = i32.wrap_i64 v4
+  v6 = call.dyn () -> (i32) v5 ()
+  v7 = i64.extend_i32_u v6
+  return v7
+  }}
+}}
+func () -> (i32) {{
+block 0 () {{
+  va = i64.const 66000
+  vx = i32.const 99
+  vto = i64.const 0
+  vw = i32.atomic.wait va vx vto
+  return vw
+  }}
+}}
+",
+        len = blob.len()
+    ));
+    let mut win = init_durable_window(WINDOW, TEST_ARENA);
+    win[BLOB_AT..BLOB_AT + blob.len()].copy_from_slice(&blob);
+    temen_durable::arm_freeze_after_backedges(&mut win, TEST_ARENA, 5);
+
+    let mut h = Host::new();
+    h.set_durable(true);
+    let jh = temen_run::grant_jit_durable_confined(&mut h, &inst, 4);
+    let mut fuel = 10_000_000u64;
+    let (r, _) = run_capture_reserved_with_host(
+        &inst,
+        0,
+        &[Value::I32(jh)],
+        &mut fuel,
+        &win,
+        SIZE_LOG2,
+        &mut h,
+    );
+    assert_eq!(
+        r,
+        Ok(vec![Value::I64(7)]),
+        "the run goes on to its uninterrupted result"
+    );
+    let d = h.take_freeze_declined().expect("the freeze is declined");
+    assert_eq!(d.cause, temen_interp::DeclineCause::UnitThread);
+    assert!(h.residue().is_empty(), "nothing is carried");
+
+    let mut h = Host::new();
+    h.set_durable(true);
+    h.set_jit_hosts_threads(true);
+    let jh = temen_run::grant_jit_durable_confined(&mut h, &inst, 4);
+    let jit = temen_run::jit_cap_run(
+        &inst,
+        0,
+        &[jh as i64],
+        &MemLayout::image(win),
+        SIZE_LOG2,
+        4,
+        &mut h,
+        None,
+    )
+    .map(|(o, _)| o);
+    assert!(matches!(jit, Err(JitError::Unsupported(_))), "JIT: {jit:?}");
+}
+
+/// R2.3 — only a root that unwound took a cut. The root spawns a thread that waits for a word, then
+/// resumes a fiber (the armed freeze's trigger); the root raises the word and returns 3 without
+/// joining. The root's result stands and nothing is carried: the hand-off admits a residue only when
+/// the root unwound (`froze`), and drops one any other vCPU left.
+#[test]
+fn a_root_that_returns_while_a_thread_triggers_the_freeze_keeps_its_result() {
+    let inst = instrument(
+        r#"
+func () -> (i64) {
+block 0 () {
+  vz = i64.const 0
+  vt = thread.spawn 1 vz vz
+  vaddr = i64.const 66000
+  vone = i32.const 1
+  i32.store vaddr vone
+  vn2 = atomic.notify vaddr vone
+  vr = i64.const 3
+  return vr
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (v0: i64, v1: i64) {
+  vaddr = i64.const 66000
+  vexp = i32.const 0
+  vinf = i64.const -1
+  vst = i32.atomic.wait vaddr vexp vinf
+  vf = ref.func 2
+  vss = i64.const 4096
+  vk = cont.new vf vss
+  vz2 = i64.const 0
+  va, vb = cont.resume vk vz2
+  return vb
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (v0: i64, v1: i64) {
+  v2 = i64.const 5
+  v3 = suspend v2
+  return v3
+  }
+}
+"#,
+    );
+    let mut win = init_durable_window(WINDOW, TEST_ARENA);
+    arm_freeze_after(&mut win, TEST_ARENA, 1);
+    let mut h = Host::new();
+    h.set_durable(true);
+    assert_eq!(interp_run(&inst, &win, &mut h), Ok(vec![Value::I64(3)]));
+    assert!(
+        h.residue().is_empty() && !h.freeze_refused(),
+        "nothing is carried"
+    );
 }

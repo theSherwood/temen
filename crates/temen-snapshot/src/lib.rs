@@ -483,6 +483,10 @@ pub enum FreezeError {
     DetachedUnreached { parent_task: usize, slot: usize },
     /// Detached children nest deeper than [`MAX_DETACHED_DEPTH`].
     DetachedTooDeep,
+    /// #3034 — the freeze's own residue was refused by the thaw pass for a rule no guest value
+    /// breaks: the engine and the pass disagree ([`Host::freeze_refused`]), so no artifact of it is
+    /// written.
+    ResidueRefused,
     /// #1688 — a fork twin the freeze could not carry ([`Host::unreached_twins`]): it never
     /// unwound, it ended after the freeze rang it otherwise than by returning (#2571), or its parent
     /// did not ride. The artifact would be missing a process, so freeze refuses it whole.
@@ -740,6 +744,9 @@ fn freeze_at(
     depth: usize,
     cut: &Cut,
 ) -> Result<Vec<u8>, FreezeError> {
+    if host.freeze_refused() {
+        return Err(FreezeError::ResidueRefused);
+    }
     if let Some(p) = host.unreached_detached().first() {
         return Err(FreezeError::DetachedUnreached {
             parent_task: p.parent_task,
@@ -3305,6 +3312,132 @@ mod decoder_bounds_tests {
             read_jit_body(&mut Reader::new(&b)).is_ok(),
             "the ceiling itself"
         );
+    }
+}
+
+/// #3034 — a forged serve section, put through `restore`: the decoder seeds the serve state through
+/// `Host::set_serve`, whose rule refuses a counter past `TASK_MAX`, a ticket at or past the counter, and
+/// a frozen handler naming no live fiber of the admitted residue. A run cannot write any of them (the
+/// setter refuses them first), so the section is rebuilt with the codec's own writers.
+#[cfg(test)]
+mod forged_serve_tests {
+    use super::*;
+
+    const ARENA: ShadowArena = ShadowArena::new(16448, 65536);
+
+    fn module() -> Module {
+        let mut m = temen_text::parse_module(
+            "func (i32) -> (i64) {\nblock 0 (v0: i32) {\n  v1 = i32.const 0\n  v2 = call.cap 2 0 (i32) -> (i64) v0 (v1)\n  return v2\n  }\n}\n",
+        )
+        .expect("parse");
+        m.memory = Some(temen_ir::Memory {
+            size_log2: 17,
+            shadow: Some(ARENA),
+        });
+        temen_durable::transform_module(&m).expect("transform")
+    }
+
+    /// `art` with its serve section replaced by one holding `queue` tickets, `next` and `handlers`.
+    fn with_serve(art: &[u8], queue: &[u64], next: u64, handlers: &[(u32, u64)]) -> Vec<u8> {
+        let (hdr, map) = sections(art).expect("sections");
+        let mut map: BTreeMap<u64, Vec<u8>> =
+            map.into_iter().map(|(t, b)| (t, b.to_vec())).collect();
+        let mut b = Vec::new();
+        let queue: Vec<SvcDispatch> = queue
+            .iter()
+            .map(|&ticket| SvcDispatch {
+                export: 0,
+                op: 0,
+                args: Vec::new(),
+                ticket,
+            })
+            .collect();
+        write_serve_trio(&mut b, &queue, &[], next);
+        write_ticket_map(&mut b, &[]);
+        write_ticket_map(&mut b, handlers);
+        map.insert(TAG_SERVE, b);
+        let mut out = Vec::new();
+        wire::write_header(&mut out, hdr.kind, hdr.version, hdr.flags);
+        for (tag, body) in &map {
+            section(&mut out, *tag, |o| o.extend_from_slice(body));
+        }
+        out
+    }
+
+    /// `art` with its guest-JIT section replaced by `domains` over a table of `2^4` slots.
+    fn with_jit(art: &[u8], domains: &[DurableJitTable]) -> Vec<u8> {
+        let (hdr, map) = sections(art).expect("sections");
+        let mut map: BTreeMap<u64, Vec<u8>> =
+            map.into_iter().map(|(t, b)| (t, b.to_vec())).collect();
+        let mut b = Vec::new();
+        write_jit(&mut b, 4, domains);
+        map.insert(TAG_JIT, b);
+        let mut out = Vec::new();
+        wire::write_header(&mut out, hdr.kind, hdr.version, hdr.flags);
+        for (tag, body) in &map {
+            section(&mut out, *tag, |o| o.extend_from_slice(body));
+        }
+        out
+    }
+
+    /// #3034 — one record per dispatch-table slot: the run's table is one table, so two domains
+    /// installed at one slot is a cut no run makes (#3102 keeps a run from writing one).
+    #[test]
+    fn a_duplicate_install_slot_is_refused_at_restore() {
+        let m = module();
+        let win = temen_durable::init_durable_window(1 << 17, ARENA);
+        let art = freeze(&m, &win, &Host::new()).expect("freeze");
+        let unit = temen_text::parse_module(
+            "memory 17\nfunc () -> (i64) {\nblock 0 () {\n  v0 = i64.const 1\n  return v0\n  }\n}\n",
+        )
+        .expect("parse unit");
+        let domain = |slot| DurableJitTable {
+            mem_log2: Some(17),
+            units_left: 10,
+            bytes_left: 1 << 20,
+            units: vec![DurableJitUnit {
+                unit_ir: temen_encode::encode_module(&unit),
+                install_type_id: 0,
+            }],
+            installed: vec![(slot, 0)],
+        };
+        let restores = |a: &[u8]| restore(a, &m, &mut Host::new()).map(|_| ());
+        assert_eq!(
+            restores(&with_jit(&art, &[domain(3), domain(4)])),
+            Ok(()),
+            "the control"
+        );
+        assert_eq!(
+            restores(&with_jit(&art, &[domain(3), domain(3)])),
+            Err(RestoreError::Malformed),
+            "two domains installed at slot 3"
+        );
+    }
+
+    #[test]
+    fn a_forged_serve_section_is_refused_at_restore() {
+        let m = module();
+        let win = temen_durable::init_durable_window(1 << 17, ARENA);
+        let art = freeze(&m, &win, &Host::new()).expect("freeze");
+        let restores = |a: &[u8]| restore(a, &m, &mut Host::new()).map(|_| ());
+        assert_eq!(
+            restores(&with_serve(&art, &[6], 7, &[])),
+            Ok(()),
+            "the control"
+        );
+        for (what, forged) in [
+            (
+                "a counter past TASK_MAX",
+                with_serve(&art, &[], u64::MAX, &[]),
+            ),
+            ("a ticket at the counter", with_serve(&art, &[7], 7, &[])),
+            (
+                "a handler naming no fiber",
+                with_serve(&art, &[], 7, &[(0, 3)]),
+            ),
+        ] {
+            assert_eq!(restores(&forged), Err(RestoreError::Malformed), "{what}");
+        }
     }
 }
 
