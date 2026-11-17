@@ -2890,6 +2890,17 @@ impl Domain {
                 lock(&self.children.table)
                     .pin(v.slot, ChildEntry::Thread(std::sync::Arc::clone(&done)));
             }
+            if let (Some(r), true) = (v.completed_result, slot_ok) {
+                // It rides the next freeze again if no join takes it first, as one that finished in
+                // this run does (#3103: it was dropped).
+                lock(&self.completed_children).push(CompletedChild {
+                    task: v.task as u64,
+                    parent: v.parent_task as u64,
+                    slot: v.slot,
+                    result: r,
+                    done: std::sync::Arc::clone(&done),
+                });
+            }
             if ended.is_some() {
                 continue; // already-done: no re-run, no §15 live count, no context
             }

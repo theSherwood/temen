@@ -867,6 +867,128 @@ fn a_trap_code_no_trap_has_is_refused_on_the_embedders_route() {
     }
 }
 
+/// Root spawns a thread that raises the word at 66000 and returns 7; the root waits for the word,
+/// resumes a fiber twice (the freeze triggers), then joins the thread: `7 * 1000 + 9`.
+const FINISHED_UNJOINED: &str = r#"
+func () -> (i64) {
+block 0 () {
+  vz = i64.const 0
+  vt = thread.spawn 1 vz vz
+  vaddr = i64.const 66000
+  vexp = i32.const 0
+  vinf = i64.const -1
+  vw = i32.atomic.wait vaddr vexp vinf
+  vf = ref.func 2
+  vss = i64.const 4096
+  vk = cont.new vf vss
+  va1, vb1 = cont.resume vk vz
+  vnine = i64.const 9
+  va2, vb2 = cont.resume vk vnine
+  vst, vr = thread.join vt
+  vth = i64.const 1000
+  vm = i64.mul vr vth
+  vs = i64.add vm vb2
+  return vs
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (v0: i64, v1: i64) {
+  vaddr = i64.const 66000
+  vone = i32.const 1
+  i32.store vaddr vone
+  vn = atomic.notify vaddr vone
+  vr = i64.const 7
+  return vr
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (v0: i64, v1: i64) {
+  v2 = i64.const 5
+  v3 = suspend v2
+  v4 = suspend v3
+  return v4
+  }
+}
+"#;
+
+/// A thread that finished unjoined rides a freeze as its result, is delivered at the thaw, and rides
+/// the next freeze again if no join takes it first: frozen at the first resume, thawed on the
+/// tree-walker or the JIT, frozen again at the second, and thawed, the join still reads 7 (#3103).
+/// On `f2aff3d` the second freeze, on either engine, carried nothing for it, and the
+/// twice-thawed run returned 9.
+#[test]
+fn a_finished_unjoined_thread_rides_a_second_freeze_after_a_thaw() {
+    let inst = instrument(FINISHED_UNJOINED);
+    let want = Ok(vec![Value::I64(7009)]);
+    assert_eq!(
+        interp_run(
+            &inst,
+            &init_durable_window(WINDOW, TEST_ARENA),
+            &mut Host::new()
+        ),
+        want,
+        "uninterrupted"
+    );
+    let mut win = init_durable_window(WINDOW, TEST_ARENA);
+    arm_freeze_after(&mut win, TEST_ARENA, 1);
+    let mut h = Host::new();
+    let (r, snap) = {
+        h.set_durable(true);
+        let mut fuel = 10_000_000u64;
+        run_capture_reserved_with_host(&inst, 0, &[], &mut fuel, &win, SIZE_LOG2, &mut h)
+    };
+    assert!(r.is_ok(), "the first freeze: {r:?}");
+    let art = temen_snapshot::freeze(&inst, &snap, &h).expect("freeze");
+    let finished = |art: &[u8]| {
+        decode_residue(art)
+            .expect("decode")
+            .vcpus
+            .iter()
+            .map(|v| v.completed_result)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(finished(&art), [Some(7)], "the thread rides as its result");
+
+    // Thawed and frozen again before the join, on each engine that re-creates threads.
+    let rearmed = || {
+        let mut h = Host::new();
+        let mut w = temen_snapshot::restore(&art, &inst, &mut h).expect("restore");
+        begin_thaw(&mut w, TEST_ARENA, 0);
+        arm_freeze_after(&mut w, TEST_ARENA, 2);
+        h.set_durable(true);
+        (h, w)
+    };
+    let (mut h, w) = rearmed();
+    let mut fuel = 10_000_000u64;
+    let (r, snap) = run_capture_reserved_with_host(&inst, 0, &[], &mut fuel, &w, SIZE_LOG2, &mut h);
+    assert!(r.is_ok(), "the tree-walker's second freeze: {r:?}");
+    let tw = temen_snapshot::freeze(&inst, &snap, &h).expect("freeze");
+    let (mut h, w) = rearmed();
+    let snap = match temen_run::jit_cap_run(
+        &inst,
+        0,
+        &[],
+        &MemLayout::image(w),
+        SIZE_LOG2,
+        0,
+        &mut h,
+        None,
+    ) {
+        Ok((JitOutcome::Returned(_), snap)) => snap,
+        other => panic!("the JIT's second freeze: {:?}", other.map(|(o, _)| o)),
+    };
+    let jit = temen_snapshot::freeze(&inst, snap.bytes(), &h).expect("freeze");
+
+    for (engine, art) in [("tree-walker", tw), ("JIT", jit)] {
+        assert_eq!(
+            finished(&art),
+            [Some(7)],
+            "{engine}: it rides the second freeze"
+        );
+        thaws_on_every_engine(&inst, &art, &want);
+    }
+}
+
 /// Makes `n` fibers, resuming each once (each suspends, staying live), and returns how many it made.
 fn many_fibers(n: i64) -> String {
     format!(

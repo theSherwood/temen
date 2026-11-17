@@ -3172,6 +3172,14 @@ fn seed_thread(
     if let Some(r) = ff.completed_result {
         s.results
             .insert(cid, Outcome::ended(Ok(vec![Value::I64(r)])));
+        s.finished_threads.insert(
+            cid,
+            FinishedThread {
+                parent_task: parent,
+                slot: ff.slot,
+                sink: Arc::clone(&p.domain.host),
+            },
+        );
         return;
     }
     let Some(ctx) = ctx else {
