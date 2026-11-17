@@ -421,8 +421,8 @@ fn an_instance_charges_the_fuel_cell_it_is_given() {
         None,
     );
     assert_eq!(answer(&mut cm), 7);
-    assert!(later.left < 100, "the instance charged its own cell");
-    assert_eq!(compiled_with.left, 100, "and not the compile's");
+    assert!(later.can_burn() < 100, "the instance charged its own cell");
+    assert_eq!(compiled_with.can_burn(), 100, "and not the compile's");
 }
 
 #[test]
