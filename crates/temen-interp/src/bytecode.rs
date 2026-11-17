@@ -8955,8 +8955,7 @@ fn image_parks(host: &Host, m: &Module, census: &ImageCensus) -> Parks {
 ///   `call.import.dyn`: what the call reaches is not known at admission (removed with the last
 ///   clause that names a call target the kernel cannot serve);
 /// - **`punt shape`**: a host procedure's call its embedder may answer (a host-answered or an
-///   offloadable procedure held), whose declared results are not exactly one `i64` ([`punt_shape`];
-///   #3072);
+///   offloadable procedure held), whose one declared result is not an `i64` ([`punt_shape`]; #3072);
 /// - every other clause is [`kernel_op`]'s, which decides an inline `call.cap` and a bound import's
 ///   target alike. A call that parks (a pipe or stdin read, a pipe write, a punted call) or wakes
 ///   another's park (a pipe end's `close`, a region post's `signal`) is admitted: the kernel's rules
@@ -9037,10 +9036,11 @@ pub fn native_scope(m: &Module, host: &Host) -> Result<(), &'static str> {
 
 /// #2958 slice 5 — the `punt shape` clause: a host procedure's call that its embedder may answer (the
 /// host holds a host-answered or an offloadable procedure, either of which may answer a call
-/// `OffloadOutcome::Host`), whose declared results are not exactly one `i64`. The oracle declines such a call
-/// (only an `[i64]` reply parks on the embedder's answer), and the Cranelift JIT's cap thunk, which
-/// sees how many result slots a call has but not their types, cannot tell it from one that parks
-/// (#3071). Removed when the thunk learns the call's result types (#3072). An inline `call.cap` on a
+/// `OffloadOutcome::Host`), whose one declared result is not an `i64`. The oracle declines such a
+/// call (only an `[i64]` reply parks on the embedder's answer), and the Cranelift JIT's cap thunk,
+/// which sees how many result slots a call has but not their types, cannot tell it from one that
+/// parks (#3071). A call of no result or of two or more is not declined: the thunk tells those apart
+/// by their count, and answers them as the oracle does. Removed when the thunk learns the call's result types (#3072). An inline `call.cap` on a
 /// host procedure, or a `call.import` / `call.sym` whose binding is one, is decided on the call's
 /// own signature; a host holding neither kind declines nothing here.
 fn punt_shape(host: &Host, m: &Module, i: &Inst) -> Result<(), &'static str> {
@@ -9065,11 +9065,11 @@ fn punt_shape(host: &Host, m: &Module, i: &Inst) -> Result<(), &'static str> {
             super::ProcHandler::HostAnswered(_) | super::ProcHandler::Offloadable(_)
         )
     });
-    let one_i64 = matches!(
+    let ambiguous = matches!(
         m.types.get(sig as usize),
-        Some(temen_ir::TypeEntry::Func(f)) if f.results[..] == [temen_ir::ValType::I64]
+        Some(temen_ir::TypeEntry::Func(f)) if f.results.len() == 1 && f.results[0] != temen_ir::ValType::I64
     );
-    match answered && !one_i64 {
+    match answered && ambiguous {
         true => Err("punt shape"),
         false => Ok(()),
     }
@@ -9608,14 +9608,25 @@ struct DispatchParks {
 }
 
 impl DispatchParks {
-    /// Whether the op left no flag at all ([`call_park`]'s check of [`Host::parks_left`]).
+    /// Whether the op left no flag at all ([`call_park`]'s check of [`Host::parks_left`]). An
+    /// exhaustive destructure, so a new flag fails to compile until it is decided here.
     fn quiet(&self) -> bool {
-        !self.stdin
-            && self.request.is_none()
-            && self.pipe_read.is_none()
-            && self.pipe_write.is_none()
-            && !self.sig_interrupt
-            && self.region.is_none()
+        let DispatchParks {
+            stdin,
+            request,
+            // Drained only with a `SpawnSelf` request, which `request` already counts.
+            spawn: _,
+            pipe_read,
+            pipe_write,
+            sig_interrupt,
+            region,
+        } = self;
+        !stdin
+            && request.is_none()
+            && pipe_read.is_none()
+            && pipe_write.is_none()
+            && !sig_interrupt
+            && region.is_none()
     }
 
     /// Drain every per-op flag from `p`. Call ONLY inside the dispatch's own lock scope.
@@ -23798,20 +23809,18 @@ impl Vm {
                     // the Jit cap on the bytecode engine too (the pure-host `compile`/`compile_linked`
                     // ops 0/5 stay on `cap_dispatch_slots` below). The submitted unit is re-verified by
                     // the embedder's `jit_validator` before it runs — the security hinge is unchanged.
+                    // The op it reaches is the dispatch's own translation ([`Host::import_target`]),
+                    // so a grouped binding's remapped op is a driver op here too.
                     if *type_id == temen_ir::CAP_IMPORT_TYPE_ID {
-                        if let Some(b) = host.with(|p| p.import_binding(*op)) {
-                            if b.bound
-                                && b.type_id == super::cap_id::JIT
-                                && matches!(b.op, 1 | 3 | 4)
-                            {
+                        if let Ok((b_type, b_op, b_handle)) = host.with(|p| p.import_target(*op)) {
+                            if b_type == super::cap_id::JIT && matches!(b_op, 1 | 3 | 4) {
                                 // invoke needs its code handle in arg0; install and uninstall are
                                 // held to their contract, as on the oracle (#2361).
                                 let sig = temen_ir::FuncType {
                                     params: params.to_vec(),
                                     results: results.to_vec(),
                                 };
-                                if argv.is_empty()
-                                    || !temen_ir::served_shape_ok(b.type_id, b.op, &sig)
+                                if argv.is_empty() || !temen_ir::served_shape_ok(b_type, b_op, &sig)
                                 {
                                     return Err(Trap::CapFault);
                                 }
@@ -23819,19 +23828,19 @@ impl Vm {
                                 self.cur = cur;
                                 self.base = base;
                                 self.pc = pc + 1;
-                                return Ok(match b.op {
+                                return Ok(match b_op {
                                     3 => Outcome::JitInstall {
-                                        h: b.handle,
+                                        h: b_handle,
                                         code: argv[0] as i32,
                                         dst: *dst,
                                     },
                                     4 => Outcome::JitUninstall {
-                                        h: b.handle,
+                                        h: b_handle,
                                         slot: argv[0],
                                         dst: *dst,
                                     },
                                     _ => Outcome::JitInvoke {
-                                        h: b.handle,
+                                        h: b_handle,
                                         code: argv[0] as i32,
                                         argv: argv[1..].to_vec().into_boxed_slice(),
                                         dst: *dst,

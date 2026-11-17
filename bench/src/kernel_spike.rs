@@ -745,7 +745,7 @@ fn run_nowake_fibers(reps: usize) {
                     continue;
                 }
                 let args = move |n| vec![n, k, mode, same];
-                let mut lanes = [("x2-interp", x2_interp(&m))];
+                let mut lanes = [("x2-interp", x2_interp(&m, Host::new))];
                 let label = format!("{what}, K = {k} {where_}");
                 per_iter(
                     &label,
