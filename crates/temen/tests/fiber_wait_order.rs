@@ -322,3 +322,70 @@ block 0 () {{
     );
     pin(&src, 13);
 }
+
+/// A fiber's timed wait is in the wait index's deadlines with the threads' (#3078 slice 1), so a run
+/// where nothing else can move still times it out, though no thread waits: the root idles on its
+/// fiber (`cont.resume.block`, no loop), and the pump's clock, finding nothing runnable, jumps to
+/// the fiber's deadline. A poll loop (`cont.resume`) never idles; its poll times the wait out once its
+/// real deadline has passed. Either way the fiber returns `WAIT_TIMED_OUT` (2): the answer is
+/// `resume_status * 100 + 2` = 102. The pump's "a thread naps" checks (its quantum, its idle point)
+/// ask only after threads' deadlines; this row is what shows that leaves a fiber's timed out.
+#[test]
+fn a_timed_fiber_wait_times_out_when_no_thread_waits() {
+    let fiber = r#"func (i64, i64) -> (i64) {
+block 0 (vsp: i64, varg: i64) {
+  vaddr = i64.const 16384
+  vexp = i32.const 0
+  vto = i64.const 10000000
+  vst = i32.atomic.wait vaddr vexp vto
+  vst64 = i64.extend_i32_s vst
+  return vst64
+  }
+}
+"#;
+    let idles = format!(
+        r#"memory 16
+func () -> (i64) {{
+block 0 () {{
+  vf = ref.func 1
+  vz = i64.const 0
+  vc = cont.new vf vz
+  vs, vv = cont.resume.block vc vz
+  vk = i64.const 100
+  vse = i64.extend_i32_s vs
+  va = i64.mul vse vk
+  vr = i64.add va vv
+  return vr
+  }}
+}}
+{fiber}"#
+    );
+    let polls = format!(
+        r#"memory 16
+func () -> (i64) {{
+block 0 () {{
+  vf = ref.func 1
+  vz = i64.const 0
+  vc = cont.new vf vz
+  br 1(vc)
+  }}
+block 1 (vc1: i64) {{
+  vz1 = i64.const 0
+  vs, vv = cont.resume vc1 vz1
+  vparked = i32.const 3
+  vagain = i32.eq vs vparked
+  br_if vagain 1(vc1) 2(vs, vv)
+  }}
+block 2 (vs2: i32, vv2: i64) {{
+  vk = i64.const 100
+  vse = i64.extend_i32_s vs2
+  va = i64.mul vse vk
+  vr = i64.add va vv2
+  return vr
+  }}
+}}
+{fiber}"#
+    );
+    pin(&idles, 102);
+    pin(&polls, 102);
+}
