@@ -1327,6 +1327,9 @@ fn the_embedder_jit_path_refuses_residue_it_cannot_recreate_and_keeps_it() {
     let mut h = Host::new();
     h.set_durable(true);
     let clk = h.grant_clock();
+    // #3034 — a detached child is a record only a domain that can spawn one carries: this module has
+    // no `Instantiator` call, so its host holds a `Jit` domain, whose installed code may.
+    h.grant_jit_with_table(Some(SIZE_LOG2), 4);
     let child = temen_interp::LiveDetached {
         parent_task: 0,
         slot: 0,
