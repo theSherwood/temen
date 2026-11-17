@@ -9605,6 +9605,9 @@ struct DispatchParks {
     sig_interrupt: bool,
     /// #1936 — a post's `signal` left this region word to wake.
     region: Option<super::RegionWake>,
+    /// A peer's pipe write or close raised a wake flag. It needs no action at a dispatch site (see
+    /// [`Self::take`]), but it is per-op too, so it is drained, and counted in [`Self::quiet`].
+    woke: bool,
 }
 
 impl DispatchParks {
@@ -9620,6 +9623,7 @@ impl DispatchParks {
             pipe_write,
             sig_interrupt,
             region,
+            woke,
         } = self;
         !stdin
             && request.is_none()
@@ -9627,6 +9631,33 @@ impl DispatchParks {
             && pipe_write.is_none()
             && !sig_interrupt
             && region.is_none()
+            && !woke
+    }
+
+    /// The flags the last dispatch left, drained into `into`, which is left as it was (`None`)
+    /// when the dispatch left none, as most calls do: such a call writes nothing, where returning
+    /// the `Option` would move one the size of `Self`. Call ONLY inside the dispatch's own lock scope: the read is under the hold the call that
+    /// could leave a flag ran in, so no other vCPU's dispatch can leave or clear one between the
+    /// call and the read (#1173).
+    ///
+    /// `!parks_left()` is exactly "[`Self::take`] would find nothing". `take` drains, and
+    /// [`Host::parks_left`] covers:
+    /// - the stdin park (`stdin_parked`): its `stdin_parked` term;
+    /// - the personality request (`park_request`), and the spawn plan taken only with a
+    ///   `SpawnSelf` request: `transients_left`'s `park_request` term;
+    /// - both pipe parks (`pipe_read_parked`, `pipe_write_parked`), the region wake
+    ///   (`region_wake`) and both pipe wakes (`pipe_wake`, `pipe_wake_writers`):
+    ///   `transients_left`'s terms, one each;
+    /// - the interrupt latch (`sig_interrupt`): its `sig_interrupt` term.
+    ///
+    /// A debug build checks it where it skips the drain: a real drain must find nothing
+    /// ([`Self::quiet`], an exhaustive destructure, the pipe wakes included).
+    fn left(p: &mut Host, into: &mut Option<Self>) {
+        if p.parks_left() {
+            *into = Some(Self::take(p));
+            return;
+        }
+        debug_assert!(Self::take(p).quiet(), "a flag `parks_left` missed");
     }
 
     /// Drain every per-op flag from `p`. Call ONLY inside the dispatch's own lock scope.
@@ -9635,7 +9666,7 @@ impl DispatchParks {
         let spawn = matches!(request, Some(super::ParkEvent::SpawnSelf { .. }))
             .then(|| p.take_spawn_plan())
             .flatten();
-        let parks = Self {
+        Self {
             stdin: p.take_stdin_parked(),
             request,
             spawn,
@@ -9645,13 +9676,12 @@ impl DispatchParks {
             pipe_write: (p.take_pipe_write_parked()).and_then(|i| p.pipe_probe(i, true)),
             sig_interrupt: p.take_sig_interrupt(),
             region: p.take_region_wake(),
-        };
-        // The wake flags a peer's write/close raised need no action at a dispatch site — the pump
-        // looks at pipe readiness at each round's settle, and the store itself fired the wakers
-        // executor 2's parked tasks registered on the pipe (#2757, [`super::PipeProbe::listen`]) —
-        // but they are per-op too, so they drain here as well.
-        let _ = (p.take_pipe_wake(), p.take_pipe_wake_writers());
-        parks
+            // The wake flags a peer's write/close raised need no action at a dispatch site (the
+            // pump looks at pipe readiness at each round's settle, and the store itself fired the
+            // wakers executor 2's parked tasks registered on the pipe, #2757,
+            // [`super::PipeProbe::listen`]), but they are per-op too, so they drain here as well.
+            woke: p.take_pipe_wake().is_some() | p.take_pipe_wake_writers().is_some(),
+        }
     }
 
     /// #2550 — what the op these flags describe leaves its caller to do: the one park decision of
@@ -9737,15 +9767,11 @@ pub enum CallPark {
 /// durable run (`native_scope`'s `durable`), so no freeze abandons its park.
 pub fn call_park(host: &mut Host, read: bool) -> CallPark {
     // Most calls leave nothing: they pay one look at the flags.
-    if !host.parks_left() {
-        // The one list of flags `parks_left` reads is every flag a drain takes.
-        debug_assert!(
-            DispatchParks::take(host).quiet(),
-            "a flag `parks_left` missed"
-        );
+    let mut parks = None;
+    DispatchParks::left(host, &mut parks);
+    let Some(parks) = parks else {
         return CallPark::Done(None);
-    }
-    let parks = DispatchParks::take(host);
+    };
     parks.decide(read, |f| match f {
         ParkFact::Interrupted(sig) => (sig && !host.signal_restart()) || host.park_interrupted(),
         ParkFact::Abandon => false,
@@ -22246,6 +22272,12 @@ struct ByteSetJmp {
     window: Box<[Reg]>,
 }
 
+/// The personality's `(armed, source)` poll pair a resume fetches once ([`Host::signal_poll`]).
+type SignalPoll = Option<(
+    std::sync::Arc<std::sync::atomic::AtomicBool>,
+    std::sync::Arc<dyn super::SignalSource + Send + Sync>,
+)>;
+
 // `Clone` for time-travel checkpointing (DEBUGGING.md W1): a `ScheduledDebugRun` snapshots each task's
 // active `Vm` into the `seek` checkpoint ladder. Every field is a plain value or read-only `Arc`
 // (`jit_eligible` — the tier-up bitmap, shared not mutated), so this is a faithful deep copy; the
@@ -22904,6 +22936,341 @@ impl Vm {
         } else {
             self.run_ops::<false>(source, table, fuel, mem, host, budget)
         }
+    }
+
+    /// The `call.cap` / `call.import` op ([`Op::CapCall`]) at `(module, cur, base, pc)`, moved out of
+    /// [`Self::run_ops`]'s `match` unchanged. The loop's register allocation sets every op's cost, and
+    /// this arm inline moved it (#3088): with it inline, an `alu` loop with no call ran 14% slower
+    /// than main (wall-clock); out of line it runs at main's speed. `Ok(Ok(pc))` goes on at `pc`;
+    /// `Ok(Err(outcome))` stops the step with `outcome`, the VM's place saved.
+    #[inline(never)]
+    fn cap_call(
+        &mut self,
+        call: &CapCallOp,
+        at: (usize, usize, usize, usize),
+        mem: &mut Option<Mem>,
+        host: &mut HostCell,
+        signal_poll: &SignalPoll,
+    ) -> Result<Result<usize, Outcome>, Trap> {
+        let (module, cur, base, mut pc) = at;
+        let CapCallOp {
+            type_id,
+            op,
+            handle,
+            params,
+            args,
+            dst,
+            results,
+        } = call;
+        // Generic synchronous powerbox dispatch — the same path and ABI the tree-walker's
+        // generic `CapCall` arm uses (`cap_dispatch_slots`): handle as an i32, args/results
+        // as i64 slots, results re-typed by the call's `sig.results`. Via [`HostCell`] so a
+        // parallel vCPU takes the shared-host lock only for this one call (4c-host); the
+        // cooperative path is exclusive (uncontended), so order is unchanged.
+        // `u32::MAX` = no handle operand (a v8 `call.import` — the slot binding
+        // identifies the capability; the dispatch ignores the value).
+        let h = if *handle == u32::MAX {
+            0
+        } else {
+            self.regs[base + *handle as usize].i32()
+        };
+        // #2319 — the call's arg and result slots, on this stack when they fit.
+        let (mut arg_stack, mut arg_heap) = ([0; CALL_STACK_SLOTS], Vec::new());
+        let argv = call_slots(&mut arg_stack, &mut arg_heap, args.len());
+        for (s, a) in argv.iter_mut().zip(args.iter()) {
+            *s = self.regs[base + *a as usize].i64();
+        }
+        let argv: &[i64] = argv;
+        let (mut res_stack, mut res_heap) = ([0; CALL_STACK_SLOTS], Vec::new());
+        let res = call_slots(&mut res_stack, &mut res_heap, results.len());
+        // #2361 — the call defines every result it declares: whatever lands below (the
+        // host's results, an errno, a parked call's delivery) lands over zeros, as the
+        // oracle and the Cranelift JIT define them.
+        for i in 0..results.len() {
+            self.regs[base + *dst as usize + i] = Reg::default();
+        }
+        // #1904 — the oracle's stop see-through (#1672): a stopped domain runs under a
+        // landing freeze only to reach its next freeze point, so nothing may leave it on the
+        // way — a host call is abandoned rather than performed, for the thaw to re-issue.
+        // (A serve op is `Op::SvcPoll`, which the freeze already makes inert.)
+        if signal_poll.as_ref().is_some_and(|(_, s)| s.stopped())
+            && self.abandon_for_freeze(mem, host)
+        {
+            pc += 1;
+            return Ok(Ok(pc));
+        }
+        // FORK.md §8.6 / #1080 rung 4 — `pipe(fds)` (CAP_SELF op 16): the one mint
+        // ([`super::Host::mint_pipe`]). The generic dispatch below declines it (an engine
+        // serves it only where its reads and writes can park), so it is serviced here.
+        if *type_id == temen_ir::CAP_SELF_TYPE_ID && *op == super::CAP_SELF_PIPE {
+            let fds = argv.first().copied().unwrap_or(0) as u64;
+            let mut sole = mem.as_mut().map(super::SoleMem);
+            let gm = sole.as_mut().map(|m| m as &mut dyn GuestMem);
+            let r = host.with(|p| p.mint_pipe(fds, gm));
+            self.regs[base + *dst as usize] = Reg::from_i64(r);
+            pc += 1;
+            return Ok(Ok(pc));
+        }
+        // §22: an **import-bound** `Jit` driver op (`invoke`/`install`/`uninstall`) can't be
+        // serviced by the generic `cap_dispatch_slots` — it needs the scheduler-owning
+        // driver, exactly like a *static* `call.cap (JIT, op)` (which lowers straight to
+        // `Op::JitInvoke`). Resolve the binding and surface the same driver `Outcome`, so a
+        // self-hosted guest whose `__vm_jit_*` are lowered to `call.import` (temen-llvm) drives
+        // the Jit cap on the bytecode engine too (the pure-host `compile`/`compile_linked`
+        // ops 0/5 stay on `cap_dispatch_slots` below). The submitted unit is re-verified by
+        // the embedder's `jit_validator` before it runs — the security hinge is unchanged.
+        // The op it reaches is the dispatch's own translation ([`Host::import_target`]),
+        // so a grouped binding's remapped op is a driver op here too.
+        if *type_id == temen_ir::CAP_IMPORT_TYPE_ID {
+            if let Ok((b_type, b_op, b_handle)) = host.with(|p| p.import_target(*op)) {
+                if b_type == super::cap_id::JIT && matches!(b_op, 1 | 3 | 4) {
+                    // invoke needs its code handle in arg0; install and uninstall are
+                    // held to their contract, as on the oracle (#2361).
+                    let sig = temen_ir::FuncType {
+                        params: params.to_vec(),
+                        results: results.to_vec(),
+                    };
+                    if argv.is_empty() || !temen_ir::served_shape_ok(b_type, b_op, &sig) {
+                        return Err(Trap::CapFault);
+                    }
+                    self.module = module;
+                    self.cur = cur;
+                    self.base = base;
+                    self.pc = pc + 1;
+                    return Ok(Err(match b_op {
+                        3 => Outcome::JitInstall {
+                            h: b_handle,
+                            code: argv[0] as i32,
+                            dst: *dst,
+                        },
+                        4 => Outcome::JitUninstall {
+                            h: b_handle,
+                            slot: argv[0],
+                            dst: *dst,
+                        },
+                        _ => Outcome::JitInvoke {
+                            h: b_handle,
+                            code: argv[0] as i32,
+                            argv: argv[1..].to_vec().into_boxed_slice(),
+                            dst: *dst,
+                            // The unit entry's params are the call's params minus arg0 (code).
+                            params: params.get(1..).unwrap_or(&[]).to_vec().into_boxed_slice(),
+                            results: results.clone(),
+                        },
+                    }));
+                }
+            }
+        }
+        // #2109: the host copies the call's buffers in one go ([`super::SoleMem`]).
+        let mut sole = mem.as_mut().map(super::SoleMem);
+        let gm = sole.as_mut().map(|m| m as &mut dyn GuestMem);
+        let mut pending_id = None;
+        // #1173 — take this dispatch's PER-OP park/interrupt flags in the SAME lock scope
+        // as the dispatch that sets them. They live on the shared `Host`, and on the
+        // PARALLEL driver every vCPU of a domain shares one, so draining them under a
+        // later, separate `with` let a sibling thread's unrelated dispatch — landing in
+        // the gap — take THIS op's flags: the parked reader then fell through to the
+        // non-park arm and kept the placeholder `0` its rewound read had returned (a pipe
+        // read answering EOF that never happened), while the sibling wrote the `-EINTR`
+        // into its own `dst`. That is the `EINTR(42)` → `0` flake, at ~20% per attempt.
+        // Under one lock the flags are what they always meant to be: extra return values
+        // of this dispatch, unreachable by any other vCPU.
+        let (mut unlocked, mut live, mut parks) = (None, None, None);
+        let r = host.with(|p| {
+            let r = p.cap_dispatch_slots_deferring(
+                *type_id,
+                *op,
+                h,
+                argv,
+                &mut *res,
+                gm,
+                Some(&mut pending_id),
+                Some(&mut unlocked),
+                Some(&mut live),
+            );
+            // The flags it left, drained in this same hold, or `None` for a call that left none:
+            // carried out as `pending_id`, `unlocked` and `live` are, so a call that left none
+            // moves nothing the size of `DispatchParks` ([`DispatchParks::left`]).
+            DispatchParks::left(p, &mut parks);
+            r
+        });
+        // #2645 — an unlocked host procedure runs now, the domain's host let go: on the
+        // parallel driver its other tasks make their host calls meanwhile. It raised no
+        // park, so the rest of this arm only delivers its results.
+        r?;
+        // §3.6 (I36 slice 2) — caller-side parking: a call through a live-callee
+        // offer does not complete in the dispatch, which hands its target back. The task
+        // stops to make it, and the driver enqueues it on the callee's inbound queue and
+        // parks the task until the handler's reply (the tree-walker's caller-parking arm,
+        // task-level).
+        if let Some(target) = live {
+            let sig = target.sig(argv.len(), results.len())?;
+            self.module = module;
+            self.cur = cur;
+            self.base = base;
+            self.pc = pc + 1;
+            return Ok(Err(Outcome::LiveCall(LiveCall {
+                callee: target.callee,
+                export: target.export,
+                op: target.op,
+                args: argv.to_vec(),
+                sig,
+                dst: *dst,
+            })));
+        }
+        if let Some(call) = unlocked {
+            call.run(argv, res, sole.as_mut().map(|m| m as &mut dyn GuestMem))?;
+        }
+        let res: &[i64] = res;
+        // §12 parking-on-blocking: a punted offloadable dispatch. The `with` scope
+        // above already released the shared-host lock. The exactly-`i64` case is
+        // surfaced as [`Outcome::CapPending`] so the DRIVER chooses the wait shape
+        // (F2: the cooperative `drive` fiber-parks a punting fiber; every other
+        // driver waits inline — the I45 posture). Other reply shapes keep the
+        // slice-1 inline wait right here; the placeholder `res` is discarded.
+        if let Some(id) = pending_id {
+            if results.len() > 1 {
+                // A punted job answers one scalar ([`super::OffloadWork`]) — a
+                // wider declared signature is a registration bug, fail-closed
+                // BEFORE any park or wait.
+                return Err(Trap::CapFault);
+            }
+            if let [ValType::I64] = &results[..] {
+                self.module = module;
+                self.cur = cur;
+                self.base = base;
+                self.pc = pc + 1;
+                return Ok(Err(Outcome::CapPending { id, dst: *dst }));
+            }
+            // #1722 — no other reply shape parks, so a host-completed punt, which only
+            // its embedder can finish, declines as the oracle's does: waiting for it
+            // would never return (the single-threaded build's wait panics).
+            let comps = host.with(|p| p.completions());
+            let r = comps.wait_unless_host_owned(id).ok_or(Trap::CapFault)?;
+            if let Some(ty) = results.first() {
+                self.regs[base + *dst as usize] = Reg::from_value(slot_to_val(*ty, r));
+            }
+            pc += 1;
+            return Ok(Ok(pc));
+        }
+        // A call that left no flag (most calls) is done: no import lookup and no decision.
+        let decided = match parks {
+            None => CallPark::Done(None),
+            Some(parks) => {
+                // A `call.import` dispatch carries the `CAP_IMPORT_TYPE_ID` sentinel — read
+                // the `(type_id, op)` it reaches, a grouped binding's through its remap
+                // ([`Host::import_target`], the dispatch's own translation), so an imported stdin
+                // `read` parks exactly like the resolved `call.cap` form (IMPORTS.md phase 3), as
+                // a native task's call does (the JIT's call site passes the reached op).
+                let (eff_tid, eff_op) = if *type_id == temen_ir::CAP_IMPORT_TYPE_ID {
+                    host.with(|p| p.import_target(*op))
+                        .map(|(t, o, _)| (t, o))
+                        .unwrap_or((*type_id, *op))
+                } else {
+                    (*type_id, *op)
+                };
+                // #2550 — what the op leaves its task to do: the one decision executor 2's tasks
+                // share ([`DispatchParks::decide`], a native task's call too). A blocking stdin
+                // read or a pipe park rewinds the op, which re-executes on wake (#1146, #1080
+                // rung 4); a deliverable non-`SA_RESTART` signal (the latched interrupt, or one
+                // already pending at the park) completes it `-EINTR` instead, its caught handler
+                // delivered at the next safepoint; a landing freeze abandons it with its
+                // placeholder answer. A personality's request (#799/#1080: `fork`, `execve`,
+                // `posix_spawn`, a blocking `waitpid`) is the cooperative driver's; `fork`,
+                // `execve` and `posix_spawn` advance past the op, `waitpid` rewinds it.
+                let read = eff_tid == super::cap_id::STREAM && eff_op == 0;
+                parks.decide(read, |f| match f {
+                    ParkFact::Interrupted(sig) => {
+                        (sig && !host.with(|p| p.signal_restart()))
+                            || host.with(|p| p.park_interrupted())
+                    }
+                    ParkFact::Abandon => self.abandon_for_freeze(mem, host),
+                })
+            }
+        };
+        let park = |vm: &mut Self, at: usize, out: Outcome| {
+            vm.module = module;
+            vm.cur = cur;
+            vm.base = base;
+            vm.pc = at;
+            Ok(Err(out))
+        };
+        match decided {
+            CallPark::Eintr => {
+                self.regs[base + *dst as usize] = Reg::from_i64(temen_ir::errno::EINTR);
+                pc += 1;
+            }
+            CallPark::Abandon => {
+                self.set_results(base + *dst as usize, res, results);
+                pc += 1;
+            }
+            CallPark::Stdin => return park(self, pc, Outcome::StdinPark),
+            CallPark::PipeRead(pipe) => return park(self, pc, Outcome::PipeRead { pipe }),
+            CallPark::PipeWrite(pipe) => return park(self, pc, Outcome::PipeWrite { pipe }),
+            CallPark::Request(ev, plan) => {
+                let out = match ev {
+                    super::ParkEvent::ForkSelf => Outcome::ForkSelf { dst: *dst },
+                    super::ParkEvent::TaskExit(id) => {
+                        return park(
+                            self,
+                            pc,
+                            Outcome::ReapWait {
+                                child: Some(id as usize),
+                            },
+                        );
+                    }
+                    super::ParkEvent::TaskExitAny => {
+                        return park(self, pc, Outcome::ReapWait { child: None });
+                    }
+                    // #1609 — `execve` through the personality, which already resolved
+                    // the path and packed argv/envp into the powerbox args region: the
+                    // op-14 image-replace, with the self-contained-command shape. A
+                    // refused exec lands its errno in `dst`.
+                    super::ParkEvent::ExecSelf { cmd } => Outcome::Exec {
+                        cmd,
+                        grants_ptr: 0,
+                        grants_n: 0,
+                        entry: 0,
+                        size_log2: 0,
+                        dst: *dst,
+                        personality: true,
+                    },
+                    // The driver writes the new pid (or the errno) into `dst`.
+                    super::ParkEvent::SpawnSelf { cmd } => Outcome::SpawnSelf {
+                        cmd,
+                        plan: plan.expect("a staged spawn"),
+                        dst: *dst,
+                    },
+                };
+                return park(self, pc + 1, out);
+            }
+            // Only a native task's call parks on a punt here; an op's surfaced above.
+            CallPark::CapPending(_) => return Err(Trap::Malformed),
+            CallPark::Done(region) => {
+                self.set_results(base + *dst as usize, res, results);
+                pc += 1;
+                // #1936 — a post's signal: the op is done, and the driver wakes the
+                // word's waiters, which only it can reach.
+                if let Some(w) = region {
+                    return park(self, pc, Outcome::WakeRegion(w));
+                }
+                // #1198 — this syscall STOPPED its own domain (a background terminal
+                // read/write hit `tty_background_check` → SIGTTIN/SIGTTOU default-action
+                // stop; or a `^Z` SIGTSTP). The tree-walker benches a stopped domain at
+                // its per-op `stop_flag` safepoint, so a libc restart loop (`while (r ==
+                // -ERESTART) read();`) parks after one turn. The bytecode engine has no
+                // per-op poll, so that loop would spin here forever. Yield to the pump at
+                // THIS syscall boundary — the result is already written and `pc` is past
+                // the op, so the resume re-executes the *next* op on wake — and let the
+                // round-robin pick bench the stopped domain (it re-admits at SIGCONT).
+                // Gated on a signal personality, and only reached when a syscall
+                // completed inline (no park).
+                if signal_poll.as_ref().is_some_and(|(_, s)| s.stopped()) {
+                    return park(self, pc, Outcome::Suspended);
+                }
+            }
+        }
+        Ok(Ok(pc))
     }
 
     /// [`Vm::resume`]'s op loop. The cursor (`cur`/`base`/`pc`) lives in locals for the duration of
@@ -23743,325 +24110,9 @@ impl Vm {
                     pc = 0;
                 }
                 Op::CapCall(call) => {
-                    let CapCallOp {
-                        type_id,
-                        op,
-                        handle,
-                        params,
-                        args,
-                        dst,
-                        results,
-                    } = &**call;
-                    // Generic synchronous powerbox dispatch — the same path and ABI the tree-walker's
-                    // generic `CapCall` arm uses (`cap_dispatch_slots`): handle as an i32, args/results
-                    // as i64 slots, results re-typed by the call's `sig.results`. Via [`HostCell`] so a
-                    // parallel vCPU takes the shared-host lock only for this one call (4c-host); the
-                    // cooperative path is exclusive (uncontended), so order is unchanged.
-                    // `u32::MAX` = no handle operand (a v8 `call.import` — the slot binding
-                    // identifies the capability; the dispatch ignores the value).
-                    let h = if *handle == u32::MAX {
-                        0
-                    } else {
-                        r!(*handle).i32()
-                    };
-                    // #2319 — the call's arg and result slots, on this stack when they fit.
-                    let (mut arg_stack, mut arg_heap) = ([0; CALL_STACK_SLOTS], Vec::new());
-                    let argv = call_slots(&mut arg_stack, &mut arg_heap, args.len());
-                    for (s, a) in argv.iter_mut().zip(args.iter()) {
-                        *s = r!(*a).i64();
-                    }
-                    let argv: &[i64] = argv;
-                    let (mut res_stack, mut res_heap) = ([0; CALL_STACK_SLOTS], Vec::new());
-                    let res = call_slots(&mut res_stack, &mut res_heap, results.len());
-                    // #2361 — the call defines every result it declares: whatever lands below (the
-                    // host's results, an errno, a parked call's delivery) lands over zeros, as the
-                    // oracle and the Cranelift JIT define them.
-                    for i in 0..results.len() {
-                        self.regs[base + *dst as usize + i] = Reg::default();
-                    }
-                    // #1904 — the oracle's stop see-through (#1672): a stopped domain runs under a
-                    // landing freeze only to reach its next freeze point, so nothing may leave it on the
-                    // way — a host call is abandoned rather than performed, for the thaw to re-issue.
-                    // (A serve op is `Op::SvcPoll`, which the freeze already makes inert.)
-                    if signal_poll.as_ref().is_some_and(|(_, s)| s.stopped())
-                        && self.abandon_for_freeze(mem, host)
-                    {
-                        pc += 1;
-                        continue;
-                    }
-                    // FORK.md §8.6 / #1080 rung 4 — `pipe(fds)` (CAP_SELF op 16): the one mint
-                    // ([`super::Host::mint_pipe`]). The generic dispatch below declines it (an engine
-                    // serves it only where its reads and writes can park), so it is serviced here.
-                    if *type_id == temen_ir::CAP_SELF_TYPE_ID && *op == super::CAP_SELF_PIPE {
-                        let fds = argv.first().copied().unwrap_or(0) as u64;
-                        let mut sole = mem.as_mut().map(super::SoleMem);
-                        let gm = sole.as_mut().map(|m| m as &mut dyn GuestMem);
-                        let r = host.with(|p| p.mint_pipe(fds, gm));
-                        self.regs[base + *dst as usize] = Reg::from_i64(r);
-                        pc += 1;
-                        continue;
-                    }
-                    // §22: an **import-bound** `Jit` driver op (`invoke`/`install`/`uninstall`) can't be
-                    // serviced by the generic `cap_dispatch_slots` — it needs the scheduler-owning
-                    // driver, exactly like a *static* `call.cap (JIT, op)` (which lowers straight to
-                    // `Op::JitInvoke`). Resolve the binding and surface the same driver `Outcome`, so a
-                    // self-hosted guest whose `__vm_jit_*` are lowered to `call.import` (temen-llvm) drives
-                    // the Jit cap on the bytecode engine too (the pure-host `compile`/`compile_linked`
-                    // ops 0/5 stay on `cap_dispatch_slots` below). The submitted unit is re-verified by
-                    // the embedder's `jit_validator` before it runs — the security hinge is unchanged.
-                    // The op it reaches is the dispatch's own translation ([`Host::import_target`]),
-                    // so a grouped binding's remapped op is a driver op here too.
-                    if *type_id == temen_ir::CAP_IMPORT_TYPE_ID {
-                        if let Ok((b_type, b_op, b_handle)) = host.with(|p| p.import_target(*op)) {
-                            if b_type == super::cap_id::JIT && matches!(b_op, 1 | 3 | 4) {
-                                // invoke needs its code handle in arg0; install and uninstall are
-                                // held to their contract, as on the oracle (#2361).
-                                let sig = temen_ir::FuncType {
-                                    params: params.to_vec(),
-                                    results: results.to_vec(),
-                                };
-                                if argv.is_empty() || !temen_ir::served_shape_ok(b_type, b_op, &sig)
-                                {
-                                    return Err(Trap::CapFault);
-                                }
-                                self.module = module;
-                                self.cur = cur;
-                                self.base = base;
-                                self.pc = pc + 1;
-                                return Ok(match b_op {
-                                    3 => Outcome::JitInstall {
-                                        h: b_handle,
-                                        code: argv[0] as i32,
-                                        dst: *dst,
-                                    },
-                                    4 => Outcome::JitUninstall {
-                                        h: b_handle,
-                                        slot: argv[0],
-                                        dst: *dst,
-                                    },
-                                    _ => Outcome::JitInvoke {
-                                        h: b_handle,
-                                        code: argv[0] as i32,
-                                        argv: argv[1..].to_vec().into_boxed_slice(),
-                                        dst: *dst,
-                                        // The unit entry's params are the call's params minus arg0 (code).
-                                        params: params
-                                            .get(1..)
-                                            .unwrap_or(&[])
-                                            .to_vec()
-                                            .into_boxed_slice(),
-                                        results: results.clone(),
-                                    },
-                                });
-                            }
-                        }
-                    }
-                    // #2109: the host copies the call's buffers in one go ([`super::SoleMem`]).
-                    let mut sole = mem.as_mut().map(super::SoleMem);
-                    let gm = sole.as_mut().map(|m| m as &mut dyn GuestMem);
-                    let mut pending_id = None;
-                    // #1173 — take this dispatch's PER-OP park/interrupt flags in the SAME lock scope
-                    // as the dispatch that sets them. They live on the shared `Host`, and on the
-                    // PARALLEL driver every vCPU of a domain shares one, so draining them under a
-                    // later, separate `with` let a sibling thread's unrelated dispatch — landing in
-                    // the gap — take THIS op's flags: the parked reader then fell through to the
-                    // non-park arm and kept the placeholder `0` its rewound read had returned (a pipe
-                    // read answering EOF that never happened), while the sibling wrote the `-EINTR`
-                    // into its own `dst`. That is the `EINTR(42)` → `0` flake, at ~20% per attempt.
-                    // Under one lock the flags are what they always meant to be: extra return values
-                    // of this dispatch, unreachable by any other vCPU.
-                    let (mut unlocked, mut live) = (None, None);
-                    let (r, parks) = host.with(|p| {
-                        let r = p.cap_dispatch_slots_deferring(
-                            *type_id,
-                            *op,
-                            h,
-                            argv,
-                            &mut *res,
-                            gm,
-                            Some(&mut pending_id),
-                            Some(&mut unlocked),
-                            Some(&mut live),
-                        );
-                        // Drain unconditionally (the tree-walker's park site does the same): a flag
-                        // only ever means "the op *this* dispatch just ran wants to park", so one
-                        // left set would misfire on a later, unrelated op. The wake flags need no
-                        // action here: see [`DispatchParks::take`].
-                        (r, DispatchParks::take(p))
-                    });
-                    // #2645 — an unlocked host procedure runs now, the domain's host let go: on the
-                    // parallel driver its other tasks make their host calls meanwhile. It raised no
-                    // park, so the rest of this arm only delivers its results.
-                    r?;
-                    // §3.6 (I36 slice 2) — caller-side parking: a call through a live-callee
-                    // offer does not complete in the dispatch, which hands its target back. The task
-                    // stops to make it, and the driver enqueues it on the callee's inbound queue and
-                    // parks the task until the handler's reply (the tree-walker's caller-parking arm,
-                    // task-level).
-                    if let Some(target) = live {
-                        let sig = target.sig(argv.len(), results.len())?;
-                        self.module = module;
-                        self.cur = cur;
-                        self.base = base;
-                        self.pc = pc + 1;
-                        return Ok(Outcome::LiveCall(LiveCall {
-                            callee: target.callee,
-                            export: target.export,
-                            op: target.op,
-                            args: argv.to_vec(),
-                            sig,
-                            dst: *dst,
-                        }));
-                    }
-                    if let Some(call) = unlocked {
-                        call.run(argv, res, sole.as_mut().map(|m| m as &mut dyn GuestMem))?;
-                    }
-                    let res: &[i64] = res;
-                    // §12 parking-on-blocking: a punted offloadable dispatch. The `with` scope
-                    // above already released the shared-host lock. The exactly-`i64` case is
-                    // surfaced as [`Outcome::CapPending`] so the DRIVER chooses the wait shape
-                    // (F2: the cooperative `drive` fiber-parks a punting fiber; every other
-                    // driver waits inline — the I45 posture). Other reply shapes keep the
-                    // slice-1 inline wait right here; the placeholder `res` is discarded.
-                    if let Some(id) = pending_id {
-                        if results.len() > 1 {
-                            // A punted job answers one scalar ([`super::OffloadWork`]) — a
-                            // wider declared signature is a registration bug, fail-closed
-                            // BEFORE any park or wait.
-                            return Err(Trap::CapFault);
-                        }
-                        if let [ValType::I64] = &results[..] {
-                            self.module = module;
-                            self.cur = cur;
-                            self.base = base;
-                            self.pc = pc + 1;
-                            return Ok(Outcome::CapPending { id, dst: *dst });
-                        }
-                        // #1722 — no other reply shape parks, so a host-completed punt, which only
-                        // its embedder can finish, declines as the oracle's does: waiting for it
-                        // would never return (the single-threaded build's wait panics).
-                        let comps = host.with(|p| p.completions());
-                        let r = comps.wait_unless_host_owned(id).ok_or(Trap::CapFault)?;
-                        if let Some(ty) = results.first() {
-                            self.regs[base + *dst as usize] = Reg::from_value(slot_to_val(*ty, r));
-                        }
-                        pc += 1;
-                        continue;
-                    }
-                    // A `call.import` dispatch carries the `CAP_IMPORT_TYPE_ID` sentinel — read
-                    // the `(type_id, op)` it reaches, a grouped binding's through its remap
-                    // ([`Host::import_target`], the dispatch's own translation), so an imported stdin
-                    // `read` parks exactly like the resolved `call.cap` form (IMPORTS.md phase 3), as
-                    // a native task's call does (the JIT's call site passes the reached op).
-                    let (eff_tid, eff_op) = if *type_id == temen_ir::CAP_IMPORT_TYPE_ID {
-                        host.with(|p| p.import_target(*op))
-                            .map(|(t, o, _)| (t, o))
-                            .unwrap_or((*type_id, *op))
-                    } else {
-                        (*type_id, *op)
-                    };
-                    // #2550 — what the op leaves its task to do: the one decision executor 2's tasks
-                    // share ([`DispatchParks::decide`], a native task's call too). A blocking stdin
-                    // read or a pipe park rewinds the op, which re-executes on wake (#1146, #1080
-                    // rung 4); a deliverable non-`SA_RESTART` signal (the latched interrupt, or one
-                    // already pending at the park) completes it `-EINTR` instead, its caught handler
-                    // delivered at the next safepoint; a landing freeze abandons it with its
-                    // placeholder answer. A personality's request (#799/#1080: `fork`, `execve`,
-                    // `posix_spawn`, a blocking `waitpid`) is the cooperative driver's; `fork`,
-                    // `execve` and `posix_spawn` advance past the op, `waitpid` rewinds it.
-                    let read = eff_tid == super::cap_id::STREAM && eff_op == 0;
-                    let decided = parks.decide(read, |f| match f {
-                        ParkFact::Interrupted(sig) => {
-                            (sig && !host.with(|p| p.signal_restart()))
-                                || host.with(|p| p.park_interrupted())
-                        }
-                        ParkFact::Abandon => self.abandon_for_freeze(mem, host),
-                    });
-                    let park = |vm: &mut Self, at: usize, out: Outcome| {
-                        vm.module = module;
-                        vm.cur = cur;
-                        vm.base = base;
-                        vm.pc = at;
-                        Ok(out)
-                    };
-                    match decided {
-                        CallPark::Eintr => {
-                            self.regs[base + *dst as usize] = Reg::from_i64(temen_ir::errno::EINTR);
-                            pc += 1;
-                        }
-                        CallPark::Abandon => {
-                            self.set_results(base + *dst as usize, res, results);
-                            pc += 1;
-                        }
-                        CallPark::Stdin => return park(self, pc, Outcome::StdinPark),
-                        CallPark::PipeRead(pipe) => {
-                            return park(self, pc, Outcome::PipeRead { pipe })
-                        }
-                        CallPark::PipeWrite(pipe) => {
-                            return park(self, pc, Outcome::PipeWrite { pipe })
-                        }
-                        CallPark::Request(ev, plan) => {
-                            let out = match ev {
-                                super::ParkEvent::ForkSelf => Outcome::ForkSelf { dst: *dst },
-                                super::ParkEvent::TaskExit(id) => {
-                                    return park(
-                                        self,
-                                        pc,
-                                        Outcome::ReapWait {
-                                            child: Some(id as usize),
-                                        },
-                                    );
-                                }
-                                super::ParkEvent::TaskExitAny => {
-                                    return park(self, pc, Outcome::ReapWait { child: None });
-                                }
-                                // #1609 — `execve` through the personality, which already resolved
-                                // the path and packed argv/envp into the powerbox args region: the
-                                // op-14 image-replace, with the self-contained-command shape. A
-                                // refused exec lands its errno in `dst`.
-                                super::ParkEvent::ExecSelf { cmd } => Outcome::Exec {
-                                    cmd,
-                                    grants_ptr: 0,
-                                    grants_n: 0,
-                                    entry: 0,
-                                    size_log2: 0,
-                                    dst: *dst,
-                                    personality: true,
-                                },
-                                // The driver writes the new pid (or the errno) into `dst`.
-                                super::ParkEvent::SpawnSelf { cmd } => Outcome::SpawnSelf {
-                                    cmd,
-                                    plan: plan.expect("a staged spawn"),
-                                    dst: *dst,
-                                },
-                            };
-                            return park(self, pc + 1, out);
-                        }
-                        // Only a native task's call parks on a punt here; an op's surfaced above.
-                        CallPark::CapPending(_) => return Err(Trap::Malformed),
-                        CallPark::Done(region) => {
-                            self.set_results(base + *dst as usize, res, results);
-                            pc += 1;
-                            // #1936 — a post's signal: the op is done, and the driver wakes the
-                            // word's waiters, which only it can reach.
-                            if let Some(w) = region {
-                                return park(self, pc, Outcome::WakeRegion(w));
-                            }
-                            // #1198 — this syscall STOPPED its own domain (a background terminal
-                            // read/write hit `tty_background_check` → SIGTTIN/SIGTTOU default-action
-                            // stop; or a `^Z` SIGTSTP). The tree-walker benches a stopped domain at
-                            // its per-op `stop_flag` safepoint, so a libc restart loop (`while (r ==
-                            // -ERESTART) read();`) parks after one turn. The bytecode engine has no
-                            // per-op poll, so that loop would spin here forever. Yield to the pump at
-                            // THIS syscall boundary — the result is already written and `pc` is past
-                            // the op, so the resume re-executes the *next* op on wake — and let the
-                            // round-robin pick bench the stopped domain (it re-admits at SIGCONT).
-                            // Gated on a signal personality, and only reached when a syscall
-                            // completed inline (no park).
-                            if signal_poll.as_ref().is_some_and(|(_, s)| s.stopped()) {
-                                return park(self, pc, Outcome::Suspended);
-                            }
-                        }
+                    match self.cap_call(call, (module, cur, base, pc), mem, host, &signal_poll)? {
+                        Ok(next) => pc = next,
+                        Err(out) => return Ok(out),
                     }
                 }
                 Op::SvcPoll { dst, wait } => {
