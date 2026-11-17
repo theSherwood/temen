@@ -16063,10 +16063,8 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
             }
             macro_rules! jit_uninstall_body {
                 ($h:expr, $args:expr) => {{
-                    let domain = {
-                        let hg = host.lock_unpoisoned();
-                        hg.resolve_jit_domain($h)? // authority: a forged handle is inert
-                    };
+                    // Authority: a forged handle is inert. Any domain's may clear any installed slot.
+                    host.lock_unpoisoned().resolve_jit_domain($h)?;
                     let slot = get(&frames[top].vals, *$args.first().ok_or(Trap::Malformed)?)?.i64()
                         as usize;
                     // A guest may only clear slots it installed (`≥ funcs.len()`, the module-0
@@ -16074,7 +16072,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     let res = if dt.uninstall(slot, funcs.len()) {
                         // Drop the occupancy record so a snapshot doesn't re-apply a cleared slot.
                         host.lock_unpoisoned()
-                            .jit_forget_install(domain, slot as u32);
+                            .jit_forget_install(slot as u32);
                         0
                     } else {
                         EINVAL
@@ -33136,15 +33134,21 @@ impl Host {
     /// a per-run transient) and rides a snapshot. A repeat of the same slot replaces (the table slot
     /// holds one unit); push order is preserved otherwise, so a re-apply reproduces dispatch.
     pub fn jit_record_install(&mut self, domain: u32, slot: u32, unit: u32) {
-        if let Some(d) = self.jit_tables.get_mut(domain as usize) {
-            d.installed.retain(|&(s, _)| s != slot);
-            d.installed.push((slot, unit));
+        if domain as usize >= self.jit_tables.len() {
+            return;
         }
+        self.jit_forget_install(slot);
+        self.jit_tables[domain as usize]
+            .installed
+            .push((slot, unit));
     }
 
     /// Forget a B2 `uninstall`: `slot` is cleared, so drop its occupancy record (DURABILITY.md §12.5).
-    pub fn jit_forget_install(&mut self, domain: u32, slot: u32) {
-        if let Some(d) = self.jit_tables.get_mut(domain as usize) {
+    /// From every domain: the dispatch table is the run's one, and an `uninstall` through any domain's
+    /// handle clears a slot another domain filled (#3102: its record stayed, and a later
+    /// install there gave the slot two records, which a restore refuses).
+    pub fn jit_forget_install(&mut self, slot: u32) {
+        for d in &mut self.jit_tables {
             d.installed.retain(|&(s, _)| s != slot);
         }
     }

@@ -1228,7 +1228,7 @@ unsafe fn jit_native_op(
             // SAFETY: `cm` is the in-flight run's CompiledModule (guest suspended).
             let v = if slot >= 0 && (*cm).uninstall(slot as u32) {
                 // Drop the occupancy record so a snapshot doesn't re-apply a cleared slot.
-                host.jit_forget_install(domain, slot as u32);
+                host.jit_forget_install(slot as u32);
                 0
             } else {
                 EINVAL

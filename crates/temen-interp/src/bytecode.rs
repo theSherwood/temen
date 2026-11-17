@@ -5346,7 +5346,7 @@ fn debug_advance_fiber(
         }
         Ok(Outcome::JitUninstall { h, slot, dst }) => {
             let jit_table = host.resolve_jit_domain(h);
-            let forget = |t, slot| host.jit_forget_install(t, slot);
+            let forget = |_, slot| host.jit_forget_install(slot);
             match jit_uninstall(jit_table, source, table, slot, &mut vt.active, dst, forget) {
                 Ok(_) => FiberStep::Stepped,
                 Err(t) => FiberStep::Trapped(t),
@@ -12103,7 +12103,7 @@ fn drive_nested(
             }
             Outcome::JitUninstall { h, slot, dst } if run_meta.is_some() => {
                 let jit_table = host.with(|p| p.resolve_jit_domain(h));
-                let forget = |t, slot| host.with(|p| p.jit_forget_install(t, slot));
+                let forget = |_, slot| host.with(|p| p.jit_forget_install(slot));
                 jit_uninstall(jit_table, source, table, slot, &mut vt.active, dst, forget)?;
             }
             // #1334: a §22 `Jit.invoke` reached on a nested interpretation — a cross-tier bounce out
@@ -16951,7 +16951,7 @@ impl SchedCore {
                 let env = tasks[ti].domain;
                 let host = &domains[env].host;
                 let jit_table = host.lock_unpoisoned().resolve_jit_domain(h);
-                let forget = |t, slot| host.lock_unpoisoned().jit_forget_install(t, slot);
+                let forget = |_, slot| host.lock_unpoisoned().jit_forget_install(slot);
                 let table = &*domains[env].table;
                 let active = &mut tasks[ti].vm.vt.active;
                 let cleared = jit_uninstall(jit_table, source, table, slot, active, dst, forget);

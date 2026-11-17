@@ -165,6 +165,33 @@ fn an_install_no_run_makes_is_refused() {
     assert!(refused(3, Some(5)), "a unit the domain does not hold");
 }
 
+/// #3102 — the dispatch table is the run's one, so an `uninstall` through any domain's handle
+/// clears a slot another domain filled, and a later `install` through either takes it again. Each
+/// slot has one record at the freeze: the restore admits the artifact, and only the new install is
+/// re-applied. On `f2aff3d` the uninstall forgot the slot only in its own domain: the slot carried
+/// two records, and the restore refused a real run's artifact as `Malformed`.
+#[test]
+fn a_slot_uninstalled_through_another_domain_and_reinstalled_has_one_record() {
+    let module = gate_module();
+    let mut host = Host::new();
+    host.set_jit_validator(validator);
+    let a = host.grant_jit_with_table(Some(SIZE_LOG2), 4);
+    let b = host.grant_jit_with_table(Some(SIZE_LOG2), 4);
+    let ca = host.jit_compile(a, &unit_blob(1)).unwrap().unwrap();
+    let cb = host.jit_compile(b, &unit_blob(2)).unwrap().unwrap();
+    // What the install and uninstall arms record: A installs at 3, B uninstalls 3 and installs there.
+    host.jit_record_install(ca.domain, 3, ca.unit);
+    host.jit_forget_install(3);
+    host.jit_record_install(cb.domain, 3, cb.unit);
+    assert_eq!(host.jit_installs(ca.domain), vec![], "A's install is gone");
+
+    let artifact = freeze(&module, &vec![0u8; WINDOW], &host).expect("freeze");
+    let mut thost = Host::new();
+    restore(&artifact, &module, &mut thost).expect("a real run's artifact restores");
+    assert_eq!(thost.jit_installs(ca.domain), vec![]);
+    assert_eq!(thost.jit_installs(cb.domain), vec![(3, cb.unit)]);
+}
+
 /// A JIT-free durable domain's artifact is unaffected by Slice 2: Section 5 is elided, so it stays
 /// byte-identical across a round-trip (the `!jit.is_empty()` guard).
 #[test]
