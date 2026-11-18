@@ -3862,24 +3862,48 @@ fn drive_over_cell(
                 // unreached, never written as if it had unwound. So is one that ran to its end while
                 // its domain was held for its own paged children (#2455): it did not unwind.
                 // #1688 — one rung between its last poll and its return returned: its result rides as
-                // a completed child's does. A trap only when it was the child's own: any other may
-                // be the run's end reaping it where it parked.
-                // Owner decision 25 (#2949) — one a trap of its own ended during the cut rides that
-                // trap as a completed child's outcome: its join answers it.
+                // a completed child's does. A trap only when it was the child's own (filed above):
+                // any other may be the run's end reaping it where it parked.
+                // Owner decision 25 (#2949) — one a trap of its own ended during the cut, before or
+                // after its root unwound, rides that trap as a completed child's outcome: its join
+                // answers it, and what its unwound root kept goes back as its end hands it back.
                 let dom = p.host.lock_unpoisoned().domain_id() as usize;
-                let (unwound, withheld, own_trap, out) = {
+                let (unwound, withheld, out) = {
                     let mut s = sched.lock();
                     let withheld = s.withheld.remove(&p.child_task).map(|w| w.outcome);
+                    let unwound = s.unwound.contains(&p.child_task);
+                    let kept = s.kept_leases.remove(&p.child_task);
+                    let own_trap = s.own_trap_domains.get(&dom).copied();
+                    if let (Some(trap), false) = (own_trap, withheld.is_some()) {
+                        s.results.remove(&p.child_task);
+                        if unwound {
+                            if let Some(end) = end_unwound_child(&p.host, kept) {
+                                notify_locked(&mut s, end.signal().key(), u32::MAX);
+                            }
+                        }
+                        drop(s);
+                        if p.joinable {
+                            owner
+                                .lock_unpoisoned()
+                                .residue
+                                .detached
+                                .push(FrozenDetached {
+                                    parent_task: p.parent_task,
+                                    slot: p.slot,
+                                    completed_result: Err(trap.code()),
+                                });
+                        }
+                        continue;
+                    }
                     (
-                        s.unwound.contains(&p.child_task),
+                        unwound,
                         withheld.is_some(),
-                        s.own_trap_domains.contains(&dom),
                         withheld.or_else(|| s.results.remove(&p.child_task)),
                     )
                 };
                 let m = match out {
                     Some(o) if unwound => o.mem.filter(|_| o.result.is_ok()),
-                    Some(o) if !withheld && (o.result.is_ok() || own_trap) => {
+                    Some(o) if !withheld && o.result.is_ok() => {
                         // #2465 — one its spawner detached leaves nothing anyone can join.
                         if p.joinable {
                             owner
@@ -3932,6 +3956,24 @@ fn drive_over_cell(
             for pid in mine {
                 let t = twins.remove(&pid).expect("listed just above");
                 let servicer = t.reaper == TwinReaper::Servicer;
+                // Owner decision 25 (#2949) — one a trap of its own ended during the cut ends with it,
+                // as a twin that trapped does: its exit hooks run, and a servicer's outcome rides.
+                if let Some(host) = &t.host {
+                    let dom = host.lock_unpoisoned().domain_id() as usize;
+                    let mut s = sched.lock();
+                    if let Some(trap) = s.own_trap_domains.get(&dom).copied() {
+                        s.results.remove(&pid);
+                        twin_finished_locked(&mut s, pid, host, &Err(trap));
+                        drop(s);
+                        if servicer {
+                            exited_twins.push(FrozenTwin {
+                                pid,
+                                outcome: Err(trap.code()),
+                            });
+                        }
+                        continue;
+                    }
+                }
                 let (unwound, out) = {
                     let mut s = sched.lock();
                     (s.unwound.contains(&pid), s.results.remove(&pid))
@@ -7631,10 +7673,16 @@ struct Sched {
     /// rides the cut as its join's answer.
     freeze_fault: Option<Trap>,
     /// Owner decision 25 (#2949) — each domain other than the run's root's that a trap of its own ended
-    /// while a freeze was in flight: a vCPU of it ended `Err` before anything else ended the domain
-    /// (a kill, the run's teardown). The harvest files such a detached child as a completed child
-    /// answering its trap, rather than as unreached.
-    own_trap_domains: BTreeSet<usize>,
+    /// while a freeze was in flight, with that trap: a vCPU of it (its root, a thread, a fiber it ran,
+    /// its freeze drive) ended `Err` before anything else ended the domain (a kill, the run's
+    /// teardown), and the freeze did not refuse it. The harvest files such a detached child as a
+    /// completed child answering its trap, and such a fork twin as one that ended with it, whether
+    /// or not its root had unwound.
+    own_trap_domains: BTreeMap<usize, Trap>,
+    /// Each detached child's window lease its root kept as it unwound for the freeze, by its task:
+    /// handed back by the harvest when a trap of its own ended it after all ([`end_unwound_child`]),
+    /// and otherwise left charged for the artifact, as before.
+    kept_leases: BTreeMap<TaskId, (Arc<Mutex<Host>>, Lease)>,
     /// #2695 step 2 — each domain resting after its entry returned ([`HeldDomain`]), by
     /// [`Domain::id`]: what its activations run over ([`activation`]). Kept, dead or not, until
     /// the run ends.
@@ -9725,10 +9773,7 @@ fn kill_withheld(s: &mut Sched, domain: usize, host: &Arc<Mutex<Host>>) {
         return;
     };
     let w = s.withheld.remove(&id).expect("found just above");
-    let end = host.lock_unpoisoned().release_memory();
-    if let Some((cell, lease)) = w.lease {
-        cell.lock_unpoisoned().release_detached(lease);
-    }
+    let end = end_unwound_child(host, w.lease);
     s.unwound.remove(&id);
     if let Some(joiner) = s.join_waiters.remove(&id) {
         s.runnable.push_back(joiner);
@@ -9743,6 +9788,21 @@ fn kill_withheld(s: &mut Sched, domain: usize, host: &Arc<Mutex<Host>>) {
     if let Some(end) = end {
         notify_locked(s, end.signal().key(), u32::MAX);
     }
+}
+
+/// A detached child whose root unwound for a freeze, ended after all (a `kill` of a withheld one, or
+/// a trap of its own in the cut, owner decision 25): its window goes back, as its end hands it back
+/// ([`Host::release_memory`]), with its lease, once. Answers its end post, for the caller to signal
+/// once the end is published (#1936, #2800).
+fn end_unwound_child(
+    host: &Arc<Mutex<Host>>,
+    lease: Option<(Arc<Mutex<Host>>, Lease)>,
+) -> Option<EndPost> {
+    let end = host.lock_unpoisoned().release_memory();
+    if let Some((cell, lease)) = lease {
+        cell.lock_unpoisoned().release_detached(lease);
+    }
+    end
 }
 
 /// #1584 / §13.4 4c-bis — bring every park the scheduler owns through a freeze, for either trigger
@@ -10657,13 +10717,13 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 // raised where it was refused; a trap of the root domain's own vCPUs ends the run
                 // anyway. A detached child's own trap is the child's: its join answers it, and the
                 // cut files it as a completed child. A fork twin's is its own as well.
-                if s.froze && !s.forked_twins.contains_key(&id) {
-                    if let Err(t) = &outcome.result {
-                        if freeze_refused || key == s.root_domain {
-                            s.freeze_fault.get_or_insert(*t);
-                        } else if !s.dead.contains_key(&key) {
-                            s.own_trap_domains.insert(key);
-                        }
+                if let (true, Err(t)) = (s.froze, &outcome.result) {
+                    let twin = s.forked_twins.contains_key(&id);
+                    if !twin && (freeze_refused || key == s.root_domain) {
+                        s.freeze_fault.get_or_insert(*t);
+                    } else if !freeze_refused && key != s.root_domain && !s.dead.contains_key(&key)
+                    {
+                        s.own_trap_domains.entry(key).or_insert(*t);
                     }
                 }
                 // (Never during a freeze unwind: servers are quiesced by freeze-on-quiesce, not run.)
@@ -10750,8 +10810,13 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                         lease: frozen_lease,
                     };
                     s.withheld.insert(id, w);
-                } else if !retired {
-                    s.results.insert(id, outcome);
+                } else {
+                    if let Some(kept) = frozen_lease {
+                        s.kept_leases.insert(id, kept);
+                    }
+                    if !retired {
+                        s.results.insert(id, outcome);
+                    }
                 }
                 // #1936, #2800 — the end post once the end is published (its `poll` and `join`
                 // see it), under the lock that retires this vCPU, so a waiter it wakes is runnable

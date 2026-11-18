@@ -1784,52 +1784,180 @@ fn the_jit_declines_a_nested_record_kind_it_stands_up_no_runtime_for() {
     );
 }
 
-/// #3034 — a child [`NEST_ROOT`] can spawn in [`NEST`]'s place that writes a value outside its own
-/// region into its own shadow-SP word (guest memory), then waits a second on a futex nothing
-/// notifies, so it is live when the freeze lands, and returns [`NEST_TOTAL`].
+/// #3034 — the shadow-SP word of the context the first `thread.spawn` of a child gets (the top of its
+/// vCPU pool), and of its root's (0).
+fn own_word(thread: bool) -> u64 {
+    let ctx = if thread {
+        temen_ir::durable_abi::ShadowContexts::default()
+            .reserve(ARENA, 0)
+            .expect("a context for the thread")
+    } else {
+        0
+    };
+    ARENA.region_base(ctx)
+}
+
+/// A futex wait on a word nothing notifies, forever: a park the freeze re-admits, whenever it lands.
+const PARK: &str = "  va = i64.const 66000
+  vw0 = i32.const 0
+  vinf = i64.const -1
+  vw = i32.atomic.wait va vw0 vinf
+";
+
+/// A store of 8 (inside no region: below every frame base) into the shadow-SP word at `word`.
+fn scribble(word: u64) -> String {
+    format!("  vsa = i64.const {word}\n  vsv = i64.const 8\n  i64.store vsa vsv\n")
+}
+
+/// #3034 — a child [`NEST_ROOT`] can spawn in [`NEST`]'s place whose root scribbles its own shadow-SP
+/// word, then parks forever: whenever the freeze lands, its root unwinds at that park and its push
+/// check traps `Unreachable`. No safepoint comes before the scribble.
 fn scribble_nest() -> String {
     format!(
         "memory 17 shadow 16448 65536
 func (i64, i64) -> (i64) {{
 block 0 (v0: i64, v1: i64) {{
-  vsa = i64.const {word}
-  vsv = i64.const 8
-  i64.store vsa vsv
-  va = i64.const 66000
-  vw0 = i32.const 0
-  vto = i64.const 1000000000
-  vw = i32.atomic.wait va vw0 vto
-  vr = i64.const {NEST_TOTAL}
+{}{PARK}  vr = i64.const 7
   return vr
   }}
 }}
 ",
-        word = ARENA.region_base(0)
+        scribble(own_word(false))
     )
 }
 
-/// #3034 — **a child's fault is the child's**, through the engine's own trap path, on every engine.
-/// A live detached child whose own shadow-SP word its guest scribbled traps at its own push check as
-/// the freeze rings it and it unwinds: it ends as a child that trapped `Unreachable` ends. The
-/// parent's run and freeze go on, the child rides the artifact completed with that trap, the
-/// artifact restores, and every engine's thaw answers it from the root's rewound `join` as its
-/// status. The budget nodes the freeze leaves equal those of a run whose child trapped before the
-/// cut ([`TRAP_NEST`]).
-#[test]
-fn a_childs_scribbled_shadow_word_ends_the_child_and_the_parents_freeze_goes_on() {
+/// #3034, round 4 B1 — a child whose root spawns a thread and parks forever at once, while its
+/// thread scribbles its own word and then parks forever too. The root parked first, so the freeze
+/// re-admits it first: on the tree-walker the root unwinds cleanly, and then the thread unwinds and
+/// traps at its push check, after its root unwound.
+fn root_first_nest() -> String {
+    format!(
+        "memory 17 shadow 16448 65536
+func (i64, i64) -> (i64) {{
+block 0 (v0: i64, v1: i64) {{
+  vz = i64.const 0
+  vt = thread.spawn 1 vz vz
+{PARK}  vr = i64.const 7
+  return vr
+  }}
+}}
+func (i64, i64) -> (i64) {{
+block 0 (v0: i64, v1: i64) {{
+{}{PARK}  vr = i64.const 7
+  return vr
+  }}
+}}
+",
+        scribble(own_word(true))
+    )
+}
+
+/// #3034, round 4 B1 — the other order: the thread scribbles its own word, raises a flag the root
+/// waits for, and parks forever; the root, once it sees the flag, parks forever after it. The thread
+/// parked first, so on the tree-walker it unwinds first and traps at its push check, which ends the
+/// child's domain before its root has unwound.
+fn thread_first_nest() -> String {
+    format!(
+        "memory 17 shadow 16448 65536
+func (i64, i64) -> (i64) {{
+block 0 (v0: i64, v1: i64) {{
+  vz = i64.const 0
+  vt = thread.spawn 1 vz vz
+  br 1()
+}}
+block 1 () {{
+  vfa = i64.const 66008
+  vf0 = i32.const 0
+  vms = i64.const 1000000
+  vfw = i32.atomic.wait vfa vf0 vms
+  vflag = i32.load vfa
+  vup = i32.ne vflag vf0
+  br_if vup 2() 1()
+}}
+block 2 () {{
+{PARK}  vr = i64.const 7
+  return vr
+  }}
+}}
+func (i64, i64) -> (i64) {{
+block 0 (v0: i64, v1: i64) {{
+{}  vfa = i64.const 66008
+  vone = i32.const 1
+  i32.store vfa vone
+  vn = atomic.notify vfa vone
+{PARK}  vr = i64.const 7
+  return vr
+  }}
+}}
+",
+        scribble(own_word(true))
+    )
+}
+
+/// #3034, round 4 B1 — a child whose fiber fails its extent check: its root makes a fiber and resumes
+/// it; the fiber raises its own window's freeze (a guest store of `UNWINDING` into its freeze word),
+/// writes its own shadow-SP word past its region's end, and returns with no safepoint between. Its
+/// return under the unwind reads that word and refuses it ([`temen_ir::thaw::extent_fits`]), so the
+/// child's root traps `Unreachable`, wherever its parent's freeze has got to.
+fn fiber_extent_nest() -> String {
+    let past = ARENA.region_base(1) + 2 * ARENA.stride;
+    let freeze = ARENA.freeze_word().expect("an arena");
+    format!(
+        "memory 17 shadow 16448 65536
+func (i64, i64) -> (i64) {{
+block 0 (v0: i64, v1: i64) {{
+  vf = ref.func 1
+  vss = i64.const 4096
+  vk = cont.new vf vss
+  vz = i64.const 0
+  vs, vv = cont.resume vk vz
+{PARK}  return vv
+  }}
+}}
+func (i64, i64) -> (i64) {{
+block 0 (v0: i64, v1: i64) {{
+  vfw = i64.const {freeze}
+  vun = i32.const {unwinding}
+  i32.store vfw vun
+  vsa = i64.const {word}
+  vsv = i64.const {past}
+  i64.store vsa vsv
+  vr = i64.const 7
+  return vr
+  }}
+}}
+",
+        unwinding = temen_ir::durable_abi::STATE_UNWINDING,
+        word = ARENA.region_base(1),
+    )
+}
+
+/// #3034 — owner decision 25: **a detached child's own trap in the cut is the child's**, through the
+/// engine's ordinary end of a trapped child, on every engine. `child` ends with `Unreachable` during
+/// its parent's freeze; `live` is how many vCPUs it runs ([`nest_powerbox`]). The parent's run and
+/// freeze go on, the child rides the artifact completed with that trap, the artifact restores, every
+/// engine's thaw answers it from the root's rewound `join` as its status, and the budget nodes the
+/// freeze leaves equal those of a run whose child trapped before the cut ([`TRAP_NEST`]).
+fn own_trap_rides(child: &str, live: i64) {
     use Engine::*;
     let unreachable = (Ok(temen_ir::trap_code::UNREACHABLE * 1000), "");
-    let budgets = |src: &str, e: Engine, live: i64| {
+    let frozen = |src: &str, e: Engine, live: i64| {
         let (root, child) = nest_modules(src);
-        let (mut host, args) = nest_powerbox(&child, 100, live);
+        let (mut host, args) = nest_powerbox(&child, 0, live);
         let mut win = init_durable_window(1 << PARENT_LOG2, ARENA);
         arm_freeze_after(&mut win, ARENA, 1);
         let (r, _, snap) = nest_run(e, &root, &args, &win, &mut host, None)?;
         Some((r, host, snap, root, child, args))
     };
+    let nodes = |h: &Host| {
+        h.capture_durable_budgets()
+            .iter()
+            .map(|n| (n.used.mem, n.used.spawn))
+            .collect::<Vec<_>>()
+    };
     let mut runs = Vec::new();
     for e in [Interp, Jit] {
-        let Some((r, host, snap, root, child, args)) = budgets(&scribble_nest(), e, 1) else {
+        let Some((r, host, snap, root, child, args)) = frozen(child, e, live) else {
             continue; // a target without the JIT's child executor
         };
         assert_eq!(r, Ok(0), "{e:?}: the parent's freeze goes on");
@@ -1841,15 +1969,9 @@ fn a_childs_scribbled_shadow_word_ends_the_child_and_the_parents_freeze_goes_on(
         assert_eq!(
             host.frozen_detached()[0].completed_result,
             Err(temen_ir::trap_code::UNREACHABLE),
-            "{e:?}: answering the push check's trap"
+            "{e:?}: answering its own trap"
         );
-        let (_, trapped, ..) = budgets(TRAP_NEST, e, 2).expect("the same engine");
-        let nodes = |h: &Host| {
-            h.capture_durable_budgets()
-                .iter()
-                .map(|n| (n.used.mem, n.used.spawn))
-                .collect::<Vec<_>>()
-        };
+        let (_, trapped, ..) = frozen(TRAP_NEST, e, 2).expect("the same engine");
         assert_eq!(
             nodes(&host),
             nodes(&trapped),
@@ -1872,4 +1994,31 @@ fn a_childs_scribbled_shadow_word_ends_the_child_and_the_parents_freeze_goes_on(
         ));
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// #3034 — a child whose root scribbled its own shadow-SP word traps at its own push check as it
+/// unwinds for the freeze. On `0265ec4`'s tree-walker the whole run failed `Unreachable`.
+#[test]
+fn a_childs_scribbled_shadow_word_ends_the_child_and_the_parents_freeze_goes_on() {
+    own_trap_rides(&scribble_nest(), 1);
+}
+
+/// #3034, round 4 B1 — a child's thread traps in the cut **after** its root unwound. On `0424e12`'s
+/// tree-walker the child was captured live, with no record of the thread.
+#[test]
+fn a_childs_thread_that_traps_after_its_root_unwound_ends_the_child() {
+    own_trap_rides(&root_first_nest(), 2);
+}
+
+/// #3034, round 4 B1 — a child's thread traps in the cut **before** its root unwound.
+#[test]
+fn a_childs_thread_that_traps_before_its_root_unwound_ends_the_child() {
+    own_trap_rides(&thread_first_nest(), 2);
+}
+
+/// #3034, round 4 B1 — a child's fiber fails its extent check ([`fiber_extent_nest`]). Without the
+/// check, the tree-walker captures the child live with that fiber's record.
+#[test]
+fn a_childs_fiber_that_fails_its_extent_check_ends_the_child() {
+    own_trap_rides(&fiber_extent_nest(), 1);
 }
