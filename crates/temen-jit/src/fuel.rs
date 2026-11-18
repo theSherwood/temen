@@ -148,8 +148,9 @@ pub struct FuelCell {
     /// at a time.
     src: Mutex<Arc<dyn BudgetNode>>,
     /// `left` is not the chain's to take back: #1991, the chain was unbounded at every level at the
-    /// last refill, which granted a [`QUANTUM`] drawn from nothing; or #3081, `left` is a spawned
-    /// vCPU's entry its spawn already paid ([`Self::seed_entry`]), which is never refunded. None of it
+    /// last refill, which granted a [`QUANTUM`] drawn from nothing; or #3081, `left` is the credit
+    /// seeded for a spawned vCPU's entry, which its spawn alone charges ([`Self::seed_entry`]), and
+    /// which is never refunded. None of it
     /// goes back to the chain (`settle`, `rearm`, `Drop`). Written by a refill and by the seeding,
     /// under `src`'s lock. A refill that draws rewrites it (to `true` only on an unbounded chain); the
     /// refill's early return, which keeps another context's refill, leaves it as it is.
@@ -210,8 +211,9 @@ impl FuelCell {
     /// every engine. The seed is never refunded: the cell holds exactly the unit, marked as none of
     /// the chain's (`free`), so whether the vCPU burns it or stops first (its run ended before its
     /// first charge: a kill check or a domain poll comes first in the prologue, or lazy code never
-    /// ran), nothing goes back. The refill that follows the burn clears the mark, so while it is set
-    /// the cell holds the unit or nothing. What a recycled cell held goes back to its chain first,
+    /// ran), nothing goes back. The refill that follows the burn rewrites the mark as any refill
+    /// does: cleared on a bounded chain, set again on an unbounded one, whose quantum is drawn from
+    /// nothing. What a recycled cell held goes back to its chain first,
     /// under the lock a refill takes and through the raw pointer, as [`Self::settle`] does; a fiber
     /// of the cell's earlier vCPU that refills it in between races it as any shared charge does
     /// (#3080).

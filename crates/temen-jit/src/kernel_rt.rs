@@ -185,8 +185,9 @@ impl KernelRun {
 
     /// #2958 slice 6 — the run's trap-time backtrace, innermost frame first, and the fiber that was
     /// running (`-1` for none): the first capture a vCPU published ([`Self::run_vcpu`]). Empty and
-    /// `None` when none was, as when no vCPU trapped or its code carried no `-g`. Read once every vCPU has gone; it takes the
-    /// capture.
+    /// `None` when none was, as when no vCPU trapped or its code carried no `-g`. A memory fault is
+    /// captured whatever `-g` says, so its backtrace can be empty with the fiber `Some(-1)`. Read
+    /// once every vCPU has gone; it takes the capture.
     pub fn trap_backtrace(&self) -> (Vec<JitFrameLoc>, Option<i64>) {
         let cap = self.trap.lock().unwrap_or_else(|e| e.into_inner()).take();
         match cap {
@@ -241,8 +242,9 @@ impl KernelRun {
         // freeze's deferred inline child, which runs after its root took the root's capture. Neither
         // takes what it made, and the kernel root runs on the caller's thread, so without this a
         // trap that makes no capture here (a host-raised fault, a trap without `-g`) would publish
-        // theirs as this run's.
-        drop(mem::take_trap_frame());
+        // theirs as this run's. Until it answers `None`: on Windows a memory fault and an explicit
+        // trap capture into two thread-locals, and one take clears one of them.
+        while mem::take_trap_frame().is_some() {}
         let mut results;
         let faulted = match entry {
             VcpuEntry::Root(args) => {

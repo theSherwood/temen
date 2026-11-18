@@ -23172,11 +23172,11 @@ impl Fuel {
     /// and the pump on the domain's): fuel with a node takes exactly one unit from it in one step
     /// ([`NodeRef::take_exact`]), never from a chunk it already holds and never by a draw and a
     /// give-back, which would empty the node's room for a moment beside vCPUs drawing from it on
-    /// threads of their own. A chunk the payer holds was drawn for burning: the spawning vCPU's own
-    /// on the tree-walker and the pump, and on executor 2 the rules' hand, which runs no vCPU, so
-    /// what it holds is burned by nobody. Paying from it took the entry out of fuel the run had
-    /// already drawn: N spawns still cost N + 1, but completed on a budget of N + 1 where the oracle
-    /// needs 2N. Every level unbounded charges nothing. A fixed allowance (no node: a debug tier's, or a lent one) pays from what it holds.
+    /// threads of their own. A chunk the payer holds is never touched: it is fuel the payer drew to
+    /// burn, and an entry paid from it would be charged against the run's earlier draw rather than
+    /// the node's room, so a spawn's cost would depend on what its payer happened to hold. Every
+    /// level unbounded charges nothing. A fixed allowance (no node: a debug tier's, or a lent one)
+    /// pays from what it holds.
     pub(crate) fn pay_entry(&mut self) -> Result<(), Trap> {
         match self.src.as_ref() {
             Some(s) => match s.take_exact(1) {

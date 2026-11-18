@@ -4027,6 +4027,11 @@ block 0 () {
 /// handler that traps under `-g` leaves its capture there, which nothing takes. The kernel route's
 /// root runs on that same thread: a run whose trap makes no capture (a division without `-g`)
 /// reports no fiber and no backtrace, not the handler's.
+///
+/// The control first shows the producer is real: after the same held call, today's route's run,
+/// whose root takes no pre-clear, reports the handler's fiber (`Some(-1)`, #3124's symptom). When
+/// #3124 is fixed and the held path takes its own capture, the control fails: the row then needs
+/// another producer (a durable freeze's deferred inline child) to keep testing the pre-clear.
 #[test]
 fn a_held_handlers_capture_is_never_a_kernel_runs() {
     let held = std::sync::Arc::new(module(
@@ -4052,20 +4057,62 @@ debug.fname 1 \"boom\"
 debug.loc 1 0 2 0 50 3
 ",
     ));
+    let inert = module(
+        "func () -> (i64) {
+block 0 () {
+  vc = i32.const 0
+  vr = call.cap 7 0 () -> (i64) vc()
+  return vr
+  }
+}
+",
+    );
     let bare = div0("root", false);
-    bounded("a held call, then the kernel route", move || {
-        let mut host = Host::new();
-        host.set_self_module(&held);
-        let (d, results) =
-            temen_run::hold(temen_interp::Executor::Jit, held, 0, &[], u64::MAX, host)
-                .unwrap_or_else(|(t, _)| panic!("the entry ends in {t:?}"));
-        assert_eq!(d.executor(), temen_interp::Executor::Jit, "held on the JIT");
-        assert_eq!(results, vec![temen_interp::Value::I64(1)]);
-        let mut fuel = 1_000_000;
-        let reply = d.call(0, 0, &[], &mut fuel);
-        // The handler's trap ends the domain (`CAP_REVOKED`, -9).
-        assert_eq!(reply, temen_interp::Reply::Failed(-9), "the handler traps");
-        assert_eq!(d.end().1, Some(Trap::DivByZero));
+    bounded("a held call, then a run on this thread", move || {
+        // A held domain on the JIT whose one call traps under `-g` on this thread.
+        let trap_a_held_call = || {
+            let mut host = Host::new();
+            host.set_self_module(&held);
+            let (d, results) = temen_run::hold(
+                temen_interp::Executor::Jit,
+                std::sync::Arc::clone(&held),
+                0,
+                &[],
+                u64::MAX,
+                host,
+            )
+            .unwrap_or_else(|(t, _)| panic!("the entry ends in {t:?}"));
+            assert_eq!(d.executor(), temen_interp::Executor::Jit, "held on the JIT");
+            assert_eq!(results, vec![temen_interp::Value::I64(1)]);
+            let mut fuel = 1_000_000;
+            // The handler's trap ends the domain (`CAP_REVOKED`, -9).
+            let reply = d.call(0, 0, &[], &mut fuel);
+            assert_eq!(reply, temen_interp::Reply::Failed(-9), "the handler traps");
+            assert_eq!(d.end().1, Some(Trap::DivByZero));
+        };
+        trap_a_held_call();
+        let mut cm = temen_jit::CompiledModule::compile(
+            &inert,
+            0,
+            temen_jit::INERT_CAP_THUNK,
+            core::ptr::null_mut(),
+            temen_ir::DEFAULT_RESERVED_LOG2,
+            None,
+            None,
+            None,
+            None,
+            None,
+            0,
+        )
+        .expect("compiles");
+        let (o, _) = cm.run(&[], None, None).expect("runs");
+        assert_eq!(o, JitOutcome::Trapped(temen_jit::TrapKind::CapFault));
+        assert_eq!(
+            cm.last_trap_fiber(),
+            Some(-1),
+            "the control: the held call left its capture on this thread (#3124)"
+        );
+        trap_a_held_call();
         let end = kernel_end(&bare);
         assert_eq!(end.result, Err(Trap::DivByZero));
         assert!(end.backtrace.is_empty(), "{:?}", end.backtrace);
@@ -4474,6 +4521,48 @@ block 2 () {
     assert_eq!(tree, Ok(39), "the oracle");
     assert_eq!(pump, tree, "the pump");
     assert_eq!(x2, tree, "executor 2");
+}
+
+/// #2958 slice 6 — a held run's root on executor 2 (`HeldThreads`, which runs it on the opener's
+/// thread, `run_root_here`) burns on from its entry's draw too: its entry of 60 taken back-edges
+/// needs exactly 61, as on the tree-walker and the pump, and runs out at 60.
+#[test]
+fn a_held_runs_root_burns_on_from_its_entrys_draw() {
+    let m = std::sync::Arc::new(module(
+        "func () -> (i64) {
+block 0 () {
+  vn = i64.const 61
+  br 1(vn)
+}
+block 1 (vi: i64) {
+  vone = i64.const 1
+  vj = i64.sub vi vone
+  vz = i64.eqz vj
+  br_if vz 2() 1(vj)
+}
+block 2 () {
+  vr = i64.const 7
+  return vr
+  }
+}
+",
+    ));
+    use temen_interp::Executor::{Pump, Threads, TreeWalker};
+    for on in [TreeWalker, Pump, Threads] {
+        for (fuel, want) in [(100, None), (61, None), (60, Some(Trap::OutOfFuel))] {
+            let started = temen_run::hold(on, std::sync::Arc::clone(&m), 0, &[], fuel, Host::new());
+            let got = match started {
+                Ok((d, results)) => {
+                    assert_eq!(d.executor(), on, "held where it was asked");
+                    assert_eq!(results, vec![temen_interp::Value::I64(7)], "{on:?}");
+                    drop(d.end());
+                    None
+                }
+                Err((t, _)) => Some(t),
+            };
+            assert_eq!(got, want, "{on:?}, fuel {fuel}");
+        }
+    }
 }
 
 /// #2958 slice 6, #3081 — every engine's spawn pays a thread's entry by one rule: one unit taken from
