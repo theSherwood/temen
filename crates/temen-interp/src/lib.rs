@@ -23136,7 +23136,8 @@ impl Fuel {
     /// cell draws from ([`Self::source`]) and draws nothing itself, so no chunk is ever stranded in
     /// it while the task's code burns elsewhere. A burn charges nothing: the tier's code charged the
     /// same safepoint (its entry prologue, for the root's entry charge). Its refill grants without a
-    /// draw and hands nothing back, so [`Self::burn`]'s hot path is every fuel's.
+    /// draw and hands nothing back, so [`Self::burn`]'s hot path is every fuel's. A spawn it makes
+    /// pays its thread's entry from the node ([`Self::pay_entry`], #3081).
     pub(crate) fn native(src: NodeRef) -> Fuel {
         Fuel {
             left: 0,
@@ -23164,15 +23165,29 @@ impl Fuel {
         Ok(())
     }
 
-    /// #2977 — pay a stack's entry before the stack runs: burn one, and keep none of the draw that
-    /// paid it. A thread waits in the run queue after its spawn has paid, and a chunk held there is
-    /// fuel no running vCPU can burn: a thousand queued threads would strand a thousand chunks.
+    /// #2977, #3081 — pay a thread's entry as its spawn completes: one unit, and no draw kept for it.
+    /// A thread waits in the run queue after its spawn has paid, and a chunk held there is fuel no
+    /// running vCPU can burn: a thousand queued threads would strand a thousand chunks. One rule for
+    /// every engine's spawn, whoever pays (the tree-walker pays on the child's fresh fuel, executor 2
+    /// and the pump on the domain's): fuel with a node takes exactly one unit from it in one step
+    /// ([`NodeRef::take_exact`]), never from a chunk it already holds and never by a draw and a
+    /// give-back, which would empty the node's room for a moment beside vCPUs drawing from it on
+    /// threads of their own. A chunk the payer holds is never touched: it is fuel the payer drew to
+    /// burn, and an entry paid from it would be charged against the run's earlier draw rather than
+    /// the node's room, so a spawn's cost would depend on what its payer happened to hold. Every
+    /// level unbounded charges nothing. A fixed allowance (no node: a debug tier's, or a lent one)
+    /// pays from what it holds.
     pub(crate) fn pay_entry(&mut self) -> Result<(), Trap> {
-        self.burn()?;
-        if let Some(s) = self.src.as_ref().filter(|_| !self.native) {
-            s.give_back(std::mem::take(&mut self.left));
+        match self.src.as_ref() {
+            Some(s) => match s.take_exact(1) {
+                Some(false) => Err(Trap::OutOfFuel),
+                None | Some(true) => Ok(()),
+            },
+            None => {
+                self.left = self.left.checked_sub(1).ok_or(Trap::OutOfFuel)?;
+                Ok(())
+            }
         }
-        Ok(())
     }
 
     /// Whether one unit is there to burn, drawing it if `left` is spent: a charge decided ahead of

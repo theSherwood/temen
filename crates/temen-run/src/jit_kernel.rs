@@ -20,7 +20,7 @@
 //! ([`EmittedCall::fuel_node`]), as today's JIT's vCPUs draw from their domain's: the node is the
 //! one source of truth, and what a cell drew and did not burn goes back to it when its vCPU ends. A
 //! refill draws and runs on: a native task does not yield to the kernel at a refill (quantum
-//! preemption is #2958 slice 6).
+//! preemption is #2958 slice 6b, designed with lanes, its first consumer).
 
 use std::sync::Arc;
 use temen_interp::bytecode::{
@@ -83,6 +83,14 @@ pub struct KernelEnd {
     pub asked: bool,
     /// How many vCPUs ran as kernel tasks, the root's included.
     pub vcpus: u64,
+    /// #2958 slice 6 — the trap-time backtrace, innermost frame first, of the first vCPU that ended in
+    /// a trap, the root's or a spawned one's ([`KernelRun::trap_backtrace`]), as today's route reports
+    /// one (`CompiledModule::last_trap_backtrace`): empty when the run ended in no trap, or its code
+    /// carried no `-g`.
+    pub backtrace: Vec<temen_jit::JitFrameLoc>,
+    /// The fiber that was running when that vCPU trapped (`-1`: none), `None` with no backtrace's
+    /// capture, as `CompiledModule::last_trap_fiber`.
+    pub trap_fiber: Option<i64>,
 }
 
 impl KernelEnd {
@@ -94,6 +102,8 @@ impl KernelEnd {
             snapshot: None,
             asked: false,
             vcpus: 0,
+            backtrace: Vec::new(),
+            trap_fiber: None,
         }
     }
 
@@ -412,7 +422,8 @@ pub fn run(
         start.fuel,
         std::mem::take(host),
         &[], // the window is the tier's, started above
-        reserved.trailing_zeros() as u8,
+        // Unread: executor 2 builds no window here, since the tier's is the run's (above).
+        start.reserved_log2,
         None,
         false,
     );
@@ -434,6 +445,8 @@ pub fn run(
                 snapshot: None,
                 asked: false,
                 vcpus: 0,
+                backtrace: Vec::new(),
+                trap_fiber: None,
             });
         }
     };
@@ -457,11 +470,18 @@ pub fn run(
     // The window is unmapped as the last holder of `kr` drops it, the reader's included (a thread
     // that has counted itself out may still hold the run, and with it both, for a moment).
     let snapshot = start.snapshot_cap.and_then(|cap| kr.snapshot(cap));
+    // A trap's backtrace, as today's route reports one only for a run that ended in a trap.
+    let (backtrace, trap_fiber) = match &result {
+        Err(t) if !matches!(t, Trap::Exit(_)) => kr.trap_backtrace(),
+        _ => (Vec::new(), None),
+    };
     Ok(KernelEnd {
         result,
         snapshot,
         asked: start.snapshot_cap.is_some(),
         vcpus: vcpus.load(std::sync::atomic::Ordering::Relaxed),
+        backtrace,
+        trap_fiber,
     })
 }
 
@@ -520,10 +540,22 @@ fn tier_run(call: &mut EmittedCall<'_>) -> Result<(), Trap> {
     };
     // Its own cell, drawing from its task's budget node, so siblings never share one; what it drew
     // and did not burn goes back to the node as it drops, when the vCPU ends however it ends.
+    // #3081 — a thread's entry is charged by its spawn alone (`Fuel::pay_entry`): one unit on a
+    // bounded chain, nothing on an unbounded one. Its cell is seeded with a credit against its
+    // prologue's own charge of it, never refunded, whether the prologue burns it or the vCPU stops
+    // first: the JIT's one rule (`FuelCell::seed_entry`). Seeded once the thread will run guest code;
+    // a task that never gets here is never seeded, and what its spawn paid stays paid.
+    let seeded = matches!(call.entry, CallEntry::Thread) && call.fuel_node.is_some();
     let mut fuel = match call.fuel_node.take() {
         Some(node) => FuelCell::drawing(Arc::new(crate::HostNode(node))),
         None => FuelCell::fixed(u64::MAX),
     };
+    if seeded {
+        // SAFETY: the cell was made just above, for this vCPU alone, and nothing charges it yet; its
+        // spawn completed, so its entry is charged by the spawn alone, and the seed is the credit
+        // for the prologue's own charge of it.
+        unsafe { FuelCell::seed_entry(&mut *fuel as *mut FuelCell) };
+    }
     let (tls, host, end) = (call.tls, call.host_cell(), call.end);
     let ran = {
         let mut hook = Hook(call);

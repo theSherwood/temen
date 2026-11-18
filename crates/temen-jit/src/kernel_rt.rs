@@ -38,7 +38,7 @@
 //! lent, or a give-back that does not find this record lending this very hook, fails closed
 //! (`Malformed`) in every build and asserts in a debug one.
 
-use crate::{mem, slot_record, CompiledModule, FuelCell, TrapKind, VmCtx};
+use crate::{mem, slot_record, CompiledModule, FuelCell, JitFrameLoc, TrapKind, VmCtx};
 use core::ptr::NonNull;
 use std::cell::Cell;
 use std::sync::atomic::AtomicI64;
@@ -355,6 +355,12 @@ pub struct KernelRun {
     /// The cell `cm`'s instance was compiled with, which arms its fuel checks: no vCPU charges it
     /// (each is handed its own, [`Self::run_vcpu`]), but the code holds its address.
     _armed: Option<Box<FuelCell>>,
+    /// #2958 slice 6 — the first trap-time capture (`pc`, return addresses, fiber) a vCPU published,
+    /// the root's or a spawned one's, which [`Self::run_vcpu`] takes on the vCPU's own thread before
+    /// the thread-local is lost with it ([`Self::trap_backtrace`]). First wins, as the
+    /// JIT's own hub's does (`publish_trap_capture`): when two vCPUs trap at once, any trapping frame's
+    /// chain is a valid kill backtrace (#2499). A leaf lock, held for one `get_or_insert`.
+    trap: std::sync::Mutex<Option<(usize, Vec<usize>, i64)>>,
     /// #3078 slice 2 — every vCPU context the run has made, for the next vCPU to reuse once its own
     /// ended: a context lives as long as its run, since a fiber its vCPU made goes on running on it
     /// after the vCPU ends (`vmctx.rs`'s note), as today's route keeps them (`Domain::vcpu_ctxs`).
@@ -437,6 +443,7 @@ impl KernelRun {
             ctxs: Mutex::new(Vec::new()),
             #[cfg(fiber_rt)]
             fibers,
+            trap: std::sync::Mutex::new(None),
         };
         Some(Some((run, ro)))
     }
@@ -472,6 +479,19 @@ impl KernelRun {
         #[cfg(fiber_rt)]
         if let Some(f) = &self.fibers {
             f.table.end();
+        }
+    }
+
+    /// #2958 slice 6 — the run's trap-time backtrace, innermost frame first, and the fiber that was
+    /// running (`-1` for none): the first capture a vCPU published ([`Self::run_vcpu`]). Empty and
+    /// `None` when none was, as when no vCPU trapped or its code carried no `-g`. A memory fault is
+    /// captured whatever `-g` says, so its backtrace can be empty with the fiber `Some(-1)`. Read
+    /// once every vCPU has gone; it takes the capture.
+    pub fn trap_backtrace(&self) -> (Vec<JitFrameLoc>, Option<i64>) {
+        let cap = self.trap.lock().unwrap_or_else(|e| e.into_inner()).take();
+        match cap {
+            Some((pc, rets, fiber)) => (self.cm.trap_backtrace(pc, &rets), Some(fiber)),
+            None => (Vec::new(), None),
         }
     }
 
@@ -589,6 +609,14 @@ impl KernelRun {
         crate::vcpu_tls::seed(tls);
         crate::vcpu_tls::set_serve_handlers(0);
         crate::durable_shadow::seed(cm.shadow.region_base(0));
+        // A capture left on this thread by code that is not this run's: a held domain's activation
+        // run inline from outside (`HeldSite::activate`), whose handler faulted, or a durable
+        // freeze's deferred inline child, which runs after its root took the root's capture. Neither
+        // takes what it made, and the kernel root runs on the caller's thread, so without this a
+        // trap that makes no capture here (a host-raised fault, a trap without `-g`) would publish
+        // theirs as this run's. Until it answers `None`: on Windows a memory fault and an explicit
+        // trap capture into two thread-locals, and one take clears one of them.
+        while mem::take_trap_frame().is_some() {}
         let mut results;
         let faulted = match entry {
             VcpuEntry::Root(args) => {
@@ -638,6 +666,18 @@ impl KernelRun {
         };
         if faulted {
             vm.raise(mem::FAULT_TRAP);
+        }
+        // This vCPU's own trap-time capture, taken on its thread, which may end with it, so none is
+        // left there for a later run to read. Cleared above, a capture is made only where this vCPU
+        // trapped, and the first one published is the run's ([`Self::trap_backtrace`]), whatever
+        // end word won. A kill door's `DOMAIN_DONE` can win the word over an epoch trap's own raise,
+        // and the run still ends in a trap whose capture this is. A vCPU stopped by another's end
+        // made none.
+        if let Some(cap) = mem::take_trap_frame() {
+            self.trap
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get_or_insert(cap);
         }
         match vm.ended() {
             Some(code) => Err(code),

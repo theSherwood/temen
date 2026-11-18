@@ -169,7 +169,7 @@ fn thread_spawn_join_sums_results() {
         \x20 return v1\n\
           }\n\
         }\n";
-    assert_jit_matches_interp(src, Some("no window"));
+    assert_jit_matches_interp(src, None);
 }
 
 /// Four worker threads each `atomic.rmw.add` a shared counter 100×; the total is exactly 400 on every
@@ -289,7 +289,7 @@ fn thread_with_fiber_inside() {
         \x20 return v2\n\
           }\n\
         }\n";
-    assert_jit_matches_interp(src, Some("no window"));
+    assert_jit_matches_interp(src, Some("fibers"));
 }
 
 /// Fibers + threads on the **parallel** pool: four worker threads each drive their own generator fiber
@@ -400,7 +400,7 @@ fn thread_double_join_is_spent() {
         \x20 return v1\n\
           }\n\
         }\n";
-    assert_jit_matches_interp(src, Some("no window"));
+    assert_jit_matches_interp(src, None);
 }
 
 /// **The fiber handle namespace is domain-wide on both backends (D57 3b-ii).** The JIT's fiber
@@ -446,7 +446,7 @@ fn fiber_namespace_is_domain_wide() {
         \x20 return v1\n\
           }\n\
         }\n";
-    assert_jit_matches_interp(src, Some("no window"));
+    assert_jit_matches_interp(src, Some("fibers"));
     // Pin the absolute result too (worker handle 1 ⇒ join 1 ⇒ 100, + root fiber's 7+41 = 148):
     // the old per-thread JIT tables produced 48 here (worker handle 0).
     let m = parse_module(src).expect("parse");
@@ -493,7 +493,7 @@ fn fiber_suspended_on_root_migrates_to_spawned_vcpu() {
           }\n\
         }\n";
     // Both backends agree (the differential)…
-    assert_jit_matches_interp(src, Some("no window"));
+    assert_jit_matches_interp(src, Some("fibers"));
     // …and the absolute migration semantics: the fiber *continued* on the worker, stack intact.
     let m = parse_module(src).expect("parse");
     let mut fuel = 1_000_000u64;
