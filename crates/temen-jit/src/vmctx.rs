@@ -275,6 +275,23 @@ impl VmCtx {
         unsafe { self.vcpu_ending(self.end, fuel) }
     }
 
+    /// #3133 — a fiber's own context, made by its `cont.new` from the context of the code that made
+    /// it: the same instance, end and run, charging the same cell, and holding that cell's owner
+    /// alive (an activation's, #3000), so nothing of the code that made it is reached through it
+    /// once that code's own context has gone (a held activation's, a serve handler's window's). Not
+    /// a handler's context (`handler_window` is null) and not a site's (`serve_site` is empty). It
+    /// lives with the fiber's stack ([`crate::fiber_rt`]'s `Stack`).
+    pub(crate) fn fiber(&self) -> VmCtx {
+        // SAFETY: the end is this domain's own, which outlives the domain's fibers.
+        #[allow(unused_mut)]
+        let mut ctx = unsafe { self.vcpu_ending(self.end, self.fuel) };
+        #[cfg(fiber_rt)]
+        {
+            ctx.cell = self.cell.clone();
+        }
+        ctx
+    }
+
     /// #2958 — [`Self::vcpu`] over the end word `end` in place of this context's own: a kernel
     /// run's, which executor 2 owns (`kernel_rt::KernelRun::run_vcpu`).
     ///
@@ -572,9 +589,10 @@ block 0 (v0: i64, v1: i64) {
         assert_eq!(run_marked(src), (trapped, false), "the waiter stopped");
     }
 
-    /// #2488 — a fiber runs on its creator's context wherever it is resumed, so a fiber the root made
-    /// that traps on another vCPU stops the root's context, not the resumer's: the resumer stops
-    /// at the check after its `cont.resume`, which reads the domain's end.
+    /// #2488, #3133 — a fiber runs on a context of its own, so a fiber the root made that traps on
+    /// another vCPU writes its own context's stop word and the domain's end, and nothing of the
+    /// resumer's: the resumer stops at the check after its `cont.resume`, which reads the domain's
+    /// end.
     #[test]
     fn a_resumer_stops_when_a_fiber_made_elsewhere_traps() {
         if !temen_fiber::supported() {
@@ -610,5 +628,56 @@ block 0 (v0: i64, v1: i64) {
 ";
         let trapped = crate::JitOutcome::Trapped(crate::TrapKind::Unreachable);
         assert_eq!(run_marked(src), (trapped, false), "the resumer stopped");
+    }
+
+    /// #3133 — and the fiber's creator, running when the fiber traps on another vCPU, stops too: no
+    /// raise reaches its context, and its loop's domain poll reads the domain's end. The root spins
+    /// with no way out but that end; the run is bounded so that a creator that never stops fails
+    /// this row instead of hanging the suite.
+    #[test]
+    fn a_creator_stops_when_its_fiber_traps_on_another_vcpu() {
+        if !temen_fiber::supported() {
+            return;
+        }
+        let src = "memory 16
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  v1 = ref.func 2
+  v2 = i64.const 8192
+  v3 = cont.new v1 v2
+  v4 = i64.const 0
+  v5 = thread.spawn 1 v4 v3
+  br 1(v4)
+}
+block 1 (vi: i64) {
+  vone = i64.const 1
+  vj = i64.add vi vone
+  br 1(vj)
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (v0: i64, v1: i64) {
+  v2 = i64.const 0
+  vs, vv = cont.resume v1 v2
+  return vv
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (v0: i64, v1: i64) {
+  unreachable
+  }
+}
+";
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(run_marked(src).0);
+        });
+        let ended = rx
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .expect("the creator stops once the domain ended");
+        assert_eq!(
+            ended,
+            crate::JitOutcome::Trapped(crate::TrapKind::Unreachable)
+        );
     }
 }

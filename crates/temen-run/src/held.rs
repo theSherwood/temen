@@ -30,11 +30,6 @@ use crate::{jit_proc, CAP_REVOKED};
 /// can serve its offers in a serve loop (`svc.poll`, `svc.wait`): a thread of it parked in `svc.wait`
 /// takes its calls first, which the JIT's do not reach yet (#2895), so the tree-walker holds it
 /// (INVARIANTS #9).
-///
-/// #3133 (stop-gap) — the JIT also declines a module that can make a fiber: one with a fiber op, or
-/// one whose host lets its submitted units host fibers. A fiber made in an activation keeps that
-/// activation's context and fuel cell, which end with the call, and a later resume would run on
-/// them. The tree-walker holds it until a fiber has a context of its own (#3080).
 pub fn hold(
     on: Executor,
     m: Arc<Module>,
@@ -43,9 +38,7 @@ pub fn hold(
     fuel: u64,
     host: Host,
 ) -> Result<(HeldDomain, Vec<Value>), (Trap, Box<Host>)> {
-    let fibers = host.jit_hosts_fibers() || m.funcs.iter().any(temen_ir::Func::uses_fibers);
     let jit = on == Executor::Jit
-        && !fibers
         && !crate::folds_to_oracle(&m)
         && !jit_proc::serves(&jit_proc::host_calls(&m), &host);
     if jit {

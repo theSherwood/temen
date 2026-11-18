@@ -781,16 +781,16 @@ block 1 (vi: i64) {
 }
 "#;
 
-/// #3133 (stop-gap) — a domain that can make a fiber is held by the tree-walker when it is asked
-/// for on the JIT. A fiber made in an activation keeps that activation's context and fuel cell, which
-/// end with the call, so on the JIT a later resume ran on freed memory: a fiber that never started
-/// wrote its start refund into the freed cell, and one that suspended in its first call read its
-/// freed context once resumed in the next. Here each fiber is made in one call and resumed by the
-/// later ones, either never started in its first call or started and suspended there, each call on
-/// a loan and on none, and the domain answers as the oracle does. The context per fiber (#3080) lets the JIT hold it again,
-/// and these rows then assert the JIT.
+/// #3133 — a held domain's fiber outlives the call that made it, on the JIT. A fiber made in an
+/// activation kept that activation's context and fuel cell, which end with the call, so a later
+/// resume ran on freed memory: a fiber that never started wrote its start refund into the freed
+/// cell, and one that suspended in its first call read its freed context once resumed in the next.
+/// A fiber now runs on a context of its own, which holds that cell alive. Here each fiber is made in
+/// one call and resumed by the later ones, either never started in its first call or started and
+/// suspended there, each call on a loan and on none, and the JIT holds the domain and answers as
+/// the oracle does.
 #[test]
-fn a_domain_that_makes_fibers_is_held_by_the_tree_walker_on_the_jit() {
+fn a_held_domains_fiber_outlives_the_call_that_made_it() {
     bounded(|| {
         for start in [0, 1] {
             for loan in [u64::MAX, 1_000_000] {
@@ -800,11 +800,7 @@ fn a_domain_that_makes_fibers_is_held_by_the_tree_walker_on_the_jit() {
                 let started = temen_run::hold(Executor::Jit, m, 0, &[], u64::MAX, host);
                 let (d, results) =
                     started.unwrap_or_else(|(t, _)| panic!("the entry ends in {t:?}"));
-                assert_eq!(
-                    d.executor(),
-                    Executor::TreeWalker,
-                    "start {start}, loan {loan}"
-                );
+                assert_eq!(d.executor(), Executor::Jit, "start {start}, loan {loan}");
                 assert_eq!(results, vec![Value::I64(1)]);
                 let mut fuel = loan;
                 assert_eq!(
@@ -846,20 +842,20 @@ block 0 () {
 }
 "#;
 
-/// #3133 (stop-gap) — the same for a domain with no fiber op whose host lets its submitted units host
-/// fibers: such a unit's `cont.new` in an activation would keep the activation's context alike. The
-/// same domain without the grant is the JIT's, so the grant is what declines it.
+/// #3133 — a domain with no fiber op whose host lets its submitted units host fibers is held on the
+/// JIT, with the grant and without it: a unit's `cont.new` in an activation makes a context of its
+/// own as the domain's does.
 #[test]
-fn a_domain_whose_units_may_host_fibers_is_held_by_the_tree_walker_on_the_jit() {
+fn a_domain_whose_units_may_host_fibers_is_held_on_the_jit() {
     bounded(|| {
-        for (hosts, held_on) in [(false, Executor::Jit), (true, Executor::TreeWalker)] {
+        for hosts in [false, true] {
             let m = module(SEVEN);
             let mut host = Host::new();
             host.set_self_module(&m);
             host.set_jit_hosts_fibers(hosts);
             let started = temen_run::hold(Executor::Jit, m, 0, &[], u64::MAX, host);
             let (d, results) = started.unwrap_or_else(|(t, _)| panic!("the entry ends in {t:?}"));
-            assert_eq!(d.executor(), held_on, "hosting fibers: {hosts}");
+            assert_eq!(d.executor(), Executor::Jit, "hosting fibers: {hosts}");
             assert_eq!(results, vec![Value::I64(1)]);
             assert_eq!(call(&d, 0, &[]), Reply::Results(vec![7]));
         }
@@ -952,7 +948,7 @@ block 0 (v0: i32, v1: i32, v2: i32, v3: i32) {{
 /// window's context, and a fiber it makes lands in the run's table. When the vCPU that served ended,
 /// its serve site went, and the window's context with it, so the child's root resumed the fiber onto
 /// freed memory (reproduced on 5326ff0, under ASan with freed memory filled: a read of a pointer from
-/// the freed context in compiled code). The run now keeps a retired site until it ends. Both engines
+/// the freed context in compiled code). The fiber now runs on a context of its own. Both engines
 /// answer the oracle's 50 · 1_000_000 + 42_080.
 #[test]
 fn a_serve_handlers_fiber_outlives_the_thread_that_served() {
