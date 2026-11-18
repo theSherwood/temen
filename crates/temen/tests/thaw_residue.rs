@@ -1247,14 +1247,10 @@ fn a_twins_vcpu_in_the_twins_root_context_is_refused() {
     );
 }
 
-/// Makes `n` fibers one after another, each run to its end, and returns their count. A durable run
-/// may make any number: a finished fiber gives its context back. Bytecode does not reuse a finished
-/// slot as the oracle does (its handles differ, #3101), so the arena bound `a4f45ed` gave its
-/// `cont.new` counted lifetime fibers there and faulted the eleventh; it was taken out.
-#[test]
-fn a_durable_run_makes_and_finishes_more_fibers_than_contexts_on_every_engine() {
-    let inst = instrument(
-        r#"
+/// A durable root that makes, resumes and finishes thirty fibers one after another (each returns 5
+/// at once), then returns the count: more fibers than the arena has contexts, never more than one
+/// live.
+const THIRTY_FIBERS: &str = r#"
 func () -> (i64) {
 block 0 () {
   vz = i64.const 0
@@ -1285,8 +1281,15 @@ block 0 (v0: i64, v1: i64) {
   return v2
   }
 }
-"#,
-    );
+"#;
+
+/// Makes `n` fibers one after another, each run to its end, and returns their count. A durable run
+/// may make any number: a finished fiber gives its context back. Bytecode does not reuse a finished
+/// slot as the oracle does (its handles differ, #3101), so the arena bound `a4f45ed` gave its
+/// `cont.new` counted lifetime fibers there and faulted the eleventh; it was taken out.
+#[test]
+fn a_durable_run_makes_and_finishes_more_fibers_than_contexts_on_every_engine() {
+    let inst = instrument(THIRTY_FIBERS);
     let win = init_durable_window(WINDOW, TEST_ARENA);
     let want = Ok(vec![Value::I64(30)]);
     assert_eq!(
@@ -1635,4 +1638,59 @@ fn interp_run_with(
 ) -> Result<Vec<Value>, temen_interp::Trap> {
     let mut fuel = 10_000_000u64;
     run_capture_reserved_with_host(inst, 0, &[Value::I32(jh)], &mut fuel, win, SIZE_LOG2, h).0
+}
+
+/// [`THIRTY_FIBERS`] that raises its own freeze after its twentieth fiber finished: a guest store of
+/// `UNWINDING` into its freeze word, which every engine's next safepoint answers.
+fn thirty_fibers_freezing_at_twenty() -> String {
+    let freeze = TEST_ARENA.freeze_word().expect("an arena");
+    THIRTY_FIBERS.replace(
+        "  vone = i64.const 1\n  vj1 = i64.add vj vone\n",
+        &format!(
+            "  vone = i64.const 1\n  vj1 = i64.add vj vone\n  vtw = i64.const 20\n  vat = i64.eq vj1 vtw\n  \
+             vfw = i64.const {freeze}\n  vcur = i32.load vfw\n  vun = i32.const {un}\n  vnew = select vat vun vcur\n  \
+             i32.store vfw vnew\n",
+            un = STATE_UNWINDING
+        ),
+    )
+}
+
+/// #3034 round 4 (B2) — the bytecode engine never reuses a fiber slot (#3101), so a run that made and
+/// finished twenty fibers before its freeze holds slots past the arena, whose records no restore
+/// admits. Its freeze is refused as an engine refusal, `FiberFault`, where it used to return `Ok` and
+/// write an artifact every restore refused as `Malformed`. The tree-walker, which reuses its one
+/// slot, freezes the same run, and its artifact restores.
+#[test]
+fn a_bytecode_freeze_past_the_arena_is_refused_not_written() {
+    let src = thirty_fibers_freezing_at_twenty();
+    assert_ne!(src, THIRTY_FIBERS, "the freeze is raised");
+    let inst = instrument(&src);
+    let win = init_durable_window(WINDOW, TEST_ARENA);
+    let mut h = Host::new();
+    h.set_durable(true);
+    let mut fuel = 10_000_000u64;
+    let bc = temen_interp::bytecode::compile_and_run_capture_reserved_with_host(
+        &inst,
+        0,
+        &[],
+        &mut fuel,
+        &win,
+        SIZE_LOG2,
+        &mut h,
+    )
+    .map(|c| c.0);
+    assert_eq!(
+        bc,
+        Some(Err(temen_interp::Trap::FiberFault)),
+        "the bytecode refuses"
+    );
+
+    let mut h = Host::new();
+    h.set_durable(true);
+    let mut fuel = 10_000_000u64;
+    let (r, snap) =
+        run_capture_reserved_with_host(&inst, 0, &[], &mut fuel, &win, SIZE_LOG2, &mut h);
+    assert_eq!(r, Ok(vec![Value::I64(0)]), "the tree-walker freezes");
+    let art = temen_snapshot::freeze(&inst, &snap, &h).expect("freeze");
+    temen_snapshot::restore(&art, &inst, &mut Host::new()).expect("and its artifact restores");
 }

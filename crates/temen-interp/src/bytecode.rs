@@ -11821,6 +11821,15 @@ fn freeze_drive(
         .as_ref()
         .and_then(|m| m.durable_get_sp(root_word))
         .unwrap_or(arena.frame_base(0));
+    // #3034 round 4 (B2) — this engine never reuses a fiber slot (#3101), so a run that made and
+    // finished more fibers than its arena has contexts holds slots no record may name: no restore
+    // admits their records. The freeze is refused here, before anything is consumed, as an engine
+    // refusal, rather than written as an artifact nothing can thaw.
+    let fits =
+        |slot: usize| temen_ir::durable_abi::ShadowContexts::default().fiber_fits(arena, slot);
+    if fibers.len().checked_sub(1).is_some_and(|last| !fits(last)) {
+        return Err(Trap::FiberFault);
+    }
     // The tree-walker's classification, before anything is consumed: an unwoken **cap** park would
     // spill the freeze placeholder as the call's result, which its thaw cannot re-derive, so it
     // fails the whole freeze closed.
