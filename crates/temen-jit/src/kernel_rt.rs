@@ -70,25 +70,68 @@ thread_local! {
     };
 }
 
-/// This thread's record, resolved on the thread running now: `#[inline(never)]` for the reason
-/// `fiber_rt::current` is (#1466), since a thunk that reads it may run on a fiber's stack. It lives
-/// as long as the thread.
-///
-/// The `black_box` keeps each call a call: a function that only computes an address is otherwise
-/// taken as pure, and two calls around a switch merged into one, which is the very read the
-/// borrow's check after its park needs ([`through_hook`]).
+// The record's accessors. Each is `#[inline(never)]` and reads or writes the record's cells, the rule
+// #1466 made for per-thread state reached on a fiber's stack, as `fiber_rt::current` is: the thread's
+// address is resolved inside the call, on the thread running it, and since the call reads memory a
+// call between two of them (a park) keeps them apart. No address of the record is held across a
+// park: one so held would be the thread's that took it, whichever thread runs on after.
+
+/// The run this thread's record names: its end word, null when this thread runs no kernel vCPU.
 #[inline(never)]
-fn record() -> &'static Record {
-    // SAFETY: the thread's own record outlives every use of it on the thread, none of which crosses
-    // to another.
-    std::hint::black_box(RECORD.with(|r| unsafe { &*(r as *const Record) }))
+fn record_end() -> *const AtomicI64 {
+    RECORD.with(|r| r.end.get())
+}
+
+/// What a thunk's take of the hook for the run of end word `end` found.
+enum Taken {
+    /// The record names another run, or none.
+    NotOurs,
+    /// The hook is already borrowed.
+    Borrowed,
+    Hook(NonNull<dyn KernelPark>),
+}
+
+/// Take the hook of this thread's record if it names the run of end word `end`.
+#[inline(never)]
+fn take_hook(end: *const AtomicI64) -> Taken {
+    RECORD.with(|r| {
+        if !std::ptr::eq(r.end.get(), end) {
+            return Taken::NotOurs;
+        }
+        match r.hook.take() {
+            Some(h) => Taken::Hook(h),
+            None => Taken::Borrowed,
+        }
+    })
+}
+
+/// Give `hook` back to this thread's record, if it is the one that lent it: it names the run of end
+/// word `end` and is borrowed. `false`, and nothing written, otherwise.
+#[inline(never)]
+fn give_back(end: *const AtomicI64, hook: NonNull<dyn KernelPark>) -> bool {
+    RECORD.with(|r| {
+        let lent = std::ptr::eq(r.end.get(), end) && r.hook.get().is_none();
+        if lent {
+            r.hook.set(Some(hook));
+        }
+        lent
+    })
+}
+
+/// Set this thread's record, answering what it held.
+#[inline(never)]
+fn set_record(
+    end: *const AtomicI64,
+    hook: Option<NonNull<dyn KernelPark>>,
+) -> (*const AtomicI64, Option<NonNull<dyn KernelPark>>) {
+    RECORD.with(|r| (r.end.replace(end), r.hook.replace(hook)))
 }
 
 /// Whether code running on `vm` runs as a vCPU of a kernel run on this thread: its §12 ops and
 /// parks are the kernel's, never this crate's own thread runtime's. A context of no kernel run
 /// answers at once, without the thread's record.
 pub fn on_vcpu(vm: &VmCtx) -> bool {
-    vm.kernel && std::ptr::eq(record().end.get(), vm.end_word())
+    vm.kernel && std::ptr::eq(record_end(), vm.end_word())
 }
 
 /// Whether code running on `vm` runs as a kernel vCPU **inside a fiber**: a park there is a fiber's,
@@ -142,27 +185,27 @@ unsafe fn through_hook(
     if !vm.kernel {
         return None;
     }
-    let r = record();
-    if !std::ptr::eq(r.end.get(), vm.end_word()) {
-        return None;
-    }
-    let Some(hook) = r.hook.take() else {
-        // Re-entry while a borrow is live: never on a kernel run (the module docs).
-        debug_assert!(false, "a kernel hook reached while it is borrowed");
-        vm.raise(temen_ir::trap_code::MALFORMED);
-        return Some([0, 0]);
+    let end = vm.end_word();
+    let hook = match take_hook(end) {
+        Taken::NotOurs => return None,
+        Taken::Hook(h) => h,
+        Taken::Borrowed => {
+            // Re-entry while a borrow is live: never on a kernel run (the module docs).
+            debug_assert!(false, "a kernel hook reached while it is borrowed");
+            vm.raise(temen_ir::trap_code::MALFORMED);
+            return Some([0, 0]);
+        }
     };
     // SAFETY: the record holds no hook while it is borrowed, so nothing else reaches it meanwhile.
     let out = f(unsafe { &mut *hook.as_ptr() });
-    // The thread running now must be the one that borrowed: resolved again, as after a switch.
-    if !std::ptr::eq(record(), r) {
-        // The borrow spanned a switch onto another thread: never (the module docs).
+    // Given back to the record of the thread running now, which must be the one that lent it.
+    if !give_back(end, hook) {
+        // The borrow spanned a switch onto another thread: never (the module docs). The lending
+        // thread's record stays borrowed, so its next thunk fails closed too.
         debug_assert!(false, "a kernel hook's borrow spanned a switch");
-        r.hook.set(Some(hook));
         vm.raise(temen_ir::trap_code::MALFORMED);
         return Some([0, 0]);
     }
-    r.hook.set(Some(hook));
     match out {
         Ok(r) => Some(r),
         Err(code) => {
@@ -194,8 +237,7 @@ impl Published {
         let hook: *mut (dyn KernelPark + '_) = hook;
         // SAFETY: the guard ends the record's use of the hook before the hook goes (the contract).
         let hook: *mut (dyn KernelPark + 'static) = unsafe { std::mem::transmute(hook) };
-        let r = record();
-        let prev = (r.end.replace(end), r.hook.replace(NonNull::new(hook)));
+        let prev = set_record(end, NonNull::new(hook));
         #[cfg(fiber_rt)]
         let fibers = fibers.map(|mut rt| {
             let prev = crate::fiber_rt::set_current(&mut *rt);
@@ -215,9 +257,7 @@ impl Drop for Published {
         if let Some((_, prev)) = &self.fibers {
             crate::fiber_rt::set_current(*prev);
         }
-        let r = record();
-        r.end.set(self.prev.0);
-        r.hook.set(self.prev.1);
+        set_record(self.prev.0, self.prev.1);
     }
 }
 
