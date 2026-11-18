@@ -15645,9 +15645,10 @@ impl SchedCore {
             funcs: primary.lazy.ir.funcs(),
             arena: primary.shadow.unwrap_or(super::ShadowArena::EMPTY),
         };
-        if !admits_thaw(&h) || h.admit_residue(code, 0).is_err() {
+        if !admits_thaw(&h) {
             return Err(Trap::Malformed);
         }
+        let thaw = h.take_admitted(code, 0).map_err(|_| Trap::Malformed)?;
         reapply_installs(&h, source, &table)?;
         // Fuel unification: the root's entry is paid as its task is made, as a thread's is
         // ([`entry_task`]). Gated exactly as the tree-walker's `drive` (`super::drive_arc`): a durable
@@ -15677,7 +15678,7 @@ impl SchedCore {
         let mut fibers = FiberTables::default();
         {
             // Only the fibers: a residue with more was refused above ([`admits_thaw`]).
-            let mut seed = h.take_frozen_fibers();
+            let mut seed = thaw.into_parts().fibers;
             seed.sort_by_key(|f| f.slot);
             for (expected, ff) in seed.into_iter().enumerate() {
                 debug_assert_eq!(

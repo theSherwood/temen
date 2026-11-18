@@ -2726,12 +2726,13 @@ fn drive_arc(
         funcs: &funcs,
         arena,
     };
-    if host.admit_residue(code, 0).is_err() {
+    let Ok(thaw) = host.take_admitted(code, 0) else {
         return (Err(Trap::Malformed), Vec::new(), None);
-    }
+    };
+    #[allow(unused_mut)] // bent by the test hook only
+    let mut thaw = ThawResidue::of(thaw, 0);
     #[cfg(feature = "thaw-backstop-tests")]
-    thaw_backstop::bend_admitted(&mut host.residue);
-    let thaw = ThawResidue::take(host, 0);
+    thaw_backstop::bend_admitted(&mut thaw.residue);
     let handoff = host.handoff();
     // The powerbox is **shared** by every vCPU of the run (so spawned threads inherit it): move the
     // caller's host into an `Arc<Mutex<Host>>`, hand a clone to the root (and, on `thread.spawn`, to
@@ -2828,12 +2829,12 @@ struct ThawResidue {
 }
 
 impl ThawResidue {
-    /// Take a restored domain's residue off its powerbox, where restore seeded it (cleared there).
-    /// Empty for a freeze or an ordinary run. `task` is the id its root had in the frozen run.
-    fn take(host: &mut Host, task: TaskId) -> Self {
+    /// A domain's admitted residue ([`Host::take_admitted`]), for its root that had id `task` in the
+    /// frozen run. Empty for a freeze or an ordinary run.
+    fn of(thaw: Thaw, task: TaskId) -> Self {
         ThawResidue {
             task,
-            residue: host.take_residue(),
+            residue: thaw.into_parts(),
         }
     }
 
@@ -3261,16 +3262,20 @@ fn relaunch_twin(s: &mut Sched, sched: &Arc<Scheduler>, parent: &VCpu, tt: LiveT
     } = tt;
     let pid = pid as TaskId;
     let (entry, ctx) = (launch.entry as FuncIdx, launch.ctx as usize);
+    let mut residue = ThawResidue::default();
     // #3034 — its residue, admitted for its parent's program in its forking context: a refused one
     // ends it as a twin that cannot be re-created ends.
-    let admitted = parent.mem.as_ref().is_some_and(|pm| {
+    let admitted = parent.mem.as_ref().and_then(|pm| {
         let code = temen_ir::thaw::Code {
             funcs,
             arena: pm.shadow,
         };
-        host.admit_residue(code, ctx).is_ok()
+        host.take_admitted(code, ctx).ok()
     });
-    let residue = ThawResidue::take(&mut host, pid);
+    let admitted = admitted.is_some_and(|thaw| {
+        residue = ThawResidue::of(thaw, pid);
+        true
+    });
     let reaper = if launch.servicer {
         TwinReaper::Servicer
     } else {
@@ -3430,9 +3435,9 @@ fn relaunch_detached(s: &mut Sched, sched: &Arc<Scheduler>, spawner: &mut VCpu, 
             funcs: &relaunch.funcs,
             arena: relaunch.shadow.unwrap_or(ShadowArena::EMPTY),
         };
-        if host.admit_residue(code, 0).is_err() {
+        let Ok(thaw) = host.take_admitted(code, 0) else {
             break 'ready Err(false);
-        }
+        };
         // #1971 — the lease op 17 filed at the spawn, filed again: the child's window goes back to
         // the budget that paid for it when the child ends, on the spawner's handle, as an unfrozen
         // child's does.
@@ -3445,6 +3450,7 @@ fn relaunch_detached(s: &mut Sched, sched: &Arc<Scheduler>, spawner: &mut VCpu, 
             runs,
         );
         let Ok(lease) = filed else {
+            host.set_thaw(thaw); // what a refused child hands back reads it there
             break 'ready Err(false);
         };
         let lease = lease.map(|lease| (Arc::clone(&spawner.domain.host), lease));
@@ -3463,11 +3469,12 @@ fn relaunch_detached(s: &mut Sched, sched: &Arc<Scheduler>, spawner: &mut VCpu, 
             if let Some((spawner_host, lease)) = &lease {
                 spawner_host.lock_unpoisoned().release_detached(*lease);
             }
+            host.set_thaw(thaw);
             break 'ready Err(lease.is_some());
         };
-        Ok((relaunch, lease, mem))
+        Ok((relaunch, lease, mem, thaw))
     };
-    let (relaunch, lease, mem) = match ready {
+    let (relaunch, lease, mem, thaw) = match ready {
         Ok(ready) => ready,
         Err(leased) => {
             // #1936 — its end post, and its own children's, as their ends would signal them.
@@ -3487,7 +3494,7 @@ fn relaunch_detached(s: &mut Sched, sched: &Arc<Scheduler>, spawner: &mut VCpu, 
         ..
     } = relaunch;
     // Its residue, now that it is relaunched: until here a refusal dropped it with the child.
-    let residue = ThawResidue::take(&mut host, task);
+    let residue = ThawResidue::of(thaw, task);
     let dom = host.domain_id() as usize;
     let child_host = Arc::new(Mutex::new(host));
     sched.wire_signal_doors(&child_host);
@@ -28692,33 +28699,23 @@ impl Host {
     /// that thaws it seeds. Refused, and left in place, when a value in it is one no run of `m` makes
     /// (an artifact restored against another module), so a declining engine hands it to the next.
     pub fn take_thaw(&mut self, m: &Module) -> Result<Thaw, temen_ir::thaw::Malformed> {
-        let installs = self.installs_code();
-        temen_ir::thaw::validate(m, installs, 0, self.take_residue()).map_err(|r| {
-            self.residue = *r.residue;
-            temen_ir::thaw::Malformed
-        })
+        self.take_admitted(m.into(), 0)
     }
 
-    /// #3034 — admit the residue this powerbox holds for a domain running `code` from shadow context
-    /// `root_ctx`, leaving it in place (in seeding order): what a thaw that consumes it in place asks
-    /// first. A freeze leaves its residue here unsealed ([`Host::leave_freeze`]), so whatever thaws
-    /// from it admits it, as [`Host::take_thaw`] does.
-    pub(crate) fn admit_residue(
+    /// #3034 — the residue this powerbox holds, admitted for a domain running `code` from shadow
+    /// context `root_ctx`, and taken: the only way an engine's thaw gets a residue (a freeze leaves
+    /// one here unsealed, [`Host::leave_freeze`]). Refused, and left in place, when a value in it is
+    /// one no run of `code` makes.
+    pub(crate) fn take_admitted(
         &mut self,
         code: temen_ir::thaw::Code<'_>,
         root_ctx: usize,
-    ) -> Result<(), temen_ir::thaw::Malformed> {
+    ) -> Result<Thaw, temen_ir::thaw::Malformed> {
         let installs = self.installs_code();
-        match temen_ir::thaw::validate(code, installs, root_ctx, self.take_residue()) {
-            Ok(thaw) => {
-                self.residue = thaw.into_parts();
-                Ok(())
-            }
-            Err(r) => {
-                self.residue = *r.residue;
-                Err(temen_ir::thaw::Malformed)
-            }
-        }
+        temen_ir::thaw::validate(code, installs, root_ctx, self.take_residue()).map_err(|r| {
+            self.residue = *r.residue;
+            temen_ir::thaw::Malformed
+        })
     }
 
     /// #3034 — take the residue this powerbox holds (cleared here): an embedder that thaws it on
@@ -28730,11 +28727,6 @@ impl Host {
     /// The residue this powerbox holds (see [`Host::set_thaw`]).
     pub fn residue(&self) -> &Residue {
         &self.residue
-    }
-
-    /// The fibers of the residue, taken: the part of it the bytecode engine re-creates.
-    pub(crate) fn take_frozen_fibers(&mut self) -> Vec<FrozenFiber> {
-        std::mem::take(&mut self.residue.fibers)
     }
 
     /// Record the fibers a freeze flattened.
