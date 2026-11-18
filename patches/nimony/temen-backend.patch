@@ -34,9 +34,10 @@ its own (#2049); its executable is `<stem>.plugin`, since a `t` build's `-o:` ad
 path with no extension. `nimsem e` (`buildGraphForEval`) still plans the C
 toolchain itself; no build uses it.
 
-Applied to a COPY of the pinned sources at build time (`scripts/nim-toolchain.sh`); the
-vendored `nimony/` submodule is never modified. Against the submodule pin (4a965c9b).
-Drop it when upstream nimony has a Temen backend — it is written to be upstreamed as is.
+Applied to a COPY of the pinned sources at build time (`scripts/nim-toolchain.sh`), and to the
+submodule for the native build and then reverted (`scripts/ci/provision-nimony.sh`); the vendored
+`nimony/` submodule is never left modified. Against the submodule pin (4a965c9b). Drop it when
+upstream nimony has a Temen backend — it is written to be upstreamed as is.
 diff --git a/src/gear2/modnames.nim b/src/gear2/modnames.nim
 index 580e27ea..cc1bd779 100644
 --- a/src/gear2/modnames.nim

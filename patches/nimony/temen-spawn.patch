@@ -22,8 +22,9 @@ A native build of a program built for Temen still links. That build is `nimony c
 the self-hosted lane holds Temen's build to. `temen_spawn.c` is `.compile`d into it: a `pspawn` that
 refuses with -ENOSYS. A Temen build (`nimony t`) compiles no C, so it never sees that file.
 
-Applied to a COPY of the pinned sources at build time (`scripts/nim-toolchain.sh`); the vendored
-`nimony/` submodule is never modified. Against the submodule pin (4a965c9b). Temen-specific,
+Applied to a COPY of the pinned sources at build time (`scripts/nim-toolchain.sh`), and to the
+submodule for the native build and then reverted (`scripts/ci/provision-nimony.sh`); the vendored
+`nimony/` submodule is never left modified. Against the submodule pin (4a965c9b). Temen-specific,
 like temen-backend.patch, which it goes with.
 diff --git a/lib/std/os.nim b/lib/std/os.nim
 index 638500ad..695ce280 100644

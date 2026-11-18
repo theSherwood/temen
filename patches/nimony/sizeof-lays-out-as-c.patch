@@ -1,0 +1,78 @@
+nimony's compile-time `sizeof` lays an object out as C does: it aligns a field of an object, array
+or tuple type, and a field's `{.align: N.}` (#3128).
+
+Why: a `const` or a `when` reads the size nimony computes itself (`sizeof.nim`), while the C backend
+lays the object out with C's rules, so the two must agree. They did not in two ways:
+- `update` rounds the running size up to a scalar field's alignment, but `combine`, which an object,
+  array or tuple field goes through, only added. Such a field was placed at the end of the field
+  before it, and the final round-up to the object's alignment hid the gap unless another field
+  followed: `bool; (u32, u32); bool` was 12 bytes at compile time, 16 laid out.
+- a field's `{.align: N.}` was not read: `u8; int32 {.align: 16.}` was 8 bytes, 32 laid out.
+A binding's size check reads the compile-time size: unir-schemac's Nim bindings for unir's store
+session did not compile. Hexer's `passByConstRef` reads the same sizes. Neither is fixed upstream as
+of nim-lang/nimony master (2026-11-18).
+
+What: each field is sized on its own, its alignment raised to its `{.align: N.}`, and `combine`
+places it, rounding the running size up to its alignment first, unless the object is packed. A
+scalar field then gets exactly what `update` gave it. A packed aggregate's `maxAlign` is 0, which
+`align` cannot take, and it starts at any byte, so it rounds up to 1.
+
+Applied to a COPY of the pinned sources at build time (`scripts/nim-toolchain.sh`), and to the
+submodule for the native build and then reverted (`scripts/ci/provision-nimony.sh`); the vendored
+`nimony/` submodule is never left modified. Against the submodule pin (4a965c9b). Drop it when
+upstream lays objects out as C does at compile time.
+
+diff --git a/src/nimony/sizeof.nim b/src/nimony/sizeof.nim
+index 5b80b60..f138b16 100644
+--- a/src/nimony/sizeof.nim
++++ b/src/nimony/sizeof.nim
+@@ -28,6 +28,9 @@ proc update(c: var SizeofValue; size, align: int) =
+ proc combine(c: var SizeofValue; inner: SizeofValue) =
+   if c.maxAlign != 0:
+     c.maxAlign = max(c.maxAlign, inner.maxAlign)
++    # An aggregate starts at its alignment, as a scalar does in `update`; a packed one (`maxAlign`
++    # 0) at any byte.
++    c.size = align(c.size, max(inner.maxAlign, 1))
+   c.size = c.size + inner.size
+   c.overflow = c.overflow or inner.overflow
+ 
+@@ -76,6 +79,20 @@ proc parseTypePragmas(n: Cursor): TypePragmas =
+   elif not n.isDotToken:
+     error "illformed AST inside type section: ", n
+ 
++proc fieldAlign(pragmas: Cursor): int =
++  ## A field's `{.align: N.}`: 0 when it has none.
++  result = 0
++  var n = pragmas
++  if n.substructureKind == PragmasU:
++    n.into PragmasU:
++      while n.hasMore:
++        if n.pragmaKind == AlignP:
++          n.into:
++            if n.kind == IntLit: result = int(n.intVal)
++            while n.hasMore: skip n
++        else:
++          skip n
++
+ proc `<`(x: xint; b: int64): bool = x < createXint(b)
+ 
+ proc getSize(c: var SizeofValue; cache: var Table[SymId, SizeofValue]; n: Cursor; ptrSize: int)
+@@ -124,12 +141,14 @@ proc getSizeObject(c: var SizeofValue; cache: var Table[SymId, SizeofValue]; ite
+       combine(c, cCase)
+     else:
+       let field = takeLocal(n, SkipFinalParRi)
++      var f = createSizeofValue(c.strict)
++      getSize f, cache, field.typ, ptrSize
++      # A field's `{.align: N.}` raises its alignment to N, as C's `alignas` does.
++      f.maxAlign = max(f.maxAlign, fieldAlign(field.pragmas))
+       if UnionP in pragmas.pragmas:
+-        var c2 = createSizeofValue(c.strict)
+-        getSize c2, cache, field.typ, ptrSize
+-        combineCaseObject(c, c2)
++        combineCaseObject(c, f)
+       else:
+-        getSize c, cache, field.typ, ptrSize
++        combine c, f
+ 
+ proc getSize(c: var SizeofValue; cache: var Table[SymId, SizeofValue]; n: Cursor; ptrSize: int) =
+   var counter = 20

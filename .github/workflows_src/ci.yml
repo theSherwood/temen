@@ -159,6 +159,8 @@ jobs:
       # #1839 — the Nim compiler rides the same cache: provision-nimony.sh builds it from the
       # commit pinned there (NIM_SRC_REV), so the script's hash in the key covers it too. That
       # replaced `setup-nim`'s moving devel nightly and the wait loop around its re-cut window (#856).
+      # So do temen's patches, which the build applies (#3128): the script rebuilds a toolchain built
+      # without them, but only a key that names them keeps that rebuild out of every later run.
       # Not for `upstream`: its toolchain is built from master, and saved under this key (the pinned
       # gitlink) it would be the toolchain later runs restore.
       - name: Cache nimony toolchain build
@@ -172,7 +174,7 @@ jobs:
           # No `restore-keys`: a prefix fallback restores a toolchain built by a DIFFERENT script
           # revision (an `NIM_SRC_REV` bump, say), which is precisely the staleness the skip now
           # makes consequential. Exact key or rebuild.
-          key: nimony-${{ runner.os }}-${{ steps.nimony-rev.outputs.sha }}-${{ hashFiles('scripts/ci/provision-nimony.sh') }}
+          key: nimony-${{ runner.os }}-${{ steps.nimony-rev.outputs.sha }}-${{ hashFiles('scripts/ci/provision-nimony.sh', 'patches/nimony/*.patch') }}
       - name: Build nimony toolchain
         id: toolchain
         env:

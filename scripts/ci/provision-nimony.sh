@@ -13,9 +13,14 @@
 # lockstep with any temen-leng change the newer frontend requires (`git -C nimony checkout <ref>` +
 # commit the submodule). This replaces the old in-script clone-and-checkout of a hard-coded SHA.
 #
+# It builds nimony with temen's patches (`patches/nimony`), as every nimony temen builds is: this one,
+# which the tests and temen's consumers compile with, and the self-hosted lane's
+# (`scripts/nim-toolchain.sh`, from a copy). They go onto the submodule for the build and come off
+# after it, so the checkout stays at its pin (#3128).
+#
 # `NIMONY_REV=<branch or commit>` builds another nimony than the pinned one, for the nightly canary
-# against upstream master (#2034). It moves the working tree's submodules; `git submodule update`
-# puts them back.
+# against upstream master (#2034), with the same patches. It moves the working tree's submodules;
+# `git submodule update` puts them back.
 set -euo pipefail
 
 # The caller appends our stdout to $GITHUB_ENV, so ONLY the final `KEY=value` lines may go there —
@@ -129,8 +134,14 @@ ln -sf "$WORK/nimony" "$NIM_ROOT/dist/nimony"
 # *exists* — so a half-restored or broken cache would not skip, it would surface as confusing
 # failures in the suite proper. Verifying here means the toolchain is either good or rebuilt before
 # a test looks at it.
+#
+# A probe cannot tell whether the tools carry temen's patches, so the build records what it was built
+# from, the pin and the patches, in `nimony/bin` (git-ignored), and a toolchain built from anything
+# else is rebuilt.
+built_from() { { git -C nimony rev-parse HEAD; cat "$WORK"/patches/nimony/*.patch; } | sha256sum; }
 toolchain_works() {
   [ -x nimony/bin/nimony ] || return 1
+  [ "$(cat nimony/bin/temen-built-from 2>/dev/null)" = "$(built_from)" ] || return 1
   local probe rc
   probe="$(mktemp -d)"
   # Mirrors the smallest shape in `crates/temen-leng/tests/nim_diff/` — `echo` lives in
@@ -151,11 +162,29 @@ toolchain_works() {
 if [ -z "${NIMONY_REV:-}" ] && toolchain_works; then
   echo "provision-nimony: restored nimony/bin compiles a probe — skipping the hastur build." >&2
 else
+  # The patches go on in order, and come off in reverse however the build ends: a patch that does
+  # not apply stops the script, as it stops the self-hosted lane.
+  patched=()
+  unpatch() {
+    local i
+    for ((i = ${#patched[@]} - 1; i >= 0; i--)); do git -C nimony apply -R "${patched[i]}"; done
+    patched=()
+  }
+  trap unpatch EXIT
+  for p in "$WORK"/patches/nimony/*.patch; do
+    git -C nimony apply "$p" || {
+      echo "provision-nimony: $(basename "$p") does not apply to nimony $(git -C nimony rev-parse --short HEAD)" >&2
+      exit 1
+    }
+    patched+=("$p")
+  done
   # `src/hastur/hastur.nim`, not `src/hastur`: hastur became a directory of modules, so the bare
   # directory no longer resolves to a compilable file. `--release` sits AFTER the filename on
   # purpose — everything before it is nim's, everything after is hastur's, and `nim c -r x --release`
   # would hand the flag to nim and leave hastur with `build all` alone.
   ( cd nimony && nim c -r src/hastur/hastur.nim --release build all )
+  unpatch
+  built_from > nimony/bin/temen-built-from
 fi
 
 echo "NIMONY_BIN=$WORK/nimony/bin" >&3
