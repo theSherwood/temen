@@ -148,8 +148,9 @@ pub struct FuelCell {
     /// at a time.
     src: Mutex<Arc<dyn BudgetNode>>,
     /// `left` is not the chain's to take back: #1991, the chain was unbounded at every level at the
-    /// last refill, which granted a [`QUANTUM`] drawn from nothing; or #3081, `left` is a spawned
-    /// vCPU's entry its spawn already paid ([`Self::seed_entry`]), which is never refunded. None of it
+    /// last refill, which granted a [`QUANTUM`] drawn from nothing; or #3081, `left` is the credit
+    /// seeded for a spawned vCPU's entry, which its spawn alone charges ([`Self::seed_entry`]), and
+    /// which is never refunded. None of it
     /// goes back to the chain (`settle`, `rearm`, `Drop`). Written by a refill and by the seeding,
     /// under `src`'s lock. A refill that draws rewrites it (to `true` only on an unbounded chain); the
     /// refill's early return, which keeps another context's refill, leaves it as it is.
@@ -204,24 +205,31 @@ impl FuelCell {
         self.chain().take_exact(1)
     }
 
-    /// #3081 — seed `cell` with a spawned vCPU's entry, which its spawn already paid
-    /// ([`Self::pay_entry`]), for its prologue to burn without a draw. A paid entry is never
-    /// refunded: the cell holds exactly the unit, marked as none of the chain's (`free`), so
-    /// whether the vCPU burns it or stops first (its run ended before its first charge: a kill check
-    /// or a domain poll comes first in the prologue, or lazy code never ran), nothing goes back. The
-    /// refill that follows the burn clears the mark, so while it is set the cell holds the unit or
-    /// nothing. What a recycled cell held goes back to its chain first, under the lock a refill takes
-    /// and through the raw pointer, as [`Self::settle`] does; a fiber of the cell's earlier vCPU that
-    /// refills it in between races it as any shared charge does (#3080).
+    /// #3081 — seed `cell` with a spawned vCPU's entry: one unit, a credit against the charge its
+    /// entry's prologue makes, so the entry is charged once, by its spawn ([`Self::pay_entry`]),
+    /// whatever the spawn paid: one unit on a bounded chain, nothing on an unbounded one, as on
+    /// every engine. The seed is never refunded: the cell holds exactly the unit, marked as none of
+    /// the chain's (`free`), so whether the vCPU burns it or stops first (its run ended before its
+    /// first charge: a kill check or a domain poll comes first in the prologue, or lazy code never
+    /// ran), nothing goes back. The refill that follows the burn rewrites the mark as any refill
+    /// does: cleared on a bounded chain, set again on an unbounded one, whose quantum is drawn from
+    /// nothing. What a recycled cell held goes back to its chain first,
+    /// under the lock a refill takes and through the raw pointer, as [`Self::settle`] does; a fiber
+    /// of the cell's earlier vCPU that refills it in between races it as any shared charge does
+    /// (#3080).
     ///
-    /// Today's route seeds through it (`os_thread_rt::run_child`); the kernel route's call lands with
-    /// #2958 slice 6 (PR #3085), on each native thread's own cell.
+    /// Both of the JIT's routes seed through it, each on the thread's own cell. The kernel route
+    /// (temen-run's `jit_kernel::tier_run`) seeds every thread entry on a node-backed cell. Today's
+    /// (`os_thread_rt::run_child`) gates on the answer its spawn carried (`paid_entry`), which is the
+    /// same answer in every reachable case. The two differ only for a chain unbounded at the spawn
+    /// and bounded when the thread starts, and nothing bounds a chain during a run: `transfer` only
+    /// raises a ceiling, and an activation's limit is set before its run starts.
     ///
     /// # Safety
     /// - `cell` is a live cell that no context but this vCPU's (and #3080's fibers) charges.
     /// - It runs before this vCPU's first guest code: none of the vCPU's code charges the cell yet.
-    /// - Exactly one unit has already been taken from the cell's chain for this vCPU
-    ///   (`take_exact(1)` answered `Some(true)`, [`Self::pay_entry`]); seeding otherwise mints one.
+    /// - The vCPU's spawn completed: its entry is charged by the spawn alone (`pay_entry` answered
+    ///   `Some(true)` or `None`), and the seed stands for the prologue's own charge of it.
     pub unsafe fn seed_entry(cell: *mut FuelCell) {
         let src = (*cell).src.lock().unwrap_or_else(|e| e.into_inner());
         let left = core::ptr::addr_of_mut!((*cell).left);

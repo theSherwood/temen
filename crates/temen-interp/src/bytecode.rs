@@ -2083,30 +2083,22 @@ fn child_task(
     payer: Option<NodeRef>,
 ) -> Result<(VTask, SharedSlots), Trap> {
     let table = build_table_for(prog.progs.len(), jit_table_log2, module);
-    let vt = entry_task(prog, module as usize, 0, args, payer, None)?;
+    let vt = entry_task(prog, module as usize, 0, args, payer)?;
     Ok((vt, table))
 }
 
 /// A new vCPU's task, entered at `func` of `module` (`unit`, that module's program) with `args`, its
 /// frames homed there: the root's, a thread's, a §14/§5 child's or an exec'd image's first frame.
-/// `Malformed` for a function `unit` does not have.
-///
-/// `charge`: the fuel its entry is charged to. Fuel unification (INVARIANTS #9): a stack's first entry
-/// costs one, as a call's does and as the JIT's entry prologue charges it, so the root's and a
-/// thread's entries are paid here, as the task is made. `None` for a durable thaw's root, which
-/// continues an already-charged run, and for a child's or an exec'd image's entry, which the rule
-/// does not reach yet (#3012).
+/// `Malformed` for a function `unit` does not have. It charges nothing: the root's entry is paid by
+/// [`SchedCore::new`], a thread's at its spawn ([`thread_task`]), and a child's or an exec'd image's
+/// not yet (#3012).
 fn entry_task(
     unit: &Compiled,
     module: usize,
     func: usize,
     args: &[Value],
     payer: Option<NodeRef>,
-    charge: Option<&mut Fuel>,
 ) -> Result<VTask, Trap> {
-    if let Some(fuel) = charge {
-        fuel.burn()?;
-    }
     let mut vt = VTask::new(unit, func, args, payer)?;
     vt.active.module = module;
     vt.active.home = module;
@@ -2118,9 +2110,11 @@ fn entry_task(
 /// word with the dense vCPU id it numbers the thread by (§12; a root's is 0). `Malformed` for a module
 /// or function the run's source does not have.
 ///
-/// Its entry is paid from `fuel`, the fuel of the domain it runs in, as the spawn completes
-/// ([`entry_task`], #2977): a freeze after the spawn has paid it, and a thaw re-creates no thread
-/// through here. Out of fuel traps the spawner, which ends the run as the thread's own trap would.
+/// Its entry is paid as the spawn completes through `fuel`, the fuel of the domain it runs in, by the
+/// rule every engine's spawn pays by ([`super::Fuel::pay_entry`], #2977, #3081): one unit taken
+/// from the node, never from the chunk `fuel` holds for the vCPUs already running. A freeze after
+/// the spawn has paid it, and a thaw re-creates no thread through here. Out of fuel traps the
+/// spawner, which ends the run as the thread's own trap would.
 fn thread_task(
     source: &ModuleSource,
     module: usize,
@@ -2131,13 +2125,13 @@ fn thread_task(
     fuel: &mut Fuel,
 ) -> Result<VTask, Trap> {
     let cm = source.get(module).ok_or(Trap::Malformed)?;
+    fuel.pay_entry()?;
     entry_task(
         &cm,
         module,
         func as usize,
         &[Value::I64(arg0), Value::I64(arg1)],
         payer,
-        Some(fuel),
     )
 }
 
@@ -9040,7 +9034,6 @@ fn image_parks(host: &Host, m: &Module, census: &ImageCensus) -> Parks {
 ///   with no kernel (the phase that runs every JIT program on the kernel, after phase 2);
 /// - **`durable`**: executor 2 has no freeze driver (#2533; the phase that ports freeze);
 /// - **`bytecode`**: the rules need the module's bytecode compile ([`admits_for`]; slice 7);
-/// - **`no window`**: a thread of a module with no memory interprets ([`tierup_servable`]; slice 6);
 /// - **`fibers`**: a fiber's park runs on the engine's fiber runtime, whose futex core its vCPU
 ///   waits share (phase 2);
 /// - **`gc.roots`**: the rules scan an interpreted task's frames, not native ones (a later phase,
@@ -9083,10 +9076,6 @@ pub fn native_scope(m: &Module, host: &Host) -> Result<(), &'static str> {
     }
     if !admits_for(m, true) {
         return Err("bytecode");
-    }
-    let spawns = m.funcs.iter().any(|f| f.uses_concurrency_besides_wait());
-    if m.memory.is_none() && spawns {
-        return Err("no window");
     }
     if m.funcs.iter().any(temen_ir::Func::uses_fibers) {
         return Err("fibers");
@@ -9325,16 +9314,33 @@ fn kernel_inst(host: &Host, i: &Inst) -> Result<(), &'static str> {
 /// `call.cap` and a bound import's target. **Default-deny**: what this does not list, the kernel
 /// route declines, and `Err` names the clause and so what removes it (#2958's plan, section B):
 ///
-/// - **`fuel`**: `self.fuel.remaining`, whose parity on a native task is slice 6's;
+/// - **`fuel`**: `self.fuel.remaining`. Unreachable today: the bytecode compile declines the op, so
+///   [`native_scope`]'s `bytecode` declines such a module first. Removed with `bytecode` (slice 7),
+///   whose PR adds the rows that compare the op's answer with the oracle's;
 /// - **`file region`**: `create_region` while a region factory is set ([`file_region`]; #3005's
 ///   fix);
 /// - **`process`**: `clone_caller`, `reap`, `exec` (a later phase; #2958 amendment 5);
 /// - **`serving`**: a service point, a call through a guest interface, or `export.handle` (self
 ///   op 8, packed), which mints an offer of the module's own impl (#2791, #2792);
-/// - **`§14 children`**: `Instantiator`, `Module`, `ModuleLoader` (a later phase);
+/// - **`§14 children`**: `Instantiator`, `Module`, `ModuleLoader`, and a §13 region's `grant` into
+///   a child domain (`SharedRegion` op 4) (a later phase);
 /// - **`jit cap`**: §22 `Jit` and its code handles: two dispatch tables (a later phase);
-/// - **`cap`**: `FreezeAuthority` (a `CapFault` on every engine, with no consumer) and an op no
-///   interface has.
+/// - **`imports`**: a `call.cap` on a reserved pseudo-id at or above [`temen_ir::CAP_DYN_TYPE_ID`]
+///   but `self`'s, whose target a binding or a mid-run attach chooses ([`native_scope`]'s clause).
+///
+/// - **`cap`**: every `(type_id, op)` this table does not list. What each engine answers, measured
+///   (#2958 slice 6), alike on the tree-walker, the bytecode engine and today's route:
+///   - an id [`cap_id`] leaves unassigned, under which nothing is granted: `CapFault`;
+///   - a `self` op no engine serves: `CapFault`;
+///   - an op past a built-in interface's last, on a genuine handle: `CapFault` for `Exit`, the
+///     clock for `Clock` (its arm reads no op, #3119), `-EINVAL` for `AddressSpace`, `Budget` and
+///     `SharedRegion`;
+///   - a `FreezeAuthority` op past 5: `-EINVAL`.
+///
+///   They are not admitted: an unlisted op may gain a meaning later, and must then be decided here.
+///   Removed when today's route is cut: a program it declines then runs on the bytecode engine and
+///   loses nothing, since every engine answers each of these calls alike (owner decision 19 on
+///   #2949).
 fn kernel_op(host: &Host, type_id: u32, op: u32) -> Result<(), &'static str> {
     use temen_ir::cap_id::*;
     use temen_ir::{CAP_DYN_TYPE_ID, CAP_SELF_TYPE_ID};
@@ -9354,6 +9360,10 @@ fn kernel_op(host: &Host, type_id: u32, op: u32) -> Result<(), &'static str> {
         | (SHARED_REGION, 0..=3 | 5..=7)
         | (HOST_PROC, _)
         | (BLOCKING, _) => Ok(()),
+        // A §13 region's `grant` into a child domain.
+        (SHARED_REGION, 4) => Err("§14 children"),
+        // `FreezeAuthority`'s ops 0–5, each `-EINVAL` on every engine (#2958 slice 6).
+        (FREEZE_AUTHORITY, 0..=5) => Ok(()),
         // The `self` ops: plain below 6 and at 17–19; from 6 on, packed as `selfop | idx << 8`
         // (the host's dispatch), so decided on the low byte. `self.pipe` (16) mints a pipe, as both
         // interpreters' do.
@@ -9368,11 +9378,15 @@ fn kernel_op(host: &Host, type_id: u32, op: u32) -> Result<(), &'static str> {
             8..=10 => Err("serving"),
             11 | 12 | 14 => Err("process"),
             13 => Err("fuel"),
+            // A plain op (0–5) packed with an index (the arm above took it with none): `Malformed`
+            // on every engine (the JIT names that trap code `SetjmpFault`, #3087).
+            0..=5 => Ok(()),
             _ => Err("cap"),
         },
         (INSTANTIATOR | MODULE | MODULE_LOADER, _) => Err("§14 children"),
         (JIT | JIT_CODE, _) => Err("jit cap"),
-        (t, _) if (GUEST_IMPL_BASE..CAP_DYN_TYPE_ID).contains(&t) => Err("serving"),
+        (GUEST_IMPL_BASE..CAP_DYN_TYPE_ID, _) => Err("serving"),
+        (CAP_DYN_TYPE_ID.., _) => Err("imports"),
         _ => Err("cap"),
     }
 }
@@ -9650,8 +9664,8 @@ fn exec_image_build(
     let cunit = source.get(cm).ok_or(super::EINVAL)?;
     let child_table = build_table_for(cunit.progs.len(), child_host.jit_table_log2(), cm as u32);
     let payer = Some(child_host.own_node());
-    let mut new_vt = entry_task(&cunit, cm, entry as usize, &child_args, payer, None)
-        .map_err(|_| super::EINVAL)?;
+    let mut new_vt =
+        entry_task(&cunit, cm, entry as usize, &child_args, payer).map_err(|_| super::EINVAL)?;
     if let Some(leaf) = leaf {
         new_vt.active.tier_up_leaf(leaf);
     }
@@ -15590,13 +15604,16 @@ impl SchedCore {
     ) -> Result<SchedCore, Trap> {
         let mut h = host.lock_unpoisoned();
         reapply_installs(&h, source, &table)?;
-        // Fuel unification: the root's entry is paid as its task is made, as a thread's is
-        // ([`entry_task`]). Gated exactly as the tree-walker's `drive` (`super::drive_arc`): a durable
-        // **thaw** re-enters to continue an already-charged run (the root re-enters under
-        // `REWINDING`), so it must not re-charge.
-        let charge = (!thaws(&h, mem.as_ref())).then_some(&mut fuel);
+        // Fuel unification (INVARIANTS #9): the root's entry costs one, as a call's does and as the
+        // JIT's entry prologue charges it, paid as its task is made, from the root's own fuel (a
+        // thread's is paid at its spawn, [`thread_task`]). Gated exactly as the tree-walker's `drive`
+        // (`super::drive_arc`): a durable **thaw** re-enters to continue an already-charged run (the
+        // root re-enters under `REWINDING`), so it must not re-charge.
+        if !thaws(&h, mem.as_ref()) {
+            fuel.burn()?;
+        }
         let root = &source.primary();
-        let root_vt = entry_task(root, 0, entry as usize, args, Some(h.own_node()), charge)?;
+        let root_vt = entry_task(root, 0, entry as usize, args, Some(h.own_node()))?;
         let tasks: Tasks = std::iter::once(TaskSlot::new(root_vt, 0, LiveVcpu::none())).collect();
         wire_kill(&h);
         // #1122/#1146/#1262 — the run's bell ([`SchedCore::bell`]): wire the root's personality
@@ -18887,7 +18904,8 @@ impl CoopRun {
 ///   item 3). A window still on a non-flat backing (an allocation failure) stays interpreted,
 ///   fail-closed.
 ///
-/// A memory-less run has no window to serve — no bitmap.
+/// A memory-less run has no window to serve — no bitmap (#3083: the browser's tier). A native tier's
+/// run is asked about its own window first, which it always has (#2958 slice 6).
 fn tierup_servable(cand: Option<&Mem>, root: Option<&Mem>) -> bool {
     match (cand, root) {
         (Some(c), Some(r)) => {
@@ -19410,6 +19428,19 @@ impl Threads {
             e.fuel.for_thread(),
         )
     }
+
+    /// The root's thread's view and hand: the fuel [`SchedCore::new`] paid the root's entry from,
+    /// with what its draw left, as the oracle's root burns on from its entry's draw. The rules keep a
+    /// fresh hand of the domain's fuel. A fresh hand for the root would strand that draw with the
+    /// rules until the run ends, and the root run out of fuel early.
+    fn root_hand(&mut self) -> (Option<Mem>, Fuel) {
+        let e = &mut self.core.domains[0];
+        let rules = e.fuel.for_thread();
+        (
+            e.mem.as_ref().map(Mem::fork_for_thread),
+            std::mem::replace(&mut e.fuel, rules),
+        )
+    }
 }
 
 /// A run on executor 2: the domain its tasks run, the root's powerbox cell, the shared state, how
@@ -19640,7 +19671,12 @@ pub enum CallEntry {
     Call,
     /// The run's root task's entry.
     Root,
-    /// A spawned thread's entry.
+    /// The entry of a task that is not the run's root. On a native tier that is always a
+    /// `thread.spawn` child, whose entry its spawn alone charges ([`thread_task`], #3081), so the
+    /// tier's code starts its fuel holding a credit of one unit for its entry's own charge. That
+    /// holds only because [`kernel_op`] declines every other way a task is made (`§14 children`,
+    /// `process`): the PR that removes `§14 children` must revisit it, as a child's entry is not
+    /// paid that way (#3012).
     Thread,
 }
 
@@ -20250,14 +20286,14 @@ impl ThreadRun {
 
     /// Start the root on a thread of its own, for the opener to watch the run ([`Self::watch`]).
     fn start_root(self: &std::sync::Arc<Self>) {
-        let (view, hand) = self.state.lock_unpoisoned().hand(0);
+        let (view, hand) = self.state.lock_unpoisoned().root_hand();
         let r = std::sync::Arc::clone(self);
         self.start_thread(move || run_task_thread(r, 0, view, hand), None);
     }
 
     /// Run the root on this thread, the opener's ([`ThreadPlatform::opener`]).
     fn run_root_here(self: &std::sync::Arc<Self>) {
-        let (view, hand) = self.state.lock_unpoisoned().hand(0);
+        let (view, hand) = self.state.lock_unpoisoned().root_hand();
         run_task_thread(std::sync::Arc::clone(self), 0, view, hand);
     }
 
