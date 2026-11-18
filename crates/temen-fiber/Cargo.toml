@@ -11,8 +11,9 @@ publish = false
 # mirroring how `temen-mem` isolates the memory `unsafe` — so it stays small and auditable.
 [features]
 # AddressSanitizer fiber-switch annotations (`__sanitizer_{start,finish}_switch_fiber`) around
-# every stack switch, so ASan-instrumented code can run on fiber stacks. Enabled by the dedicated
-# sanitizer job (nightly, -Zsanitizer=address); zero-cost otherwise.
+# every stack switch, so ASan-instrumented code can run on fiber stacks, and the arena backend's
+# poisoning of a freed stack slot (cleared when the slot is handed out again, #3032). Enabled by the
+# dedicated sanitizer job (nightly, -Zsanitizer=address); zero-cost otherwise.
 asan = []
 # The arena control-stack allocator is the DEFAULT (see `lib.rs`): stacks are sub-allocated from
 # large arenas with a free-list instead of one mmap+guard per fiber, so concurrency scales past the
