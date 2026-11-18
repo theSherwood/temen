@@ -61,20 +61,11 @@ fn in_a_thread_on_the_kernel_route(src: &str, m: &temen_ir::Module) {
     if !entry.params.is_empty() || entry.results != [temen_ir::ValType::I64] {
         return;
     }
-    // A memoryless one meets `no window` first (#2958 slice 6 removes it).
     let declined = jit_kernel::admit(m, &temen_interp::Host::new(), false, u64::MAX).err();
-    assert!(
-        matches!(declined, Some("fiber only" | "no window")),
-        "{declined:?}\n{src}"
-    );
+    assert_eq!(declined, Some("fiber only"), "{src}");
     let n = m.funcs.len();
-    let memory = if m.memory.is_none() {
-        "memory 16\n"
-    } else {
-        ""
-    };
     let wrapped = format!(
-        "{memory}{src}
+        "{src}
 func (i64, i64) -> (i64) {{
 block 0 (va: i64, vb: i64) {{
   vr = call 0()
