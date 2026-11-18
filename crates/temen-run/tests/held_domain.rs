@@ -726,6 +726,146 @@ fn a_domain_that_serves_is_held_by_the_tree_walker_on_the_jit() {
     });
 }
 
+/// #3133 — a domain whose handler makes a fiber that outlives its call: `mk(start)` makes a fiber
+/// that counts up from 41 and suspends each count, resumes it once first when `start` is not 0, and
+/// answers its handle; `go(h)` resumes it and answers `status · 1000 + value`.
+const FIBER_MAKER: &str = r#"memory 16
+type 0 func (i64) -> (i64)
+type 1 interface { mk: 0, go: 0 }
+export 0 interface "svc" 1 { mk: 1, go: 2 }
+func () -> (i64) {
+block 0 () {
+  vr = i64.const 1
+  return vr
+  }
+}
+func (i64) -> (i64) {
+block 0 (vstart: i64) {
+  vf = ref.func 3
+  vz = i64.const 0
+  vk = cont.new vf vz
+  vgo = i64.ne vstart vz
+  br_if vgo 1(vk) 2(vk)
+}
+block 1 (vk1: i64) {
+  vz1 = i64.const 0
+  vs, vv = cont.resume vk1 vz1
+  br 2(vk1)
+}
+block 2 (vk2: i64) {
+  return vk2
+  }
+}
+func (i64) -> (i64) {
+block 0 (vh: i64) {
+  vz = i64.const 0
+  vs, vv = cont.resume vh vz
+  vs64 = i64.extend_i32_s vs
+  vk = i64.const 1000
+  vm = i64.mul vs64 vk
+  vr = i64.add vm vv
+  return vr
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, varg: i64) {
+  vc = i64.const 41
+  br 1(vc)
+}
+block 1 (vi: i64) {
+  vone = i64.const 1
+  vj = i64.add vi vone
+  vx = suspend vj
+  br 1(vj)
+  }
+}
+"#;
+
+/// #3133 (stop-gap) — a domain that can make a fiber is held by the tree-walker when it is asked
+/// for on the JIT. A fiber made in an activation keeps that activation's context and fuel cell, which
+/// end with the call, so on the JIT a later resume ran on freed memory: a fiber that never started
+/// wrote its start refund into the freed cell, and one that suspended in its first call read its
+/// freed context once resumed in the next. Here each fiber is made in one call and resumed by the
+/// later ones, either never started in its first call or started and suspended there, each call on
+/// a loan and on none, and the domain answers as the oracle does. The context per fiber (#3080) lets the JIT hold it again,
+/// and these rows then assert the JIT.
+#[test]
+fn a_domain_that_makes_fibers_is_held_by_the_tree_walker_on_the_jit() {
+    bounded(|| {
+        for start in [0, 1] {
+            for loan in [u64::MAX, 1_000_000] {
+                let m = module(FIBER_MAKER);
+                let mut host = Host::new();
+                host.set_self_module(&m);
+                let started = temen_run::hold(Executor::Jit, m, 0, &[], u64::MAX, host);
+                let (d, results) =
+                    started.unwrap_or_else(|(t, _)| panic!("the entry ends in {t:?}"));
+                assert_eq!(
+                    d.executor(),
+                    Executor::TreeWalker,
+                    "start {start}, loan {loan}"
+                );
+                assert_eq!(results, vec![Value::I64(1)]);
+                let mut fuel = loan;
+                assert_eq!(
+                    d.call(0, 0, &[start], &mut fuel),
+                    Reply::Results(vec![0]),
+                    "the fiber's handle"
+                );
+                for n in 0..3 {
+                    let mut fuel = loan;
+                    assert_eq!(
+                        d.call(0, 1, &[0], &mut fuel),
+                        Reply::Results(vec![42 + start + n]),
+                        "start {start}, loan {loan}: resume {n} in a later call"
+                    );
+                }
+                let (_host, trap) = d.end();
+                assert_eq!(trap, None);
+            }
+        }
+    });
+}
+
+/// #3133 — an offer of one op, `seven()`, with no fiber op and no serve loop.
+const SEVEN: &str = r#"memory 16
+type 0 func () -> (i64)
+type 1 interface { seven: 0 }
+export 0 interface "svc" 1 { seven: 1 }
+func () -> (i64) {
+block 0 () {
+  vr = i64.const 1
+  return vr
+  }
+}
+func () -> (i64) {
+block 0 () {
+  vr = i64.const 7
+  return vr
+  }
+}
+"#;
+
+/// #3133 (stop-gap) — the same for a domain with no fiber op whose host lets its submitted units host
+/// fibers: such a unit's `cont.new` in an activation would keep the activation's context alike. The
+/// same domain without the grant is the JIT's, so the grant is what declines it.
+#[test]
+fn a_domain_whose_units_may_host_fibers_is_held_by_the_tree_walker_on_the_jit() {
+    bounded(|| {
+        for (hosts, held_on) in [(false, Executor::Jit), (true, Executor::TreeWalker)] {
+            let m = module(SEVEN);
+            let mut host = Host::new();
+            host.set_self_module(&m);
+            host.set_jit_hosts_fibers(hosts);
+            let started = temen_run::hold(Executor::Jit, m, 0, &[], u64::MAX, host);
+            let (d, results) = started.unwrap_or_else(|(t, _)| panic!("the entry ends in {t:?}"));
+            assert_eq!(d.executor(), held_on, "hosting fibers: {hosts}");
+            assert_eq!(results, vec![Value::I64(1)]);
+            assert_eq!(call(&d, 0, &[]), Reply::Results(vec![7]));
+        }
+    });
+}
+
 /// The threads [`COUNTING`] has started, in this test binary.
 static STARTED: AtomicUsize = AtomicUsize::new(0);
 
