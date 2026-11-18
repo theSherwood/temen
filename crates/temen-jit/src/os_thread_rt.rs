@@ -882,6 +882,11 @@ pub(crate) struct Domain {
     /// run's end. Boxed, since code holds each context's address while the list grows.
     #[allow(clippy::vec_box)]
     vcpu_ctxs: Mutex<Vec<Box<VcpuCtx>>>,
+    /// #3133 — the serve sites of this run's ended vCPUs, revoked and kept until the run ends: a
+    /// fiber a handler made runs on its window's context, and goes on running on it from the run's
+    /// fiber table after the vCPU that served ended. Emptied with [`Self::vcpu_ctxs`].
+    #[cfg(fiber_rt)]
+    retired_sites: Mutex<Vec<std::sync::Arc<crate::child_exec::ServeSite>>>,
 }
 
 /// #2488 — a spawned vCPU's own context ([`crate::VmCtx::vcpu`]) and the fuel cell it charges: the
@@ -1192,6 +1197,8 @@ impl Domain {
             hub: 0,
             node,
             vcpu_ctxs: Mutex::new(Vec::new()),
+            #[cfg(fiber_rt)]
+            retired_sites: Mutex::new(Vec::new()),
         }
     }
 
@@ -1268,6 +1275,8 @@ impl Domain {
         }
         if let Some(site) = ctx.vm.serve_site.take() {
             site.revoke();
+            // #3133 — a fiber one of its handlers made may still run on its window's context.
+            lock(&self.retired_sites).push(site);
         }
         lock(&self.vcpu_ctxs).push(ctx);
     }
@@ -1379,6 +1388,8 @@ impl Domain {
             killing,
             lanes,
             vcpu_ctxs,
+            #[cfg(fiber_rt)]
+            retired_sites,
             // The futex table and the wakers are kept, not replaced: hosts outside the run reach
             // them between runs (`CompiledModule::park_hub`'s users wake the futex table by the
             // domain's address; an `outside_waker` holds it weakly), so no join can make a
@@ -1433,6 +1444,8 @@ impl Domain {
         killing.store(0, Ordering::Release);
         lock(lanes).clear();
         lock(vcpu_ctxs).clear();
+        #[cfg(fiber_rt)]
+        lock(retired_sites).clear();
         // A vCPU's waiter leaves at teardown; a fiber's event-parked one can stay queued, and a
         // later run's `notify` would count it.
         lock(&park.futex).clear();
