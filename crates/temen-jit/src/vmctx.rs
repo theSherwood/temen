@@ -383,15 +383,11 @@ impl VmCtx {
 
     /// #2958 — whether code running on this context runs as a kernel vCPU on this thread: a task of
     /// executor 2's run (`kernel_rt::KernelRun::run_vcpu`), whose §12 ops and parks are the kernel's,
-    /// never this crate's own thread runtime's: a context of a kernel run ([`Self::kernel`]) on a
-    /// thread whose record names that run (`kernel_rt`'s module docs).
+    /// never this crate's own thread runtime's ([`Self::kernel`]). Only a vCPU of the run runs its
+    /// code, on a thread whose record names the run; a thunk finding otherwise fails closed
+    /// (`kernel_rt`'s module docs).
     pub fn on_kernel(&self) -> bool {
-        self.kernel && crate::kernel_rt::on_vcpu(self)
-    }
-
-    /// #3078 — the domain's end word, which names its run: every context of a run points at it.
-    pub(crate) fn end_word(&self) -> *const AtomicI64 {
-        self.end
+        self.kernel
     }
 
     /// The code that ended this context's domain, or `None` while it runs.

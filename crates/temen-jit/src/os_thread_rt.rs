@@ -3590,7 +3590,7 @@ pub(crate) unsafe extern "C" fn fiber_resume_block(
     // #3078 slice 2 — on a kernel vCPU every target answers as a `cont.resume` does, as on the
     // oracle, which blocks only on a parked one: and no fiber parks on a run the kernel admits
     // (`fiber parks`), so reaching one is a bug in that predicate, and it fails closed.
-    if crate::kernel_rt::on_vcpu(vm) {
+    if vm.on_kernel() {
         let value = fiber_rt::fiber_resume(handle, arg, status_out, vm as *const _ as u64);
         if *status_out == FIBER_PARKED_STATUS {
             vm.raise(temen_ir::trap_code::MALFORMED);

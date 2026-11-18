@@ -887,6 +887,12 @@ impl SharedFiberTable {
         slot
     }
 
+    /// #3078 — a test's fiber, in a fresh slot of this table.
+    #[cfg(test)]
+    pub(crate) fn create_for_test(&self, fiber: Fiber) -> Option<i64> {
+        self.create(fiber, 0, 0, FiberCharge::none(), false)
+    }
+
     /// #2878 — whether the next slot a thaw seeds owns a context inside the arena, as `create`
     /// requires of a durable fiber ([`ShadowContexts::fiber_fits`]): the snapshot that names how many
     /// fibers to seed is untrusted (DURABILITY.md §4), and each resume raw-stores into the context.
@@ -1802,12 +1808,13 @@ pub(crate) fn context_id() -> u64 {
     THREAD_CONTEXT.with(|t| t as *const u8 as u64)
 }
 
-/// #3078 — whether a fiber is running on this thread now: [`current_fiber_slot`] is `Some`, with no
-/// slot taken.
-pub(crate) fn in_a_fiber() -> bool {
-    let rt = current();
-    // SAFETY: `current()` is this thread's live runtime; the borrow is momentary.
-    !rt.is_null() && unsafe { !(*rt).active_slots.is_empty() }
+/// #3078 — whether `rt`, a vCPU's runtime, is running one of its fibers now.
+///
+/// # Safety
+/// `rt` is a live runtime of this thread's.
+pub(crate) unsafe fn runs_a_fiber(rt: *const FiberRuntime) -> bool {
+    // SAFETY: the caller's contract; the borrow is momentary.
+    unsafe { !(*rt).active_slots.is_empty() }
 }
 
 pub(crate) fn current_fiber_slot() -> Option<Arc<FiberSlot>> {

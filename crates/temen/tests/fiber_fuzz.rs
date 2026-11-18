@@ -487,7 +487,8 @@ fn generated_migration_schedules_agree_on_interp_and_jit() {
     let mut migrations = 0u64;
     // Programs skipped for a transient Windows fiber-stack allocation failure (see the JIT arm).
     #[cfg_attr(not(windows), allow(unused_mut))]
-    let mut alloc_skips = 0u64;
+    // Per route ([`Route::BOTH`]'s order), so one route cannot fail on half the programs and pass.
+    let mut alloc_skips = [0u64; 2];
     for _ in 0..iters {
         let nf = 1 + rng.range(3); // fibers
         let nw = 1 + rng.range(3); // sequential workers (each a fresh OS thread)
@@ -603,13 +604,19 @@ fn generated_migration_schedules_agree_on_interp_and_jit() {
         // JIT — the real cross-thread stack switches; must match exactly, on both of its routes
         // while both exist (#2958): today's thread runtime, and the kernel's, which runs every
         // worker as a kernel task (#3078 slice 2), unmetered (`fiber fuel`, #3080).
-        for jit in Route::BOTH.map(|r| match r {
-            Route::Today => compile_and_run(&m, 0, &[]).expect("jit compile/run"),
-            Route::Kernel => {
-                jit_kernel::expect_kernel(&m, 0, &[], None, jit_kernel::lane_fuel(&m), None)
-                    .expect("the kernel route admits it")
-            }
-        }) {
+        for (route, jit) in Route::BOTH
+            .map(|r| match r {
+                Route::Today => compile_and_run(&m, 0, &[]).expect("jit compile/run"),
+                Route::Kernel => {
+                    jit_kernel::expect_kernel(&m, 0, &[], None, jit_kernel::lane_fuel(&m), None)
+                        .expect("the kernel route admits it")
+                }
+            })
+            .into_iter()
+            .enumerate()
+        {
+            #[cfg(not(windows))]
+            let _ = route; // counted only where a stack reservation can fail transiently
             match jit {
                 JitOutcome::Returned(slots) => {
                     let want: Vec<i64> = interp
@@ -634,7 +641,7 @@ fn generated_migration_schedules_agree_on_interp_and_jit() {
                     // macOS run a superset of these seeds (same RNG, longer loop) with no skip.
                     #[cfg(windows)]
                     if matches!(other, JitOutcome::Trapped(temen_jit::TrapKind::FiberFault)) {
-                        alloc_skips += 1;
+                        alloc_skips[route] += 1;
                         continue;
                     }
                     panic!("interp returned {interp:?} but the JIT gave {other:?}\n{src}")
@@ -644,10 +651,13 @@ fn generated_migration_schedules_agree_on_interp_and_jit() {
     }
     // The skip above is for *transient* allocation pressure only: if a meaningful share of the
     // corpus FiberFaults, that is systematic (a real Windows fiber-stack bug), not pressure — fail.
-    assert!(
-        alloc_skips <= iters / 2,
-        "too many JIT FiberFaults to be transient allocation pressure: {alloc_skips}/{iters}"
-    );
+    for (route, skips) in Route::BOTH.iter().zip(alloc_skips) {
+        assert!(
+            skips <= iters / 4,
+            "too many JIT FiberFaults on {route:?}'s route to be transient allocation pressure: \
+             {skips}/{iters}"
+        );
+    }
     // Coverage guard: the corpus must have actually exercised saved-stack cross-executor resumes
     // (≈1.9 per program empirically; a quarter of that is a comfortable floor).
     assert!(

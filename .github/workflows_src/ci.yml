@@ -1053,9 +1053,9 @@ jobs:
         run: |
           set -euo pipefail
           asan="--features temen-jit/asan -Z build-std --target x86_64-unknown-linux-gnu"
-          # Each binary and the test filter it runs: held_domain and pool_after_teardown whole; jit_kernel's
-          # fiber rows (#3078); the #2990 test in temen-run's lib (`held::tests`); child_exec's unit tests
-          # in temen-jit's lib.
+          # Each binary and the test filter it runs: held_domain and pool_after_teardown whole;
+          # jit_kernel's slice-2 rows and kernel_fiber_stacks (#3078); the #2990 test in temen-run's
+          # lib (`held::tests`); child_exec's unit tests in temen-jit's lib.
           run_binary() {
             local bin="$1" filter="$2" n
             [ -n "$bin" ] || { echo "no test binary built"; exit 1; }
@@ -1067,8 +1067,10 @@ jobs:
           run_binary "$(cargo test -p temen-run $asan --test held_domain --no-run --message-format=json | exe held_domain)" ""
           run_binary "$(cargo test -p temen-run $asan --test pool_after_teardown --no-run --message-format=json | exe pool_after_teardown)" ""
           # #3078 slice 2 — a kernel run's vCPU contexts outlive their vCPUs, since a fiber a vCPU made
-          # runs on its context after it ends: the fiber rows read freed heap without the run's pool.
-          run_binary "$(cargo test -p temen-run $asan --test jit_kernel --no-run --message-format=json | exe jit_kernel)" "fiber"
+          # runs on its context after it ends: the slice's rows read freed heap without the run's
+          # pool; and the run ends its fiber table as it returns (kernel_fiber_stacks).
+          run_binary "$(cargo test -p temen-run $asan --test jit_kernel --no-run --message-format=json | exe jit_kernel)" "kernel_fibers::"
+          run_binary "$(cargo test -p temen-run $asan --test kernel_fiber_stacks --no-run --message-format=json | exe kernel_fiber_stacks)" ""
           run_binary "$(cargo test -p temen-run $asan --lib --no-run --message-format=json | exe temen_run)" "held::tests::"
           run_binary "$(cargo test -p temen-jit --features asan -Z build-std --target x86_64-unknown-linux-gnu --lib --no-run --message-format=json | exe temen_jit)" "child_exec::tests::"
         env:

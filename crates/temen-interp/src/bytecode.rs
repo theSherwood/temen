@@ -9132,20 +9132,15 @@ pub fn native_scope(m: &Module, host: &Host) -> Result<(), &'static str> {
     if m.imports.len() != host.import_bindings.len() {
         return Err("imports");
     }
-    for (slot, b) in host.import_bindings.iter().enumerate() {
-        if b.rebindable || !b.bound {
-            return Err("imports");
-        }
-        // Every op the slot reaches: a grouped binding's remap (consumer op → the target's op,
-        // [`Host::import_target`]), or the one bound op.
-        match host.import_remaps.get(slot).and_then(|r| r.as_deref()) {
-            Some(ops) => {
-                for &op in ops {
-                    kernel_op(host, b.type_id, op, CallSite::import(b))?;
-                }
-            }
-            None => _ = kernel_op(host, b.type_id, b.op, CallSite::import(b))?,
-        }
+    if host
+        .import_bindings
+        .iter()
+        .any(|b| b.rebindable || !b.bound)
+    {
+        return Err("imports");
+    }
+    for (b, op) in bound_ops(host) {
+        kernel_op(host, b.type_id, op, CallSite::import(b))?;
     }
     for i in m
         .funcs
@@ -9223,9 +9218,9 @@ fn file_region(host: &Host) -> bool {
 /// #2958 slice 4 — whether a kernel task can run instruction `i` under `host`, as far as it reaches
 /// the host: every instruction kind is named here, with no wildcard arm, so a kind added to the IR
 /// is decided before it compiles. A `call.import` is decided through its binding ([`native_scope`]);
-/// the kinds that reach no host state, or only the §12 rules and the window, pass. The kinds
-/// declined whole before this scan pass here: fiber ops (`fibers`) and `gc.roots` in
-/// [`native_scope`], and `setjmp`/`longjmp`, which the JIT's compile refuses.
+/// the kinds that reach no host state, or only the §12 rules and the window, pass. So do the fiber
+/// ops, which [`native_scope`] decides on the module (`fiber only`, `fiber parks`), and the kinds it
+/// declines whole before this scan (`gc.roots`) or the JIT's compile refuses (`setjmp`/`longjmp`).
 fn kernel_inst(host: &Host, i: &Inst, mints: bool) -> Result<CallParks, &'static str> {
     let inline = CallSite {
         handle: None,
@@ -9453,23 +9448,34 @@ fn fiber_parks(m: &Module, host: &Host) -> bool {
     let insts = || (m.funcs.iter().flat_map(|f| &f.blocks)).flat_map(|b| &b.insts);
     let pipe = |t: u32, op: u32| t == CAP_SELF_TYPE_ID && op == super::CAP_SELF_PIPE;
     let mints = insts().any(|i| matches!(i, Inst::CapCall(c) if pipe(c.type_id, c.op)))
-        || (host.import_bindings.iter()).any(|b| pipe(b.type_id, b.op));
+        || bound_ops(host).any(|(b, op)| pipe(b.type_id, op));
     let may = |r: Result<CallParks, &str>| r == Ok(CallParks::May);
     let waits = insts().any(|i| matches!(i, Inst::MemoryWait { .. }));
     let inline = insts().any(|i| may(kernel_inst(host, i, mints)));
-    let imports = host.import_bindings.iter().enumerate().any(|(slot, b)| {
+    let imports = bound_ops(host).any(|(b, op)| {
         let site = CallSite {
-            handle: Some(b.handle),
             mints,
+            ..CallSite::import(b)
         };
-        match host.import_remaps.get(slot).and_then(|r| r.as_deref()) {
-            Some(ops) => ops
-                .iter()
-                .any(|&op| may(kernel_op(host, b.type_id, op, site))),
-            None => may(kernel_op(host, b.type_id, b.op, site)),
-        }
+        may(kernel_op(host, b.type_id, op, site))
     });
     waits || inline || imports
+}
+
+/// Every op `host`'s import bindings reach, with the binding: a grouped binding's remap (consumer op
+/// → the target's op, [`Host::import_target`]), or the one bound op. The one walk [`native_scope`]'s
+/// clauses read the bindings by.
+fn bound_ops(host: &Host) -> impl Iterator<Item = (&super::BoundImport, u32)> + '_ {
+    host.import_bindings
+        .iter()
+        .enumerate()
+        .flat_map(move |(slot, b)| {
+            let ops: Vec<u32> = match host.import_remaps.get(slot).and_then(|r| r.as_deref()) {
+                Some(ops) => ops.to_vec(),
+                None => vec![b.op],
+            };
+            ops.into_iter().map(move |op| (b, op))
+        })
 }
 
 /// #2958 — whether `host`'s emitted tier makes the §12 thread ops itself ([`ThreadTier::native`]),
@@ -20624,6 +20630,12 @@ impl BounceTask<'_> {
     fn park_native(&mut self, stop: VcpuStop) -> Result<[Reg; 2], Trap> {
         let (run, ti) = (self.run, self.ti);
         let mut g = run.state.lock_unpoisoned();
+        // #3078 — a native tier's task is never in a held run: a held run never reaches
+        // `native_scope` (its doc). So no activation is carried onto this thread while it parks
+        // here (`Next::Carry` comes only from a held run's calls), and the thread runs no guest code
+        // until the park returns. The kernel hook its thunk borrowed (`temen_jit::kernel_rt`) is
+        // safe either way: a carried activation's emitted code would publish a record of its own.
+        debug_assert!(g.core.held.is_none(), "a native task in a held run");
         if g.over.is_some() || matches!(g.core.tasks[ti].state, TaskState::Done(_)) {
             return Err(Trap::ThreadFault);
         }
@@ -20638,10 +20650,6 @@ impl BounceTask<'_> {
                 Next::Run => break true,
                 Next::Stop => break false,
                 Next::Carry(a) => {
-                    // #3078 — never on a native task: only a held run carries, and a held run
-                    // never reaches the kernel. The kernel's hook is borrowed on this thread now
-                    // (`temen_jit::kernel_rt`), so another task's code here would reach it.
-                    debug_assert!(g.core.held.is_none(), "a native task carries");
                     let (view, _) = g.hand(0);
                     g = carry(run, g, a, view, Fuel::fixed(0));
                 }

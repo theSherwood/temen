@@ -434,7 +434,9 @@ fibers, no park (ns per round trip / per notify):"
             ("today", today(&m, 0, Host::new(), true)),
             ("kernel", kernel(&m, 0, Host::new)),
         ];
-        let label = format!("round trip, {w} vCPU");
+        // Per `n`: `w` vCPUs each make `n` round trips at once, so this is wall time per round trip
+        // of each vCPU, not of all `w` together.
+        let label = format!("round trip, {w} vCPU (wall per n)");
         per_iter(
             &label,
             &mut lanes,

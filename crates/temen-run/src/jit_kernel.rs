@@ -39,8 +39,11 @@ pub struct Admitted<'m>(&'m Module);
 /// `temen_interp::bytecode::native_scope`, plus the start's own clauses:
 /// - **`fiber fuel`**: the run is metered ([`metered`]) and `m` uses fibers. A fiber's code charges
 ///   its creator vCPU's fuel cell wherever it runs, so a fiber resumed on another vCPU loses charges
-///   to its creator's at once, where the oracle charges the vCPU that runs it (#3080, which removes
-///   this clause);
+///   to its creator's at once, where the oracle charges the vCPU that runs it. It is a memory-safety
+///   gate too: a vCPU's cell is a local of its thread (`tier_run`), so a metered fiber resumed after
+///   its creator ended would write into a dead thread's stack; `KernelRun::new` refuses such a
+///   compile whatever admitted it. #3080's fix removes the clause, and must first move a vCPU's cell
+///   off its thread's stack;
 /// - **`kept code`**: the embedder keeps the run's compile for later runs (a `JitCodeCache`,
 ///   #2389), whose shared code the kernel route does not instance yet (#2981).
 ///
@@ -142,6 +145,38 @@ pub fn run_fresh(
     Ok((end.outcome().0, vcpus))
 }
 
+/// How long a suite's kernel-lane run ([`expect_kernel`]) may take before the case fails: a lost
+/// wake must be a failure that says what ran, not a job's timeout.
+const LANE_BOUND: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// [`run_fresh`] on a thread of its own, failing the case if it does not end within
+/// [`LANE_BOUND`]: the thread is left behind, and the panic names the entry, its arguments and the
+/// module's size.
+fn bounded_fresh(
+    m: &Module,
+    entry: u32,
+    args: &[i64],
+    kill: Option<&Arc<temen_jit::Interrupt>>,
+    fuel: u64,
+) -> Result<(JitOutcome, u64), &'static str> {
+    let (m2, args2, kill2) = (m.clone(), args.to_vec(), kill.cloned());
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(run_fresh(&m2, entry, &args2, kill2.as_ref(), fuel));
+    });
+    match rx.recv_timeout(LANE_BOUND) {
+        Ok(r) => r,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => panic!(
+            "the kernel route's run of entry {entry}{args:?} ({} functions, fuel {fuel}) did not end \
+             within {LANE_BOUND:?}",
+            m.funcs.len()
+        ),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            panic!("the kernel route's run of entry {entry}{args:?} panicked")
+        }
+    }
+}
+
 /// The two routes a JIT program's threads run on while both exist (#2958): the JIT's own thread
 /// runtime, and the kernel's. The suites run each case on both; today's arm goes with the code it
 /// tests, in the phase-2 PR that deletes it.
@@ -155,8 +190,8 @@ impl Route {
     pub const BOTH: [Route; 2] = [Route::Today, Route::Kernel];
 }
 
-/// Test-facing: run `m`'s `entry(args)` on the kernel route ([`run_fresh`], granted `fuel`) and
-/// check the route a case expects of it: `declined` names the clause that must decline it, `None` that it must run
+/// Test-facing: run `m`'s `entry(args)` on the kernel route ([`run_fresh`], granted `fuel`, bounded
+/// by [`LANE_BOUND`]) and check the route a case expects of it: `declined` names the clause that must decline it, `None` that it must run
 /// as kernel tasks. `None` back when it was declined, as expected.
 #[doc(hidden)]
 pub fn expect_kernel(
@@ -167,7 +202,7 @@ pub fn expect_kernel(
     fuel: u64,
     declined: Option<&'static str>,
 ) -> Option<JitOutcome> {
-    match (run_fresh(m, entry, args, kill, fuel), declined) {
+    match (bounded_fresh(m, entry, args, kill, fuel), declined) {
         (Ok((o, vcpus)), None) => {
             assert!(vcpus >= 1, "the run's vCPUs ran as kernel tasks");
             Some(o)
@@ -181,8 +216,8 @@ pub fn expect_kernel(
     }
 }
 
-/// Test-facing: the fuel a suite's kernel lane grants `m`: the default, or for a module that uses
-/// fibers none at all, which `fiber fuel` declines metered until #3080. The one place the suites
+/// Test-facing: the fuel a suite's kernel lane grants `m`: the default, or unmetered (`u64::MAX`) for
+/// a module that uses fibers, whose metered run `fiber fuel` declines until #3080. The one place the suites
 /// read it, so #3080's fix gives every fiber row its metered lane here.
 #[doc(hidden)]
 pub fn lane_fuel(m: &Module) -> u64 {
@@ -391,6 +426,8 @@ pub fn run(
     host.replace_run_door(embedders);
     drop(co);
     drop(_kill);
+    // No thread runs guest code now: the run's fibers go, before its host goes back to the caller.
+    kr.end_fibers();
     // Every thread has counted itself out, so no guest code runs: the window holds what the run
     // left in it.
     // The window is unmapped as the last holder of `kr` drops it, the reader's included (a thread
@@ -518,16 +555,11 @@ type CallPayload = Option<CallPark>;
 /// `vm`'s own thread, inside the guarded call its vCPU runs (`KernelRun::run_vcpu`), and holds no
 /// other reference to the hook and no `Host` lock.
 pub(crate) unsafe fn park_call(vm: &temen_jit::VmCtx, park: CallPark) -> Option<[i64; 2]> {
-    // #3078 slice 2 — a park made in a fiber is the fiber's, which the kernel does not take yet:
-    // `native_scope`'s `fiber parks` declines every module that could make one, so reaching one is
-    // a bug in that predicate, and it fails closed. A region post's wake parks nothing.
-    if !matches!(park, CallPark::Done(_)) && temen_jit::kernel_rt::in_fiber(vm) {
-        vm.raise(Trap::Malformed.code());
-        return Some([0, 0]);
-    }
+    // A rewound park or a punted call's parks its caller; a region post's wake does not.
+    let parks = !matches!(park, CallPark::Done(_));
     let mut payload: CallPayload = Some(park);
     // SAFETY: this function's own contract is the callee's.
-    unsafe { temen_jit::kernel_rt::park_call(vm, &mut payload) }
+    unsafe { temen_jit::kernel_rt::park_call(vm, parks, &mut payload) }
 }
 
 #[cfg(test)]

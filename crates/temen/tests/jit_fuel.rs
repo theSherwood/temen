@@ -1011,7 +1011,6 @@ fn jit_fuel_a_fiber_outliving_its_vcpu_runs_on_the_kernel_route_unmetered() {
     use temen_run::jit_kernel;
     let m = parse_module(A_FIBER_OUTLIVES_ITS_VCPU).expect("parse");
     verify_module(&m).expect("verify");
-    let (got, vcpus) = jit_kernel::run_fresh(&m, 0, &[], None, u64::MAX).expect("in scope");
-    assert!(vcpus >= 3, "the root, A and the thread ran as kernel tasks");
+    let got = jit_kernel::expect_kernel(&m, 0, &[], None, u64::MAX, None).expect("in scope");
     assert_eq!(got, JitOutcome::Returned(vec![3 + 6 + 6 + 7]));
 }
