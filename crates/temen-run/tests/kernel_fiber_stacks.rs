@@ -45,14 +45,23 @@ fn a_kernel_run_hands_back_the_stack_of_a_fiber_a_fault_abandoned() {
     };
     let m = temen_text::parse_module(FAULTS_IN_A_FIBER).expect("parse");
     temen_verify::verify_module(&m).expect("verify");
-    let run = || jit_kernel::run_fresh(&m, 0, &[], None, u64::MAX).expect("in scope");
-    // The first run warms whatever the arena keeps; every later one must leave the count there.
-    let (out, _) = run();
-    assert_eq!(out, JitOutcome::Trapped(temen_jit::TrapKind::MemoryFault));
-    let after_one = temen_fiber::live_stacks();
-    for i in 2..=5 {
-        let (out, vcpus) = run();
-        assert!(vcpus >= 2, "it ran as kernel tasks");
+    // Bounded, as every suite's kernel lane is: a join that never wakes after the fault fails the
+    // test, saying so.
+    let run = || {
+        jit_kernel::expect_kernel(
+            &m,
+            0,
+            &[],
+            None,
+            u64::MAX,
+            jit_kernel::Expect::Kernel { vcpus: 2 },
+        )
+        .expect("in scope")
+    };
+    // Before the first run: a one-time leak is a leak too. The arena itself keeps no stack live.
+    let before = temen_fiber::live_stacks();
+    for i in 1..=5 {
+        let out = run();
         assert_eq!(
             out,
             JitOutcome::Trapped(temen_jit::TrapKind::MemoryFault),
@@ -60,7 +69,7 @@ fn a_kernel_run_hands_back_the_stack_of_a_fiber_a_fault_abandoned() {
         );
         assert_eq!(
             temen_fiber::live_stacks(),
-            after_one,
+            before,
             "run {i} left its abandoned fiber's stack live"
         );
     }

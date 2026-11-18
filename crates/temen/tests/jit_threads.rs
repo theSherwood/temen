@@ -114,9 +114,14 @@ fn jit_routes(m: &temen_ir::Module, declined: Option<&'static str>) -> Vec<JitOu
         .iter()
         .filter_map(|r| match r {
             Route::Today => Some(compile_and_run(m, 0, &[]).expect("jit compile/run")),
-            Route::Kernel => {
-                jit_kernel::expect_kernel(m, 0, &[], None, jit_kernel::lane_fuel(m), declined)
-            }
+            Route::Kernel => jit_kernel::expect_kernel(
+                m,
+                0,
+                &[],
+                None,
+                jit_kernel::lane_fuel(m),
+                jit_kernel::Expect::of(declined),
+            ),
         })
         .collect()
 }

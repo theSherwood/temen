@@ -9470,11 +9470,11 @@ fn bound_ops(host: &Host) -> impl Iterator<Item = (&super::BoundImport, u32)> + 
         .iter()
         .enumerate()
         .flat_map(move |(slot, b)| {
-            let ops: Vec<u32> = match host.import_remaps.get(slot).and_then(|r| r.as_deref()) {
-                Some(ops) => ops.to_vec(),
-                None => vec![b.op],
+            let ops = match host.import_remaps.get(slot).and_then(|r| r.as_deref()) {
+                Some(ops) => ops,
+                None => std::slice::from_ref(&b.op),
             };
-            ops.into_iter().map(move |op| (b, op))
+            ops.iter().map(move |&op| (b, op))
         })
 }
 

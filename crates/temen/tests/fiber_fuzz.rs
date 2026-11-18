@@ -607,10 +607,15 @@ fn generated_migration_schedules_agree_on_interp_and_jit() {
         for (route, jit) in Route::BOTH
             .map(|r| match r {
                 Route::Today => compile_and_run(&m, 0, &[]).expect("jit compile/run"),
-                Route::Kernel => {
-                    jit_kernel::expect_kernel(&m, 0, &[], None, jit_kernel::lane_fuel(&m), None)
-                        .expect("the kernel route admits it")
-                }
+                Route::Kernel => jit_kernel::expect_kernel(
+                    &m,
+                    0,
+                    &[],
+                    None,
+                    jit_kernel::lane_fuel(&m),
+                    jit_kernel::Expect::of(None),
+                )
+                .expect("the kernel route admits it"),
             })
             .into_iter()
             .enumerate()

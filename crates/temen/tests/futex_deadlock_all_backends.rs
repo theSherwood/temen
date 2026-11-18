@@ -89,7 +89,7 @@ fn run_on(
             &[],
             None,
             jit_kernel::lane_fuel(&module),
-            declined,
+            jit_kernel::Expect::of(declined),
         )?),
     };
     Some((r, t0.elapsed()))

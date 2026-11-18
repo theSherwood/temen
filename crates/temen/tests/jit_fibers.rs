@@ -96,8 +96,15 @@ block 0 () {{
     let entry = (n + 1) as u32;
     let mut fuel = 10_000_000u64;
     let interp = run(&w, entry, &[], &mut fuel);
-    let kernel = jit_kernel::expect_kernel(&w, entry, &[], None, u64::MAX, None)
-        .expect("the kernel route admits it");
+    let kernel = jit_kernel::expect_kernel(
+        &w,
+        entry,
+        &[],
+        None,
+        u64::MAX,
+        jit_kernel::Expect::Kernel { vcpus: 2 },
+    )
+    .expect("the kernel route admits it");
     match (&interp, &kernel) {
         (Ok(vals), JitOutcome::Returned(slots)) => {
             let want: Vec<i64> = vals.iter().map(to_slot).collect();

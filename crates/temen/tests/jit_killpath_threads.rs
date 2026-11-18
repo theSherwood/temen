@@ -58,7 +58,7 @@ fn run_killed(src: &str, delay_ms: u64) -> Vec<JitOutcome> {
                     &[0i64],
                     Some(&interrupt),
                     jit_kernel::lane_fuel(&m),
-                    None,
+                    jit_kernel::Expect::of(None),
                 ),
             };
             watchdog.join().unwrap();

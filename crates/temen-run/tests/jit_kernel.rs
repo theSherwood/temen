@@ -4421,7 +4421,11 @@ block 0 (vsp: i64, varg: i64) {{
     /// #3078 slice 2 — the kill door ends a kernel run with fibers suspended. The guest calls a host
     /// procedure once both its fibers are suspended, one of them on an ended vCPU's context, and the
     /// procedure fires the door, so the run is killed with them alive: it ends `OutOfFuel`, and
-    /// [`bounded`] fails the test, saying so, if it does not end within [`PROMPT`].
+    /// [`bounded`] fails the test, saying so, if it does not end within [`PROMPT`]. The door's
+    /// waker asks the run's door to stop, which takes the run lock, from inside the procedure, while
+    /// the vCPU holds the domain's `Host` lock: safe here only because no sibling is live to hold the
+    /// run lock and wait for that `Host` lock (the lock order is run lock → `Host` lock); a
+    /// `RunDoor::stop` that finds the lock busy answers `false` and is asked again.
     #[test]
     fn the_kill_door_ends_a_kernel_run_with_fibers_suspended() {
         let kill = temen_jit::Interrupt::new();
@@ -4560,12 +4564,12 @@ block 0 (vsp: i64, varg: i64) {{
         ))
     }
 
-    /// #3078 slice 2 (review B1) — a kernel run ends its fiber table as it returns, as today's route
-    /// does: the stack and the `mem` charge of a fiber a fault abandoned mid-run, whose slot an `Arc` in
-    /// a frame the fault jumped past still holds, are back when `run` returns. So under a grant with room
-    /// for the window and one fiber, a run that faults inside its fiber, then a run that makes and
-    /// keeps one, on the same host, end as the oracle's two runs do; and so do two back-to-back runs
-    /// that each leave one fiber suspended.
+    /// #3078 slice 2 — a kernel run's fibers' `mem` charges are back by the time `run` returns, as
+    /// the oracle's are: under a grant with room for the window and one fiber, a run that faults inside
+    /// its fiber, then a run that makes and keeps one, on the same host, end as the oracle's two runs
+    /// do; and so do two back-to-back runs that each leave one fiber suspended. (The stacks are
+    /// `kernel_fiber_stacks.rs`'s row.) Each run is bounded: a join that never wakes after the fault
+    /// fails the test, saying so.
     #[test]
     fn a_kernel_run_hands_its_fibers_back_as_it_returns() {
         let room = (1i64 << 16) + temen_ir::FIBER_STACK as i64;
@@ -4579,11 +4583,15 @@ block 0 (vsp: i64, varg: i64) {{
                 let mut left = u64::MAX;
                 let want = temen_interp::run_with_host(&m, 0, &[], &mut left, &mut oracle_host)
                     .map(|v| v.len());
-                let admitted = jit_kernel::admit(&m, &host, false, u64::MAX).expect("in scope");
-                let got = jit_kernel::run(admitted, fresh_start(u64::MAX), &mut host)
-                    .expect("compiles")
-                    .result
-                    .map(|v| v.len());
+                let m = m.clone();
+                let (got, back) = bounded("the kernel route", move || {
+                    let mut host = host;
+                    let admitted = jit_kernel::admit(&m, &host, false, u64::MAX).expect("in scope");
+                    let end = jit_kernel::run(admitted, fresh_start(u64::MAX), &mut host)
+                        .expect("compiles");
+                    (end.result.map(|v| v.len()), host)
+                });
+                host = back;
                 assert_eq!(
                     got,
                     want,
@@ -4779,7 +4787,32 @@ block 0 (vsp: i64, varg: i64) {{
             h.set_import_remap(0, std::sync::Arc::from(vec![1u32, 0]));
             h
         };
+        // A grouped binding whose own op is `own`, its remap `ops`: a walk that read only the
+        // binding's own op would see `own` alone.
+        let remapped = |type_id: u32, own: u32, ops: Vec<u32>, setup: &dyn Fn(&mut Host) -> i32| {
+            let mut h = Host::new();
+            let handle = setup(&mut h);
+            h.set_import_bindings(vec![BoundImport::required(type_id, own, handle)]);
+            h.set_import_remap(0, std::sync::Arc::from(ops));
+            h
+        };
+        let blocking_stdin = |h: &mut Host| {
+            h.stdin_block = true;
+            h.grant_stream(temen_interp::StreamRole::In)
+        };
         let rows: Vec<(temen_ir::Module, Host, Option<&str>)> = vec![
+            // Only through the remap: a write (op 1, no pipe) whose read reaches a blocking stdin.
+            (
+                fibered_import(true, false),
+                remapped(STREAM, 1, vec![1, 0], &blocking_stdin),
+                Some("fiber parks"),
+            ),
+            // Only through the remap: `self.pipe` (16) mints, so the inline stream read may park.
+            (
+                fibered_import(true, true),
+                remapped(temen_ir::CAP_SELF_TYPE_ID, 0, vec![0, 16], &nothing),
+                Some("fiber parks"),
+            ),
             (
                 fibered_import(false, false),
                 bound(STREAM, 0, &pipe_read),

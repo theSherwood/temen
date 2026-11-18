@@ -60,10 +60,15 @@ fn both(m: &temen_ir::Module, declined: Option<&'static str>) -> (i64, i64) {
             .expect("jit run");
             Some(first(jo))
         }
-        Route::Kernel => {
-            jit_kernel::expect_kernel(m, 0, &[], None, jit_kernel::lane_fuel(m), declined)
-                .map(first)
-        }
+        Route::Kernel => jit_kernel::expect_kernel(
+            m,
+            0,
+            &[],
+            None,
+            jit_kernel::lane_fuel(m),
+            jit_kernel::Expect::of(declined),
+        )
+        .map(first),
     });
     let jit = jits.next().expect("today's route");
     for other in jits {

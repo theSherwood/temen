@@ -14,25 +14,29 @@
 //! Everything `native_scope` declines runs on [`crate::os_thread_rt`], unchanged.
 //!
 //! **The thread's record (#3078 slice 2).** A kernel vCPU's hook is found by the thread of control
-//! running now, never through the context the code carries (which says only that it is a kernel
-//! run's, `VmCtx::kernel`, a fact of the run): a fiber's code carries its creator's
+//! running now, never through the context the code carries: a fiber's code carries its creator's
 //! context ([`crate::VmCtx`], `vmctx.rs`'s note), so a fiber made on one vCPU and resumed on another
-//! must reach the hook of the vCPU it runs on. [`KernelRun::run_vcpu`] publishes the record for its
-//! guarded call, and one guard restores the thread's earlier record on every exit; for a module with
-//! fibers it publishes the vCPU's fiber runtime (`fiber_rt`'s `CURRENT_RT`) too, and restores that
-//! as well. The record names that runtime: whether a park is a fiber's is asked of the run's own,
-//! never of the thread's `CURRENT_RT`, which may be another run's. The record names its run by the run's one end word, which every context of a
-//! kernel run points at, a fiber's creator context included: a context of any other run, whose code
-//! a synchronous host procedure may run on this thread (a held domain's call, a nested `jit_run`),
-//! fails that compare and takes the JIT's own runtime, as it would on any other thread.
+//! must reach the hook of the vCPU it runs on. The context says only whether it is a kernel run's
+//! (`VmCtx::kernel`, a fact of the run): a context of no kernel run never reads the record, so code
+//! of another run that a synchronous host procedure runs on this thread (a held domain's call, a
+//! nested `jit_run`) takes the JIT's own runtime, as on any other thread. A kernel run's context
+//! asks the record, which names its run by the run's one end word (every context of the run, a
+//! fiber's creator context included, points at it): one whose thread's record names another run, or
+//! none, traps `Malformed`, since only a vCPU of the run runs its code.
+//!
+//! [`KernelRun::run_vcpu`] publishes the record for its guarded call, and one guard restores the
+//! thread's earlier record on every exit, so a nested kernel run hands the outer vCPU its record
+//! back. For a module with fibers it publishes the vCPU's fiber runtime (`fiber_rt`'s `CURRENT_RT`)
+//! too, and restores that as well. The record names that runtime: whether a park is a fiber's is
+//! asked of the run's own, never of the thread's `CURRENT_RT`, which may be another run's.
 //!
 //! **The borrow.** A thunk takes the hook `&mut` for one [`KernelPark`] call, marking the record
 //! borrowed meanwhile. During it the thread runs no guest code: the kernel parks the thread in place
 //! (`park_native`), and executor 2 carries another task's activation onto a parked thread only for a
 //! held run (`Next::Carry`), which never reaches the kernel. A borrow never spans a fiber switch:
 //! the call runs on this stack, and no switch happens inside it. A thunk that finds the record
-//! borrowed, or the swap back that does not find it so, fails closed (`Malformed`) in every build
-//! and asserts in a debug one.
+//! lent, or a give-back that does not find this record lending this very hook, fails closed
+//! (`Malformed`) in every build and asserts in a debug one.
 
 use crate::{mem, slot_record, CompiledModule, FuelCell, TrapKind, VmCtx};
 use core::ptr::NonNull;
@@ -56,11 +60,14 @@ pub trait KernelPark {
 }
 
 /// The thread's record (the module docs): the run its vCPU is of, by its end word (null when this
-/// thread runs no kernel vCPU), and its hook, which a thunk takes for the length of its borrow: a
-/// record whose end is set and whose hook is `None` is borrowed.
+/// thread runs no kernel vCPU), its hook, which a thunk borrows for one call (`lent`), and the vCPU's
+/// own fiber runtime.
 struct Record {
     end: Cell<*const AtomicI64>,
     hook: Cell<Option<NonNull<dyn KernelPark>>>,
+    /// The hook is lent to a thunk now. It stays named in `hook` meanwhile, so the give-back can
+    /// check that what it hands back is this record's own hook, not another vCPU's of the run.
+    lent: Cell<bool>,
     /// The vCPU's own fiber runtime (`fiber_rt::FiberRuntime`), null for a run whose module has no
     /// fiber op: whether a park is a fiber's is asked of it, never of the thread's `CURRENT_RT`, which
     /// may be another run's (a fiber of a run that called the host procedure this run is in).
@@ -72,6 +79,7 @@ struct Record {
 struct Fields {
     end: *const AtomicI64,
     hook: Option<NonNull<dyn KernelPark>>,
+    lent: bool,
     fibers: *const core::ffi::c_void,
 }
 
@@ -80,6 +88,7 @@ thread_local! {
         Record {
             end: Cell::new(std::ptr::null()),
             hook: Cell::new(None),
+            lent: Cell::new(false),
             fibers: Cell::new(std::ptr::null()),
         }
     };
@@ -114,21 +123,29 @@ fn take_hook(end: *const AtomicI64) -> Taken {
         if !std::ptr::eq(r.end.get(), end) {
             return Taken::NotOurs;
         }
-        match r.hook.take() {
-            Some(h) => Taken::Hook(h),
-            None => Taken::Borrowed,
+        match (r.lent.get(), r.hook.get()) {
+            (false, Some(h)) => {
+                r.lent.set(true);
+                Taken::Hook(h)
+            }
+            _ => Taken::Borrowed,
         }
     })
 }
 
 /// Give `hook` back to this thread's record, if it is the one that lent it: it names the run of end
-/// word `end` and is borrowed. `false`, and nothing written, otherwise.
+/// word `end`, is lent, and lent this very hook (another vCPU's record of the same run, also
+/// mid-borrow, lent its own). `false`, and nothing written, otherwise.
 #[inline(never)]
 fn give_back(end: *const AtomicI64, hook: NonNull<dyn KernelPark>) -> bool {
     RECORD.with(|r| {
-        let lent = std::ptr::eq(r.end.get(), end) && r.hook.get().is_none();
+        let own = r
+            .hook
+            .get()
+            .is_some_and(|h| std::ptr::addr_eq(h.as_ptr(), hook.as_ptr()));
+        let lent = std::ptr::eq(r.end.get(), end) && r.lent.get() && own;
         if lent {
-            r.hook.set(Some(hook));
+            r.lent.set(false);
         }
         lent
     })
@@ -140,6 +157,7 @@ fn set_record(f: Fields) -> Fields {
     RECORD.with(|r| Fields {
         end: r.end.replace(f.end),
         hook: r.hook.replace(f.hook),
+        lent: r.lent.replace(f.lent),
         fibers: r.fibers.replace(f.fibers),
     })
 }
@@ -231,7 +249,7 @@ unsafe fn through_hook(
             return Some([0, 0]);
         }
     };
-    // SAFETY: the record holds no hook while it is borrowed, so nothing else reaches it meanwhile.
+    // SAFETY: the record is marked lent, so nothing else reaches the hook meanwhile.
     let out = f(unsafe { &mut *hook.as_ptr() });
     // Given back to the record of the thread running now, which must be the one that lent it.
     if !give_back(end, hook) {
@@ -286,6 +304,7 @@ impl Published {
         let prev = set_record(Fields {
             end,
             hook: NonNull::new(hook),
+            lent: false,
             fibers: own,
         });
         Published {
@@ -672,17 +691,20 @@ mod tests {
     use super::*;
     use crate::fiber_rt::{FiberRuntime, SharedFiberTable};
     use crate::vmctx::{InstanceAddrs, Window};
+    use std::sync::atomic::Ordering;
     use std::sync::Arc;
 
-    /// A hook whose `park` runs `then` first, as code on the vCPU's thread during its park would.
-    struct Then<F: FnMut() -> Option<[i64; 2]>>(F);
+    /// A hook whose `park` runs `then` first, as code on the vCPU's thread during its park would,
+    /// and which counts the call parks that reach it.
+    struct Then<F: FnMut() -> Option<[i64; 2]>>(F, usize);
 
     impl<F: FnMut() -> Option<[i64; 2]>> KernelPark for Then<F> {
         fn park(&mut self, _: NativeStop) -> Result<[i64; 2], i64> {
             Ok((self.0)().unwrap_or([7, 7]))
         }
         fn park_call(&mut self, _: &mut dyn std::any::Any) -> Result<[i64; 2], i64> {
-            Ok([0, 0])
+            self.1 += 1;
+            Ok([5, 5])
         }
     }
 
@@ -726,7 +748,7 @@ mod tests {
         let vm = context(&end, true);
         let vm_at = &vm as *const VmCtx;
         // SAFETY: `vm` outlives the hook.
-        let mut hook = Then(|| routed(unsafe { &*vm_at }, NOTIFY));
+        let mut hook = Then(|| routed(unsafe { &*vm_at }, NOTIFY), 0);
         // SAFETY: `hook` outlives the guard.
         let published = unsafe { Published::new(&end, &mut hook, None) };
         assert_eq!(
@@ -747,7 +769,7 @@ mod tests {
     fn another_runs_context_on_a_kernel_vcpus_thread_is_not_the_kernels() {
         let (end, other_end) = (AtomicI64::new(0), AtomicI64::new(0));
         let other = context(&other_end, false);
-        let mut hook = Then(|| None);
+        let mut hook = Then(|| None, 0);
         // SAFETY: `hook` outlives the guard.
         let _published = unsafe { Published::new(&end, &mut hook, None) };
         assert!(!other.on_kernel());
@@ -763,7 +785,7 @@ mod tests {
     fn a_kernel_context_off_its_vcpus_threads_fails_closed() {
         let (end, other_end) = (AtomicI64::new(0), AtomicI64::new(0));
         let stray = context(&other_end, true);
-        let mut hook = Then(|| None);
+        let mut hook = Then(|| None, 0);
         // SAFETY: `hook` outlives the guard.
         let _published = unsafe { Published::new(&end, &mut hook, None) };
         assert_eq!(routed(&stray, NOTIFY), Some([0, 0]));
@@ -778,13 +800,36 @@ mod tests {
         let end = AtomicI64::new(0);
         let vm = context(&end, true);
         let parks = std::cell::Cell::new(0);
-        let mut hook = Then(|| {
-            parks.set(parks.get() + 1);
-            None
-        });
+        let mut hook = Then(
+            || {
+                parks.set(parks.get() + 1);
+                None
+            },
+            0,
+        );
+        let hook_at = &hook as *const Then<_>;
         // SAFETY: `hook` outlives the guard.
         let published = unsafe { Published::new(&end, &mut hook, Some(in_a_fiber())) };
         assert!(in_fiber(&vm), "the vCPU's own runtime runs a fiber");
+        // A region post's wake (not a park) reaches the hook; a call park does not. Each on a context
+        // of its own over the run's end, which nothing has ended yet.
+        let wake = context(&end, true);
+        // SAFETY: a call's wake on this thread, with no other reference to the hook.
+        assert_eq!(unsafe { park_call(&wake, false, &mut ()) }, Some([5, 5]));
+        assert_eq!(
+            end.load(Ordering::Relaxed),
+            0,
+            "a wake in a fiber is the task's"
+        );
+        // SAFETY: as above.
+        assert_eq!(unsafe { park_call(&vm, true, &mut ()) }, Some([0, 0]));
+        assert_eq!(
+            vm.ended(),
+            Some(temen_ir::trap_code::MALFORMED),
+            "the call park's backstop"
+        );
+        end.store(0, Ordering::Relaxed);
+        let vm = context(&end, true);
         assert_eq!(
             routed(&vm, NOTIFY),
             Some([7, 7]),
@@ -797,16 +842,14 @@ mod tests {
             Some(temen_ir::trap_code::MALFORMED),
             "the wait's backstop"
         );
-        let call = context(&end, true);
-        // SAFETY: a call's park on this thread, with no other reference to the hook.
-        assert_eq!(unsafe { park_call(&call, true, &mut ()) }, Some([0, 0]));
-        assert_eq!(
-            call.ended(),
-            Some(temen_ir::trap_code::MALFORMED),
-            "the call park's backstop"
-        );
         drop(published);
-        assert_eq!(parks.get(), 1, "only the notify reached the hook");
+        // SAFETY: the guard is gone; nothing else holds the hook.
+        let call_parks = unsafe { (*hook_at).1 };
+        assert_eq!(
+            (parks.get(), call_parks),
+            (1, 1),
+            "only the notify and the wake reached it"
+        );
     }
 
     /// #3078 slice 2 (review B2) — whether a park is a fiber's is asked of the run's own runtime: a
@@ -817,7 +860,7 @@ mod tests {
         let vm = context(&end, true);
         let outer = Box::into_raw(in_a_fiber());
         let prev = crate::fiber_rt::set_current(outer);
-        let mut hook = Then(|| None);
+        let mut hook = Then(|| None, 0);
         // SAFETY: `hook` outlives the guard.
         let published = unsafe { Published::new(&end, &mut hook, None) };
         assert!(!in_fiber(&vm));
@@ -837,19 +880,108 @@ mod tests {
         let (end, elsewhere) = (AtomicI64::new(0), AtomicI64::new(0));
         let vm = context(&end, true);
         // The park ends with another run's record on this thread, as a switch onto it would leave.
-        let mut hook = Then(|| {
-            set_record(Fields {
-                end: &elsewhere,
-                hook: None,
-                fibers: std::ptr::null(),
-            });
-            None
-        });
+        let mut hook = Then(
+            || {
+                set_record(Fields {
+                    end: &elsewhere,
+                    hook: None,
+                    lent: true,
+                    fibers: std::ptr::null(),
+                });
+                None
+            },
+            0,
+        );
         // SAFETY: `hook` outlives the guard.
         let published = unsafe { Published::new(&end, &mut hook, None) };
         assert_eq!(routed(&vm, NOTIFY), Some([0, 0]));
         drop(published);
         assert_eq!(vm.ended(), Some(temen_ir::trap_code::MALFORMED));
+    }
+
+    /// #3078 slice 2 (review round 2) — a borrow whose park ended on another vCPU's record of the
+    /// same run, itself mid-borrow (a switch moved it, which never happens on a kernel run), is not
+    /// given back there: that record lent a hook of its own, and the give-back compares the hook, so
+    /// it writes nothing and fails closed rather than cross-wire the two vCPUs' hooks.
+    #[test]
+    #[cfg_attr(debug_assertions, should_panic(expected = "spanned a switch"))]
+    fn a_borrow_that_ends_on_a_sibling_vcpus_borrowed_record_fails_closed() {
+        let end = AtomicI64::new(0);
+        let vm = context(&end, true);
+        let mut sibling = Then(|| None, 0);
+        let sibling_hook: *mut (dyn KernelPark + '_) = &mut sibling;
+        // SAFETY: only the pointer is kept, as a record's; it is never called.
+        let sibling_hook: *mut dyn KernelPark = unsafe { std::mem::transmute(sibling_hook) };
+        // The park ends on a record of the same run whose own hook is lent too.
+        let mut hook = Then(
+            || {
+                set_record(Fields {
+                    end: &end,
+                    hook: NonNull::new(sibling_hook),
+                    lent: true,
+                    fibers: std::ptr::null(),
+                });
+                None
+            },
+            0,
+        );
+        // SAFETY: `hook` outlives the guard.
+        let published = unsafe { Published::new(&end, &mut hook, None) };
+        assert_eq!(routed(&vm, NOTIFY), Some([0, 0]));
+        drop(published);
+        assert_eq!(vm.ended(), Some(temen_ir::trap_code::MALFORMED));
+    }
+
+    /// #3078 slice 2 (review R1) — a module with fibers compiled with fuel checks is never a kernel
+    /// run, whatever admitted it: a vCPU's cell lives on its thread's stack, and a fiber charges its
+    /// creator's cell wherever it runs, after its creator ended too (#3080). Unmetered, it is one.
+    #[test]
+    fn a_metered_module_with_fibers_is_no_kernel_run() {
+        let m = temen_text::parse_module(
+            "memory 16
+func () -> (i64) {
+block 0 () {
+  vz = i64.const 0
+  vf = ref.func 1
+  vk = cont.new vf vz
+  vs, vv = cont.resume vk vz
+  vt = thread.spawn 1 vz vz
+  vts, vtv = thread.join vt
+  return vv
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (va: i64, vb: i64) {
+  return va
+  }
+}
+",
+        )
+        .expect("parse");
+        let compile = |fuel: Option<*mut FuelCell>| {
+            CompiledModule::compile(
+                &m,
+                0,
+                crate::empty_cap_thunk,
+                std::ptr::null_mut(),
+                temen_ir::DEFAULT_RESERVED_LOG2,
+                None,
+                None,
+                fuel,
+                None,
+                None,
+                0,
+            )
+            .expect("compile")
+        };
+        let mut armed = FuelCell::fixed(0);
+        let metered = compile(Some(&mut *armed as *mut FuelCell));
+        assert!(KernelRun::new(metered, Some(armed), &[], None).is_none());
+        let unmetered = compile(None);
+        assert!(matches!(
+            KernelRun::new(unmetered, None, &[], None),
+            Some(Some(_))
+        ));
     }
 
     /// #3078 slice 2 (review B3) — `cont.resume.block` of a target its resume finds event-parked
@@ -874,7 +1006,7 @@ mod tests {
         .expect("a stack");
         let handle = table.create_for_test(fiber).expect("a slot");
         let rt = Box::new(FiberRuntime::new(Arc::clone(&table), 0, 0));
-        let mut hook = Then(|| None);
+        let mut hook = Then(|| None, 0);
         // SAFETY: `hook` outlives the guard.
         let published = unsafe { Published::new(&end, &mut hook, Some(rt)) };
         let mut status = 0i64;

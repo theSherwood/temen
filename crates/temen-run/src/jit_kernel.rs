@@ -190,9 +190,26 @@ impl Route {
     pub const BOTH: [Route; 2] = [Route::Today, Route::Kernel];
 }
 
+/// Test-facing: what a case expects of the kernel route ([`expect_kernel`]).
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug)]
+pub enum Expect {
+    /// It runs there, as at least this many kernel tasks.
+    Kernel { vcpus: u64 },
+    /// This clause declines it.
+    Declined(&'static str),
+}
+
+impl Expect {
+    /// A case the kernel runs (as one task at least), or the clause that declines it.
+    pub fn of(declined: Option<&'static str>) -> Expect {
+        declined.map_or(Expect::Kernel { vcpus: 1 }, Expect::Declined)
+    }
+}
+
 /// Test-facing: run `m`'s `entry(args)` on the kernel route ([`run_fresh`], granted `fuel`, bounded
-/// by [`LANE_BOUND`]) and check the route a case expects of it: `declined` names the clause that must decline it, `None` that it must run
-/// as kernel tasks. `None` back when it was declined, as expected.
+/// by [`LANE_BOUND`]) and check the route a case expects of it ([`Expect`]). `None` back when it was
+/// declined, as expected.
 #[doc(hidden)]
 pub fn expect_kernel(
     m: &Module,
@@ -200,11 +217,18 @@ pub fn expect_kernel(
     args: &[i64],
     kill: Option<&Arc<temen_jit::Interrupt>>,
     fuel: u64,
-    declined: Option<&'static str>,
+    route: Expect,
 ) -> Option<JitOutcome> {
+    let (declined, least) = match route {
+        Expect::Kernel { vcpus } => (None, vcpus),
+        Expect::Declined(clause) => (Some(clause), 0),
+    };
     match (bounded_fresh(m, entry, args, kill, fuel), declined) {
         (Ok((o, vcpus)), None) => {
-            assert!(vcpus >= 1, "the run's vCPUs ran as kernel tasks");
+            assert!(
+                vcpus >= least,
+                "the run's vCPUs ran as kernel tasks: {vcpus}, of at least {least}"
+            );
             Some(o)
         }
         (Err(clause), Some(want)) => {
