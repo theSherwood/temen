@@ -687,6 +687,115 @@ enum Op {
     },
 }
 
+/// #3088 — the ops [`Vm::run_hot`] runs. The rule is about what an op's common path calls: an op is
+/// here if that path calls nothing outside the engine's own register, memory, frame and fuel
+/// helpers (it computes, branches, calls and returns between guest functions, or reads or writes a
+/// field of the vCPU: its TLS word, its durable region's base). `call.cap` is here too, as the one
+/// op that leaves the engine often enough to sit between them: its arm is a single call to the
+/// out-of-line [`Vm::cap_call`], so how a host call is written cannot reach the loop.
+///
+/// A hot arm still has rare exits, each of which ends the step: a call that tiers up
+/// (`Outcome::TierUp`), the entry's return (`Outcome::Done`), a page fault in a demand-paged child,
+/// a trap, and a host call that parks. And `Ret` from an async signal handler tells the signal
+/// source the handler returned (`handler_returned`), off its common path.
+///
+/// Every other op ([`cold_ops`]) is [`Vm::run_ops`]'s: its common path calls the host, a driver or the
+/// scheduler, or hands the step to the driver with an [`Outcome`]. A new op whose common path calls
+/// out goes there or, if it sits between hot ops often enough to matter, here as one call to an
+/// `#[inline(never)]` method, with `scripts/ci/ir-guard.sh` as the arbiter.
+///
+/// The two lists partition [`Op`], and the compiler holds them to it: [`runs_hot`] matches both with
+/// no wildcard, and each loop matches its own ops' arms plus the other's list with none.
+macro_rules! hot_ops {
+    () => {
+        Op::Const { .. }
+            | Op::DurableShadowBase { .. }
+            | Op::VcpuTlsGet { .. }
+            | Op::VcpuTlsSet { .. }
+            | Op::CapCall(..)
+            | Op::IntBin { .. }
+            | Op::IntCmp { .. }
+            | Op::IntBinImm { .. }
+            | Op::IntCmpImm { .. }
+            | Op::IntUn { .. }
+            | Op::Eqz { .. }
+            | Op::Convert { .. }
+            | Op::Select { .. }
+            | Op::FBin { .. }
+            | Op::FUn { .. }
+            | Op::FCmp { .. }
+            | Op::FToISat { .. }
+            | Op::FToITrap { .. }
+            | Op::IToFConv { .. }
+            | Op::Cast { .. }
+            | Op::RefFunc { .. }
+            | Op::Load { .. }
+            | Op::Store { .. }
+            | Op::MemCopy { .. }
+            | Op::MemMove { .. }
+            | Op::MemFill { .. }
+            | Op::AtomicLoad { .. }
+            | Op::AtomicStore { .. }
+            | Op::AtomicRmw { .. }
+            | Op::AtomicCmpxchg { .. }
+            | Op::Br { .. }
+            | Op::BrIf { .. }
+            | Op::BrIfCmp { .. }
+            | Op::BrIfCmpImm { .. }
+            | Op::BrTable { .. }
+            | Op::Call { .. }
+            | Op::CallIndirect { .. }
+            | Op::Ret { .. }
+            | Op::TailCall { .. }
+            | Op::TailCallIndirect { .. }
+    };
+}
+/// #3088 — the ops [`Vm::run_ops`] runs; [`hot_ops`] gives the rule. Five of them fit neither of its
+/// cold cases (calling out, or handing the step to the driver), and are cold for a reason each:
+/// - `SetJmp`, `LongJmp`: large (they save or restore a register window through the setjmp table)
+///   and rare.
+/// - `Eval`: runs the op through the oracle's own evaluator (`eval_inst`), outside this engine.
+/// - `Unreachable`, `CapFault`: traps, paid at most once per run.
+macro_rules! cold_ops {
+    () => {
+        Op::SvcPoll { .. }
+            | Op::CloneCaller { .. }
+            | Op::Reap { .. }
+            | Op::ExecModule { .. }
+            | Op::ChildCtl { .. }
+            | Op::ChildOffer { .. }
+            | Op::CapSelfExt { .. }
+            | Op::ContNew { .. }
+            | Op::ContResume { .. }
+            | Op::Suspend { .. }
+            | Op::SetJmp { .. }
+            | Op::LongJmp { .. }
+            | Op::ThreadSpawn { .. }
+            | Op::ThreadJoin { .. }
+            | Op::InstantiateRec { .. }
+            | Op::InstJoin { .. }
+            | Op::MemoryWait { .. }
+            | Op::MemoryNotify { .. }
+            | Op::JitInstall { .. }
+            | Op::JitUninstall { .. }
+            | Op::JitInvoke(..)
+            | Op::GcRoots { .. }
+            | Op::Unreachable
+            | Op::CapFault
+            | Op::Eval { .. }
+    };
+}
+
+/// Whether `op` is one of [`hot_ops`]. Its `match` is the proof that the two lists partition [`Op`]: a
+/// variant in neither fails to compile, and one in both is an unreachable pattern.
+#[deny(unreachable_patterns)]
+fn runs_hot(op: &Op) -> bool {
+    match op {
+        hot_ops!() => true,
+        cold_ops!() => false,
+    }
+}
+
 // #2486 — the payloads of the ops a run seldom executes, boxed so that every op fits in half a
 // cache line (the assertion below); each is one call, which costs far more than the indirection.
 
@@ -9603,14 +9712,15 @@ struct DispatchParks {
     sig_interrupt: bool,
     /// #1936 — a post's `signal` left this region word to wake.
     region: Option<super::RegionWake>,
-    /// A peer's pipe write or close raised a wake flag. It needs no action at a dispatch site (see
-    /// [`Self::take`]), but it is per-op too, so it is drained, and counted in [`Self::quiet`].
+    /// This dispatch's own pipe write or close raised a wake flag (for the peers parked on that
+    /// pipe). It needs no action at a dispatch site (see [`Self::take`]), but it is per-op too, so
+    /// it is drained, and counted in [`Self::quiet`].
     woke: bool,
 }
 
 impl DispatchParks {
-    /// Whether the op left no flag at all ([`call_park`]'s check of [`Host::parks_left`]). An
-    /// exhaustive destructure, so a new flag fails to compile until it is decided here.
+    /// Whether the op left no flag at all ([`Self::left`]'s debug check of [`Host::parks_left`]).
+    /// An exhaustive destructure, so a new flag fails to compile until it is decided here.
     fn quiet(&self) -> bool {
         let DispatchParks {
             stdin,
@@ -9634,9 +9744,9 @@ impl DispatchParks {
 
     /// The flags the last dispatch left, drained into `into`, which is left as it was (`None`)
     /// when the dispatch left none, as most calls do: such a call writes nothing, where returning
-    /// the `Option` would move one the size of `Self`. Call ONLY inside the dispatch's own lock scope: the read is under the hold the call that
-    /// could leave a flag ran in, so no other vCPU's dispatch can leave or clear one between the
-    /// call and the read (#1173).
+    /// the `Option` would move one the size of `Self`. Call ONLY inside the dispatch's own lock
+    /// scope: the read is under the hold the call that could leave a flag ran in, so no other
+    /// vCPU's dispatch can leave or clear one between the call and the read (#1173).
     ///
     /// `!parks_left()` is exactly "[`Self::take`] would find nothing". `take` drains, and
     /// [`Host::parks_left`] covers:
@@ -9674,7 +9784,7 @@ impl DispatchParks {
             pipe_write: (p.take_pipe_write_parked()).and_then(|i| p.pipe_probe(i, true)),
             sig_interrupt: p.take_sig_interrupt(),
             region: p.take_region_wake(),
-            // The wake flags a peer's write/close raised need no action at a dispatch site (the
+            // The wake flags this dispatch's own write/close raised need no action here (the
             // pump looks at pipe readiness at each round's settle, and the store itself fired the
             // wakers executor 2's parked tasks registered on the pipe, #2757,
             // [`super::PipeProbe::listen`]), but they are per-op too, so they drain here as well.
@@ -22296,6 +22406,78 @@ type SignalPoll = Option<(
     std::sync::Arc<dyn super::SignalSource + Send + Sync>,
 )>;
 
+/// #3088 — [`Vm::run_ops`]'s place, handed to [`Vm::run_hot`] and back.
+struct Cursor {
+    module: usize,
+    cur: usize,
+    base: usize,
+    pc: usize,
+    budget: u64,
+}
+
+/// The compiled unit for module index `m`, through the run's lock-free local cache of `source`
+/// (THREADS.md 4c-domain), refreshed only on a miss: a unit installed since the last sync. A forged
+/// or stale index is `Malformed` (defensive).
+#[inline(always)]
+fn resolve_module(
+    local: &mut Vec<std::sync::Arc<Compiled>>,
+    source: &ModuleSource,
+    m: usize,
+) -> Result<std::sync::Arc<Compiled>, Trap> {
+    if m >= local.len() {
+        *local = source.snapshot();
+    }
+    local.get(m).cloned().ok_or(Trap::Malformed)
+}
+
+/// #3088 — where [`Vm::run_hot`] hands the step back to [`Vm::run_ops`].
+enum Hand {
+    /// At one of `run_ops`'s ops, charged and checked: `run_ops` runs it as it is.
+    Checked,
+    /// At an op not yet charged: one of the per-op checks has something to do, and `run_ops` makes
+    /// them.
+    Unchecked,
+    /// The step ended.
+    Done(Outcome),
+}
+
+/// The two flags the per-op checks read: the domain's `term_flag` and the signal personality's
+/// `armed`. A run has both or neither (`None` without a signal personality).
+type Watch<'a> = Option<(
+    &'a std::sync::atomic::AtomicBool,
+    &'a std::sync::atomic::AtomicBool,
+)>;
+
+/// #3088 — whether one of the per-op checks has something to do before the next op: the budget is
+/// spent (suspend), the domain was killed (`term_flag`), or a caught signal is pending (`armed`) and
+/// the vCPU is under `MAX_SIG_HANDLER_NEST` handlers deep (`nest`, read only then). The one
+/// definition both loops use: [`Vm::run_hot`] hands back on it, and [`Vm::run_ops`] runs its check
+/// block only when it holds. A new per-op check goes here and in that block; one added to the block
+/// alone never fires on its own (only when another check is already due, as under `budget = 1`).
+macro_rules! checks_due {
+    ($budget:expr, $watch:expr, $nest:expr) => {
+        $budget == 0
+            || match $watch {
+                Some((term, armed)) => {
+                    term.load(std::sync::atomic::Ordering::Relaxed)
+                        || (armed.load(std::sync::atomic::Ordering::Relaxed)
+                            && $nest.len() < super::MAX_SIG_HANDLER_NEST)
+                }
+                None => false,
+            }
+    };
+}
+
+/// #3088 — what [`Vm::run_hot`] reads of [`Vm::run_ops`]'s step and never changes.
+#[derive(Clone, Copy)]
+struct HotCtx<'a> {
+    source: &'a ModuleSource,
+    table: &'a SharedSlots,
+    signal_poll: &'a SignalPoll,
+    /// The flags [`checks_due`] reads.
+    watch: Watch<'a>,
+}
+
 // `Clone` for time-travel checkpointing (DEBUGGING.md W1): a `ScheduledDebugRun` snapshots each task's
 // active `Vm` into the `seek` checkpoint ladder. Every field is a plain value or read-only `Arc`
 // (`jit_eligible` — the tier-up bitmap, shared not mutated), so this is a faithful deep copy; the
@@ -22870,10 +23052,10 @@ impl Vm {
         }
     }
 
-    /// §2.2 / #2164 — the fault arm of [`paged!`](Self::run_ops) in a demand-paged child: a
-    /// recoverable fault becomes [`Outcome::PageFault`] with the cursor left at the op, `at`; any
-    /// other trap stands. Out of line and cold, so the memory ops keep only their branch on the
-    /// error in the op loop.
+    /// §2.2 / #2164 — the fault arm of `paged!` (in [`Self::run_hot`] and [`Self::run_ops`]) in a
+    /// demand-paged child: a recoverable fault becomes [`Outcome::PageFault`] with the cursor left
+    /// at the op, `at`; any other trap stands. Out of line and cold, so the memory ops keep only
+    /// their branch on the error in the op loop.
     #[cold]
     #[inline(never)]
     fn page_fault_or_trap(
@@ -22956,11 +23138,11 @@ impl Vm {
         }
     }
 
-    /// The `call.cap` / `call.import` op ([`Op::CapCall`]) at `(module, cur, base, pc)`, moved out of
-    /// [`Self::run_ops`]'s `match` unchanged. The loop's register allocation sets every op's cost, and
-    /// this arm inline moved it (#3088): with it inline, an `alu` loop with no call ran 14% slower
-    /// than main (wall-clock); out of line it runs at main's speed. `Ok(Ok(pc))` goes on at `pc`;
-    /// `Ok(Err(outcome))` stops the step with `outcome`, the VM's place saved.
+    /// The `call.cap` / `call.import` op ([`Op::CapCall`]) at `(module, cur, base, pc)`, out of line so
+    /// that [`Self::run_hot`]'s arm for it is one call: the loop's register allocation sets every op's
+    /// cost, and this arm inline moved it (#3088: an `alu` loop with no call ran 14% slower). Edit it
+    /// freely; `scripts/ci/ir-guard.sh` shows what the loop pays for its call. `Ok(Ok(pc))` goes on at
+    /// `pc`; `Ok(Err(outcome))` stops the step with `outcome`, the VM's place saved.
     #[inline(never)]
     fn cap_call(
         &mut self,
@@ -23291,76 +23473,70 @@ impl Vm {
         Ok(Ok(pc))
     }
 
-    /// [`Vm::resume`]'s op loop. The cursor (`cur`/`base`/`pc`) lives in locals for the duration of
-    /// the loop so the optimizer keeps it in registers; it is written back to `self` only when the
-    /// loop exits (suspend), which is also what a future blocking-op / debug-stop seam will do
-    /// before yielding. `PAGED`: a recoverable memory fault fetches a page ([`Vm::resume`] says why
-    /// it is a parameter).
-    fn run_ops<const PAGED: bool>(
+    /// #2474 — a safepoint burns a fuel and counts as the work [`Vm::work`] measures calls by.
+    #[inline(always)]
+    fn safepoint(&mut self, fuel: &mut Fuel) -> Result<(), Trap> {
+        step(fuel, None)?;
+        self.work += 1;
+        Ok(())
+    }
+
+    /// #3088 — the op loop for the hot ops ([`hot_ops`] says which and why), in a function of its
+    /// own. LLVM allocates registers over a whole function, so in one shared loop every op's cost
+    /// depended on how every other arm was written: an arm the loop never reached moved an `alu` loop
+    /// by 12%. Here only the hot ops' arms share the function, so their code depends only on them,
+    /// and `scripts/ci/ir-guard.sh` holds what they cost.
+    ///
+    /// [`Vm::run_ops`] enters it at one of its ops, charged and checked. It runs ops, making
+    /// `run_ops`'s per-op checks before each, until it reaches one of `run_ops`'s ops ([`Hand::Checked`])
+    /// or a check has something to do ([`Hand::Unchecked`]), and leaves the cursor in `at`.
+    #[inline(never)]
+    #[deny(unreachable_patterns)]
+    #[allow(clippy::too_many_arguments)]
+    fn run_hot<const PAGED: bool>(
         &mut self,
-        source: &ModuleSource,
-        table: &SharedSlots,
+        at: &mut Cursor,
+        c: &mut std::sync::Arc<Compiled>,
+        local: &mut Vec<std::sync::Arc<Compiled>>,
+        cx: &HotCtx<'_>,
         fuel: &mut Fuel,
         mem: &mut Option<Mem>,
         host: &mut HostCell,
-        mut budget: u64,
-    ) -> Result<Outcome, Trap> {
-        let mut module = self.module;
-        let mut cur = self.cur;
-        let mut base = self.base;
-        let mut pc = self.pc;
-        // THREADS.md 4c-domain: the shared module source is read through a per-vCPU **lock-free local
-        // cache** (`Arc` clones), refreshed only on a miss (a unit installed since the last sync). The
-        // active module is held as an owned `Arc<Compiled>` (`c`) — independent of `local`, so a refresh
-        // can't invalidate it — re-resolved only when an activation crosses modules (so the per-op hot
-        // path, `c.*` via `Arc` deref, is unchanged). `resolve!` returns the `Arc` for a module index.
-        // #2742 — a resume resolves only the module it enters; the cache is filled on the first
-        // activation that crosses modules, so an entry costs no clone of every unit.
-        let mut local: Vec<std::sync::Arc<Compiled>> = Vec::new();
-        macro_rules! resolve {
-            ($m:expr) => {{
-                let m = $m as usize;
-                if m >= local.len() {
-                    local = source.snapshot(); // miss: a module installed since last sync
-                }
-                match local.get(m) {
-                    Some(a) => std::sync::Arc::clone(a),
-                    None => return Err(Trap::Malformed), // forged/stale module index (defensive)
-                }
-            }};
+    ) -> Result<Hand, Trap> {
+        let HotCtx {
+            source,
+            table,
+            signal_poll,
+            watch,
+        } = *cx;
+        let Cursor {
+            mut module,
+            mut cur,
+            mut base,
+            mut pc,
+            mut budget,
+        } = *at;
+        let prog = c.prog(cur);
+        let (mut ops, mut edges): (&[Op], &Copies) = (&prog.ops, &prog.copies);
+        debug_assert!(
+            runs_hot(&ops[pc]),
+            "run_ops enters run_hot at one of its ops"
+        );
+        macro_rules! r {
+            ($i:expr) => {
+                self.regs[base + $i as usize]
+            };
         }
-        let mut c: std::sync::Arc<Compiled> = source.get(module).ok_or(Trap::Malformed)?;
-        // The current function's ops, which every op reads (`ops[pc]`). Set again wherever the
-        // current function changes (`enter!`), so the per-op read is one index and checks nothing.
-        let mut ops: &[Op] = &c.prog(cur).ops;
-        // Its edges' copies, which a taken branch reads (#2486); set with `ops`.
-        let mut edges: &Copies = &c.prog(cur).copies;
+        macro_rules! resolve {
+            ($m:expr) => {
+                resolve_module(local, source, $m as usize)?
+            };
+        }
         macro_rules! enter {
             () => {{
                 let prog = c.prog(cur);
                 (ops, edges) = (&prog.ops, &prog.copies);
             }};
-        }
-
-        // #1146 async signal delivery (the bytecode twin of the tree-walker's #796 L2 safepoint
-        // redirect). Fetch the personality's `(armed, source)` poll pair once per resume — two cheap
-        // `Arc` clones per quantum, not per op. `None` on any run without a signal personality (JIT
-        // bench, pure compute), so the per-op check in the loop is a single predictable branch there.
-        let signal_poll = host.with(|h| h.signal_poll());
-        // #1246 — the per-op default-action TERMINATE poll (the bytecode twin of the tree-walker's
-        // `term_flag` safepoint). Fetched once per resume, and only when a signal personality is present
-        // (`None` on a pure-compute / JIT-bench run, so the per-op check is skipped entirely). A killed
-        // task observes the kill mid-step and dies at its next op ([`wire_kill`]): on executor 2 it may
-        // be running on its own thread when another kills it; a task that is not running is finalized
-        // by the settle's kill sweep (#1215).
-        let term_flag = signal_poll
-            .as_ref()
-            .map(|_| host.with(|h| h.term_flag.clone()));
-
-        macro_rules! r {
-            ($i:expr) => {
-                self.regs[base + $i as usize]
-            };
         }
         // §2.2 / #2164 — a memory op's result. In a demand-paged child (`PAGED`), a recoverable
         // fault is a page to fetch, not a trap: the cursor is left AT the op, which re-executes once
@@ -23370,7 +23546,9 @@ impl Vm {
                 match $access {
                     Ok(v) => v,
                     Err(t) if PAGED => {
-                        return self.page_fault_or_trap(t, mem, (module, cur, base, pc))
+                        return self
+                            .page_fault_or_trap(t, mem, (module, cur, base, pc))
+                            .map(Hand::Done)
                     }
                     Err(t) => return Err(t),
                 }
@@ -23400,12 +23578,10 @@ impl Vm {
                 }
             }};
         }
-        // #2474 — a safepoint burns a fuel and counts as the work [`Vm::work`] measures calls by.
         macro_rules! safepoint {
-            () => {{
-                step(fuel, None)?;
-                self.work += 1;
-            }};
+            () => {
+                self.safepoint(fuel)?
+            };
         }
         // Fuel unification: fuel is metered at **IR safepoints** — a taken back-edge and each function
         // entry — not per op. A back-edge is a *backward* jump in the flat op array: blocks are laid
@@ -23441,101 +23617,19 @@ impl Vm {
                         self.cur = cur;
                         self.base = base;
                         self.pc = pc + 1;
-                        return Ok(Outcome::TierUp {
+                        return Ok(Hand::Done(Outcome::TierUp {
                             module: $m as u32,
                             func: $f as u32,
                             argv,
                             dst: TierUpDst::Frame(*$dst as usize),
                             results,
                             mapped,
-                        });
+                        }));
                     }
                 }
             };
         }
-
         loop {
-            if budget == 0 {
-                // Pause at this op boundary: persist the cursor so a later `resume` continues here.
-                self.module = module;
-                self.cur = cur;
-                self.base = base;
-                self.pc = pc;
-                return Ok(Outcome::Suspended);
-            }
-            budget -= 1;
-            // #1246 default-action terminate: a `SIG_DFL` SIGKILL/SIGTERM/SIGINT delivered to this
-            // domain set its `term_flag` (the personality's inline kill apply, [`wire_kill`]). Die at
-            // this op — the step returns the trap, and the exit hook reports term-by-signal from the
-            // personality's `term_sig` bookkeeping (WIFSIGNALED), exactly like the tree-walker.
-            // Checked before the async-signal redirect (death beats a caught delivery).
-            if let Some(tf) = &term_flag {
-                if tf.load(std::sync::atomic::Ordering::Relaxed) {
-                    return Err(Trap::ThreadFault);
-                }
-            }
-            // #1146 async signal delivery: at this per-op safepoint, if the personality has a caught,
-            // unmasked signal pending (its cheap `armed` flag) and we are not already
-            // `MAX_SIG_HANDLER_NEST` deep, redirect this vCPU into the guest handler
-            // `(i64 sp, i32 signum) -> ()` — a window opened exactly like a `call.dyn`, resolved and
-            // type-checked through the dispatch table. The interrupted op is NOT advanced (the return
-            // entry resumes at `pc`, re-running it once the handler returns), matching the tree-walker.
-            // Same interrupt-at-safepoint shape as `kill`, but non-lethal. (Interruptible-park `-EINTR`
-            // is a follow-up: no interruptible parks reach this synchronous safepoint path yet.)
-            if self.sig_handler_stack.len() < super::MAX_SIG_HANDLER_NEST {
-                if let Some((armed, source)) = &signal_poll {
-                    if armed.load(std::sync::atomic::Ordering::Relaxed) {
-                        // The source owns its own locking (an `Arc<Mutex<Proc>>`); we hold no host lock
-                        // here. A `None` means nothing deliverable (ignored/masked/stopped) — it also
-                        // disarms, so the check idles until the next `raise`/`kill`.
-                        if let Some((fref, signum, sp)) = source.take_deliverable() {
-                            let slot = (fref as u32 as usize) & (table.len() - 1);
-                            let ts = table.slot(slot);
-                            if ts.module != super::TABLE_EMPTY {
-                                let (tmod, tfunc) = (ts.module as usize, ts.func as usize);
-                                let tm = resolve!(tmod);
-                                let (cp, cr) = &tm.sigs[tfunc];
-                                // `void handler(int)` = `(i64 sp, i32 signum) -> ()` — chibicc threads
-                                // the data-SP as v0. A mis-typed handler is dropped (the signal was
-                                // already consumed by `take_deliverable`), never fatal.
-                                if matches!(cp.as_slice(), [ValType::I64, ValType::I32])
-                                    && cr.is_empty()
-                                {
-                                    // Open a fresh window past the current activation (like `Op::Call`),
-                                    // seeded with `(sp, signum)`. `nb`/`need` use the *current* `c`
-                                    // before any cross-module reassignment below.
-                                    let nb = base + c.prog(cur).nslots as usize;
-                                    let need = nb + tm.prog(tfunc).nslots as usize;
-                                    self.open_frame(need)?;
-                                    self.regs[nb] = Reg::from_i64(sp as i64);
-                                    self.regs[nb + 1] = Reg::from_i32(signum);
-                                    // Return linkage resumes at the SAME `pc` so the interrupted op
-                                    // re-runs; the void handler writes no results (`ret_abs` unused —
-                                    // `base` is a harmless placeholder).
-                                    self.stack.push((module, cur, base, pc, base, self.entered));
-                                    self.entered = self.work;
-                                    if tmod != module {
-                                        module = tmod;
-                                        c = tm;
-                                    }
-                                    cur = tfunc;
-                                    enter!();
-                                    base = nb;
-                                    pc = 0;
-                                    self.sig_handler_stack.push(self.stack.len());
-                                    continue;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            #[cfg(feature = "callprof")]
-            if module == 0 {
-                if let Some(loc) = c.prog(cur).src.get(pc).copied().flatten() {
-                    callprof::op(cur, loc);
-                }
-            }
             debug_assert!(
                 std::ptr::eq(ops, &c.prog(cur).ops[..]),
                 "the ops a run reads are its current function's"
@@ -23842,6 +23936,483 @@ impl Vm {
                     edge!(*copies);
                     pc = *target as usize;
                 }
+                Op::Call { callee, args, dst } => {
+                    safepoint!(); // fuel unification: function-entry safepoint
+                    let callee = *callee as usize;
+                    #[cfg(feature = "callprof")]
+                    if module == 0 {
+                        callprof::hit(callee);
+                    }
+                    tier_up!(module, callee, c.result_types[callee], args, dst);
+                    // A direct call stays in the current module.
+                    let nb = base + c.prog(cur).nslots as usize;
+                    let need = nb + c.prog(callee).nslots as usize;
+                    self.open_frame(need)?;
+                    for (i, a) in args.iter().enumerate() {
+                        self.regs[nb + i] = self.regs[base + *a as usize];
+                    }
+                    self.stack.push((
+                        module,
+                        cur,
+                        base,
+                        pc + 1,
+                        base + *dst as usize,
+                        self.entered,
+                    ));
+                    self.entered = self.work;
+                    cur = callee;
+                    enter!();
+                    base = nb;
+                    pc = 0;
+                }
+                Op::CallIndirect { call, dst } => {
+                    let IndirectCall {
+                        idx,
+                        args,
+                        want_params,
+                        want_results,
+                    } = &**call;
+                    safepoint!(); // fuel unification: function-entry safepoint
+
+                    // Resolve through the **runtime dispatch table** (slot ⇒ (module, func)); an empty
+                    // padding slot or a signature mismatch is an inert IndirectCallType trap. The
+                    // target may be an installed §22 unit (a different module) — a cross-module call.
+                    let slot = (r!(*idx).i32() as u32 as usize) & (table.len() - 1);
+                    let ts = table.slot(slot);
+                    if ts.module == super::TABLE_EMPTY {
+                        return Err(Trap::IndirectCallType);
+                    }
+                    let (tmod, tfunc) = (ts.module as usize, ts.func as usize);
+                    let tm = resolve!(tmod);
+                    let (cp, cr) = &tm.sigs[tfunc];
+                    if cp.as_slice() != &want_params[..] || cr.as_slice() != &want_results[..] {
+                        return Err(Trap::IndirectCallType);
+                    }
+                    // #2474 — a call through the table tiers up as a direct one does.
+                    tier_up!(tmod, tfunc, tm.result_types[tfunc], args, dst);
+                    let nb = base + c.prog(cur).nslots as usize;
+                    let need = nb + tm.prog(tfunc).nslots as usize;
+                    self.open_frame(need)?;
+                    for (i, a) in args.iter().enumerate() {
+                        self.regs[nb + i] = self.regs[base + *a as usize];
+                    }
+                    self.stack.push((
+                        module,
+                        cur,
+                        base,
+                        pc + 1,
+                        base + *dst as usize,
+                        self.entered,
+                    ));
+                    self.entered = self.work;
+                    if tmod != module {
+                        module = tmod;
+                        *c = tm;
+                    }
+                    cur = tfunc;
+                    enter!();
+                    base = nb;
+                    pc = 0;
+                }
+                Op::Ret { srcs, leave } => {
+                    // #1146 — if this returns from an injected async signal handler (its guard entry
+                    // records the stack depth at injection, which equals the current depth when the
+                    // handler's own `Ret` fires), restore the personality's block-during-handler mask
+                    // before unwinding, exactly as the tree-walker does on the handler's `Return`. A
+                    // held fatal signal exposed by the unmask fires its default action inside
+                    // `handler_returned` (a no-op here unless the driver wired `set_kill`).
+                    if self.sig_handler_stack.last() == Some(&self.stack.len()) {
+                        self.sig_handler_stack.pop();
+                        if let Some((_, source)) = &signal_poll {
+                            source.handler_returned();
+                        }
+                    }
+                    if *leave {
+                        self.leave_setjmps(self.stack.len());
+                    }
+                    match self.stack.pop() {
+                        None => {
+                            // The entry's results go to the first slots of its window, gathered
+                            // first as they may overlap them, with the cursor that types them.
+                            self.scratch.clear();
+                            for s in srcs.iter() {
+                                self.scratch.push(self.regs[base + *s as usize]);
+                            }
+                            // A value returned twice can make more results than slots.
+                            self.grow_regs(base + srcs.len())?;
+                            self.regs[base..base + srcs.len()].copy_from_slice(&self.scratch);
+                            (self.module, self.cur, self.base) = (module, cur, base);
+                            return Ok(Hand::Done(Outcome::Done));
+                        }
+                        Some((cmod, cprog, cbase, cpc, ret_abs, centered)) => {
+                            self.count_call(module, cur);
+                            self.entered = centered;
+                            for (i, s) in srcs.iter().enumerate() {
+                                self.regs[ret_abs + i] = self.regs[base + *s as usize];
+                            }
+                            if cmod != module {
+                                module = cmod;
+                                *c = resolve!(cmod);
+                            }
+                            cur = cprog;
+                            enter!();
+                            base = cbase;
+                            pc = cpc;
+                        }
+                    }
+                }
+                // Tail calls reuse the *current* window (`base` unchanged) instead of pushing a
+                // return entry, so the callee returns to this activation's caller. Args may alias the
+                // destination prefix, so gather into `scratch` then scatter (like edge copies).
+                Op::TailCall {
+                    callee,
+                    args,
+                    leave,
+                } => {
+                    safepoint!(); // fuel unification: function-entry safepoint
+                    let callee = *callee as usize;
+                    #[cfg(feature = "callprof")]
+                    if module == 0 {
+                        callprof::hit(callee);
+                    }
+                    self.count_call(module, cur);
+                    self.entered = self.work;
+                    if *leave {
+                        self.leave_setjmps(self.stack.len());
+                    }
+                    self.grow_regs(base + c.prog(callee).nslots as usize)?;
+                    self.scratch.clear();
+                    for a in args.iter() {
+                        self.scratch.push(self.regs[base + *a as usize]);
+                    }
+                    for (i, &v) in self.scratch.iter().enumerate() {
+                        self.regs[base + i] = v;
+                    }
+                    cur = callee;
+                    enter!();
+                    pc = 0;
+                }
+                Op::TailCallIndirect { call, leave } => {
+                    let IndirectCall {
+                        idx,
+                        args,
+                        want_params,
+                        want_results,
+                    } = &**call;
+                    safepoint!(); // fuel unification: function-entry safepoint
+                    let slot = (r!(*idx).i32() as u32 as usize) & (table.len() - 1);
+                    let ts = table.slot(slot);
+                    if ts.module == super::TABLE_EMPTY {
+                        return Err(Trap::IndirectCallType);
+                    }
+                    let (tmod, tfunc) = (ts.module as usize, ts.func as usize);
+                    let tm = resolve!(tmod);
+                    let (cp, cr) = &tm.sigs[tfunc];
+                    if cp.as_slice() != &want_params[..] || cr.as_slice() != &want_results[..] {
+                        return Err(Trap::IndirectCallType);
+                    }
+                    self.count_call(module, cur);
+                    self.entered = self.work;
+                    if *leave {
+                        self.leave_setjmps(self.stack.len());
+                    }
+                    self.grow_regs(base + tm.prog(tfunc).nslots as usize)?;
+                    self.scratch.clear();
+                    for a in args.iter() {
+                        self.scratch.push(self.regs[base + *a as usize]);
+                    }
+                    for (i, &v) in self.scratch.iter().enumerate() {
+                        self.regs[base + i] = v;
+                    }
+                    if tmod != module {
+                        module = tmod;
+                        *c = tm;
+                    }
+                    cur = tfunc;
+                    enter!();
+                    pc = 0;
+                }
+                Op::CapCall(call) => {
+                    match self.cap_call(call, (module, cur, base, pc), mem, host, signal_poll)? {
+                        Ok(next) => pc = next,
+                        Err(out) => return Ok(Hand::Done(out)),
+                    }
+                }
+                Op::DurableShadowBase { dst } => {
+                    // §12.8 4A.5: this context's shadow-SP word address (its own region base).
+                    self.regs[base + *dst as usize] =
+                        Reg::from_i64(self.durable_region_base as i64);
+                    pc += 1;
+                }
+                Op::VcpuTlsGet { dst } => {
+                    // §12 per-vCPU TLS read: this vCPU's word (seeded to its dense id, guest-overwritable).
+                    self.regs[base + *dst as usize] = Reg::from_i64(self.tls);
+                    pc += 1;
+                }
+                Op::VcpuTlsSet { val } => {
+                    self.tls = r!(*val).i64();
+                    pc += 1;
+                }
+                cold_ops!() => {
+                    // `run_ops`'s, charged and checked: it runs it as it is.
+                    *at = Cursor {
+                        module,
+                        cur,
+                        base,
+                        pc,
+                        budget,
+                    };
+                    return Ok(Hand::Checked);
+                }
+            }
+            // The next op's checks: any with something to do, `run_ops` does.
+            if checks_due!(budget, watch, self.sig_handler_stack) {
+                break;
+            }
+            budget -= 1;
+            #[cfg(feature = "callprof")]
+            if module == 0 {
+                if let Some(loc) = c.prog(cur).src.get(pc).copied().flatten() {
+                    callprof::op(cur, loc);
+                }
+            }
+        }
+        *at = Cursor {
+            module,
+            cur,
+            base,
+            pc,
+            budget,
+        };
+        Ok(Hand::Unchecked)
+    }
+
+    /// [`Vm::resume`]'s op loop. The cursor (`cur`/`base`/`pc`) lives in locals for the duration of
+    /// the loop so the optimizer keeps it in registers; it is written back to `self` only when the
+    /// loop exits (suspend), which is also what a future blocking-op / debug-stop seam will do
+    /// before yielding. `PAGED`: a recoverable memory fault fetches a page ([`Vm::resume`] says why
+    /// it is a parameter).
+    ///
+    /// #3088 — it runs the ops that leave the engine ([`cold_ops`]) and makes the per-op checks; the
+    /// rest run in [`Vm::run_hot`], which it enters at the first of them. An op's arm lives in the
+    /// loop its list names, and nowhere else.
+    #[deny(unreachable_patterns)]
+    fn run_ops<const PAGED: bool>(
+        &mut self,
+        source: &ModuleSource,
+        table: &SharedSlots,
+        fuel: &mut Fuel,
+        mem: &mut Option<Mem>,
+        host: &mut HostCell,
+        mut budget: u64,
+    ) -> Result<Outcome, Trap> {
+        let mut module = self.module;
+        let mut cur = self.cur;
+        let mut base = self.base;
+        let mut pc = self.pc;
+        // THREADS.md 4c-domain: the shared module source is read through a per-vCPU **lock-free local
+        // cache** (`Arc` clones), refreshed only on a miss (a unit installed since the last sync). The
+        // active module is held as an owned `Arc<Compiled>` (`c`) — independent of `local`, so a refresh
+        // can't invalidate it — re-resolved only when an activation crosses modules (so the per-op hot
+        // path, `c.*` via `Arc` deref, is unchanged). `resolve!` returns the `Arc` for a module index.
+        // #2742 — a resume resolves only the module it enters; the cache is filled on the first
+        // activation that crosses modules, so an entry costs no clone of every unit.
+        let mut local: Vec<std::sync::Arc<Compiled>> = Vec::new();
+        macro_rules! resolve {
+            ($m:expr) => {
+                resolve_module(&mut local, source, $m as usize)?
+            };
+        }
+        let mut c: std::sync::Arc<Compiled> = source.get(module).ok_or(Trap::Malformed)?;
+        // The current function's ops, which every op reads (`ops[pc]`). Set again wherever the
+        // current function changes (`enter!`), so the per-op read is one index and checks nothing.
+        let mut ops: &[Op] = &c.prog(cur).ops;
+        macro_rules! enter {
+            () => {
+                ops = &c.prog(cur).ops
+            };
+        }
+
+        // #1146 async signal delivery (the bytecode twin of the tree-walker's #796 L2 safepoint
+        // redirect). Fetch the personality's `(armed, source)` poll pair once per resume — two cheap
+        // `Arc` clones per quantum, not per op. `None` on any run without a signal personality (JIT
+        // bench, pure compute), so the per-op check in the loop is a single predictable branch there.
+        let signal_poll = host.with(|h| h.signal_poll());
+        // #1246 — the per-op default-action TERMINATE poll (the bytecode twin of the tree-walker's
+        // `term_flag` safepoint). Fetched once per resume, and only when a signal personality is present
+        // (`None` on a pure-compute / JIT-bench run, so the per-op check is skipped entirely). A killed
+        // task observes the kill mid-step and dies at its next op ([`wire_kill`]): on executor 2 it may
+        // be running on its own thread when another kills it; a task that is not running is finalized
+        // by the settle's kill sweep (#1215).
+        let term_flag = signal_poll
+            .as_ref()
+            .map(|_| host.with(|h| h.term_flag.clone()));
+        // What [`Vm::run_hot`] reads and never changes.
+        let rcx = HotCtx {
+            source,
+            table,
+            signal_poll: &signal_poll,
+            watch: term_flag
+                .as_deref()
+                .zip(signal_poll.as_ref().map(|(armed, _)| &**armed)),
+        };
+
+        macro_rules! r {
+            ($i:expr) => {
+                self.regs[base + $i as usize]
+            };
+        }
+        // §2.2 / #2164 — a memory op's result. In a demand-paged child (`PAGED`), a recoverable
+        // fault is a page to fetch, not a trap: the cursor is left AT the op, which re-executes once
+        // the page is in place, and the fault goes to the driver. The oracle's `handle_mem`.
+        macro_rules! paged {
+            ($access:expr) => {
+                match $access {
+                    Ok(v) => v,
+                    Err(t) if PAGED => {
+                        return self.page_fault_or_trap(t, mem, (module, cur, base, pc))
+                    }
+                    Err(t) => return Err(t),
+                }
+            };
+        }
+        macro_rules! safepoint {
+            () => {
+                self.safepoint(fuel)?
+            };
+        }
+
+        // #3088 — `true` when the op at `pc` was charged and checked by `run_hot`, which handed it
+        // back as one of ours.
+        let mut checked = false;
+        loop {
+            if !std::mem::take(&mut checked) {
+                // #3088 — the per-op checks run only when [`checks_due`] says one has something to do,
+                // the one predicate `run_hot` stops on too: a check added here and not there never
+                // fires on its own.
+                if checks_due!(budget, rcx.watch, self.sig_handler_stack) {
+                    if budget == 0 {
+                        // Pause at this op boundary: persist the cursor so a later `resume` continues here.
+                        self.module = module;
+                        self.cur = cur;
+                        self.base = base;
+                        self.pc = pc;
+                        return Ok(Outcome::Suspended);
+                    }
+                    budget -= 1;
+                    // #1246 default-action terminate: a `SIG_DFL` SIGKILL/SIGTERM/SIGINT delivered to this
+                    // domain set its `term_flag` (the personality's inline kill apply, [`wire_kill`]). Die at
+                    // this op — the step returns the trap, and the exit hook reports term-by-signal from the
+                    // personality's `term_sig` bookkeeping (WIFSIGNALED), exactly like the tree-walker.
+                    // Checked before the async-signal redirect (death beats a caught delivery).
+                    if let Some(tf) = &term_flag {
+                        if tf.load(std::sync::atomic::Ordering::Relaxed) {
+                            return Err(Trap::ThreadFault);
+                        }
+                    }
+                    // #1146 async signal delivery: at this per-op safepoint, if the personality has a caught,
+                    // unmasked signal pending (its cheap `armed` flag) and we are not already
+                    // `MAX_SIG_HANDLER_NEST` deep, redirect this vCPU into the guest handler
+                    // `(i64 sp, i32 signum) -> ()` — a window opened exactly like a `call.dyn`, resolved and
+                    // type-checked through the dispatch table. The interrupted op is NOT advanced (the return
+                    // entry resumes at `pc`, re-running it once the handler returns), matching the tree-walker.
+                    // Same interrupt-at-safepoint shape as `kill`, but non-lethal. (Interruptible-park `-EINTR`
+                    // is a follow-up: no interruptible parks reach this synchronous safepoint path yet.)
+                    if self.sig_handler_stack.len() < super::MAX_SIG_HANDLER_NEST {
+                        if let Some((armed, source)) = &signal_poll {
+                            if armed.load(std::sync::atomic::Ordering::Relaxed) {
+                                // The source owns its own locking (an `Arc<Mutex<Proc>>`); we hold no host lock
+                                // here. A `None` means nothing deliverable (ignored/masked/stopped) — it also
+                                // disarms, so the check idles until the next `raise`/`kill`.
+                                if let Some((fref, signum, sp)) = source.take_deliverable() {
+                                    let slot = (fref as u32 as usize) & (table.len() - 1);
+                                    let ts = table.slot(slot);
+                                    if ts.module != super::TABLE_EMPTY {
+                                        let (tmod, tfunc) = (ts.module as usize, ts.func as usize);
+                                        let tm = resolve!(tmod);
+                                        let (cp, cr) = &tm.sigs[tfunc];
+                                        // `void handler(int)` = `(i64 sp, i32 signum) -> ()` — chibicc threads
+                                        // the data-SP as v0. A mis-typed handler is dropped (the signal was
+                                        // already consumed by `take_deliverable`), never fatal.
+                                        if matches!(cp.as_slice(), [ValType::I64, ValType::I32])
+                                            && cr.is_empty()
+                                        {
+                                            // Open a fresh window past the current activation (like `Op::Call`),
+                                            // seeded with `(sp, signum)`. `nb`/`need` use the *current* `c`
+                                            // before any cross-module reassignment below.
+                                            let nb = base + c.prog(cur).nslots as usize;
+                                            let need = nb + tm.prog(tfunc).nslots as usize;
+                                            self.open_frame(need)?;
+                                            self.regs[nb] = Reg::from_i64(sp as i64);
+                                            self.regs[nb + 1] = Reg::from_i32(signum);
+                                            // Return linkage resumes at the SAME `pc` so the interrupted op
+                                            // re-runs; the void handler writes no results (`ret_abs` unused —
+                                            // `base` is a harmless placeholder).
+                                            self.stack.push((
+                                                module,
+                                                cur,
+                                                base,
+                                                pc,
+                                                base,
+                                                self.entered,
+                                            ));
+                                            self.entered = self.work;
+                                            if tmod != module {
+                                                module = tmod;
+                                                c = tm;
+                                            }
+                                            cur = tfunc;
+                                            enter!();
+                                            base = nb;
+                                            pc = 0;
+                                            self.sig_handler_stack.push(self.stack.len());
+                                            continue;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    budget -= 1;
+                }
+                #[cfg(feature = "callprof")]
+                if module == 0 {
+                    if let Some(loc) = c.prog(cur).src.get(pc).copied().flatten() {
+                        callprof::op(cur, loc);
+                    }
+                }
+            }
+            debug_assert!(
+                std::ptr::eq(ops, &c.prog(cur).ops[..]),
+                "the ops a run reads are its current function's"
+            );
+            match &ops[pc] {
+                // The hot ops ([`hot_ops`]) run in [`Vm::run_hot`] (#3088).
+                hot_ops!() => {
+                    let mut at = Cursor {
+                        module,
+                        cur,
+                        base,
+                        pc,
+                        budget,
+                    };
+                    match self
+                        .run_hot::<PAGED>(&mut at, &mut c, &mut local, &rcx, fuel, mem, host)?
+                    {
+                        Hand::Done(out) => return Ok(out),
+                        Hand::Checked => checked = true,
+                        Hand::Unchecked => {}
+                    }
+                    Cursor {
+                        module,
+                        cur,
+                        base,
+                        pc,
+                        budget,
+                    } = at;
+                    enter!();
+                }
                 // `<setjmp.h>` `setjmp`: checkpoint the resume point (the op after this, in this
                 // activation) and its register window, named by a token written into the guest
                 // `jmp_buf`, and return 0.
@@ -23930,208 +24501,6 @@ impl Vm {
                     enter!();
                     self.regs[base..base + point.window.len()].copy_from_slice(&point.window);
                     self.regs[base + point.dst as usize] = Reg::from_i32(resume);
-                }
-                Op::Call { callee, args, dst } => {
-                    safepoint!(); // fuel unification: function-entry safepoint
-                    let callee = *callee as usize;
-                    #[cfg(feature = "callprof")]
-                    if module == 0 {
-                        callprof::hit(callee);
-                    }
-                    tier_up!(module, callee, c.result_types[callee], args, dst);
-                    // A direct call stays in the current module.
-                    let nb = base + c.prog(cur).nslots as usize;
-                    let need = nb + c.prog(callee).nslots as usize;
-                    self.open_frame(need)?;
-                    for (i, a) in args.iter().enumerate() {
-                        self.regs[nb + i] = self.regs[base + *a as usize];
-                    }
-                    self.stack.push((
-                        module,
-                        cur,
-                        base,
-                        pc + 1,
-                        base + *dst as usize,
-                        self.entered,
-                    ));
-                    self.entered = self.work;
-                    cur = callee;
-                    enter!();
-                    base = nb;
-                    pc = 0;
-                }
-                Op::CallIndirect { call, dst } => {
-                    let IndirectCall {
-                        idx,
-                        args,
-                        want_params,
-                        want_results,
-                    } = &**call;
-                    safepoint!(); // fuel unification: function-entry safepoint
-
-                    // Resolve through the **runtime dispatch table** (slot ⇒ (module, func)); an empty
-                    // padding slot or a signature mismatch is an inert IndirectCallType trap. The
-                    // target may be an installed §22 unit (a different module) — a cross-module call.
-                    let slot = (r!(*idx).i32() as u32 as usize) & (table.len() - 1);
-                    let ts = table.slot(slot);
-                    if ts.module == super::TABLE_EMPTY {
-                        return Err(Trap::IndirectCallType);
-                    }
-                    let (tmod, tfunc) = (ts.module as usize, ts.func as usize);
-                    let tm = resolve!(tmod);
-                    let (cp, cr) = &tm.sigs[tfunc];
-                    if cp.as_slice() != &want_params[..] || cr.as_slice() != &want_results[..] {
-                        return Err(Trap::IndirectCallType);
-                    }
-                    // #2474 — a call through the table tiers up as a direct one does.
-                    tier_up!(tmod, tfunc, tm.result_types[tfunc], args, dst);
-                    let nb = base + c.prog(cur).nslots as usize;
-                    let need = nb + tm.prog(tfunc).nslots as usize;
-                    self.open_frame(need)?;
-                    for (i, a) in args.iter().enumerate() {
-                        self.regs[nb + i] = self.regs[base + *a as usize];
-                    }
-                    self.stack.push((
-                        module,
-                        cur,
-                        base,
-                        pc + 1,
-                        base + *dst as usize,
-                        self.entered,
-                    ));
-                    self.entered = self.work;
-                    if tmod != module {
-                        module = tmod;
-                        c = tm;
-                    }
-                    cur = tfunc;
-                    enter!();
-                    base = nb;
-                    pc = 0;
-                }
-                Op::Ret { srcs, leave } => {
-                    // #1146 — if this returns from an injected async signal handler (its guard entry
-                    // records the stack depth at injection, which equals the current depth when the
-                    // handler's own `Ret` fires), restore the personality's block-during-handler mask
-                    // before unwinding, exactly as the tree-walker does on the handler's `Return`. A
-                    // held fatal signal exposed by the unmask fires its default action inside
-                    // `handler_returned` (a no-op here unless the driver wired `set_kill`).
-                    if self.sig_handler_stack.last() == Some(&self.stack.len()) {
-                        self.sig_handler_stack.pop();
-                        if let Some((_, source)) = &signal_poll {
-                            source.handler_returned();
-                        }
-                    }
-                    if *leave {
-                        self.leave_setjmps(self.stack.len());
-                    }
-                    match self.stack.pop() {
-                        None => {
-                            // The entry's results go to the first slots of its window, gathered
-                            // first as they may overlap them, with the cursor that types them.
-                            self.scratch.clear();
-                            for s in srcs.iter() {
-                                self.scratch.push(self.regs[base + *s as usize]);
-                            }
-                            // A value returned twice can make more results than slots.
-                            self.grow_regs(base + srcs.len())?;
-                            self.regs[base..base + srcs.len()].copy_from_slice(&self.scratch);
-                            (self.module, self.cur, self.base) = (module, cur, base);
-                            return Ok(Outcome::Done);
-                        }
-                        Some((cmod, cprog, cbase, cpc, ret_abs, centered)) => {
-                            self.count_call(module, cur);
-                            self.entered = centered;
-                            for (i, s) in srcs.iter().enumerate() {
-                                self.regs[ret_abs + i] = self.regs[base + *s as usize];
-                            }
-                            if cmod != module {
-                                module = cmod;
-                                c = resolve!(cmod);
-                            }
-                            cur = cprog;
-                            enter!();
-                            base = cbase;
-                            pc = cpc;
-                        }
-                    }
-                }
-                // Tail calls reuse the *current* window (`base` unchanged) instead of pushing a
-                // return entry, so the callee returns to this activation's caller. Args may alias the
-                // destination prefix, so gather into `scratch` then scatter (like edge copies).
-                Op::TailCall {
-                    callee,
-                    args,
-                    leave,
-                } => {
-                    safepoint!(); // fuel unification: function-entry safepoint
-                    let callee = *callee as usize;
-                    #[cfg(feature = "callprof")]
-                    if module == 0 {
-                        callprof::hit(callee);
-                    }
-                    self.count_call(module, cur);
-                    self.entered = self.work;
-                    if *leave {
-                        self.leave_setjmps(self.stack.len());
-                    }
-                    self.grow_regs(base + c.prog(callee).nslots as usize)?;
-                    self.scratch.clear();
-                    for a in args.iter() {
-                        self.scratch.push(self.regs[base + *a as usize]);
-                    }
-                    for (i, &v) in self.scratch.iter().enumerate() {
-                        self.regs[base + i] = v;
-                    }
-                    cur = callee;
-                    enter!();
-                    pc = 0;
-                }
-                Op::TailCallIndirect { call, leave } => {
-                    let IndirectCall {
-                        idx,
-                        args,
-                        want_params,
-                        want_results,
-                    } = &**call;
-                    safepoint!(); // fuel unification: function-entry safepoint
-                    let slot = (r!(*idx).i32() as u32 as usize) & (table.len() - 1);
-                    let ts = table.slot(slot);
-                    if ts.module == super::TABLE_EMPTY {
-                        return Err(Trap::IndirectCallType);
-                    }
-                    let (tmod, tfunc) = (ts.module as usize, ts.func as usize);
-                    let tm = resolve!(tmod);
-                    let (cp, cr) = &tm.sigs[tfunc];
-                    if cp.as_slice() != &want_params[..] || cr.as_slice() != &want_results[..] {
-                        return Err(Trap::IndirectCallType);
-                    }
-                    self.count_call(module, cur);
-                    self.entered = self.work;
-                    if *leave {
-                        self.leave_setjmps(self.stack.len());
-                    }
-                    self.grow_regs(base + tm.prog(tfunc).nslots as usize)?;
-                    self.scratch.clear();
-                    for a in args.iter() {
-                        self.scratch.push(self.regs[base + *a as usize]);
-                    }
-                    for (i, &v) in self.scratch.iter().enumerate() {
-                        self.regs[base + i] = v;
-                    }
-                    if tmod != module {
-                        module = tmod;
-                        c = tm;
-                    }
-                    cur = tfunc;
-                    enter!();
-                    pc = 0;
-                }
-                Op::CapCall(call) => {
-                    match self.cap_call(call, (module, cur, base, pc), mem, host, &signal_poll)? {
-                        Ok(next) => pc = next,
-                        Err(out) => return Ok(out),
-                    }
                 }
                 Op::SvcPoll { dst, wait } => {
                     // §3.6 serve-loop core. #2160, the oracle's rule: a serve op inside a running
@@ -24580,21 +24949,6 @@ impl Vm {
                     if let Some(v) = r {
                         self.regs[base + *dst as usize] = v;
                     }
-                    pc += 1;
-                }
-                Op::DurableShadowBase { dst } => {
-                    // §12.8 4A.5: this context's shadow-SP word address (its own region base).
-                    self.regs[base + *dst as usize] =
-                        Reg::from_i64(self.durable_region_base as i64);
-                    pc += 1;
-                }
-                Op::VcpuTlsGet { dst } => {
-                    // §12 per-vCPU TLS read: this vCPU's word (seeded to its dense id, guest-overwritable).
-                    self.regs[base + *dst as usize] = Reg::from_i64(self.tls);
-                    pc += 1;
-                }
-                Op::VcpuTlsSet { val } => {
-                    self.tls = r!(*val).i64();
                     pc += 1;
                 }
             }
