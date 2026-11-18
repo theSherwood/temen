@@ -882,6 +882,14 @@ pub(crate) struct Domain {
     /// run's end. Boxed, since code holds each context's address while the list grows.
     #[allow(clippy::vec_box)]
     vcpu_ctxs: Mutex<Vec<Box<VcpuCtx>>>,
+    /// #3133 (stop-gap) — the handler contexts of the serve sites this run's ended vCPUs left: a
+    /// fiber a serve handler made runs on its window's context, and goes on running on it from the
+    /// run's fiber table after the vCPU that served ended and its site went. Only the context is
+    /// kept, not the site and its idle handler fibers: one `VmCtx` (264 bytes, 280 with its `Arc`)
+    /// per vCPU that served, until the run ends. Emptied with [`Self::vcpu_ctxs`]. A fiber with a
+    /// context of its own (#3080) removes it.
+    #[cfg(fiber_rt)]
+    retired_handler_ctxs: Mutex<Vec<std::sync::Arc<crate::VmCtx>>>,
 }
 
 /// #2488 — a spawned vCPU's own context ([`crate::VmCtx::vcpu`]) and the fuel cell it charges: the
@@ -1192,6 +1200,8 @@ impl Domain {
             hub: 0,
             node,
             vcpu_ctxs: Mutex::new(Vec::new()),
+            #[cfg(fiber_rt)]
+            retired_handler_ctxs: Mutex::new(Vec::new()),
         }
     }
 
@@ -1268,6 +1278,8 @@ impl Domain {
         }
         if let Some(site) = ctx.vm.serve_site.take() {
             site.revoke();
+            // #3133 — a fiber one of its handlers made may still run on its window's context.
+            lock(&self.retired_handler_ctxs).push(site.handler_ctx());
         }
         lock(&self.vcpu_ctxs).push(ctx);
     }
@@ -1379,6 +1391,8 @@ impl Domain {
             killing,
             lanes,
             vcpu_ctxs,
+            #[cfg(fiber_rt)]
+            retired_handler_ctxs,
             // The futex table and the wakers are kept, not replaced: hosts outside the run reach
             // them between runs (`CompiledModule::park_hub`'s users wake the futex table by the
             // domain's address; an `outside_waker` holds it weakly), so no join can make a
@@ -1433,6 +1447,8 @@ impl Domain {
         killing.store(0, Ordering::Release);
         lock(lanes).clear();
         lock(vcpu_ctxs).clear();
+        #[cfg(fiber_rt)]
+        lock(retired_handler_ctxs).clear();
         // A vCPU's waiter leaves at teardown; a fiber's event-parked one can stay queued, and a
         // later run's `notify` would count it.
         lock(&park.futex).clear();

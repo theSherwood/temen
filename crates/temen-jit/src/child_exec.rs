@@ -1257,6 +1257,14 @@ impl ServeSite {
         }
     }
 
+    /// #3133 (stop-gap) — the context its handlers run as, which a fiber one of them made goes on
+    /// running on after the site is gone (`os_thread_rt`'s `retired_handler_ctxs`). Its
+    /// `handler_window` names the window, which may be gone by then: a fiber's code never reads it
+    /// (`handler_steps_aside` answers `None` in a guest fiber first).
+    pub(crate) fn handler_ctx(&self) -> Arc<VmCtx> {
+        Arc::clone(&self.window.vm)
+    }
+
     /// #2742 — the site's vCPU has ended, however it ended (owner, 2026-11-09): its window never opens
     /// again, so each handler of it the pool holds answers its call `CAP_REVOKED` now, as the
     /// oracle answers a dead vCPU's parked handlers. Their fibers unwind once their domain has no

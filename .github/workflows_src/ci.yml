@@ -1080,7 +1080,9 @@ jobs:
           # -Z build-std's recompiled std would trip.
           RUSTFLAGS: "-Zsanitizer=address"
           # The fiber scheduler leaks values on a dropped-suspended fiber's stack (documented).
-          ASAN_OPTIONS: "detect_leaks=0"
+          # #3133 — fill freed memory, so a read of it by JIT code (which ASan does not instrument) is a
+          # wrong pointer that faults rather than the stale bytes it used to hold.
+          ASAN_OPTIONS: "detect_leaks=0:max_free_fill_size=4096:free_fill_byte=171"
 
   browser-real:
     name: real-browser (Chromium via Playwright)

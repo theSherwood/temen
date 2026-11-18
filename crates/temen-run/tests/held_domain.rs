@@ -726,6 +726,284 @@ fn a_domain_that_serves_is_held_by_the_tree_walker_on_the_jit() {
     });
 }
 
+/// #3133 — a domain whose handler makes a fiber that outlives its call: `mk(start)` makes a fiber
+/// that counts up from 41 and suspends each count, resumes it once first when `start` is not 0, and
+/// answers its handle; `go(h)` resumes it and answers `status · 1000 + value`.
+const FIBER_MAKER: &str = r#"memory 16
+type 0 func (i64) -> (i64)
+type 1 interface { mk: 0, go: 0 }
+export 0 interface "svc" 1 { mk: 1, go: 2 }
+func () -> (i64) {
+block 0 () {
+  vr = i64.const 1
+  return vr
+  }
+}
+func (i64) -> (i64) {
+block 0 (vstart: i64) {
+  vf = ref.func 3
+  vz = i64.const 0
+  vk = cont.new vf vz
+  vgo = i64.ne vstart vz
+  br_if vgo 1(vk) 2(vk)
+}
+block 1 (vk1: i64) {
+  vz1 = i64.const 0
+  vs, vv = cont.resume vk1 vz1
+  br 2(vk1)
+}
+block 2 (vk2: i64) {
+  return vk2
+  }
+}
+func (i64) -> (i64) {
+block 0 (vh: i64) {
+  vz = i64.const 0
+  vs, vv = cont.resume vh vz
+  vs64 = i64.extend_i32_s vs
+  vk = i64.const 1000
+  vm = i64.mul vs64 vk
+  vr = i64.add vm vv
+  return vr
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, varg: i64) {
+  vc = i64.const 41
+  br 1(vc)
+}
+block 1 (vi: i64) {
+  vone = i64.const 1
+  vj = i64.add vi vone
+  vx = suspend vj
+  br 1(vj)
+  }
+}
+"#;
+
+/// #3133 (stop-gap) — a domain that can make a fiber is held by the tree-walker when it is asked
+/// for on the JIT. A fiber made in an activation keeps that activation's context and fuel cell, which
+/// end with the call, so on the JIT a later resume ran on freed memory: a fiber that never started
+/// wrote its start refund into the freed cell, and one that suspended in its first call read its
+/// freed context once resumed in the next. Here each fiber is made in one call and resumed by the
+/// later ones, either never started in its first call or started and suspended there, each call on
+/// a loan and on none, and the domain answers as the oracle does. The context per fiber (#3080) lets the JIT hold it again,
+/// and these rows then assert the JIT.
+#[test]
+fn a_domain_that_makes_fibers_is_held_by_the_tree_walker_on_the_jit() {
+    bounded(|| {
+        for start in [0, 1] {
+            for loan in [u64::MAX, 1_000_000] {
+                let m = module(FIBER_MAKER);
+                let mut host = Host::new();
+                host.set_self_module(&m);
+                let started = temen_run::hold(Executor::Jit, m, 0, &[], u64::MAX, host);
+                let (d, results) =
+                    started.unwrap_or_else(|(t, _)| panic!("the entry ends in {t:?}"));
+                assert_eq!(
+                    d.executor(),
+                    Executor::TreeWalker,
+                    "start {start}, loan {loan}"
+                );
+                assert_eq!(results, vec![Value::I64(1)]);
+                let mut fuel = loan;
+                assert_eq!(
+                    d.call(0, 0, &[start], &mut fuel),
+                    Reply::Results(vec![0]),
+                    "the fiber's handle"
+                );
+                for n in 0..3 {
+                    let mut fuel = loan;
+                    assert_eq!(
+                        d.call(0, 1, &[0], &mut fuel),
+                        Reply::Results(vec![42 + start + n]),
+                        "start {start}, loan {loan}: resume {n} in a later call"
+                    );
+                }
+                let (_host, trap) = d.end();
+                assert_eq!(trap, None);
+            }
+        }
+    });
+}
+
+/// #3133 — an offer of one op, `seven()`, with no fiber op and no serve loop.
+const SEVEN: &str = r#"memory 16
+type 0 func () -> (i64)
+type 1 interface { seven: 0 }
+export 0 interface "svc" 1 { seven: 1 }
+func () -> (i64) {
+block 0 () {
+  vr = i64.const 1
+  return vr
+  }
+}
+func () -> (i64) {
+block 0 () {
+  vr = i64.const 7
+  return vr
+  }
+}
+"#;
+
+/// #3133 (stop-gap) — the same for a domain with no fiber op whose host lets its submitted units host
+/// fibers: such a unit's `cont.new` in an activation would keep the activation's context alike. The
+/// same domain without the grant is the JIT's, so the grant is what declines it.
+#[test]
+fn a_domain_whose_units_may_host_fibers_is_held_by_the_tree_walker_on_the_jit() {
+    bounded(|| {
+        for (hosts, held_on) in [(false, Executor::Jit), (true, Executor::TreeWalker)] {
+            let m = module(SEVEN);
+            let mut host = Host::new();
+            host.set_self_module(&m);
+            host.set_jit_hosts_fibers(hosts);
+            let started = temen_run::hold(Executor::Jit, m, 0, &[], u64::MAX, host);
+            let (d, results) = started.unwrap_or_else(|(t, _)| panic!("the entry ends in {t:?}"));
+            assert_eq!(d.executor(), held_on, "hosting fibers: {hosts}");
+            assert_eq!(results, vec![Value::I64(1)]);
+            assert_eq!(call(&d, 0, &[]), Reply::Results(vec![7]));
+        }
+    });
+}
+
+/// #3133 — a §14 child whose thread serves one call of its offer `addmul` and ends: the handler
+/// makes a fiber over its first argument and leaves its handle at 2048, and the child's root joins
+/// the thread and resumes the fiber twice (it suspends 5, then returns `5 + 40`), answering 50.
+const SERVES_A_FIBER: &str = r#"memory 12
+type 0 func (i64, i64) -> (i64, i64)
+type 1 interface { addmul: 0 }
+export 0 interface "addmul" 1 { addmul: 1 }
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vz = i64.const 0
+  vt = thread.spawn 2 vz vz
+  vs, vv = thread.join vt
+  vat = i64.const 2048
+  vk = i64.load vat
+  vrs, vr = cont.resume vk vz
+  vrs2, vr2 = cont.resume vk vz
+  vsum = i64.add vr vr2
+  return vsum
+  }
+}
+func (i64, i64) -> (i64, i64) {
+block 0 (va: i64, vb: i64) {
+  vf = ref.func 3
+  vk = cont.new vf va
+  vat = i64.const 2048
+  i64.store vat vk
+  vs = i64.add va vb
+  vm = i64.mul va vb
+  return vs, vm
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (va: i64, vb: i64) {
+  vz = i32.const 0
+  vn = svc.wait vz
+  return vn
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, varg: i64) {
+  vc = i64.const 5
+  vx = suspend vc
+  vd = i64.add vc vsp
+  return vd
+  }
+}
+"#;
+
+/// The root that spawns [`SERVES_A_FIBER`] detached, calls `addmul(40, 2)` through a live offer over
+/// its export, joins it, and answers `join · 1_000_000 + sum · 1000 + product`.
+fn calls_a_server() -> String {
+    format!(
+        r#"memory 17
+
+func (i32, i32, i32, i32) -> (i64) {{
+block 0 (v0: i32, v1: i32, v2: i32, v3: i32) {{
+  vrm = i64.const 17416
+  i32.store vrm v1
+  vrb = i64.const 17420
+  i32.store vrb v2
+  vrp = i64.const 17408
+  v5 = call.cap 6 17 (i64) -> (i32) v0 (vrp)
+  v6 = i64.const 0
+  v7 = call.cap 6 14 (i32, i64) -> (i32) v0 (v5, v6)
+  va = i64.const 40
+  vb = i64.const 2
+  vsum, vprod = call.cap 268435456 0 (i64, i64) -> (i64, i64) v7 (va, vb)
+  vthousand = i64.const 1000
+  vsh = i64.mul vsum vthousand
+  vcall = i64.add vsh vprod
+  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) v0 (v5)
+  vk = i64.const 1000000
+  vm = i64.mul vj vk
+  vs = i64.add vm vcall
+  return vs
+  }}
+}}
+{rec}"#,
+        rec = rec::segment(17408, &SpawnRec::default())
+    )
+}
+
+/// #3133 — not a held domain; here so the `asan-held` lane runs it. A serve handler runs on its
+/// window's context, and a fiber it makes lands in the run's table. When the vCPU that served ended,
+/// its serve site went, and the window's context with it, so the child's root resumed the fiber onto
+/// freed memory (reproduced on 5326ff0, under ASan with freed memory filled: a read of a pointer from
+/// the freed context in compiled code). The run now keeps a retired site until it ends. Both engines
+/// answer the oracle's 50 · 1_000_000 + 42_080.
+#[test]
+fn a_serve_handlers_fiber_outlives_the_thread_that_served() {
+    let caller = module(&calls_a_server());
+    let server = module(SERVES_A_FIBER);
+    for jit in [false, true] {
+        let (caller, server) = (Arc::clone(&caller), Arc::clone(&server));
+        let got = bounded(move || {
+            let mut host = Host::new();
+            host.set_self_module(&caller);
+            let args = [
+                host.grant_instantiator(),
+                host.grant_module(&server),
+                host.grant_budget(-1, 1 << 20, -1),
+                host.grant_clock(),
+            ];
+            if jit {
+                let image = temen_interp::MemLayout::image(vec![0u8; 128 << 10]);
+                let (out, _) = temen_run::jit_cap_run(
+                    &caller,
+                    0,
+                    &args.map(i64::from),
+                    &image,
+                    0,
+                    0,
+                    &mut host,
+                    None,
+                )
+                .expect("the JIT compiles the caller");
+                format!("{out:?}")
+            } else {
+                let mut fuel = 5_000_000u64;
+                let r = temen_interp::run_with_host(
+                    &caller,
+                    0,
+                    &args.map(Value::I32),
+                    &mut fuel,
+                    &mut host,
+                );
+                format!("{r:?}")
+            }
+        });
+        let want = if jit {
+            "Returned([50042080])"
+        } else {
+            "Ok([I64(50042080)])"
+        };
+        assert_eq!(got, want, "the JIT: {jit}");
+    }
+}
+
 /// The threads [`COUNTING`] has started, in this test binary.
 static STARTED: AtomicUsize = AtomicUsize::new(0);
 
