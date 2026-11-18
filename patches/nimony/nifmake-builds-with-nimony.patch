@@ -20,9 +20,10 @@ Behaviour is unchanged, except that a nimony-built nifmake's `--profile` reports
 (nimony's `posix` binds `wait4` without a `rusage`). The patched file builds with classic Nim (the
 pinned devel) and with nimony, and either binary drives `nimony c` to the same result.
 
-Applied to a COPY of the pinned sources at build time (`scripts/nim-toolchain.sh`); the
-vendored `nimony/` submodule is never modified. Against the submodule pin (4a965c9b).
-Drop it when upstream nifmake builds with nimony.
+Applied to a COPY of the pinned sources at build time (`scripts/nim-toolchain.sh`), and to the
+submodule for the native build and then reverted (`scripts/ci/provision-nimony.sh`); the vendored
+`nimony/` submodule is never left modified. Against the submodule pin (4a965c9b). Drop it when
+upstream nifmake builds with nimony.
 diff --git a/src/nifmake/nifmake.nim b/src/nifmake/nifmake.nim
 index 7b6e92cc..e26f5197 100644
 --- a/src/nifmake/nifmake.nim

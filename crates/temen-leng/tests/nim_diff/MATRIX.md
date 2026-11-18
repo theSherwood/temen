@@ -49,7 +49,7 @@ means adding it to a row.
 | Feature | Cases | Status |
 |---|---|---|
 | Value objects, nested objects | `objects_plain`, `objects_nested` | ✅ |
-| Object layout as C lays it out | `objects_layout` | ✅ |
+| Object layout as C lays it out, and its size at compile time | `objects_layout` | ✅ |
 | A module-level aggregate initializer | `global_aggregate_init` | ✅ |
 | `ref object` | `objects_ref`, `objects_ref_string` | ✅ |
 | An object with a `seq` field | `objects_seq_field` | ✅ |

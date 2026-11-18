@@ -1,6 +1,10 @@
 # Object layout as C lays it out (#2201): every object's size and every field's offset, which native
 # nimony takes from its C compiler. An object that crosses into C or Rust code, or onto a wire with a
 # C layout, reads the wrong fields unless both agree.
+#
+# And each object's size at compile time, in a `const` (#3128), which nimony computes itself. Native
+# and Temen share that value, so the differential cannot see it: the program holds it to the layout,
+# and fails if the two differ.
 import std/syncio
 
 type
@@ -52,8 +56,39 @@ type
   Tail = object
     n: int32
     data: UncheckedArray[int64]
+  # An object after padding with a field after it, which compile-time `sizeof` once placed at the end
+  # of the field before it (#3128).
+  Pair = object
+    a, b: uint32
+  Opt = object
+    present: uint8
+    value: uint64
+  After = object
+    more: bool
+    pair: Pair
+    opt: Opt
+    waits: bool
 
 proc off(base, field: pointer): string = $(cast[int](field) - cast[int](base))
+
+# Every object but `Tail`, which has no size at compile time: nimony leaves an `UncheckedArray`
+# unsized.
+const
+  names = ["Padded", "Nested", "WithArray", "Floats", "Scalars", "Union", "Variant", "Packed",
+    "Aligned", "Base", "Derived", "After"]
+  compiled = [sizeof(Padded), sizeof(Nested), sizeof(WithArray), sizeof(Floats), sizeof(Scalars),
+    sizeof(Union), sizeof(Variant), sizeof(Packed), sizeof(Aligned), sizeof(Base), sizeof(Derived),
+    sizeof(After)]
+
+# The objects whose compile-time size is not their layout's, each with both sizes.
+proc misplaced(): string =
+  let laid = [sizeof(Padded), sizeof(Nested), sizeof(WithArray), sizeof(Floats), sizeof(Scalars),
+    sizeof(Union), sizeof(Variant), sizeof(Packed), sizeof(Aligned), sizeof(Base), sizeof(Derived),
+    sizeof(After)]
+  result = ""
+  for i in 0 ..< laid.len:
+    if compiled[i] != laid[i]:
+      result.add names[i] & ": " & $compiled[i] & " at compile time, " & $laid[i] & " laid out\n"
 
 proc go(): string =
   var p = default(Padded)
@@ -85,5 +120,12 @@ proc go(): string =
   var buf = default(array[4, int64])
   let t = cast[ptr Tail](addr buf)
   result.add "Tail " & $sizeof(Tail) & ": " & off(t, addr t.data) & "\n"
+  var r = default(After)
+  result.add "After " & $sizeof(After) & ": " & off(addr r, addr r.pair) & " " & off(addr r, addr r.opt) &
+    " " & off(addr r, addr r.waits) & "\n"
 
 write(stdout, go())
+let wrong = misplaced()
+if wrong.len > 0:
+  write(stdout, wrong)
+  quit(1)
