@@ -281,9 +281,84 @@ as any guest access — the existing hinge already covers it. The verifier still
 typing/control-flow/index-ranges of the instrumented IR. A transform bug is a
 *correctness* bug, never a confinement bug.
 
-Corollary: restore never crosses a trust boundary as structured data (host loads
-opaque bytes and calls the entry), unlike host-side frame capture, whose restore path
-is a parser over attacker-controlled frames in the host.
+**The artifact is untrusted input (owner, 2026-11-13, #3034), and restore is the trust
+boundary.** The shadow stack itself crosses as opaque window bytes, as above; but an artifact
+also carries structured data the host parses and acts on — the thaw residue (frozen fibers and
+vCPUs, the root's extent, the child table, detached children and fork twins), the serve state,
+the handle table, guest-JIT units — and on the Cranelift JIT some of it picks the offsets of raw
+host stores. Every value restore reads is therefore one of:
+
+1. **checked against the module and the cut** — by the decoder (`temen-snapshot`: geometry,
+   canonical order, counts no larger than the bytes left, handle bindings, the serve tickets,
+   guest-JIT installs) or by the **one thaw pass**, `temen_ir::thaw::validate`, which admits a
+   domain's residue whole only if every value in it is one a run of the module could have made
+   (each nested artifact through the same pass, against its own module);
+2. **handed to an embedder hook that may only narrow it** — named capabilities, budget ceilings,
+   module grants;
+3. **re-verified** — a guest-JIT unit's IR goes through the verifier again; or
+4. **opaque guest bytes** — window pages, pipe buffers, region bytes — which reach the guest
+   only through the confinement lowering, like any other guest memory.
+
+An engine thaws only an admitted residue: what an engine's thaw seeds is always the pass's result
+type, `Thaw` (the interpreters take it with `Host::take_admitted`, the JIT with `Host::take_thaw` and
+`CompiledModule::set_durable`), and an engine that re-creates less than all of it declines the thaw
+whole to the tree-walker rather than thawing part of it. A residue can sit on a powerbox unsealed (a
+freeze leaves one there, `Host::leave_freeze`), but no engine's thaw reads it until the pass has
+returned it. The checks at each use that predate the pass (#2945) stay only in front of a raw host store
+or an unchecked index, as a backstop that is loud in debug. Open: whether an artifact may set the
+attestation and the guest-JIT quotas at all, or only narrow what the restoring host grants (#3096).
+
+**A freeze checks what a guest writes, where it reads it.** A freeze's residue is the engine's own
+state except for one kind of value: each context's **shadow-SP word**, in its region's header, which
+is guest memory. The transform's push check bounds a context's word only at that context's own unwind
+(`sp` below its frames, or a push past its region's end, traps `Unreachable`), so a word can change
+after that. Every engine therefore checks each extent where its freeze reads it out of the window, by
+one rule (`temen_ir::thaw::extent_fits`, the rule the thaw pass applies to an artifact's extents):
+
+| Word | Read and checked at | The guest gets |
+|---|---|---|
+| the root's (context 0, a twin's forking context) | its vCPU's end (TW, the settle that records it); the run root after its unwind (JIT); a detached child's root at its settle (JIT) | that domain ends `Unreachable` |
+| a spawned vCPU's | its own end (TW settle; JIT vCPU harvest and inline children) | the thread traps `Unreachable`, which ends its domain |
+| a fiber's | its flatten by the freeze drive, or its return under the unwind (TW, bytecode); its `Complete` at the exit swap (JIT) | the drive's trap, `Unreachable`, the run's result |
+
+What the freeze records is the value it checked, so no later write can change it.
+
+**Whose a trap in the cut is** (owner decision 25, #2949). A detached child's own trap during the
+cut (a guest fault above, or any other trap its code or its own checks raise, in its root, a thread
+of its domain, a fiber it runs or its freeze drive) is the child's, for the one shape this is proven
+for (`own_trap_fate`): a detached child that is not demand-paged (withheld, #2455) and had no live
+§14 child of its own when the trap ended it, whether or not a freeze of it recorded that child. It ends as a trapped child ends (an unwound root's window and
+kept lease go back, once), its join answers the trap (or what its root returned, if the root
+returned before the trap), it rides its parent's artifact as a completed child, and the parent's
+freeze goes on, on every engine. For any other shape (a demand-paged child, a child with a §14 child
+of its own, a fork twin still live at the harvest) the tree-walker refuses the freeze instead, the
+child or twin unreached, as every trap in the cut did before decision 25 (#3131). A personality's
+twin that trapped before the freeze rang it is not in the cut: it retired then, as that
+personality's zombie.
+
+A member the engine **could not freeze** is a refusal, which fails the run on every engine, raised where it is refused: on the tree-walker a park its thaw cannot re-derive, or
+a live child nothing can reach (`VCpu::freeze_refused`); on the bytecode engine the same parks, and a
+fiber table past its arena (it never reuses a slot, #3101); on the JIT a child whose window the host
+could not read in a run that froze (`end_refused`, #2286, #2318). An artifact without the member would look whole and not
+be (INVARIANTS #9c, #1689). A trap of the root domain's own vCPUs ends the run as any trap of its
+does.
+
+Nothing else is checked at a freeze. The residue rides on the powerbox unsealed (`Host::leave_freeze`), and
+whatever thaws from it admits it through the pass first: `restore`, the tree-walker's thaw (each
+domain it re-creates, a detached child's and a twin's included), the bytecode engine's and the JIT's.
+A bug that left a value no run makes would surface there, as `Malformed`, where the round-trip rows
+and the durable differential fuzzing look. A run whose root returned or trapped carries no residue,
+though a vCPU of it unwound.
+
+A freeze asked for while an installed unit's thread runs is **declined** (`DeclineCause::UnitThread`)
+at the countdown and freeze-on-quiesce triggers, and the run goes on: neither engine's thaw can
+resolve a thread's entry in a unit (#3108). The JIT, which has no freeze census, declines a durable
+run that hosts a unit's threads whole. A unit's fiber rides: its freeze records the funcref the fiber
+was made with (the table slot), which the thaw's start resolves through the re-applied table, on
+every engine.
+
+A frame-capture design would have had the same boundary, as a parser over attacker-controlled
+frames in the host; this one keeps the structured part small and checks it in one place.
 
 ---
 

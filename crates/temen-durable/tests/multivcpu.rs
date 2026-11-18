@@ -144,9 +144,16 @@ fn two_vcpu_domain_freezes_and_thaws() {
         h.set_durable(true);
         h.clock_ns = clock_after;
         let clk = h.grant_clock();
-        h.set_frozen_vcpus(frozen);
-        h.set_frozen_root_sp(root_sp);
-        h.set_child_generations(children);
+        h.admit_thaw(
+            &inst,
+            temen_interp::Residue {
+                vcpus: frozen,
+                root_sp: Some(root_sp),
+                children,
+                ..Default::default()
+            },
+        )
+        .expect("a residue a run made");
         let mut fuel = 1_000_000u64;
         let (r, _) = run_capture_reserved_with_host(
             &inst,
@@ -293,10 +300,17 @@ fn vcpu_and_fiber_coexist_through_freeze_thaw() {
         h.set_durable(true);
         h.clock_ns = clock_after;
         let clk = h.grant_clock();
-        h.set_frozen_fibers(frozen_fibers);
-        h.set_frozen_vcpus(frozen_vcpus);
-        h.set_frozen_root_sp(root_sp);
-        h.set_child_generations(children);
+        h.admit_thaw(
+            &inst,
+            temen_interp::Residue {
+                fibers: frozen_fibers,
+                vcpus: frozen_vcpus,
+                root_sp: Some(root_sp),
+                children,
+                ..Default::default()
+            },
+        )
+        .expect("a residue a run made");
         let mut fuel = 1_000_000u64;
         let (r, _) = run_capture_reserved_with_host(
             &inst,
@@ -439,10 +453,17 @@ fn child_owns_fiber_through_freeze_thaw() {
         h.set_durable(true);
         h.clock_ns = clock_after;
         let clk = h.grant_clock();
-        h.set_frozen_fibers(frozen_fibers);
-        h.set_frozen_vcpus(frozen_vcpus);
-        h.set_frozen_root_sp(root_sp);
-        h.set_child_generations(children);
+        h.admit_thaw(
+            &inst,
+            temen_interp::Residue {
+                fibers: frozen_fibers,
+                vcpus: frozen_vcpus,
+                root_sp: Some(root_sp),
+                children,
+                ..Default::default()
+            },
+        )
+        .expect("a residue a run made");
         let mut fuel = 1_000_000u64;
         let (r, _) = run_capture_reserved_with_host(
             &inst,
@@ -591,9 +612,16 @@ fn nested_spawn_tree_freezes_and_thaws() {
         h.set_durable(true);
         h.clock_ns = 99;
         let clk = h.grant_clock();
-        h.set_frozen_vcpus(frozen);
-        h.set_frozen_root_sp(root_sp);
-        h.set_child_generations(children);
+        h.admit_thaw(
+            &inst,
+            temen_interp::Residue {
+                vcpus: frozen,
+                root_sp: Some(root_sp),
+                children,
+                ..Default::default()
+            },
+        )
+        .expect("a residue a run made");
         let mut fuel = 1_000_000u64;
         let (r, _) = run_capture_reserved_with_host(
             &inst,
@@ -688,9 +716,16 @@ fn a_frozen_threads_entry_is_paid_once() {
         h.set_durable(true);
         h.clock_ns = clock_after;
         let clk = h.grant_clock();
-        h.set_frozen_vcpus(frozen);
-        h.set_frozen_root_sp(root_sp);
-        h.set_child_generations(children);
+        h.admit_thaw(
+            &inst,
+            temen_interp::Residue {
+                vcpus: frozen,
+                root_sp: Some(root_sp),
+                children,
+                ..Default::default()
+            },
+        )
+        .expect("a residue a run made");
         let mut fuel = BUDGET;
         let (r, _) = run_capture_reserved_with_host(
             &inst,

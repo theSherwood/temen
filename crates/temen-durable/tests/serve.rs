@@ -116,7 +116,14 @@ fn a_mid_handler_freeze_thaws_and_the_handler_replies() {
 
     // Thaw: the serve loop adopts the handler, which rewinds, finishes and replies.
     let fibers = h.frozen_fibers().to_vec();
-    h.set_frozen_fibers(fibers);
+    h.admit_thaw(
+        &inst,
+        temen_interp::Residue {
+            fibers,
+            ..Default::default()
+        },
+    )
+    .expect("a residue a run made");
     let mut twin = snap;
     begin_thaw(&mut twin, TEST_ARENA, 0);
     let mut fuel = 1_000_000u64;
@@ -228,8 +235,21 @@ fn a_domain_frozen_at_its_serve_point_thaws_and_drains_the_restored_queue() {
     h2.set_durable(true);
     h2.set_self_module(&inst);
     let (q, res, next) = trio;
-    h2.set_svc_state(q, res, next);
-    h2.set_frozen_root_sp(root_sp);
+    h2.set_serve(temen_interp::Serve {
+        queue: q,
+        results: res,
+        next_ticket: next,
+        ..Default::default()
+    })
+    .expect("a run's serve state");
+    h2.admit_thaw(
+        &inst,
+        temen_interp::Residue {
+            root_sp: Some(root_sp),
+            ..Default::default()
+        },
+    )
+    .expect("a residue a run made");
     let r_thaw = {
         let mut win = snap.clone();
         begin_thaw(&mut win, TEST_ARENA, 0);
@@ -326,7 +346,13 @@ fn an_idle_server_freezes_on_quiesce_and_thaws_still_serving() {
     h2.set_durable(true);
     h2.set_self_module(&inst);
     let (q, res, next) = trio;
-    h2.set_svc_state(q, res, next);
+    h2.set_serve(temen_interp::Serve {
+        queue: q,
+        results: res,
+        next_ticket: next,
+        ..Default::default()
+    })
+    .expect("a run's serve state");
     let ticket = h2
         .svc_enqueue(0, 0, vec![41])
         .expect("enqueue into restored server");
@@ -460,8 +486,7 @@ fn a_parked_handler_freezes_and_its_thaw_replies() {
 
     // `poke` arrives; the thaw resumes `hold`, and `poke` wakes it.
     let t_poke = h.svc_enqueue(0, 1, vec![0]).expect("enqueue");
-    let fibers = h.frozen_fibers().to_vec();
-    h.set_frozen_fibers(fibers);
+    // The freeze's residue stays on `h` for its thaw.
     let mut twin = snap;
     begin_thaw(&mut twin, TEST_ARENA, 0);
     let (r, _) = run(&mut h, &twin);

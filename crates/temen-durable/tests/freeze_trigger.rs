@@ -223,7 +223,15 @@ fn a_resume_of_a_parked_fiber_frozen_mid_delivery_continues_with_the_delivered_v
     begin_thaw(&mut thaw_win, TEST_ARENA, 0);
     let mut thost = Host::new();
     thost.set_durable(true);
-    thost.set_frozen_fibers(frozen);
+    thost
+        .admit_thaw(
+            &inst,
+            temen_interp::Residue {
+                fibers: frozen,
+                ..Default::default()
+            },
+        )
+        .expect("a residue a run made");
     let mut fuel = 100_000u64;
     let (r, _) =
         run_capture_reserved_with_host(&inst, 0, &[], &mut fuel, &thaw_win, SIZE_LOG2, &mut thost);

@@ -20,8 +20,8 @@ use temen_interp::put_results;
 use temen_interp::{Host, HostProcGrant, ProcHandler};
 use temen_ir::{Memory, Module};
 use temen_jit::{
-    compile_and_run_durable, DurableResidue, DurableRun, FreezeController, FrozenFiber, FrozenVCpu,
-    JitError, JitOutcome, TrapKind,
+    compile_and_run_durable, DurableRun, FreezeController, FrozenFiber, FrozenVCpu, JitError,
+    JitOutcome, TrapKind,
 };
 use temen_run::CapCtx;
 use temen_snapshot::{freeze as codec_freeze, restore as codec_restore};
@@ -147,10 +147,13 @@ fn concurrent_freeze_from(inst: &Module, from: FreezeFrom) -> Option<FreezeOutco
         cc.thunk(),
         cc.ptr(),
         DurableRun {
-            seed: DurableResidue {
-                root_sp: Some(TEST_ARENA.frame_base(0)),
-                ..Default::default()
-            },
+            seed: jit_thaw(
+                inst,
+                temen_ir::thaw::RawResidue {
+                    root_sp: Some(TEST_ARENA.frame_base(0)),
+                    ..Default::default()
+                },
+            ),
             freeze: Some(freeze),
             ..Default::default()
         },
@@ -199,12 +202,16 @@ fn thaw(
         cc.thunk(),
         cc.ptr(),
         DurableRun {
-            seed: DurableResidue {
-                fibers: fibers.to_vec(),
-                vcpus: vcpus.to_vec(),
-                root_sp: Some(root_sp),
-                children: children.to_vec(),
-            },
+            seed: jit_thaw(
+                inst,
+                temen_ir::thaw::RawResidue {
+                    fibers: fibers.to_vec(),
+                    vcpus: vcpus.to_vec(),
+                    root_sp: Some(root_sp),
+                    children: children.to_vec(),
+                    ..Default::default()
+                },
+            ),
             ..Default::default()
         },
     )
@@ -758,10 +765,13 @@ fn nested_concurrent_spawn_returns_grandchild_value() {
         cc.thunk(),
         cc.ptr(),
         DurableRun {
-            seed: DurableResidue {
-                root_sp: Some(TEST_ARENA.frame_base(0)),
-                ..Default::default()
-            },
+            seed: jit_thaw(
+                &inst,
+                temen_ir::thaw::RawResidue {
+                    root_sp: Some(TEST_ARENA.frame_base(0)),
+                    ..Default::default()
+                },
+            ),
             freeze: Some(freeze),
             ..Default::default()
         },
@@ -1222,10 +1232,13 @@ fn run_mv_fresh(inst: &Module) -> (JitOutcome, Vec<u8>) {
         cc.thunk(),
         cc.ptr(),
         DurableRun {
-            seed: DurableResidue {
-                root_sp: Some(TEST_ARENA.frame_base(0)),
-                ..Default::default()
-            },
+            seed: jit_thaw(
+                inst,
+                temen_ir::thaw::RawResidue {
+                    root_sp: Some(TEST_ARENA.frame_base(0)),
+                    ..Default::default()
+                },
+            ),
             ..Default::default()
         },
     )
@@ -1560,10 +1573,18 @@ fn recycled_context_artifact_canonical_re_freeze_through_the_codec() {
     let mut fhost = Host::new();
     fhost.set_durable(true);
     let _ = fhost.grant_clock(); // the only durable handle; mirrors the real domain's clock
-    fhost.set_frozen_fibers(i_fibers);
-    fhost.set_frozen_vcpus(i_vcpus);
-    fhost.set_frozen_root_sp(froot_sp);
-    fhost.set_child_generations(fchildren);
+    fhost
+        .admit_thaw(
+            &inst,
+            temen_interp::Residue {
+                fibers: i_fibers,
+                vcpus: i_vcpus,
+                root_sp: Some(froot_sp),
+                children: fchildren,
+                ..Default::default()
+            },
+        )
+        .expect("a residue a run made");
 
     // Serialize the real §12 artifact carrying the recycled residue + sparse window image.
     let artifact = codec_freeze(&inst, &fsnap, &fhost).expect("recycled artifact serializes");
@@ -1693,14 +1714,11 @@ fn a_reused_compile_runs_then_freezes_then_thaws() {
         Err(e) => panic!("compile: {e:?}"),
     };
     let args = [clk as i64, hf as i64];
-    let fresh = DurableResidue {
-        root_sp: Some(TEST_ARENA.frame_base(0)),
-        ..Default::default()
-    };
 
     // Run 1: uninterrupted. Its child completes on its own OS thread, unjoined.
     cm.set_freeze_controller(None);
-    cm.set_durable(fresh);
+    cm.set_durable(temen_jit::JitThaw::default())
+        .expect("no residue");
     let (out, win) = cm
         .run(
             &args,
@@ -1750,7 +1768,8 @@ fn a_reused_compile_runs_then_freezes_then_thaws() {
     let mut twin = snap;
     begin_thaw(&mut twin, TEST_ARENA, 0);
     cm.set_freeze_controller(None);
-    cm.set_durable(residue);
+    cm.set_durable(jit_thaw(&inst, residue.into_raw()))
+        .expect("a residue a run made");
     let (out, fin) = cm.run(&args, Some(&twin), Some(WINDOW)).expect("thaw");
     assert!(matches!(out, JitOutcome::Returned(_)), "thaw: {out:?}");
     assert_eq!(
@@ -1845,10 +1864,8 @@ fn an_armed_run_s_unrun_deferred_spawn_gives_back_what_it_took() {
     for run in 1..=3 {
         let mut win = init_durable_window(WINDOW, TEST_ARENA);
         arm_freeze_after(&mut win, TEST_ARENA, 1_000_000);
-        cm.set_durable(DurableResidue {
-            root_sp: Some(TEST_ARENA.frame_base(0)),
-            ..Default::default()
-        });
+        cm.set_durable(temen_jit::JitThaw::default())
+            .expect("no residue");
         let (out, _) = cm.run(&[], Some(&win), Some(WINDOW)).expect("armed run");
         assert_eq!(out, JitOutcome::Returned(vec![7]), "run {run}");
         assert_eq!(
@@ -1857,4 +1874,12 @@ fn an_armed_run_s_unrun_deferred_spawn_gives_back_what_it_took() {
             "run {run}'s unrun child still holds its vCPU charge"
         );
     }
+}
+
+/// #3034 — a JIT thaw seed: `raw`, admitted against `m` by the one thaw pass.
+fn jit_thaw(
+    m: &temen_ir::Module,
+    raw: temen_ir::thaw::RawResidue<temen_jit::JitDetached, ()>,
+) -> temen_jit::JitThaw {
+    temen_ir::thaw::validate(m, false, 0, raw).expect("a residue a run made")
 }

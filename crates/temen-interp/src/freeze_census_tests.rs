@@ -33,6 +33,7 @@ impl Fixture {
             children: &self.children,
             host: &self.root,
             registry: &self.registry,
+            unit_thread: false,
         }
     }
 
@@ -110,6 +111,18 @@ impl Fixture {
 fn a_run_with_nothing_in_the_way_is_not_declined() {
     let f = Fixture::new().with_detached_child(true);
     assert_eq!(f.census(&f.root_seat()), None);
+}
+
+/// #3034 R2.1 — a unit's thread cannot be carried (its residue names the unit's function by an index
+/// a thaw reads in the program, #3108): a freeze it triggers is declined, and the run goes on.
+#[test]
+fn a_units_thread_declines() {
+    let f = Fixture::new();
+    let seat = Seat {
+        unit_thread: true,
+        ..f.root_seat()
+    };
+    assert_eq!(f.census(&seat), Some(DeclineCause::UnitThread));
 }
 
 #[test]

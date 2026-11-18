@@ -124,18 +124,35 @@ fn run(
 
 /// A captured child as the thaw receives it — what `temen-snapshot`'s restore produces from the
 /// artifact, here handed over in memory.
-fn thawed(c: CapturedDetached) -> ThawedDetached {
+fn thawed(c: CapturedDetached) -> LiveDetached {
     let host = Arc::try_unwrap(c.host)
         .unwrap_or_else(|_| panic!("the run released the child's powerbox"))
         .into_inner()
         .unwrap_or_else(|e| e.into_inner());
-    ThawedDetached {
+    LiveDetached {
         parent_task: c.parent_task,
         slot: c.slot,
-        window: c.window,
-        reserved_log2: c.reserved_log2,
-        host,
-        launch: c.launch,
+        joinable: c.launch.joinable,
+        task: c.launch.task,
+        lane: c.launch.lane,
+        payload: ThawedDetached {
+            window: c.window,
+            reserved_log2: c.reserved_log2,
+            host,
+            digest: c.launch.digest,
+            names: c.launch.names,
+            pager: c.launch.pager,
+        },
+    }
+}
+
+/// The parent's residue for a thaw: what its freeze left on `fhost`, with `live` detached children.
+fn residue(fhost: &Host, live: Vec<LiveDetached>, completed: Vec<FrozenDetached>) -> Residue {
+    Residue {
+        children: fhost.child_generations().to_vec(),
+        live_detached: live,
+        detached: completed,
+        ..Residue::default()
     }
 }
 
@@ -201,8 +218,10 @@ fn a_live_detached_child_is_captured_and_its_thaw_completes_the_join() {
     let mut twin = fsnap.clone();
     begin_thaw(&mut twin, ARENA, 0);
     let (mut thost, targs) = powerbox(&child);
-    thost.set_thawed_detached(captured.into_iter().map(thawed).collect());
-    thost.set_child_generations(fhost.child_generations().to_vec());
+    let live = captured.into_iter().map(thawed).collect();
+    thost
+        .admit_thaw(&parent, residue(&fhost, live, Vec::new()))
+        .expect("a residue a run made");
     let (tr, tsnap) = run(&parent, &mut thost, &targs, &twin);
     assert_eq!(
         tr,
@@ -215,7 +234,7 @@ fn a_live_detached_child_is_captured_and_its_thaw_completes_the_join() {
         "the thaw ran back to NORMAL"
     );
     assert!(
-        thost.captured_detached().is_empty() && thost.take_thawed_detached().is_empty(),
+        thost.captured_detached().is_empty() && thost.thawed_detached().is_empty(),
         "nothing left over for a later run"
     );
 }
@@ -260,8 +279,9 @@ block 0 (v0: i64) {
     let mut twin = fsnap.clone();
     begin_thaw(&mut twin, ARENA, 0);
     let (mut thost, targs) = powerbox(&child);
-    thost.set_frozen_detached(frozen);
-    thost.set_child_generations(fhost.child_generations().to_vec());
+    thost
+        .admit_thaw(&parent, residue(&fhost, Vec::new(), frozen))
+        .expect("a residue a run made");
     let (tr, _) = run(&parent, &mut thost, &targs, &twin);
     assert_eq!(tr, Ok(vec![Value::I64(4950)]), "the join took the result");
 }
@@ -411,8 +431,10 @@ fn a_child_the_thaw_does_not_relaunch_ends_with_thread_fault() {
     let mut twin = fsnap.clone();
     begin_thaw(&mut twin, ARENA, 0);
     let (mut thost, targs) = powerbox(&summing(7));
-    thost.set_thawed_detached(captured.into_iter().map(thawed).collect());
-    thost.set_child_generations(fhost.child_generations().to_vec());
+    let live = captured.into_iter().map(thawed).collect();
+    thost
+        .admit_thaw(&parent, residue(&fhost, live, Vec::new()))
+        .expect("a residue a run made");
     let (tr, _) = run(&parent, &mut thost, &targs, &twin);
     assert_eq!(
         tr,

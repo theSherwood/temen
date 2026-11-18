@@ -744,79 +744,15 @@ pub struct WindowRestore {
     pub tail: Vec<TailPage>,
 }
 
-/// The host-side residue of a fiber the durable freeze driver flattened (DURABILITY.md §12.8) — the
-/// JIT mirror of `temen_interp::FrozenFiber`. Its continuation lives in its in-window shadow region;
-/// this carries what a thaw must re-seed: the registry slot (= guest handle), entry funcref +
-/// data-stack base (to re-enter it), and the flattened shadow-SP extent. A durable **freeze** run
-/// returns one per flattened fiber; a **thaw** run is handed them back to re-create the fibers.
-/// Every slot of the table rides (#1684): a fresh fiber at its empty frame base, and a free slot as
-/// [`FrozenFiber::free`] — the same records as the interpreter's.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct FrozenFiber {
-    pub slot: usize,
-    pub func: i32,
-    /// The entry's first argument, `cont.new`'s `arg0`.
-    pub arg0: i64,
-    /// `0` for a free slot: no shadow region lies at offset 0.
-    pub shadow_sp: u64,
-    /// The slot's generation at freeze (recycling step 2): re-seeded on thaw so a guest handle to a
-    /// recycled fiber still resolves. 0 for a non-recycled fiber. Mirrors `temen_interp::FrozenFiber`
-    /// (48-bit field — the `i64` handle's generation bits).
-    pub generation: u64,
-    /// #1538 — the fiber's last `suspend` value was already consumed by a resumer that ran on, so a
-    /// thaw claim delivers its argument at the rewound `suspend` instead of re-parking. Mirrors
-    /// `temen_interp::FrozenFiber::consumed`.
-    pub consumed: bool,
-}
+/// The residue records a durable freeze writes and a thaw re-creates: one definition for every engine
+/// (#3034, INVARIANTS #13).
+pub use temen_ir::thaw::{FrozenFiber, FrozenVCpu};
 
-impl FrozenFiber {
-    /// #1684 — a free slot (its fiber finished): only its generation rides.
-    pub fn free(slot: usize, generation: u64) -> FrozenFiber {
-        FrozenFiber {
-            slot,
-            func: 0,
-            arg0: 0,
-            shadow_sp: 0,
-            generation,
-            consumed: false,
-        }
-    }
-
-    /// Whether this is a [`FrozenFiber::free`] slot.
-    pub fn is_free(&self) -> bool {
-        self.shadow_sp == 0
-    }
-}
-
-/// The host-side residue of a **spawned vCPU** (a `thread.spawn` child) flattened by a multi-vCPU
-/// durable freeze (DURABILITY.md §12.8 slice 3.3) — the JIT mirror of `temen_interp::FrozenVCpu`. Its
-/// continuation lives in its own in-window shadow region (`shadow_region_base(task)`); this carries
-/// what a thaw must re-attach: its task id (= shadow context index + spawn order), entry function +
-/// spawn args (to re-enter it), and the flattened shadow-SP extent. A multi-vCPU **freeze** returns
-/// one per flattened child; a **thaw** is handed them back to re-create the children.
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub struct FrozenVCpu {
-    pub task: usize,
-    /// The task that **spawned** this child (slice 3.4: nested spawns) — `0` for the root's direct
-    /// children, a child's task for a grandchild. Thaw rebuilds the per-parent join tables from this so
-    /// a grandchild's reloaded handle resolves in its parent's table. Mirror of `temen_interp`'s field.
-    pub parent_task: usize,
-    /// Its slot in its domain's child table (#1685, #2043) — the thaw re-attaches it there. `0` for
-    /// one no handle names ([`Self::joinable`]).
-    pub slot: usize,
-    /// #2043 — whether a handle still names it: `false` for one its spawner detached, which rides at
-    /// slot `0` and thaws with no handle naming it. Mirror of `temen_interp`'s field.
-    pub joinable: bool,
-    pub func: i32,
-    pub args: Vec<i64>,
-    pub shadow_sp: u64,
-    /// §12.8 4A.5 follow-up A: `Some(result)` for a **completed-but-unjoined** concurrent child — one
-    /// that finished before the freeze point, so its `thread.join` result must survive in the snapshot
-    /// (the host-side Done cell isn't captured otherwise). The thaw delivers this result into the
-    /// spawner's join table **without re-running** the child (no double side effects). `None` for a
-    /// normal frozen child (re-spawned + rewound on thaw); `shadow_sp`/`func`/`args` are then inert.
-    pub completed_result: Option<i64>,
-}
+/// #3034 — a thaw seed for this engine: a residue the thaw pass admitted
+/// ([`temen_ir::thaw::validate`]), each live detached child's payload built for this runtime. It
+/// carries no fork twins: this engine does not re-create them (#3098), so a thaw holding one is
+/// refused ([`CompiledModule::set_durable`]) and the embedder thaws on the tree-walker.
+pub type JitThaw = temen_ir::thaw::Thaw<JitDetached, ()>;
 
 /// The durable snapshot's window-image page granularity (must match `temen-snapshot`'s `PAGE` /
 /// `temen-interp`'s `DURABLE_SNAPSHOT_PAGE`): a restored protection map has one entry per this many
@@ -2204,6 +2140,26 @@ pub struct DurableResidue {
     pub children: Vec<u32>,
 }
 
+impl DurableResidue {
+    /// #3034 — this freeze's residue as a thaw residue, for the thaw pass to admit
+    /// ([`temen_ir::thaw::validate`]) before any engine thaws it.
+    pub fn into_raw<D, T>(self) -> temen_ir::thaw::RawResidue<D, T> {
+        let DurableResidue {
+            fibers,
+            vcpus,
+            root_sp,
+            children,
+        } = self;
+        temen_ir::thaw::RawResidue {
+            fibers,
+            vcpus,
+            root_sp,
+            children,
+            ..Default::default()
+        }
+    }
+}
+
 /// #1361 step 4 — a **detached** child a durable JIT freeze reached: what the embedder needs to put
 /// it in the parent's artifact (as the interpreter's `CapturedDetached`) or to tell why it cannot.
 pub struct DetachedHarvest {
@@ -2226,6 +2182,9 @@ pub struct DetachedHarvest {
     /// #2465 — whether its parent can still join it: `false` once the parent detached it (op 10),
     /// which the harvest carries only when it unwound for the freeze.
     pub joinable: bool,
+    /// #3034, owner decision 25 — the freeze could not carry it (its window could not be read):
+    /// a refusal, which fails the run, never the child's own trap.
+    pub refused: bool,
 }
 
 /// #1361 step 4 — what a durable detached child that unwound for a freeze left for the harvest.
@@ -2240,19 +2199,93 @@ pub struct DetachedCapture {
     pub residue: DurableResidue,
 }
 
-/// #1361 step 4 — a detached child a JIT **thaw** re-creates in its parent's nursery, at the join
-/// slot it was spawned at (see [`CompiledModule::set_detached_seed`]).
-pub enum DetachedSeed {
+/// #1361 step 4 — a live detached child of a [`JitThaw`], as its embedder prepared it.
+pub enum JitDetached {
+    /// Re-launched under `REWINDING` at its join slot.
+    Relaunch(Box<CapturedSeed>),
+    /// #2430 — one its embedder cannot re-launch (its program no longer binds, or the pools have
+    /// no room for its lease): one its parent can join ends `ThreadFault`, as on the interpreter.
+    Dropped,
+}
+
+/// #1361 step 4 — a detached child a JIT thaw re-creates in its parent's nursery, at the join slot it
+/// was spawned at: the runtime's form of a [`JitThaw`]'s detached children.
+pub(crate) enum DetachedSeed {
     /// One the freeze captured live: re-launched under `REWINDING`.
-    Captured(Box<CapturedSeed>),
-    /// #2041 — one that had completed but was not joined: its `join` outcome, which the parent's
-    /// rewound `join` reloads, as the interpreter's thaw delivers it.
+    Captured {
+        slot: usize,
+        /// #2465 — whether its parent can join it; `false` re-files it detached (op 10).
+        joinable: bool,
+        seed: Box<CapturedSeed>,
+    },
+    /// #2041 — one that had completed but was not joined, or one its embedder dropped: its `join`
+    /// outcome, which the parent's rewound `join` reloads, as the interpreter's thaw delivers it.
     Completed { slot: usize, result: i64, trap: i64 },
 }
 
-/// #1361 step 4 — what a captured detached child's re-launch needs.
+/// #3034 — a [`JitThaw`] taken apart for this runtime: what a domain re-creates before its root
+/// re-enters under `REWINDING`.
+pub(crate) struct Seeded {
+    pub(crate) residue: DurableResidue,
+    pub(crate) detached: Vec<DetachedSeed>,
+}
+
+/// Take `thaw` apart for this runtime. `Err` (it, untouched) for one holding a fork twin, which this
+/// engine does not re-create (#3098): the caller refuses the thaw whole, never part of it (#1690).
+pub(crate) fn seeded(thaw: JitThaw) -> Result<Seeded, Box<JitThaw>> {
+    if !thaw.parts().twins.is_empty() || !thaw.parts().exited_twins.is_empty() {
+        return Err(Box::new(thaw));
+    }
+    // Every part of the residue, by name: one this engine does not consume does not compile.
+    let temen_ir::thaw::RawResidue {
+        fibers,
+        vcpus,
+        root_sp,
+        children,
+        detached,
+        live_detached,
+        twins,
+        exited_twins,
+    } = thaw.into_parts();
+    debug_assert!(twins.is_empty() && exited_twins.is_empty(), "checked above");
+    let completed = detached.into_iter().map(|d| {
+        let (result, trap) = match d.completed_result {
+            Ok(v) => (v, 0),
+            Err(t) => (0, t),
+        };
+        DetachedSeed::Completed {
+            slot: d.slot,
+            result,
+            trap,
+        }
+    });
+    let live = live_detached.into_iter().filter_map(|l| match l.payload {
+        JitDetached::Relaunch(seed) => Some(DetachedSeed::Captured {
+            slot: l.slot,
+            joinable: l.joinable,
+            seed,
+        }),
+        JitDetached::Dropped => l.joinable.then_some(DetachedSeed::Completed {
+            slot: l.slot,
+            result: 0,
+            trap: TrapKind::ThreadFault as i64,
+        }),
+    });
+    Ok(Seeded {
+        residue: DurableResidue {
+            fibers,
+            vcpus,
+            root_sp,
+            children,
+        },
+        // Live children first, as the embedder seeded them before.
+        detached: live.chain(completed).collect(),
+    })
+}
+
+/// #1361 step 4 — what a captured detached child's re-launch needs. Its join slot and whether its parent
+/// can join it are the admitted keys beside it ([`temen_ir::thaw::LiveDetached`]).
 pub struct CapturedSeed {
-    pub slot: usize,
     pub mapped_log2: u8,
     pub reserved_log2: u8,
     /// Its own program, resolved by the embedder from the module digest the artifact names.
@@ -2277,15 +2310,10 @@ pub struct CapturedSeed {
     /// the budget that paid, the bytes it paid, and the bound on its runs (#2268). Handed back when
     /// the thawed child ends. `None` when the parent holds no handle on that budget.
     pub window: Option<(i32, u64, u64)>,
-    /// #2010 — its own children, re-created in its nursery before it runs.
-    pub children: Vec<DetachedSeed>,
-    /// Its [`DetachedCapture::residue`], re-created before its root runs: its fibers re-seeded in its
-    /// table (#2031), and its `thread.spawn` vCPUs re-spawned into its domain, each rewinding from its
-    /// own extent (#2010).
-    pub residue: DurableResidue,
-    /// #2465 — whether its parent can join it; `false` re-files it detached (op 10), as the cut
-    /// left it.
-    pub joinable: bool,
+    /// Its own thaw, admitted against its own program: re-created before its root runs — its fibers
+    /// re-seeded in its table (#2031), its `thread.spawn` vCPUs re-spawned into its domain, each
+    /// rewinding from its own extent (#2010), and its own detached children in its nursery.
+    pub residue: JitThaw,
 }
 
 /// #1768 — the embedder's side of a **fork** on the JIT (FORK.md §9.5): fork is durable freeze →
@@ -2435,12 +2463,12 @@ unsafe fn arm_fork_rewind(base: *mut u8, shadow: temen_ir::durable_abi::ShadowAr
 }
 
 /// How a durable JIT run is driven beyond its residue.
-#[derive(Clone, Default)]
+#[derive(Default)]
 pub struct DurableRun {
     /// Per-page protections to re-establish on a thawed window (§12.3); empty on a freeze.
     pub init_prots: Vec<WindowProt>,
     /// The thaw seed (empty on a freeze or an ordinary durable run).
-    pub seed: DurableResidue,
+    pub seed: JitThaw,
     /// An async freeze controller (Phase-4 Slice A): a controller thread's
     /// [`FreezeController::request_freeze`] lands mid-run. A child spawned while `NORMAL` runs on its
     /// own OS thread with its own reserved shadow context, controller or not (#2543), so an async freeze
@@ -2489,7 +2517,7 @@ pub fn compile_and_run_durable(
             prots: run.init_prots,
             tail: Vec::new(),
         });
-        cm.set_durable(run.seed);
+        cm.set_durable(run.seed)?;
         cm.freeze_ctl = run.freeze;
         let (outcome, win) = cm.run(args, Some(init_mem), Some(SNAP_CAP))?;
         Ok((outcome, win, cm.take_durable_residue()))
@@ -5052,15 +5080,44 @@ impl CompiledModule {
     /// caller's, so an embedder like `temen_run::jit_cap_run` needs no second durable entry point.
     /// `seed` is the thaw seed: the residue to re-create before a `REWINDING` run (empty for a freeze
     /// or an ordinary durable run). The freeze residue comes back via [`Self::take_durable_residue`].
-    pub fn set_durable(&mut self, seed: DurableResidue) {
-        self.seed.fibers = seed.fibers;
-        self.seed.vcpus = seed.vcpus;
-        self.seed.root_sp = seed.root_sp;
+    pub fn set_durable(&mut self, seed: JitThaw) -> Result<(), JitError> {
+        let Ok(Seeded { residue, detached }) = seeded(seed) else {
+            return Err(JitError::Unsupported(
+                "durable JIT thaw: a fork twin the JIT cannot re-create",
+            ));
+        };
+        self.seed.fibers = residue.fibers;
+        self.seed.vcpus = residue.vcpus;
+        self.seed.root_sp = residue.root_sp;
         // #2043 — the domain's child table as its freeze left it, which the run installs before the
         // thaw pins its records back: a spent handle stays spent, and the next spawn takes the handle
         // the uninterrupted run would have (#2619).
-        self.seed.children = Some(seed.children);
+        self.seed.children = Some(residue.children);
+        // #1361 step 4 — the detached children it re-creates, each at its recorded join slot, before
+        // the root re-enters under `REWINDING`.
+        self.seed.detached = detached;
         self.durable = true;
+        Ok(())
+    }
+
+    /// #3034 — test infrastructure only (the `thaw-backstop-tests` feature, which no product build
+    /// turns on): make the next run a durable thaw seeded with `residue` as it stands, without the
+    /// pass, so a test reaches the refusals behind it (`tests/thaw_backstops.rs`).
+    #[cfg(feature = "thaw-backstop-tests")]
+    #[doc(hidden)]
+    pub fn seed_unadmitted(&mut self, residue: DurableResidue) {
+        self.seed.fibers = residue.fibers;
+        self.seed.vcpus = residue.vcpus;
+        self.seed.root_sp = residue.root_sp;
+        self.seed.children = Some(residue.children);
+        self.durable = true;
+    }
+
+    /// #3034 — the record kinds a thaw run of this instance re-creates: fibers (it stood up a fiber
+    /// runtime), vCPUs (a thread domain) and detached children (a nursery). An embedder declines a
+    /// residue with another kind whole, before it takes it.
+    pub fn reseeds(&self) -> [bool; 3] {
+        [self.fibers, self.threads, self.makes_nursery()]
     }
 
     /// The residue the last durable run's freeze produced (empty unless a freeze caught something);
@@ -5073,12 +5130,6 @@ impl CompiledModule {
     /// [`DetachedHarvest`]); taken. Each carries a powerbox ref the caller now owns.
     pub fn take_detached_harvest(&mut self) -> Vec<DetachedHarvest> {
         std::mem::take(&mut self.detached_out)
-    }
-
-    /// #1361 step 4 — the detached children the next (thaw) run re-creates, each at its recorded join
-    /// slot, before the root re-enters under `REWINDING`.
-    pub fn set_detached_seed(&mut self, seed: Vec<DetachedSeed>) {
-        self.seed.detached = seed;
     }
 
     /// Run an **incrementally defined** function (a trampoline pointer returned by
@@ -5858,7 +5909,13 @@ impl CompiledModule {
             // §12.8 4A.5: the root's shadow-SP word lives in its own region (context 0); children no
             // longer share it.
             let root_sp = fiber_rt::read_shadow_sp(mem_base as u64, (*this).shadow.region_base(0));
-            (*this).frozen.root_sp = (root_sp != 0).then_some(root_sp);
+            // #3034 — the root's extent is guest memory, checked as it is read: one outside its region
+            // (a zero word among them) is the guest's fault, and the run ends `Unreachable`.
+            if temen_ir::thaw::extent_fits((*this).shadow, 0, root_sp) {
+                (*this).frozen.root_sp = Some(root_sp);
+            } else {
+                vm.raise(TrapKind::Unreachable as i64);
+            }
             // Slice 3.3: each `thread.spawn` during the freeze *deferred* its child (recording the
             // request, returning the handle) so the root could unwind first — matching the interp,
             // which enqueues a child and runs it only after the spawning vCPU yields. Now that the
@@ -10679,6 +10736,22 @@ fn fiber_func_type() -> FuncType {
     FuncType {
         params: vec![ValType::I64, ValType::I64],
         results: vec![ValType::I64],
+    }
+}
+
+/// #3034 — the record kinds a durable §14 child running `m` re-creates at a thaw, as
+/// [`CompiledModule::reseeds`] says for a root: fibers when its code uses `cont.*` or `gc.roots` (it
+/// then has the fiber runtime), vCPUs (a durable child always stands up a domain), and detached
+/// children when it holds an `Instantiator` (its nursery).
+pub fn child_reseeds(m: &IrModule) -> [bool; 3] {
+    #[cfg(fiber_rt)]
+    {
+        [module_uses_fibers(m), true, module_uses_instantiator(m)]
+    }
+    #[cfg(not(fiber_rt))]
+    {
+        let _ = m;
+        [false; 3]
     }
 }
 

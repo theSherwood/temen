@@ -538,7 +538,7 @@ pub fn servicer_twin_rides(at: TwinAtCut, wait: Wait) {
     let expect = match at {
         TwinAtCut::Live | TwinAtCut::LiveWithChild => (vec![3], vec![]),
         TwinAtCut::Exited => exited(Ok(7)),
-        TwinAtCut::Crashed => exited(Err(temen_interp::Trap::Unreachable)),
+        TwinAtCut::Crashed => exited(Err(temen_interp::Trap::Unreachable.code())),
     };
     // Frozen twice, on one lane: from a fresh run, then from its thaw, where the twin is the one the
     // thaw re-created or filed again.

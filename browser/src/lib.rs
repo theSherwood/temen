@@ -9459,6 +9459,12 @@ pub extern "C" fn temen_durable_thaw_resume(
         return 0;
     }
     let (t_space, t_clk) = (caps[0].handle(), caps[1].handle());
+    // #3034 — the bytecode engine re-creates a residue's fibers and nothing else: one with more
+    // (spawned vCPUs, detached children, fork twins) is refused whole, never thawed in part.
+    if !bytecode::admits_thaw(&host) {
+        set(STATUS_UNSUPPORTED);
+        return 0;
+    }
     let Some(prog) = bytecode::SharedProgram::compile(&m) else {
         set(STATUS_UNSUPPORTED);
         return 0;
@@ -10688,6 +10694,11 @@ fn emit_regions(
     // #1009 M1: size the shared table to the guest (see `tierup_table_log2`), consistently across
     // the emit, the host's domain table, the slot mirror, the unit emitter, and the driver.
     let table_log2 = tierup_table_log2(m.funcs.len());
+    // #3034 — no `Jit` grant reserves more than `MAX_TABLE_LOG2`: a guest that would need more
+    // declines the tier-up.
+    if table_log2 > temen_ir::MAX_TABLE_LOG2 {
+        return Err(STATUS_UNSUPPORTED);
+    }
     // #1009: a rodata guest (a `readonly` data segment — every real on-ramp card lays out its
     // `.rodata` this way) emits the shared table PAGED: one durable `Ro` page makes the window
     // non-one-bound-representable, so the per-call #717 `scalar_extent` sync would decline EVERY

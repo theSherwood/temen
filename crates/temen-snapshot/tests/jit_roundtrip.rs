@@ -139,6 +139,59 @@ fn jit_install_occupancy_round_trips() {
     );
 }
 
+/// #3034 — a re-applied `install` is one the guest's own made: into a padding slot of the dispatch
+/// table, past the module's functions, naming a unit its domain holds. On `b099bbb` an artifact could
+/// place a unit over a module function's slot (slot 0 here): the next run's `call.dyn` of that slot
+/// reached the unit's code instead of the module function the slot names. A slot past the table, or a
+/// unit the domain does not hold, was skipped silently. Each is now refused.
+#[test]
+fn an_install_no_run_makes_is_refused() {
+    let module = gate_module();
+    let refused = |slot: u32, unit: Option<u32>| {
+        let mut host = Host::new();
+        host.set_jit_validator(validator);
+        let dom = host.grant_jit_with_table(Some(SIZE_LOG2), 4); // 16 slots, function 0 in slot 0
+        let c0 = host.jit_compile(dom, &unit_blob(42)).unwrap().unwrap();
+        host.jit_record_install(c0.domain, slot, unit.unwrap_or(c0.unit));
+        let artifact = freeze(&module, &vec![0u8; WINDOW], &host).expect("freeze");
+        matches!(
+            restore(&artifact, &module, &mut Host::new()),
+            Err(RestoreError::Malformed)
+        )
+    };
+    assert!(!refused(3, None), "a padding slot, as a run installs");
+    assert!(refused(0, None), "a module function's slot");
+    assert!(refused(16, None), "a slot past the table");
+    assert!(refused(3, Some(5)), "a unit the domain does not hold");
+}
+
+/// #3102 — the dispatch table is the run's one, so an `uninstall` through any domain's handle
+/// clears a slot another domain filled, and a later `install` through either takes it again. Each
+/// slot has one record at the freeze: the restore admits the artifact, and only the new install is
+/// re-applied. On `f2aff3d` the uninstall forgot the slot only in its own domain: the slot carried
+/// two records, and the restore refused a real run's artifact as `Malformed`.
+#[test]
+fn a_slot_uninstalled_through_another_domain_and_reinstalled_has_one_record() {
+    let module = gate_module();
+    let mut host = Host::new();
+    host.set_jit_validator(validator);
+    let a = host.grant_jit_with_table(Some(SIZE_LOG2), 4);
+    let b = host.grant_jit_with_table(Some(SIZE_LOG2), 4);
+    let ca = host.jit_compile(a, &unit_blob(1)).unwrap().unwrap();
+    let cb = host.jit_compile(b, &unit_blob(2)).unwrap().unwrap();
+    // What the install and uninstall arms record: A installs at 3, B uninstalls 3 and installs there.
+    host.jit_record_install(ca.domain, 3, ca.unit);
+    host.jit_forget_install(3);
+    host.jit_record_install(cb.domain, 3, cb.unit);
+    assert_eq!(host.jit_installs(ca.domain), vec![], "A's install is gone");
+
+    let artifact = freeze(&module, &vec![0u8; WINDOW], &host).expect("freeze");
+    let mut thost = Host::new();
+    restore(&artifact, &module, &mut thost).expect("a real run's artifact restores");
+    assert_eq!(thost.jit_installs(ca.domain), vec![]);
+    assert_eq!(thost.jit_installs(cb.domain), vec![(3, cb.unit)]);
+}
+
 /// A JIT-free durable domain's artifact is unaffected by Slice 2: Section 5 is elided, so it stays
 /// byte-identical across a round-trip (the `!jit.is_empty()` guard).
 #[test]
@@ -203,4 +256,33 @@ fn codec_refuses_a_tampered_unit() {
         Err(RestoreError::JitReconstruct) | Err(RestoreError::Malformed) => {}
         other => panic!("expected a fail-closed refusal, got {other:?}"),
     }
+}
+
+/// #3034 — a `Jit` grant reserves at most `2^MAX_TABLE_LOG2` dispatch-table slots: every engine builds
+/// the table eagerly. The ceiling itself is granted, and its artifact restores.
+#[test]
+fn a_grant_at_the_table_ceiling_is_granted_and_restores() {
+    let module = gate_module();
+    let mut host = Host::new();
+    host.set_jit_validator(validator);
+    host.grant_jit_with_table(Some(SIZE_LOG2), temen_ir::MAX_TABLE_LOG2);
+    let artifact = freeze(&module, &vec![0u8; WINDOW], &host).expect("freeze");
+    let mut thost = Host::new();
+    restore(&artifact, &module, &mut thost).expect("restore");
+    assert_eq!(thost.jit_table_log2(), temen_ir::MAX_TABLE_LOG2);
+}
+
+/// One past the ceiling is an embedder's precondition broken, as a full handle table is.
+#[test]
+#[should_panic(expected = "MAX_TABLE_LOG2")]
+fn a_grant_past_the_table_ceiling_panics() {
+    let mut host = Host::new();
+    host.grant_jit_with_table(Some(SIZE_LOG2), temen_ir::MAX_TABLE_LOG2 + 1);
+}
+
+/// And so does a reservation set past it.
+#[test]
+#[should_panic(expected = "MAX_TABLE_LOG2")]
+fn a_reservation_past_the_table_ceiling_panics() {
+    Host::new().set_jit_table_log2(temen_ir::MAX_TABLE_LOG2 + 1);
 }

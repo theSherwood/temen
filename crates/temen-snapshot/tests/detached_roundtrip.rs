@@ -11,8 +11,9 @@
 use std::sync::{Arc, Mutex};
 use temen_durable::{init_durable_window, transform_module, write_state, STATE_UNWINDING};
 use temen_interp::{
-    module_digest, run_capture_reserved_with_host, CapturedDetached, CapturedProt, DetachedLaunch,
-    DurableBinding, Host, Lease, MemLayout, StreamRole, ThawedDetached, Value, WINDOW_RUNS,
+    detached_launch, module_digest, run_capture_reserved_with_host, CapturedDetached, CapturedProt,
+    DetachedLaunch, DurableBinding, Host, Lease, LiveDetached, MemLayout, Residue, StreamRole,
+    Value, WINDOW_RUNS,
 };
 use temen_ir::durable_abi::ShadowArena;
 use temen_ir::Module;
@@ -36,13 +37,27 @@ fn instrument(src: &str) -> Module {
     inst
 }
 
+/// Returns 7; on a path it never takes, it spawns a detached child (#3034: the cuts below carry
+/// detached children, which only a module with an `Instantiator` call makes).
 fn parent() -> Module {
     instrument(
         "memory 17 shadow 16448 65536
 func (i64) -> (i64) {
 block 0 (v0: i64) {
+  vz = i64.const 0
+  vc = i64.eq v0 vz
+  br_if vc 1() 2(v0)
+}
+block 1 () {
   v1 = i64.const 7
   return v1
+}
+block 2 (vi: i64) {
+  vh = i32.wrap_i64 vi
+  vrp = i64.const 0
+  vs = call.cap 6 17 (i64) -> (i32) vh (vrp)
+  vs64 = i64.extend_i32_u vs
+  return vs64
   }
 }
 ",
@@ -128,7 +143,7 @@ fn parent_with(
     host.set_durable(true);
     host.grant_durable_module(c);
     // #2043 — its child table: slot 0's child spent, slot 1 the captured one's.
-    host.set_child_generations(vec![1, 1]);
+    children(&mut host, vec![1, 1]);
     host.set_captured_detached(vec![CapturedDetached {
         parent_task: 0,
         slot: 1,
@@ -148,16 +163,35 @@ fn freeze(p: &Module, win: &[u8], host: &Host) -> Result<Vec<u8>, FreezeError> {
 }
 
 /// The restored child re-captured, so the tree can be frozen again from what restore produced.
-fn recaptured(t: ThawedDetached, c: &Module) -> CapturedDetached {
+fn recaptured(t: LiveDetached, c: &Module) -> CapturedDetached {
+    let launch = detached_launch(&t);
     CapturedDetached {
         parent_task: t.parent_task,
         slot: t.slot,
-        window: t.window,
-        reserved_log2: t.reserved_log2,
-        host: Arc::new(Mutex::new(t.host)),
+        window: t.payload.window,
+        reserved_log2: t.payload.reserved_log2,
+        host: Arc::new(Mutex::new(t.payload.host)),
         module: Arc::new(c.clone()),
-        launch: t.launch,
+        launch,
     }
+}
+
+/// #2043 — the parent's child table, as a hand-assembled cut gives it (#3034: through the thaw pass).
+fn children(host: &mut Host, generations: Vec<u32>) {
+    host.admit_thaw(
+        &parent(),
+        Residue {
+            children: generations,
+            ..Residue::default()
+        },
+    )
+    .expect("a child table a run makes");
+}
+
+/// The live detached children a restore left on `host`, and its child table.
+fn thawed(host: &mut Host) -> (Vec<LiveDetached>, Vec<u32>) {
+    let r = host.take_residue();
+    (r.live_detached, r.children)
 }
 
 #[test]
@@ -176,20 +210,24 @@ fn a_live_detached_child_round_trips_through_its_parents_artifact() {
     );
     assert_eq!(reserved, 17);
 
-    let thawed = rhost.take_thawed_detached();
+    let (thawed, generations) = thawed(&mut rhost);
     assert_eq!(thawed.len(), 1, "one child came back");
     let t = &thawed[0];
     assert_eq!((t.parent_task, t.slot), (0, 1));
-    assert_eq!(t.launch, launch(&c), "the launch record survives exactly");
-    assert_eq!(t.reserved_log2, 17);
+    assert_eq!(
+        detached_launch(t),
+        launch(&c),
+        "the launch record survives exactly"
+    );
+    assert_eq!(t.payload.reserved_log2, 17);
     let (orig_window, orig_host) = frozen_root(&c);
     assert_eq!(
-        t.window.bytes(),
+        t.payload.window.bytes(),
         orig_window.bytes(),
         "the child's image survives"
     );
     assert_eq!(
-        t.host.capture_durable_handles(),
+        t.payload.host.capture_durable_handles(),
         orig_host.capture_durable_handles(),
         "the child's handle table restored into the child's powerbox"
     );
@@ -203,7 +241,7 @@ fn a_live_detached_child_round_trips_through_its_parents_artifact() {
     let mut again = Host::new();
     again.set_durable(true);
     again.grant_durable_module(&c);
-    again.set_child_generations(rhost.child_generations().to_vec());
+    children(&mut again, generations);
     again.set_captured_detached(thawed.into_iter().map(|t| recaptured(t, &c)).collect());
     assert_eq!(freeze(&p, &win, &again).expect("re-freeze"), art);
 }
@@ -239,16 +277,16 @@ fn a_childs_inherited_stdout_rides_its_artifact_as_inherited() {
     rhost.set_durable(true);
     rhost.grant_durable_module(&c);
     restore_with_prots(&art, &p, &mut rhost).expect("restore");
-    let thawed = rhost.take_thawed_detached();
+    let (thawed, generations) = thawed(&mut rhost);
     assert!(
-        holds(&thawed[0].host),
+        holds(&thawed[0].payload.host),
         "restored, the stream is still inherited"
     );
 
     let mut again = Host::new();
     again.set_durable(true);
     again.grant_durable_module(&c);
-    again.set_child_generations(rhost.child_generations().to_vec());
+    children(&mut again, generations);
     again.set_captured_detached(thawed.into_iter().map(|t| recaptured(t, &c)).collect());
     assert_eq!(freeze(&p, &win, &again).expect("re-freeze"), art);
 }
@@ -277,8 +315,20 @@ type 1 interface { page: 0 }
 export 0 interface \"pager\" 1 { page: 1 }
 func (i64) -> (i64) {
 block 0 (v0: i64) {
+  vz = i64.const 0
+  vc = i64.eq v0 vz
+  br_if vc 1() 2(v0)
+}
+block 1 () {
   v1 = i64.const 7
   return v1
+}
+block 2 (vi: i64) {
+  vh = i32.wrap_i64 vi
+  vrp = i64.const 0
+  vs = call.cap 6 17 (i64) -> (i32) vh (vrp)
+  vs64 = i64.extend_i32_u vs
+  return vs64
   }
 }
 func (i64) -> (i64) {
@@ -311,10 +361,10 @@ fn a_paged_childs_pager_rides_its_launch_record() {
         let mut rhost = Host::new();
         rhost.set_durable(true);
         rhost.grant_durable_module(&c);
-        restore_with_prots(art, &p, &mut rhost).map(|_| rhost.take_thawed_detached())
+        restore_with_prots(art, &p, &mut rhost).map(|_| thawed(&mut rhost).0)
     };
     let thawed = restore(&paged(0)).expect("restore");
-    assert_eq!(thawed[0].launch.pager, Some(0), "the pager survives");
+    assert_eq!(thawed[0].payload.pager, Some(0), "the pager survives");
     assert_eq!(
         restore(&paged(1)).map(|_| ()),
         Err(RestoreError::Malformed),
@@ -342,11 +392,11 @@ fn a_childs_join_claim_rides_its_launch_record() {
         let mut rhost = Host::new();
         rhost.set_durable(true);
         rhost.grant_durable_module(&c);
-        restore_with_prots(art, &p, &mut rhost).map(|_| rhost.take_thawed_detached())
+        restore_with_prots(art, &p, &mut rhost).map(|_| thawed(&mut rhost).0)
     };
     for joinable in [true, false] {
         let thawed = restore(&art(joinable)).expect("restore");
-        assert_eq!(thawed[0].launch.joinable, joinable, "the claim survives");
+        assert_eq!(thawed[0].joinable, joinable, "the claim survives");
     }
     let (claimed, detached) = (art(true), art(false));
     let at: Vec<usize> = (0..claimed.len())
@@ -392,7 +442,7 @@ fn a_child_whose_restore_fails_refuses_the_parents() {
     rhost.set_named_cap_registrar(Box::new(temen_fs::regrant_vm_fs));
     restore_with_prots(&art, &p, &mut rhost)
         .expect("a registrar serving `vm_fs` restores the tree");
-    assert_eq!(rhost.take_thawed_detached().len(), 1);
+    assert_eq!(thawed(&mut rhost).0.len(), 1);
 }
 
 /// #1944 slice 2: a detached child's `"budget"` is its spawner's node, so parent and child share a
@@ -424,7 +474,7 @@ fn a_budget_node_the_parent_and_child_share_is_one_node_after_a_thaw() {
         .cap_call(cap_id::BUDGET, 0, cb, &[-1, 1 << 16, -1], 1, None)
         .unwrap()[0] as i32;
     assert!(mine >= 0, "the child splits a node of its own");
-    host.set_child_generations(vec![1, 1]);
+    children(&mut host, vec![1, 1]);
     host.set_captured_detached(vec![CapturedDetached {
         parent_task: 0,
         slot: 1,
@@ -442,8 +492,8 @@ fn a_budget_node_the_parent_and_child_share_is_one_node_after_a_thaw() {
     rhost.set_durable(true);
     rhost.grant_durable_module(&c);
     restore_with_prots(&art, &p, &mut rhost).expect("restore");
-    let mut thawed = rhost.take_thawed_detached();
-    let t = &mut thawed[0];
+    let (mut thawed, generations) = thawed(&mut rhost);
+    let t = &mut thawed[0].payload;
     assert_eq!(
         read(&mut rhost, paid),
         Ok(vec![1 << 17]),
@@ -470,6 +520,7 @@ fn a_budget_node_the_parent_and_child_share_is_one_node_after_a_thaw() {
     t.host.budget_mem_give(mine, 1 << 16);
 
     // §12.6 canonicality: the restored tree re-freezes to the same bytes.
+    children(&mut rhost, generations);
     rhost.set_captured_detached(thawed.into_iter().map(|t| recaptured(t, &c)).collect());
     assert_eq!(freeze(&p, &win, &rhost).expect("re-freeze"), art);
 }

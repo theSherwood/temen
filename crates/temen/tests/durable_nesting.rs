@@ -221,7 +221,15 @@ fn freeze_after_detached_child_joined_thaws_and_reloads_the_join_result() {
     let mut twin = fsnap.clone();
     begin_thaw(&mut twin, TEST_ARENA, 0);
     let (mut thost, targs) = detached_powerbox();
-    thost.set_frozen_fibers(fhost.frozen_fibers().to_vec());
+    thost
+        .admit_thaw(
+            &parent,
+            temen_interp::Residue {
+                fibers: fhost.frozen_fibers().to_vec(),
+                ..Default::default()
+            },
+        )
+        .expect("a residue a run made");
     let mut fuel = 5_000_000u64;
     let (tr, tsnap) =
         run_capture_reserved_with_host(&parent, 0, &targs, &mut fuel, &twin, SIZE_LOG2, &mut thost);

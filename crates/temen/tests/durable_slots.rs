@@ -526,12 +526,17 @@ fn run(
     // Granted second, so its handle is [`INSTANTIATOR`]: what [`DETACHED_THREAD`] detaches through.
     assert_eq!(h.grant_instantiator(), INSTANTIATOR);
     if let (Engine::Interp | Engine::Bytecode, Some(r)) = (engine, seed) {
-        h.set_frozen_vcpus(r.vcpus.clone());
-        h.set_frozen_fibers(r.fibers.clone());
-        if let Some(sp) = r.root_sp {
-            h.set_frozen_root_sp(sp);
-        }
-        h.set_child_generations(r.children.clone());
+        h.admit_thaw(
+            inst,
+            temen_interp::Residue {
+                fibers: r.fibers.clone(),
+                vcpus: r.vcpus.clone(),
+                root_sp: r.root_sp,
+                children: r.children.clone(),
+                ..Default::default()
+            },
+        )
+        .expect("a residue a run made");
     }
     let mut fuel = 1_000_000u64;
     let args = [Value::I32(clk)];
@@ -572,7 +577,7 @@ fn run(
 mod jit {
     use super::*;
     use std::sync::Mutex;
-    use temen_jit::{compile_and_run_durable, DurableResidue, DurableRun, JitError, JitOutcome};
+    use temen_jit::{compile_and_run_durable, DurableRun, JitError, JitOutcome};
     use temen_run::CapCtx;
 
     pub type Out = (Result<i64, String>, Vec<u8>, Residue);
@@ -585,16 +590,20 @@ mod jit {
         seed: Option<&Residue>,
     ) -> Option<Out> {
         let seed = match seed {
-            Some(r) => DurableResidue {
-                vcpus: r.vcpus.iter().map(to_jit).collect(),
-                fibers: r.fibers.iter().map(fiber_to_jit).collect(),
-                root_sp: r.root_sp,
-                children: r.children.clone(),
-            },
-            None => DurableResidue {
-                root_sp: Some(arena(inst).region_base(0)),
-                ..Default::default()
-            },
+            Some(r) => temen_ir::thaw::validate(
+                inst,
+                false,
+                0,
+                temen_ir::thaw::RawResidue {
+                    vcpus: r.vcpus.clone(),
+                    fibers: r.fibers.clone(),
+                    root_sp: r.root_sp,
+                    children: r.children.clone(),
+                    ..Default::default()
+                },
+            )
+            .expect("a residue a run made"),
+            None => temen_jit::JitThaw::default(),
         };
         // The guests spawn vCPUs that `call.cap` from their own OS threads: the host goes behind the
         // serialized thunk's lock for the run, and comes back after (#1166).
@@ -625,60 +634,12 @@ mod jit {
             other => Err(format!("{other:?}")),
         };
         let residue = Residue {
-            vcpus: residue.vcpus.iter().map(to_interp).collect(),
-            fibers: residue.fibers.iter().map(fiber_to_interp).collect(),
+            vcpus: residue.vcpus.clone(),
+            fibers: residue.fibers.clone(),
             root_sp: residue.root_sp,
             children: residue.children,
         };
         Some((result, window, residue))
-    }
-
-    fn fiber_to_jit(f: &FrozenFiber) -> temen_jit::FrozenFiber {
-        temen_jit::FrozenFiber {
-            slot: f.slot,
-            func: f.func,
-            arg0: f.arg0,
-            shadow_sp: f.shadow_sp,
-            generation: f.generation,
-            consumed: f.consumed,
-        }
-    }
-
-    fn fiber_to_interp(f: &temen_jit::FrozenFiber) -> FrozenFiber {
-        FrozenFiber {
-            slot: f.slot,
-            func: f.func,
-            arg0: f.arg0,
-            shadow_sp: f.shadow_sp,
-            generation: f.generation,
-            consumed: f.consumed,
-        }
-    }
-
-    fn to_jit(v: &FrozenVCpu) -> temen_jit::FrozenVCpu {
-        temen_jit::FrozenVCpu {
-            task: v.task,
-            parent_task: v.parent_task,
-            slot: v.slot,
-            joinable: v.joinable,
-            func: v.func,
-            args: v.args.clone(),
-            shadow_sp: v.shadow_sp,
-            completed_result: v.completed_result,
-        }
-    }
-
-    fn to_interp(v: &temen_jit::FrozenVCpu) -> FrozenVCpu {
-        FrozenVCpu {
-            task: v.task,
-            parent_task: v.parent_task,
-            slot: v.slot,
-            joinable: v.joinable,
-            func: v.func,
-            args: v.args.clone(),
-            shadow_sp: v.shadow_sp,
-            completed_result: v.completed_result,
-        }
     }
 }
 

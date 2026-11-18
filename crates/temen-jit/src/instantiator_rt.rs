@@ -93,6 +93,9 @@ pub(crate) struct DurableCell {
     /// #2757 — the waker of the child's task, registered at its spawn
     /// ([`crate::child_exec::ChildExec::spawn`]) and fired by [`Self::ring`].
     waker: std::sync::OnceLock<crate::child_exec::TaskWaker>,
+    /// #3034, owner decision 25 — the freeze could not carry the child (the host could not read its
+    /// window, #2286, #2318): a refusal, which fails the run, not the child's own trap.
+    pub(crate) refused: std::sync::atomic::AtomicBool,
 }
 
 impl DurableCell {
@@ -110,6 +113,7 @@ impl DurableCell {
             reserved_log2,
             held_tail,
             waker: std::sync::OnceLock::new(),
+            refused: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -416,11 +420,23 @@ unsafe impl<T> Send for SendRaw<T> {}
 /// As [`Nursery::relaunch_detached`]'s seed: each holds two live counted refs, owned here.
 unsafe fn release_seed(release: crate::GrantChildReleaser, seed: crate::DetachedSeed) {
     // A completed child's seed holds no powerbox.
-    if let crate::DetachedSeed::Captured(seed) = seed {
+    if let crate::DetachedSeed::Captured { seed, .. } = seed {
         release(seed.child.ctx);
         release(seed.child.retained_ctx);
-        for c in seed.children {
-            release_seed(release, c);
+        release_thaw(release, seed.residue);
+    }
+}
+
+/// [`release_seed`] for the live children of a thaw that was not re-created.
+///
+/// # Safety
+/// As [`release_seed`].
+unsafe fn release_thaw(release: crate::GrantChildReleaser, thaw: crate::JitThaw) {
+    for l in thaw.into_parts().live_detached {
+        if let crate::JitDetached::Relaunch(seed) = l.payload {
+            release(seed.child.ctx);
+            release(seed.child.retained_ctx);
+            release_thaw(release, seed.residue);
         }
     }
 }
@@ -1276,6 +1292,7 @@ impl Nursery {
                     outcome: *c.done.state.lock().unwrap_or_else(|e| e.into_inner()),
                     children: Vec::new(),
                     joinable: true,
+                    refused: false,
                 });
                 return;
             }
@@ -1294,6 +1311,7 @@ impl Nursery {
                     .as_ref()
                     .map_or_else(Vec::new, |k| k.take_detached_harvest()),
                 joinable,
+                refused: d.refused.load(std::sync::atomic::Ordering::Acquire),
             });
         });
         out
@@ -1321,11 +1339,15 @@ impl Nursery {
                 self.seed_child_result(slot, result, trap);
                 return true;
             }
-            crate::DetachedSeed::Captured(seed) => *seed,
+            crate::DetachedSeed::Captured {
+                slot,
+                joinable,
+                seed,
+            } => (slot, joinable, *seed),
         };
-        let (slot, joinable) = (seed.slot, seed.joinable);
+        let (slot, joinable, seed) = seed;
         // SAFETY: as this function's.
-        let relaunched = self.relaunch_captured(seed);
+        let relaunched = self.relaunch_captured(slot, joinable, seed);
         if !relaunched && joinable {
             self.seed_child_result(slot, 0, TrapKind::ThreadFault as i64);
         }
@@ -1336,9 +1358,13 @@ impl Nursery {
     ///
     /// # Safety
     /// As [`Self::relaunch_detached`].
-    unsafe fn relaunch_captured(&self, seed: crate::CapturedSeed) -> bool {
+    unsafe fn relaunch_captured(
+        &self,
+        slot: usize,
+        joinable: bool,
+        seed: crate::CapturedSeed,
+    ) -> bool {
         let crate::CapturedSeed {
-            slot,
             mapped_log2,
             reserved_log2,
             funcs,
@@ -1351,15 +1377,28 @@ impl Nursery {
             tail,
             child: gc,
             window,
-            children,
             residue,
-            joinable,
         } = seed;
         let release_addr = self.grant_release.load(Ordering::Acquire);
         if release_addr == 0 {
             return false;
         }
         let release: crate::GrantChildReleaser = core::mem::transmute(release_addr);
+        // #3034 — its own thaw, as this runtime re-creates it. The embedder declined one holding a
+        // fork twin before seeding the parent ([`crate::seeded`]).
+        let (residue, children) = match crate::seeded(residue) {
+            Ok(s) => (s.residue, s.detached),
+            Err(thaw) => {
+                debug_assert!(
+                    false,
+                    "a detached child's thaw with a fork twin reached the JIT"
+                );
+                release(gc.ctx);
+                release(gc.retained_ctx);
+                release_thaw(release, *thaw);
+                return false;
+            }
+        };
         let thunk_addr = self.grant_thunk.load(Ordering::Acquire);
         let child_thunk: crate::CapThunk = if thunk_addr != 0 {
             core::mem::transmute::<usize, crate::CapThunk>(thunk_addr)

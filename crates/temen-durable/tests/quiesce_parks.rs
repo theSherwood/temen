@@ -208,11 +208,16 @@ fn a_join_parked_root_takes_the_freeze_its_child_was_re_admitted_for() {
     let mut h2 = Host::new();
     h2.set_durable(true);
     h2.set_self_module(&inst);
-    h2.set_frozen_vcpus(frozen);
-    h2.set_child_generations(h.child_generations().to_vec());
-    if let Some(sp) = root_sp {
-        h2.set_frozen_root_sp(sp);
-    }
+    h2.admit_thaw(
+        &inst,
+        temen_interp::Residue {
+            vcpus: frozen,
+            root_sp,
+            children: h.child_generations().to_vec(),
+            ..Default::default()
+        },
+    )
+    .expect("a residue a run made");
     let mut win2 = snap.clone();
     win2[66000..66004].copy_from_slice(&1i32.to_le_bytes());
     begin_thaw(&mut win2, TEST_ARENA, 0);
@@ -257,12 +262,17 @@ fn thaw_with_the_word_changed(inst: &Inst, snap: &[u8], h: &Host) -> Result<Vec<
     let mut h2 = Host::new();
     h2.set_durable(true);
     h2.set_self_module(inst);
-    h2.set_frozen_vcpus(h.frozen_vcpus().to_vec());
-    h2.set_child_generations(h.child_generations().to_vec());
-    if let Some(sp) = h.frozen_root_sp() {
-        h2.set_frozen_root_sp(sp);
-    }
-    h2.set_frozen_fibers(h.frozen_fibers().to_vec());
+    h2.admit_thaw(
+        inst,
+        temen_interp::Residue {
+            fibers: h.frozen_fibers().to_vec(),
+            vcpus: h.frozen_vcpus().to_vec(),
+            root_sp: h.frozen_root_sp(),
+            children: h.child_generations().to_vec(),
+            ..Default::default()
+        },
+    )
+    .expect("a residue a run made");
     let mut win = snap.to_vec();
     win[66000..66004].copy_from_slice(&1i32.to_le_bytes());
     begin_thaw(&mut win, TEST_ARENA, 0);
@@ -455,10 +465,15 @@ fn a_thawed_fiber_park_idles_and_freezes_again() {
     let mut h2 = Host::new();
     h2.set_durable(true);
     h2.set_self_module(&inst);
-    h2.set_frozen_fibers(h.frozen_fibers().to_vec());
-    if let Some(sp) = h.frozen_root_sp() {
-        h2.set_frozen_root_sp(sp);
-    }
+    h2.admit_thaw(
+        &inst,
+        temen_interp::Residue {
+            fibers: h.frozen_fibers().to_vec(),
+            root_sp: h.frozen_root_sp(),
+            ..Default::default()
+        },
+    )
+    .expect("a residue a run made");
     let mut win2 = snap.clone();
     begin_thaw(&mut win2, TEST_ARENA, 0);
     arm_freeze_on_quiesce(&mut win2, TEST_ARENA);
@@ -761,8 +776,7 @@ fn a_vcpu_stopped_before_the_freeze_is_brought_through_it() {
     assert_eq!(h.frozen_fibers().len(), 1, "the fiber is in the cut");
 
     stopper.cont();
-    let fibers = h.frozen_fibers().to_vec();
-    h.set_frozen_fibers(fibers);
+    // The freeze's residue stays on `h` for its thaw.
     let mut win2 = snap;
     begin_thaw(&mut win2, TEST_ARENA, 0);
     let mut fuel = 1_000_000u64;

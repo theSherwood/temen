@@ -751,8 +751,13 @@ pub mod durable_abi {
         /// may hold ([`Self::pool`]): the checked inverse of [`ShadowArena::region_base`]. `None`
         /// below the arena, past the pool, or for an arena with no regions. A thaw residue is
         /// untrusted (DURABILITY.md §4), and the context names the region a runtime writes.
+        ///
+        /// An extent lies in `(region_base, region_base + stride]`: never at a region's base (its SP
+        /// word sits there), and exactly at its end when the unwound chain fills the region, which
+        /// the transform's push check (`newsp > region_end` traps) admits. So the inverse floors
+        /// `sp - 1`, not `sp` (#3034).
         pub fn vcpu_of_sp(arena: ShadowArena, sp: u64) -> Option<usize> {
-            let off = sp.checked_sub(arena.base)?;
+            let off = sp.checked_sub(arena.base)?.checked_sub(1)?;
             let ctx = usize::try_from(off.checked_div(arena.stride)?).ok()?;
             (1..=Self::ceiling(arena)).contains(&ctx).then_some(ctx)
         }
@@ -7975,12 +7980,19 @@ pub struct Data {
     pub bytes: Vec<u8>,
 }
 
+/// #3034 — the largest `call.dyn` dispatch-table reservation (`log2` slots) a `Jit` grant may carry:
+/// 1,048,576 slots. Every engine builds its table `1 << log2` slots eagerly, so the grant setters
+/// refuse past it (an embedder precondition), a restore refuses an artifact that names more, and an
+/// embedder that would need more for a module declines it.
+pub const MAX_TABLE_LOG2: u8 = 20;
+
 pub mod cfg;
 pub mod dominance;
 pub mod handles;
 pub mod immediates;
 pub mod par;
 pub mod seams;
+pub mod thaw;
 pub use dominance::{Captured, Moves};
 
 /// **Compile-time confinement bound analysis** (§1a "guard-when-bounded", D36–D38/D63) — the shared,

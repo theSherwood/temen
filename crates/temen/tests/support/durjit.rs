@@ -33,9 +33,7 @@ use temen_durable::{
     arm_freeze_after, begin_thaw, init_durable_window, read_state, transform_module, write_state,
     STATE_NORMAL, STATE_UNWINDING,
 };
-use temen_interp::{
-    run_capture_reserved_with_host, FrozenFiber as InterpFrozen, Host, Trap, Value,
-};
+use temen_interp::{run_capture_reserved_with_host, Host, Trap, Value};
 use temen_ir::{Module, ValType};
 use temen_jit::{
     compile_and_run_capture_reserved_with_host, compile_and_run_durable, DurableResidue,
@@ -346,19 +344,15 @@ pub fn fuzz_recycle_fiber_one_xbackend(g: &mut Gen) {
     // ...and through the §12 codec to a byte-identical artifact (residue generation included).
     let art_i = freeze(&inst, &isnap, &ihost).expect("interp recycle freeze serializes");
     let mut jhost2 = Host::new();
-    jhost2.set_frozen_fibers(
-        jfibers
-            .iter()
-            .map(|f| InterpFrozen {
-                slot: f.slot,
-                func: f.func,
-                arg0: f.arg0,
-                shadow_sp: f.shadow_sp,
-                generation: f.generation,
-                consumed: f.consumed,
-            })
-            .collect(),
-    );
+    jhost2
+        .admit_thaw(
+            &inst,
+            temen_interp::Residue {
+                fibers: jfibers.to_vec(),
+                ..Default::default()
+            },
+        )
+        .expect("a residue a run made");
     let art_j = freeze(&inst, &jsnap, &jhost2).expect("JIT recycle freeze serializes");
     assert_eq!(
         art_i, art_j,
@@ -393,10 +387,13 @@ pub fn fuzz_recycle_fiber_one_xbackend(g: &mut Gen) {
         temen_run::cap_thunk,
         &mut jhost3 as *mut Host as *mut c_void,
         DurableRun {
-            seed: DurableResidue {
-                fibers: seed.to_vec(),
-                ..Default::default()
-            },
+            seed: jit_thaw(
+                &inst,
+                temen_ir::thaw::RawResidue {
+                    fibers: seed.to_vec(),
+                    ..Default::default()
+                },
+            ),
             ..Default::default()
         },
     ) {
@@ -406,4 +403,12 @@ pub fn fuzz_recycle_fiber_one_xbackend(g: &mut Gen) {
         Err(e) => panic!("JIT failed to thaw the recycled artifact: {e:?}\n{inst:#?}"),
     };
     assert_returned_eq(&inst, &base, jthaw, "recycle-thaw");
+}
+
+/// #3034 — a JIT thaw seed: `raw`, admitted against `m` by the one thaw pass.
+fn jit_thaw(
+    m: &temen_ir::Module,
+    raw: temen_ir::thaw::RawResidue<temen_jit::JitDetached, ()>,
+) -> temen_jit::JitThaw {
+    temen_ir::thaw::validate(m, false, 0, raw).expect("a residue a run made")
 }

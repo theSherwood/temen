@@ -3595,7 +3595,7 @@ pub fn compile_and_run_seeded_with_host(
     let table = source.root_table(host.jit_table_log2());
     let mut mem = Mem::root(m, default_reserved_log2(), None, init_mem);
     super::LAST_CAPTURE_FAULT.with(|c| *c.borrow_mut() = None);
-    let r = run(source, table, func, args, fuel, &mut mem, host);
+    let r = run(source, table, func, args, fuel, &mut mem, host)?;
     // #1714: the faulting address of a `MemoryFault`, in the same per-run slot the tree-walker's
     // run funnel fills (`last_capture_fault_addr`) — this path dropped the window with it, so an
     // embedder of a plain run could not say *where* a segfault was. The scheduler records the
@@ -3760,7 +3760,7 @@ pub fn compile_and_run_capture(
     let source = ModuleSource::shared(std::sync::Arc::new(c));
     let table = source.root_table(host.jit_table_log2());
     let mut mem = Mem::root(m, default_reserved_log2(), None, init_mem);
-    let r = run(source, table, func, args, fuel, &mut mem, &mut host);
+    let r = run(source, table, func, args, fuel, &mut mem, &mut host)?;
     let snap = mem
         .as_ref()
         .map(|mm| mm.snapshot(init_mem.len() as u64))
@@ -3798,7 +3798,7 @@ pub fn compile_and_run_capture_over(
         Some(std::sync::Arc::clone(&back)),
         init_mem,
     );
-    let r = run(source, table, func, args, fuel, &mut mem, &mut host);
+    let r = run(source, table, func, args, fuel, &mut mem, &mut host)?;
     let snap = mem
         .as_ref()
         .map(|mm| mm.snapshot(init_mem.len() as u64))
@@ -3845,7 +3845,7 @@ pub fn compile_and_run_over_shared_with_host(
             ..WindowSpec::default()
         })
     });
-    Some(run(source, table, func, args, fuel, &mut mem, host))
+    run(source, table, func, args, fuel, &mut mem, host)
 }
 
 /// A module compiled **once** for repeated runs over a caller-provided shared window — the cached form
@@ -4011,7 +4011,9 @@ impl SharedProgram {
             }
             mm
         });
-        let out = run(source, table, func, args, fuel, &mut mem, host);
+        // A reactor thaws nothing: a host carrying a residue is refused, never seeded in part (#3034).
+        let out =
+            run(source, table, func, args, fuel, &mut mem, host).unwrap_or(Err(Trap::Malformed));
         let (pages, mapped) = match mem.as_ref() {
             None => (Some((1, 0, 0, Vec::new())), 0),
             Some(m) => {
@@ -4171,7 +4173,7 @@ fn parallel_domain(
     back: Option<std::sync::Arc<super::Region>>,
     init_mem: &[u8],
 ) -> Option<Result<ParallelStart, Trap>> {
-    if host.is_durable() {
+    if host.is_durable() || !admits_thaw(host) {
         return None;
     }
     let c = compile_module_for(m, host.self_module(), true)?;
@@ -4277,7 +4279,8 @@ impl Reactor {
     ) -> Result<Vec<Value>, Trap> {
         // A frame's program and table are fresh; the persistent `mem` carries state across calls.
         let (source, table) = self.frame(func, host)?;
-        run(source, table, func, args, fuel, &mut self.mem, host)
+        // A reactor thaws nothing: a host carrying a residue is refused, never seeded in part (#3034).
+        run(source, table, func, args, fuel, &mut self.mem, host).unwrap_or(Err(Trap::Malformed))
     }
 
     /// The program and root table one frame of `func` runs over, for [`call`](Self::call) and
@@ -4370,7 +4373,8 @@ pub fn compile_and_run_capture_reserved_with_host(
     // fail-closed refusal of a freeze over a live-or-unjoined §14 child; this engine's own
     // instantiate arm has none of them, so driving a durable §14 module here would both skip the
     // admission rule and mint the exact thaw-faulting artifact the tree-walker refuses.
-    if outside_reserved_subset(m) {
+    // (The thaw gate is also [`run`]'s; asked here first, it saves the compile.)
+    if outside_reserved_subset(m) || !admits_thaw(host) {
         return None;
     }
     // `cont.*` durability is fully supported (DURABILITY.md §12.8): the per-fiber shadow-SP swap keeps
@@ -4389,6 +4393,32 @@ pub fn compile_and_run_capture_reserved_with_host(
         reserved_log2,
         host,
     )
+}
+
+/// #3034 — whether this engine re-creates the whole thaw residue `host` holds: its fibers, and
+/// nothing else (it runs no `thread.*`, §14 nesting, fork twins or frozen serve handlers durably). A residue with more is
+/// declined to the tree-walker whole, never thawed in part: the one predicate every durable entry
+/// onto this engine asks, the browser's included.
+pub fn admits_thaw(host: &Host) -> bool {
+    let super::Residue {
+        fibers: _,
+        vcpus,
+        root_sp,
+        children,
+        detached,
+        live_detached,
+        twins,
+        exited_twins,
+    } = host.residue();
+    // Nor a serve loop's frozen handlers (#1676), which only the tree-walker's serve loop adopts.
+    host.frozen_handlers().is_empty()
+        && vcpus.is_empty()
+        && root_sp.is_none()
+        && children.is_empty()
+        && detached.is_empty()
+        && live_detached.is_empty()
+        && twins.is_empty()
+        && exited_twins.is_empty()
 }
 
 /// The modules the reserved-window entries refuse before compiling: multi-vCPU `thread.*` and §14
@@ -4450,7 +4480,7 @@ pub fn run_capture_reserved_over_compiled_with_host(
     let source = ModuleSource::shared(compiled);
     let table = source.root_table(host.jit_table_log2());
     let mut mem = Mem::root(m, reserved_log2, None, init_mem);
-    let r = run(source, table, func, args, fuel, &mut mem, host);
+    let r = run(source, table, func, args, fuel, &mut mem, host)?;
     let snap = mem
         .as_ref()
         .map(|mm| mm.snapshot_window(super::SNAP_CAP))
@@ -5419,7 +5449,7 @@ fn debug_advance_fiber(
         }
         Ok(Outcome::JitUninstall { h, slot, dst }) => {
             let jit_table = host.resolve_jit_domain(h);
-            let forget = |t, slot| host.jit_forget_install(t, slot);
+            let forget = |_, slot| host.jit_forget_install(slot);
             match jit_uninstall(jit_table, source, table, slot, &mut vt.active, dst, forget) {
                 Ok(_) => FiberStep::Stepped,
                 Err(t) => FiberStep::Trapped(t),
@@ -9786,10 +9816,15 @@ fn run(
     fuel: &mut u64,
     mem: &mut Option<Mem>,
     host: &mut Host,
-) -> Result<Vec<Value>, Trap> {
+) -> Option<Result<Vec<Value>, Trap>> {
+    // #3034 — the one thaw gate of every entry that runs here: a residue this engine does not
+    // re-create whole is declined to the tree-walker, left on the host.
+    if !admits_thaw(host) {
+        return None;
+    }
     // The production path never preempts itself: an unlimited budget makes `resume` run straight to
     // completion, with the per-op budget branch perfectly predicted (so the hot loop is unchanged).
-    drive(source, table, entry, args, fuel, mem, host, u64::MAX)
+    Some(drive(source, table, entry, args, fuel, mem, host, u64::MAX))
 }
 
 /// The per-op park/interrupt flags one capability dispatch may raise (#1173). They live on the shared
@@ -11901,6 +11936,15 @@ fn freeze_drive(
         .as_ref()
         .and_then(|m| m.durable_get_sp(root_word))
         .unwrap_or(arena.frame_base(0));
+    // #3034 round 4 (B2) — this engine never reuses a fiber slot (#3101), so a run that made and
+    // finished more fibers than its arena has contexts holds slots no record may name: no restore
+    // admits their records. The freeze is refused here, before anything is consumed, as an engine
+    // refusal, rather than written as an artifact nothing can thaw.
+    let fits =
+        |slot: usize| temen_ir::durable_abi::ShadowContexts::default().fiber_fits(arena, slot);
+    if fibers.len().checked_sub(1).is_some_and(|last| !fits(last)) {
+        return Err(Trap::FiberFault);
+    }
     // The tree-walker's classification, before anything is consumed: an unwoken **cap** park would
     // spill the freeze placeholder as the call's result, which its thaw cannot re-derive, so it
     // fails the whole freeze closed.
@@ -11982,14 +12026,22 @@ fn freeze_drive(
                 // Not parked: nothing to flatten. A fresh, already-unwound (#1835) or finished slot
                 // still rides (#1684), so the thaw rebuilds the table slot for slot.
                 match &other {
-                    FiberState::Pending { funcref, arg0, .. } => frozen.push(super::FrozenFiber {
-                        slot,
-                        func: *funcref,
-                        arg0: *arg0,
-                        shadow_sp: fiber_sp[slot], // its frame base, or the frames the freeze spilled
-                        generation: 0,
-                        consumed: false,
-                    }),
+                    // Its extent was read out of its word at its last switch: checked here, where
+                    // the freeze records it (#3034).
+                    FiberState::Pending { funcref, arg0, .. } => {
+                        let shadow_sp = fiber_sp[slot]; // its frame base, or the frames the freeze spilled
+                        if !temen_ir::thaw::extent_fits(arena, slot + 1, shadow_sp) {
+                            return Err(Trap::Unreachable);
+                        }
+                        frozen.push(super::FrozenFiber {
+                            slot,
+                            func: *funcref,
+                            arg0: *arg0,
+                            shadow_sp,
+                            generation: 0,
+                            consumed: false,
+                        })
+                    }
                     FiberState::Done | FiberState::Free => {
                         frozen.push(super::FrozenFiber::free(slot, 0))
                     }
@@ -12019,11 +12071,15 @@ fn freeze_drive(
             VcpuStop::Done(_) => {}
             _ => return Err(Trap::FiberFault), // a freeze unwind never spawns / instantiates / blocks
         }
+        // #3034 — the fiber's extent, read out of its context's word (guest memory) and checked as
+        // it is read, as on the tree-walker: one outside its region is the guest's fault, and the
+        // drive traps `Unreachable`, which surfaces as the run's result.
         let shadow_sp = ctx
             .mem
             .as_ref()
             .and_then(|m| m.durable_get_sp(arena.region_base(slot + 1)))
-            .unwrap_or(arena.frame_base(slot + 1));
+            .filter(|&sp| temen_ir::thaw::extent_fits(arena, slot + 1, sp))
+            .ok_or(Trap::Unreachable)?;
         fiber_sp[slot] = shadow_sp;
         frozen.push(super::FrozenFiber {
             slot,
@@ -12465,7 +12521,7 @@ fn drive_nested(
             }
             Outcome::JitUninstall { h, slot, dst } if run_meta.is_some() => {
                 let jit_table = host.with(|p| p.resolve_jit_domain(h));
-                let forget = |t, slot| host.with(|p| p.jit_forget_install(t, slot));
+                let forget = |_, slot| host.with(|p| p.jit_forget_install(slot));
                 jit_uninstall(jit_table, source, table, slot, &mut vt.active, dst, forget)?;
             }
             // #1334: a §22 `Jit.invoke` reached on a nested interpretation — a cross-tier bounce out
@@ -15687,7 +15743,7 @@ impl SchedCore {
     }
 
     /// A run's initial scheduling state: the root task at `entry` in the root domain, plus any
-    /// fibers a durable freeze left to re-seed (taken from the host's `frozen_fibers`), after the
+    /// fibers a durable freeze left to re-seed (the sealed `Thaw` [`Host::take_admitted`] returns, taken last), after the
     /// once-per-run entry-fuel charge, over a table that holds the §22 installs the host recorded
     /// ([`reapply_installs`]). The root domain is `mem`, the powerbox in `host`, `dom`'s table and
     /// `fuel`; the window is taken only once nothing can refuse the run, so a refusal leaves it with
@@ -15704,6 +15760,18 @@ impl SchedCore {
         bell: Option<super::Bell>,
     ) -> Result<SchedCore, Trap> {
         let mut h = host.lock_unpoisoned();
+        // #3034 — every run of this engine starts here, so here is where a thaw residue it does not
+        // re-create whole is refused: an entry that can decline did so first ([`run`]); any other
+        // (a reactor's call, a `CoopRun`, a `ThreadRun`) is refused before anything is seeded. What it
+        // re-creates it admits first for the program it runs: a freeze leaves a residue unsealed.
+        let primary = source.primary();
+        let code = temen_ir::thaw::Code {
+            funcs: primary.lazy.ir.funcs(),
+            arena: primary.shadow.unwrap_or(super::ShadowArena::EMPTY),
+        };
+        if !admits_thaw(&h) {
+            return Err(Trap::Malformed);
+        }
         reapply_installs(&h, source, &table)?;
         // Fuel unification (INVARIANTS #9): the root's entry costs one, as a call's does and as the
         // JIT's entry prologue charges it, paid as its task is made, from the root's own fuel (a
@@ -15715,6 +15783,8 @@ impl SchedCore {
         }
         let root = &source.primary();
         let root_vt = entry_task(root, 0, entry as usize, args, Some(h.own_node()))?;
+        // Taken once nothing before it can refuse the start, which leaves the residue in place.
+        let thaw = h.take_admitted(code, 0).map_err(|_| Trap::Malformed)?;
         let tasks: Tasks = std::iter::once(TaskSlot::new(root_vt, 0, LiveVcpu::none())).collect();
         wire_kill(&h);
         // #1122/#1146/#1262 — the run's bell ([`SchedCore::bell`]): wire the root's personality
@@ -15735,7 +15805,8 @@ impl SchedCore {
         // (cleared) from the host; empty for a freeze or ordinary run.
         let mut fibers = FiberTables::default();
         {
-            let mut seed = std::mem::take(&mut h.frozen_fibers);
+            // Only the fibers: a residue with more was refused above ([`admits_thaw`]).
+            let mut seed = thaw.into_parts().fibers;
             seed.sort_by_key(|f| f.slot);
             for (expected, ff) in seed.into_iter().enumerate() {
                 debug_assert_eq!(
@@ -16002,7 +16073,7 @@ impl CoopSched {
                     let FiberTables { fibers, sp, meta } = fibers;
                     let waits = &mut tasks.waits;
                     let frozen = freeze_drive(fibers, sp, meta, waits, source, &mut ctx, budget)?;
-                    g.frozen_fibers = frozen;
+                    g.put_frozen_fibers(frozen);
                 }
                 // `res` is the root's `Result<Vec<Value>, Trap>`: `Ok(vals)` → `Done(vals)`; a root
                 // trap stays `Err(trap)` (the run's fatal trap), exactly as `drive` returned it.
@@ -17439,7 +17510,7 @@ impl SchedCore {
                 let env = tasks[ti].domain;
                 let host = &domains[env].host;
                 let jit_table = host.lock_unpoisoned().resolve_jit_domain(h);
-                let forget = |t, slot| host.lock_unpoisoned().jit_forget_install(t, slot);
+                let forget = |_, slot| host.lock_unpoisoned().jit_forget_install(slot);
                 let table = &*domains[env].table;
                 let active = &mut tasks[ti].vm.vt.active;
                 let cleared = jit_uninstall(jit_table, source, table, slot, active, dst, forget);
@@ -25227,7 +25298,7 @@ block 0 () {
         let (mut host, mut fuel) = (Host::new(), u64::MAX);
         let mut mem = Mem::root(&m, default_reserved_log2(), None, &[]);
         let r = run(source, table, 0, &[], &mut fuel, &mut mem, &mut host);
-        assert_eq!(r, Ok(vec![Value::I32(7)]));
+        assert_eq!(r, Some(Ok(vec![Value::I32(7)])));
         assert!(c.progs[0].get().is_some() && c.progs[1].get().is_some());
         assert!(c.progs[2].get().is_none(), "nothing enters function 2");
     }

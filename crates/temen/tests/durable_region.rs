@@ -637,19 +637,22 @@ fn a_region_shared_with_a_detached_child_rides_and_stays_shared() {
     // A restore holds the child as thaw residue; captured again, the tree re-freezes to the same
     // bytes, its region numbered as before (§12.6).
     let (mut again, rwin, rprots) = restored();
-    let recaptured = again
-        .take_thawed_detached()
+    let mut residue = again.take_residue();
+    let recaptured = std::mem::take(&mut residue.live_detached)
         .into_iter()
         .map(|t| temen_interp::CapturedDetached {
             parent_task: t.parent_task,
             slot: t.slot,
-            window: t.window,
-            reserved_log2: t.reserved_log2,
-            host: Arc::new(std::sync::Mutex::new(t.host)),
+            launch: temen_interp::detached_launch(&t),
+            window: t.payload.window,
+            reserved_log2: t.payload.reserved_log2,
+            host: Arc::new(std::sync::Mutex::new(t.payload.host)),
             module: Arc::new(child.clone()),
-            launch: t.launch,
         })
         .collect();
+    again
+        .admit_thaw(&parent, residue)
+        .expect("the rest of the residue the restore admitted");
     again.set_captured_detached(recaptured);
     assert_eq!(
         freeze_with_prots(&parent, &rwin, &rprots, SIZE_LOG2, &again).expect("re-freeze"),
@@ -1727,19 +1730,22 @@ fn a_detached_childs_end_post_rides_a_freeze() {
         (thost, rwin, rprots)
     };
     let (mut again, rwin, rprots) = restored();
-    let recaptured = again
-        .take_thawed_detached()
+    let mut residue = again.take_residue();
+    let recaptured = std::mem::take(&mut residue.live_detached)
         .into_iter()
         .map(|t| temen_interp::CapturedDetached {
             parent_task: t.parent_task,
             slot: t.slot,
-            window: t.window,
-            reserved_log2: t.reserved_log2,
-            host: Arc::new(std::sync::Mutex::new(t.host)),
+            launch: temen_interp::detached_launch(&t),
+            window: t.payload.window,
+            reserved_log2: t.payload.reserved_log2,
+            host: Arc::new(std::sync::Mutex::new(t.payload.host)),
             module: Arc::new(child.clone()),
-            launch: t.launch,
         })
         .collect();
+    again
+        .admit_thaw(&parent, residue)
+        .expect("the rest of the residue the restore admitted");
     again.set_captured_detached(recaptured);
     assert_eq!(
         freeze_with_prots(&parent, &rwin, &rprots, SIZE_LOG2, &again).expect("re-freeze"),
