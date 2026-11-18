@@ -15642,7 +15642,7 @@ impl SchedCore {
     }
 
     /// A run's initial scheduling state: the root task at `entry` in the root domain, plus any
-    /// fibers a durable freeze left to re-seed (taken from the host's `frozen_fibers`), after the
+    /// fibers a durable freeze left to re-seed (the sealed `Thaw` [`Host::take_admitted`] returns, taken last), after the
     /// once-per-run entry-fuel charge, over a table that holds the §22 installs the host recorded
     /// ([`reapply_installs`]). The root domain is `mem`, the powerbox in `host`, `dom`'s table and
     /// `fuel`; the window is taken only once nothing can refuse the run, so a refusal leaves it with

@@ -3876,19 +3876,19 @@ fn drive_over_cell(
                     let withheld = s.withheld.remove(&p.child_task).map(|w| w.outcome);
                     let unwound = s.unwound.contains(&p.child_task);
                     let kept = s.kept_leases.remove(&p.child_task);
-                    if let Some(trap) = s.own_trap_domains.get(&dom).copied() {
+                    if let Some(own) = s.own_trap_domains.get(&dom).copied() {
                         let stored = s.results.remove(&p.child_task);
                         let fate = own_trap_fate(
                             false,
                             withheld.is_some(),
-                            has_children,
+                            has_children || own.had_children,
                             unwound,
                             stored.as_ref().map(|o| &o.result),
                         );
                         let completed = match fate {
-                            OwnTrapFate::Trapped => Err(trap.code()),
+                            OwnTrapFate::Trapped => Err(own.trap.code()),
                             OwnTrapFate::Returned => {
-                                join_outcome(stored.map_or(Err(trap), |o| o.result))
+                                join_outcome(stored.expect("`Returned` has a stored result").result)
                             }
                             OwnTrapFate::Refused => {
                                 drop(s);
@@ -3981,7 +3981,8 @@ fn drive_over_cell(
                 let t = twins.remove(&pid).expect("listed just above");
                 let servicer = t.reaper == TwinReaper::Servicer;
                 // Owner decision 25 (#2949) is not proven for a twin a trap of its own ended in the
-                // cut ([`own_trap_fate`]): it is unreached, and the freeze is refused (#3131).
+                // cut: it is unreached, and the freeze is refused (#3131). A twin's other inputs do not
+                // matter; the call keeps [`own_trap_fate`] the one place that says so.
                 if let Some(host) = &t.host {
                     let dom = host.lock_unpoisoned().domain_id() as usize;
                     let own_trap = sched.lock().own_trap_domains.contains_key(&dom);
@@ -4143,6 +4144,17 @@ fn drive_over_cell(
 /// and the run did not fail. A root that returned keeps its result, and one that trapped its trap.
 fn carries_cut(froze: bool, result: &Result<Vec<Value>, Trap>) -> bool {
     froze && result.is_ok()
+}
+
+/// Owner decision 25 (#2949) — the trap of its own that ended a domain in the cut
+/// ([`Sched::own_trap_domains`]).
+#[derive(Clone, Copy, Debug)]
+struct OwnTrap {
+    trap: Trap,
+    /// Whether the domain still had a live §14 child when the trap was recorded, whether or not a
+    /// freeze of it recorded the child (`pending_detached`): a child whose own vCPU trapped before it
+    /// froze never recorded its children, so the harvest cannot see them there.
+    had_children: bool,
 }
 
 /// Owner decision 25 (#2949) — what the harvest does with a domain a trap of its own ended in the cut
@@ -7731,7 +7743,7 @@ struct Sched {
     /// teardown), and the freeze did not refuse it. The harvest files such a detached child as a
     /// completed child answering its trap, and such a fork twin as one that ended with it, whether
     /// or not its root had unwound.
-    own_trap_domains: BTreeMap<usize, Trap>,
+    own_trap_domains: BTreeMap<usize, OwnTrap>,
     /// Each detached child's window lease its root kept as it unwound for the freeze, by its task:
     /// handed back by the harvest when a trap of its own ended it after all ([`end_unwound_child`]),
     /// and otherwise left charged for the artifact, as before.
@@ -10734,11 +10746,15 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                     .kill
                     .as_ref()
                     .is_some_and(|k| k.load(Ordering::Relaxed));
-                let orphans = if killed {
+                // #3034 — and a trap's domain notes whether it still had a §14 child, recorded by a
+                // freeze or not ([`OwnTrap::had_children`]).
+                let children = if killed || outcome.result.is_err() {
                     child_domains(&v.domain.children)
                 } else {
                     Vec::new()
                 };
+                let had_children = !children.is_empty();
+                let orphans = if killed { children } else { Vec::new() };
                 drop(v);
                 let mut s = sched.lock();
                 for (flag, host) in &orphans {
@@ -10776,7 +10792,10 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                         s.freeze_fault.get_or_insert(*t);
                     } else if !freeze_refused && key != s.root_domain && !s.dead.contains_key(&key)
                     {
-                        s.own_trap_domains.entry(key).or_insert(*t);
+                        s.own_trap_domains.entry(key).or_insert(OwnTrap {
+                            trap: *t,
+                            had_children,
+                        });
                     }
                 }
                 // (Never during a freeze unwind: servers are quiesced by freeze-on-quiesce, not run.)

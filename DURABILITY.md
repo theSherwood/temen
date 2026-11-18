@@ -326,13 +326,15 @@ What the freeze records is the value it checked, so no later write can change it
 **Whose a trap in the cut is** (owner decision 25, #2949). A detached child's own trap during the
 cut (a guest fault above, or any other trap its code or its own checks raise, in its root, a thread
 of its domain, a fiber it runs or its freeze drive) is the child's, for the one shape this is proven
-for (`own_trap_fate`): a detached child that is not demand-paged (withheld, #2455) and has no
-detached child of its own in the cut. It ends as a trapped child ends (an unwound root's window and
+for (`own_trap_fate`): a detached child that is not demand-paged (withheld, #2455) and had no live
+§14 child of its own when the trap ended it, whether or not a freeze of it recorded that child. It ends as a trapped child ends (an unwound root's window and
 kept lease go back, once), its join answers the trap (or what its root returned, if the root
 returned before the trap), it rides its parent's artifact as a completed child, and the parent's
-freeze goes on, on every engine. For any other shape (a demand-paged child, a child with detached
-children of its own, a fork twin) the tree-walker refuses the freeze instead, the child or twin
-unreached, as every trap in the cut did before decision 25 (#3131).
+freeze goes on, on every engine. For any other shape (a demand-paged child, a child with a §14 child
+of its own, a fork twin still live at the harvest) the tree-walker refuses the freeze instead, the
+child or twin unreached, as every trap in the cut did before decision 25 (#3131). A personality's
+twin that trapped before the freeze rang it is not in the cut: it retired then, as that
+personality's zombie.
 
 A member the engine **could not freeze** is a refusal, which fails the run on every engine, raised where it is refused: on the tree-walker a park its thaw cannot re-derive, or
 a live child nothing can reach (`VCpu::freeze_refused`); on the bytecode engine the same parks, and a

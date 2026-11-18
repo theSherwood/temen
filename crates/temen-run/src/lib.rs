@@ -1997,7 +1997,8 @@ fn pending_detached(c: temen_interp::CapturedDetached) -> temen_interp::PendingD
 /// extent in it was checked where the JIT read it (#3034): a guest's fault ended its context as a trap.
 ///
 /// Owner decision 25 — a detached child the freeze could not carry (its window could not be read)
-/// fails the run, as on the tree-walker: the outcome becomes `ThreadFault`, and nothing is carried.
+/// fails the run, as on the tree-walker: a run that returned ends `ThreadFault` instead, and nothing
+/// is carried.
 fn jit_durable_leave<B>(
     cm: &mut CompiledModule,
     host: &mut Host,
@@ -2011,8 +2012,11 @@ fn jit_durable_leave<B>(
     // that did not freeze is no member of a cut. The run froze iff its root unwound (its extent).
     let refused = refused && residue.root_sp.is_some();
     leave_residue(host, residue, completed, trapped || refused);
+    // A run that ended for a reason of its own keeps that end.
     match r {
-        Ok((_, b)) if refused => Ok((JitOutcome::Trapped(temen_jit::TrapKind::ThreadFault), b)),
+        Ok((JitOutcome::Returned(_), b)) if refused => {
+            Ok((JitOutcome::Trapped(temen_jit::TrapKind::ThreadFault), b))
+        }
         r => r,
     }
 }

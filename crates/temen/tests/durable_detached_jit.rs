@@ -2068,9 +2068,82 @@ block 0 (v0: i64, v1: i64) {{
 /// completed by the parent's own unwind and never reaches the harvest, and a root rung after its last
 /// safepoint cannot return before its next poll on the one worker. The harvest's answer for that
 /// shape (the root's result, not the thread's trap) is pinned by `own_trap_fate`'s table.
+///
+/// `live` is 3, one more than the child's two vCPUs, so the parent's gate opens only once the child
+/// has ended: the thread's spawn charge alone would open it before the child's root returned, and a
+/// freeze rung then has the thread trap first, which the JIT rightly answers with the trap.
 #[test]
 fn a_childs_thread_that_traps_after_its_root_returned_leaves_the_roots_result() {
-    own_trap_rides_as(&root_returned_nest(), 2, 0, Answered::Returned);
+    own_trap_rides_as(&root_returned_nest(), 3, 0, Answered::Returned);
+}
+
+/// #3034, the audit's final round — a child whose root scribbles its own shadow-SP word, spawns a
+/// durable detached grandchild that parks forever (func 1, `"nest"`), and parks forever: its root
+/// traps as it unwinds, before it froze, so it never recorded the grandchild. The scribble comes
+/// first because the parent's gate opens at the grandchild's spawn charge: the freeze can find the
+/// child at any point after it, and every such point is past the scribble.
+fn grand_scribble_nest() -> String {
+    format!(
+        "memory 17 shadow 16448 65536
+data 90112 \"budget\"
+data 90120 \"nest\"
+export 0 func \"nest\" 1
+func (i64, i64) -> (i64) {{
+block 0 (v0: i64, v1: i64) {{
+{}  vbp = i64.const 90112
+  vbl = i64.const 6
+  vb = self.resolve vbp vbl
+  vmp = i64.const 90120
+  vml = i64.const 4
+  vm = self.resolve vmp vml
+  vrm = i64.const 90248
+  i32.store vrm vm
+  vrb = i64.const 90252
+  i32.store vrb vb
+  vrp = i64.const 90240
+  vinst = i32.wrap_i64 v0
+  vh = call.cap 6 17 (i64) -> (i32) vinst (vrp)
+{PARK}  vr = i64.const 7
+  return vr
+  }}
+}}
+func (i64, i64) -> (i64) {{
+block 0 (v0: i64, v1: i64) {{
+{PARK}  vr = i64.const 7
+  return vr
+  }}
+}}
+{}",
+        scribble(own_word(false)),
+        spawn_rec(90240)
+    )
+}
+
+/// #3034, the audit's final round — owner decision 25 is proven only for a child with no §14 child
+/// of its own: one whose own trap in the cut ended it while it still had a live grandchild refuses
+/// the freeze, recorded or not ([`grand_scribble_nest`]). The tree-walker leaves the child unreached;
+/// the JIT files the child and leaves the grandchild unreached; neither writes an artifact. On
+/// `e791772` the tree-walker filed the child completed and wrote an artifact in which the grandchild
+/// was gone.
+#[test]
+fn a_childs_own_trap_with_a_live_grandchild_refuses_the_freeze() {
+    for e in [Engine::Interp, Engine::Jit] {
+        let (root, child) = nest_modules(&grand_scribble_nest());
+        let (mut host, args) = nest_powerbox(&child, 0, 2);
+        let mut win = init_durable_window(1 << PARENT_LOG2, ARENA);
+        arm_freeze_after(&mut win, ARENA, 1);
+        let Some((r, _, snap)) = nest_run(e, &root, &args, &win, &mut host, None) else {
+            continue; // a target without the JIT's child executor
+        };
+        assert!(
+            !host.unreached_detached().is_empty(),
+            "{e:?}: a member is unreached ({r:?})"
+        );
+        assert!(
+            temen_snapshot::freeze(&root, &snap, &host).is_err(),
+            "{e:?}: no artifact is written ({r:?})"
+        );
+    }
 }
 
 /// #3034, round 4 B1 — a child's fiber fails its extent check ([`fiber_extent_nest`]). Without the
