@@ -149,6 +149,20 @@ fn free_slot(p: *mut u8) {
     STATE.lock().unwrap_or_else(|e| e.into_inner()).free.push(p);
 }
 
+/// AddressSanitizer's manual poisoning (`feature = "asan"`). A freed slot stays mapped, so ASan's
+/// shadow for it outlives the stack: [`Stack`] poisons a slot when it is freed and clears it when
+/// it is handed out again (#3032).
+#[cfg(feature = "asan")]
+mod asan {
+    use core::ffi::c_void;
+    extern "C" {
+        /// Mark `[addr, addr + size)` unaddressable: an instrumented access to it reports.
+        pub fn __asan_poison_memory_region(addr: *const c_void, size: usize);
+        /// Mark `[addr, addr + size)` addressable.
+        pub fn __asan_unpoison_memory_region(addr: *const c_void, size: usize);
+    }
+}
+
 /// An arena-allocated control stack slot — same surface as `stack_unix`/`stack_windows`, minus the
 /// guard page.
 pub struct Stack {
@@ -164,9 +178,16 @@ impl Stack {
     /// `FiberFault`, never an abort.
     pub fn new(size: usize) -> Option<Stack> {
         debug_assert!(size <= SLOT, "arena slot is {SLOT}; requested {size}");
-        Some(Stack {
-            base: alloc_slot()?,
-        })
+        let base = alloc_slot()?;
+        // ASan: no frame lives on a slot being handed out, so all of it is addressable. A reused slot
+        // comes back poisoned by `drop` — including where its last fiber's frames never returned to
+        // clear their own redzones, which this stack's frames would otherwise read through.
+        #[cfg(feature = "asan")]
+        // SAFETY: the slot we now own; nothing runs on it yet.
+        unsafe {
+            asan::__asan_unpoison_memory_region(base.cast(), SLOT)
+        };
+        Some(Stack { base })
     }
 
     /// The top of the stack (highest address, exclusive) — passed to `make`; also TEB `StackBase`.
@@ -207,6 +228,15 @@ impl Stack {
 
 impl Drop for Stack {
     fn drop(&mut self) {
+        // ASan: nothing runs on the slot again until `new` hands it out. Until then, an access to
+        // what lived on it reports: a dropped fiber's `Control` through a stale `Yielder`, its frames
+        // through a kept frame pointer. Only until then: the free list is LIFO, so the next
+        // `Stack::new` anywhere in the process may take this slot and clear it.
+        #[cfg(feature = "asan")]
+        // SAFETY: the slot we own, which nothing runs on again.
+        unsafe {
+            asan::__asan_poison_memory_region(self.base.cast(), SLOT)
+        };
         free_slot(self.base);
     }
 }

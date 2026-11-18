@@ -1047,30 +1047,25 @@ jobs:
       - uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2 # nightly
         with: { toolchain: "${{ env.RUST_NIGHTLY }}", components: rust-src }
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-      - name: held domains under ASan, each test in a process of its own
-        # One process per test until #3032 is settled: two JIT runs in one process report a
-        # stack-buffer-overflow in a child task's fiber entry, on main, which each test alone does not.
-        # The step fails if a build fails or a binary lists no test, so it never passes on nothing.
+      - name: held domains under ASan, one process per test binary
+        # The step fails if a build fails or a filter matches no test, so it never passes on nothing.
         run: |
           set -euo pipefail
           asan="--features temen-jit/asan -Z build-std --target x86_64-unknown-linux-gnu"
           # Each binary and the test filter it runs: held_domain and pool_after_teardown whole; the #2990 test in
           # temen-run's lib (`held::tests`); child_exec's unit tests in temen-jit's lib.
-          run_each() {
-            local bin="$1" filter="$2" n=0
+          run_binary() {
+            local bin="$1" filter="$2" n
             [ -n "$bin" ] || { echo "no test binary built"; exit 1; }
-            for t in $("$bin" --list | sed -n 's/: test$//p' | grep -- "$filter"); do
-              "$bin" --exact "$t"
-              n=$((n + 1))
-            done
+            n=$("$bin" --list "$filter" | grep -c ': test$' || true)
             [ "$n" -gt 0 ] || { echo "$bin: no test matched '$filter'"; exit 1; }
-            echo "$bin: $n tests"
+            "$bin" "$filter"
           }
           exe() { jq -r "select(.target.name == \"$1\" and .profile.test and .executable != null) | .executable"; }
-          run_each "$(cargo test -p temen-run $asan --test held_domain --no-run --message-format=json | exe held_domain)" ""
-          run_each "$(cargo test -p temen-run $asan --test pool_after_teardown --no-run --message-format=json | exe pool_after_teardown)" ""
-          run_each "$(cargo test -p temen-run $asan --lib --no-run --message-format=json | exe temen_run)" "held::tests::"
-          run_each "$(cargo test -p temen-jit --features asan -Z build-std --target x86_64-unknown-linux-gnu --lib --no-run --message-format=json | exe temen_jit)" "child_exec::tests::"
+          run_binary "$(cargo test -p temen-run $asan --test held_domain --no-run --message-format=json | exe held_domain)" ""
+          run_binary "$(cargo test -p temen-run $asan --test pool_after_teardown --no-run --message-format=json | exe pool_after_teardown)" ""
+          run_binary "$(cargo test -p temen-run $asan --lib --no-run --message-format=json | exe temen_run)" "held::tests::"
+          run_binary "$(cargo test -p temen-jit --features asan -Z build-std --target x86_64-unknown-linux-gnu --lib --no-run --message-format=json | exe temen_jit)" "child_exec::tests::"
         env:
           # As the asan lane: -Zsanitizer=address replaces the workflow-global `-D warnings`, which
           # -Z build-std's recompiled std would trip.
