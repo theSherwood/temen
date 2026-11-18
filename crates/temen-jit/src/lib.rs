@@ -2182,6 +2182,9 @@ pub struct DetachedHarvest {
     /// #2465 — whether its parent can still join it: `false` once the parent detached it (op 10),
     /// which the harvest carries only when it unwound for the freeze.
     pub joinable: bool,
+    /// #3034, owner decision 25 — the freeze could not carry it (its window could not be read):
+    /// a refusal, which fails the run, never the child's own trap.
+    pub refused: bool,
 }
 
 /// #1361 step 4 — what a durable detached child that unwound for a freeze left for the harvest.

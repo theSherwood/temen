@@ -93,6 +93,9 @@ pub(crate) struct DurableCell {
     /// #2757 — the waker of the child's task, registered at its spawn
     /// ([`crate::child_exec::ChildExec::spawn`]) and fired by [`Self::ring`].
     waker: std::sync::OnceLock<crate::child_exec::TaskWaker>,
+    /// #3034, owner decision 25 — the freeze could not carry the child (the host could not read its
+    /// window, #2286, #2318): a refusal, which fails the run, not the child's own trap.
+    pub(crate) refused: std::sync::atomic::AtomicBool,
 }
 
 impl DurableCell {
@@ -110,6 +113,7 @@ impl DurableCell {
             reserved_log2,
             held_tail,
             waker: std::sync::OnceLock::new(),
+            refused: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -1288,6 +1292,7 @@ impl Nursery {
                     outcome: *c.done.state.lock().unwrap_or_else(|e| e.into_inner()),
                     children: Vec::new(),
                     joinable: true,
+                    refused: false,
                 });
                 return;
             }
@@ -1306,6 +1311,7 @@ impl Nursery {
                     .as_ref()
                     .map_or_else(Vec::new, |k| k.take_detached_harvest()),
                 joinable,
+                refused: d.refused.load(std::sync::atomic::Ordering::Acquire),
             });
         });
         out

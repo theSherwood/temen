@@ -404,8 +404,12 @@ impl ChildTask {
     }
 
     /// The child ends with `ThreadFault`, unless it trapped already: the host could not read its
-    /// window (#2286, #2318).
+    /// window (#2286, #2318). Under a freeze that is a refusal (owner decision 25): its harvest
+    /// fails the run rather than file the child as one that trapped.
     fn end_refused(&self) {
+        if let Some(d) = self.done.durable.as_ref() {
+            d.refused.store(true, Ordering::Release);
+        }
         self.vm.raise(TrapKind::ThreadFault as i64);
     }
 

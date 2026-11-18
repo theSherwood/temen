@@ -1694,3 +1694,70 @@ fn a_bytecode_freeze_past_the_arena_is_refused_not_written() {
     let art = temen_snapshot::freeze(&inst, &snap, &h).expect("freeze");
     temen_snapshot::restore(&art, &inst, &mut Host::new()).expect("and its artifact restores");
 }
+
+/// #3034 round 4 — the freeze's own extent check, reached deterministically (the push check never
+/// sees this value): the root spawns a thread and joins it; the thread raises the freeze (a guest
+/// store of `UNWINDING` into its freeze word), writes its own shadow-SP word past its region's end
+/// and returns, with no safepoint between. Its end reads that word under the unwind and refuses it
+/// ([`temen_ir::thaw::extent_fits`]): the thread traps `Unreachable`, in the root's own domain, so
+/// the run ends with it, on both engines. Without the check, the freeze recorded the thread at that
+/// extent, and the artifact's restore refused it.
+#[test]
+fn a_threads_extent_past_its_region_traps_at_the_freezes_own_check() {
+    let ctx = temen_ir::durable_abi::ShadowContexts::default()
+        .reserve(TEST_ARENA, 0)
+        .expect("a context");
+    let word = TEST_ARENA.region_base(ctx);
+    let past = word + 2 * TEST_ARENA.stride;
+    let freeze = TEST_ARENA.freeze_word().expect("an arena");
+    let inst = instrument(&format!(
+        "func () -> (i64) {{
+block 0 () {{
+  vz = i64.const 0
+  vt = thread.spawn 1 vz vz
+  vst, vr = thread.join vt
+  return vr
+  }}
+}}
+func (i64, i64) -> (i64) {{
+block 0 (v0: i64, v1: i64) {{
+  vfw = i64.const {freeze}
+  vun = i32.const {STATE_UNWINDING}
+  i32.store vfw vun
+  vsa = i64.const {word}
+  vsv = i64.const {past}
+  i64.store vsa vsv
+  v7 = i64.const 7
+  return v7
+  }}
+}}
+"
+    ));
+    let win = init_durable_window(WINDOW, TEST_ARENA);
+    let mut h = Host::new();
+    assert_eq!(
+        interp_run(&inst, &win, &mut h),
+        Err(temen_interp::Trap::Unreachable),
+        "tree-walker"
+    );
+    let mut h = Host::new();
+    h.set_durable(true);
+    let jit = temen_run::jit_cap_run(
+        &inst,
+        0,
+        &[],
+        &MemLayout::image(win),
+        SIZE_LOG2,
+        0,
+        &mut h,
+        None,
+    )
+    .map(|(o, _)| o);
+    assert!(
+        matches!(
+            jit,
+            Ok(JitOutcome::Trapped(temen_jit::TrapKind::Unreachable))
+        ),
+        "JIT: {jit:?}"
+    );
+}

@@ -14365,7 +14365,11 @@ impl VCpu {
                         .await_reply_after_thaw(shadow_context_index(slot), ticket);
                     (Some(Reg::from_i64(0)), true)
                 }
-                _ => return Err(Trap::FiberFault),
+                // A park the classification above admitted and this one cannot flatten: a refusal.
+                _ => {
+                    self.freeze_refused = true;
+                    return Err(Trap::FiberFault);
+                }
             };
             self.flatten_fiber_for_freeze(slot, frames, placeholder, reissue)?;
         }
@@ -28721,10 +28725,10 @@ impl Host {
         self.cap_record.is_some()
     }
 
-    /// #3034 — seed the residue the next (thaw) run re-creates: what a restore admitted, or a JIT
-    /// freeze's left for the codec. The only way into a powerbox's residue from outside this crate: a
-    /// [`Thaw`] is built only by [`temen_ir::thaw::validate`], so every value in it is one a run of the
-    /// module could have made. Replaces whatever is there.
+    /// #3034 — seed the residue the next (thaw) run re-creates: what a restore admitted, as a [`Thaw`],
+    /// which only [`temen_ir::thaw::validate`] builds. A freeze leaves its own residue here unsealed
+    /// ([`Host::leave_freeze`]); every engine's thaw takes what it seeds through the pass
+    /// ([`Host::take_admitted`], [`Host::take_thaw`]). Replaces whatever is there.
     pub fn set_thaw(&mut self, thaw: Thaw) {
         self.residue = thaw.into_parts();
     }

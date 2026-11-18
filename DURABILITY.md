@@ -299,10 +299,12 @@ host stores. Every value restore reads is therefore one of:
 4. **opaque guest bytes** — window pages, pipe buffers, region bytes — which reach the guest
    only through the confinement lowering, like any other guest memory.
 
-An engine thaws only an admitted residue: the pass's result type, `Thaw`, is the only way a
-residue reaches an engine (`Host::set_thaw`, `CompiledModule::set_durable`), and an engine that
-re-creates less than all of it declines the thaw whole to the tree-walker rather than thawing part
-of it. The checks at each use that predate the pass (#2945) stay only in front of a raw host store
+An engine thaws only an admitted residue: what an engine's thaw seeds is always the pass's result
+type, `Thaw` (the interpreters take it with `Host::take_admitted`, the JIT with `Host::take_thaw` and
+`CompiledModule::set_durable`), and an engine that re-creates less than all of it declines the thaw
+whole to the tree-walker rather than thawing part of it. A residue can sit on a powerbox unsealed (a
+freeze leaves one there, `Host::leave_freeze`), but no engine's thaw reads it until the pass has
+returned it. The checks at each use that predate the pass (#2945) stay only in front of a raw host store
 or an unchecked index, as a backstop that is loud in debug. Open: whether an artifact may set the
 attestation and the guest-JIT quotas at all, or only narrow what the restoring host grants (#3096).
 
@@ -322,14 +324,20 @@ one rule (`temen_ir::thaw::extent_fits`, the rule the thaw pass applies to an ar
 What the freeze records is the value it checked, so no later write can change it.
 
 **Whose a trap in the cut is** (owner decision 25, #2949). A detached child's own trap during the
-cut, a guest fault above or any other its code or its own checks raise, in its root or a thread of
-its domain, is the child's: it ends as a trapped child ends, its join answers the trap, it rides its
-parent's artifact as a completed child, and the parent's freeze goes on, on every engine. A member
-the engine **could not freeze** (a park its thaw cannot re-derive, a live child nothing can reach) is
-a refusal: it fails the run, raised where it is refused (`VCpu::freeze_refused`), because an artifact
-without it would look whole and not be (INVARIANTS #9c, #1689). A trap of the root domain's own
-vCPUs ends the run as any trap of its does; a fork twin's is its own. Nothing else
-is checked at a freeze. The residue rides on the powerbox unsealed (`Host::leave_freeze`), and
+cut (a guest fault above, or any other trap its code or its own checks raise, in its root, a thread
+of its domain, a fiber it runs or its freeze drive, before or after its root unwound) is the child's:
+it ends as a trapped child ends (an unwound root's window and kept lease go back, once), its join
+answers the trap, it rides its parent's artifact as a completed child, and the parent's freeze goes
+on, on every engine. A fork twin's own trap ends the twin the same way: its exit hooks run, and a
+servicer's outcome rides. A member the engine **could not freeze** is a refusal, which fails the run
+on every engine, raised where it is refused: on the tree-walker a park its thaw cannot re-derive, or
+a live child nothing can reach (`VCpu::freeze_refused`); on the bytecode engine the same parks, and a
+fiber table past its arena (it never reuses a slot, #3101); on the JIT a child whose window the host
+could not read (`end_refused`, #2286, #2318). An artifact without the member would look whole and not
+be (INVARIANTS #9c, #1689). A trap of the root domain's own vCPUs ends the run as any trap of its
+does.
+
+Nothing else is checked at a freeze. The residue rides on the powerbox unsealed (`Host::leave_freeze`), and
 whatever thaws from it admits it through the pass first: `restore`, the tree-walker's thaw (each
 domain it re-creates, a detached child's and a twin's included), the bytecode engine's and the JIT's.
 A bug that left a value no run makes would surface there, as `Malformed`, where the round-trip rows

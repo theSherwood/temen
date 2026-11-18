@@ -2,8 +2,10 @@
 //!
 //! A snapshot's residue sections are structured data every engine's thaw acts on, some of it with raw
 //! host stores at offsets the values pick. An artifact is untrusted input (owner, 2026-11-13), so the
-//! residue crosses into an engine only as a [`Thaw`], which only [`validate`] builds: every value in it
-//! is one a run of the module could have made. An engine takes it apart with [`Thaw::into_parts`] and
+//! residue crosses into an engine's thaw only as a [`Thaw`], which only [`validate`] builds: every value
+//! in it is one a run of the module could have made. A freeze's own residue is engine state, which
+//! rides unsealed until a thaw admits it; the one value in it a guest writes, each extent, the freeze
+//! checks where it reads it ([`extent_fits`]). An engine takes it apart with [`Thaw::into_parts`] and
 //! destructures the [`ThawParts`] whole, so a residue field no engine consumes cannot be dropped
 //! silently: it does not compile until each engine consumes it or declines the thaw.
 //!
@@ -478,8 +480,8 @@ impl<'a> From<&'a Module> for Code<'a> {
 
 /// Admit `raw`, the residue of a domain running `code` whose root runs in shadow context `root_ctx`
 /// (`0`, or a fork twin's forking context), or refuse it, handing it back. `installs`: the domain holds
-/// a `Jit` grant ([`Makes`]). The one check every engine's thaw, and every freeze's hand-off of what it
-/// unwound, goes through (#3034); the ranges are the ones a freeze writes.
+/// a `Jit` grant ([`Makes`]). The one check every engine's thaw, and every restore, goes through (#3034);
+/// the ranges are the ones a freeze writes.
 pub fn validate<'a, D, T>(
     code: impl Into<Code<'a>>,
     installs: bool,

@@ -1620,7 +1620,7 @@ pub fn jit_cap_run(
             hg.set_jit_native_ctx(0);
             hg.set_serve_ctx(0);
             hg.set_park_hub(0);
-            jit_durable_leave(&mut cm, &mut hg, ended(&r));
+            let r = jit_durable_leave(&mut cm, &mut hg, r);
             drop(hg);
             *host = Host::from_cell(host_cell);
             return r.map(|(o, bytes)| (o, jit_layout(m, host, bytes, cm.take_tail_out())));
@@ -1672,7 +1672,7 @@ pub fn jit_cap_run(
     // The module dies with this call — leave no dangling registration behind.
     host.set_jit_native_ctx(0);
     host.set_park_hub(0);
-    jit_durable_leave(&mut cm, host, ended(&r));
+    let r = jit_durable_leave(&mut cm, host, r);
     r.map(|(o, bytes)| (o, jit_layout(m, host, bytes, cm.take_tail_out())))
 }
 
@@ -1844,17 +1844,20 @@ fn reseeds(kinds: [bool; 3], r: &temen_interp::Residue) -> bool {
 /// #1361 step 4 — the durable detached children a JIT freeze reached, onto the `Host` where the
 /// interpreter's harvest leaves them: an unwound child as a [`temen_interp::CapturedDetached`] (its
 /// window, its powerbox, its launch record), one that completed before the cut as a
-/// [`temen_interp::FrozenDetached`] result, and one that never reached its poll (or trapped) as
-/// unreached — which the codec refuses whole rather than emit part of the tree. #2010 — a captured
+/// [`temen_interp::FrozenDetached`] result, as is one a trap of its own ended in the cut (owner
+/// decision 25), and one that never reached its poll as unreached — which the codec refuses whole
+/// rather than emit part of the tree. One the freeze could not carry (`refused`) fails the run. #2010 — a captured
 /// child's own children land on its powerbox the same way, and every unreached one in the tree on
 /// the root's, as the oracle's recursive harvest leaves them.
 fn jit_detached_leave(
     cm: &mut CompiledModule,
     host: &mut Host,
     trapped: bool,
+    refused: &mut bool,
 ) -> Vec<temen_interp::FrozenDetached> {
     let mut unreached = Vec::new();
-    let (captured, completed) = detached_left(cm.take_detached_harvest(), &mut unreached, trapped);
+    let (captured, completed) =
+        detached_left(cm.take_detached_harvest(), &mut unreached, trapped, refused);
     if !captured.is_empty() {
         host.set_captured_detached(captured);
     }
@@ -1881,6 +1884,7 @@ fn detached_left(
     harvest: Vec<temen_jit::DetachedHarvest>,
     unreached: &mut Vec<temen_interp::PendingDetached>,
     trapped: bool,
+    refused: &mut bool,
 ) -> (
     Vec<temen_interp::CapturedDetached>,
     Vec<temen_interp::FrozenDetached>,
@@ -1902,6 +1906,8 @@ fn detached_left(
         // SAFETY: the harvest hands over the nursery's retained ref — one counted `Arc` to the
         // child's `Mutex<Host>`, built by `finish_child_build` — now ours.
         let child = unsafe { std::sync::Arc::from_raw(h.powerbox as *const Mutex<Host>) };
+        // Owner decision 25 — a child the freeze could not carry fails the run.
+        *refused |= h.refused;
         let (module, lane, names) = {
             let c = child.lock().unwrap_or_else(|e| e.into_inner());
             (c.self_module(), c.lane_cap(), c.cap_names().to_vec())
@@ -1916,7 +1922,8 @@ fn detached_left(
             module: std::sync::Arc::clone(&module),
             pager: None,
         };
-        let (grand_captured, grand_completed) = detached_left(h.children, unreached, trapped);
+        let (grand_captured, grand_completed) =
+            detached_left(h.children, unreached, trapped, refused);
         let outcome = join_outcome(h.outcome);
         let Some(capture) = h.capture else {
             unreached.extend(grand_captured.into_iter().map(pending_detached));
@@ -1988,9 +1995,27 @@ fn pending_detached(c: temen_interp::CapturedDetached) -> temen_interp::PendingD
 /// the interp's freeze driver leaves it, so one `temen_snapshot::freeze(module, window, host)` serves
 /// both engines. The whole residue, not just the fibers (#1690); none from a run that `trapped`. Each
 /// extent in it was checked where the JIT read it (#3034): a guest's fault ended its context as a trap.
-fn jit_durable_leave(cm: &mut CompiledModule, host: &mut Host, trapped: bool) {
-    let completed = jit_detached_leave(cm, host, trapped);
-    leave_residue(host, cm.take_durable_residue(), completed, trapped);
+///
+/// Owner decision 25 — a detached child the freeze could not carry (its window could not be read)
+/// fails the run, as on the tree-walker: the outcome becomes `ThreadFault`, and nothing is carried.
+fn jit_durable_leave<B>(
+    cm: &mut CompiledModule,
+    host: &mut Host,
+    r: Result<(JitOutcome, B), temen_jit::JitError>,
+) -> Result<(JitOutcome, B), temen_jit::JitError> {
+    let mut refused = false;
+    let trapped = ended(&r);
+    let completed = jit_detached_leave(cm, host, trapped, &mut refused);
+    leave_residue(
+        host,
+        cm.take_durable_residue(),
+        completed,
+        trapped || refused,
+    );
+    match r {
+        Ok((_, b)) if refused => Ok((JitOutcome::Trapped(temen_jit::TrapKind::ThreadFault), b)),
+        r => r,
+    }
 }
 
 /// A JIT freeze's residue onto `host`, where the interpreter's freeze leaves it: a run root's, or a
