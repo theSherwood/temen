@@ -17,7 +17,8 @@
 //! (robust to a noisy box). Uses only `std`.
 //!
 //! Run: `cargo run --release --bin temen-bench` (`-- --threads` for the concurrency section only,
-//! `-- --threads pingpong mutex` for the kernels named). With `--features run`, the pingpong kernels
+//! `-- --threads pingpong mutex` for the kernels named; `-- --ir KERNEL ENGINE N` runs one kernel once,
+//! for `scripts/ci/ir-guard.sh` to count its instructions). With `--features run`, the pingpong kernels
 //! also run on today's Cranelift JIT, the reference a bytecode scheduler change is measured against.
 
 use std::time::Instant;
@@ -35,6 +36,14 @@ fn main() {
             .skip(1)
             .collect();
         concurrency(&only);
+        return;
+    }
+    if let Some(at) = std::env::args().position(|a| a == "--ir") {
+        let a: Vec<String> = std::env::args().skip(at + 1).collect();
+        let [kernel, engine, n] = &a[..] else {
+            panic!("usage: temen-bench --ir KERNEL ENGINE N");
+        };
+        ir_once(kernel, engine, n.parse().expect("N is a loop count"));
         return;
     }
     // ---- escape-TCB hot paths (decode/verify) ----------------------------------------------
@@ -923,6 +932,129 @@ block 2 (v10: i32) {
   }
 }
 "#;
+
+/// #3088 — **one** run of one kernel on one engine, nothing else, for `scripts/ci/ir-guard.sh`: it counts
+/// this process's instructions under cachegrind at two loop counts, and the difference over the
+/// difference in `n` is the kernel's per-iteration count, exact and the same on every run.
+/// `ENGINE` is `bytecode` or `tree-walker`.
+fn ir_once(kernel: &str, engine: &str, n: i32) {
+    // Valgrind cannot reserve the default 128 GiB window; the kernels need one page of it.
+    assert!(
+        ir::set_default_reserved_log2(30),
+        "the reservation is chosen before any window"
+    );
+    let src: String = match kernel {
+        "alu" => ALU.into(),
+        "call" => CALL.into(),
+        "call_indirect" => CALL_INDIRECT.into(),
+        "mem" => MEM.into(),
+        "hostcall" => HOSTCALL.into(),
+        "tls" => TLS.into(),
+        "fiber_switch" => FIBER_SWITCH.into(),
+        "fiber_wait" => FIBER_WAIT.into(),
+        _ => panic!("no kernel {kernel}"),
+    };
+    let m = ir_from_text(&src);
+    let mut fuel = u64::MAX;
+    let r = match (kernel, engine) {
+        ("hostcall", _) => {
+            let (mut host, handle) = hostcall_host();
+            let args = [Value::I32(handle), Value::I32(n)];
+            match engine {
+                "bytecode" => {
+                    bytecode::compile_and_run_with_host(&m, 0, &args, &mut fuel, &mut host)
+                        .expect("bytecode engine drives the kernel")
+                }
+                "tree-walker" => temen_interp::run_with_host(&m, 0, &args, &mut fuel, &mut host),
+                _ => panic!("no engine {engine}"),
+            }
+        }
+        (_, "bytecode") => bytecode::compile_and_run(&m, 0, &[Value::I32(n)], &mut fuel)
+            .expect("bytecode engine drives the kernel"),
+        (_, "tree-walker") => temen_interp::run(&m, 0, &[Value::I32(n)], &mut fuel),
+        _ => panic!("no engine {engine}"),
+    };
+    // The kernel's answer, so a count can only come from a run that did the kernel's work: a
+    // dispatch that began answering an errno, say, would read cheaper and still be `Ok`.
+    let want = match kernel {
+        // `acc += n; n -= 1`, down to 1.
+        "alu" => vec![Value::I32((1..=n).fold(0i32, |a, i| a.wrapping_add(i)))],
+        // One `+1` per iteration: a call, an indirect call, a store and a load, a host call.
+        "call" | "call_indirect" | "mem" | "hostcall" => vec![Value::I32(n)],
+        // The word, set to 1, read once per iteration.
+        "tls" => vec![Value::I32(n)],
+        // The fiber's count after its `n`th suspend.
+        "fiber_switch" => vec![Value::I64(n as i64)],
+        // The fiber only parks (never suspends with a value), so each resume yields 0. This answer
+        // does not count iterations; the row is reported, not gated.
+        "fiber_wait" => vec![Value::I64(0)],
+        _ => unreachable!(),
+    };
+    assert_eq!(r, Ok(want), "{kernel} on the {engine}");
+}
+
+/// Each iteration reads the vCPU's TLS word (`vcpu.tls.get`), which every thread-local access in
+/// the C, LLVM and Nim frontends lowers to. The word is set to 1 first, so the sum of the reads is
+/// the iteration count.
+const TLS: &str = r#"
+func (i32) -> (i32) {
+block 0 (v0: i32) {
+  v10 = i64.const 1
+  vcpu.tls.set v10
+  v1 = i32.const 0
+  br 1(v0, v1)
+}
+block 1 (v2: i32, v3: i32) {
+  v8 = vcpu.tls.get
+  v9 = i32.wrap_i64 v8
+  v4 = i32.add v3 v9
+  v5 = i32.const 1
+  v6 = i32.sub v2 v5
+  br_if v6 1(v6, v4) 2(v4)
+}
+block 2 (v7: i32) {
+  return v7
+  }
+}
+"#;
+
+/// Each iteration makes one synchronous host call (`call.cap`) — the cost of an op that leaves the
+/// engine and comes back, which a guest's every libc call through a personality pays. The handle is
+/// the first argument.
+const HOSTCALL: &str = r#"
+func (i32, i32) -> (i32) {
+block 0 (v0: i32, v1: i32) {
+  v2 = i32.const 0
+  br 1(v1, v2, v0)
+}
+block 1 (v3: i32, v4: i32, v5: i32) {
+  v6 = i64.extend_i32_u v4
+  v7 = call.cap 13 0 (i64) -> (i64) v5 (v6)
+  v8 = i32.wrap_i64 v7
+  v9 = i32.const 1
+  v10 = i32.sub v3 v9
+  br_if v10 1(v10, v8, v5) 2(v8)
+}
+block 2 (v11: i32) {
+  return v11
+  }
+}
+"#;
+
+/// A host whose one capability (type 13, the `HOSTCALL` kernel's) adds 1 to its argument.
+fn hostcall_host() -> (temen_interp::Host, i32) {
+    use temen_interp::{CapState, Host, HostProcGrant, ProcHandler};
+    let mut host = Host::new();
+    let handle = host.grant_host_proc(HostProcGrant::new(
+        ProcHandler::Sync(Box::new(
+            |_op: u32, args: &[i64], out: &mut [i64], _mem, _| {
+                temen_interp::put_results(out, &[args[0] + 1])
+            },
+        )),
+        CapState::Stateless,
+    ));
+    (host, handle)
+}
 
 fn ir_from_text(src: &str) -> ir::Module {
     temen::text::parse_module(src).expect("corpus program must parse")

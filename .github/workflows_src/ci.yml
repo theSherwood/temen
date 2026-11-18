@@ -464,6 +464,30 @@ jobs:
         working-directory: bench
         run: env -u RUSTFLAGS cargo run --release -- --check baseline.txt --tol 0.4
 
+  ir-guard:
+    # #3088 — instructions per loop iteration for a few interpreter kernels, against
+    # `bench/ir-baseline.txt`. The bytecode engine's per-op cost moves with any edit to its op loop's
+    # function, by 10% in either direction; wall-clock here can't see that, an instruction count can,
+    # exactly. Deterministic (the same binary counts the same on every run and every CPU for the gated
+    # kernels — `scripts/ci/ir-guard.sh` says why), so it gates: a count past ±2% fails until the PR
+    # re-records the baseline with `--update`, which puts the change in its diff.
+    name: instruction-count guard
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with: { toolchain: "${{ env.RUST_STABLE }}" }
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      # From the cached debs (#2947): a run reaches Ubuntu's archive only when the cache is empty.
+      - name: install valgrind
+        timeout-minutes: 15
+        uses: ./.github/actions/apt-install
+        with: { packages: valgrind }
+      # The runner's CPU and valgrind, in the log: the gated counts must not depend on either.
+      - run: valgrind --version && grep -m1 'model name' /proc/cpuinfo
+      - run: bash scripts/ci/ir-guard.sh
+
   excluded-crates-compile:
     name: excluded crates compile (every workspace-excluded crate)
     # The crates the root manifest `exclude`s are invisible to every `--workspace` command, so an API
@@ -1024,33 +1048,29 @@ jobs:
       - uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2 # nightly
         with: { toolchain: "${{ env.RUST_NIGHTLY }}", components: rust-src }
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-      - name: held domains under ASan, each test in a process of its own
-        # One process per test until #3032 is settled: two JIT runs in one process report a
-        # stack-buffer-overflow in a child task's fiber entry, on main, which each test alone does not.
-        # The step fails if a build fails or a binary lists no test, so it never passes on nothing.
+      - name: held domains under ASan, one process per test binary
+        # The step fails if a build fails or a filter matches no test, so it never passes on nothing.
         run: |
           set -euo pipefail
           asan="--features temen-jit/asan -Z build-std --target x86_64-unknown-linux-gnu"
-          # Each binary and the test filter it runs: held_domain and pool_after_teardown whole; the #2990 test in
-          # temen-run's lib (`held::tests`); child_exec's unit tests in temen-jit's lib.
-          run_each() {
-            local bin="$1" filter="$2" n=0
+          # Each binary and the test filter it runs: held_domain and pool_after_teardown whole; jit_kernel's
+          # fiber rows (#3078); the #2990 test in temen-run's lib (`held::tests`); child_exec's unit tests
+          # in temen-jit's lib.
+          run_binary() {
+            local bin="$1" filter="$2" n
             [ -n "$bin" ] || { echo "no test binary built"; exit 1; }
-            for t in $("$bin" --list | sed -n 's/: test$//p' | grep -- "$filter"); do
-              "$bin" --exact "$t"
-              n=$((n + 1))
-            done
+            n=$("$bin" --list "$filter" | grep -c ': test$' || true)
             [ "$n" -gt 0 ] || { echo "$bin: no test matched '$filter'"; exit 1; }
-            echo "$bin: $n tests"
+            "$bin" "$filter"
           }
           exe() { jq -r "select(.target.name == \"$1\" and .profile.test and .executable != null) | .executable"; }
-          run_each "$(cargo test -p temen-run $asan --test held_domain --no-run --message-format=json | exe held_domain)" ""
-          run_each "$(cargo test -p temen-run $asan --test pool_after_teardown --no-run --message-format=json | exe pool_after_teardown)" ""
+          run_binary "$(cargo test -p temen-run $asan --test held_domain --no-run --message-format=json | exe held_domain)" ""
+          run_binary "$(cargo test -p temen-run $asan --test pool_after_teardown --no-run --message-format=json | exe pool_after_teardown)" ""
           # #3078 slice 2 — a kernel run's vCPU contexts outlive their vCPUs, since a fiber a vCPU made
           # runs on its context after it ends: the fiber rows read freed heap without the run's pool.
-          run_each "$(cargo test -p temen-run $asan --test jit_kernel --no-run --message-format=json | exe jit_kernel)" "fiber"
-          run_each "$(cargo test -p temen-run $asan --lib --no-run --message-format=json | exe temen_run)" "held::tests::"
-          run_each "$(cargo test -p temen-jit --features asan -Z build-std --target x86_64-unknown-linux-gnu --lib --no-run --message-format=json | exe temen_jit)" "child_exec::tests::"
+          run_binary "$(cargo test -p temen-run $asan --test jit_kernel --no-run --message-format=json | exe jit_kernel)" "fiber"
+          run_binary "$(cargo test -p temen-run $asan --lib --no-run --message-format=json | exe temen_run)" "held::tests::"
+          run_binary "$(cargo test -p temen-jit --features asan -Z build-std --target x86_64-unknown-linux-gnu --lib --no-run --message-format=json | exe temen_jit)" "child_exec::tests::"
         env:
           # As the asan lane: -Zsanitizer=address replaces the workflow-global `-D warnings`, which
           # -Z build-std's recompiled std would trip.
