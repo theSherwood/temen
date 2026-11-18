@@ -26,12 +26,9 @@ fn an_own_trap_completes_only_the_proven_shape() {
     use OwnTrapFate::*;
     let ok = Ok(vec![Value::I64(7)]);
     let err = Err(Trap::Unreachable);
-    // (twin, withheld, has children, root unwound, stored result) → fate
-    let table: [(
-        (bool, bool, bool, bool, Option<&Result<Vec<Value>, Trap>>),
-        OwnTrapFate,
-        &str,
-    ); 9] = [
+    /// (twin, withheld, has children, root unwound, stored result)
+    type Shape<'a> = (bool, bool, bool, bool, Option<&'a Result<Vec<Value>, Trap>>);
+    let table: [(Shape, OwnTrapFate, &str); 9] = [
         (
             (false, false, false, true, Some(&ok)),
             Trapped,
