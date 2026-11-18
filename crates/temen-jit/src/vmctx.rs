@@ -407,6 +407,18 @@ impl VmCtx {
         self.kernel
     }
 
+    /// #3133 — this context's own stop word, for a test of a reused fiber context.
+    #[cfg(test)]
+    pub(crate) fn stop_word(&self) -> i64 {
+        self.trap.load(Ordering::Relaxed)
+    }
+
+    /// #3133 — whether a cap thunk made its state on this context, for the same test.
+    #[cfg(test)]
+    pub(crate) fn has_thunk_state(&self) -> bool {
+        self.thunk_state.get().is_some()
+    }
+
     /// The code that ended this context's domain, or `None` while it runs.
     pub fn ended(&self) -> Option<i64> {
         match self.end().load(Ordering::Relaxed) {
@@ -628,6 +640,46 @@ block 0 (v0: i64, v1: i64) {
 ";
         let trapped = crate::JitOutcome::Trapped(crate::TrapKind::Unreachable);
         assert_eq!(run_marked(src), (trapped, false), "the resumer stopped");
+    }
+
+    /// #3133 — a fiber's context is its maker's instance, end and cell, and nothing that names a
+    /// window, a site or a vCPU of the maker's: a maker that is a serve handler's window context
+    /// hands its fiber no `handler_window` (a fiber outlives the window, and never steps aside for
+    /// it), no serve site, no cap-thunk state and no end of its own, and the cell's owner it shares
+    /// is held, not borrowed.
+    #[cfg(fiber_rt)]
+    #[test]
+    fn a_fibers_context_names_no_window_site_or_vcpu_of_its_maker() {
+        let root = VmCtx::new(InstanceAddrs::NONE, Window::NONE);
+        let mut maker = root.vcpu(core::ptr::null_mut());
+        let owner = crate::fuel::SharedCell::fixed(10);
+        maker.fuel = owner.get();
+        maker.cell = Some(std::sync::Arc::clone(&owner));
+        maker.handler_window.store(
+            core::ptr::NonNull::<crate::child_exec::Window>::dangling().as_ptr(),
+            core::sync::atomic::Ordering::Release,
+        );
+        let _ = maker.thunk_state(|| 7u32);
+        let f = maker.fiber();
+        assert!(f
+            .handler_window
+            .load(core::sync::atomic::Ordering::Acquire)
+            .is_null());
+        assert!(f.serve_site.get().is_none());
+        assert!(f.thunk_state.get().is_none());
+        assert!(f.owned_end.is_none() && f.owned_handlers.is_none());
+        assert_eq!(f.domain_key(), maker.domain_key(), "the maker's end");
+        assert_eq!(f.fuel, maker.fuel, "the maker's cell");
+        assert!(f
+            .cell
+            .as_ref()
+            .is_some_and(|c| std::sync::Arc::ptr_eq(c, &owner)));
+        drop(maker);
+        assert_eq!(
+            std::sync::Arc::strong_count(&owner),
+            2,
+            "the fiber holds the cell's owner"
+        );
     }
 
     /// #3133 — and the fiber's creator, running when the fiber traps on another vCPU, stops too: no

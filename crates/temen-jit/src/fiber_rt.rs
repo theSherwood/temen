@@ -1272,6 +1272,10 @@ unsafe fn guest_fiber(
         }
         None => Box::new(creator.fiber()),
     };
+    debug_assert!(
+        ctx.handler_window.load(Ordering::Relaxed).is_null(),
+        "a fiber's context names no window (#3133)"
+    );
     let vm = &*ctx as *const crate::VmCtx as u64;
     let fiber = make_fiber(
         funcref,
@@ -1708,7 +1712,11 @@ pub(crate) unsafe extern "C" fn fiber_resume(
             // list for recycling (step 3).
             let stack = slot.fiber.lock().unwrap_or_else(|e| e.into_inner()).take();
             // #3133 — its context, once its stack is gone, for this vCPU's next `cont.new`.
-            if let Some(Stack { fiber, ctx: Some(ctx) }) = stack {
+            if let Some(Stack {
+                fiber,
+                ctx: Some(ctx),
+            }) = stack
+            {
                 drop(fiber);
                 let spares = &mut (*current()).spare_ctxs;
                 if spares.len() < SPARE_CTXS {
@@ -2511,6 +2519,55 @@ mod flatten_claim_tests {
     /// generation, as the race left it, so this driver's claim of its snapshot's handle loses. That
     /// is a stale snapshot, not a forgery: a flattening resume skips the fiber. A guest's resume of
     /// the same handle finds it spent (#2667), and only a generation the slot never reached faults.
+    /// #3133 — a context a returned fiber left on its vCPU is the next `cont.new`'s, rewritten whole:
+    /// whatever the earlier fiber's left in it (its domain's end in its stop word, a cap thunk's
+    /// state, the cell of the code that made it) the new fiber's context is its own maker's, and
+    /// it is the same allocation.
+    #[test]
+    fn a_reused_fiber_context_starts_as_its_makers() {
+        if !temen_fiber::supported() {
+            return;
+        }
+        extern "C" fn never(_: u64, _: u64, _: u64, _: u64, _: u64, _: u64, _: u64) -> u64 {
+            unreachable!("the fiber is never resumed")
+        }
+        let table = Arc::new(SharedFiberTable::new(4, ShadowArena::EMPTY, None));
+        let rt = Box::into_raw(Box::new(FiberRuntime::new(table, 0, 0)));
+        // The earlier fiber's: another domain, ended; a cap thunk's state; a held cell.
+        let other = crate::VmCtx::new(crate::InstanceAddrs::NONE, crate::Window::NONE);
+        let mut earlier = other.vcpu(core::ptr::null_mut());
+        let owner = crate::fuel::SharedCell::fixed(10);
+        earlier.fuel = owner.get();
+        earlier.cell = Some(Arc::clone(&owner));
+        let mut spare = Box::new(earlier.fiber());
+        spare.raise(crate::TrapKind::Unreachable as i64);
+        let _ = spare.thunk_state(|| 7u32);
+        let at = &*spare as *const crate::VmCtx;
+        // SAFETY: `rt` is this test's, alive below; nothing resumes the fiber made here.
+        unsafe { (*rt).spare_ctxs.push(spare) };
+        let maker = crate::VmCtx::new(crate::InstanceAddrs::NONE, crate::Window::NONE);
+        let stack =
+            unsafe { super::guest_fiber(rt, &maker, 0, 0, 0, 0, 0, 0, never) }.expect("a stack");
+        let ctx = stack.ctx.as_deref().expect("a guest fiber's context");
+        assert_eq!(ctx as *const crate::VmCtx, at, "the spare, reused");
+        assert_eq!(ctx.stop_word(), 0, "not the earlier domain's end");
+        assert_eq!(ctx.ended(), None);
+        assert_eq!(ctx.domain_key(), maker.domain_key(), "its maker's end");
+        assert!(!ctx.has_thunk_state(), "no cap thunk's state");
+        assert!(
+            ctx.cell.is_none() && ctx.fuel.is_null(),
+            "its maker's (no) cell"
+        );
+        assert_eq!(
+            Arc::strong_count(&owner),
+            2,
+            "the earlier fiber's cell let go"
+        );
+        drop(stack);
+        // SAFETY: made by `Box::into_raw` above, and nothing else holds it.
+        drop(unsafe { Box::from_raw(rt) });
+    }
+
     #[test]
     fn a_flattening_resume_that_loses_its_claim_skips_the_fiber() {
         let table = Arc::new(SharedFiberTable::new(4, ShadowArena::EMPTY, None));
