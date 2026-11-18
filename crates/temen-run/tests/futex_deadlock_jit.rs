@@ -31,7 +31,15 @@ fn jit_unarmed(m: &temen_ir::Module) -> Vec<Result<temen_jit::JitOutcome, String
         .iter()
         .filter_map(|r| match r {
             Route::Today => Some(jit_today(m)),
-            Route::Kernel => jit_kernel::expect_kernel(m, 0, &[], None, None).map(Ok),
+            Route::Kernel => jit_kernel::expect_kernel(
+                m,
+                0,
+                &[],
+                None,
+                jit_kernel::lane_fuel(m),
+                jit_kernel::Expect::of(None),
+            )
+            .map(Ok),
         })
         .collect()
 }

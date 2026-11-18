@@ -41,7 +41,8 @@ fn today(m: &temen_ir::Module) -> Result<Vec<i64>, Trap> {
 fn kernel(m: &temen_ir::Module) -> Result<Vec<i64>, Trap> {
     let m = m.clone();
     let (o, vcpus) = bounded("the kernel route", move || {
-        jit_kernel::run_fresh(&m, 0, &[], None).expect("in the kernel's scope")
+        jit_kernel::run_fresh(&m, 0, &[], None, jit_kernel::lane_fuel(&m))
+            .expect("in the kernel's scope")
     });
     assert!(vcpus >= 1, "it ran as kernel tasks");
     result(o)
@@ -239,7 +240,8 @@ fn fueled(m: &temen_ir::Module, budget: u64) -> [(Result<Vec<i64>, Trap>, u64); 
     let km = m.clone();
     let kernel = bounded("the kernel route", move || {
         let mut host = Host::new();
-        let admitted = jit_kernel::admit(&km, &host, false).expect("in the kernel's scope");
+        let admitted = jit_kernel::admit(&km, &host, false, temen_interp::DEFAULT_FUEL)
+            .expect("in the kernel's scope");
         let end = jit_kernel::run(admitted, fresh_start(budget), &mut host).expect("compiles");
         assert!(end.vcpus >= 1, "it ran as kernel tasks");
         (result(end.outcome().0), host.fuel_left())
@@ -660,7 +662,8 @@ fn the_kill_door_ends_vcpus_that_only_take_the_futex_fast_paths() {
         // Bounded: a kill that never lands fails the test instead of hanging it.
         let door = std::sync::Arc::clone(&kill);
         let (o, vcpus) = bounded("the killed run", move || {
-            jit_kernel::run_fresh(&m, 0, &[], Some(&door)).expect("in scope")
+            jit_kernel::run_fresh(&m, 0, &[], Some(&door), jit_kernel::lane_fuel(&m))
+                .expect("in scope")
         });
         let took = fired.lock().unwrap().expect("the kill fired").elapsed();
         watchdog.join().unwrap();
@@ -771,7 +774,8 @@ fn granted(
         let mut host = Host::new();
         ceilings(&mut host);
         let m = make(grant(&mut host));
-        let admitted = jit_kernel::admit(&m, &host, false).expect("in the kernel's scope");
+        let admitted = jit_kernel::admit(&m, &host, false, temen_interp::DEFAULT_FUEL)
+            .expect("in the kernel's scope");
         let start = fresh_start(u64::MAX);
         let end = jit_kernel::run(admitted, start, &mut host).expect("compiles");
         assert!(end.vcpus >= 1, "it ran as kernel tasks");
@@ -1099,7 +1103,8 @@ fn futex_ops_racing_page_ops_never_fault_the_host() {
                 let (vcpus, result, recovered) = bounded("the race", move || {
                     let mut host = Host::new();
                     let m = racing(host.grant_memory(), op, protect, turns);
-                    let admitted = jit_kernel::admit(&m, &host, false).expect("in scope");
+                    let admitted = jit_kernel::admit(&m, &host, false, temen_interp::DEFAULT_FUEL)
+                        .expect("in scope");
                     let start = fresh_start(u64::MAX);
                     let end = jit_kernel::run(admitted, start, &mut host).expect("compiles");
                     (end.vcpus, end.result, host.cap_pages_recovered())
@@ -1225,7 +1230,7 @@ block 0 () {{
     let fresh = temen_interp::MemLayout::image(Vec::new());
     let run = |m: &temen_ir::Module, init: &temen_interp::MemLayout, host: &mut Host| {
         assert!(
-            jit_kernel::admit(m, host, false).is_ok(),
+            jit_kernel::admit(m, host, false, temen_interp::DEFAULT_FUEL).is_ok(),
             "the kernel route admits the start"
         );
         let r = temen_ir::DEFAULT_RESERVED_LOG2;
@@ -1280,7 +1285,11 @@ block 0 () {{
 }}
 "
     ));
-    assert_eq!(jit_kernel::admit(&m, &root, false).err(), None, "admitted");
+    assert_eq!(
+        jit_kernel::admit(&m, &root, false, temen_interp::DEFAULT_FUEL).err(),
+        None,
+        "admitted"
+    );
     let init = temen_interp::MemLayout::image(Vec::new());
     let r = temen_ir::DEFAULT_RESERVED_LOG2;
     let (o, _) = temen_run::jit_cap_run(&m, 0, &[], &init, r, 0, &mut root, None).expect("runs");
@@ -1511,7 +1520,8 @@ block 2 (vrc: i64) {{
     let (result, recovered) = bounded("the kernel run", || {
         let mut host = Host::new();
         let m = program(maps_and_truncates(&mut host));
-        let admitted = jit_kernel::admit(&m, &host, false).expect("in scope");
+        let admitted =
+            jit_kernel::admit(&m, &host, false, temen_interp::DEFAULT_FUEL).expect("in scope");
         let start = fresh_start(temen_interp::DEFAULT_FUEL);
         let end = jit_kernel::run(admitted, start, &mut host).expect("compiles");
         (end.result, host.cap_pages_recovered())
@@ -2050,7 +2060,11 @@ block 0 (va: i64, vb: i64) {
         (call(selfop, 5 | 1 << 8), Host::new()),
     ];
     for (i, (m, host)) in admitted.iter().enumerate() {
-        assert_eq!(jit_kernel::admit(m, host, false).err(), None, "row {i}");
+        assert_eq!(
+            jit_kernel::admit(m, host, false, temen_interp::DEFAULT_FUEL).err(),
+            None,
+            "row {i}"
+        );
     }
     let rows: Vec<(temen_ir::Module, Host, &str)> = vec![
         // A §13 region's `grant` into a child domain: inline, the bytecode compile declines it
@@ -2094,13 +2108,13 @@ block 0 (va: i64, vb: i64) {
         .iter()
         .enumerate()
         .filter_map(|(i, (m, host, clause))| {
-            let got = jit_kernel::admit(m, host, false).err();
+            let got = jit_kernel::admit(m, host, false, temen_interp::DEFAULT_FUEL).err();
             (got != Some(*clause)).then(|| format!("row {i}: {got:?}, not {clause:?}"))
         })
         .collect();
     assert!(wrong.is_empty(), "{wrong:#?}");
-    // The kinds `native_scope` decides before the calls: a fiber (`fibers`) and a `gc.roots`
-    // (`gc.roots`), which the instruction scan passes because these clauses already declined them.
+    // The kinds `native_scope` decides before the calls: a fiber-only module (`fiber only`) and a
+    // `gc.roots` (`gc.roots`), which the instruction scan passes because these clauses decide them.
     let fiber = module(
         "memory 16
 func () -> (i64) {
@@ -2122,14 +2136,14 @@ block 0 (va: i64) {
 ",
     );
     assert_eq!(
-        jit_kernel::admit(&fiber, &Host::new(), false).err(),
-        Some("fibers")
+        jit_kernel::admit(&fiber, &Host::new(), false, temen_interp::DEFAULT_FUEL).err(),
+        Some("fiber only")
     );
     let roots = rooted(
         "  vlo = i64.const 0\n  vhi = i64.const -1\n  vmask = i64.const -1\n  vbuf = i64.const 32768\n  vcap = i64.const 8\n  vr = gc.roots vlo vhi vmask vbuf vcap",
     );
     assert_eq!(
-        jit_kernel::admit(&roots, &Host::new(), false).err(),
+        jit_kernel::admit(&roots, &Host::new(), false, temen_interp::DEFAULT_FUEL).err(),
         Some("gc.roots")
     );
     // An armed external-wake bell (`outside bell`): a park nothing in the run can end would wait for
@@ -2138,15 +2152,23 @@ block 0 (va: i64) {
     let mut belled = Host::new();
     belled.arm_external_wake();
     assert_eq!(
-        jit_kernel::admit(&call(0, 0), &belled, false).err(),
+        jit_kernel::admit(&call(0, 0), &belled, false, temen_interp::DEFAULT_FUEL).err(),
         Some("outside bell")
     );
     // And what it admits beside them: a stream read with a non-blocking stdin and no pipe, and the
     // packed `type_id` and `covers` of a self interface past the first, as their typed forms are.
-    assert!(jit_kernel::admit(&call(0, 0), &Host::new(), false).is_ok());
+    assert!(
+        jit_kernel::admit(&call(0, 0), &Host::new(), false, temen_interp::DEFAULT_FUEL).is_ok()
+    );
     for op in [6 | 1 << 8, 7 | 1 << 8] {
         assert!(
-            jit_kernel::admit(&call(selfop, op), &Host::new(), false).is_ok(),
+            jit_kernel::admit(
+                &call(selfop, op),
+                &Host::new(),
+                false,
+                temen_interp::DEFAULT_FUEL
+            )
+            .is_ok(),
             "self op {op:#x}"
         );
     }
@@ -2200,7 +2222,7 @@ fn a_wait_on_an_alias_of_a_truncated_file_is_declined() {
     let mut host = Host::new();
     let fs = grant_mmap_fs(&mut host);
     assert_eq!(
-        jit_kernel::admit(&truncated(fs), &host, false).err(),
+        jit_kernel::admit(&truncated(fs), &host, false, temen_interp::DEFAULT_FUEL).err(),
         Some("file region")
     );
 }
@@ -2240,10 +2262,10 @@ block 0 () {
         host
     };
     assert_eq!(
-        jit_kernel::admit(&m, &bound(4), false).err(),
+        jit_kernel::admit(&m, &bound(4), false, temen_interp::DEFAULT_FUEL).err(),
         Some("§14 children")
     );
-    assert!(jit_kernel::admit(&m, &bound(0), false).is_ok());
+    assert!(jit_kernel::admit(&m, &bound(0), false, temen_interp::DEFAULT_FUEL).is_ok());
 }
 
 /// A `{ write, read }` interface over host `Stream` handle `h`, its methods remapped to ops 1 and 0,
@@ -2294,7 +2316,8 @@ fn a_grouped_stream_read_answers_as_the_oracle_on_the_kernel_route() {
         oracle.map(|v| v.to_vec()),
         Ok(vec![temen_interp::Value::I64(2)])
     );
-    let admitted = jit_kernel::admit(&m, &host, false).expect("in the kernel's scope");
+    let admitted = jit_kernel::admit(&m, &host, false, temen_interp::DEFAULT_FUEL)
+        .expect("in the kernel's scope");
     let end = jit_kernel::run(admitted, fresh_start(u64::MAX), &mut host).expect("compiles");
     assert_eq!(end.result.map(|v| v.to_vec()), Ok(vec![2]));
 }
@@ -2311,7 +2334,8 @@ fn a_grouped_stream_read_on_a_blocking_stdin_parks_on_both_executor_2_lanes() {
     host.set_stdin_blocking(true);
     let km = m.clone();
     let kernel = bounded("the kernel route", move || {
-        let admitted = jit_kernel::admit(&km, &host, false).expect("in the kernel's scope");
+        let admitted = jit_kernel::admit(&km, &host, false, temen_interp::DEFAULT_FUEL)
+            .expect("in the kernel's scope");
         jit_kernel::run(admitted, fresh_start(u64::MAX), &mut host)
             .expect("compiles")
             .result
@@ -2558,7 +2582,7 @@ block 2 (vr2: i32) {
         Err(temen_jit::JitError::Unsupported(_))
     ));
     assert_eq!(
-        jit_kernel::run_fresh(&m, 0, &[], None).err(),
+        jit_kernel::run_fresh(&m, 0, &[], None, jit_kernel::lane_fuel(&m)).err(),
         Some("the JIT's compile")
     );
 }
@@ -2599,7 +2623,7 @@ block 0 () {
     ];
     for (type_id, op, clause) in rows {
         assert_eq!(
-            jit_kernel::admit(&m, &bound(type_id, op), false).err(),
+            jit_kernel::admit(&m, &bound(type_id, op), false, temen_interp::DEFAULT_FUEL).err(),
             Some(clause),
             "({type_id}, {op})"
         );
@@ -2607,7 +2631,7 @@ block 0 () {
     use temen_ir::cap_id::{HOST_PROC, SHARED_REGION, STREAM};
     for (type_id, op) in [(SHARED_REGION, 7), (STREAM, 0), (STREAM, 1), (HOST_PROC, 0)] {
         assert_eq!(
-            jit_kernel::admit(&m, &bound(type_id, op), false).err(),
+            jit_kernel::admit(&m, &bound(type_id, op), false, temen_interp::DEFAULT_FUEL).err(),
             None,
             "({type_id}, {op})"
         );
@@ -2685,7 +2709,8 @@ block 1 () {{
 fn held_after(m: &temen_ir::Module) -> [(i64, i64); 2] {
     let mut host = Host::new();
     let node = host.own_node();
-    let admitted = jit_kernel::admit(m, &host, false).expect("in the kernel's scope");
+    let admitted = jit_kernel::admit(m, &host, false, temen_interp::DEFAULT_FUEL)
+        .expect("in the kernel's scope");
     let start = fresh_start(temen_interp::DEFAULT_FUEL);
     let end = jit_kernel::run(admitted, start, &mut host).expect("compiles");
     assert_eq!(end.vcpus, 13, "every vCPU ran as a kernel task");
@@ -2760,7 +2785,7 @@ block 0 () {
 ",
     );
     assert_eq!(
-        jit_kernel::admit(&m, &Host::new(), false).err(),
+        jit_kernel::admit(&m, &Host::new(), false, temen_interp::DEFAULT_FUEL).err(),
         Some("serving")
     );
 }
@@ -2793,7 +2818,7 @@ block 0 (va0: i64, vb0: i64) {
 ",
     );
     assert!(
-        jit_kernel::admit(&m, &Host::new(), false).is_ok(),
+        jit_kernel::admit(&m, &Host::new(), false, temen_interp::DEFAULT_FUEL).is_ok(),
         "in the kernel's scope"
     );
     assert!(
@@ -2804,7 +2829,7 @@ block 0 (va0: i64, vb0: i64) {
         "today's route declines it"
     );
     assert_eq!(
-        jit_kernel::run_fresh(&m, 0, &[], None).err(),
+        jit_kernel::run_fresh(&m, 0, &[], None, jit_kernel::lane_fuel(&m)).err(),
         Some("the JIT's compile"),
         "the kernel route declines it at the compile"
     );
@@ -3341,7 +3366,8 @@ fn a_punted_call_answered_after_its_park_listened_answers_on_the_kernel_route() 
             PARKED.open_next()
         });
         let answer = bounded("the kernel route", move || {
-            let admitted = jit_kernel::admit(&m, &host, false).expect("in the kernel's scope");
+            let admitted = jit_kernel::admit(&m, &host, false, temen_interp::DEFAULT_FUEL)
+                .expect("in the kernel's scope");
             let end =
                 jit_kernel::run(admitted, fresh_start(u64::MAX), &mut host).expect("compiles");
             assert!(end.vcpus >= 1, "it ran as kernel tasks");
@@ -3415,7 +3441,8 @@ block 0 (va: i64, vb: i64) {{
         }
     });
     let ended = bounded("the kernel route", move || {
-        let admitted = jit_kernel::admit(&m, &host, false).expect("in the kernel's scope");
+        let admitted = jit_kernel::admit(&m, &host, false, temen_interp::DEFAULT_FUEL)
+            .expect("in the kernel's scope");
         let end = jit_kernel::run(admitted, fresh_start(u64::MAX), &mut host).expect("compiles");
         assert!(end.vcpus >= 1, "it ran as kernel tasks");
         end.result
@@ -3441,7 +3468,8 @@ fn a_host_answered_call_parks_until_its_embedder_answers_on_the_kernel_route() {
     let mut host = Host::new();
     let h = host.grant_host_proc(temen_interp::HostProcGrant::declared("later", &requests));
     let m = calls_punted(h, true);
-    let admitted = jit_kernel::admit(&m, &host, false).expect("in the kernel's scope");
+    let admitted = jit_kernel::admit(&m, &host, false, temen_interp::DEFAULT_FUEL)
+        .expect("in the kernel's scope");
     let answerer = std::thread::spawn(move || {
         let until = Instant::now() + PROMPT;
         loop {
@@ -3646,7 +3674,7 @@ fn a_punted_calls_answer_by_its_shape_on_every_engine() {
             let mut h = Host::new();
             let m = make(grant(&mut h));
             if k == 2 {
-                let clause = jit_kernel::admit(&m, &h, false).err();
+                let clause = jit_kernel::admit(&m, &h, false, temen_interp::DEFAULT_FUEL).err();
                 let declined = want[2].is_none();
                 if clause != declined.then_some("punt shape") {
                     wrong.push(format!("({shape}) {owner}, {lane}: admit says {clause:?}"));
@@ -3811,7 +3839,8 @@ fn a_memoryless_programs_threads_run_as_kernel_tasks() {
         assert_eq!(today(&m), want, "today's route, {n} threads");
         let km = m.clone();
         let (o, vcpus) = bounded("the kernel route", move || {
-            jit_kernel::run_fresh(&km, 0, &[], None).expect("in the kernel's scope")
+            jit_kernel::run_fresh(&km, 0, &[], None, jit_kernel::lane_fuel(&km))
+                .expect("in the kernel's scope")
         });
         assert_eq!(
             vcpus,
@@ -3908,7 +3937,7 @@ block 0 (v0: i64, v1: i64) {{
 /// A kernel run of `m`, as an embedder's `jit_kernel::run` ends it, on this thread.
 fn kernel_end(m: &temen_ir::Module) -> jit_kernel::KernelEnd {
     let mut host = Host::new();
-    let admitted = jit_kernel::admit(m, &host, false).expect("in the kernel's scope");
+    let admitted = jit_kernel::admit(m, &host, false, u64::MAX).expect("in the kernel's scope");
     let end = jit_kernel::run(admitted, fresh_start(u64::MAX), &mut host).expect("compiles");
     assert!(end.vcpus >= 1, "it ran as kernel tasks");
     end
@@ -4189,7 +4218,7 @@ fn a_call_no_interface_serves_is_a_cap_fault_and_the_kernel_declines_it() {
         let mut host = Host::new();
         let m = make(host.grant_freeze_authority());
         assert_eq!(
-            jit_kernel::admit(&m, &host, false).err(),
+            jit_kernel::admit(&m, &host, false, temen_interp::DEFAULT_FUEL).err(),
             Some("cap"),
             "({t}, {op:#x})"
         );
@@ -4459,7 +4488,7 @@ fn spawn_rows(m: &temen_ir::Module, budget: u64) -> [(&'static str, &'static str
     let km = m.clone();
     let kernel = bounded("the kernel route", move || {
         let mut host = Host::new();
-        let admitted = jit_kernel::admit(&km, &host, false).expect("in the kernel's scope");
+        let admitted = jit_kernel::admit(&km, &host, false, budget).expect("in the kernel's scope");
         let end = jit_kernel::run(admitted, fresh_start(budget), &mut host).expect("compiles");
         assert!(end.vcpus >= 1, "it ran as kernel tasks");
         let r = end.result;
@@ -4641,7 +4670,7 @@ fn an_op_past_a_builtins_last_answers_alike_and_the_kernel_declines_it() {
         let mut host = Host::new();
         let m = make(grant(&mut host));
         assert_eq!(
-            jit_kernel::admit(&m, &host, false).err(),
+            jit_kernel::admit(&m, &host, false, temen_interp::DEFAULT_FUEL).err(),
             Some("cap"),
             "({t}, {op})"
         );
@@ -4652,6 +4681,1179 @@ fn an_op_past_a_builtins_last_answers_alike_and_the_kernel_declines_it() {
         );
         for (route, got) in granted_but_kernel(make, grant) {
             assert_eq!(got, want, "{route}: ({t}, {op})");
+        }
+    }
+}
+
+// ----- #3078 slice 2: native fibers on kernel vCPUs, with no fiber park --------------------------
+
+/// #3078 slice 2's rows, in a module of their own so a job selects them by one name
+/// (`kernel_fibers::`): `asan-held` runs them, the lifetime rows among them.
+mod kernel_fibers {
+    use super::*;
+
+    /// A threaded module (unless `spawn` is false) whose root first makes and runs one fiber to its end,
+    /// then runs `body`, which defines `vr`.
+    fn fibered(spawn: bool, body: &str) -> temen_ir::Module {
+        let thread = match spawn {
+            true => "  vt = thread.spawn 1 vz vz\n  vts, vtv = thread.join vt\n",
+            false => "",
+        };
+        module(&format!(
+            "memory 16
+func () -> (i64) {{
+block 0 () {{
+  vz = i64.const 0
+  vf = ref.func 2
+  vk = cont.new vf vz
+  vks, vkv = cont.resume vk vz
+{thread}{body}
+  return vr
+  }}
+}}
+func (i64, i64) -> (i64) {{
+block 0 (va: i64, vb: i64) {{
+  return va
+  }}
+}}
+func (i64, i64) -> (i64) {{
+block 0 (vsp: i64, varg: i64) {{
+  v5 = i64.const 5
+  return v5
+  }}
+}}
+"
+        ))
+    }
+
+    /// The kernel route's answer granted `fuel`, and the oracle's, which must agree: the run on the
+    /// kernel route checked to have run its vCPUs as kernel tasks, within [`PROMPT`].
+    fn on_kernel_as_oracle(m: &temen_ir::Module) -> Result<Vec<i64>, Trap> {
+        let k = kernel(m);
+        assert_eq!(k, oracle(m), "the kernel route and the oracle agree");
+        k
+    }
+
+    /// #3078 slice 2 — `fibers` is three clauses now. A module with fibers and no `thread.spawn` keeps
+    /// its single-vCPU path (`fiber only`); one whose fibers might park (a `memory.wait`, or a call that
+    /// can park) keeps today's route (`fiber parks`); a metered run of one keeps it too (`fiber fuel`,
+    /// #3080). Every other fibered module is admitted: a join, spawn, notify or region `signal` made in a
+    /// fiber is the stop of the task that runs it.
+    #[test]
+    fn each_fiber_clause_declines_what_it_names_and_admits_the_rest() {
+        use temen_interp::{put_results, CapState, HostProcGrant, OffloadOutcome, ProcHandler};
+        let selfop = u32::MAX;
+        let call = |ty: u32, op: u32| {
+            let args = match ty {
+                u32::MAX => "() -> (i64) vc ()",
+                _ => "(i64) -> (i64) vc(vz)",
+            };
+            fibered(
+                true,
+                &format!("  vc = i32.const 0\n  vr = call.cap {ty} {op} {args}"),
+            )
+        };
+        let blocking_stdin = || {
+            let mut h = Host::new();
+            h.stdin_block = true;
+            h
+        };
+        let pipe = || {
+            let mut h = Host::new();
+            h.grant_pipe();
+            h
+        };
+        let blocking = || {
+            let mut h = Host::new();
+            h.grant_blocking(Duration::ZERO, None);
+            h
+        };
+        let sync_proc = || {
+            let mut h = Host::new();
+            h.grant_host_proc(HostProcGrant::new(
+                ProcHandler::Sync(Box::new(|_, _, out, _, _| put_results(out, &[0]))),
+                CapState::Stateless,
+            ));
+            h
+        };
+        let offloadable = || {
+            let mut h = Host::new();
+            h.grant_host_proc(HostProcGrant::new(
+                ProcHandler::Offloadable(Box::new(|_, _, _| OffloadOutcome::Done(Ok(())))),
+                CapState::Stateless,
+            ));
+            h
+        };
+        let notify = "  vq = i64.const 16400\n  vone = i32.const 1\n  vn = atomic.notify vq vone\n  vr = i64.extend_i32_u vn";
+        let wait = "  vq = i64.const 16400\n  vone = i32.const 1\n  vto = i64.const 0\n  vw = i32.atomic.wait vq vone vto\n  vr = i64.extend_i32_u vw";
+        let mints = "  vp = i64.const 16384\n  vpr = call.cap 4294967295 16 (i64) -> (i64) vc(vp)\n  vr = call.cap 0 0 (i64) -> (i64) vc(vz)";
+        let rows: Vec<(temen_ir::Module, Host, u64, Option<&str>)> = vec![
+            (
+                fibered(false, notify),
+                Host::new(),
+                u64::MAX,
+                Some("fiber only"),
+            ),
+            (
+                fibered(true, wait),
+                Host::new(),
+                u64::MAX,
+                Some("fiber parks"),
+            ),
+            (call(0, 0), pipe(), u64::MAX, Some("fiber parks")),
+            (call(0, 1), pipe(), u64::MAX, Some("fiber parks")),
+            (call(0, 0), blocking_stdin(), u64::MAX, Some("fiber parks")),
+            (
+                fibered(true, &format!("  vc = i32.const 0\n{mints}")),
+                Host::new(),
+                u64::MAX,
+                Some("fiber parks"),
+            ),
+            (call(13, 0), offloadable(), u64::MAX, Some("fiber parks")),
+            (call(10, 0), blocking(), u64::MAX, Some("fiber parks")),
+            (
+                fibered(true, notify),
+                Host::new(),
+                temen_interp::DEFAULT_FUEL,
+                Some("fiber fuel"),
+            ),
+            // Admitted: a stream write with no pipe to park on, a read of a stdin that does not block, a
+            // sync host procedure, a region post's `signal`, a self op, and a fibered threaded notify.
+            (call(0, 1), Host::new(), u64::MAX, None),
+            (call(0, 0), Host::new(), u64::MAX, None),
+            (call(13, 0), sync_proc(), u64::MAX, None),
+            (call(4, 7), Host::new(), u64::MAX, None),
+            (call(selfop, 19), Host::new(), u64::MAX, None),
+            (fibered(true, notify), Host::new(), u64::MAX, None),
+        ];
+        let wrong: Vec<String> = rows
+            .iter()
+            .enumerate()
+            .filter_map(|(i, (m, host, fuel, clause))| {
+                let got = jit_kernel::admit(m, host, false, *fuel).err();
+                (got != *clause).then(|| format!("row {i}: {got:?}, not {clause:?}"))
+            })
+            .collect();
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// #3078 slice 2 — the admitted fibered programs answer as the oracle does on the kernel route: a
+    /// notify, a spawn and a join made from inside a fiber, a region post's `signal` there, and the
+    /// fiber's own value.
+    #[test]
+    fn a_spawn_join_and_notify_inside_a_fiber_answer_as_the_oracle_on_the_kernel_route() {
+        let m = module(
+            "memory 16
+func () -> (i64) {
+block 0 () {
+  vz = i64.const 0
+  vt = thread.spawn 1 vz vz
+  vts, vtv = thread.join vt
+  vf = ref.func 2
+  vk = cont.new vf vz
+  vs, vv = cont.resume vk vz
+  vr = i64.add vv vtv
+  return vr
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (va: i64, vb: i64) {
+  v3 = i64.const 3
+  return v3
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, varg: i64) {
+  vz = i64.const 0
+  vc = thread.spawn 3 vz vz
+  vq = i64.const 16400
+  vone = i32.const 1
+  vn = atomic.notify vq vone
+  vcs, vcv = thread.join vc
+  vn64 = i64.extend_i32_u vn
+  vr = i64.add vcv vn64
+  return vr
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (va: i64, vb: i64) {
+  v7 = i64.const 7
+  return v7
+  }
+}
+",
+        );
+        assert_eq!(on_kernel_as_oracle(&m), Ok(vec![10]));
+    }
+
+    /// #3078 slice 2 — finding 0b and 0a: a fiber thread A made, claimed by thread B, runs B's thunks.
+    /// Its spawn, notify and join are B's task's stops, reached through B's thread's record, never
+    /// through the context the fiber carries, which is A's.
+    ///
+    /// - `ended`: A has ended before B claims the fiber, so its context waits in the run's pool, and no
+    ///   task of A's could apply a stop: had the stops gone to A's hook, they would read a freed one.
+    ///   This is also the context's lifetime row: a run without the pool frees A's context as A ends.
+    /// - not `ended`: A is alive and parked in its join of B, its hook borrowed on A's thread: had the
+    ///   stops gone to A's hook, they would alias that borrow.
+    fn a_to_b(ended: bool) -> temen_ir::Module {
+        let (root, a) = match ended {
+        // The root joins A, then hands B the fiber.
+        true => (
+            "  va = thread.spawn 1 vz vz\n  vas, vk = thread.join va\n  vb = thread.spawn 2 vk vz\n  vbs, vr = thread.join vb",
+            "  vf = ref.func 3\n  vk = cont.new vf va\n  return vk",
+        ),
+        // A makes the fiber, hands it to B and joins B.
+        false => (
+            "  va = thread.spawn 1 vz vz\n  vas, vr = thread.join va",
+            "  vf = ref.func 3\n  vk = cont.new vf va\n  vz2 = i64.const 0\n  vb = thread.spawn 2 vk vz2\n  vbs, vbv = thread.join vb\n  return vbv",
+        ),
+    };
+        module(&format!(
+            "memory 16
+func () -> (i64) {{
+block 0 () {{
+  vz = i64.const 0
+{root}
+  return vr
+  }}
+}}
+func (i64, i64) -> (i64) {{
+block 0 (va: i64, vx: i64) {{
+{a}
+  }}
+}}
+func (i64, i64) -> (i64) {{
+block 0 (vk: i64, vb: i64) {{
+  vz = i64.const 0
+  vs, vv = cont.resume vk vz
+  return vv
+  }}
+}}
+func (i64, i64) -> (i64) {{
+block 0 (vsp: i64, varg: i64) {{
+  vz = i64.const 0
+  vc = thread.spawn 4 vz vz
+  vq = i64.const 16400
+  vone = i32.const 1
+  vn = atomic.notify vq vone
+  vcs, vcv = thread.join vc
+  vn64 = i64.extend_i32_u vn
+  vr = i64.add vcv vn64
+  return vr
+  }}
+}}
+func (i64, i64) -> (i64) {{
+block 0 (va: i64, vb: i64) {{
+  v7 = i64.const 7
+  return v7
+  }}
+}}
+"
+        ))
+    }
+
+    #[test]
+    fn a_fiber_made_on_one_vcpu_makes_its_stops_as_the_vcpu_that_runs_it() {
+        for ended in [true, false] {
+            for _ in 0..50 {
+                assert_eq!(
+                    on_kernel_as_oracle(&a_to_b(ended)),
+                    Ok(vec![7]),
+                    "ended: {ended}"
+                );
+            }
+        }
+    }
+
+    /// #3078 slice 2 — `cont.resume.block` on the kernel route, state by state, as the oracle answers it:
+    /// it blocks only on a parked target, which no admitted run makes (`fiber parks`), so every other
+    /// state answers as `cont.resume` does. A thread resumes, with `cont.resume.block`, a fiber that is
+    /// fresh (it runs and returns 5), finished (`-EBADF`), its own (running on this vCPU: `FiberFault`),
+    /// forged (`FiberFault`), or running on another vCPU (`FiberFault`).
+    fn blocking_resume_of(state: &str) -> temen_ir::Module {
+        let thread = match state {
+        "fresh" => "  vs, vr = cont.resume.block vk vz",
+        "finished" => "  vs0, vv0 = cont.resume vk vz\n  vs, vv = cont.resume.block vk vz\n  vr = i64.extend_i32_s vs",
+        "forged" => "  vbad = i64.const 16777216\n  vs, vr = cont.resume.block vbad vz",
+        "self" => "  vs, vr = cont.resume vk vk",
+        // The fiber, resumed by the root, flags 16400 and spins until 16404 is set; this thread waits
+        // for the flag and resumes it while it runs elsewhere.
+        _ => "  br 1(vk)\n}\nblock 1 (vk1: i64) {\n  vq = i64.const 16400\n  vf = i32.atomic.load vq\n  br_if vf 2(vk1) 1(vk1)\n}\nblock 2 (vk2: i64) {\n  vz2 = i64.const 0\n  vs, vr = cont.resume.block vk2 vz2",
+    };
+        let fiber = match state {
+        "self" => "  vs, vr = cont.resume.block varg vsp\n  return vr",
+        "elsewhere" => "  vq = i64.const 16400\n  vone = i32.const 1\n  i32.atomic.store vq vone\n  br 1()\n}\nblock 1 () {\n  vg = i64.const 16404\n  vgo = i32.atomic.load vg\n  br_if vgo 2() 1()\n}\nblock 2 () {\n  v5 = i64.const 5\n  return v5",
+        _ => "  v5 = i64.const 5\n  return v5",
+    };
+        let root_resumes = match state {
+            "elsewhere" => "  vrs, vrv = cont.resume vk vz\n",
+            _ => "",
+        };
+        module(&format!(
+            "memory 16
+func () -> (i64) {{
+block 0 () {{
+  vz = i64.const 0
+  vf = ref.func 2
+  vk = cont.new vf vz
+  vt = thread.spawn 1 vk vz
+{root_resumes}  vts, vtv = thread.join vt
+  return vtv
+  }}
+}}
+func (i64, i64) -> (i64) {{
+block 0 (vk: i64, vb: i64) {{
+  vz = i64.const 0
+{thread}
+  return vr
+  }}
+}}
+func (i64, i64) -> (i64) {{
+block 0 (vsp: i64, varg: i64) {{
+{fiber}
+  }}
+}}
+"
+        ))
+    }
+
+    #[test]
+    fn a_blocking_resume_answers_as_the_oracle_in_every_state_on_the_kernel_route() {
+        let fault = Err(Trap::FiberFault);
+        for (state, want) in [
+            ("fresh", Ok(vec![5])),
+            ("finished", Ok(vec![temen_ir::errno::EBADF])),
+            ("forged", fault.clone()),
+            ("self", fault.clone()),
+            ("elsewhere", fault),
+        ] {
+            assert_eq!(
+                on_kernel_as_oracle(&blocking_resume_of(state)),
+                want,
+                "{state}"
+            );
+        }
+    }
+
+    /// A threaded program whose root calls host procedure `handle` (a sync one, on the vCPU's own
+    /// thread), then spawns and joins a thread, and returns what the procedure answered. Its kernel
+    /// run's thread record must not reach code the procedure runs, and must be its own again after.
+    fn calls_a_host_procedure(handle: i32) -> temen_ir::Module {
+        module(&format!(
+            "memory 16
+func () -> (i64) {{
+block 0 () {{
+  vz = i64.const 0
+  vc = i32.const {handle}
+  vr = call.cap 13 0 (i64) -> (i64) vc(vz)
+  vt = thread.spawn 1 vz vz
+  vts, vtv = thread.join vt
+  return vr
+  }}
+}}
+func (i64, i64) -> (i64) {{
+block 0 (va: i64, vb: i64) {{
+  return va
+  }}
+}}
+"
+        ))
+    }
+
+    /// A host whose one procedure answers `f()`, called on the calling vCPU's thread, and its handle.
+    fn answering(f: impl FnMut() -> i64 + Send + 'static) -> (Host, i32) {
+        use temen_interp::{put_results, CapState, HostProcGrant, ProcHandler};
+        let mut h = Host::new();
+        let mut f = f;
+        let handle = h.grant_host_proc(HostProcGrant::new(
+            ProcHandler::Sync(Box::new(move |_, _, out, _, _| put_results(out, &[f()]))),
+            CapState::Stateless,
+        ));
+        (h, handle)
+    }
+
+    /// The kernel run of [`calls_a_host_procedure`] over `host`: what it answers, and how many kernel
+    /// runs this thread took meanwhile.
+    fn on_kernel_with((host, handle): (Host, i32)) -> (Result<Vec<i64>, Trap>, u64) {
+        bounded("the kernel route", move || {
+            let m = calls_a_host_procedure(handle);
+            let mut host = host;
+            let before = jit_kernel::kernel_runs();
+            let admitted =
+                jit_kernel::admit(&m, &host, false, temen_interp::DEFAULT_FUEL).expect("in scope");
+            let end = jit_kernel::run(admitted, fresh_start(temen_interp::DEFAULT_FUEL), &mut host)
+                .expect("compiles");
+            (end.result, jit_kernel::kernel_runs() - before)
+        })
+    }
+
+    /// A threaded fibered program today's route serves on a default (metered) run, whose root spawns and joins a thread
+    /// that notifies, and resumes a fiber that does the same: 3 + 5.
+    const TODAYS: &str = "memory 16
+func () -> (i64) {
+block 0 () {
+  vz = i64.const 0
+  vf = ref.func 2
+  vk = cont.new vf vz
+  vs, vv = cont.resume vk vz
+  vt = thread.spawn 1 vz vz
+  vts, vtv = thread.join vt
+  vr = i64.add vv vtv
+  return vr
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (va: i64, vb: i64) {
+  vq = i64.const 16400
+  vone = i32.const 1
+  vn = atomic.notify vq vone
+  v3 = i64.const 3
+  return v3
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, varg: i64) {
+  vz = i64.const 0
+  vt = thread.spawn 1 vz vz
+  vts, vtv = thread.join vt
+  v2 = i64.const 2
+  vr = i64.add vtv v2
+  return vr
+  }
+}
+";
+
+    /// #3078 slice 2 (the audit's change) — the thread's record names its run, so code of another run on
+    /// a kernel vCPU's thread never reaches it: here a second JIT run, on today's route, that a sync host
+    /// procedure starts on the vCPU's own thread. Its spawns, joins and notifies, in a fiber and out of
+    /// one, are its own runtime's: with a record keyed by the thread alone they would be the outer
+    /// task's stops. It answers as it does on a thread of its own, and only the outer run is a kernel one.
+    #[test]
+    fn a_jit_run_a_host_procedure_starts_on_a_kernel_vcpu_takes_its_own_route() {
+        let m = module(TODAYS);
+        assert!(
+            jit_kernel::admit(&m, &Host::new(), false, temen_interp::DEFAULT_FUEL).is_err(),
+            "today's route serves it"
+        );
+        let alone = compile_and_run(&m, 0, &[]).expect("jit");
+        assert_eq!(alone, JitOutcome::Returned(vec![8]));
+        let inner = m.clone();
+        let (got, runs) = on_kernel_with(answering(move || {
+            match compile_and_run(&inner, 0, &[]).expect("jit") {
+                JitOutcome::Returned(v) => v[0],
+                o => panic!("the inner run ended {o:?}"),
+            }
+        }));
+        assert_eq!(
+            got,
+            Ok(vec![8]),
+            "the inner run's answer, through the outer"
+        );
+        assert_eq!(runs, 1, "only the outer run took the kernel route");
+    }
+
+    /// #3078 slice 2 (the audit's change) — the same when the procedure's run is itself a kernel run on
+    /// the vCPU's thread: both runs' contexts are kernel ones, so it is the record's end word that tells
+    /// them apart, and the inner run's guard that gives the outer vCPU its record back. The inner run's
+    /// stops are its own tasks', the outer task's join and call go on after it, and both runs are kernel
+    /// runs.
+    #[test]
+    fn a_kernel_run_a_host_procedure_starts_on_a_kernel_vcpu_keeps_its_own_record() {
+        let inner = a_to_b(true);
+        let (got, runs) = on_kernel_with(answering(move || {
+            let (o, vcpus) =
+                jit_kernel::run_fresh(&inner, 0, &[], None, u64::MAX).expect("in scope");
+            assert!(vcpus >= 3, "the inner run's vCPUs ran as kernel tasks");
+            match o {
+                JitOutcome::Returned(v) => v[0],
+                o => panic!("the inner run ended {o:?}"),
+            }
+        }));
+        assert_eq!(
+            got,
+            Ok(vec![7]),
+            "the inner run's answer, through the outer"
+        );
+        assert_eq!(runs, 2, "both runs took the kernel route");
+    }
+
+    /// #3078 slice 2 (the audit's change) — the same, for a held JIT domain the procedure calls: its
+    /// activation runs on the kernel vCPU's thread, and its capability call and its notify are its own
+    /// run's. Its word holds 5 in its own window, which its entry stored, and 0 in the outer run's: its
+    /// wait for 0 answers not-equal (1) at once on its own route, where sent to the outer run's rules it
+    /// would find the word equal and answer timed-out (2). Nothing in it depends on another thread's
+    /// timing. (A wait there that could time out is not used: a held JIT domain's call never returns
+    /// from one, on main too, #3129.)
+    #[test]
+    fn a_held_domain_a_host_procedure_calls_on_a_kernel_vcpu_takes_its_own_route() {
+        use temen_interp::{Executor, Reply};
+        let held = std::sync::Arc::new(
+            temen_text::parse_module(
+                "memory 16
+type 0 func () -> (i64)
+type 1 interface { poke: 0 }
+export 0 interface \"svc\" 1 { poke: 1 }
+func () -> (i64) {
+block 0 () {
+  vq = i64.const 16400
+  vfive = i32.const 5
+  i32.atomic.store vq vfive
+  vz = i64.const 0
+  vt = thread.spawn 2 vz vz
+  vts, vtv = thread.join vt
+  vr = i64.const 1
+  return vr
+  }
+}
+func () -> (i64) {
+block 0 () {
+  vone = i32.const 1
+  vp = call.cap 4294967295 19 () -> (i64) vone ()
+  vq = i64.const 16400
+  vn = atomic.notify vq vone
+  vzero = i32.const 0
+  vto = i64.const 0
+  vw = i32.atomic.wait vq vzero vto
+  vr = i64.extend_i32_u vw
+  return vr
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (va: i64, vb: i64) {
+  return va
+  }
+}
+",
+            )
+            .expect("parse"),
+        );
+        temen_verify::verify_module(&held).expect("verify");
+        let mut host = Host::new();
+        host.set_self_module(&held);
+        let (domain, _) = temen_run::hold(Executor::Jit, held, 0, &[], u64::MAX, host)
+            .unwrap_or_else(|(t, _)| panic!("the held entry ended {t:?}"));
+        assert_eq!(domain.executor(), Executor::Jit, "held on the JIT");
+        let poke = |d: &temen_interp::HeldDomain| {
+            let mut fuel = 1_000_000;
+            match d.call(0, 0, &[], &mut fuel) {
+                Reply::Results(v) => v[0],
+                Reply::Failed(e) => panic!("the call failed {e}"),
+            }
+        };
+        assert_eq!(poke(&domain), 1, "on its own, the wait answers not-equal");
+        let (got, runs) = on_kernel_with(answering(move || poke(&domain)));
+        assert_eq!(got, Ok(vec![1]), "the held call's wait was its own run's");
+        assert_eq!(runs, 1, "only the outer run took the kernel route");
+    }
+
+    /// A run that leaves fibers behind: the root makes fiber F (which suspends forever) and resumes it
+    /// once, then a thread makes fiber G, resumes it once and hands it back; the root resumes G on its
+    /// own vCPU, so G runs on a context whose vCPU has ended, and then `end` ends the run with both
+    /// suspended: a return of 9, an `unreachable` in the root, a fault in G (a load past the window), or
+    /// a loop the kill door ends.
+    fn leaves_fibers(end: &str) -> temen_ir::Module {
+        let (root, g) = match end.split_once(' ') {
+        _ if end == "trap" => (
+            "  unreachable\n}\nblock 1 () {\n  vr = i64.const 9".to_string(),
+            "",
+        ),
+        _ if end == "fault" => (
+            "  vr = i64.const 9".to_string(),
+            "  vfar = i64.const 1099511627776\n  vbad = i64.load vfar\n",
+        ),
+        // `kill H`: with both fibers suspended, call host procedure H (which fires the kill door),
+        // then loop until the door ends the run.
+        Some(("kill", handle)) => (
+            format!("  vc = i32.const {handle}\n  vp = call.cap 13 0 (i64) -> (i64) vc(vz)\n  br 1()\n}}\nblock 1 () {{\n  br 1()\n}}\nblock 2 () {{\n  vr = i64.const 9"),
+            "",
+        ),
+        _ => ("  vr = i64.const 9".to_string(), ""),
+    };
+        module(&format!(
+            "memory 16
+func () -> (i64) {{
+block 0 () {{
+  vz = i64.const 0
+  vf = ref.func 2
+  vk = cont.new vf vz
+  vs, vv = cont.resume vk vz
+  vt = thread.spawn 1 vz vz
+  vts, vg = thread.join vt
+  vgs, vgv = cont.resume vg vz
+{root}
+  return vr
+  }}
+}}
+func (i64, i64) -> (i64) {{
+block 0 (va: i64, vb: i64) {{
+  vf = ref.func 3
+  vk = cont.new vf va
+  vs, vv = cont.resume vk va
+  return vk
+  }}
+}}
+func (i64, i64) -> (i64) {{
+block 0 (vsp: i64, varg: i64) {{
+  br 1()
+}}
+block 1 () {{
+  vz = i64.const 0
+  vx = suspend vz
+  br 1()
+  }}
+}}
+func (i64, i64) -> (i64) {{
+block 0 (vsp: i64, varg: i64) {{
+  vz = i64.const 0
+  vx = suspend vz
+{g}  vy = suspend vz
+  return vz
+  }}
+}}
+"
+        ))
+    }
+
+    /// #3078 slice 2 — a run that ends with fibers suspended, one of them on a context whose vCPU ended,
+    /// ends as the oracle's does, however it ends: by the root's return, a trap, or a fault in a fiber
+    /// migrated from an ended vCPU. Their stacks go with the run's fiber table, after its last thread.
+    #[test]
+    fn a_run_ending_with_fibers_suspended_ends_as_the_oracles_on_the_kernel_route() {
+        for (end, want) in [
+            ("return", Ok(vec![9])),
+            ("trap", Err(Trap::Unreachable)),
+            ("fault", Err(Trap::MemoryFault)),
+        ] {
+            assert_eq!(on_kernel_as_oracle(&leaves_fibers(end)), want, "{end}");
+        }
+    }
+
+    /// #3078 slice 2 — the kill door ends a kernel run with fibers suspended. The guest calls a host
+    /// procedure once both its fibers are suspended, one of them on an ended vCPU's context, and the
+    /// procedure fires the door, so the run is killed with them alive: it ends `OutOfFuel`, and
+    /// [`bounded`] fails the test, saying so, if it does not end within [`PROMPT`]. The door's
+    /// waker asks the run's door to stop, which takes the run lock, from inside the procedure, while
+    /// the vCPU holds the domain's `Host` lock: safe here only because no sibling is live to hold the
+    /// run lock and wait for that `Host` lock (the lock order is run lock → `Host` lock); a
+    /// `RunDoor::stop` that finds the lock busy answers `false` and is asked again.
+    #[test]
+    fn the_kill_door_ends_a_kernel_run_with_fibers_suspended() {
+        let kill = temen_jit::Interrupt::new();
+        let door = std::sync::Arc::clone(&kill);
+        let fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let saw = std::sync::Arc::clone(&fired);
+        let (mut host, handle) = answering(move || {
+            saw.store(true, std::sync::atomic::Ordering::SeqCst);
+            door.fire();
+            0
+        });
+        let m = leaves_fibers(&format!("kill {handle}"));
+        let (got, vcpus) = bounded("the killed run", move || {
+            let admitted = jit_kernel::admit(&m, &host, false, u64::MAX).expect("in scope");
+            let start = jit_kernel::Start {
+                kill: Some(&kill),
+                ..fresh_start(u64::MAX)
+            };
+            let end = jit_kernel::run(admitted, start, &mut host).expect("compiles");
+            (end.result, end.vcpus)
+        });
+        assert!(
+            fired.load(std::sync::atomic::Ordering::SeqCst),
+            "the guest reached its fibers' suspension"
+        );
+        assert!(vcpus >= 2, "it ran as kernel tasks");
+        assert_eq!(got, Err(Trap::OutOfFuel));
+    }
+
+    /// A spawned thread makes `n` fibers and resumes each once, so each stays suspended: it answers `n`.
+    fn makes_fibers(n: u32) -> temen_ir::Module {
+        let mut body = String::new();
+        for i in 0..n {
+            body.push_str(&format!(
+                "  vk{i} = cont.new vf vz\n  vs{i}, vv{i} = cont.resume vk{i} vz\n"
+            ));
+        }
+        module(&format!(
+            "memory 16
+func () -> (i64) {{
+block 0 () {{
+  vz = i64.const 0
+  vt = thread.spawn 1 vz vz
+  vts, vr = thread.join vt
+  return vr
+  }}
+}}
+func (i64, i64) -> (i64) {{
+block 0 (va: i64, vb: i64) {{
+  vz = i64.const 0
+  vf = ref.func 2
+{body}  vn = i64.const {n}
+  return vn
+  }}
+}}
+func (i64, i64) -> (i64) {{
+block 0 (vsp: i64, varg: i64) {{
+  vz = i64.const 0
+  vx = suspend vz
+  return vz
+  }}
+}}
+"
+        ))
+    }
+
+    /// #3078 slice 2 — a kernel run's fibers charge its budget node's `mem` (#2112), as the oracle's do:
+    /// with room for the window and two fibers, two suspended fibers fit and a third is a `FiberFault`.
+    #[test]
+    fn a_kernel_runs_fibers_spend_its_mem_as_the_oracles_do() {
+        let room = (1i64 << 16) + 2 * temen_ir::FIBER_STACK as i64;
+        let granted = move || {
+            let mut h = Host::new();
+            h.set_grant(room, -1, -1, -1);
+            h
+        };
+        for (n, want) in [(2, Ok(vec![2])), (3, Err(Trap::FiberFault))] {
+            let m = makes_fibers(n);
+            let mut left = u64::MAX;
+            let oracle =
+                temen_interp::run_with_host(&m, 0, &[], &mut left, &mut granted()).map(|v| {
+                    (v.iter())
+                        .map(|x| match x {
+                            temen_interp::Value::I64(n) => *n,
+                            other => panic!("{other:?}"),
+                        })
+                        .collect::<Vec<_>>()
+                });
+            let kernel = bounded("the kernel route", move || {
+                let mut h = granted();
+                let admitted = jit_kernel::admit(&m, &h, false, u64::MAX).expect("in scope");
+                jit_kernel::run(admitted, fresh_start(u64::MAX), &mut h)
+                    .expect("compiles")
+                    .result
+            });
+            assert_eq!(oracle, want, "the oracle, {n} fibers");
+            assert_eq!(kernel, want, "the kernel route, {n} fibers");
+        }
+    }
+
+    /// A spawned thread makes one fiber and resumes it; the fiber faults (`fault`, a load past the
+    /// window) or suspends. The root joins the thread and answers 1.
+    fn one_fiber(fault: bool) -> temen_ir::Module {
+        let body = match fault {
+            true => "  vfar = i64.const 1099511627776\n  vbad = i64.load vfar\n",
+            false => "",
+        };
+        module(&format!(
+            "memory 16
+func () -> (i64) {{
+block 0 () {{
+  vz = i64.const 0
+  vt = thread.spawn 1 vz vz
+  vts, vtv = thread.join vt
+  vone = i64.const 1
+  return vone
+  }}
+}}
+func (i64, i64) -> (i64) {{
+block 0 (va: i64, vb: i64) {{
+  vz = i64.const 0
+  vf = ref.func 2
+  vk = cont.new vf vz
+  vs, vv = cont.resume vk vz
+  return vz
+  }}
+}}
+func (i64, i64) -> (i64) {{
+block 0 (vsp: i64, varg: i64) {{
+  vz = i64.const 0
+{body}  vx = suspend vz
+  return vz
+  }}
+}}
+"
+        ))
+    }
+
+    /// #3078 slice 2 — a kernel run's fibers' `mem` charges are back by the time `run` returns, as
+    /// the oracle's are: under a grant with room for the window and one fiber, a run that faults inside
+    /// its fiber, then a run that makes and keeps one, on the same host, end as the oracle's two runs
+    /// do; and so do two back-to-back runs that each leave one fiber suspended. (The stacks are
+    /// `kernel_fiber_stacks.rs`'s row.) Each run is bounded: a join that never wakes after the fault
+    /// fails the test, saying so.
+    #[test]
+    fn a_kernel_run_hands_its_fibers_back_as_it_returns() {
+        let room = (1i64 << 16) + temen_ir::FIBER_STACK as i64;
+        for first in [true, false] {
+            let mut host = Host::new();
+            host.set_grant(room, -1, -1, -1);
+            let mut oracle_host = Host::new();
+            oracle_host.set_grant(room, -1, -1, -1);
+            for (i, fault) in [(0, first), (1, false)] {
+                let m = one_fiber(fault);
+                let mut left = u64::MAX;
+                let want = temen_interp::run_with_host(&m, 0, &[], &mut left, &mut oracle_host)
+                    .map(|v| v.len());
+                let m = m.clone();
+                let (got, back) = bounded("the kernel route", move || {
+                    let mut host = host;
+                    let admitted = jit_kernel::admit(&m, &host, false, u64::MAX).expect("in scope");
+                    let end = jit_kernel::run(admitted, fresh_start(u64::MAX), &mut host)
+                        .expect("compiles");
+                    (end.result.map(|v| v.len()), host)
+                });
+                host = back;
+                assert_eq!(
+                    got,
+                    want,
+                    "run {i} after a {} run",
+                    ["suspending", "faulting"][first as usize]
+                );
+            }
+        }
+    }
+
+    /// A threaded fibered program whose fiber calls host procedure `handle` and returns its answer,
+    /// which the root returns.
+    fn calls_a_host_procedure_in_a_fiber(handle: i32) -> temen_ir::Module {
+        module(&format!(
+            "memory 16
+func () -> (i64) {{
+block 0 () {{
+  vz = i64.const 0
+  vt = thread.spawn 1 vz vz
+  vts, vtv = thread.join vt
+  vf = ref.func 2
+  vk = cont.new vf vz
+  vs, vr = cont.resume vk vz
+  return vr
+  }}
+}}
+func (i64, i64) -> (i64) {{
+block 0 (va: i64, vb: i64) {{
+  return va
+  }}
+}}
+func (i64, i64) -> (i64) {{
+block 0 (vsp: i64, varg: i64) {{
+  vz = i64.const 0
+  vc = i32.const {handle}
+  vr = call.cap 13 0 (i64) -> (i64) vc(vz)
+  return vr
+  }}
+}}
+"
+        ))
+    }
+
+    /// A threaded program with no fiber op whose waits park: the root's wait times out (status 2), and
+    /// a thread waits until the root stores and notifies, then answers 7. It answers `10 * 2 + 7`.
+    const WAITS_AND_PARKS: &str = "memory 16
+func () -> (i64) {
+block 0 () {
+  vz = i64.const 0
+  vt = thread.spawn 1 vz vz
+  vq = i64.const 16400
+  vzw = i32.const 0
+  vto = i64.const 1000
+  vw = i32.atomic.wait vq vzw vto
+  vg = i64.const 16404
+  vone = i32.const 1
+  i32.atomic.store vg vone
+  vn = atomic.notify vg vone
+  vts, vtv = thread.join vt
+  vw64 = i64.extend_i32_u vw
+  vten = i64.const 10
+  vhi = i64.mul vw64 vten
+  vr = i64.add vhi vtv
+  return vr
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (va: i64, vb: i64) {
+  vg = i64.const 16404
+  vzw = i32.const 0
+  vinf = i64.const -1
+  vw = i32.atomic.wait vg vzw vinf
+  vr = i64.const 7
+  return vr
+  }
+}
+";
+
+    /// #3078 slice 2 (review B2) — whether a park is a fiber's is asked of the run's own fiber runtime,
+    /// which the thread's record names, never of the thread's `CURRENT_RT`: a fiber of kernel run X
+    /// calls a sync host procedure, which starts kernel run Y, with no fiber op, on the same thread with
+    /// X's runtime still published. Y's waits park through Y's rules, as the oracle's do, where asking
+    /// the thread's runtime would see X's fiber and trap `Malformed` at the backstop.
+    #[test]
+    fn a_fiberless_kernel_run_inside_a_fiber_of_another_parks_as_the_oracles() {
+        let y = module(WAITS_AND_PARKS);
+        let want = oracle(&y).expect("the oracle's run");
+        let inner = y.clone();
+        let (h, handle) = answering(move || {
+            let (o, vcpus) =
+                jit_kernel::run_fresh(&inner, 0, &[], None, u64::MAX).expect("in scope");
+            assert!(vcpus >= 2, "the inner run's vCPUs ran as kernel tasks");
+            match o {
+                JitOutcome::Returned(v) => v[0],
+                o => panic!("the inner run ended {o:?}"),
+            }
+        });
+        let x = calls_a_host_procedure_in_a_fiber(handle);
+        let (got, runs) = bounded("the kernel route", move || {
+            let mut host = h;
+            let before = jit_kernel::kernel_runs();
+            let admitted = jit_kernel::admit(&x, &host, false, u64::MAX).expect("in scope");
+            let end =
+                jit_kernel::run(admitted, fresh_start(u64::MAX), &mut host).expect("compiles");
+            (end.result, jit_kernel::kernel_runs() - before)
+        });
+        assert_eq!(got, Ok(want), "Y's answer, through X's fiber");
+        assert_eq!(runs, 2, "both runs took the kernel route");
+    }
+
+    /// A threaded fibered module that calls import 0 (`(i64) -> (i64)`), or with `grouped` a grouped
+    /// `Stream` import's `read`, and with `read` also makes an inline stream read on handle 0.
+    fn fibered_import(grouped: bool, read: bool) -> temen_ir::Module {
+        let (import, call) = match grouped {
+        true => (
+            "type 0 func (i64, i64) -> (i64)\ntype 1 interface { write: 0, read: 0 }\nimport 0 interface \"stdio\" 1\n",
+            "  v0 = i64.const 16384\n  v1 = i64.const 4\n  vr = call.import 0.read (v0, v1)",
+        ),
+        false => (
+            "import 0 \"target\" (i64) -> (i64)\n",
+            "  vr = call.import 0 (vz)",
+        ),
+    };
+        let inline = match read {
+            true => "  vh = i32.const 0\n  vrd = call.cap 0 0 (i64) -> (i64) vh(vz)\n",
+            false => "",
+        };
+        module(&format!(
+            "{import}memory 16
+func () -> (i64) {{
+block 0 () {{
+  vz = i64.const 0
+  vt = thread.spawn 1 vz vz
+  vts, vtv = thread.join vt
+  vf = ref.func 2
+  vk = cont.new vf vz
+  vs, vv = cont.resume vk vz
+{inline}{call}
+  return vr
+  }}
+}}
+func (i64, i64) -> (i64) {{
+block 0 (va: i64, vb: i64) {{
+  return va
+  }}
+}}
+func (i64, i64) -> (i64) {{
+block 0 (vsp: i64, varg: i64) {{
+  return vsp
+  }}
+}}
+"
+        ))
+    }
+
+    /// #3078 slice 2 (review R4) — `fiber parks` reads every op an import binding reaches, a grouped
+    /// slot's remap included, as `native_scope`'s other clauses do: an import bound to a pipe's read, to
+    /// a punting host procedure, or a grouped `Stream` import whose `read` the remap reaches on a
+    /// blocking stdin, may park; an import bound to `self.pipe` mints a pipe end, on which the module's
+    /// inline stream read may then park. Bound to a stream's write with no pipe, or to a sync host
+    /// procedure, nothing parks.
+    #[test]
+    fn fiber_parks_reads_every_op_an_import_reaches() {
+        use temen_interp::{
+            put_results, BoundImport, CapState, HostProcGrant, OffloadOutcome, ProcHandler,
+        };
+        use temen_ir::cap_id::{HOST_PROC, STREAM};
+        let bound = |type_id: u32, op: u32, setup: &dyn Fn(&mut Host) -> i32| {
+            let mut h = Host::new();
+            let handle = setup(&mut h);
+            h.set_import_bindings(vec![BoundImport::required(type_id, op, handle)]);
+            h
+        };
+        let pipe_read = |h: &mut Host| h.grant_pipe().1;
+        let nothing = |_: &mut Host| 0;
+        let offloadable = |h: &mut Host| {
+            h.grant_host_proc(HostProcGrant::new(
+                ProcHandler::Offloadable(Box::new(|_, _, _| OffloadOutcome::Done(Ok(())))),
+                CapState::Stateless,
+            ))
+        };
+        let sync = |h: &mut Host| {
+            h.grant_host_proc(HostProcGrant::new(
+                ProcHandler::Sync(Box::new(|_, _, out, _, _| put_results(out, &[0]))),
+                CapState::Stateless,
+            ))
+        };
+        let grouped = |stdin_blocks: bool| {
+            let mut h = Host::new();
+            h.stdin_block = stdin_blocks;
+            let s = h.grant_stream(temen_interp::StreamRole::In);
+            h.set_import_bindings(vec![BoundImport::required(STREAM, 0, s)]);
+            h.set_import_remap(0, std::sync::Arc::from(vec![1u32, 0]));
+            h
+        };
+        // A grouped binding whose own op is `own`, its remap `ops`: a walk that read only the
+        // binding's own op would see `own` alone.
+        let remapped = |type_id: u32, own: u32, ops: Vec<u32>, setup: &dyn Fn(&mut Host) -> i32| {
+            let mut h = Host::new();
+            let handle = setup(&mut h);
+            h.set_import_bindings(vec![BoundImport::required(type_id, own, handle)]);
+            h.set_import_remap(0, std::sync::Arc::from(ops));
+            h
+        };
+        let blocking_stdin = |h: &mut Host| {
+            h.stdin_block = true;
+            h.grant_stream(temen_interp::StreamRole::In)
+        };
+        let rows: Vec<(temen_ir::Module, Host, Option<&str>)> = vec![
+            // Only through the remap: a write (op 1, no pipe) whose read reaches a blocking stdin.
+            (
+                fibered_import(true, false),
+                remapped(STREAM, 1, vec![1, 0], &blocking_stdin),
+                Some("fiber parks"),
+            ),
+            // Only through the remap: `self.pipe` (16) mints, so the inline stream read may park.
+            (
+                fibered_import(true, true),
+                remapped(temen_ir::CAP_SELF_TYPE_ID, 0, vec![0, 16], &nothing),
+                Some("fiber parks"),
+            ),
+            (
+                fibered_import(false, false),
+                bound(STREAM, 0, &pipe_read),
+                Some("fiber parks"),
+            ),
+            (
+                fibered_import(false, false),
+                bound(HOST_PROC, 0, &offloadable),
+                Some("fiber parks"),
+            ),
+            (
+                fibered_import(true, false),
+                grouped(true),
+                Some("fiber parks"),
+            ),
+            (
+                fibered_import(false, true),
+                bound(temen_ir::CAP_SELF_TYPE_ID, 16, &nothing),
+                Some("fiber parks"),
+            ),
+            (
+                fibered_import(false, false),
+                bound(STREAM, 1, &nothing),
+                None,
+            ),
+            (
+                fibered_import(false, false),
+                bound(HOST_PROC, 0, &sync),
+                None,
+            ),
+            (fibered_import(true, false), grouped(false), None),
+        ];
+        let wrong: Vec<String> = rows
+            .iter()
+            .enumerate()
+            .filter_map(|(i, (m, host, clause))| {
+                let got = jit_kernel::admit(m, host, false, u64::MAX).err();
+                (got != *clause).then(|| format!("row {i}: {got:?}, not {clause:?}"))
+            })
+            .collect();
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// #3078 slice 2 (review R4) — the case the run's context pool exists for: thread A makes fiber F
+    /// and ends, so A's context waits in the pool; thread D starts, takes that context, flags 16408 and
+    /// spins until 16412 is set; only then does thread B claim F. F runs on A's context, which live D
+    /// runs on too, from B's thread: its spawn, notify and join must be B's task's stops, found by B's
+    /// thread's record, where a lookup through the context would find D's. The root then releases D.
+    /// Every spin is a guest loop the bounded kernel run fails the test on, should it not end.
+    const ON_A_CONTEXT_A_LIVE_VCPU_TOOK: &str = "memory 16
+func () -> (i64) {
+block 0 () {
+  vz = i64.const 0
+  va = thread.spawn 1 vz vz
+  vas, vk = thread.join va
+  vd = thread.spawn 3 vz vz
+  br 1(vk, vd)
+}
+block 1 (vk1: i64, vd1: i32) {
+  vs = i64.const 16408
+  vstarted = i32.atomic.load vs
+  br_if vstarted 2(vk1, vd1) 1(vk1, vd1)
+}
+block 2 (vk2: i64, vd2: i32) {
+  vz2 = i64.const 0
+  vb = thread.spawn 2 vk2 vz2
+  vbs, vr = thread.join vb
+  vg = i64.const 16412
+  vone = i32.const 1
+  i32.atomic.store vg vone
+  vds, vdv = thread.join vd2
+  return vr
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (va: i64, vx: i64) {
+  vf = ref.func 4
+  vk = cont.new vf va
+  return vk
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vk: i64, vb: i64) {
+  vz = i64.const 0
+  vs, vv = cont.resume vk vz
+  return vv
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (va: i64, vb: i64) {
+  vs = i64.const 16408
+  vone = i32.const 1
+  i32.atomic.store vs vone
+  br 1()
+}
+block 1 () {
+  vg = i64.const 16412
+  vgo = i32.atomic.load vg
+  br_if vgo 2() 1()
+}
+block 2 () {
+  vz = i64.const 0
+  return vz
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, varg: i64) {
+  vz = i64.const 0
+  vc = thread.spawn 5 vz vz
+  vq = i64.const 16400
+  vone = i32.const 1
+  vn = atomic.notify vq vone
+  vcs, vcv = thread.join vc
+  vn64 = i64.extend_i32_u vn
+  vr = i64.add vcv vn64
+  return vr
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (va: i64, vb: i64) {
+  v7 = i64.const 7
+  return v7
+  }
+}
+";
+
+    #[test]
+    fn a_fiber_on_a_context_a_live_vcpu_took_makes_its_stops_as_its_resumer() {
+        let m = module(ON_A_CONTEXT_A_LIVE_VCPU_TOOK);
+        for _ in 0..20 {
+            assert_eq!(on_kernel_as_oracle(&m), Ok(vec![7]));
         }
     }
 }

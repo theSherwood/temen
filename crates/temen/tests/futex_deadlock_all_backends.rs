@@ -83,9 +83,14 @@ fn run_on(
             }
         }
         Lane::Jit(Route::Today) => jit(temen_jit::compile_and_run(&module, 0, &[]).expect("jit")),
-        Lane::Jit(Route::Kernel) => {
-            jit(jit_kernel::expect_kernel(&module, 0, &[], None, declined)?)
-        }
+        Lane::Jit(Route::Kernel) => jit(jit_kernel::expect_kernel(
+            &module,
+            0,
+            &[],
+            None,
+            jit_kernel::lane_fuel(&module),
+            jit_kernel::Expect::of(declined),
+        )?),
     };
     Some((r, t0.elapsed()))
 }
@@ -193,7 +198,7 @@ fn an_infinite_wait_inside_a_fiber_faults_on_every_backend() {
     pin_all_fault(
         FIBER_INFINITE_WAIT,
         "an unsatisfiable infinite wait inside a fiber",
-        Some("fibers"),
+        Some("fiber only"),
     );
 }
 
@@ -397,6 +402,6 @@ fn a_vcpu_driving_a_just_notified_fiber_is_not_counted_blocked() {
         NOTIFY_A_BLOCK_DRIVEN_FIBER_THEN_WAIT,
         "I64(300)",
         "notify a block-driven fiber, then wait for its reply",
-        Some("fibers"),
+        Some("fiber parks"),
     );
 }

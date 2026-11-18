@@ -11,7 +11,8 @@
 //! run (#2953). No lane meters fuel.
 //!
 //! `SPIKE_SECTIONS` picks sections, comma-separated: `compute`, `spawn`, `park` (the default three),
-//! `k1000`, `nowake`, `alias` (#2958 slice 4), `pairs`, `always` (#2985), `pipes` (#2958 slice 5). `SPIKE_K` picks the park section's K values (`0,100,1000` by
+//! `k1000`, `nowake`, `alias` (#2958 slice 4), `pairs`, `always` (#2985), `pipes` (#2958 slice 5), `fibers`
+//! (#3078 slice 2). `SPIKE_K` picks the park section's K values (`0,100,1000` by
 //! default), `SPIKE_LANES` its lanes.
 
 use std::time::{Duration, Instant};
@@ -63,7 +64,7 @@ fn today<'a>(m: &'a Module, entry: u32, host: Host, locked: bool) -> Lane<'a> {
 fn kernel(m: &Module, entry: u32, host: fn() -> Host) -> Lane<'_> {
     Box::new(move |args| {
         let mut h = host();
-        let admitted = jit_kernel::admit(m, &h, false).expect("in the kernel's scope");
+        let admitted = jit_kernel::admit(m, &h, false, u64::MAX).expect("in the kernel's scope");
         let start = jit_kernel::Start {
             entry,
             args,
@@ -283,7 +284,7 @@ pub fn run(reps: usize) {
         for k in [&crate::ALU, &crate::MEMSUM] {
             let m = parse(k.ir);
             assert_eq!(
-                jit_kernel::admit(&m, &Host::new(), false).err(),
+                jit_kernel::admit(&m, &Host::new(), false, u64::MAX).err(),
                 Some("no §12 op")
             );
             let mut lanes = [("today", today(&m, 0, Host::new(), false))];
@@ -411,6 +412,59 @@ pub fn run(reps: usize) {
     }
     if on("pipes") {
         run_pipes(reps);
+    }
+    if on("fibers") {
+        run_fibers(reps);
+    }
+}
+
+/// #3078 slice 2 — exit rows 1 and 4 on today's lane and the kernel's, interleaved: a fiber's
+/// `suspend`/`cont.resume` round trip with no park, on one spawned vCPU and on four, each resuming a
+/// fiber of its own ([`crate::kernel_spike_ir::FIBER_ROUNDTRIP_IR`]); and a notify with no waiter
+/// beside `k` suspended fibers ([`crate::kernel_spike_ir::NOWAKE_SUSPENDED_IR`]). Unmetered: the
+/// kernel route declines a metered fibered run (`fiber fuel`, #3080).
+fn run_fibers(reps: usize) {
+    println!(
+        "
+fibers, no park (ns per round trip / per notify):"
+    );
+    let m = parse(crate::kernel_spike_ir::FIBER_ROUNDTRIP_IR);
+    for w in [1i64, 4] {
+        let mut lanes = [
+            ("today", today(&m, 0, Host::new(), true)),
+            ("kernel", kernel(&m, 0, Host::new)),
+        ];
+        // Per `n`: `w` vCPUs each make `n` round trips at once, so this is wall time per round trip
+        // of each vCPU, not of all `w` together.
+        let label = format!("round trip, {w} vCPU (wall per n)");
+        per_iter(
+            &label,
+            &mut lanes,
+            move |n| vec![n, w],
+            (1_000, 2_001_000),
+            1.0,
+            reps,
+            1.0,
+            "ns",
+        );
+    }
+    let m = parse(crate::kernel_spike_ir::NOWAKE_SUSPENDED_IR);
+    for k in [0i64, 100, 1_000] {
+        let mut lanes = [
+            ("today", today(&m, 0, Host::new(), true)),
+            ("kernel", kernel(&m, 0, Host::new)),
+        ];
+        let label = format!("notify, none, K = {k} suspended");
+        per_iter(
+            &label,
+            &mut lanes,
+            move |n| vec![n, k],
+            (1_000, 2_001_000),
+            1.0,
+            reps,
+            1.0,
+            "ns",
+        );
     }
 }
 

@@ -52,7 +52,14 @@ fn run_killed(src: &str, delay_ms: u64) -> Vec<JitOutcome> {
                     )
                     .expect("jit compiles"),
                 ),
-                Route::Kernel => jit_kernel::expect_kernel(&m, 0, &[0i64], Some(&interrupt), None),
+                Route::Kernel => jit_kernel::expect_kernel(
+                    &m,
+                    0,
+                    &[0i64],
+                    Some(&interrupt),
+                    jit_kernel::lane_fuel(&m),
+                    jit_kernel::Expect::of(None),
+                ),
             };
             watchdog.join().unwrap();
             outcome

@@ -1503,7 +1503,7 @@ pub fn jit_cap_run(
     // A fresh window: its page map is `init`'s, none from an earlier run (see `reset_cap_pages`).
     host.reset_cap_pages(init.page_map());
     // #2958 — a program `jit_kernel::admit` admits runs its vCPUs as executor 2's tasks.
-    if let Ok(admitted) = jit_kernel::admit(m, host, false) {
+    if let Ok(admitted) = jit_kernel::admit(m, host, false, temen_interp::DEFAULT_FUEL) {
         let start = jit_kernel::Start {
             entry,
             args,
@@ -7990,7 +7990,7 @@ fn jit_run(
     // level meters nothing, and the run's code compiles without fuel checks.
     limits.grant(host);
     // #2958 — a program `jit_kernel::admit` admits runs its vCPUs as executor 2's tasks.
-    if let Ok(admitted) = jit_kernel::admit(m, host, code.is_some()) {
+    if let Ok(admitted) = jit_kernel::admit(m, host, code.is_some(), limits.fuel()) {
         let mut end = with_deadline(limits.deadline, |kill| {
             let start = jit_kernel::Start {
                 entry: func,
@@ -9460,7 +9460,7 @@ impl Instance {
         let owned = self.window_override(config);
         let m = owned.as_ref().unwrap_or(&self.module);
         let host = self.diff_host(config, m.memory.map_or(0, |mc| 1u64 << mc.size_log2));
-        jit_kernel::admit(m, &host, config.jit_code.is_some()).map(|_| ())
+        jit_kernel::admit(m, &host, config.jit_code.is_some(), config.limits.fuel()).map(|_| ())
     }
 
     pub fn run_diff(&self, config: &RunConfig) -> Result<Run, String> {

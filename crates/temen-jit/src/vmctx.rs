@@ -129,10 +129,11 @@ pub struct VmCtx {
     /// ([`Self::thunk_state`]): made by the thunk's first call, dropped with the context. Never read
     /// by compiled code. #2847 — beside it, the type it was made as.
     thunk_state: std::sync::OnceLock<(core::any::TypeId, Box<dyn core::any::Any + Send + Sync>)>,
-    /// #2958 — on a vCPU that runs as a task of executor 2's scheduling core, where its §12 ops go
-    /// ([`crate::kernel_rt`]): set by `KernelRun::run_vcpu` for its guarded call, `None` on every
-    /// other context. Never read by compiled code, so it sits past every field the code loads.
-    pub(crate) kernel: Option<core::ptr::NonNull<dyn crate::kernel_rt::KernelPark>>,
+    /// #3078 — this context is a kernel run's (`kernel_rt::KernelRun`): a fact of the run, which
+    /// every context of it carries from its root, a fiber's creator context included, so it is right
+    /// wherever the code runs. Where its §12 ops go is the thread's ([`crate::kernel_rt`]'s record),
+    /// asked only when this is set. Never read by compiled code.
+    pub(crate) kernel: bool,
     /// #3000 — the owner of the cell `fuel` names, on a held domain's activation: shared with every
     /// activation that charges the same cell, so the cell lives until the last context charging it
     /// goes ([`crate::child_exec::HeldSite::activate`]). `None` on every other context, whose cell
@@ -261,7 +262,7 @@ impl VmCtx {
             #[cfg(fiber_rt)]
             owned_handlers: Some(owned_handlers),
             thunk_state: std::sync::OnceLock::new(),
-            kernel: None,
+            kernel: false,
             #[cfg(fiber_rt)]
             cell: None,
         }
@@ -311,7 +312,7 @@ impl VmCtx {
             #[cfg(fiber_rt)]
             owned_handlers: None,
             thunk_state: std::sync::OnceLock::new(),
-            kernel: None,
+            kernel: self.kernel,
             #[cfg(fiber_rt)]
             cell: None,
         }
@@ -380,11 +381,13 @@ impl VmCtx {
             .then(|| unsafe { &*(&**state as *const (dyn Any + Send + Sync)).cast::<T>() })
     }
 
-    /// #2958 — whether this is a kernel vCPU's context: a task of executor 2's run
-    /// (`kernel_rt::KernelRun::run_vcpu`), whose §12 ops and parks are the kernel's, never this
-    /// crate's own thread runtime's.
+    /// #2958 — whether code running on this context runs as a kernel vCPU on this thread: a task of
+    /// executor 2's run (`kernel_rt::KernelRun::run_vcpu`), whose §12 ops and parks are the kernel's,
+    /// never this crate's own thread runtime's ([`Self::kernel`]). Only a vCPU of the run runs its
+    /// code, on a thread whose record names the run; a thunk finding otherwise fails closed
+    /// (`kernel_rt`'s module docs).
     pub fn on_kernel(&self) -> bool {
-        self.kernel.is_some()
+        self.kernel
     }
 
     /// The code that ended this context's domain, or `None` while it runs.

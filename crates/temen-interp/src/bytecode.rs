@@ -9034,8 +9034,13 @@ fn image_parks(host: &Host, m: &Module, census: &ImageCensus) -> Parks {
 ///   with no kernel (the phase that runs every JIT program on the kernel, after phase 2);
 /// - **`durable`**: executor 2 has no freeze driver (#2533; the phase that ports freeze);
 /// - **`bytecode`**: the rules need the module's bytecode compile ([`admits_for`]; slice 7);
-/// - **`fibers`**: a fiber's park runs on the engine's fiber runtime, whose futex core its vCPU
-///   waits share (phase 2);
+/// - **`fiber only`**: a module with fibers and no `thread.spawn` keeps its single-vCPU path
+///   (#3078, owner decision 21: removed by the slice that runs a run with no `thread.spawn` on the
+///   kernel without locks);
+/// - **`fiber parks`**: a module with fibers that makes a `memory.wait` or a call that can park
+///   ([`fiber_parks`]): a fiber's park runs on the engine's fiber runtime, not the kernel's rules yet
+///   (#3078 slices 3 and 4). A join, a spawn, a notify and a region post's `signal` made in a fiber
+///   are the stops of the task that runs it, through that thread's hook;
 /// - **`gc.roots`**: the rules scan an interpreted task's frames, not native ones (a later phase,
 ///   or for good if no consumer needs it);
 /// - **`signals`**: delivery into native code is the engine's safepoint redirect, not executor 2's
@@ -9078,7 +9083,15 @@ pub fn native_scope(m: &Module, host: &Host) -> Result<(), &'static str> {
         return Err("bytecode");
     }
     if m.funcs.iter().any(temen_ir::Func::uses_fibers) {
-        return Err("fibers");
+        let spawns_thread = (m.funcs.iter().flat_map(|f| &f.blocks))
+            .flat_map(|b| &b.insts)
+            .any(|i| matches!(i, Inst::ThreadSpawn { .. }));
+        if !spawns_thread {
+            return Err("fiber only");
+        }
+        if fiber_parks(m, host) {
+            return Err("fiber parks");
+        }
     }
     if m.funcs.iter().any(temen_ir::Func::uses_gc_roots) {
         return Err("gc.roots");
@@ -9108,20 +9121,15 @@ pub fn native_scope(m: &Module, host: &Host) -> Result<(), &'static str> {
     if m.imports.len() != host.import_bindings.len() {
         return Err("imports");
     }
-    for (slot, b) in host.import_bindings.iter().enumerate() {
-        if b.rebindable || !b.bound {
-            return Err("imports");
-        }
-        // Every op the slot reaches: a grouped binding's remap (consumer op → the target's op,
-        // [`Host::import_target`]), or the one bound op.
-        match host.import_remaps.get(slot).and_then(|r| r.as_deref()) {
-            Some(ops) => {
-                for &op in ops {
-                    kernel_op(host, b.type_id, op)?;
-                }
-            }
-            None => kernel_op(host, b.type_id, b.op)?,
-        }
+    if host
+        .import_bindings
+        .iter()
+        .any(|b| b.rebindable || !b.bound)
+    {
+        return Err("imports");
+    }
+    for (b, op) in bound_ops(host) {
+        kernel_op(host, b.type_id, op, CallSite::import(b))?;
     }
     for i in m
         .funcs
@@ -9129,7 +9137,7 @@ pub fn native_scope(m: &Module, host: &Host) -> Result<(), &'static str> {
         .flat_map(|f| &f.blocks)
         .flat_map(|b| &b.insts)
     {
-        kernel_inst(host, i)?;
+        kernel_inst(host, i, false)?;
         punt_shape(host, m, i)?;
     }
     Ok(())
@@ -9199,15 +9207,19 @@ fn file_region(host: &Host) -> bool {
 /// #2958 slice 4 — whether a kernel task can run instruction `i` under `host`, as far as it reaches
 /// the host: every instruction kind is named here, with no wildcard arm, so a kind added to the IR
 /// is decided before it compiles. A `call.import` is decided through its binding ([`native_scope`]);
-/// the kinds that reach no host state, or only the §12 rules and the window, pass. The kinds
-/// declined whole before this scan pass here: fiber ops (`fibers`) and `gc.roots` in
-/// [`native_scope`], and `setjmp`/`longjmp`, which the JIT's compile refuses.
-fn kernel_inst(host: &Host, i: &Inst) -> Result<(), &'static str> {
+/// the kinds that reach no host state, or only the §12 rules and the window, pass. So do the fiber
+/// ops, which [`native_scope`] decides on the module (`fiber only`, `fiber parks`), and the kinds it
+/// declines whole before this scan (`gc.roots`) or the JIT's compile refuses (`setjmp`/`longjmp`).
+fn kernel_inst(host: &Host, i: &Inst, mints: bool) -> Result<CallParks, &'static str> {
+    let inline = CallSite {
+        handle: None,
+        mints,
+    };
     match i {
-        Inst::CapCall(c) => kernel_op(host, c.type_id, c.op),
+        Inst::CapCall(c) => kernel_op(host, c.type_id, c.op, inline),
         // A `call.import`, and a `call.sym` (a flat import dispatch, op 0, once bound), are decided
         // through their binding.
-        Inst::CallImport { .. } | Inst::CallSym { .. } => Ok(()),
+        Inst::CallImport { .. } | Inst::CallSym { .. } => Ok(CallParks::No),
         // What a dynamic dispatch or an attach reaches is chosen mid-run; a data or function symbol
         // names what only a link resolves.
         Inst::CallImportDyn { .. }
@@ -9217,10 +9229,14 @@ fn kernel_inst(host: &Host, i: &Inst) -> Result<(), &'static str> {
         // The typed `self` extensions are the packed self ops the bytecode compile and the JIT
         // lower them to, decided in the one table: `type_id` (6) and `covers` (7) pass,
         // `export.handle` (8) is `serving`.
-        Inst::CapSelfTypeId { ty } => kernel_op(host, temen_ir::CAP_SELF_TYPE_ID, 6 | ty << 8),
-        Inst::CapSelfCovers { ty, .. } => kernel_op(host, temen_ir::CAP_SELF_TYPE_ID, 7 | ty << 8),
+        Inst::CapSelfTypeId { ty } => {
+            kernel_op(host, temen_ir::CAP_SELF_TYPE_ID, 6 | ty << 8, inline)
+        }
+        Inst::CapSelfCovers { ty, .. } => {
+            kernel_op(host, temen_ir::CAP_SELF_TYPE_ID, 7 | ty << 8, inline)
+        }
         Inst::ExportHandle { export } => {
-            kernel_op(host, temen_ir::CAP_SELF_TYPE_ID, 8 | export << 8)
+            kernel_op(host, temen_ir::CAP_SELF_TYPE_ID, 8 | export << 8, inline)
         }
         Inst::ConstI32 { .. }
         | Inst::ConstI64 { .. }
@@ -9303,7 +9319,7 @@ fn kernel_inst(host: &Host, i: &Inst) -> Result<(), &'static str> {
         | Inst::VNot { .. }
         | Inst::Bitselect { .. }
         | Inst::Shuffle { .. }
-        | Inst::Swizzle { .. } => Ok(()),
+        | Inst::Swizzle { .. } => Ok(CallParks::No),
     }
 }
 
@@ -9341,36 +9357,51 @@ fn kernel_inst(host: &Host, i: &Inst) -> Result<(), &'static str> {
 ///   Removed when today's route is cut: a program it declines then runs on the bytecode engine and
 ///   loses nothing, since every engine answers each of these calls alike (owner decision 19 on
 ///   #2949).
-fn kernel_op(host: &Host, type_id: u32, op: u32) -> Result<(), &'static str> {
+fn kernel_op(
+    host: &Host,
+    type_id: u32,
+    op: u32,
+    site: CallSite,
+) -> Result<CallParks, &'static str> {
     use temen_ir::cap_id::*;
     use temen_ir::{CAP_DYN_TYPE_ID, CAP_SELF_TYPE_ID};
+    let may = |parks: bool| match parks {
+        true => CallParks::May,
+        false => CallParks::No,
+    };
     match (type_id, op) {
         // A guest mint under a region factory: [`file_region`].
         (ADDRESS_SPACE, 5) if host.region_factory.is_some() => Err("file region"),
         // Every stream op: a read or write of a pipe or a blocking stdin parks through the rules, a
         // pipe's `close` wakes the other end's parks through its store, and an op past `close`
-        // answers `EINVAL`. A host procedure parks on its punted answer through the rules (a minting
-        // one is `file region`, decided host-wide), as does the offload exerciser `Blocking`; a
-        // region post's `signal` (7) wakes its word's waiters through them.
-        (STREAM, _)
-        | (EXIT, 0)
+        // answers `EINVAL`. A read or a write parks on a pipe end the host holds or the module can
+        // mint ([`CallSite::mints`]), and a read on a blocking stdin.
+        (STREAM, 0 | 1) => Ok(may(stream_op_parks(host, op) || site.mints)),
+        (STREAM, _) => Ok(CallParks::No),
+        // A host procedure parks on its punted answer through the rules (a minting one is `file
+        // region`, decided host-wide), as does the offload exerciser `Blocking`.
+        (HOST_PROC, _) => Ok(may(
+            host_proc_parks(host, site.handle) != super::OpParks::Never
+        )),
+        (BLOCKING, _) => Ok(CallParks::May),
+        // A region post's `signal` (7) wakes its word's waiters through the rules: a stop that does
+        // not park.
+        (EXIT, 0)
         | (CLOCK, 0)
         | (ADDRESS_SPACE, 0..=5)
         | (BUDGET, 0..=3)
-        | (SHARED_REGION, 0..=3 | 5..=7)
-        | (HOST_PROC, _)
-        | (BLOCKING, _) => Ok(()),
+        | (SHARED_REGION, 0..=3 | 5..=7) => Ok(CallParks::No),
         // A §13 region's `grant` into a child domain.
         (SHARED_REGION, 4) => Err("§14 children"),
         // `FreezeAuthority`'s ops 0–5, each `-EINVAL` on every engine (#2958 slice 6).
-        (FREEZE_AUTHORITY, 0..=5) => Ok(()),
+        (FREEZE_AUTHORITY, 0..=5) => Ok(CallParks::No),
         // The `self` ops: plain below 6 and at 17–19; from 6 on, packed as `selfop | idx << 8`
         // (the host's dispatch), so decided on the low byte. `self.pipe` (16) mints a pipe, as both
         // interpreters' do.
-        (CAP_SELF_TYPE_ID, 0..=5 | 16..=19) => Ok(()),
+        (CAP_SELF_TYPE_ID, 0..=5 | 16..=19) => Ok(CallParks::No),
         (CAP_SELF_TYPE_ID, op) => match op & 0xFF {
             // `type_id` and `covers` of a self interface.
-            6 | 7 => Ok(()),
+            6 | 7 => Ok(CallParks::No),
             // `export.handle` (8) mints an offer of the module's own impl under its interface's
             // interned id, which is a built-in's (`Stream`, `Exit`) when the shapes match: a call on
             // it would pass this table as that built-in's op and run the guest's impl. 9 and 10 are
@@ -9380,7 +9411,7 @@ fn kernel_op(host: &Host, type_id: u32, op: u32) -> Result<(), &'static str> {
             13 => Err("fuel"),
             // A plain op (0–5) packed with an index (the arm above took it with none): `Malformed`
             // on every engine (the JIT names that trap code `SetjmpFault`, #3087).
-            0..=5 => Ok(()),
+            0..=5 => Ok(CallParks::No),
             _ => Err("cap"),
         },
         (INSTANTIATOR | MODULE | MODULE_LOADER, _) => Err("§14 children"),
@@ -9389,6 +9420,76 @@ fn kernel_op(host: &Host, type_id: u32, op: u32) -> Result<(), &'static str> {
         (CAP_DYN_TYPE_ID.., _) => Err("imports"),
         _ => Err("cap"),
     }
+}
+
+/// #3078 slice 2 — whether a call [`kernel_op`] admits can park its caller: `fiber parks` declines a
+/// module whose fibers might make one, since a fiber's park is not the kernel's yet (slice 4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CallParks {
+    No,
+    May,
+}
+
+/// #3078 slice 2 — what [`kernel_op`] knows of a call site beside its target.
+#[derive(Clone, Copy)]
+struct CallSite {
+    /// A bound import's handle; `None` for an inline call, whose handle is an operand.
+    handle: Option<i32>,
+    /// Whether the module can mint a pipe end mid-run (`self.pipe`, inline or bound), on which any
+    /// stream read or write may then park. Every other way a stream end enters the host's table on
+    /// a run the kernel admits is a host fact at admission ([`stream_op_parks`]): the embedder's
+    /// `Host::grant_pipe` before the run; a personality's `pipe` and a fork's inherited ends
+    /// (`signals`, `process`); a §14 child's grant (`§14 children`); a guest offer (`serving`). Only
+    /// `fiber parks` asks: the other clauses read no park.
+    mints: bool,
+}
+
+impl CallSite {
+    fn import(b: &super::BoundImport) -> CallSite {
+        CallSite {
+            handle: Some(b.handle),
+            mints: false,
+        }
+    }
+}
+
+/// #3078 slice 2 — the `fiber parks` clause: a module that uses fibers and makes a `memory.wait`,
+/// or a call [`kernel_op`] says can park (inline, or through a bound import's every op). Which code
+/// runs in a fiber cannot be known statically, so it is decided on the module. A target `kernel_op`
+/// declines is not asked: a later clause declines the module.
+fn fiber_parks(m: &Module, host: &Host) -> bool {
+    use temen_ir::CAP_SELF_TYPE_ID;
+    let insts = || (m.funcs.iter().flat_map(|f| &f.blocks)).flat_map(|b| &b.insts);
+    let pipe = |t: u32, op: u32| t == CAP_SELF_TYPE_ID && op == super::CAP_SELF_PIPE;
+    let mints = insts().any(|i| matches!(i, Inst::CapCall(c) if pipe(c.type_id, c.op)))
+        || bound_ops(host).any(|(b, op)| pipe(b.type_id, op));
+    let may = |r: Result<CallParks, &str>| r == Ok(CallParks::May);
+    let waits = insts().any(|i| matches!(i, Inst::MemoryWait { .. }));
+    let inline = insts().any(|i| may(kernel_inst(host, i, mints)));
+    let imports = bound_ops(host).any(|(b, op)| {
+        let site = CallSite {
+            mints,
+            ..CallSite::import(b)
+        };
+        may(kernel_op(host, b.type_id, op, site))
+    });
+    waits || inline || imports
+}
+
+/// Every op `host`'s import bindings reach, with the binding: a grouped binding's remap (consumer op
+/// → the target's op, [`Host::import_target`]), or the one bound op. The one walk [`native_scope`]'s
+/// clauses read the bindings by.
+fn bound_ops(host: &Host) -> impl Iterator<Item = (&super::BoundImport, u32)> + '_ {
+    host.import_bindings
+        .iter()
+        .enumerate()
+        .flat_map(move |(slot, b)| {
+            let ops = match host.import_remaps.get(slot).and_then(|r| r.as_deref()) {
+                Some(ops) => ops,
+                None => std::slice::from_ref(&b.op),
+            };
+            ops.iter().map(move |&op| (b, op))
+        })
 }
 
 /// #2958 — whether `host`'s emitted tier makes the §12 thread ops itself ([`ThreadTier::native`]),
@@ -20565,6 +20666,12 @@ impl BounceTask<'_> {
     fn park_native(&mut self, stop: VcpuStop) -> Result<[Reg; 2], Trap> {
         let (run, ti) = (self.run, self.ti);
         let mut g = run.state.lock_unpoisoned();
+        // #3078 — a native tier's task is never in a held run: a held run never reaches
+        // `native_scope` (its doc). So no activation is carried onto this thread while it parks
+        // here (`Next::Carry` comes only from a held run's calls), and the thread runs no guest code
+        // until the park returns. The kernel hook its thunk borrowed (`temen_jit::kernel_rt`) is
+        // safe either way: a carried activation's emitted code would publish a record of its own.
+        debug_assert!(g.core.held.is_none(), "a native task in a held run");
         if g.over.is_some() || matches!(g.core.tasks[ti].state, TaskState::Done(_)) {
             return Err(Trap::ThreadFault);
         }
