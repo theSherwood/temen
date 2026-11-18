@@ -15657,7 +15657,6 @@ impl SchedCore {
         if !admits_thaw(&h) {
             return Err(Trap::Malformed);
         }
-        let thaw = h.take_admitted(code, 0).map_err(|_| Trap::Malformed)?;
         reapply_installs(&h, source, &table)?;
         // Fuel unification: the root's entry is paid as its task is made, as a thread's is
         // ([`entry_task`]). Gated exactly as the tree-walker's `drive` (`super::drive_arc`): a durable
@@ -15666,6 +15665,8 @@ impl SchedCore {
         let charge = (!thaws(&h, mem.as_ref())).then_some(&mut fuel);
         let root = &source.primary();
         let root_vt = entry_task(root, 0, entry as usize, args, Some(h.own_node()), charge)?;
+        // Taken once nothing before it can refuse the start, which leaves the residue in place.
+        let thaw = h.take_admitted(code, 0).map_err(|_| Trap::Malformed)?;
         let tasks: Tasks = std::iter::once(TaskSlot::new(root_vt, 0, LiveVcpu::none())).collect();
         wire_kill(&h);
         // #1122/#1146/#1262 — the run's bell ([`SchedCore::bell`]): wire the root's personality

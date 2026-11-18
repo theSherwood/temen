@@ -3864,18 +3864,42 @@ fn drive_over_cell(
                 // #1688 — one rung between its last poll and its return returned: its result rides as
                 // a completed child's does. A trap only when it was the child's own (filed above):
                 // any other may be the run's end reaping it where it parked.
-                // Owner decision 25 (#2949) — one a trap of its own ended during the cut, before or
-                // after its root unwound, rides that trap as a completed child's outcome: its join
-                // answers it, and what its unwound root kept goes back as its end hands it back.
-                let dom = p.host.lock_unpoisoned().domain_id() as usize;
+                // Owner decision 25 (#2949) — one a trap of its own ended during the cut goes where
+                // [`own_trap_fate`] says: completed, answering its trap or what its root returned
+                // (what its unwound root kept goes back as its end hands it back), or unreached.
+                let (dom, has_children) = {
+                    let h = p.host.lock_unpoisoned();
+                    (h.domain_id() as usize, !h.pending_detached.is_empty())
+                };
                 let (unwound, withheld, out) = {
                     let mut s = sched.lock();
                     let withheld = s.withheld.remove(&p.child_task).map(|w| w.outcome);
                     let unwound = s.unwound.contains(&p.child_task);
                     let kept = s.kept_leases.remove(&p.child_task);
-                    let own_trap = s.own_trap_domains.get(&dom).copied();
-                    if let (Some(trap), false) = (own_trap, withheld.is_some()) {
-                        s.results.remove(&p.child_task);
+                    if let Some(trap) = s.own_trap_domains.get(&dom).copied() {
+                        let stored = s.results.remove(&p.child_task);
+                        let fate = own_trap_fate(
+                            false,
+                            withheld.is_some(),
+                            has_children,
+                            unwound,
+                            stored.as_ref().map(|o| &o.result),
+                        );
+                        let completed = match fate {
+                            OwnTrapFate::Trapped => Err(trap.code()),
+                            OwnTrapFate::Returned => {
+                                join_outcome(stored.map_or(Err(trap), |o| o.result))
+                            }
+                            OwnTrapFate::Refused => {
+                                drop(s);
+                                // With its own children in the cut, as the JIT refuses them.
+                                let grand =
+                                    std::mem::take(&mut p.host.lock_unpoisoned().pending_detached);
+                                unreached.push(p);
+                                unreached.extend(grand);
+                                continue;
+                            }
+                        };
                         if unwound {
                             if let Some(end) = end_unwound_child(&p.host, kept) {
                                 notify_locked(&mut s, end.signal().key(), u32::MAX);
@@ -3890,7 +3914,7 @@ fn drive_over_cell(
                                 .push(FrozenDetached {
                                     parent_task: p.parent_task,
                                     slot: p.slot,
-                                    completed_result: Err(trap.code()),
+                                    completed_result: completed,
                                 });
                         }
                         continue;
@@ -3956,21 +3980,15 @@ fn drive_over_cell(
             for pid in mine {
                 let t = twins.remove(&pid).expect("listed just above");
                 let servicer = t.reaper == TwinReaper::Servicer;
-                // Owner decision 25 (#2949) — one a trap of its own ended during the cut ends with it,
-                // as a twin that trapped does: its exit hooks run, and a servicer's outcome rides.
+                // Owner decision 25 (#2949) is not proven for a twin a trap of its own ended in the
+                // cut ([`own_trap_fate`]): it is unreached, and the freeze is refused (#3131).
                 if let Some(host) = &t.host {
                     let dom = host.lock_unpoisoned().domain_id() as usize;
-                    let mut s = sched.lock();
-                    if let Some(trap) = s.own_trap_domains.get(&dom).copied() {
-                        s.results.remove(&pid);
-                        twin_finished_locked(&mut s, pid, host, &Err(trap));
-                        drop(s);
-                        if servicer {
-                            exited_twins.push(FrozenTwin {
-                                pid,
-                                outcome: Err(trap.code()),
-                            });
-                        }
+                    let own_trap = sched.lock().own_trap_domains.contains_key(&dom);
+                    if own_trap
+                        && own_trap_fate(true, false, false, false, None) == OwnTrapFate::Refused
+                    {
+                        unreached_twins.push(pid);
                         continue;
                     }
                 }
@@ -4125,6 +4143,41 @@ fn drive_over_cell(
 /// and the run did not fail. A root that returned keeps its result, and one that trapped its trap.
 fn carries_cut(froze: bool, result: &Result<Vec<Value>, Trap>) -> bool {
     froze && result.is_ok()
+}
+
+/// Owner decision 25 (#2949) — what the harvest does with a domain a trap of its own ended in the cut
+/// ([`own_trap_fate`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OwnTrapFate {
+    /// It rides as a completed child answering its trap.
+    Trapped,
+    /// Its root returned before the trap: it rides as a completed child answering what it returned.
+    Returned,
+    /// No proven shape: the child (or twin) is unreached, and the freeze is refused.
+    Refused,
+}
+
+/// Owner decision 25 (#2949), default-deny: the one shape decision 25 is proven for is a detached
+/// child, not a fork twin and not withheld (demand-paged), with no detached child of its own in the
+/// cut, whose root unwound or ended `Err` (it rides answering its trap), or returned `Ok` before the
+/// trap (it rides answering that). Anything else refuses the freeze, as every trap in the cut did
+/// before decision 25 (#3034 round 5).
+fn own_trap_fate(
+    twin: bool,
+    withheld: bool,
+    has_children: bool,
+    unwound: bool,
+    stored: Option<&Result<Vec<Value>, Trap>>,
+) -> OwnTrapFate {
+    if twin || withheld || has_children {
+        return OwnTrapFate::Refused;
+    }
+    match stored {
+        _ if unwound => OwnTrapFate::Trapped,
+        Some(Err(_)) => OwnTrapFate::Trapped,
+        Some(Ok(_)) => OwnTrapFate::Returned,
+        None => OwnTrapFate::Refused,
+    }
 }
 
 /// [`Host::drop_freeze`] for each domain of a cut a run does not carry.

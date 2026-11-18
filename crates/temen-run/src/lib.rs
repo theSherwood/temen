@@ -2006,12 +2006,11 @@ fn jit_durable_leave<B>(
     let mut refused = false;
     let trapped = ended(&r);
     let completed = jit_detached_leave(cm, host, trapped, &mut refused);
-    leave_residue(
-        host,
-        cm.take_durable_residue(),
-        completed,
-        trapped || refused,
-    );
+    let residue = cm.take_durable_residue();
+    // A refusal is a freeze's: a child whose window could not be re-opened at its finish in a run
+    // that did not freeze is no member of a cut. The run froze iff its root unwound (its extent).
+    let refused = refused && residue.root_sp.is_some();
+    leave_residue(host, residue, completed, trapped || refused);
     match r {
         Ok((_, b)) if refused => Ok((JitOutcome::Trapped(temen_jit::TrapKind::ThreadFault), b)),
         r => r,

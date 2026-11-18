@@ -325,15 +325,19 @@ What the freeze records is the value it checked, so no later write can change it
 
 **Whose a trap in the cut is** (owner decision 25, #2949). A detached child's own trap during the
 cut (a guest fault above, or any other trap its code or its own checks raise, in its root, a thread
-of its domain, a fiber it runs or its freeze drive, before or after its root unwound) is the child's:
-it ends as a trapped child ends (an unwound root's window and kept lease go back, once), its join
-answers the trap, it rides its parent's artifact as a completed child, and the parent's freeze goes
-on, on every engine. A fork twin's own trap ends the twin the same way: its exit hooks run, and a
-servicer's outcome rides. A member the engine **could not freeze** is a refusal, which fails the run
-on every engine, raised where it is refused: on the tree-walker a park its thaw cannot re-derive, or
+of its domain, a fiber it runs or its freeze drive) is the child's, for the one shape this is proven
+for (`own_trap_fate`): a detached child that is not demand-paged (withheld, #2455) and has no
+detached child of its own in the cut. It ends as a trapped child ends (an unwound root's window and
+kept lease go back, once), its join answers the trap (or what its root returned, if the root
+returned before the trap), it rides its parent's artifact as a completed child, and the parent's
+freeze goes on, on every engine. For any other shape (a demand-paged child, a child with detached
+children of its own, a fork twin) the tree-walker refuses the freeze instead, the child or twin
+unreached, as every trap in the cut did before decision 25 (#3131).
+
+A member the engine **could not freeze** is a refusal, which fails the run on every engine, raised where it is refused: on the tree-walker a park its thaw cannot re-derive, or
 a live child nothing can reach (`VCpu::freeze_refused`); on the bytecode engine the same parks, and a
 fiber table past its arena (it never reuses a slot, #3101); on the JIT a child whose window the host
-could not read (`end_refused`, #2286, #2318). An artifact without the member would look whole and not
+could not read in a run that froze (`end_refused`, #2286, #2318). An artifact without the member would look whole and not
 be (INVARIANTS #9c, #1689). A trap of the root domain's own vCPUs ends the run as any trap of its
 does.
 

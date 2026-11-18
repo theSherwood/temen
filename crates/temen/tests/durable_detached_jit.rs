@@ -1830,6 +1830,13 @@ block 0 (v0: i64, v1: i64) {{
 /// thread scribbles its own word and then parks forever too. The root parked first, so the freeze
 /// re-admits it first: on the tree-walker the root unwinds cleanly, and then the thread unwinds and
 /// traps at its push check, after its root unwound.
+///
+/// That holds only if the thread has parked before the freeze lands. The thread is runnable from its
+/// spawn, which is before the parent's gate passes ([`NEST_ROOT`] waits for the budget to show both
+/// vCPUs), and the row's parent then parks again for its settle (1 ms) before it freezes. So the
+/// tree-walker's one worker, which runs its queue in order, runs the thread to its park before the
+/// parent's freeze, however late the parent's timer is. A settle of 0 would not park (a wait that has
+/// already timed out returns), and the freeze could then find the thread not yet run.
 fn root_first_nest() -> String {
     format!(
         "memory 17 shadow 16448 65536
@@ -1939,11 +1946,33 @@ block 0 (v0: i64, v1: i64) {{
 /// engine's thaw answers it from the root's rewound `join` as its status, and the budget nodes the
 /// freeze leaves equal those of a run whose child trapped before the cut ([`TRAP_NEST`]).
 fn own_trap_rides(child: &str, live: i64) {
+    own_trap_rides_as(child, live, 0, Answered::Trap);
+}
+
+/// What an own-trapped child's join answers in [`own_trap_rides_as`].
+#[derive(Clone, Copy, Debug)]
+enum Answered {
+    /// Its trap, `Unreachable`, compared against a child that trapped before the cut ([`TRAP_NEST`]).
+    Trap,
+    /// What its root returned, 7, compared against a child that returned before the cut
+    /// ([`QUICK_NEST`]; only the budget nodes are compared with it).
+    Returned,
+}
+
+/// [`own_trap_rides`] with the parent's settle (ms) and what the child's join answers.
+fn own_trap_rides_as(child: &str, live: i64, settle_ms: i32, answered: Answered) {
     use Engine::*;
-    let unreachable = (Ok(temen_ir::trap_code::UNREACHABLE * 1000), "");
+    let (want, answer, control) = match answered {
+        Answered::Trap => (
+            Err(temen_ir::trap_code::UNREACHABLE),
+            (Ok(temen_ir::trap_code::UNREACHABLE * 1000), ""),
+            TRAP_NEST,
+        ),
+        Answered::Returned => (Ok(7), (Ok(7), ""), QUICK_NEST),
+    };
     let frozen = |src: &str, e: Engine, live: i64| {
         let (root, child) = nest_modules(src);
-        let (mut host, args) = nest_powerbox(&child, 0, live);
+        let (mut host, args) = nest_powerbox(&child, settle_ms, live);
         let mut win = init_durable_window(1 << PARENT_LOG2, ARENA);
         arm_freeze_after(&mut win, ARENA, 1);
         let (r, _, snap) = nest_run(e, &root, &args, &win, &mut host, None)?;
@@ -1968,14 +1997,14 @@ fn own_trap_rides(child: &str, live: i64) {
         );
         assert_eq!(
             host.frozen_detached()[0].completed_result,
-            Err(temen_ir::trap_code::UNREACHABLE),
-            "{e:?}: answering its own trap"
+            want,
+            "{e:?}: answering {answered:?}"
         );
-        let (_, trapped, ..) = frozen(TRAP_NEST, e, 2).expect("the same engine");
+        let (_, ended, ..) = frozen(control, e, 2).expect("the same engine");
         assert_eq!(
             nodes(&host),
-            nodes(&trapped),
-            "{e:?}: the budget nodes of a child that trapped before the cut"
+            nodes(&ended),
+            "{e:?}: the budget nodes of a child that ended before the cut"
         );
         let art = temen_snapshot::freeze(&root, &snap, &host).expect("serialize");
         runs.push((e, art, root, child, args));
@@ -1983,15 +2012,7 @@ fn own_trap_rides(child: &str, live: i64) {
     let engines: Vec<Engine> = runs.iter().map(|r| r.0).collect();
     let mut wrong = Vec::new();
     for (froze, art, root, child, args) in &runs {
-        wrong.extend(nest_thaws(
-            art,
-            *froze,
-            root,
-            child,
-            args,
-            &engines,
-            unreachable,
-        ));
+        wrong.extend(nest_thaws(art, *froze, root, child, args, &engines, answer));
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
@@ -2007,13 +2028,49 @@ fn a_childs_scribbled_shadow_word_ends_the_child_and_the_parents_freeze_goes_on(
 /// tree-walker the child was captured live, with no record of the thread.
 #[test]
 fn a_childs_thread_that_traps_after_its_root_unwound_ends_the_child() {
-    own_trap_rides(&root_first_nest(), 2);
+    own_trap_rides_as(&root_first_nest(), 2, 1, Answered::Trap);
 }
 
 /// #3034, round 4 B1 — a child's thread traps in the cut **before** its root unwound.
 #[test]
 fn a_childs_thread_that_traps_before_its_root_unwound_ends_the_child() {
     own_trap_rides(&thread_first_nest(), 2);
+}
+
+/// #3034 round 5 — a child whose root spawns a thread and returns 7 at once, with no safepoint after
+/// the spawn, while its thread scribbles its own word and parks forever: the thread traps in the cut
+/// after its root returned.
+fn root_returned_nest() -> String {
+    format!(
+        "memory 17 shadow 16448 65536
+func (i64, i64) -> (i64) {{
+block 0 (v0: i64, v1: i64) {{
+  vz = i64.const 0
+  vt = thread.spawn 1 vz vz
+  vr = i64.const 7
+  return vr
+  }}
+}}
+func (i64, i64) -> (i64) {{
+block 0 (v0: i64, v1: i64) {{
+{}{PARK}  vr = i64.const 7
+  return vr
+  }}
+}}
+",
+        scribble(own_word(true))
+    )
+}
+
+/// #3034 round 5 — a child's thread traps in the freeze after its root **returned**: its join answers
+/// what the root returned, as an uninterrupted run's does, on both engines. On the tree-walker this
+/// passes on `8116b50` too: a root that returned before the parent's freeze reached it is filed
+/// completed by the parent's own unwind and never reaches the harvest, and a root rung after its last
+/// safepoint cannot return before its next poll on the one worker. The harvest's answer for that
+/// shape (the root's result, not the thread's trap) is pinned by `own_trap_fate`'s table.
+#[test]
+fn a_childs_thread_that_traps_after_its_root_returned_leaves_the_roots_result() {
+    own_trap_rides_as(&root_returned_nest(), 2, 0, Answered::Returned);
 }
 
 /// #3034, round 4 B1 — a child's fiber fails its extent check ([`fiber_extent_nest`]). Without the
