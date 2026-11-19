@@ -15,18 +15,72 @@ pub use temen_exec::*;
 use temen_ir::errno::*; // the one shared negative-errno table (#905)
 
 use crate::Descriptor;
-use crate::{Backend, HostCap, Instance, Limits, Outcome, RunConfig};
+use crate::{Backend, HostCap, IfaceShape, Instance, Limits, Outcome, RunConfig};
 use std::io::{Read, Write};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
-use temen_interp::{CapState, GuestMem, HostBuffer, HostProc, NodeRef, Value};
+use temen_interp::{
+    CapState, ForkedProc, HostBuffer, HostProcFork, HostProcGrant, ProcHandler, Value,
+};
+
+/// The `exec` interface's [`IfaceShape`], [`EXEC_IFACE`] parsed.
+fn exec_shape() -> IfaceShape {
+    EXEC_IFACE
+        .iter()
+        .fold(IfaceShape::new(), |shape, (name, sig)| {
+            shape.op(
+                *name,
+                temen_text::parse_func_type(sig).expect("EXEC_IFACE parses"),
+            )
+        })
+}
+
+/// An `exec` [`HostCap`] whose jobs `runner` makes (one [`RunJob`] per handler it mints): a grouped
+/// provider of [`EXEC_IFACE`], published on the handler as its vtable, so a guest's grouped import
+/// binds it by op name, in a child as in the root. Its grant is the wirer's whole act (#2962): for
+/// the slot `name` it mints the message region, charged to the grantee as the embedder's grant,
+/// grants it as `<name>.msg`, and grants the handler, which serves every byte from the region
+/// ([`serve`]) and never touches the guest's window. A `fork()` twin re-mints the handler over a
+/// fresh job table and the same region (#2970). A region the host cannot make leaves the slot
+/// unbound: its handle is the errno, so a resolve of the slot is negative and the guest's fallback
+/// runs.
+fn exec_cap(runner: impl Fn() -> RunJob + Send + Sync + 'static) -> HostCap {
+    let runner = Arc::new(runner);
+    let shape = exec_shape();
+    let vtable: (Vec<String>, Vec<temen_ir::FuncType>) = shape.ops.iter().cloned().unzip();
+    HostCap::iface_named(&shape, "exec", move |h, _, name| {
+        let msg = match h.mint_region(EXEC_MSG_LEN, true) {
+            Ok(msg) => msg,
+            Err(errno) => return errno as i32,
+        };
+        let region = h.grant_shared_region_backed(Arc::clone(&msg));
+        h.register_cap_name(&msg_name(name), region);
+        let payer = h.own_node();
+        let fork: HostProcFork = Arc::new({
+            let (runner, msg, payer) = (Arc::clone(&runner), Arc::clone(&msg), payer.clone());
+            move |_pid| {
+                let handler = serve(Arc::clone(&msg), &payer, runner());
+                // Each handler keeps a job table the guest drains output from: `Uncaptured` (#1699).
+                Some(ForkedProc::shared(
+                    ProcHandler::Sync(handler),
+                    CapState::Uncaptured,
+                ))
+            }
+        });
+        let handler = serve(msg, &payer, runner());
+        let h_exec = h.grant_host_proc(
+            HostProcGrant::new(ProcHandler::Sync(handler), CapState::Uncaptured).forkable(fork),
+        );
+        h.set_host_proc_vtable(h_exec, vtable.0.clone(), vtable.1.clone());
+        h_exec
+    })
+}
 
 /// The deterministic **scripted** backend as a [`HostCap`]: a `(argv-prefix → {stdout, stderr,
 /// exit})` table, no host processes. What differential tests and wasm/browser embedders grant.
 pub fn scripted_exec(table: Vec<ScriptedEntry>) -> HostCap {
-    let make = temen_exec::scripted_exec_handler(table);
-    // Each handler keeps a job table the guest drains output from: `Uncaptured` (#1699).
-    HostCap::host_proc(0, move |payer, _| Some((make(payer), CapState::Uncaptured)))
+    let table = Arc::new(table);
+    exec_cap(move || scripted_run(Arc::clone(&table)))
 }
 
 /// The **real subprocess** backend: spawn via the host, attenuated by an explicit program
@@ -37,9 +91,15 @@ pub fn scripted_exec(table: Vec<ScriptedEntry>) -> HostCap {
 /// the POSIX-shell way (0-255; signal death as `128 + signo`).
 pub fn host_exec(allowlist: &[&str]) -> HostCap {
     let allow: Arc<Vec<String>> = Arc::new(allowlist.iter().map(|s| s.to_string()).collect());
-    let make = host_exec_handler(allow);
-    // Each handler keeps a job table the guest drains output from: `Uncaptured` (#1699).
-    HostCap::host_proc(0, move |payer, _| Some((make(payer), CapState::Uncaptured)))
+    exec_cap(move || {
+        let allow = Arc::clone(&allow);
+        Box::new(move |argv, stdin, jobs| {
+            if !allow.is_empty() && !allow.iter().any(|a| a == &argv[0]) {
+                return Err(EPERM); // outside the allowlist: refused, not a trap
+            }
+            spawn_blocking(&argv, &stdin, jobs)
+        })
+    })
 }
 
 /// One program in a [`domain_exec`] registry: the name a `run`'s `argv[0]` selects (exact
@@ -85,51 +145,23 @@ pub fn domain_exec_with_fs(programs: Vec<DomainProgram>, child_fs: HostCap) -> H
 fn domain_exec_inner(programs: Vec<DomainProgram>, child_fs: Option<HostCap>) -> HostCap {
     let programs = Arc::new(programs);
     let child_fs = Arc::new(child_fs);
-    HostCap::host_proc(0, move |payer, _| {
-        let programs = Arc::clone(&programs);
-        let child_fs = Arc::clone(&child_fs);
-        let mut jobs = JobTable::new(payer);
-        let h = Box::new(
-            move |op: u32,
-                  args: &[i64],
-                  out: &mut [i64],
-                  mem: Option<&mut dyn GuestMem>,
-                  _minter: Option<&mut dyn temen_interp::RegionMinter>| {
-                temen_interp::put_results(
-                    out,
-                    &[domain_dispatch(
-                        &programs,
-                        (*child_fs).as_ref(),
-                        &mut jobs,
-                        op,
-                        args,
-                        mem,
-                    )],
-                )
-            },
-        ) as HostProc;
-        // A job table the guest drains output from: `Uncaptured` (#1699).
-        Some((h, CapState::Uncaptured))
+    exec_cap(move || {
+        let (programs, child_fs) = (Arc::clone(&programs), Arc::clone(&child_fs));
+        Box::new(move |argv, stdin, jobs| {
+            domain_run(&programs, (*child_fs).as_ref(), argv, stdin, jobs)
+        })
     })
 }
 
-fn domain_dispatch(
+fn domain_run(
     programs: &[DomainProgram],
     child_fs: Option<&HostCap>,
-    jobs: &mut JobTable,
-    op: u32,
-    args: &[i64],
-    mem: Option<&mut dyn GuestMem>,
-) -> i64 {
-    if op != EXEC_RUN {
-        return jobs.handle(op, args, mem);
-    }
-    let (argv, stdin) = match run_args(args, mem.as_deref()) {
-        Ok(x) => x,
-        Err(e) => return e,
-    };
+    argv: Vec<String>,
+    stdin: Vec<u8>,
+    jobs: &JobTable,
+) -> Result<Job, i64> {
     let Some(p) = programs.iter().find(|p| p.name == argv[0]) else {
-        return EPERM; // outside the registry: refused, not a trap
+        return Err(EPERM); // outside the registry: refused, not a trap
     };
     let config = RunConfig {
         limits: p.limits.clone(),
@@ -148,70 +180,17 @@ fn domain_dispatch(
             .run_with_caps(Backend::TreeWalk, &config, &[("fs", fs.clone())]),
         None => p.instance.run(Backend::TreeWalk, &config),
     };
-    match child_run {
-        Ok(run) => {
-            let exit = match run.outcome {
-                Outcome::Exited(c) => c as i64,
-                Outcome::Returned(vals) => vals.first().map_or(0, |v| match v {
-                    Value::I64(x) => *x,
-                    Value::I32(x) => *x as i64,
-                    _ => 0,
-                }),
-            };
-            match (jobs.output_of(&run.stdout), jobs.output_of(&run.stderr)) {
-                (Ok(stdout), Ok(stderr)) => jobs.push(Job {
-                    stdout,
-                    stderr,
-                    out_pos: 0,
-                    err_pos: 0,
-                    exit,
-                }),
-                _ => ENOMEM,
-            }
-        }
-        Err(_) => EINVAL, // the child trapped / ran out of fuel: a failed run, probeable
-    }
-}
-
-fn host_exec_handler(
-    allow: Arc<Vec<String>>,
-) -> impl Fn(&NodeRef) -> HostProc + Send + Sync + 'static {
-    move |payer| {
-        let allow = Arc::clone(&allow);
-        let mut jobs = JobTable::new(payer);
-        Box::new(
-            move |op: u32,
-                  args: &[i64],
-                  out: &mut [i64],
-                  mem: Option<&mut dyn GuestMem>,
-                  _minter: Option<&mut dyn temen_interp::RegionMinter>| {
-                temen_interp::put_results(out, &[host_dispatch(&allow, &mut jobs, op, args, mem)])
-            },
-        ) as HostProc
-    }
-}
-
-fn host_dispatch(
-    allow: &[String],
-    jobs: &mut JobTable,
-    op: u32,
-    args: &[i64],
-    mem: Option<&mut dyn GuestMem>,
-) -> i64 {
-    if op != EXEC_RUN {
-        return jobs.handle(op, args, mem);
-    }
-    let (argv, stdin) = match run_args(args, mem.as_deref()) {
-        Ok(x) => x,
-        Err(e) => return e,
+    // A child that trapped or ran out of fuel is a failed run, probeable.
+    let run = child_run.map_err(|_| EINVAL)?;
+    let exit = match run.outcome {
+        Outcome::Exited(c) => c as i64,
+        Outcome::Returned(vals) => vals.first().map_or(0, |v| match v {
+            Value::I64(x) => *x,
+            Value::I32(x) => *x as i64,
+            _ => 0,
+        }),
     };
-    if !allow.is_empty() && !allow.iter().any(|a| a == &argv[0]) {
-        return EPERM; // outside the allowlist: refused, not a trap
-    }
-    match spawn_blocking(&argv, &stdin, jobs) {
-        Ok(job) => jobs.push(job),
-        Err(e) => e,
-    }
+    jobs.job_of(&run.stdout, &run.stderr, exit)
 }
 
 /// Read `from` to its end into `into`: `false`, having stopped, once `into`'s payer has no room for

@@ -6011,6 +6011,18 @@ unsafe fn mapped_atomic(
     }
 }
 
+/// #2962 — `[off, off + n)` of a host mapping of a region (`base`, `len` bytes), or `None` when the
+/// range is not inside it: how a region is copied in one go (#2962). The guest may write
+/// the region meanwhile (it is shared), so the bytes are whatever is there, as a host procedure's read
+/// of a window is.
+///
+/// # Safety
+/// `base` maps `[0, len)` read-write for `'a`.
+unsafe fn mapped_range<'a>(base: *mut u8, len: usize, off: u64, n: usize) -> Option<&'a mut [u8]> {
+    temen_interp::region_range_ok(len as u64, off, n)
+        .then(|| std::slice::from_raw_parts_mut(base.add(off as usize), n))
+}
+
 /// A §13 `SharedRegion` backing over a real OS shared-memory object (`memfd`/`shm`), whose `os_fd` a
 /// window `mmap`s `MAP_SHARED` for true hardware aliasing. The fd is also mapped once into the host
 /// process so `read_byte`/`write_byte` work (e.g. if an interpreter `Mem` uses this backing); in the
@@ -6082,6 +6094,16 @@ impl SharedBacking for ShmBacking {
             // SAFETY: off < len ≤ cap; `ptr` maps `[0, cap)` RW for `self`'s lifetime.
             unsafe { *self.ptr.add(off as usize) = b }
         }
+    }
+    fn copy_out(&self, off: u64, buf: &mut [u8]) -> bool {
+        // SAFETY: `ptr` maps at least `[0, len)` RW for `self`'s lifetime.
+        let r = unsafe { mapped_range(self.ptr, self.len, off, buf.len()) };
+        r.map(|r| buf.copy_from_slice(r)).is_some()
+    }
+    fn copy_in(&self, off: u64, bytes: &[u8]) -> bool {
+        // SAFETY: as `copy_out`.
+        let r = unsafe { mapped_range(self.ptr, self.len, off, bytes.len()) };
+        r.map(|r| r.copy_from_slice(bytes)).is_some()
     }
     fn atomic(&self, off: u64, width: u32, f: &mut dyn FnMut(u64) -> Option<u64>) -> u64 {
         // SAFETY: `ptr` maps `[0, cap)` RW for `self`'s lifetime, page-aligned, and `len ≤ cap`.
@@ -6204,6 +6226,16 @@ impl SharedBacking for FileBacking {
             unsafe { *self.ptr.add(off as usize) = b }
         }
     }
+    fn copy_out(&self, off: u64, buf: &mut [u8]) -> bool {
+        // SAFETY: `ptr` maps at least `[0, len)` RW for `self`'s lifetime.
+        let r = unsafe { mapped_range(self.ptr, self.len, off, buf.len()) };
+        r.map(|r| buf.copy_from_slice(r)).is_some()
+    }
+    fn copy_in(&self, off: u64, bytes: &[u8]) -> bool {
+        // SAFETY: as `copy_out`.
+        let r = unsafe { mapped_range(self.ptr, self.len, off, bytes.len()) };
+        r.map(|r| r.copy_from_slice(bytes)).is_some()
+    }
     fn atomic(&self, off: u64, width: u32, f: &mut dyn FnMut(u64) -> Option<u64>) -> u64 {
         // SAFETY: `ptr` maps `[0, cap)` RW for `self`'s lifetime, page-aligned, and `len ≤ cap`.
         unsafe { mapped_atomic(self.ptr, self.len, off, width, f) }
@@ -6324,6 +6356,16 @@ impl SharedBacking for WinShmBacking {
             // SAFETY: off < len ≤ cap; `ptr` maps `[0, cap)` RW for `self`'s lifetime.
             unsafe { *self.ptr.add(off as usize) = b }
         }
+    }
+    fn copy_out(&self, off: u64, buf: &mut [u8]) -> bool {
+        // SAFETY: `ptr` maps at least `[0, len)` RW for `self`'s lifetime.
+        let r = unsafe { mapped_range(self.ptr, self.len, off, buf.len()) };
+        r.map(|r| buf.copy_from_slice(r)).is_some()
+    }
+    fn copy_in(&self, off: u64, bytes: &[u8]) -> bool {
+        // SAFETY: as `copy_out`.
+        let r = unsafe { mapped_range(self.ptr, self.len, off, bytes.len()) };
+        r.map(|r| r.copy_from_slice(bytes)).is_some()
     }
     fn atomic(&self, off: u64, width: u32, f: &mut dyn FnMut(u64) -> Option<u64>) -> u64 {
         // SAFETY: `ptr` maps `[0, cap)` RW for `self`'s lifetime, page-aligned, and `len ≤ cap`.
@@ -8250,7 +8292,14 @@ pub struct HostCap {
     /// `grant` mints the handle and this shape (op names + signatures) is coverage-matched
     /// against the consumer's grouped requirement at instantiation. Built by [`HostCap::iface`].
     iface: Option<Arc<Vec<(String, temen_ir::FuncType)>>>,
+    /// #2962 — a grant that needs the **name** of the slot it fills: a buffer-carrying capability's,
+    /// which grants its message region beside it as `<slot>.msg`. When set, [`HostCap::grant_as`]
+    /// calls it in place of `grant`.
+    named: Option<NamedGrantFn>,
 }
+
+/// #2962 — a [`HostCap`] grant handed the slot's name ([`HostCap::named`]).
+type NamedGrantFn = Arc<dyn Fn(&mut Host, u64, &str) -> i32 + Send + Sync>;
 
 /// A host-native interface's **canonical shape**: op names and signatures in the providing
 /// handle's native op order (position `i` is the handle's op `i`). What [`HostCap::iface`]
@@ -8396,6 +8445,40 @@ impl HostCap {
         (self.grant)(host, win)
     }
 
+    /// Grant this capability into `host` for the slot named `name` and register it under that name:
+    /// what every grant site does. A capability with a [`named`](HostCap::named) grant (a
+    /// buffer-carrying one, #2962) is handed the name, so it can grant its message region beside it
+    /// as `<name>.msg`.
+    pub fn grant_as(&self, host: &mut Host, win: u64, name: &str) -> i32 {
+        let handle = match &self.named {
+            Some(grant) => grant(host, win, name),
+            None => (self.grant)(host, win),
+        };
+        host.register_cap_name(name, handle);
+        handle
+    }
+
+    /// #2962 — a **grouped** host-native provider of `shape` (as [`HostCap::iface`]) whose grant is
+    /// handed the slot's name: a buffer-carrying interface's, which grants `<slot>.msg` beside the
+    /// slot. [`install`](HostCap::install) grants it as the interface's own `default_name`.
+    pub fn iface_named(
+        shape: &IfaceShape,
+        default_name: &'static str,
+        grant: impl Fn(&mut Host, u64, &str) -> i32 + Send + Sync + 'static,
+    ) -> HostCap {
+        let grant: NamedGrantFn = Arc::new(grant);
+        let unnamed = Arc::clone(&grant);
+        HostCap {
+            type_id: 0, // the real interface id is the granted handle's, read back at wiring
+            op: 0,
+            grant: Arc::new(move |h, win| unnamed(h, win, default_name)),
+            unbound: false,
+            offer: None,
+            iface: Some(Arc::new(shape.ops.clone())),
+            named: Some(grant),
+        }
+    }
+
     /// A `Stream` write endpoint (stdout): `write(buf, len)` is op 1.
     pub fn stdout() -> HostCap {
         HostCap {
@@ -8405,6 +8488,7 @@ impl HostCap {
             unbound: false,
             offer: None,
             iface: None,
+            named: None,
         }
     }
     /// A `Stream` read endpoint (stdin): `read(buf, len)` is op 0.
@@ -8416,6 +8500,7 @@ impl HostCap {
             unbound: false,
             offer: None,
             iface: None,
+            named: None,
         }
     }
     /// The `Exit` lifecycle capability: `exit(code)` (op 0, noreturn).
@@ -8427,6 +8512,7 @@ impl HostCap {
             unbound: false,
             offer: None,
             iface: None,
+            named: None,
         }
     }
     /// The `Clock` capability: `now(clock_id) -> i64` (op 0).
@@ -8438,6 +8524,7 @@ impl HostCap {
             unbound: false,
             offer: None,
             iface: None,
+            named: None,
         }
     }
     /// Whole-window memory authority (an `AddressSpace` over the full window — CONSOLIDATION §4):
@@ -8455,6 +8542,7 @@ impl HostCap {
             unbound: false,
             offer: None,
             iface: None,
+            named: None,
         }
     }
     /// A **host-defined** capability (iface [`cap_id::HOST_PROC`]) — arbitrary semantics behind a named
@@ -8502,6 +8590,7 @@ impl HostCap {
             unbound: false,
             offer: None,
             iface: None,
+            named: None,
         }
     }
 
@@ -8526,6 +8615,7 @@ impl HostCap {
             unbound: false,
             offer: None,
             iface: None,
+            named: None,
         }
     }
     /// #1645 — a [`HostCap`] over a [`SharedHostProc`]: this slot's **one** powerbox entry, at `op`.
@@ -8539,6 +8629,7 @@ impl HostCap {
             unbound: false,
             offer: None,
             iface: None,
+            named: None,
         }
     }
 
@@ -8564,6 +8655,7 @@ impl HostCap {
             unbound: false,
             offer: None,
             iface: None,
+            named: None,
         }
     }
     /// A fully custom binding: an explicit `(type_id, op)` and a re-grantable grant action. The escape
@@ -8580,6 +8672,7 @@ impl HostCap {
             unbound: false,
             offer: None,
             iface: None,
+            named: None,
         }
     }
 
@@ -8600,6 +8693,7 @@ impl HostCap {
             unbound: false,
             offer: None,
             iface: None,
+            named: None,
         }
     }
 
@@ -8634,6 +8728,7 @@ impl HostCap {
                 policy: temen_interp::OfferPolicy::Single, // inert: pure offers race nothing
             }),
             iface: None,
+            named: None,
         })
     }
 
@@ -8694,6 +8789,7 @@ impl HostCap {
                 policy,
             }),
             iface: None,
+            named: None,
         })
     }
 
@@ -8717,6 +8813,7 @@ impl HostCap {
             unbound: false,
             offer: None,
             iface: Some(Arc::new(shape.ops.clone())),
+            named: None,
         }
     }
 
@@ -8732,6 +8829,7 @@ impl HostCap {
             unbound: true,
             offer: None,
             iface: None,
+            named: None,
         }
     }
 }
@@ -8778,13 +8876,10 @@ impl Imports {
                     unbound: false,
                     offer: None,
                     iface: None,
+                    named: None,
                     grant: Arc::new(move |h, win| match h.resolve_cap_name(&module_name) {
                         Some(handle) => handle,
-                        None => {
-                            let handle = (provider.grant)(h, win);
-                            h.register_cap_name(&module_name, handle);
-                            handle
-                        }
+                        None => provider.grant_as(h, win, &module_name),
                     }),
                 },
             );
@@ -9544,8 +9639,7 @@ impl Instance {
         host.set_handoff(config.handoff);
         self.grant_caps(&mut host, win);
         for (name, cap) in extra_caps {
-            let handle = (cap.grant)(&mut host, win);
-            host.register_cap_name(name, handle);
+            cap.grant_as(&mut host, win, name);
         }
         host
     }
@@ -9593,8 +9687,7 @@ impl Instance {
                     // instantiation, so it cannot fail here), and bind the slot to the handle's
                     // real interned/native `type_id` with the op remap frozen below.
                     if let Some(shape) = &cap.iface {
-                        let handle = (cap.grant)(h, win);
-                        h.register_cap_name(name, handle);
+                        let handle = cap.grant_as(h, win, name);
                         let tid = h
                             .type_id_of(handle)
                             .expect("granted grouped host cap is live");
@@ -9642,8 +9735,7 @@ impl Instance {
                         );
                         continue;
                     }
-                    let handle = (cap.grant)(h, win);
-                    h.register_cap_name(name, handle);
+                    let handle = cap.grant_as(h, win, name);
                     // §7 F7: also register the **canonical** name for this interface, so a guest can
                     // name its own capabilities without knowing what it happened to call its imports.
                     // A guest delegating a cap into a §14 child (#1234) needs exactly this: grant

@@ -245,7 +245,11 @@ reply(serve_end, caller, result)  -> 0 | -errno            (resume that caller)
   carry scalars and move bulk data through a `SharedRegion` established at grant time.
   Runtime copy-in/copy-out is **rejected**: it would reintroduce exactly the lift/lower
   marshalling tax §1a defines this VM against. Consequence, stated: sibling IPC is the
-  identical *interface*, not the identical *data plane*.
+  identical *interface*, not the identical *data plane*. **Universal B (owner, 2026-11-11,
+  #2962):** with the carve gone no endpoint has the free case, so a buffer-carrying interface
+  uses the granted region *whoever serves it*: host servicers read the same region a guest one
+  would, and the caller's code is one path. `exec` is the first (EXEC.md, "Op protocol"); which
+  interfaces follow is decided on the measured bounce cost.
 - **Budget flow: the servicer pays** for servicing fuel (a caller pays only its own call
   overhead). Named consequence: a client can spend its servicer's fuel by calling in a
   loop — a *liveness* exposure inside an existing trust relationship, bounded by the

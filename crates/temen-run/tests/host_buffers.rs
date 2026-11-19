@@ -7,7 +7,7 @@
 use temen_fs::{FS_CLOSEDIR, FS_OPENDIR, FS_READDIR};
 use temen_interp::{cap_id, Host, WindowMem};
 use temen_ir::errno::{ENOMEM, ENOSPC};
-use temen_run::exec::{EXEC_CLOSE, EXEC_RUN};
+use temen_run::exec::{msg_name, EXEC_CLOSE, EXEC_RUN};
 
 /// A host whose own node's `channel` ceiling is `ceiling`.
 fn host(ceiling: i64) -> Host {
@@ -21,23 +21,27 @@ fn host(ceiling: i64) -> Host {
 #[test]
 fn an_exec_whose_output_does_not_fit_is_refused() {
     let mut h = host(1 << 20);
-    let exec = temen_run::exec::host_exec(&["yes", "echo"]).install(&mut h, 0);
-    let mut win = vec![0u8; 64];
-    let mut run = |h: &mut Host, argv: &[u8]| {
-        win[..argv.len()].copy_from_slice(argv);
-        let mut wm = WindowMem::new(&mut win, 64);
-        let args = [0, argv.len() as i64, 0, 0];
-        h.cap_call(cap_id::HOST_PROC, EXEC_RUN, exec, &args, 1, Some(&mut wm))
+    let exec = temen_run::exec::host_exec(&["yes", "echo"]).grant_as(&mut h, 0, "exec");
+    // #2962 — the grant brings its message region, charged to the grantee like the jobs are.
+    let msg = h
+        .resolve_cap_name(&msg_name("exec"))
+        .expect("the grant names its region");
+    let msg = h.resolve_region(msg).expect("a region");
+    let granted = h.channel_used();
+    let run = |h: &mut Host, argv: &[u8]| {
+        assert!(msg.copy_in(0, argv));
+        let args = [0, argv.len() as i64, 0];
+        h.cap_call(cap_id::HOST_PROC, EXEC_RUN, exec, &args, 1, None)
             .expect("dispatch")[0]
     };
     assert_eq!(run(&mut h, b"yes"), ENOMEM, "`yes` writes forever");
-    assert_eq!(h.channel_used(), 0, "and what it wrote was dropped");
+    assert_eq!(h.channel_used(), granted, "and what it wrote was dropped");
     let job = run(&mut h, b"echo\0hi");
     assert!(job >= 0, "a run whose output fits goes through: {job}");
-    assert!(h.channel_used() > 0, "its output is held");
+    assert!(h.channel_used() > granted, "its output is held");
     let close = h.cap_call(cap_id::HOST_PROC, EXEC_CLOSE, exec, &[job], 1, None);
     assert_eq!(close.expect("dispatch")[0], 0);
-    assert_eq!(h.channel_used(), 0, "closed, the job holds nothing");
+    assert_eq!(h.channel_used(), granted, "closed, the job holds nothing");
 }
 
 /// An `opendir` listing is held until it is closed, a [`temen_interp::TABLE_ENTRY`] and its name
