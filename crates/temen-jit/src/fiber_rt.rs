@@ -1078,7 +1078,9 @@ pub(crate) struct FiberRuntime {
     cur_shadow: Option<Arc<FiberSlot>>,
     /// #3133 — the contexts of guest fibers that returned on this vCPU, for its next `cont.new` to
     /// reuse ([`guest_fiber`]), as a finished slot is reused (#2486): a warmed `cont.new` allocates
-    /// none. At most [`SPARE_CTXS`].
+    /// none. At most [`SPARE_CTXS`]. Boxed: a fiber's code holds its context's address, so a context
+    /// never moves once a fiber is made on it.
+    #[allow(clippy::vec_box)]
     spare_ctxs: Vec<Box<crate::VmCtx>>,
     /// **Durable freeze residue** (slice 3.2/3.3.3): fibers this vCPU flattened during a freeze
     /// (`fiber_resume`'s `Complete` arm records each that unwound). Read back by `run_code_raw` into
@@ -2539,7 +2541,7 @@ mod flatten_claim_tests {
         let owner = crate::fuel::SharedCell::fixed(10);
         earlier.fuel = owner.get();
         earlier.cell = Some(Arc::clone(&owner));
-        let mut spare = Box::new(earlier.fiber());
+        let spare = Box::new(earlier.fiber());
         spare.raise(crate::TrapKind::Unreachable as i64);
         let _ = spare.thunk_state(|| 7u32);
         let at = &*spare as *const crate::VmCtx;
