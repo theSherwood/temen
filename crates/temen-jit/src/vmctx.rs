@@ -134,6 +134,12 @@ pub struct VmCtx {
     /// wherever the code runs. Where its §12 ops go is the thread's ([`crate::kernel_rt`]'s record),
     /// asked only when this is set. Never read by compiled code.
     pub(crate) kernel: bool,
+    /// #3133 — a guest fiber's context ([`Self::fiber`]): the context of the vCPU (or task, or
+    /// handler) whose thread of control runs it now, which every resume writes before its switch and
+    /// clears after it ([`Self::runner`]). `false`, and `runner` null, on every other context. Never
+    /// read by compiled code.
+    is_fiber: bool,
+    runner: core::sync::atomic::AtomicPtr<VmCtx>,
     /// #3000 — the owner of the cell `fuel` names, on a held domain's activation: shared with every
     /// activation that charges the same cell, so the cell lives until the last context charging it
     /// goes ([`crate::child_exec::HeldSite::activate`]). `None` on every other context, whose cell
@@ -263,6 +269,8 @@ impl VmCtx {
             owned_handlers: Some(owned_handlers),
             thunk_state: std::sync::OnceLock::new(),
             kernel: false,
+            is_fiber: false,
+            runner: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
             #[cfg(fiber_rt)]
             cell: None,
         }
@@ -289,7 +297,48 @@ impl VmCtx {
             "a held activation makes no fiber on the JIT (#3080)"
         );
         // SAFETY: the end is this domain's own, which outlives the domain's fibers.
-        unsafe { self.vcpu_ending(self.end, self.fuel) }
+        let mut ctx = unsafe { self.vcpu_ending(self.end, self.fuel) };
+        ctx.is_fiber = true;
+        ctx
+    }
+
+    /// #3133 — the context of the thread of control running this code: this context itself for a
+    /// vCPU's, a task's, a handler's or an activation's; for a guest fiber's, the one its resume
+    /// named, which a fiber that a fiber resumed inherits, so it is always the bottom one. What a
+    /// per-vCPU host fact is found by when the code may be a fiber's (the serve site).
+    pub fn runner(&self) -> &VmCtx {
+        if !self.is_fiber {
+            return self;
+        }
+        let r = self.runner.load(Ordering::Acquire);
+        debug_assert!(
+            !r.is_null(),
+            "a fiber's code runs only under a resume (#3133)"
+        );
+        if r.is_null() {
+            return self;
+        }
+        // SAFETY: a resume writes it before its switch and clears it after, and the context it names
+        // is its resumer's, live for the whole residency.
+        unsafe { &*r }
+    }
+
+    /// #3133 — a resume of the fiber whose context this is: `runner` is the thread of control that
+    /// runs it from now until [`Self::fiber_switched_out`].
+    pub(crate) fn fiber_switched_in(&self, runner: &VmCtx) {
+        debug_assert!(self.is_fiber, "only a fiber's context names a runner");
+        self.runner
+            .store(runner as *const VmCtx as *mut VmCtx, Ordering::Release);
+    }
+
+    /// #3133 — the resume that ran this fiber is back in its resumer: no thread of control runs it.
+    pub(crate) fn fiber_switched_out(&self) {
+        self.runner.store(core::ptr::null_mut(), Ordering::Release);
+    }
+
+    /// #3133 — whether no thread of control runs this fiber (a spare's, or one at rest).
+    pub(crate) fn at_rest(&self) -> bool {
+        self.runner.load(Ordering::Acquire).is_null()
     }
 
     /// #2958 — [`Self::vcpu`] over the end word `end` in place of this context's own: a kernel
@@ -330,6 +379,8 @@ impl VmCtx {
             owned_handlers: None,
             thunk_state: std::sync::OnceLock::new(),
             kernel: self.kernel,
+            is_fiber: false,
+            runner: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
             #[cfg(fiber_rt)]
             cell: None,
         }

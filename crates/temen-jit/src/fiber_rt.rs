@@ -1278,6 +1278,10 @@ unsafe fn guest_fiber(
         ctx.handler_window.load(Ordering::Relaxed).is_null(),
         "a fiber's context names no window (#3133)"
     );
+    debug_assert!(
+        ctx.at_rest(),
+        "a new fiber's context names no runner (#3133)"
+    );
     let vm = &*ctx as *const crate::VmCtx as u64;
     let fiber = make_fiber(
         funcref,
@@ -1463,7 +1467,7 @@ pub(crate) unsafe extern "C" fn fiber_resume(
     // somewhere in a resume chain), a racing resume, or a finished fiber all *lose the claim* and
     // fault. No lock or `&mut` is held past this block; the `Arc` keeps the slot (and the boxed
     // fiber it owns) stable across the switch.
-    let (slot_idx, slot, fib): (usize, Arc<FiberSlot>, *mut Fiber) = {
+    let (slot_idx, slot, fib, fctx): (usize, Arc<FiberSlot>, *mut Fiber, *const crate::VmCtx) = {
         let rt = &*rt;
         let Some((slot_idx, slot)) = rt.table.resolve(handle) else {
             fault(vm);
@@ -1526,7 +1530,12 @@ pub(crate) unsafe extern "C" fn fiber_resume(
             .unwrap_or_else(|e| e.into_inner())
             .as_mut()
         {
-            Some(s) => &mut s.fiber as *mut Fiber,
+            Some(s) => (
+                &mut s.fiber as *mut Fiber,
+                s.ctx
+                    .as_deref()
+                    .map_or(core::ptr::null(), |c| c as *const crate::VmCtx),
+            ),
             // Unreachable by invariant (a claimable slot holds its fiber); fail closed, leaving
             // the slot claimed (inert thereafter) rather than aliasing anything.
             None => {
@@ -1535,7 +1544,8 @@ pub(crate) unsafe extern "C" fn fiber_resume(
                 return 0;
             }
         };
-        (slot_idx, slot, fib)
+        let (fib, fctx) = fib;
+        (slot_idx, slot, fib, fctx)
     };
     // Durable shadow-SP swap (DURABILITY.md §12.8, D-fiber-cont option A): `fiber_resume` brackets a
     // fiber's residency, so the whole swap lives here (no change to `fiber_suspend`). On entry save
@@ -1610,7 +1620,16 @@ pub(crate) unsafe extern "C" fn fiber_resume(
         // the body's yielder push), so the futex thunk can park the RUNNING fiber; popped when the
         // resume returns, on this same OS thread.
         (*current()).active_slots.push(Arc::clone(&slot));
+        // #3133 — the one switch into a guest fiber names its runner: the resumer's own, which a
+        // fiber resumed by a fiber inherits; cleared once the fiber is back here, so none rests in a
+        // suspended fiber.
+        if let Some(c) = fctx.as_ref() {
+            c.fiber_switched_in(crate::VmCtx::at(vm).runner());
+        }
         let st = (*fib).resume(arg as u64);
+        if let Some(c) = fctx.as_ref() {
+            c.fiber_switched_out();
+        }
         (*current()).active_slots.pop();
         temen_set_current_fiber(prev_fiber);
         // Exit swap: back in the resumer (possibly on a different OS thread — re-read the runtime).
@@ -1720,6 +1739,7 @@ pub(crate) unsafe extern "C" fn fiber_resume(
             }) = stack
             {
                 drop(fiber);
+                debug_assert!(ctx.at_rest(), "a spare names no runner (#3133)");
                 let spares = &mut (*current()).spare_ctxs;
                 if spares.len() < SPARE_CTXS {
                     spares.push(ctx);
