@@ -35,7 +35,8 @@
 //! **The trust argument is the entry.** Code that runs with the wrong vmctx dispatches its `call.cap`s
 //! into the wrong powerbox — authority confusion, not a crash. So every entry into compiled code takes
 //! a `*mut VmCtx` (never a bare trap cell), and each one names whose instance it is entering: the
-//! root's, a child's, a fiber of the running instance (its creator's), a spawned vCPU (its domain's), a
+//! root's, a child's, a fiber of the running instance (its own, made from its creator's, #3133), a
+//! spawned vCPU (its domain's), a
 //! handler invoked over a live window (the window's owner). The type makes the omission a compile
 //! error; the comment at each site says which instance.
 //!
@@ -130,10 +131,16 @@ pub struct VmCtx {
     /// by compiled code. #2847 — beside it, the type it was made as.
     thunk_state: std::sync::OnceLock<(core::any::TypeId, Box<dyn core::any::Any + Send + Sync>)>,
     /// #3078 — this context is a kernel run's (`kernel_rt::KernelRun`): a fact of the run, which
-    /// every context of it carries from its root, a fiber's creator context included, so it is right
+    /// every context of it carries from its root, a fiber's included (it copies its maker's), so it is right
     /// wherever the code runs. Where its §12 ops go is the thread's ([`crate::kernel_rt`]'s record),
     /// asked only when this is set. Never read by compiled code.
     pub(crate) kernel: bool,
+    /// #3133 — a guest fiber's context ([`Self::fiber`]): the context of the vCPU (or task, or
+    /// handler) whose thread of control runs it now, which every resume writes before its switch and
+    /// clears after it ([`Self::runner`]). `false`, and `runner` null, on every other context. Never
+    /// read by compiled code.
+    is_fiber: bool,
+    runner: core::sync::atomic::AtomicPtr<VmCtx>,
     /// #3000 — the owner of the cell `fuel` names, on a held domain's activation: shared with every
     /// activation that charges the same cell, so the cell lives until the last context charging it
     /// goes ([`crate::child_exec::HeldSite::activate`]). `None` on every other context, whose cell
@@ -263,6 +270,8 @@ impl VmCtx {
             owned_handlers: Some(owned_handlers),
             thunk_state: std::sync::OnceLock::new(),
             kernel: false,
+            is_fiber: false,
+            runner: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
             #[cfg(fiber_rt)]
             cell: None,
         }
@@ -273,6 +282,64 @@ impl VmCtx {
     pub(crate) fn vcpu(&self, fuel: *mut crate::FuelCell) -> VmCtx {
         // SAFETY: the end is this domain's own, which the contract above keeps live.
         unsafe { self.vcpu_ending(self.end, fuel) }
+    }
+
+    /// #3133 — a fiber's own context, made by its `cont.new` from the context of the code that made
+    /// it: the same instance, end and run, charging the same cell, so nothing of the code that made
+    /// it is reached through it once that code's own context has gone (a serve handler's window's).
+    /// Not a handler's context (`handler_window` is null) and not a site's (`serve_site` is empty).
+    /// It lives with the fiber's stack ([`crate::fiber_rt`]'s `Stack`). The cell it charges lives as
+    /// long as the run: a vCPU's or the run's. No held activation, whose cell is the call's own
+    /// (`cell`), makes a fiber on the JIT: `temen_run::hold` declines a domain that can (#3080).
+    pub(crate) fn fiber(&self) -> VmCtx {
+        #[cfg(fiber_rt)]
+        debug_assert!(
+            self.cell.is_none(),
+            "a held activation makes no fiber on the JIT (#3080)"
+        );
+        // SAFETY: the end is this domain's own, which outlives the domain's fibers.
+        let mut ctx = unsafe { self.vcpu_ending(self.end, self.fuel) };
+        ctx.is_fiber = true;
+        ctx
+    }
+
+    /// #3133 — the context of the thread of control running this code: this context itself for a
+    /// vCPU's, a task's, a handler's or an activation's; for a guest fiber's, the one its resume
+    /// named, which a fiber that a fiber resumed inherits, so it is always the bottom one. What a
+    /// per-vCPU host fact is found by when the code may be a fiber's (the serve site).
+    pub fn runner(&self) -> &VmCtx {
+        if !self.is_fiber {
+            return self;
+        }
+        let r = self.runner.load(Ordering::Acquire);
+        debug_assert!(
+            !r.is_null(),
+            "a fiber's code runs only under a resume (#3133)"
+        );
+        if r.is_null() {
+            return self;
+        }
+        // SAFETY: a resume writes it before its switch and clears it after, and the context it names
+        // is its resumer's, live for the whole residency.
+        unsafe { &*r }
+    }
+
+    /// #3133 — a resume of the fiber whose context this is: `runner` is the thread of control that
+    /// runs it from now until [`Self::fiber_switched_out`].
+    pub(crate) fn fiber_switched_in(&self, runner: &VmCtx) {
+        debug_assert!(self.is_fiber, "only a fiber's context names a runner");
+        self.runner
+            .store(runner as *const VmCtx as *mut VmCtx, Ordering::Release);
+    }
+
+    /// #3133 — the resume that ran this fiber is back in its resumer: no thread of control runs it.
+    pub(crate) fn fiber_switched_out(&self) {
+        self.runner.store(core::ptr::null_mut(), Ordering::Release);
+    }
+
+    /// #3133 — whether no thread of control runs this fiber (a spare's, or one at rest).
+    pub(crate) fn at_rest(&self) -> bool {
+        self.runner.load(Ordering::Acquire).is_null()
     }
 
     /// #2958 — [`Self::vcpu`] over the end word `end` in place of this context's own: a kernel
@@ -313,6 +380,8 @@ impl VmCtx {
             owned_handlers: None,
             thunk_state: std::sync::OnceLock::new(),
             kernel: self.kernel,
+            is_fiber: false,
+            runner: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
             #[cfg(fiber_rt)]
             cell: None,
         }
@@ -388,6 +457,30 @@ impl VmCtx {
     /// (`kernel_rt`'s module docs).
     pub fn on_kernel(&self) -> bool {
         self.kernel
+    }
+
+    /// #3133 — this context's own stop word, for a test of a reused fiber context.
+    #[cfg(test)]
+    pub(crate) fn stop_word(&self) -> i64 {
+        self.trap.load(Ordering::Relaxed)
+    }
+
+    /// #3133 — whether a cap thunk made its state on this context, for the same test.
+    #[cfg(test)]
+    pub(crate) fn has_thunk_state(&self) -> bool {
+        self.thunk_state.get().is_some()
+    }
+
+    /// #3133 — whether this context owns nothing that lives past its code: no cell, serve site, cap
+    /// thunk state, end or handler count of its own, and it names no runner. A guest fiber's context
+    /// is such a context for its whole life, so a spare holds nothing until it is overwritten.
+    pub(crate) fn holds_nothing(&self) -> bool {
+        self.cell.is_none()
+            && self.serve_site.get().is_none()
+            && self.thunk_state.get().is_none()
+            && self.owned_end.is_none()
+            && self.owned_handlers.is_none()
+            && self.at_rest()
     }
 
     /// The code that ended this context's domain, or `None` while it runs.
@@ -572,9 +665,10 @@ block 0 (v0: i64, v1: i64) {
         assert_eq!(run_marked(src), (trapped, false), "the waiter stopped");
     }
 
-    /// #2488 — a fiber runs on its creator's context wherever it is resumed, so a fiber the root made
-    /// that traps on another vCPU stops the root's context, not the resumer's: the resumer stops
-    /// at the check after its `cont.resume`, which reads the domain's end.
+    /// #2488, #3133 — a fiber runs on a context of its own, so a fiber the root made that traps on
+    /// another vCPU writes its own context's stop word and the domain's end, and nothing of the
+    /// resumer's: the resumer stops at the check after its `cont.resume`, which reads the domain's
+    /// end.
     #[test]
     fn a_resumer_stops_when_a_fiber_made_elsewhere_traps() {
         if !temen_fiber::supported() {
@@ -610,5 +704,186 @@ block 0 (v0: i64, v1: i64) {
 ";
         let trapped = crate::JitOutcome::Trapped(crate::TrapKind::Unreachable);
         assert_eq!(run_marked(src), (trapped, false), "the resumer stopped");
+    }
+
+    /// #3133 — a fiber's context is its maker's instance, end and cell, and nothing that names a
+    /// window, a site or a vCPU of the maker's: a maker that is a serve handler's window context
+    /// hands its fiber no `handler_window` (a fiber outlives the window, and never steps aside for
+    /// it), no serve site, no cap-thunk state and no end of its own; it charges the maker's cell.
+    #[cfg(fiber_rt)]
+    #[test]
+    fn a_fibers_context_names_no_window_site_or_vcpu_of_its_maker() {
+        // The maker has each thing a fiber must not take: a root's own end and handler count, a
+        // serve site, a window to step aside for, a cap thunk's state and a cell.
+        let mut maker = VmCtx::new(InstanceAddrs::NONE, Window::NONE);
+        let mut run_cell = crate::FuelCell::fixed(10);
+        maker.fuel = &mut *run_cell;
+        let (site, _exec) = crate::child_exec::tests::parked_site();
+        assert!(maker.serve_site.set(site).is_ok());
+        maker.handler_window.store(
+            core::ptr::NonNull::<crate::child_exec::Window>::dangling().as_ptr(),
+            core::sync::atomic::Ordering::Release,
+        );
+        let _ = maker.thunk_state(|| 7u32);
+        assert!(maker.owned_end.is_some() && maker.owned_handlers.is_some());
+        assert!(maker.serve_site.get().is_some() && maker.thunk_state.get().is_some());
+        let f = maker.fiber();
+        assert!(f
+            .handler_window
+            .load(core::sync::atomic::Ordering::Acquire)
+            .is_null());
+        assert!(f.serve_site.get().is_none());
+        assert!(f.thunk_state.get().is_none());
+        assert!(f.owned_end.is_none() && f.owned_handlers.is_none());
+        assert!(f.cell.is_none());
+        assert!(f.holds_nothing());
+        assert_eq!(f.domain_key(), maker.domain_key(), "the maker's end");
+        assert!(
+            core::ptr::eq(f.handlers, maker.handlers),
+            "the maker's handler count"
+        );
+        assert_eq!(f.fuel, maker.fuel, "the maker's cell");
+    }
+
+    /// #3133 (review D) — a returned fiber's context is the next `cont.new`'s, up to the cap: the
+    /// root makes 20 fibers, runs each to its return (each leaves its context as a spare, and the
+    /// vCPU keeps [`crate::fiber_rt`]'s 16), then makes 20 more and runs them, of which 16 reuse a
+    /// spare. Each spare is asserted to hold nothing where it becomes one, in debug builds.
+    #[cfg(fiber_rt)]
+    #[test]
+    fn a_returned_fibers_context_is_reused_up_to_the_cap() {
+        if !temen_fiber::supported() {
+            return;
+        }
+        let batch = |b: usize| {
+            let base = 20000 + 8 * 20 * b;
+            format!(
+                "block {m} (vi{b}: i64) {{
+  vn{b} = i64.const 20
+  vc{b} = i64.lt_u vi{b} vn{b}
+  vzz{b} = i64.const 0
+  br_if vc{b} {mk}(vi{b}) {r0}(vzz{b})
+}}
+block {mk} (wi{b}: i64) {{
+  vf{b} = ref.func 1
+  vk{b} = cont.new vf{b} wi{b}
+  ve{b} = i64.const 8
+  vo{b} = i64.mul wi{b} ve{b}
+  vb{b} = i64.const {base}
+  va{b} = i64.add vb{b} vo{b}
+  i64.store va{b} vk{b}
+  vone{b} = i64.const 1
+  vj{b} = i64.add wi{b} vone{b}
+  br {m}(vj{b})
+}}
+block {r0} (xi{b}: i64) {{
+  xn{b} = i64.const 20
+  xc{b} = i64.lt_u xi{b} xn{b}
+  xzz{b} = i64.const 0
+  br_if xc{b} {rs}(xi{b}) {next}(xzz{b})
+}}
+block {rs} (yi{b}: i64) {{
+  ye{b} = i64.const 8
+  yo{b} = i64.mul yi{b} ye{b}
+  yb{b} = i64.const {base}
+  ya{b} = i64.add yb{b} yo{b}
+  yk{b} = i64.load ya{b}
+  yz{b} = i64.const 0
+  ys{b}, yv{b} = cont.resume yk{b} yz{b}
+  yone{b} = i64.const 1
+  yj{b} = i64.add yi{b} yone{b}
+  br {r0}(yj{b})
+}}
+",
+                m = 1 + 4 * b,
+                mk = 2 + 4 * b,
+                r0 = 3 + 4 * b,
+                rs = 4 + 4 * b,
+                next = 5 + 4 * b,
+            )
+        };
+        let mut src = String::from(
+            "memory 16
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vz0 = i64.const 0
+  br 1(vz0)
+}
+",
+        );
+        src += &batch(0);
+        src += &batch(1);
+        src += "block 9 (vlast: i64) {
+  vr = i64.const 7
+  return vr
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (v0: i64, v1: i64) {
+  return v0
+  }
+}
+";
+        let before = crate::fiber_rt::spares_reused();
+        let (out, _) = run_marked(&src);
+        assert_eq!(out, crate::JitOutcome::Returned(vec![7]));
+        assert_eq!(
+            crate::fiber_rt::spares_reused() - before,
+            16,
+            "the second batch's first 16 fibers reuse the first's contexts"
+        );
+    }
+
+    /// #3133 — and the fiber's creator, running when the fiber traps on another vCPU, stops too: no
+    /// raise reaches its context, and its loop's domain poll reads the domain's end. The root spins
+    /// with no way out but that end; the run is bounded so that a creator that never stops fails
+    /// this row instead of hanging the suite. It passes on main too, where the fiber's raise wrote the
+    /// creator's own context: it pins the new design (the fiber raises on a context of its own, and
+    /// the creator reads the domain's end), not a failure of the old one.
+    #[test]
+    fn a_creator_stops_when_its_fiber_traps_on_another_vcpu() {
+        if !temen_fiber::supported() {
+            return;
+        }
+        let src = "memory 16
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  v1 = ref.func 2
+  v2 = i64.const 8192
+  v3 = cont.new v1 v2
+  v4 = i64.const 0
+  v5 = thread.spawn 1 v4 v3
+  br 1(v4)
+}
+block 1 (vi: i64) {
+  vone = i64.const 1
+  vj = i64.add vi vone
+  br 1(vj)
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (v0: i64, v1: i64) {
+  v2 = i64.const 0
+  vs, vv = cont.resume v1 v2
+  return vv
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (v0: i64, v1: i64) {
+  unreachable
+  }
+}
+";
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(run_marked(src).0);
+        });
+        let ended = rx
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .expect("the creator stops once the domain ended");
+        assert_eq!(
+            ended,
+            crate::JitOutcome::Trapped(crate::TrapKind::Unreachable)
+        );
     }
 }

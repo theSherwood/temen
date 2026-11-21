@@ -527,8 +527,11 @@ unsafe fn cap_thunk_impl(
     // windows — the same software-page-map model, only the syscalls differ. The page map is the
     // **per-run** one from the `Host` (keyed by window base), so growth committed in an earlier
     // `call.cap` is still seen committed here — a borrow of a guest-grown page doesn't fail-closed.
-    // #2319 — the view is the run's, kept on the calling context ([`RunView`]); a call made while
-    // another holds it builds a view of its own.
+    // #2319 — the view is the run's, kept on the running vCPU's (or task's) context ([`RunView`]):
+    // a fiber's code uses the view of the vCPU it runs on (#3133, `VmCtx::runner`), so a fiber's
+    // context keeps none. A call made while another holds it builds a view of its own. The lease is
+    // this function's and every park is the thunk's, after it returns, so no stack switch happens
+    // while a call holds a view: only the runner's own thread reaches it.
     #[cfg(any(unix, windows))]
     let (mut lease, mut own);
     #[cfg(any(unix, windows))]
@@ -536,6 +539,7 @@ unsafe fn cap_thunk_impl(
         None
     } else {
         lease = vm
+            .runner()
             .thunk_state(RunView::default)
             .and_then(|run| run.lease(host, mem_base, mem_size, mem_reserved));
         match &mut lease {
@@ -3179,8 +3183,9 @@ unsafe fn serve_locked(
         .clone()
         .filter(|_| bell.is_some() && freeze.is_none())
         .and_then(|cell| {
+            // #3133 — the site is the running vCPU's (or task's), also when this code is a fiber's.
             temen_jit::ServeSite::of(
-                vm,
+                vm.runner(),
                 serve_ctx as *const c_void,
                 mem_base,
                 mem_reserved,

@@ -877,9 +877,9 @@ impl Drop for GateAside {
 /// until the handler steps back ([`Window::self_calls`]).
 pub fn handler_steps_aside(vm: &VmCtx, self_call: bool) -> Option<GateAside> {
     let window = vm.handler_window.load(Ordering::Acquire);
-    // A guest fiber's park parks the fiber alone, and the handler's own code runs on, as the fiber's
-    // resumer, with the gate.
-    if window.is_null() || crate::in_guest_fiber() {
+    // #3133 — a guest fiber's code runs on a context of its own, which names no window, so a guest
+    // fiber's park finds none here and parks the fiber alone.
+    if window.is_null() {
         return None;
     }
     let me = fiber_rt::context_id();
@@ -1255,14 +1255,6 @@ impl ServeSite {
         if self.window.pooled.load(Ordering::Acquire) != 0 {
             self.exec.offer_gate(self.window.key());
         }
-    }
-
-    /// #3133 (stop-gap) — the context its handlers run as, which a fiber one of them made goes on
-    /// running on after the site is gone (`os_thread_rt`'s `retired_handler_ctxs`). Its
-    /// `handler_window` names the window, which may be gone by then: a fiber's code never reads it
-    /// (`handler_steps_aside` answers `None` in a guest fiber first).
-    pub(crate) fn handler_ctx(&self) -> Arc<VmCtx> {
-        Arc::clone(&self.window.vm)
     }
 
     /// #2742 — the site's vCPU has ended, however it ended (owner, 2026-11-09): its window never opens
@@ -3773,7 +3765,7 @@ enum Outcome {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::{
         activation_ctx, CarriedBy, Carrier, ChildExec, Entry, HeldCaller, ServeSite, Wake,
         HANDLERS_ENDING,
@@ -3786,7 +3778,7 @@ mod tests {
     /// its gate and its domain's handler count, which is all a claim touches. With it, one task of
     /// the pool, parked and carried by this thread, so a wake the claim causes shows as its park
     /// ending and starts no worker.
-    fn parked_site() -> (Arc<ServeSite>, Arc<ChildExec>) {
+    pub(crate) fn parked_site() -> (Arc<ServeSite>, Arc<ChildExec>) {
         let exec = ChildExec::new();
         let vm = Arc::new(VmCtx::new(InstanceAddrs::NONE, crate::Window::NONE));
         let window = Arc::new(super::Window {

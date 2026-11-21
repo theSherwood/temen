@@ -1183,6 +1183,206 @@ block 0 (va: i64, vb: i64) {
 }
 "#;
 
+/// #3133 — the same, its `hang` served by a fiber's code: a serve op a fiber runs is the running
+/// vCPU's (or task's), whose end revokes its parked handlers, whichever context made the fiber and
+/// wherever it runs. Three children, each with [`HANG_ADD`]'s handlers and the poll loop as func 4,
+/// a fiber's entry: [`A_THREADS_FIBER_SERVES`], whose spawned thread makes and runs the fiber and
+/// ends; [`THE_ROOTS_FIBER_SERVES`], whose root (a pool task on the JIT) runs it and returns; and
+/// [`A_FIBER_SERVES_ON_ANOTHER_VCPU`], whose root makes it and a thread runs it and ends, which main
+/// got wrong: the fiber used its maker's context's site, the root's, which no thread's end revokes.
+/// With the site on the fiber's own context instead, each row ends `Err(ThreadFault)` on the JIT.
+/// TW and JIT, as above.
+#[test]
+fn a_fibers_serve_op_is_the_running_vcpus() {
+    let call = r#"
+  va = i64.const 1
+  vb = i64.const 2
+  vfirst = call.cap 268435456 0 (i64, i64) -> (i64) v7 (va, vb)
+  vc = i64.const 3
+  vd = i64.const 4
+  vsecond = call.cap 268435456 1 (i64, i64) -> (i64) v7 (vc, vd)
+  vthou = i64.const 1000
+  vf = i64.mul vfirst vthou
+  vcall = i64.add vf vsecond"#;
+    for (row, server) in [
+        ("a thread's fiber", A_THREADS_FIBER_SERVES),
+        ("the root's fiber", THE_ROOTS_FIBER_SERVES),
+        ("a fiber on another vCPU", A_FIBER_SERVES_ON_ANOTHER_VCPU),
+    ] {
+        let r = agree(
+            &caller(call, ""),
+            &format!("{HANG_ADD}{server}{HANG_ADD_HANDLERS}{POLL_IN_A_FIBER}"),
+            &[ENGINES[0], ENGINES[3]],
+        );
+        assert_eq!(
+            r,
+            Ok(vec![Value::I64(77 * 1_000_000 + CAP_REVOKED * 1_000 + 7)]),
+            "{row}"
+        );
+    }
+}
+
+/// #3133 (review D) — a `call.cap` a fiber makes on another vCPU than its maker's: the root makes the
+/// fiber and a spawned thread resumes it to its end; the fiber reads the clock it was handed, from
+/// the thread. Its cap thunk leases the running vCPU's view (`RunView`, through `VmCtx::runner`),
+/// the thread's, not its maker's. The root also calls `addmul`, which its server waits for. TW and
+/// JIT. (A fiber's live call from a spawned thread can trap `ThreadFault` on the JIT, on main too:
+/// #3144, so this row's fiber makes a call that does not park.)
+#[test]
+fn a_fiber_made_on_one_vcpu_calls_on_another() {
+    let call = r#"
+  va = i64.const 40
+  vb = i64.const 2
+  vsum, vprod = call.cap 268435456 0 (i64, i64) -> (i64, i64) v7 (va, vb)
+  vthousand = i64.const 1000
+  vsh = i64.mul vsum vthousand
+  vserved = i64.add vsh vprod
+  vf = ref.func 1
+  vclk = i64.extend_i32_u v3
+  vfk = cont.new vf vclk
+  vz = i64.const 0
+  vt = thread.spawn 2 vfk vz
+  vt_st, vfr = thread.join vt
+  vcall = i64.add vserved vfr"#;
+    let fibers = r#"
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, varg: i64) {
+  vc = i32.wrap_i64 vsp
+  vnow = call.cap 2 0 () -> (i64) vc ()
+  vd = i64.sub vnow vnow
+  vseven = i64.const 7
+  vr = i64.add vd vseven
+  return vr
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vk: i64, vz: i64) {
+  vs, vv = cont.resume vk vz
+  return vv
+  }
+}
+"#;
+    let r = agree(
+        &caller(call, fibers),
+        &server(ADDMUL_TYPES, ADDMUL),
+        &[ENGINES[0], ENGINES[3]],
+    );
+    assert_eq!(r, served(42_087));
+}
+
+/// `hang` (func 2) and `add` (func 3) of [`HANG_ADD`]'s interface.
+const HANG_ADD_HANDLERS: &str = r#"func (i64, i64) -> (i64) {
+block 0 (va: i64, vb: i64) {
+  vfa = i64.const 17416
+  vone = i64.const 1
+  i64.store vfa vone
+  vw = i64.const 17408
+  vexp = i32.const 0
+  vto = i64.const -1
+  vst = i32.atomic.wait vw vexp vto
+  vst64 = i64.extend_i32_u vst
+  return vst64
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (va: i64, vb: i64) {
+  vs = i64.add va vb
+  return vs
+  }
+}
+"#;
+
+/// Func 4, a fiber's entry: serve until `hang` has parked, and return 5.
+const POLL_IN_A_FIBER: &str = r#"func (i64, i64) -> (i64) {
+block 0 (va: i64, vb: i64) {
+  br 1()
+}
+block 1 () {
+  vz = i32.const 0
+  vn = call.cap 4294967295 9 () -> (i64) vz ()
+  vfa = i64.const 17416
+  vflag = i64.load vfa
+  vzero = i64.const 0
+  vset = i64.ne vflag vzero
+  br_if vset 2() 1()
+}
+block 2 () {
+  vr = i64.const 5
+  return vr
+  }
+}
+"#;
+
+/// The main spawns a thread that makes the polling fiber and runs it to its end, and joins it; then
+/// it serves `add` and returns 77.
+const A_THREADS_FIBER_SERVES: &str = r#"func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vz = i64.const 0
+  vt = thread.spawn 1 vz vz
+  vt_st, vtr = thread.join vt
+  vw = i32.const 0
+  vn = svc.wait vw
+  vr = i64.const 77
+  return vr
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (va: i64, vb: i64) {
+  vf = ref.func 4
+  vz = i64.const 0
+  vk = cont.new vf vz
+  vs, vv = cont.resume vk vz
+  return vv
+  }
+}
+"#;
+
+/// The main runs the polling fiber to its end, spawns a thread that serves `add`, and returns 77
+/// without joining it.
+const THE_ROOTS_FIBER_SERVES: &str = r#"func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vf = ref.func 4
+  vz = i64.const 0
+  vk = cont.new vf vz
+  vs, vv = cont.resume vk vz
+  vt = thread.spawn 1 vz vz
+  vr = i64.const 77
+  return vr
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (va: i64, vb: i64) {
+  vw = i32.const 0
+  vn = svc.wait vw
+  return vn
+  }
+}
+"#;
+
+/// The main makes the polling fiber and spawns a thread that runs it to its end; it joins the
+/// thread, serves `add` and returns 77.
+const A_FIBER_SERVES_ON_ANOTHER_VCPU: &str = r#"func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vf = ref.func 4
+  vz = i64.const 0
+  vk = cont.new vf vz
+  vt = thread.spawn 1 vk vz
+  vt_st, vtr = thread.join vt
+  vw = i32.const 0
+  vn = svc.wait vw
+  vr = i64.const 77
+  return vr
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vk: i64, vb: i64) {
+  vz = i64.const 0
+  vs, vv = cont.resume vk vz
+  return vv
+  }
+}
+"#;
+
 /// #2742 — the same, its main ending in a trap: the handler's call answers `CAP_REVOKED`.
 #[test]
 fn a_serve_loop_that_traps_revokes_its_parked_handler_s_call() {
@@ -1298,4 +1498,30 @@ block 0 (va: i64, vb: i64) {
         Value::I64(CAP_REVOKED),
         "a killed child joins as 0, and the call is revoked"
     );
+}
+
+/// #3133 (review E) — a handler that parks, called from a caller's guest fiber, with the direct
+/// handoff off and on: the case in which a handler's code could have run inside a guest fiber with
+/// its window set, which `handler_steps_aside` once excluded by asking `in_guest_fiber`. A fiber's
+/// context names no window now, and the handler's park steps aside on its own context. TW and JIT.
+#[test]
+fn a_parking_handler_called_from_a_callers_fiber() {
+    let handler = r#"func (i64, i64) -> (i64, i64) {
+block 0 (va: i64, vb: i64) {
+  vw = i64.const 2048
+  vexp = i32.const 0
+  vto = i64.const 1000000
+  vst = i32.atomic.wait vw vexp vto
+  vs = i64.add va vb
+  vm = i64.mul va vb
+  return vs, vm
+  }
+}
+"#;
+    let r = agree(
+        &caller(IN_A_FIBER, ADDMUL_FIBER),
+        &server(ADDMUL_TYPES, handler),
+        &[ENGINES[0], ENGINES[3]],
+    );
+    assert_eq!(r, served(42_080));
 }

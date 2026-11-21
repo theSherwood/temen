@@ -1026,3 +1026,106 @@ fn jit_thaw(
 ) -> temen_jit::JitThaw {
     temen_ir::thaw::validate(m, false, 0, raw).expect("a residue a run made")
 }
+
+/// A durable loop of 10 back-edges returning 42: no fibers.
+const LOOP_SRC: &str = "memory 17 shadow 16448 65536\n\
+    func () -> (i64) {\n\
+    block 0 () {\n\
+    \x20 v0 = i64.const 0\n\
+    \x20 br 1(v0)\n\
+    }\n\
+    block 1 (v1: i64) {\n\
+    \x20 v2 = i64.const 10\n\
+    \x20 v3 = i64.lt_u v1 v2\n\
+    \x20 br_if v3 2(v1) 3()\n\
+    }\n\
+    block 2 (v4: i64) {\n\
+    \x20 v5 = i64.const 1\n\
+    \x20 v6 = i64.add v4 v5\n\
+    \x20 br 1(v6)\n\
+    }\n\
+    block 3 () {\n\
+    \x20 v7 = i64.const 42\n\
+    \x20 return v7\n\
+      }\n\
+    }\n";
+
+/// #3139 — what a thaw through `jit_cap_run` burns past the tree-walker's thaw, fibers or none: its
+/// entry. A fix makes it 0.
+const THAW_ENTRY_GAP: u64 = 1;
+
+/// `src` frozen at its first safepoint on the tree-walker, then thawed metered on the tree-walker
+/// (on a budget) and on the JIT (through [`temen_run::jit_cap_run`], which meters every run on its
+/// host's node): what each thaw returned and burned.
+fn metered_thaws(src: &str) -> ((Vec<Value>, u64), (JitOutcome, u64)) {
+    let m = parse_module(src).expect("parse");
+    let inst = transform_module(&m).expect("transform");
+    verify_module(&inst).expect("verify");
+    let mut ihost = Host::new();
+    ihost.set_durable(true);
+    let mut iwin = init_durable_window(WINDOW, TEST_ARENA);
+    write_state(&mut iwin, TEST_ARENA, STATE_UNWINDING);
+    let mut ifuel = 1_000_000u64;
+    let (ires, isnap) =
+        run_capture_reserved_with_host(&inst, 0, &[], &mut ifuel, &iwin, WINDOW_LOG2, &mut ihost);
+    assert!(ires.is_ok(), "the freeze: {ires:?}");
+    let artifact = freeze(&inst, &isnap, &ihost).expect("freeze");
+    let restored = || {
+        let mut h = Host::new();
+        let mut win = restore(&artifact, &inst, &mut h).expect("restore");
+        begin_thaw(&mut win, TEST_ARENA, 0);
+        h.set_durable(true);
+        (h, win)
+    };
+    let budget = temen_interp::DEFAULT_FUEL;
+    let (mut h, win) = restored();
+    let mut left = budget;
+    let (tree, _) =
+        run_capture_reserved_with_host(&inst, 0, &[], &mut left, &win, WINDOW_LOG2, &mut h);
+    let tree = (tree.expect("tree-walker thaw"), budget - left);
+    let (mut h, win) = restored();
+    let (jit, _) = temen_run::jit_cap_run(
+        &inst,
+        0,
+        &[],
+        &temen_interp::MemLayout::image(win),
+        WINDOW_LOG2,
+        0,
+        &mut h,
+        None,
+    )
+    .expect("JIT thaw");
+    (tree, (jit, budget - h.fuel_left()))
+}
+
+/// #3133 (review A) — a thawed fiber's start is charged as the tree-walker charges it. The thaw
+/// re-seeds the fiber (frozen suspended) and its rewound `cont.resume` re-enters the fiber's entry;
+/// the fiber's context names the root's cell, so the entry refunds the one unit the resume charged,
+/// as `cont.new`'s fibers do. (Main passed no cell to a seeded fiber, so it did not refund: its thaw
+/// burned 2 past the tree-walker's.) The JIT's thaw burns [`THAW_ENTRY_GAP`] past the tree-walker's
+/// with a fiber as without one, so the fiber adds the same on both engines.
+#[test]
+fn a_thawed_fibers_start_is_charged_as_the_tree_walker_charges_it() {
+    let ((tv, tree), (jo, jit)) = metered_thaws(FIBER_SRC);
+    assert_eq!(tv, vec![Value::I64(107)], "tree-walker thaw");
+    assert!(
+        matches!(&jo, JitOutcome::Returned(v) if *v == vec![107]),
+        "JIT thaw: {jo:?}"
+    );
+    let ((lv, ltree), (lo, ljit)) = metered_thaws(LOOP_SRC);
+    assert_eq!(lv, vec![Value::I64(42)], "tree-walker thaw, no fibers");
+    assert!(
+        matches!(&lo, JitOutcome::Returned(v) if *v == vec![42]),
+        "JIT thaw, no fibers: {lo:?}"
+    );
+    assert_eq!(
+        ljit - ltree,
+        THAW_ENTRY_GAP,
+        "a thaw with no fibers (#3139)"
+    );
+    assert_eq!(
+        jit - tree,
+        THAW_ENTRY_GAP,
+        "a thaw with a fiber: {tree} {jit}"
+    );
+}
