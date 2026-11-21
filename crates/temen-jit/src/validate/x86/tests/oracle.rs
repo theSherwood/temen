@@ -322,6 +322,221 @@ fn map_bits(m: VexEscape) -> u8 {
     }
 }
 
+/// The `(map, mandatory-prefix, opcode)` key of a DSL form's encoding, as the decoder's vector
+/// allowlist is keyed — `None` for a one-byte-map form (not a vector decode). map: 1=0F, 2=0F38,
+/// 3=0F3A; pp: 0=none, 1=66, 2=F3, 3=F2.
+fn emitted_key(inst: &dsl::Inst) -> Option<(u8, u8, u8, u8)> {
+    let map_code = |m: VexEscape| match m {
+        VexEscape::_0F => 1,
+        VexEscape::_0F38 => 2,
+        VexEscape::_0F3A => 3,
+    };
+    let pp_code = |pp: Option<VexPrefix>| match pp {
+        None => 0,
+        Some(VexPrefix::_66) => 1,
+        Some(VexPrefix::_F3) => 2,
+        Some(VexPrefix::_F2) => 3,
+    };
+    Some(match &inst.encoding {
+        Encoding::Rex(rex) => {
+            if !rex.opcodes.escape {
+                return None; // one-byte map — not a vector decode site
+            }
+            let pfx = &rex.opcodes.prefixes;
+            let pp = match &pfx.group1 {
+                Some(Group1Prefix::REP_) => 2,
+                Some(Group1Prefix::REPNorBND) => 3,
+                _ => u8::from(pfx.group3.is_some()),
+            };
+            // A `0F 38`/`0F 3A` form carries its map opcode in `secondary`; any other escape form is
+            // a 0F-map op whose `primary` is the opcode (a `secondary`, as `0F AE`'s fences have, is a
+            // fixed ModRM byte, not a map opcode).
+            match rex.opcodes.primary {
+                0x38 => (
+                    0,
+                    2,
+                    pp,
+                    rex.opcodes.secondary.expect("a 0F38 form names its opcode"),
+                ),
+                0x3A => (
+                    0,
+                    3,
+                    pp,
+                    rex.opcodes.secondary.expect("a 0F3A form names its opcode"),
+                ),
+                primary => (0, 1, pp, primary),
+            }
+        }
+        Encoding::Vex(vex) => (
+            1,
+            map_code(vex.mmmmm.expect("a VEX form names its map")),
+            pp_code(vex.pp),
+            vex.opcode,
+        ),
+        Encoding::Evex(evex) => (
+            2,
+            map_code(evex.mmm.expect("an EVEX form names its map")),
+            pp_code(evex.pp),
+            evex.opcode,
+        ),
+    })
+}
+
+/// The set of `(class, map, pp, op)` keys Cranelift's encoder emits in a vector map (`class`: 0
+/// legacy, 1 VEX, 2 EVEX) — the oracle for the decoder's allowlist.
+fn emitted_vector_keys() -> std::collections::BTreeSet<(u8, u8, u8, u8)> {
+    instructions::list()
+        .into_iter()
+        .filter(|i| in_64bit_mode(&i.features))
+        .filter_map(|i| emitted_key(&i))
+        .collect()
+}
+
+/// Bytes for a legacy-encoded probe at `(map, pp, op)` (map: 1=0F, 2=0F38, 3=0F3A), a reg-reg ModRM
+/// and `imm` trailing byte, padded so the decoder never truncates. Used to check that a `(map, pp,
+/// op)` the DSL does not emit decodes as rejected.
+fn legacy_probe(map: u8, pp: u8, op: u8, imm: bool) -> Vec<u8> {
+    let mut b = Vec::new();
+    b.extend(match pp {
+        1 => Some(0x66),
+        2 => Some(0xF3),
+        3 => Some(0xF2),
+        _ => None,
+    });
+    b.push(0x0F);
+    b.extend(match map {
+        2 => Some(0x38),
+        3 => Some(0x3A),
+        _ => None,
+    });
+    b.push(op);
+    b.push(0xC0); // ModRM: reg-reg, no displacement
+    if imm {
+        b.push(0);
+    }
+    b.extend([0, 0, 0, 0]);
+    b
+}
+
+/// Bytes for a 3-byte-VEX probe at `(map, pp, op)`: reg-reg, low registers, `W=0 L=0`, `vvvv=1111`.
+fn vex_probe(map: u8, pp: u8, op: u8) -> Vec<u8> {
+    let mut b = vec![0xC4, 0xE0 | map, 0x78 | pp, op, 0xC0];
+    if map == 3 {
+        b.push(0); // 0F3A imm8
+    }
+    b.extend([0, 0, 0, 0]);
+    b
+}
+
+/// Bytes for an EVEX probe at `(map, pp, op)`: reg-reg, low registers, `W=0`, `L'L=0`, no mask/broadcast.
+fn evex_probe(map: u8, pp: u8, op: u8) -> Vec<u8> {
+    let mut b = vec![0x62, 0xF0 | map, 0x7C | pp, 0x08, op, 0xC0];
+    if map == 3 {
+        b.push(0);
+    }
+    b.extend([0, 0, 0, 0]);
+    b
+}
+
+fn rejects(bytes: &[u8]) -> bool {
+    matches!(
+        decode(bytes, 0).kind,
+        Kind::Undecodable | Kind::Forbidden(_)
+    )
+}
+
+/// Forward direction (#2856): every vector form Cranelift's encoder emits decodes as **modeled**, not
+/// rejected by the allowlist — else real code is rejected once the gate fails closed (#2536). Checked
+/// on the register variant, whose only rejections are unrelated (there are none for a vector op); the
+/// memory variants' rejections (EVEX compressed `disp8`) are the other oracle's concern.
+#[test]
+fn every_emitted_vector_form_is_allowed() {
+    let mut rejected = Vec::new();
+    for inst in instructions::list() {
+        if !in_64bit_mode(&inst.features) {
+            continue;
+        }
+        let Some(key) = emitted_key(&inst) else {
+            continue;
+        };
+        let Some(bytes) = synth(&inst, LOW, false, true) else {
+            continue;
+        };
+        if rejects(&bytes) {
+            rejected.push(format!("{} {bytes:02x?} {key:?}", inst.name()));
+        }
+    }
+    assert!(
+        rejected.is_empty(),
+        "the allowlist rejects {} emitted vector form(s):\n{}",
+        rejected.len(),
+        rejected.join("\n")
+    );
+}
+
+/// Complement direction (#2856): a vector form Cranelift's encoder does **not** emit decodes as
+/// rejected, so the allowlist cannot silently drift wider than the DSL. Exhaustive over the maps
+/// whose every opcode is vector-classified (legacy `0F38`/`0F3A`, all VEX, all EVEX); the `0F` map
+/// mixes in scalar ops handled before the vector fallthrough (`cpuid`, `bt`, the jumps), so there a
+/// curated sample of opcodes that do reach the fallthrough stands in. Legacy and VEX share the merged
+/// emitted set (a legacy encoding of a VEX-only key, or the reverse, is `#UD`, so accepting it is
+/// sound — [`vec_allowed`]); EVEX is checked against its own emitted set.
+#[test]
+fn non_emitted_vector_forms_are_rejected() {
+    let emitted = emitted_vector_keys();
+    let merged =
+        |map, pp, op| emitted.contains(&(0, map, pp, op)) || emitted.contains(&(1, map, pp, op));
+    let mut accepted = Vec::new();
+    // Legacy 0F38 (no imm) and 0F3A (imm8): every opcode is vector-classified.
+    for (map, imm) in [(2u8, false), (3u8, true)] {
+        for pp in 0..4 {
+            for op in 0..=255 {
+                if !merged(map, pp, op) && !rejects(&legacy_probe(map, pp, op, imm)) {
+                    accepted.push(format!("legacy map{map} pp{pp} {op:#04x}"));
+                }
+            }
+        }
+    }
+    // VEX, every map — against the merged legacy+VEX set.
+    for map in 1..=3 {
+        for pp in 0..4 {
+            for op in 0..=255 {
+                if !merged(map, pp, op) && !rejects(&vex_probe(map, pp, op)) {
+                    accepted.push(format!("vex map{map} pp{pp} {op:#04x}"));
+                }
+            }
+        }
+    }
+    // EVEX, every map — against the EVEX set.
+    for map in 1..=3 {
+        for pp in 0..4 {
+            for op in 0..=255 {
+                if !emitted.contains(&(2, map, pp, op)) && !rejects(&evex_probe(map, pp, op)) {
+                    accepted.push(format!("evex map{map} pp{pp} {op:#04x}"));
+                }
+            }
+        }
+    }
+    // 0F map: opcodes that reach the vector fallthrough yet Cranelift never emits (`0F 0F` is 3DNow!).
+    for op in [0x04u8, 0x0F, 0x24, 0x25, 0x26, 0x36, 0x39] {
+        for pp in 0..4 {
+            assert!(
+                !merged(1, pp, op),
+                "0F {op:#04x} pp{pp} is emitted — pick another probe"
+            );
+            if !rejects(&legacy_probe(1, pp, op, false)) {
+                accepted.push(format!("0F pp{pp} {op:#04x}"));
+            }
+        }
+    }
+    assert!(
+        accepted.is_empty(),
+        "the decoder accepts {} non-emitted vector form(s):\n{}",
+        accepted.len(),
+        accepted.join("\n")
+    );
+}
+
 /// Where iced says control goes after `insn`, as the decoder's [`Kind`] must classify it.
 fn flow_agrees(d: &Decoded, insn: &Instruction) -> bool {
     let target = insn.near_branch_target() as usize;

@@ -3952,9 +3952,19 @@ pub(crate) mod x86 {
             }
             0x98 => Some(one(c, start, Normal, Eff::Wr(bit(0)))), // cwde/cdqe → rax
             0x99 => Some(one(c, start, Normal, Eff::Wr(bit(2)))), // cwd/cdq/cqo → rdx
-            // nops, flag ops, invalid-in-64 legacy: no tracked GP write.
-            0x06 | 0x07 | 0x0E | 0x16 | 0x17 | 0x1E | 0x1F | 0x27 | 0x2F | 0x37 | 0x3F | 0x90
-            | 0x9B | 0x9E | 0x9F | 0xF5 | 0xF8 | 0xF9 | 0xFC | 0xFD => {
+            // The one-byte segment push/pop and BCD ops, invalid in 64-bit mode (they `#UD`).
+            // Cranelift never emits them, so a default-deny decoder rejects them rather than model a
+            // trapping byte as a nop (#2856, #2603 hole 17).
+            0x06 | 0x07 | 0x0E | 0x16 | 0x17 | 0x1E | 0x1F | 0x27 | 0x2F | 0x37 | 0x3F => {
+                Some(one(
+                    c,
+                    start,
+                    Forbidden("invalid-in-64-bit one-byte opcode"),
+                    Eff::NoGp,
+                ))
+            }
+            // nops and flag ops: no tracked GP write, no memory.
+            0x90 | 0x9B | 0x9E | 0x9F | 0xF5 | 0xF8 | 0xF9 | 0xFC | 0xFD => {
                 Some(one(c, start, Normal, Eff::NoGp))
             }
             // `pushf`/`popf` move rsp by 8, but this decoder would track no change — the same rsp
@@ -4221,6 +4231,9 @@ pub(crate) mod x86 {
             _ => finish_modrm(c, start, p, 0, Normal, E::NoGp)?,
         }
         .vector(op2, p);
+        if !vec_allowed(Map::Of, pp_of(p), op2) {
+            return Some(gate_vec(d, false));
+        }
         let gp = vec_gp_writes(Map::Of, op2, p, &d.operands);
         Some(if gp != 0 {
             Decoded {
@@ -4251,6 +4264,81 @@ pub(crate) mod x86 {
             0xE0..=0xE5 | 0xE8..=0xEF | 0xF0..=0xF6 | 0xF8..=0xFE => true,
             0x7E => p.rep == 0xF3, // movq xmm, xmm/m64; without F3 it stores a GP or xmm value
             _ => false,
+        }
+    }
+
+    /// The mandatory-prefix code the vector allowlist keys on: `0` none, `1` `66`, `2` `F3`, `3`
+    /// `F2`. `F3`/`F2` (the `rep` field) outrank `66`, as a mandatory prefix does.
+    fn pp_of(p: &Pfx) -> u8 {
+        match p.rep {
+            0xF3 => 2,
+            0xF2 => 3,
+            _ => u8::from(p.op66),
+        }
+    }
+
+    /// Whether Cranelift's x64 encoder emits a form at this `(map, pp, op)` in a **legacy or VEX**
+    /// encoding — the decoder's vector-map allowlist (#2856, #2603 hole 17). A vector decode whose
+    /// `(map, pp, op)` is not listed is a form the decoder does not model, so [`gate_vec`] rejects it
+    /// rather than let the permissive vector default classify it: an unmodeled form could be a wide
+    /// store read as a narrow one, or a GP-writer read as XMM-only, admitted on the decoder's word
+    /// once the gate fails closed (#2536). Legacy and VEX share one list — the same `(map, pp, op)`
+    /// is the same operation in both, so the shared classification models it the same way, and a
+    /// legacy encoding of a VEX-only key (or the reverse) is `#UD` on hardware and so cannot run.
+    /// EVEX reuses VEX's opcode slots for different operations, so it has its own list
+    /// ([`evex_allowed`]). The completeness oracle checks this against Cranelift's DSL both ways:
+    /// every emitted form is listed, and a sampled non-emitted form is rejected, so the list cannot
+    /// drift from the encoder.
+    #[rustfmt::skip]
+    fn vec_allowed(map: Map, pp: u8, op: u8) -> bool {
+        match map {
+            // 0F map (SSE/SSE2/AVX), by mandatory prefix: none, 66, F3, F2.
+            Map::Of => match pp {
+                0 => matches!(op, 0x10 | 0x11 | 0x14 | 0x15 | 0x16 | 0x1F | 0x28 | 0x29 | 0x2E | 0x50..=0x5F | 0xC2 | 0xC6),
+                1 => matches!(op, 0x10 | 0x11 | 0x14 | 0x1F | 0x28 | 0x29 | 0x2E | 0x50 | 0x51 | 0x54..=0x5A | 0x5C..=0x5F | 0x60..=0x76 | 0x7E | 0x7F | 0xC2 | 0xC4 | 0xC5 | 0xC6 | 0xD1..=0xD5 | 0xD7..=0xDF | 0xE0..=0xE6 | 0xE8..=0xEF | 0xF1..=0xF5 | 0xF8..=0xFE),
+                2 => matches!(op, 0x10 | 0x11 | 0x2A | 0x2C | 0x2D | 0x51 | 0x52 | 0x53 | 0x58..=0x5F | 0x6F | 0x70 | 0x7F | 0xC2 | 0xE6),
+                3 => matches!(op, 0x10 | 0x11 | 0x12 | 0x2A | 0x2C | 0x2D | 0x51 | 0x58 | 0x59 | 0x5A | 0x5C..=0x5F | 0x70 | 0xC2),
+                _ => false,
+            },
+            Map::Of38 => match pp {
+                0 => matches!(op, 0xF2 | 0xF3 | 0xF5),
+                1 => matches!(op, 0x00 | 0x01 | 0x02 | 0x04 | 0x0B | 0x10 | 0x14 | 0x15 | 0x17 | 0x18 | 0x1C..=0x1E | 0x20..=0x25 | 0x28 | 0x29 | 0x2B | 0x30..=0x35 | 0x37..=0x40 | 0x58 | 0x59 | 0x78 | 0x79 | 0x98..=0x9F | 0xA8..=0xAF | 0xB8..=0xBF | 0xF7),
+                2 => op == 0xF7,
+                3 => matches!(op, 0xF6 | 0xF7),
+                _ => false,
+            },
+            Map::Of3a => match pp {
+                1 => matches!(op, 0x08..=0x0B | 0x0E | 0x0F | 0x14..=0x17 | 0x20..=0x22 | 0x4A..=0x4C),
+                3 => op == 0xF0,
+                _ => false,
+            },
+        }
+    }
+
+    /// Whether Cranelift's x64 encoder emits a form at this `(map, pp, op)` in an **EVEX** encoding —
+    /// the AVX-512 allowlist, separate from [`vec_allowed`] because EVEX puts stores in slots where
+    /// VEX has loads, so the two maps' opcodes cannot be shared (#2856). A handful of 128-bit element
+    /// ops; the oracle checks it against the DSL like `vec_allowed`.
+    fn evex_allowed(map: Map, pp: u8, op: u8) -> bool {
+        match (map, pp) {
+            (Map::Of, 1) => matches!(op, 0x58 | 0x72 | 0x73 | 0xD2 | 0xD3 | 0xE2 | 0xF2 | 0xF3),
+            (Map::Of, 3) => op == 0x7A,
+            (Map::Of38, 1) => matches!(op, 0x1E | 0x1F | 0x40 | 0x54 | 0x75),
+            _ => false,
+        }
+    }
+
+    /// Reject a vector decode the allowlist does not list: keep its length (so the block walk stays in
+    /// sync and shadow mode logs this one form, not a cascade) but mark it `Forbidden`, so the policy
+    /// rejects it (#2856).
+    fn gate_vec(d: Decoded, allowed: bool) -> Decoded {
+        if allowed {
+            d
+        } else {
+            Decoded {
+                kind: Kind::Forbidden("vector form outside the modeled set"),
+                ..d
+            }
         }
     }
 
@@ -4397,13 +4485,15 @@ pub(crate) mod x86 {
     fn decode_0f38(c: &mut Cursor, start: usize, p: &Pfx) -> Option<Decoded> {
         let op = c.next()?; // opcode in the 0F38 map — ModRM, no immediate
         let d = finish_modrm(c, start, p, 0, Kind::Normal, EffIntent::NoGp)?;
-        Some(apply_vec_class(d, Map::Of38, op, p))
+        let d = apply_vec_class(d, Map::Of38, op, p);
+        Some(gate_vec(d, vec_allowed(Map::Of38, pp_of(p), op)))
     }
 
     fn decode_0f3a(c: &mut Cursor, start: usize, p: &Pfx) -> Option<Decoded> {
         let op = c.next()?; // opcode in the 0F3A map — all have ModRM + imm8
         let d = finish_modrm(c, start, p, 1, Kind::Normal, EffIntent::NoGp)?;
-        Some(apply_vec_class(d, Map::Of3a, op, p))
+        let d = apply_vec_class(d, Map::Of3a, op, p);
+        Some(gate_vec(d, vec_allowed(Map::Of3a, pp_of(p), op)))
     }
 
     /// Stamp a decoded vector-map instruction with its memory direction/width ([`vec_mem_0f38_3a`])
@@ -4443,6 +4533,7 @@ pub(crate) mod x86 {
             ..vex_pp_l(b1)
         };
         vex_body(c, start, &p, Map::Of, op)
+            .map(|d| gate_vec(d, vec_allowed(Map::Of, pp_of(&p), op)))
     }
 
     fn decode_vex3(c: &mut Cursor, start: usize) -> Option<Decoded> {
@@ -4464,7 +4555,7 @@ pub(crate) mod x86 {
             3 => Map::Of3a,
             _ => return Some(UNDECODABLE),
         };
-        vex_body(c, start, &p, map, op)
+        vex_body(c, start, &p, map, op).map(|d| gate_vec(d, vec_allowed(map, pp_of(&p), op)))
     }
 
     fn decode_evex(c: &mut Cursor, start: usize) -> Option<Decoded> {
@@ -4506,14 +4597,15 @@ pub(crate) mod x86 {
         // down-convert accesses less, so `16 << L'L` bounds every access (`0`, unknown, for the
         // reserved L'L). The VEX tables' widths and directions don't carry over ([`evex_reads`]).
         let d = vex_body(c, start, &p, map, op)?;
-        Some(Decoded {
+        let d = Decoded {
             width: match (p2 >> 5) & 0x03 {
                 ll @ 0..=2 => 16 << ll,
                 _ => 0,
             },
             reads_only: evex_reads(map, op, &p),
             ..d
-        })
+        };
+        Some(gate_vec(d, evex_allowed(map, pp_of(&p), op)))
     }
 
     /// Whether an EVEX instruction only reads its memory operand: exactly the AVX-512 forms
@@ -4691,6 +4783,31 @@ pub(crate) mod x86 {
             validate::arm_capture();
             let _ = compile(&m, 0).expect("compile");
             validate::take_capture()
+        }
+
+        /// #2856 — the decoder is reject-by-default in the vector maps and the one-byte map's
+        /// invalid-in-64 slots: a form Cranelift's encoder never emits is `Forbidden`, never modeled
+        /// on the decoder's word. (The allowlist's completeness against the DSL is the oracle's; this
+        /// pins the shapes the issue named, and that an emitted form still decodes.)
+        #[test]
+        fn reject_by_default_outside_the_modeled_set() {
+            let forbidden =
+                |b: &[u8]| matches!(decode(b, 0).kind, Kind::Forbidden(_) | Kind::Undecodable);
+            // The undefined 0F-map opcode the #2799 pins surfaced (iced rejects it too).
+            assert!(forbidden(&[0x0F, 0x04, 0xC0]));
+            // 3DNow! (`0F 0F /r ib`): the fallback used to read it as a 3-byte vector op.
+            assert!(forbidden(&[0x0F, 0x0F, 0xC0, 0x00]));
+            // Non-emitted 0F38 / 0F3A opcodes.
+            assert!(forbidden(&[0x66, 0x0F, 0x38, 0x05, 0xC0]));
+            assert!(forbidden(&[0x66, 0x0F, 0x3A, 0x05, 0xC0, 0x00]));
+            // The one-byte segment push/pop and BCD ops, invalid in 64-bit mode.
+            for op in [
+                0x06u8, 0x07, 0x0E, 0x16, 0x17, 0x1E, 0x1F, 0x27, 0x2F, 0x37, 0x3F,
+            ] {
+                assert!(forbidden(&[op]), "one-byte {op:#04x} not rejected");
+            }
+            // But an emitted vector form still decodes: `addps xmm0, xmm1`.
+            assert_eq!(decode(&[0x0F, 0x58, 0xC1], 0).kind, Kind::Normal);
         }
 
         /// iced-x86's decode of the one instruction at `bytes[at..]`, or `None` if iced rejects it.
