@@ -861,8 +861,12 @@ fn a_trap_code_no_trap_has_is_refused_on_the_embedders_route() {
     };
     let mut h = Host::new();
     assert!(
-        h.admit_thaw(&inst, completed(temen_ir::trap_code::THREAD_FAULT))
-            .is_ok(),
+        h.admit_thaw(
+            &inst,
+            completed(temen_ir::trap_code::THREAD_FAULT),
+            temen_interp::Serve::default()
+        )
+        .is_ok(),
         "a trap a join answers"
     );
     for code in [
@@ -872,7 +876,8 @@ fn a_trap_code_no_trap_has_is_refused_on_the_embedders_route() {
     ] {
         let mut h = Host::new();
         assert!(
-            h.admit_thaw(&inst, completed(code)).is_err(),
+            h.admit_thaw(&inst, completed(code), temen_interp::Serve::default())
+                .is_err(),
             "trap code {code:#x}"
         );
         assert!(h.residue().is_empty(), "and nothing is seeded");

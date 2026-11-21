@@ -216,6 +216,7 @@ fn a_join_parked_root_takes_the_freeze_its_child_was_re_admitted_for() {
             children: h.child_generations().to_vec(),
             ..Default::default()
         },
+        temen_interp::Serve::default(),
     )
     .expect("a residue a run made");
     let mut win2 = snap.clone();
@@ -271,6 +272,7 @@ fn thaw_with_the_word_changed(inst: &Inst, snap: &[u8], h: &Host) -> Result<Vec<
             children: h.child_generations().to_vec(),
             ..Default::default()
         },
+        temen_interp::Serve::default(),
     )
     .expect("a residue a run made");
     let mut win = snap.to_vec();
@@ -472,6 +474,7 @@ fn a_thawed_fiber_park_idles_and_freezes_again() {
             root_sp: h.frozen_root_sp(),
             ..Default::default()
         },
+        temen_interp::Serve::default(),
     )
     .expect("a residue a run made");
     let mut win2 = snap.clone();

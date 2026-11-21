@@ -754,6 +754,35 @@ pub use temen_ir::thaw::{FrozenFiber, FrozenVCpu};
 /// refused ([`CompiledModule::set_durable`]) and the embedder thaws on the tree-walker.
 pub type JitThaw = temen_ir::thaw::Thaw<JitDetached, ()>;
 
+/// #3034 — a thaw seed [`CompiledModule::set_durable`] refused, handed back: a fork twin this engine
+/// does not re-create, or a residue no run of the module at context 0 makes. Its relaunch payloads
+/// are the caller's to release ([`release_thaw`]).
+pub struct SeedRefused {
+    pub seed: Box<JitThaw>,
+}
+
+impl core::fmt::Debug for SeedRefused {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("SeedRefused")
+    }
+}
+
+/// #3034 — release the relaunch payloads of a thaw seed that will not run ([`SeedRefused`]), and
+/// those of their own seeds, at every depth: each holds two counted refs on its powerbox.
+///
+/// # Safety
+/// `release` is the releaser of the powerboxes the seed's relaunch payloads name, each of which holds
+/// two live counted refs owned by the seed, released once, here.
+pub unsafe fn release_thaw(release: GrantChildReleaser, thaw: JitThaw) {
+    for l in thaw.into_held().0.live_detached {
+        if let JitDetached::Relaunch(seed) = l.payload {
+            release(seed.child.ctx);
+            release(seed.child.retained_ctx);
+            release_thaw(release, seed.residue);
+        }
+    }
+}
+
 /// The durable snapshot's window-image page granularity (must match `temen-snapshot`'s `PAGE` /
 /// `temen-interp`'s `DURABLE_SNAPSHOT_PAGE`): a restored protection map has one entry per this many
 /// bytes. Host-page-independent for artifact portability; a 4 KiB codec page sits within one host
@@ -2230,9 +2259,14 @@ pub(crate) struct Seeded {
     pub(crate) detached: Vec<DetachedSeed>,
 }
 
-/// Take `thaw` apart for this runtime. `Err` (it, untouched) for one holding a fork twin, which this
+/// Take `thaw` apart for this runtime, running the code `facts` describe: admitted again for that
+/// code ([`temen_ir::thaw::Thaw::seed`]), so a thaw validated for another program cannot seed this
+/// one. `Err` (it, untouched) for one it does not admit, and for one holding a fork twin, which this
 /// engine does not re-create (#3098): the caller refuses the thaw whole, never part of it (#1690).
-pub(crate) fn seeded(thaw: JitThaw) -> Result<Seeded, Box<JitThaw>> {
+pub(crate) fn seeded(
+    thaw: JitThaw,
+    facts: &temen_ir::thaw::CodeFacts,
+) -> Result<Seeded, Box<JitThaw>> {
     if !thaw.parts().twins.is_empty() || !thaw.parts().exited_twins.is_empty() {
         return Err(Box::new(thaw));
     }
@@ -2246,7 +2280,7 @@ pub(crate) fn seeded(thaw: JitThaw) -> Result<Seeded, Box<JitThaw>> {
         live_detached,
         twins,
         exited_twins,
-    } = thaw.into_parts();
+    } = thaw.seed(facts, 0)?;
     debug_assert!(twins.is_empty() && exited_twins.is_empty(), "checked above");
     let completed = detached.into_iter().map(|d| {
         let (result, trap) = match d.completed_result {
@@ -2517,7 +2551,13 @@ pub fn compile_and_run_durable(
             prots: run.init_prots,
             tail: Vec::new(),
         });
-        cm.set_durable(run.seed)?;
+        // A `DurableRun` seed is built by its caller, who holds no releaser this entry could call:
+        // only `temen_run` builds relaunch payloads, and it seeds through `set_durable` itself.
+        cm.set_durable(run.seed).map_err(|_| {
+            JitError::Unsupported(
+                "durable JIT thaw: a fork twin the JIT cannot re-create, or a residue not admitted for this module",
+            )
+        })?;
         cm.freeze_ctl = run.freeze;
         let (outcome, win) = cm.run(args, Some(init_mem), Some(SNAP_CAP))?;
         Ok((outcome, win, cm.take_durable_residue()))
@@ -3464,6 +3504,9 @@ pub struct CompiledModule {
     data: Vec<Data>,
     /// #3024 — the next run's seed: a thaw's window and residue, taken whole as the run starts.
     seed: RunSeed,
+    /// #3034 — what the thaw pass needs to know of the code this module was compiled from: a seed is
+    /// admitted against it ([`Self::set_durable`]), never against code a caller names.
+    facts: Arc<temen_ir::thaw::CodeFacts>,
     /// #2427 — the pages a durable run's capture read past its declared window, by byte offset
     /// ([`Self::take_tail_out`]).
     tail_out: Vec<(u64, Vec<u8>)>,
@@ -4146,8 +4189,11 @@ impl CompiledModule {
         // the root's fiber first-resume type-check matches an installed-unit entry (#1226) instead of
         // seeing `NO_MATCH_TYPE_ID` (the root program itself has no such function). Append-only +
         // idempotent, so a fiber-free module never reaches this and function ids are unchanged.
+        // #3034 — one pass over the code for what the thaw pass needs and which runtimes this
+        // instance stands up.
+        let facts = Arc::new(temen_ir::thaw::CodeFacts::of(m));
         #[cfg(fiber_rt)]
-        if module_uses_fibers(m) {
+        if facts.uses_fibers() {
             intern_type(&mut distinct, &fiber_func_type())?;
         }
         let distinct = distinct;
@@ -4157,9 +4203,9 @@ impl CompiledModule {
         // call-trampoline address is filled in after finalize. On targets without stack-switch support,
         // `ensure_supported` has already rejected the fiber ops, so this stays `null`.
         #[cfg(fiber_rt)]
-        let uses_fibers = module_uses_fibers(m);
+        let uses_fibers = facts.uses_fibers();
         #[cfg(fiber_rt)]
-        let uses_threads = module_uses_threads(m);
+        let uses_threads = facts.uses_threads();
         // Per-run fiber constants (the §12 fiber entry type id + the function-table mask), used to build
         // fiber runtimes — one standalone, or one per vCPU when threads use `cont.*`.
         #[cfg(fiber_rt)]
@@ -4212,7 +4258,7 @@ impl CompiledModule {
         // the domain pointer.)
         #[cfg(fiber_rt)]
         let domain: Option<Box<os_thread_rt::Domain>> =
-            if uses_threads || uses_fibers || module_uses_instantiator(m) {
+            if uses_threads || uses_fibers || facts.uses_instantiator() {
                 Some(Box::new(os_thread_rt::Domain::new(node.clone())))
             } else {
                 None
@@ -4229,7 +4275,7 @@ impl CompiledModule {
         // §14 nesting: if the module holds an `Instantiator` (a `call.cap` to iface 6), stand up the
         // per-run `Nursery` those sites spawn through, which they load from the instance's vmctx.
         #[cfg(fiber_rt)]
-        let spawns = module_uses_instantiator(m);
+        let spawns = facts.uses_instantiator();
         #[cfg(fiber_rt)]
         // #1726: also for a module that can **install** §22 units (a reserved `call.dyn` table): an
         // installed unit that instantiates runs in this module's frames, so it needs this nursery
@@ -4681,7 +4727,7 @@ impl CompiledModule {
             hosted: false,
             #[cfg(fiber_rt)]
             run_lane: std::sync::Mutex::new(None),
-            nests: cfg!(fiber_rt) && module_uses_instantiator(m),
+            nests: cfg!(fiber_rt) && facts.uses_instantiator(),
             page: PageEnv::NONE,
             fn_table,
             tramp_code,
@@ -4715,6 +4761,7 @@ impl CompiledModule {
             mem_size_log2: m.memory.map(|mc| mc.size_log2),
             data: m.data.clone(),
             seed: RunSeed::default(),
+            facts,
             tail_out: Vec::new(),
             durable: false,
             shadow,
@@ -4998,6 +5045,7 @@ impl CompiledModule {
             mem_size_log2: self.mem_size_log2,
             data: self.data.clone(),
             seed: RunSeed::default(),
+            facts: Arc::clone(&self.facts),
             tail_out: Vec::new(),
             durable: false,
             shadow: self.shadow,
@@ -5080,12 +5128,13 @@ impl CompiledModule {
     /// caller's, so an embedder like `temen_run::jit_cap_run` needs no second durable entry point.
     /// `seed` is the thaw seed: the residue to re-create before a `REWINDING` run (empty for a freeze
     /// or an ordinary durable run). The freeze residue comes back via [`Self::take_durable_residue`].
-    pub fn set_durable(&mut self, seed: JitThaw) -> Result<(), JitError> {
-        let Ok(Seeded { residue, detached }) = seeded(seed) else {
-            return Err(JitError::Unsupported(
-                "durable JIT thaw: a fork twin the JIT cannot re-create",
-            ));
-        };
+    ///
+    /// #3034 — refused, and handed back whole ([`SeedRefused`]), for a seed this module does not admit
+    /// (it holds a fork twin, or values no run of this module's code at context 0 makes): its relaunch
+    /// payloads hold powerbox refs, which are the caller's to release ([`release_thaw`]).
+    pub fn set_durable(&mut self, seed: JitThaw) -> Result<(), SeedRefused> {
+        let Seeded { residue, detached } =
+            seeded(seed, &self.facts).map_err(|seed| SeedRefused { seed })?;
         self.seed.fibers = residue.fibers;
         self.seed.vcpus = residue.vcpus;
         self.seed.root_sp = residue.root_sp;
@@ -5118,6 +5167,13 @@ impl CompiledModule {
     /// residue with another kind whole, before it takes it.
     pub fn reseeds(&self) -> [bool; 3] {
         [self.fibers, self.threads, self.makes_nursery()]
+    }
+
+    /// #3034 — what the thaw pass knows of this module's code: an embedder takes a residue for it
+    /// admitted against these ([`temen_ir::thaw::validate`]), which is the check [`Self::set_durable`]
+    /// repeats, so the seed that follows the take cannot be refused.
+    pub fn thaw_facts(&self) -> &temen_ir::thaw::CodeFacts {
+        &self.facts
     }
 
     /// The residue the last durable run's freeze produced (empty unless a freeze caught something);
@@ -9089,6 +9145,11 @@ fn compile_child_windowed(
         mem_size_log2: Some(mapped_log2),
         data: Vec::new(), // a child's data segments are materialized into its window by the spawner
         seed: RunSeed::default(),
+        facts: Arc::new(temen_ir::thaw::CodeFacts::of(temen_ir::thaw::Code {
+            funcs,
+            arena: shadow,
+            impl_exports,
+        })),
         tail_out: Vec::new(),
         durable: false,
         frozen: DurableResidue::default(),
@@ -10746,7 +10807,7 @@ fn fiber_func_type() -> FuncType {
 pub fn child_reseeds(m: &IrModule) -> [bool; 3] {
     #[cfg(fiber_rt)]
     {
-        [module_uses_fibers(m), true, module_uses_instantiator(m)]
+        temen_ir::thaw::CodeFacts::of(m).reseeds()
     }
     #[cfg(not(fiber_rt))]
     {
@@ -10755,34 +10816,11 @@ pub fn child_reseeds(m: &IrModule) -> [bool; 3] {
     }
 }
 
-/// Whether `m` contains any fiber op (or a `gc.roots`, which needs the fiber runtime to walk live
-/// stacks), so `run_inner` knows to stand it up. Delegates to temen-ir's per-function predicates — the
-/// single source of truth for the op sets backends must agree on (#913) — instead of re-enumerating.
-#[cfg(fiber_rt)]
-fn module_uses_fibers(m: &IrModule) -> bool {
-    m.funcs.iter().any(|f| f.uses_fibers() || f.uses_gc_roots())
-}
-
-/// Whether `m` contains any thread op (spawn/join/wait/notify), so `run_inner` knows to run under the
-/// thread scheduler. `uses_threads` is spawn/join and `uses_futex` is wait/notify (temen-ir), so their
-/// union is the "thread scheduler needed" set this gate wants.
-#[cfg(fiber_rt)]
-fn module_uses_threads(m: &IrModule) -> bool {
-    m.funcs.iter().any(|f| f.uses_threads() || f.uses_futex())
-}
-
 /// Whether `m` contains any `setjmp`/`longjmp` op, so `run_inner` knows to stand up the per-run
 /// [`setjmp_rt::SetjmpRuntime`] those sites load from the vmctx.
 #[cfg(setjmp_rt)]
 fn module_uses_setjmp(m: &IrModule) -> bool {
     m.funcs.iter().any(|f| f.uses_setjmp())
-}
-
-/// Whether `m` holds a §14 `Instantiator` — a `call.cap` to `cap_id::INSTANTIATOR`
-/// — so `run_inner` knows to stand up the nesting [`instantiator_rt::Nursery`].
-#[cfg(fiber_rt)]
-fn module_uses_instantiator(m: &IrModule) -> bool {
-    funcs_use_instantiator(&m.funcs)
 }
 
 /// A run's §14 nursery, which its `Instantiator` sites spawn and join through: a compile's for the

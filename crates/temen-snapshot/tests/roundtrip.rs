@@ -35,6 +35,29 @@ block 0 (v0: i32) {
 }
 "#;
 
+// A serving module: one impl export (`counter`), whose `bump` op is function 1, `(i64) -> (i64)`.
+// Serve state names its handlers (#3034): a dispatch is to an op it serves, with that op's arguments.
+const SRC_SERVER: &str = r#"
+type 0 func (i64) -> (i64)
+type 1 interface { bump: 0 }
+export 0 interface "counter" 1 { bump: 1 }
+
+func () -> (i64) {
+block 0 () {
+  vz = i32.const 0
+  vn = call.cap 4294967295 9 () -> (i64) vz ()
+  return vn
+  }
+}
+func (i64) -> (i64) {
+block 0 (vx: i64) {
+  vone = i64.const 1
+  vr = i64.add vx vone
+  return vr
+  }
+}
+"#;
+
 // A *different* instrumented module (adds 200), for the identity-gate test.
 const SRC_OTHER: &str = r#"
 func (i32) -> (i64) {
@@ -855,6 +878,7 @@ fn fiber_residue_generation_round_trips_through_the_codec() {
                 fibers: residue,
                 ..Default::default()
             },
+            temen_interp::Serve::default(),
         )
         .expect("a recycled fiber's residue");
     let artifact = freeze(&inst, &snapshot, &shost).expect("freeze");
@@ -1142,29 +1166,26 @@ fn nested_spawn_tree_freeze_serialize_restore_thaw_through_the_codec() {
 fn serve_state_round_trips_through_the_codec() {
     use temen_interp::SvcDispatch;
 
-    let inst = instrument(SRC);
+    let inst = instrument(SRC_SERVER);
     let win = init_durable_window(WINDOW, TEST_ARENA);
 
     let mut host = Host::new();
-    host.set_serve(temen_interp::Serve {
-        queue: vec![
-            SvcDispatch {
-                export: 0,
-                op: 1,
-                args: vec![7, -3],
-                ticket: 5,
-            },
-            SvcDispatch {
-                export: 2,
-                op: 0,
-                args: vec![],
-                ticket: 6,
-            },
-        ],
-        results: vec![(3, Reply::Results(vec![999, -1])), (4, Reply::Failed(-9))],
-        next_ticket: 7,
-        ..Default::default()
-    })
+    let bump = |arg, ticket| SvcDispatch {
+        export: 0,
+        op: 0,
+        args: vec![arg],
+        ticket,
+    };
+    host.admit_thaw(
+        &inst,
+        temen_interp::Residue::default(),
+        temen_interp::Serve {
+            queue: vec![bump(7, 5), bump(-3, 6)],
+            results: vec![(3, Reply::Results(vec![999, -1])), (4, Reply::Failed(-9))],
+            next_ticket: 7,
+            ..Default::default()
+        },
+    )
     .expect("state a run makes");
     let artifact = freeze(&inst, &win, &host).expect("freeze with serve state");
 
@@ -1190,27 +1211,23 @@ fn serve_state_round_trips_through_the_codec() {
 #[test]
 fn a_ticket_counter_no_run_makes_is_refused() {
     use temen_interp::SvcDispatch;
-    let inst = instrument(SRC);
-    let win = init_durable_window(WINDOW, TEST_ARENA);
-    // The rule is `Host::set_serve`'s, which a restore seeds the decoded state through: refused there,
-    // it is refused at restore.
+    let inst = instrument(SRC_SERVER);
+    // The rule is `thaw::validate`'s, which both an embedder's seed and a restore go through: refused
+    // there, it is never frozen, so never restored.
     let refused = |queue: Vec<SvcDispatch>, next: u64| {
-        let mut host = Host::new();
         let serve = temen_interp::Serve {
             queue,
             next_ticket: next,
             ..Default::default()
         };
-        if host.set_serve(serve).is_err() {
-            return true;
-        }
-        let artifact = freeze(&inst, &win, &host).expect("freeze");
-        restore(&artifact, &inst, &mut Host::new()).is_err()
+        Host::new()
+            .admit_thaw(&inst, temen_interp::Residue::default(), serve)
+            .is_err()
     };
     let dispatch = |ticket| SvcDispatch {
         export: 0,
         op: 0,
-        args: vec![],
+        args: vec![1],
         ticket,
     };
     assert!(refused(Vec::new(), u64::MAX), "a counter past TASK_MAX");
@@ -1223,31 +1240,42 @@ fn a_ticket_counter_no_run_makes_is_refused() {
 /// byte-identical.
 ///
 /// #3034 — a frozen handler is a live fiber of the domain's residue replying to a ticket the domain
-/// minted, so one naming no fiber, or a ticket at or past the counter, is refused.
+/// minted, and a wait is in a context of the domain, so a handler naming no fiber, a ticket at or past
+/// the counter, and a wait in a context the domain does not run are refused.
 #[test]
 fn reply_waits_and_frozen_handlers_round_trip_through_the_codec() {
     let inst = instrument(SRC);
     let win = init_durable_window(WINDOW, TEST_ARENA);
     let mut host = Host::new();
-    host.set_serve(temen_interp::Serve {
-        waits: vec![(0, 4), (3, 0)],
-        ..Default::default()
-    })
-    .expect("state a run makes");
-    let artifact = freeze(&inst, &win, &host).expect("freeze with reply waits");
-
+    host.admit_thaw(
+        &inst,
+        temen_interp::Residue::default(),
+        temen_interp::Serve {
+            waits: vec![(0, 4)],
+            ..Default::default()
+        },
+    )
+    .expect("the root's own context");
+    let artifact = freeze(&inst, &win, &host).expect("freeze with a reply wait");
     let mut rhost = Host::new();
     let rwin = restore(&artifact, &inst, &mut rhost).expect("restore");
-    assert_eq!(rhost.reply_waits(), vec![(0, 4), (3, 0)]);
-    assert_eq!(rhost.svc_state(), (Vec::new(), Vec::new(), 0));
+    assert_eq!(rhost.reply_waits(), vec![(0, 4)]);
     let refrozen = freeze(&inst, &rwin, &rhost).expect("re-freeze");
     assert_eq!(
         refrozen, artifact,
         "canonical re-serialize is byte-identical"
     );
+    // A wait in a context the domain does not run: refused at the seed.
+    let ctx3 = temen_interp::Serve {
+        waits: vec![(3, 0)],
+        ..Default::default()
+    };
+    assert!(Host::new()
+        .admit_thaw(&inst, temen_interp::Residue::default(), ctx3)
+        .is_err());
 
     // A handler with no fiber behind it, and its ticket past the counter: neither is one a run makes,
-    // and `Host::set_serve` (which a restore seeds through) refuses each, changing nothing.
+    // and the seed refuses each, changing nothing.
     let mut h = Host::new();
     for handlers in [vec![(1, 9)], vec![(1, 0)]] {
         let forged = temen_interp::Serve {
@@ -1255,7 +1283,9 @@ fn reply_waits_and_frozen_handlers_round_trip_through_the_codec() {
             handlers,
             ..Default::default()
         };
-        assert!(h.set_serve(forged).is_err());
+        assert!(h
+            .admit_thaw(&inst, temen_interp::Residue::default(), forged)
+            .is_err());
     }
     assert!(h.frozen_handlers().is_empty());
 }
@@ -1308,14 +1338,9 @@ fn read_uleb_at(b: &[u8], at: usize) -> (u64, usize) {
     }
 }
 
-/// §13.4 slice 4b + v13 end-to-end: a **serving domain** frozen at its serve point round-trips
-/// through the real artifact. The freeze run reaches `svc.poll` under `UNWINDING` (inert
-/// sentinel — no drain), the artifact's serve section carries the untouched queue, and the
-/// restored domain's re-issued serve op drains it: the handler finally runs against the
-/// restored window and the completion cell fills — identical to the uninterrupted run.
-#[test]
-fn serving_freeze_serialize_restore_thaw_through_the_codec() {
-    const SRC_SERVE: &str = r#"
+/// A serving domain: one `svc.poll`, then `served * 1000 + cell`, its `bump(x)` handler storing `x`
+/// at the cell.
+const SRC_SERVE: &str = r#"
 memory 18
 type 0 func (i64) -> (i64)
 type 1 interface { bump: 0 }
@@ -1343,6 +1368,14 @@ block 0 (vx: i64) {
   }
 }
 "#;
+
+/// §13.4 slice 4b + v13 end-to-end: a **serving domain** frozen at its serve point round-trips
+/// through the real artifact. The freeze run reaches `svc.poll` under `UNWINDING` (inert
+/// sentinel — no drain), the artifact's serve section carries the untouched queue, and the
+/// restored domain's re-issued serve op drains it: the handler finally runs against the
+/// restored window and the completion cell fills — identical to the uninterrupted run.
+#[test]
+fn serving_freeze_serialize_restore_thaw_through_the_codec() {
     let mut m = temen_text::parse_module(SRC_SERVE).expect("parse");
     m.memory = Some(Memory {
         size_log2: SIZE_LOG2,
@@ -2372,6 +2405,7 @@ fn a_completed_detached_child_rides_the_control_section() {
             detached,
             ..Default::default()
         },
+        temen_interp::Serve::default(),
     )
     .expect("a detached residue");
     let artifact = freeze(&inst, &win, &host).expect("a detached residue is freezable");
@@ -2526,4 +2560,298 @@ fn an_unattested_module_grant_still_refuses_the_freeze() {
         freeze(&inst, &win, &host).is_ok(),
         "and the drained domain is snapshottable again"
     );
+}
+
+// ---- #2941: a restore that refuses leaves its host as it found it. ----
+
+/// `art` with `(tag, body)` appended: a section past every one the artifact holds.
+fn with_section(art: &[u8], tag: u64, body: &[u8]) -> Vec<u8> {
+    let mut out = art.to_vec();
+    let mut put = |mut v: u64| loop {
+        let b = (v & 0x7f) as u8;
+        v >>= 7;
+        out.push(if v == 0 { b } else { b | 0x80 });
+        if v == 0 {
+            break;
+        }
+    };
+    put(tag);
+    put(body.len() as u64);
+    out.extend_from_slice(body);
+    out
+}
+
+/// A region backing a test factory makes, which counts itself while it lives.
+struct Counted(std::sync::Mutex<Vec<u8>>);
+static LIVE_BACKINGS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static MADE_BACKINGS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+impl temen_interp::SharedBacking for Counted {
+    fn size(&self) -> u64 {
+        self.0.lock().unwrap().len() as u64
+    }
+    fn read_byte(&self, off: u64) -> u8 {
+        self.0.lock().unwrap()[off as usize]
+    }
+    fn write_byte(&self, off: u64, b: u8) {
+        self.0.lock().unwrap()[off as usize] = b;
+    }
+    fn atomic(&self, _off: u64, _width: u32, _f: &mut dyn FnMut(u64) -> Option<u64>) -> u64 {
+        0
+    }
+}
+
+impl Drop for Counted {
+    fn drop(&mut self) {
+        LIVE_BACKINGS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// The factory: a working backing while `FAIL_FROM` allows, then a refusal.
+static FAIL_FROM: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(usize::MAX);
+
+fn counted_backing(len: usize) -> Result<temen_interp::RegionBacking, i64> {
+    use std::sync::atomic::Ordering::SeqCst;
+    if MADE_BACKINGS.fetch_add(1, SeqCst) >= FAIL_FROM.load(SeqCst) {
+        return Err(-12); // ENOMEM
+    }
+    LIVE_BACKINGS.fetch_add(1, SeqCst);
+    Ok(std::sync::Arc::new(Counted(std::sync::Mutex::new(vec![
+        0;
+        len
+    ]))))
+}
+
+/// **#2941 part 2.** A restore that refuses leaves its host as it found it, whichever step refuses,
+/// and the same host then restores a good artifact and thaws it to the uninterrupted answer.
+///
+/// The artifact is a real freeze (the clock's saved 42 reloads on thaw: 142) whose domain also holds
+/// a named capability, a budget node and two §13 regions. The refusals:
+/// - in `decode`: a malformed late section (Section 13 empty; Section 14 with no badge). On `11ada7d`
+///   restore had already re-granted the named capability, re-minted the budget node and pinned the
+///   handles when it reached it;
+/// - in `grant`, after the registrar and the budget hook have answered: the second region's backing
+///   refused. The first, rebuilt and charged, is dropped, which hands its charge back.
+///
+/// After each, the host's footprint (what a restore writes that a freeze may not read back: host
+/// procs, regions, pipes, budget nodes and its own node's charges, its registrar and hook) equals a
+/// fresh host's, its residue and serve state are empty, and it re-freezes as a fresh host. The retry
+/// on the same host needs the registrar and the hook the refused restore borrowed.
+#[test]
+fn a_refused_restore_leaves_the_host_as_it_found_it() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let inst = instrument(SRC);
+    let prots = |w: &[u8]| vec![temen_snapshot::PageProt::Rw; w.len() / 4096];
+    let freeze_p = |w: &[u8], h: &Host| {
+        temen_snapshot::freeze_with_prots(&inst, w, &prots(w), SIZE_LOG2, h).expect("freeze")
+    };
+    // A real freeze of a domain holding the clock, a named capability, a budget node and two regions.
+    let mut fhost = Host::new();
+    fhost.clock_ns = 42;
+    let clk = fhost.grant_clock();
+    let fs = fhost.grant_host_proc(HostProcGrant::new(
+        ProcHandler::Sync(Box::new(|_op, _args, out, _mem, _| put_results(out, &[0]))),
+        temen_interp::CapState::Stateless,
+    ));
+    fhost.register_cap_name("fs", fs);
+    fhost.grant_budget_channel(7, 1 << 20, 3, -1);
+    fhost.grant_shared_region(4096);
+    fhost.grant_shared_region(4096);
+    let mut win = init_durable_window(WINDOW, TEST_ARENA);
+    write_state(&mut win, TEST_ARENA, STATE_UNWINDING);
+    let mut fuel = 100_000u64;
+    let (frozen, snapshot) = run_capture_reserved_with_host(
+        &inst,
+        0,
+        &[Value::I32(clk)],
+        &mut fuel,
+        &win,
+        SIZE_LOG2,
+        &mut fhost,
+    );
+    assert_eq!(frozen, Ok(vec![Value::I64(0)]), "the freeze's placeholder");
+    let artifact = freeze_p(&snapshot, &fhost);
+
+    // The restoring host: its registrar and budget hook, which count the questions they answer.
+    let asked = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let restoring = || {
+        let mut h = Host::new();
+        h.set_region_factory(counted_backing);
+        let a = std::sync::Arc::clone(&asked);
+        h.set_named_cap_registrar(Box::new(move |_name, _state, _payer| {
+            a.fetch_add(1, SeqCst);
+            Some(temen_interp::NamedCapGrant {
+                grant: HostProcGrant::new(
+                    ProcHandler::Sync(Box::new(|_op, _args, out, _mem, _| put_results(out, &[1]))),
+                    temen_interp::CapState::Stateless,
+                ),
+                process: None,
+            })
+        }));
+        let a = std::sync::Arc::clone(&asked);
+        h.set_budget_thaw_hook(Box::new(move |carried| {
+            a.fetch_add(1, SeqCst);
+            Some(carried)
+        }));
+        h
+    };
+    let fresh = restoring();
+    let fresh_art = freeze_p(&win, &fresh);
+    let thaws = |h: &mut Host| {
+        FAIL_FROM.store(usize::MAX, SeqCst);
+        let mut w = restore(&artifact, &inst, h).expect("the good artifact restores");
+        begin_thaw(&mut w, TEST_ARENA, 0);
+        let clk = h.capture_durable_handles().expect("durable")[0].handle();
+        let mut fuel = 100_000u64;
+        let (r, _) = run_capture_reserved_with_host(
+            &inst,
+            0,
+            &[Value::I32(clk)],
+            &mut fuel,
+            &w,
+            SIZE_LOG2,
+            h,
+        );
+        r
+    };
+    let mut control = restoring();
+    assert_eq!(
+        thaws(&mut control),
+        Ok(vec![Value::I64(142)]),
+        "the control"
+    );
+
+    let refusals: [(&str, Vec<u8>, usize, RestoreError); 3] = [
+        (
+            "an empty child table",
+            with_section(&artifact, 13, &[0]),
+            usize::MAX,
+            RestoreError::Malformed,
+        ),
+        (
+            "an end post with no badge",
+            with_section(&artifact, 14, &[0, 0, 0]),
+            usize::MAX,
+            RestoreError::Malformed,
+        ),
+        (
+            "the second region's backing, after the registrar and the hook",
+            artifact.clone(),
+            1,
+            RestoreError::RegionRefused(-12),
+        ),
+    ];
+    for (what, bent, fail_from, want) in refusals {
+        let mut h = restoring();
+        MADE_BACKINGS.store(0, SeqCst);
+        LIVE_BACKINGS.store(0, SeqCst);
+        FAIL_FROM.store(fail_from, SeqCst);
+        asked.store(0, SeqCst);
+        assert_eq!(restore(&bent, &inst, &mut h).err(), Some(want), "{what}");
+        if fail_from == 1 {
+            assert_eq!(
+                asked.load(SeqCst),
+                2,
+                "{what}: the registrar and the hook answered first"
+            );
+            assert_eq!(
+                MADE_BACKINGS.load(SeqCst),
+                2,
+                "{what}: the second backing was asked for"
+            );
+        }
+        assert_eq!(
+            LIVE_BACKINGS.load(SeqCst),
+            0,
+            "{what}: no backing outlives the refusal"
+        );
+        assert_eq!(h.restore_footprint(), fresh.restore_footprint(), "{what}");
+        assert!(
+            h.residue().is_empty() && h.serve() == temen_interp::Serve::default(),
+            "{what}"
+        );
+        assert_eq!(
+            freeze_p(&win, &h),
+            fresh_art,
+            "{what}: re-freezes as a fresh host"
+        );
+        assert_eq!(
+            thaws(&mut h),
+            Ok(vec![Value::I64(142)]),
+            "{what}: then restores and thaws"
+        );
+    }
+}
+
+/// #3034 — a module with no shadow arena has no thaw residue, but a freeze writes its serve state
+/// whenever its ticket counter moved, and a restore admits it by the same serve rules: the round trip
+/// holds both ways (the codec's re-freeze is byte-identical). At `8e132d7` the pass refused any serve
+/// state for an arena-less module.
+#[test]
+fn an_arena_less_domains_serve_state_round_trips() {
+    let mut m = temen_text::parse_module(SRC_SERVER).expect("parse");
+    m.memory = Some(Memory {
+        size_log2: SIZE_LOG2,
+        shadow: None,
+    });
+    temen_verify::verify_module(&m).expect("verify");
+    let m = std::sync::Arc::new(m);
+    let win = vec![0u8; WINDOW];
+    let mut host = Host::new();
+    host.set_self_module(&m);
+    host.svc_enqueue(0, 0, vec![41]).expect("a dispatch");
+    let artifact = freeze(&m, &win, &host).expect("freeze with serve state");
+    let mut rhost = Host::new();
+    let rwin = restore(&artifact, &m, &mut rhost).expect("restore");
+    assert_eq!(rhost.svc_state(), host.svc_state());
+    assert_eq!(freeze(&m, &rwin, &rhost).expect("re-freeze"), artifact);
+}
+
+/// #3034 — the runtime's enqueue admits a dispatch with any argument count, and the serve loop
+/// answers a wrong one `EINVAL`: a queue a run can freeze with, so a restore admits it, and the thaw
+/// answers its caller as the uninterrupted run does. (At `8e132d7` the pass required the handler's
+/// arity and refused the artifact.)
+#[test]
+fn a_dispatch_with_the_wrong_argument_count_rides_a_freeze_and_is_answered_einval() {
+    let mut m = temen_text::parse_module(SRC_SERVE).expect("parse");
+    m.memory = Some(Memory {
+        size_log2: SIZE_LOG2,
+        shadow: Some(TEST_ARENA),
+    });
+    let inst = std::sync::Arc::new(transform_module_assume_confined(&m).expect("transform"));
+    let host = || {
+        let mut h = Host::new();
+        h.set_durable(true);
+        h.set_self_module(&inst);
+        let t = h
+            .svc_enqueue(0, 0, Vec::new())
+            .expect("enqueue admits any count");
+        (h, t)
+    };
+    let einval = Some(Reply::Failed(-22));
+    let (mut base, t) = host();
+    let mut fuel = 1_000_000u64;
+    let win = init_durable_window(WINDOW, TEST_ARENA);
+    let (want, _) =
+        run_capture_reserved_with_host(&inst, 0, &[], &mut fuel, &win, SIZE_LOG2, &mut base);
+    assert_eq!(base.svc_result(t), einval, "uninterrupted: answered EINVAL");
+
+    let (mut fh, t) = host();
+    let mut win = init_durable_window(WINDOW, TEST_ARENA);
+    write_state(&mut win, TEST_ARENA, STATE_UNWINDING);
+    let mut fuel = 1_000_000u64;
+    let (r, snap) =
+        run_capture_reserved_with_host(&inst, 0, &[], &mut fuel, &win, SIZE_LOG2, &mut fh);
+    assert!(r.is_ok(), "freeze returns a placeholder: {r:?}");
+    let artifact = freeze(&inst, &snap, &fh).expect("freeze artifact");
+    let mut rhost = Host::new();
+    let mut twin = restore(&artifact, &inst, &mut rhost).expect("a queue a run froze with");
+    rhost.set_durable(true);
+    rhost.set_self_module(&inst);
+    begin_thaw(&mut twin, TEST_ARENA, 0);
+    let mut fuel = 1_000_000u64;
+    let (thawed, _) =
+        run_capture_reserved_with_host(&inst, 0, &[], &mut fuel, &twin, SIZE_LOG2, &mut rhost);
+    assert_eq!(thawed, want, "the thaw ends as the uninterrupted run");
+    assert_eq!(rhost.svc_result(t), einval, "thawed: answered EINVAL");
 }

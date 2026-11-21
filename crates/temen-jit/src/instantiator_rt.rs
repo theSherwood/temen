@@ -423,21 +423,7 @@ unsafe fn release_seed(release: crate::GrantChildReleaser, seed: crate::Detached
     if let crate::DetachedSeed::Captured { seed, .. } = seed {
         release(seed.child.ctx);
         release(seed.child.retained_ctx);
-        release_thaw(release, seed.residue);
-    }
-}
-
-/// [`release_seed`] for the live children of a thaw that was not re-created.
-///
-/// # Safety
-/// As [`release_seed`].
-unsafe fn release_thaw(release: crate::GrantChildReleaser, thaw: crate::JitThaw) {
-    for l in thaw.into_parts().live_detached {
-        if let crate::JitDetached::Relaunch(seed) = l.payload {
-            release(seed.child.ctx);
-            release(seed.child.retained_ctx);
-            release_thaw(release, seed.residue);
-        }
+        crate::release_thaw(release, seed.residue);
     }
 }
 
@@ -1384,18 +1370,24 @@ impl Nursery {
             return false;
         }
         let release: crate::GrantChildReleaser = core::mem::transmute(release_addr);
-        // #3034 — its own thaw, as this runtime re-creates it. The embedder declined one holding a
-        // fork twin before seeding the parent ([`crate::seeded`]).
-        let (residue, children) = match crate::seeded(residue) {
+        // #3034 — its own thaw, as this runtime re-creates it, admitted again for the program it
+        // runs. The embedder declined one holding a fork twin before seeding the parent, and admitted
+        // it for this program ([`crate::seeded`]).
+        let facts = temen_ir::thaw::CodeFacts::of(temen_ir::thaw::Code {
+            funcs: &funcs,
+            arena: shadow,
+            impl_exports: &impl_exports,
+        });
+        let (residue, children) = match crate::seeded(residue, &facts) {
             Ok(s) => (s.residue, s.detached),
             Err(thaw) => {
                 debug_assert!(
                     false,
-                    "a detached child's thaw with a fork twin reached the JIT"
+                    "a detached child's thaw with a fork twin, or not admitted for its program, reached the JIT"
                 );
                 release(gc.ctx);
                 release(gc.retained_ctx);
-                release_thaw(release, *thaw);
+                crate::release_thaw(release, *thaw);
                 return false;
             }
         };

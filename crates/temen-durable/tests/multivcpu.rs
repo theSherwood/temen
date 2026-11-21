@@ -152,6 +152,7 @@ fn two_vcpu_domain_freezes_and_thaws() {
                 children,
                 ..Default::default()
             },
+            temen_interp::Serve::default(),
         )
         .expect("a residue a run made");
         let mut fuel = 1_000_000u64;
@@ -309,6 +310,7 @@ fn vcpu_and_fiber_coexist_through_freeze_thaw() {
                 children,
                 ..Default::default()
             },
+            temen_interp::Serve::default(),
         )
         .expect("a residue a run made");
         let mut fuel = 1_000_000u64;
@@ -462,6 +464,7 @@ fn child_owns_fiber_through_freeze_thaw() {
                 children,
                 ..Default::default()
             },
+            temen_interp::Serve::default(),
         )
         .expect("a residue a run made");
         let mut fuel = 1_000_000u64;
@@ -620,6 +623,7 @@ fn nested_spawn_tree_freezes_and_thaws() {
                 children,
                 ..Default::default()
             },
+            temen_interp::Serve::default(),
         )
         .expect("a residue a run made");
         let mut fuel = 1_000_000u64;
@@ -724,6 +728,7 @@ fn a_frozen_threads_entry_is_paid_once() {
                 children,
                 ..Default::default()
             },
+            temen_interp::Serve::default(),
         )
         .expect("a residue a run made");
         let mut fuel = BUDGET;

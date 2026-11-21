@@ -299,12 +299,27 @@ host stores. Every value restore reads is therefore one of:
 4. **opaque guest bytes** — window pages, pipe buffers, region bytes — which reach the guest
    only through the confinement lowering, like any other guest memory.
 
-An engine thaws only an admitted residue: what an engine's thaw seeds is always the pass's result
-type, `Thaw` (the interpreters take it with `Host::take_admitted`, the JIT with `Host::take_thaw` and
-`CompiledModule::set_durable`), and an engine that re-creates less than all of it declines the thaw
-whole to the tree-walker rather than thawing part of it. A residue can sit on a powerbox unsealed (a
-freeze leaves one there, `Host::leave_freeze`), but no engine's thaw reads it until the pass has
-returned it. The checks at each use that predate the pass (#2945) stay only in front of a raw host store
+An engine thaws only a residue admitted for the code it runs (#3034 slice 2). The interpreters take
+it with `Host::take_admitted`, which runs the pass (`temen_ir::thaw::admit`) against their own code
+and root context. The JIT takes it with `Host::take_thaw` against the compiled module's own facts
+(`temen_ir::thaw::CodeFacts`, built when it compiled), and `CompiledModule::set_durable` admits the
+`Thaw` again against those facts (`Thaw::seed`), never against code its caller names: a `Thaw`
+validated for one module, or for another root context, does not seed another. An engine that
+re-creates less than all of it declines the thaw whole to the tree-walker rather than thawing part of
+it. A residue can sit on a powerbox unsealed (a freeze leaves one there, `Host::leave_freeze`, and
+a restore's admitted one is held there until an engine takes it), but no engine's thaw reads it
+until the pass has returned it for that engine. The serve state is admitted beside the residue, by
+the same pass, and a powerbox holds it in its live serve state (`Host::set_thaw`).
+
+**Restore is decode, then grant, then apply (#2941).** `decode` reads every section of the artifact
+and of every artifact nested in it, in the one canonical order (§12.1), and runs every check above,
+the pass and the cut-wide ones included, without writing the restoring host. (A reply wait's
+ticket is not checked against its callee: the wait record does not say which callee it is on.) `grant` asks the restoring embedder:
+its registrar for each domain's named capabilities, its budget hook, and last its region backings,
+the one answer that acts (a region is charged and may be an OS object; one rebuilt before a refusal
+is dropped, which hands its charge back). `apply` then writes what was decoded and granted and
+cannot fail. A restore that refuses leaves the host as it found it. (Open: the image a restore
+allocates is bounded only by the artifact's own reservation, #3100.) The checks at each use that predate the pass (#2945) stay only in front of a raw host store
 or an unchecked index, as a backstop that is loud in debug. Open: whether an artifact may set the
 attestation and the guest-JIT quotas at all, or only narrow what the restoring host grants (#3096).
 
@@ -1414,11 +1429,12 @@ objects into the artifact.
 ### 12.1 Container
 
 A sectioned binary, LEB128 varints, same conventions as `temen-encode`. Sections are
-TLV (`tag: uleb`, `len: uleb`, body) so a restore-side reader can skip unknown tags
-(forward-compatible). **Canonical form is required** — sparse entries ascending by
-index, no redundant entries, fixed varint widths — so "re-serialize after restore at
-the same point is byte-identical" is a plain `==`, which is what the fuzz property
-needs.
+TLV (`tag: uleb`, `len: uleb`, body), in strictly ascending tag order, each at most once:
+an unknown tag (#915), a repeated one or a reordered pair (#2941) is `Malformed`, since
+the version gate already pins the format. **Canonical form is required** — sparse
+entries ascending by index, no redundant entries, fixed varint widths — so "re-serialize
+after restore at the same point is byte-identical" is a plain `==`, which is what the
+fuzz property needs.
 
 ### 12.2 Section 0 — Header
 

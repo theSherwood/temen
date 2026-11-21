@@ -230,6 +230,7 @@ fn a_resume_of_a_parked_fiber_frozen_mid_delivery_continues_with_the_delivered_v
                 fibers: frozen,
                 ..Default::default()
             },
+            temen_interp::Serve::default(),
         )
         .expect("a residue a run made");
     let mut fuel = 100_000u64;
