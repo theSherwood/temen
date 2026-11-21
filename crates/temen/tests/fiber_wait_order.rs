@@ -12,6 +12,9 @@
 //! clock: every wait is timed at 10 s, which no row reaches, and every loop ends on a flag a waiter
 //! sets once it is woken.
 
+#[path = "support/kernel_lane.rs"]
+mod kernel_lane;
+
 use temen_interp::{bytecode, run, Trap, Value};
 use temen_text::parse_module;
 
@@ -39,10 +42,17 @@ fn engines(src: &str) -> [Result<Vec<Value>, Trap>; 3] {
 /// Assert every engine answers `want`, the oracle's answer.
 fn pin(src: &str, want: i64) {
     let [tw, pump, par] = engines(src);
+    let i64_want = want;
     let want = Ok(vec![Value::I64(want)]);
     assert_eq!(tw, want, "the oracle\n{src}");
     assert_eq!(pump, want, "the pump against the oracle\n{src}");
     assert_eq!(par, want, "executor 2 against the oracle\n{src}");
+    // #3078 slice 3 — a native fiber's waiter is an entry of the same index, in the same order.
+    assert_eq!(
+        kernel_lane::i64_on_kernel(src),
+        i64_want,
+        "the kernel route against the oracle\n{src}"
+    );
 }
 
 /// A fiber that waits on `W` once (`waits = 1`) or twice, and returns its last status.

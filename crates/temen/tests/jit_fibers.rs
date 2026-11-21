@@ -13,6 +13,9 @@
     all(windows, target_arch = "x86_64")
 ))]
 
+#[path = "support/kernel_lane.rs"]
+mod kernel_lane;
+
 use temen_interp::{run, Trap, Value};
 use temen_jit::{compile_and_run, JitOutcome, TrapKind};
 use temen_text::parse_module;
@@ -51,58 +54,23 @@ fn assert_jit_matches_interp(src: &str) {
     in_a_thread_on_the_kernel_route(src, &m);
 }
 
-/// #3078 slice 2 — a fiber-only module keeps its single-vCPU path (`fiber only`), so each case whose
-/// entry is `() -> (i64)` also runs inside one `thread.spawn`ed vCPU, which the kernel route admits:
-/// a wrapper entry spawns a thread that calls the case's entry, and joins it. That run, unmetered
-/// (`fiber fuel`, #3080), answers as the oracle's run of it.
+/// #3078 — each case whose entry is `() -> (i64)` also runs on the kernel route, inside one
+/// `thread.spawn`ed vCPU (`support/kernel_lane.rs`), and answers as the oracle's run of that program.
 fn in_a_thread_on_the_kernel_route(src: &str, m: &temen_ir::Module) {
-    use temen_run::jit_kernel;
     let entry = &m.funcs[0];
     if !entry.params.is_empty() || entry.results != [temen_ir::ValType::I64] {
         return;
     }
-    let declined = jit_kernel::admit(m, &temen_interp::Host::new(), false, u64::MAX).err();
-    assert_eq!(declined, Some("fiber only"), "{src}");
-    let n = m.funcs.len();
-    let wrapped = format!(
-        "{src}
-func (i64, i64) -> (i64) {{
-block 0 (va: i64, vb: i64) {{
-  vr = call 0()
-  return vr
-  }}
-}}
-func () -> (i64) {{
-block 0 () {{
-  vz = i64.const 0
-  vt = thread.spawn {n} vz vz
-  vs, vv = thread.join vt
-  return vv
-  }}
-}}
-"
-    );
-    let w = parse_module(&wrapped).unwrap_or_else(|e| panic!("parse: {e:?}\n{wrapped}"));
-    verify_module(&w).unwrap_or_else(|e| panic!("verify: {e:?}\n{wrapped}"));
-    let entry = (n + 1) as u32;
+    let (kernel, w, entry) = kernel_lane::on_kernel(src);
     let mut fuel = 10_000_000u64;
     let interp = run(&w, entry, &[], &mut fuel);
-    let kernel = jit_kernel::expect_kernel(
-        &w,
-        entry,
-        &[],
-        None,
-        u64::MAX,
-        jit_kernel::Expect::Kernel { vcpus: 2 },
-    )
-    .expect("the kernel route admits it");
     match (&interp, &kernel) {
         (Ok(vals), JitOutcome::Returned(slots)) => {
             let want: Vec<i64> = vals.iter().map(to_slot).collect();
-            assert_eq!(&want, slots, "interp vs the kernel route\n{wrapped}");
+            assert_eq!(&want, slots, "interp vs the kernel route\n{src}");
         }
         (Err(t), JitOutcome::Trapped(k)) if trap_matches(t, k) => {}
-        _ => panic!("interp {interp:?} vs the kernel route {kernel:?} disagree\n{wrapped}"),
+        _ => panic!("interp {interp:?} vs the kernel route {kernel:?} disagree\n{src}"),
     }
 }
 
