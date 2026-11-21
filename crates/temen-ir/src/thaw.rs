@@ -277,7 +277,6 @@ impl<D, T> Default for RawResidue<D, T> {
 pub struct Thaw<D, T> {
     residue: RawResidue<D, T>,
     serve: Serve,
-    root_ctx: usize,
     installs: bool,
 }
 
@@ -289,7 +288,6 @@ impl<D, T> Default for Thaw<D, T> {
         Thaw {
             residue: RawResidue::default(),
             serve: Serve::default(),
-            root_ctx: 0,
             installs: false,
         }
     }
@@ -317,13 +315,12 @@ impl<D, T> Thaw<D, T> {
     }
 
     /// The parts, for an engine that seeds `facts`' code with its root in context `root_ctx`: this
-    /// residue admitted again for exactly that code (the same check [`validate`] ran, against the
-    /// engine's own facts), and only for the context it was admitted for. Refused, and handed back
-    /// whole, otherwise, and when it carries serve state: an engine seeds none, since a powerbox
-    /// holds it ([`Thaw::into_held`]).
+    /// residue admitted again for exactly that code and context (the check [`validate`] ran, against
+    /// the engine's own facts and its own root context, the arguments [`admit`] takes). Refused, and
+    /// handed back whole, otherwise, and when it carries serve state: an engine seeds none, since a
+    /// powerbox holds it ([`Thaw::into_held`]).
     pub fn seed(self, facts: &CodeFacts, root_ctx: usize) -> Result<ThawParts<D, T>, Box<Self>> {
-        let ok = self.root_ctx == root_ctx
-            && self.serve.is_empty()
+        let ok = self.serve.is_empty()
             && (self.residue.is_empty()
                 || check(facts, self.installs, root_ctx, &self.residue, &self.serve).is_ok());
         if ok {
@@ -402,7 +399,6 @@ impl<D, T> Thaw<D, T> {
         Thaw {
             residue,
             serve: self.serve,
-            root_ctx: self.root_ctx,
             installs: self.installs,
         }
     }
@@ -495,6 +491,9 @@ pub struct CodeFacts {
     makes: Makes,
     /// Whether the code uses `cont.*` or `gc.roots`: the JIT stands up its fiber runtime for it.
     uses_fibers: bool,
+    /// Whether the code uses a thread op (`thread.spawn`/`join`, `wait`/`notify`): the JIT runs it
+    /// under its thread scheduler.
+    uses_threads: bool,
     /// Per function, whether it is a spawn entry, `(i64, i64) -> (i64)`.
     spawn: Vec<bool>,
     arena: ShadowArena,
@@ -508,6 +507,7 @@ impl Default for CodeFacts {
         CodeFacts {
             makes: Makes::default(),
             uses_fibers: false,
+            uses_threads: false,
             spawn: Vec::new(),
             arena: ShadowArena::EMPTY,
             handlers: Vec::new(),
@@ -520,9 +520,10 @@ impl CodeFacts {
     pub fn of<'a>(code: impl Into<Code<'a>>) -> CodeFacts {
         let code = code.into();
         let mut makes = Makes::default();
-        let mut uses_fibers = false;
+        let (mut uses_fibers, mut uses_threads) = (false, false);
         for f in code.funcs {
             uses_fibers |= f.uses_fibers() || f.uses_gc_roots();
+            uses_threads |= f.uses_threads() || f.uses_futex();
             for i in f.blocks.iter().flat_map(|b| &b.insts) {
                 match i {
                     Inst::ContNew { .. } => makes.fibers = true,
@@ -541,6 +542,7 @@ impl CodeFacts {
         CodeFacts {
             makes,
             uses_fibers,
+            uses_threads,
             spawn: code
                 .funcs
                 .iter()
@@ -571,6 +573,21 @@ impl CodeFacts {
     /// Its shadow arena.
     pub fn arena(&self) -> ShadowArena {
         self.arena
+    }
+
+    /// Whether the code uses `cont.*` or `gc.roots` (the JIT's fiber runtime).
+    pub fn uses_fibers(&self) -> bool {
+        self.uses_fibers
+    }
+
+    /// Whether the code uses a thread op (the JIT's thread scheduler).
+    pub fn uses_threads(&self) -> bool {
+        self.uses_threads
+    }
+
+    /// Whether the code calls an `Instantiator` (it makes detached children; the JIT's nursery).
+    pub fn uses_instantiator(&self) -> bool {
+        self.makes.detached
     }
 }
 
@@ -670,7 +687,6 @@ pub fn validate<'a, D, T>(
     let thaw = Thaw {
         residue: raw,
         serve,
-        root_ctx,
         installs,
     };
     if thaw.is_empty() {

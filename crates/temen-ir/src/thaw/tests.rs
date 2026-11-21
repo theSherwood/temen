@@ -485,9 +485,10 @@ fn serve_state_no_run_makes_is_refused() {
 }
 
 /// #3034 slice 2 — a `Thaw` reaches an engine only through [`Thaw::seed`], which admits it again
-/// for the engine's own code and context.
+/// for the engine's own code and root context: it seeds where a run could have made it, whatever it
+/// was first admitted for.
 #[test]
-fn a_thaw_seeds_only_the_code_and_context_it_was_admitted_for() {
+fn a_thaw_seeds_only_code_and_a_context_a_run_there_could_have_made_it_for() {
     let m = module(Some(A));
     let r = || RawResidue {
         vcpus: vec![real().vcpus[1].clone()],
@@ -514,5 +515,16 @@ fn a_thaw_seeds_only_the_code_and_context_it_was_admitted_for() {
         thaw(0).seed(&CodeFacts::of(&m), 0).is_err(),
         "a module with no `thread.spawn` makes no vCPU"
     );
-    assert!(thaw(0).seed(&facts, 3).is_err(), "another context");
+    assert!(
+        thaw(0).seed(&facts, 3).is_err(),
+        "the root extent lies in context 0, not 3"
+    );
+    // Admitted at context 3 with nothing that names the root's context: a run at 0 makes it too.
+    let fiberless = || RawResidue {
+        children: vec![1],
+        detached: real().detached[..0].to_vec(),
+        ..Raw::default()
+    };
+    let at3 = validate(&threads, false, 3, fiberless(), Serve::default()).expect("admitted");
+    assert!(at3.seed(&facts, 0).is_ok(), "valid where it is seeded");
 }

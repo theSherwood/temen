@@ -1032,8 +1032,8 @@ fn jit_thaw(
 /// **#3034 slice 2 — a thaw is bound to the code it was admitted for.** The JIT admits a seed again
 /// against the facts of the module it compiled, never against code its caller names: a residue
 /// admitted for `FIBER_SRC` (one frozen fiber) cannot seed a module that makes no fiber, and one
-/// admitted for a root in shadow context 3 (a fork twin's) cannot seed a JIT root, which runs in
-/// context 0. On `11ada7d` `set_durable` seeded either.
+/// whose root extent lies in shadow context 3 (a fork twin's root) cannot seed a JIT root, which runs
+/// in context 0. On `11ada7d` `set_durable` seeded either.
 #[test]
 fn a_thaw_admitted_for_one_module_cannot_seed_another() {
     let inst = transform_module(&parse_module(FIBER_SRC).expect("parse")).expect("transform");
@@ -1090,11 +1090,16 @@ fn a_thaw_admitted_for_one_module_cannot_seed_another() {
         ),
         "admitted for `FIBER_SRC`, refused by a module that makes no fiber"
     );
-    let twin = temen_ir::thaw::validate(&inst, false, 3, raw(), Default::default())
+    let arena = temen_ir::thaw::CodeFacts::of(&inst).arena();
+    let twin_root = temen_ir::thaw::RawResidue {
+        root_sp: Some(arena.frame_base(3) + 8),
+        ..raw()
+    };
+    let twin = temen_ir::thaw::validate(&inst, false, 3, twin_root, Default::default())
         .expect("a residue a twin's root, in context 3, could hold");
     assert!(
         matches!(run(&inst, twin), Err(JitError::Unsupported(_))),
-        "admitted for context 3, refused by a root in context 0"
+        "a root extent in context 3, refused by a root in context 0"
     );
     // The embedder's take is the check the seed repeats: refused against another module's facts, it
     // leaves the residue on the host for the tree-walker (INVARIANTS #9).

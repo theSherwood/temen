@@ -4154,8 +4154,11 @@ impl CompiledModule {
         // the root's fiber first-resume type-check matches an installed-unit entry (#1226) instead of
         // seeing `NO_MATCH_TYPE_ID` (the root program itself has no such function). Append-only +
         // idempotent, so a fiber-free module never reaches this and function ids are unchanged.
+        // #3034 — one pass over the code for what the thaw pass needs and which runtimes this
+        // instance stands up.
+        let facts = Arc::new(temen_ir::thaw::CodeFacts::of(m));
         #[cfg(fiber_rt)]
-        if module_uses_fibers(m) {
+        if facts.uses_fibers() {
             intern_type(&mut distinct, &fiber_func_type())?;
         }
         let distinct = distinct;
@@ -4165,9 +4168,9 @@ impl CompiledModule {
         // call-trampoline address is filled in after finalize. On targets without stack-switch support,
         // `ensure_supported` has already rejected the fiber ops, so this stays `null`.
         #[cfg(fiber_rt)]
-        let uses_fibers = module_uses_fibers(m);
+        let uses_fibers = facts.uses_fibers();
         #[cfg(fiber_rt)]
-        let uses_threads = module_uses_threads(m);
+        let uses_threads = facts.uses_threads();
         // Per-run fiber constants (the §12 fiber entry type id + the function-table mask), used to build
         // fiber runtimes — one standalone, or one per vCPU when threads use `cont.*`.
         #[cfg(fiber_rt)]
@@ -4220,7 +4223,7 @@ impl CompiledModule {
         // the domain pointer.)
         #[cfg(fiber_rt)]
         let domain: Option<Box<os_thread_rt::Domain>> =
-            if uses_threads || uses_fibers || module_uses_instantiator(m) {
+            if uses_threads || uses_fibers || facts.uses_instantiator() {
                 Some(Box::new(os_thread_rt::Domain::new(node.clone())))
             } else {
                 None
@@ -4237,7 +4240,7 @@ impl CompiledModule {
         // §14 nesting: if the module holds an `Instantiator` (a `call.cap` to iface 6), stand up the
         // per-run `Nursery` those sites spawn through, which they load from the instance's vmctx.
         #[cfg(fiber_rt)]
-        let spawns = module_uses_instantiator(m);
+        let spawns = facts.uses_instantiator();
         #[cfg(fiber_rt)]
         // #1726: also for a module that can **install** §22 units (a reserved `call.dyn` table): an
         // installed unit that instantiates runs in this module's frames, so it needs this nursery
@@ -4689,7 +4692,7 @@ impl CompiledModule {
             hosted: false,
             #[cfg(fiber_rt)]
             run_lane: std::sync::Mutex::new(None),
-            nests: cfg!(fiber_rt) && module_uses_instantiator(m),
+            nests: cfg!(fiber_rt) && facts.uses_instantiator(),
             page: PageEnv::NONE,
             fn_table,
             tramp_code,
@@ -4723,7 +4726,7 @@ impl CompiledModule {
             mem_size_log2: m.memory.map(|mc| mc.size_log2),
             data: m.data.clone(),
             seed: RunSeed::default(),
-            facts: Arc::new(temen_ir::thaw::CodeFacts::of(m)),
+            facts,
             tail_out: Vec::new(),
             durable: false,
             shadow,
@@ -10777,34 +10780,11 @@ pub fn child_reseeds(m: &IrModule) -> [bool; 3] {
     }
 }
 
-/// Whether `m` contains any fiber op (or a `gc.roots`, which needs the fiber runtime to walk live
-/// stacks), so `run_inner` knows to stand it up. Delegates to temen-ir's per-function predicates — the
-/// single source of truth for the op sets backends must agree on (#913) — instead of re-enumerating.
-#[cfg(fiber_rt)]
-fn module_uses_fibers(m: &IrModule) -> bool {
-    m.funcs.iter().any(|f| f.uses_fibers() || f.uses_gc_roots())
-}
-
-/// Whether `m` contains any thread op (spawn/join/wait/notify), so `run_inner` knows to run under the
-/// thread scheduler. `uses_threads` is spawn/join and `uses_futex` is wait/notify (temen-ir), so their
-/// union is the "thread scheduler needed" set this gate wants.
-#[cfg(fiber_rt)]
-fn module_uses_threads(m: &IrModule) -> bool {
-    m.funcs.iter().any(|f| f.uses_threads() || f.uses_futex())
-}
-
 /// Whether `m` contains any `setjmp`/`longjmp` op, so `run_inner` knows to stand up the per-run
 /// [`setjmp_rt::SetjmpRuntime`] those sites load from the vmctx.
 #[cfg(setjmp_rt)]
 fn module_uses_setjmp(m: &IrModule) -> bool {
     m.funcs.iter().any(|f| f.uses_setjmp())
-}
-
-/// Whether `m` holds a §14 `Instantiator` — a `call.cap` to `cap_id::INSTANTIATOR`
-/// — so `run_inner` knows to stand up the nesting [`instantiator_rt::Nursery`].
-#[cfg(fiber_rt)]
-fn module_uses_instantiator(m: &IrModule) -> bool {
-    funcs_use_instantiator(&m.funcs)
 }
 
 /// A run's §14 nursery, which its `Instantiator` sites spawn and join through: a compile's for the
