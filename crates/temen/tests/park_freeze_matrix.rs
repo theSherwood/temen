@@ -1125,6 +1125,117 @@ block 0 (vx: i64) {
         "{site:?}: the thaw waits on the same ticket, and C serves it once"
     );
     assert!(th.reply_waits().is_empty(), "{site:?}: the wait was taken");
+
+    // #3034 D5 — the wait's ticket is one its callee, in the cut, owes. A ticket C does not owe is a
+    // wait no run makes: refused at restore (on `11ada7d` it restored, and the thaw waited on a reply
+    // that never comes).
+    let forged = with_wait_ticket(&art, |t| t + 1000);
+    let mut fh = durable_host(&inst);
+    fh.grant_durable_module(&c);
+    assert_eq!(
+        temen_snapshot::restore(&forged, &inst, &mut fh).err(),
+        Some(temen_snapshot::RestoreError::Malformed),
+        "{site:?}: a ticket its callee does not owe"
+    );
+    // A callee the cut does not carry is the cut's boundary: the wait is admitted, and the thaw
+    // answers. Here C rides under another task than the one the caller's `LiveImpl` names, so no
+    // child of the cut is its callee, as for a callee outside it: the `LiveImpl` stays unlinked, and
+    // the run ends `CapFault` (the oracle; the JIT and the bytecode engine thaw no reply wait yet,
+    // [`jit_row`], #1904).
+    let mut edit = temen_snapshot::decode_residue(&art).expect("decode");
+    edit.live_detached[0].task += 100;
+    let outside = temen_snapshot::encode_residue(&art, &edit).expect("encode");
+    let mut oh = durable_host(&inst);
+    oh.grant_durable_module(&c);
+    let mut owin =
+        temen_snapshot::restore(&outside, &inst, &mut oh).expect("the cut's boundary restores");
+    begin_thaw(&mut owin, TEST_ARENA, 0);
+    let (res, _, _) = run(engine, &inst, &args, &owin, oh);
+    assert_eq!(
+        res,
+        Err("CapFault".into()),
+        "{site:?}: a wait on a callee outside the cut answers, never hangs"
+    );
+}
+
+/// `art` with each reply wait its root's serve section (Section 4) carries re-ticketed by `f`.
+fn with_wait_ticket(art: &[u8], f: impl Fn(u64) -> u64) -> Vec<u8> {
+    fn uleb(b: &[u8], at: &mut usize) -> u64 {
+        let (mut v, mut shift) = (0u64, 0);
+        loop {
+            let byte = b[*at];
+            *at += 1;
+            v |= u64::from(byte & 0x7f) << shift;
+            if byte & 0x80 == 0 {
+                return v;
+            }
+            shift += 7;
+        }
+    }
+    fn put(out: &mut Vec<u8>, mut v: u64) {
+        loop {
+            let b = (v & 0x7f) as u8;
+            v >>= 7;
+            out.push(if v == 0 { b } else { b | 0x80 });
+            if v == 0 {
+                return;
+            }
+        }
+    }
+    let (hdr, payload) = temen_encode::wire::read_header(art).expect("a header");
+    let mut out = Vec::new();
+    temen_encode::wire::write_header(&mut out, hdr.kind, hdr.version, hdr.flags);
+    let mut at = 0;
+    while at < payload.len() {
+        let tag = uleb(payload, &mut at);
+        let len = uleb(payload, &mut at) as usize;
+        let body = &payload[at..at + len];
+        at += len;
+        let mut nb = Vec::new();
+        if tag == 4 {
+            // The trio: the queue, the settled replies, the counter; then the waits, re-ticketed.
+            let mut r = 0;
+            let start = r;
+            for _ in 0..uleb(body, &mut r) {
+                uleb(body, &mut r);
+                uleb(body, &mut r);
+                for _ in 0..uleb(body, &mut r) {
+                    uleb(body, &mut r);
+                }
+                uleb(body, &mut r);
+            }
+            for _ in 0..uleb(body, &mut r) {
+                uleb(body, &mut r);
+                match uleb(body, &mut r) {
+                    0 => {
+                        for _ in 0..uleb(body, &mut r) {
+                            uleb(body, &mut r);
+                        }
+                    }
+                    _ => {
+                        uleb(body, &mut r);
+                    }
+                }
+            }
+            uleb(body, &mut r);
+            nb.extend_from_slice(&body[start..r]);
+            let n = uleb(body, &mut r);
+            put(&mut nb, n);
+            for _ in 0..n {
+                let ctx = uleb(body, &mut r);
+                let t = uleb(body, &mut r);
+                put(&mut nb, ctx);
+                put(&mut nb, f(t));
+            }
+            nb.extend_from_slice(&body[r..]);
+        } else {
+            nb.extend_from_slice(body);
+        }
+        put(&mut out, tag);
+        put(&mut out, nb.len() as u64);
+        out.extend_from_slice(&nb);
+    }
+    out
 }
 
 /// #1677 — a **fiber** parked at a re-issue site freezes as a vCPU parked there does: the freeze

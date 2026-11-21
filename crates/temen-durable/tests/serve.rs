@@ -114,16 +114,26 @@ fn a_mid_handler_freeze_thaws_and_the_handler_replies() {
         "the handler's ticket rides"
     );
 
-    // Thaw: the serve loop adopts the handler, which rewinds, finishes and replies.
+    // Thaw: the serve loop adopts the handler, which rewinds, finishes and replies. The residue and
+    // the serve state the freeze left are seeded together: the handler names a fiber of the residue.
     let fibers = h.frozen_fibers().to_vec();
+    let (queue, results, next_ticket) = h.svc_state();
+    let serve = temen_interp::Serve {
+        queue,
+        results,
+        next_ticket,
+        waits: h.reply_waits(),
+        handlers: h.frozen_handlers(),
+    };
     h.admit_thaw(
         &inst,
         temen_interp::Residue {
             fibers,
             ..Default::default()
         },
+        serve,
     )
-    .expect("a residue a run made");
+    .expect("a residue and serve state a run made");
     let mut twin = snap;
     begin_thaw(&mut twin, TEST_ARENA, 0);
     let mut fuel = 1_000_000u64;
@@ -235,21 +245,20 @@ fn a_domain_frozen_at_its_serve_point_thaws_and_drains_the_restored_queue() {
     h2.set_durable(true);
     h2.set_self_module(&inst);
     let (q, res, next) = trio;
-    h2.set_serve(temen_interp::Serve {
-        queue: q,
-        results: res,
-        next_ticket: next,
-        ..Default::default()
-    })
-    .expect("a run's serve state");
     h2.admit_thaw(
         &inst,
         temen_interp::Residue {
             root_sp: Some(root_sp),
             ..Default::default()
         },
+        temen_interp::Serve {
+            queue: q,
+            results: res,
+            next_ticket: next,
+            ..Default::default()
+        },
     )
-    .expect("a residue a run made");
+    .expect("a residue and serve state a run made");
     let r_thaw = {
         let mut win = snap.clone();
         begin_thaw(&mut win, TEST_ARENA, 0);
@@ -346,12 +355,16 @@ fn an_idle_server_freezes_on_quiesce_and_thaws_still_serving() {
     h2.set_durable(true);
     h2.set_self_module(&inst);
     let (q, res, next) = trio;
-    h2.set_serve(temen_interp::Serve {
-        queue: q,
-        results: res,
-        next_ticket: next,
-        ..Default::default()
-    })
+    h2.admit_thaw(
+        &inst,
+        temen_interp::Residue::default(),
+        temen_interp::Serve {
+            queue: q,
+            results: res,
+            next_ticket: next,
+            ..Default::default()
+        },
+    )
     .expect("a run's serve state");
     let ticket = h2
         .svc_enqueue(0, 0, vec![41])

@@ -28,7 +28,8 @@ use temen_interp::{
     Value,
 };
 use temen_jit::{
-    compile_and_run_durable, DurableResidue, DurableRun, FrozenFiber as JitFrozen, JitOutcome,
+    compile_and_run_durable, DurableResidue, DurableRun, FrozenFiber as JitFrozen, JitError,
+    JitOutcome,
 };
 use temen_snapshot::{freeze, restore};
 use temen_text::parse_module;
@@ -309,6 +310,7 @@ fn jit_and_interp_freeze_a_fiber_to_an_identical_artifact() {
                 fibers: residue.to_vec(),
                 ..Default::default()
             },
+            temen_interp::Serve::default(),
         )
         .expect("a residue a run made");
     let artifact_j = freeze(&inst, &jsnap, &jhost2).expect("JIT artifact");
@@ -1024,5 +1026,88 @@ fn jit_thaw(
     m: &temen_ir::Module,
     raw: temen_ir::thaw::RawResidue<temen_jit::JitDetached, ()>,
 ) -> temen_jit::JitThaw {
-    temen_ir::thaw::validate(m, false, 0, raw).expect("a residue a run made")
+    temen_ir::thaw::validate(m, false, 0, raw, Default::default()).expect("a residue a run made")
+}
+
+/// **#3034 slice 2 — a thaw is bound to the code it was admitted for.** The JIT admits a seed again
+/// against the facts of the module it compiled, never against code its caller names: a residue
+/// admitted for `FIBER_SRC` (one frozen fiber) cannot seed a module that makes no fiber, and one
+/// whose root extent lies in shadow context 3 (a fork twin's root) cannot seed a JIT root, which runs
+/// in context 0. On `11ada7d` `set_durable` seeded either.
+#[test]
+fn a_thaw_admitted_for_one_module_cannot_seed_another() {
+    let inst = transform_module(&parse_module(FIBER_SRC).expect("parse")).expect("transform");
+    let other = transform_module(
+        &parse_module(
+            "memory 17 shadow 16448 65536\nfunc () -> (i64) {\nblock 0 () {\n  v0 = i64.const 1\n  return v0\n  }\n}\n",
+        )
+        .expect("parse"),
+    )
+    .expect("transform");
+    verify_module(&other).expect("verify");
+    // A real freeze's fiber, through the codec.
+    let mut ihost = Host::new();
+    ihost.set_durable(true);
+    let mut iwin = init_durable_window(WINDOW, TEST_ARENA);
+    write_state(&mut iwin, TEST_ARENA, STATE_UNWINDING);
+    let mut ifuel = 1_000_000u64;
+    let (ires, isnap) =
+        run_capture_reserved_with_host(&inst, 0, &[], &mut ifuel, &iwin, WINDOW_LOG2, &mut ihost);
+    assert!(ires.is_ok());
+    let artifact = freeze(&inst, &isnap, &ihost).expect("freeze");
+    let mut thost = Host::new();
+    let mut thaw_win = restore(&artifact, &inst, &mut thost).expect("restore");
+    begin_thaw(&mut thaw_win, TEST_ARENA, 0);
+    let raw = || temen_ir::thaw::RawResidue {
+        fibers: jit_seed(thost.frozen_fibers()),
+        ..Default::default()
+    };
+    let run = |m: &temen_ir::Module, seed| {
+        let mut jhost = Host::new();
+        compile_and_run_durable(
+            m,
+            0,
+            &[],
+            &thaw_win,
+            WINDOW_LOG2,
+            temen_run::cap_thunk,
+            &mut jhost as *mut Host as *mut c_void,
+            DurableRun {
+                seed,
+                ..Default::default()
+            },
+        )
+        .map(|(o, ..)| o)
+    };
+    assert!(
+        matches!(run(&inst, jit_thaw(&inst, raw())), Ok(JitOutcome::Returned(ref s)) if s == &[107]),
+        "the control: admitted for the module it seeds"
+    );
+    assert!(
+        matches!(
+            run(&other, jit_thaw(&inst, raw())),
+            Err(JitError::Unsupported(_))
+        ),
+        "admitted for `FIBER_SRC`, refused by a module that makes no fiber"
+    );
+    let arena = temen_ir::thaw::CodeFacts::of(&inst).arena();
+    let twin_root = temen_ir::thaw::RawResidue {
+        root_sp: Some(arena.frame_base(3) + 8),
+        ..raw()
+    };
+    let twin = temen_ir::thaw::validate(&inst, false, 3, twin_root, Default::default())
+        .expect("a residue a twin's root, in context 3, could hold");
+    assert!(
+        matches!(run(&inst, twin), Err(JitError::Unsupported(_))),
+        "a root extent in context 3, refused by a root in context 0"
+    );
+    // The embedder's take is the check the seed repeats: refused against another module's facts, it
+    // leaves the residue on the host for the tree-walker (INVARIANTS #9).
+    let facts = temen_ir::thaw::CodeFacts::of(&other);
+    assert!(thost.take_thaw(&facts).is_err());
+    assert_eq!(
+        thost.frozen_fibers().len(),
+        1,
+        "the residue is where it was"
+    );
 }

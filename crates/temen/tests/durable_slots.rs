@@ -535,6 +535,7 @@ fn run(
                 children: r.children.clone(),
                 ..Default::default()
             },
+            temen_interp::Serve::default(),
         )
         .expect("a residue a run made");
     }
@@ -601,6 +602,7 @@ mod jit {
                     children: r.children.clone(),
                     ..Default::default()
                 },
+                Default::default(),
             )
             .expect("a residue a run made"),
             None => temen_jit::JitThaw::default(),

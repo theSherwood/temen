@@ -5,9 +5,11 @@
 //! residue crosses into an engine's thaw only as a [`Thaw`], which only [`validate`] builds: every value
 //! in it is one a run of the module could have made. A freeze's own residue is engine state, which
 //! rides unsealed until a thaw admits it; the one value in it a guest writes, each extent, the freeze
-//! checks where it reads it ([`extent_fits`]). An engine takes it apart with [`Thaw::into_parts`] and
-//! destructures the [`ThawParts`] whole, so a residue field no engine consumes cannot be dropped
-//! silently: it does not compile until each engine consumes it or declines the thaw.
+//! checks where it reads it ([`extent_fits`]). An engine gets the parts only by admitting it for the
+//! code it runs ([`admit`], [`Thaw::seed`], against [`CodeFacts`]), so a `Thaw` validated for one
+//! module cannot seed another, and destructures the [`ThawParts`] whole, so a residue field no engine
+//! consumes cannot be dropped silently: it does not compile until each engine consumes it or declines
+//! the thaw. A domain's serve state ([`Serve`]) is admitted beside its residue by the same pass.
 //!
 //! The records are the ones a freeze writes ([`FrozenFiber`], [`FrozenVCpu`], …), one definition for
 //! every engine (INVARIANTS #13/#15). A live detached child or fork twin is a domain of its own, with a
@@ -15,10 +17,11 @@
 //! pass reads only the keys beside it. Its own residue is admitted by the same pass, at its own depth,
 //! against its own module, when the codec restores its nested artifact.
 
+use alloc::boxed::Box;
 use alloc::vec::Vec;
 
 use crate::durable_abi::{ShadowArena, ShadowContexts, MAX_SHADOW_CONTEXTS};
-use crate::{cap_id, handles, trap_code, Func, Inst, Module, ValType};
+use crate::{cap_id, handles, trap_code, Func, ImplExport, Inst, Module, ValType};
 
 /// The largest task id, pid or ticket a thaw accepts: room for every `+ 1` a run makes after it.
 pub const TASK_MAX: u64 = i64::MAX as u64;
@@ -154,6 +157,71 @@ pub struct LiveTwin<T> {
     pub payload: T,
 }
 
+/// §3.6 slice 2 — one queued inbound dispatch (the serve-loop core): a call targeting this
+/// domain's impl-export `export`, op `op`, args in the i64-slot ABI, completion posted under
+/// `ticket`. Admitted as a handler over the domain's **one world** at a `svc.poll` service
+/// point — run-to-completion this slice (handler parking rides the fiber-admission slice),
+/// which is exactly the passive instance's serialized observable behavior (the oracle).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SvcDispatch {
+    pub export: u32,
+    pub op: u32,
+    pub args: Vec<i64>,
+    pub ticket: u64,
+}
+
+/// INVARIANTS #8 — what a call through a live offer (a call queued into another running domain)
+/// answers: the handler's results, or a failure of the transport. The caller lays it out by its
+/// own call's signature.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Reply {
+    /// The handler returned: its results as slots, any handle among them still the callee's.
+    Results(Vec<i64>),
+    /// The transport failed — a full queue, a refused dispatch, a callee that ended unserved: a
+    /// negative errno.
+    Failed(i64),
+}
+
+impl Reply {
+    /// The reply as one status, for a call whose op answers one integer (a pager's `page`): its first
+    /// result, or the failure's errno.
+    pub fn status(&self) -> i64 {
+        match self {
+            Reply::Results(r) => r.first().copied().unwrap_or(0),
+            Reply::Failed(errno) => *errno,
+        }
+    }
+}
+
+/// #3034 — a domain's serve state as a snapshot carries it (DURABILITY.md §13.4, #1676, #1901): the
+/// dispatches queued and the replies settled, the ticket counter, the abandoned reply waits
+/// `(context, ticket)`, and the frozen handlers `(fiber slot, ticket)`. Admitted beside the residue
+/// ([`validate`]), whose fibers its handlers name; a powerbox holds it in its live serve state, not
+/// beside the residue at rest.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Serve {
+    pub queue: Vec<SvcDispatch>,
+    pub results: Vec<(u64, Reply)>,
+    pub next_ticket: u64,
+    pub waits: Vec<(u32, u64)>,
+    pub handlers: Vec<(u32, u64)>,
+}
+
+impl Serve {
+    /// Whether it carries nothing: a domain that serves nothing, or a fresh one.
+    pub fn is_empty(&self) -> bool {
+        *self == Serve::default()
+    }
+
+    /// #3034 D5 — whether `ticket` is one this domain owes a reply to: queued, in a frozen handler,
+    /// or settled and not yet claimed. A caller's wait on this domain names one of these.
+    pub fn owes(&self, ticket: u64) -> bool {
+        self.queue.iter().any(|d| d.ticket == ticket)
+            || self.handlers.iter().any(|h| h.1 == ticket)
+            || self.results.iter().any(|r| r.0 == ticket)
+    }
+}
+
 /// A domain's thaw residue as the codec decodes it, **not yet admitted**: no engine takes one. Hand it
 /// to [`validate`].
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -200,17 +268,28 @@ impl<D, T> Default for RawResidue<D, T> {
     }
 }
 
-/// An admitted thaw residue: every value in it is one a run of the module it was validated against
-/// could have made. Only [`validate`] builds a non-empty one.
+/// An admitted thaw residue, and the serve state beside it: every value in them is one a run of the
+/// code it was validated against could have made. Only [`validate`] builds a non-empty one. It keeps
+/// the root context it was admitted for, and whether the domain installs code ([`CodeFacts`]'s
+/// `installs`), so it reaches an engine only through [`Thaw::seed`], which admits it again for that
+/// engine's own code: a `Thaw` validated for one module cannot seed another (#3034 slice 2).
 #[derive(Debug)]
-pub struct Thaw<D, T>(RawResidue<D, T>);
+pub struct Thaw<D, T> {
+    residue: RawResidue<D, T>,
+    serve: Serve,
+    installs: bool,
+}
 
 /// A [`Thaw`] taken apart, for the engine that consumes it. Destructure it whole.
 pub type ThawParts<D, T> = RawResidue<D, T>;
 
 impl<D, T> Default for Thaw<D, T> {
     fn default() -> Self {
-        Thaw(RawResidue::default())
+        Thaw {
+            residue: RawResidue::default(),
+            serve: Serve::default(),
+            installs: false,
+        }
     }
 }
 
@@ -222,17 +301,39 @@ impl<D, T> Thaw<D, T> {
 
     /// Whether it carries nothing.
     pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        self.residue.is_empty() && self.serve.is_empty()
     }
 
-    /// Read it.
+    /// Read the residue.
     pub fn parts(&self) -> &ThawParts<D, T> {
-        &self.0
+        &self.residue
     }
 
-    /// Take it apart, to consume it.
-    pub fn into_parts(self) -> ThawParts<D, T> {
-        self.0
+    /// Read the serve state.
+    pub fn serve(&self) -> &Serve {
+        &self.serve
+    }
+
+    /// The parts, for an engine that seeds `facts`' code with its root in context `root_ctx`: this
+    /// residue admitted again for exactly that code and context (the check [`validate`] ran, against
+    /// the engine's own facts and its own root context, the arguments [`admit`] takes). Refused, and
+    /// handed back whole, otherwise, and when it carries serve state: an engine seeds none, since a
+    /// powerbox holds it ([`Thaw::into_held`]).
+    pub fn seed(self, facts: &CodeFacts, root_ctx: usize) -> Result<ThawParts<D, T>, Box<Self>> {
+        let ok = self.serve.is_empty()
+            && (self.residue.is_empty()
+                || check(facts, self.installs, root_ctx, &self.residue, &self.serve).is_ok());
+        if ok {
+            Ok(self.residue)
+        } else {
+            Err(Box::new(self))
+        }
+    }
+
+    /// The residue and the serve state, for a powerbox to hold: the serve state in its live serve
+    /// state, the residue at rest until an engine's thaw admits it again ([`admit`]).
+    pub fn into_held(self) -> (RawResidue<D, T>, Serve) {
+        (self.residue, self.serve)
     }
 
     /// #3099 — the residue as a live detached child's own root sees it: the JIT runs the child as the
@@ -241,7 +342,7 @@ impl<D, T> Thaw<D, T> {
     /// every vCPU's task, so the residue stays one the pass admits.
     pub fn rerooted(mut self, task: u64) -> Self {
         if task != 0 {
-            for v in &mut self.0.vcpus {
+            for v in &mut self.residue.vcpus {
                 if v.parent_task as u64 == task {
                     v.parent_task = 0;
                 }
@@ -257,8 +358,8 @@ impl<D, T> Thaw<D, T> {
         mut detached: impl FnMut(LiveDetached<D>) -> D2,
         mut twin: impl FnMut(LiveTwin<T>) -> T2,
     ) -> Thaw<D2, T2> {
-        let r = self.0;
-        Thaw(RawResidue {
+        let r = self.residue;
+        let residue = RawResidue {
             fibers: r.fibers,
             vcpus: r.vcpus,
             root_sp: r.root_sp,
@@ -294,7 +395,12 @@ impl<D, T> Thaw<D, T> {
                 })
                 .collect(),
             exited_twins: r.exited_twins,
-        })
+        };
+        Thaw {
+            residue,
+            serve: self.serve,
+            installs: self.installs,
+        }
     }
 }
 
@@ -343,7 +449,7 @@ pub struct Malformed;
 /// A residue [`validate`] refused, handed back whole: a caller that declines the thaw leaves it where
 /// it found it.
 pub struct Refused<D, T> {
-    pub residue: alloc::boxed::Box<RawResidue<D, T>>,
+    pub residue: Box<RawResidue<D, T>>,
 }
 
 impl<D, T> core::fmt::Debug for Refused<D, T> {
@@ -358,69 +464,131 @@ impl<D, T> From<Refused<D, T>> for Malformed {
     }
 }
 
-/// The record kinds the code of a domain of `m` can make (#3034): a fiber needs a `cont.new` or a serve
-/// op (`svc.poll`/`svc.wait`, whose handlers are fibers), a vCPU
-/// a `thread.spawn`, and a detached child an `Instantiator` call. `installs` says the domain holds a
-/// `Jit` grant: code installed through it runs in the domain's frames and may make any of them
-/// (DESIGN.md §22). An engine that stood up no runtime for a kind its residue holds declines the thaw
-/// whole (`temen_run`'s JIT hosts an installed unit's fibers and threads only under the grant's
-/// hosting, #3104).
+/// The record kinds the code of a domain can make (#3034): a fiber needs a `cont.new` or a serve op
+/// (`svc.poll`/`svc.wait`, whose handlers are fibers), a vCPU a `thread.spawn`, and a detached child an
+/// `Instantiator` call. A domain that holds a `Jit` grant (`installs`) runs installed code in its
+/// frames, which may make any of them (DESIGN.md §22). An engine that stood up no runtime for a kind
+/// its residue holds declines the thaw whole (`temen_run`'s JIT hosts an installed unit's fibers and
+/// threads only under the grant's hosting, #3104).
 ///
 /// `installs` is read from the restored domain, whose `Jit` domains come from the artifact's
 /// Section 5 whether or not the restoring host grants one: a forged Section 5 turns this rule off for
 /// every kind. Tying it to the re-granted grant is #3096 A1.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct Makes {
     fibers: bool,
     vcpus: bool,
     detached: bool,
 }
 
-impl Makes {
-    /// Which of the kinds `r` holds the code can make. Only those are looked for, in one pass that
-    /// stops once each is found, and an empty residue costs nothing.
-    fn of<D, T>(code: Code<'_>, installs: bool, r: &RawResidue<D, T>) -> Makes {
-        let want = Makes {
-            fibers: !r.fibers.is_empty(),
-            vcpus: !r.vcpus.is_empty(),
-            detached: !(r.detached.is_empty() && r.live_detached.is_empty()),
-        };
-        if installs || want == Makes::NONE {
-            return want;
+/// #3034 — what [`validate`] needs to know about the code a residue is admitted against, owned: which
+/// record kinds it makes, which of its functions `thread.spawn` can name, how many it has, its shadow
+/// arena, and each impl export's handlers' arities. Built once from the code ([`CodeFacts::of`]), so
+/// an engine that keeps no IR (the JIT's compiled module) answers the check from what it was compiled
+/// from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CodeFacts {
+    makes: Makes,
+    /// Whether the code uses `cont.*` or `gc.roots`: the JIT stands up its fiber runtime for it.
+    uses_fibers: bool,
+    /// Whether the code uses a thread op (`thread.spawn`/`join`, `wait`/`notify`): the JIT runs it
+    /// under its thread scheduler.
+    uses_threads: bool,
+    /// Per function, whether it is a spawn entry, `(i64, i64) -> (i64)`.
+    spawn: Vec<bool>,
+    arena: ShadowArena,
+    /// Per impl export, per op: its handler's parameter count, `None` for a function out of range.
+    handlers: Vec<Vec<Option<usize>>>,
+}
+
+impl Default for CodeFacts {
+    /// The facts of no code: it makes nothing and has no arena.
+    fn default() -> Self {
+        CodeFacts {
+            makes: Makes::default(),
+            uses_fibers: false,
+            uses_threads: false,
+            spawn: Vec::new(),
+            arena: ShadowArena::EMPTY,
+            handlers: Vec::new(),
         }
-        let mut got = Makes::NONE;
-        for i in code
-            .funcs
-            .iter()
-            .flat_map(|f| &f.blocks)
-            .flat_map(|b| &b.insts)
-        {
-            match i {
-                Inst::ContNew { .. } => got.fibers = true,
-                // A serve op runs each dispatch as a handler fiber of the serving task (#2742); a
-                // durable domain reaches one only by a direct `call.cap` (an import never binds to one).
-                Inst::CapCall(c) if crate::durable_abi::is_serve_op(c.type_id, c.op) => {
-                    got.fibers = true
+    }
+}
+
+impl CodeFacts {
+    /// The facts of `code`, in one pass over it.
+    pub fn of<'a>(code: impl Into<Code<'a>>) -> CodeFacts {
+        let code = code.into();
+        let mut makes = Makes::default();
+        let (mut uses_fibers, mut uses_threads) = (false, false);
+        for f in code.funcs {
+            uses_fibers |= f.uses_fibers() || f.uses_gc_roots();
+            uses_threads |= f.uses_threads() || f.uses_futex();
+            for i in f.blocks.iter().flat_map(|b| &b.insts) {
+                match i {
+                    Inst::ContNew { .. } => makes.fibers = true,
+                    // A serve op runs each dispatch as a handler fiber of the serving task (#2742); a
+                    // durable domain reaches one only by a direct `call.cap` (an import never binds
+                    // to one).
+                    Inst::CapCall(c) if crate::durable_abi::is_serve_op(c.type_id, c.op) => {
+                        makes.fibers = true
+                    }
+                    Inst::ThreadSpawn { .. } => makes.vcpus = true,
+                    Inst::CapCall(c) if c.type_id == cap_id::INSTANTIATOR => makes.detached = true,
+                    _ => {}
                 }
-                Inst::ThreadSpawn { .. } => got.vcpus = true,
-                Inst::CapCall(c) if c.type_id == cap_id::INSTANTIATOR => got.detached = true,
-                _ => continue,
-            }
-            if (got.fibers || !want.fibers)
-                && (got.vcpus || !want.vcpus)
-                && (got.detached || !want.detached)
-            {
-                break;
             }
         }
-        got
+        CodeFacts {
+            makes,
+            uses_fibers,
+            uses_threads,
+            spawn: code
+                .funcs
+                .iter()
+                .map(|f| f.params == [ValType::I64, ValType::I64] && f.results == [ValType::I64])
+                .collect(),
+            arena: code.arena,
+            handlers: code
+                .impl_exports
+                .iter()
+                .map(|e| {
+                    e.ops
+                        .iter()
+                        .map(|&f| code.funcs.get(f as usize).map(|f| f.params.len()))
+                        .collect()
+                })
+                .collect(),
+        }
     }
 
-    const NONE: Makes = Makes {
-        fibers: false,
-        vcpus: false,
-        detached: false,
-    };
+    /// The record kinds `[fibers, vcpus, detached]` a JIT instance of this code stands up a runtime
+    /// for, when it hosts a thread domain: a fiber runtime for `cont.*`/`gc.roots`, a nursery for an
+    /// `Instantiator`. Not [`validate`]'s rule: installed code may make a kind its module's runtime
+    /// does not host (#3104).
+    pub fn reseeds(&self) -> [bool; 3] {
+        [self.uses_fibers, true, self.makes.detached]
+    }
+
+    /// Its shadow arena.
+    pub fn arena(&self) -> ShadowArena {
+        self.arena
+    }
+
+    /// Whether the code uses `cont.*` or `gc.roots` (the JIT's fiber runtime).
+    pub fn uses_fibers(&self) -> bool {
+        self.uses_fibers
+    }
+
+    /// Whether the code uses a thread op (the JIT's thread scheduler).
+    pub fn uses_threads(&self) -> bool {
+        self.uses_threads
+    }
+
+    /// Whether the code calls an `Instantiator` (it makes detached children; the JIT's nursery).
+    pub fn uses_instantiator(&self) -> bool {
+        self.makes.detached
+    }
 }
 
 /// Whether `code` is a trap's wire code as a join outcome carries it: one a guest can see
@@ -429,14 +597,6 @@ pub fn surfaced_trap(code: TrapCode) -> bool {
     let low = code & 0xffff_ffff;
     (trap_code::DIV_BY_ZERO..=trap_code::STACK_OVERFLOW).contains(&low)
         && (low == trap_code::EXIT || code == low)
-}
-
-/// Whether `f` is a module function `thread.spawn` can name: `(i64, i64) -> (i64)`.
-fn spawn_entry(funcs: &[Func], f: i32) -> bool {
-    usize::try_from(f)
-        .ok()
-        .and_then(|f| funcs.get(f))
-        .is_some_and(|f| f.params == [ValType::I64, ValType::I64] && f.results == [ValType::I64])
 }
 
 /// #3034 — whether `sp` is an extent inside context `ctx`'s region: at or past its empty frame base,
@@ -464,12 +624,16 @@ fn issued(children: &[u32], slot: usize) -> bool {
 pub struct Code<'a> {
     pub funcs: &'a [Func],
     pub arena: ShadowArena,
+    /// Its impl exports, whose handlers a serve state's dispatches name. Only [`validate`] with serve
+    /// state reads them; [`admit`], which takes none, does not.
+    pub impl_exports: &'a [ImplExport],
 }
 
 impl<'a> From<&'a Module> for Code<'a> {
     fn from(m: &'a Module) -> Code<'a> {
         Code {
             funcs: &m.funcs,
+            impl_exports: &m.impl_exports,
             arena: m
                 .memory
                 .and_then(|mem| mem.shadow)
@@ -478,45 +642,102 @@ impl<'a> From<&'a Module> for Code<'a> {
     }
 }
 
+/// The code a residue is admitted against: borrowed, its facts built for the one check, or the facts
+/// an engine already holds ([`CodeFacts`]).
+#[derive(Clone, Copy, Debug)]
+pub enum CodeRef<'a> {
+    Code(Code<'a>),
+    Facts(&'a CodeFacts),
+}
+
+impl<'a> From<Code<'a>> for CodeRef<'a> {
+    fn from(c: Code<'a>) -> Self {
+        CodeRef::Code(c)
+    }
+}
+
+impl<'a> From<&'a Module> for CodeRef<'a> {
+    fn from(m: &'a Module) -> Self {
+        CodeRef::Code(m.into())
+    }
+}
+
+impl<'a> From<&'a CodeFacts> for CodeRef<'a> {
+    fn from(f: &'a CodeFacts) -> Self {
+        CodeRef::Facts(f)
+    }
+}
+
 /// Admit `raw`, the residue of a domain running `code` whose root runs in shadow context `root_ctx`
-/// (`0`, or a fork twin's forking context), or refuse it, handing it back. `installs`: the domain holds
-/// a `Jit` grant ([`Makes`]). The one check every engine's thaw, and every restore, goes through (#3034);
-/// the ranges are the ones a freeze writes.
+/// (`0`, or a fork twin's forking context), and `serve`, the domain's serve state, or refuse them,
+/// handing the residue back. `installs`: the domain holds a `Jit` grant ([`Makes`]). The one check
+/// every engine's thaw, and every restore, goes through (#3034); the ranges are the ones a freeze
+/// writes.
 pub fn validate<'a, D, T>(
-    code: impl Into<Code<'a>>,
+    code: impl Into<CodeRef<'a>>,
     installs: bool,
     root_ctx: usize,
     mut raw: RawResidue<D, T>,
+    serve: Serve,
 ) -> Result<Thaw<D, T>, Refused<D, T>> {
     // The order every engine seeds in (and the codec writes): fibers by slot, vCPUs by task. A freeze
     // that hands its residue over in memory records them in the order they unwound.
     raw.fibers.sort_by_key(|f| f.slot);
     raw.vcpus.sort_by_key(|v| v.task);
-    if raw.is_empty() {
-        return Ok(Thaw(raw));
+    let thaw = Thaw {
+        residue: raw,
+        serve,
+        installs,
+    };
+    if thaw.is_empty() {
+        return Ok(thaw);
     }
-    let code = code.into();
-    match check(code, Makes::of(code, installs, &raw), root_ctx, &raw) {
-        Ok(()) => Ok(Thaw(raw)),
+    let owned;
+    let facts = match code.into() {
+        CodeRef::Facts(f) => f,
+        CodeRef::Code(c) => {
+            owned = CodeFacts::of(c);
+            &owned
+        }
+    };
+    match check(facts, installs, root_ctx, &thaw.residue, &thaw.serve) {
+        Ok(()) => Ok(thaw),
         Err(Malformed) => Err(Refused {
-            residue: alloc::boxed::Box::new(raw),
+            residue: Box::new(thaw.residue),
         }),
     }
 }
 
+/// [`validate`] for a residue with no serve state, taken apart for the engine that seeds it: what an
+/// engine's thaw does with the residue a powerbox holds at rest.
+pub fn admit<'a, D, T>(
+    code: impl Into<CodeRef<'a>>,
+    installs: bool,
+    root_ctx: usize,
+    raw: RawResidue<D, T>,
+) -> Result<ThawParts<D, T>, Refused<D, T>> {
+    validate(code, installs, root_ctx, raw, Serve::default()).map(|t| t.residue)
+}
+
 /// [`validate`]'s checks, over a residue in seeding order.
 fn check<D, T>(
-    code: Code<'_>,
-    makes: Makes,
+    code: &CodeFacts,
+    installs: bool,
     root_ctx: usize,
     r: &RawResidue<D, T>,
+    serve: &Serve,
 ) -> Result<(), Malformed> {
     let ok = |c: bool| if c { Ok(()) } else { Err(Malformed) };
     let a = code.arena;
+    let makes = Makes {
+        fibers: installs || code.makes.fibers,
+        vcpus: installs || code.makes.vcpus,
+        detached: installs || code.makes.detached,
+    };
 
     // A module without a shadow arena is not freezable (INVARIANTS #16): it has no residue at all.
     if !a.region_fits(root_ctx) {
-        return ok(r.is_empty());
+        return ok(r.is_empty() && serve.is_empty());
     }
 
     // Only a kind of record the domain's code can make.
@@ -565,7 +786,8 @@ fn check<D, T>(
         }
         let ctx = ShadowContexts::vcpu_of_sp(a, v.shadow_sp).ok_or(Malformed)?;
         ok(ctx != root_ctx && in_region(a, ctx, v.shadow_sp))?;
-        ok(spawn_entry(code.funcs, v.func) && v.args.len() == 2)?;
+        let entry = usize::try_from(v.func).ok().and_then(|f| code.spawn.get(f));
+        ok(entry == Some(&true) && v.args.len() == 2)?;
         ok(held & (1 << ctx) == 0)?;
         held |= 1 << ctx;
     }
@@ -604,13 +826,45 @@ fn check<D, T>(
     // ---- Fork twins: a pid a fork returns; a live one re-enters a module function in a context
     // the forking vCPU could hold.
     for t in &r.twins {
-        ok(t.pid >= 1 && t.pid <= TASK_MAX && (t.entry as usize) < code.funcs.len())?;
+        ok(t.pid >= 1 && t.pid <= TASK_MAX && (t.entry as usize) < code.spawn.len())?;
         let ctx = t.ctx as usize;
         ok(ctx < MAX_SHADOW_CONTEXTS && a.region_fits(ctx))?;
     }
     ok(r.exited_twins
         .iter()
         .all(|t| t.pid >= 1 && t.pid <= TASK_MAX && t.outcome.err().is_none_or(surfaced_trap)))?;
+
+    // ---- Serve state (#1676, #1901): each queued dispatch names a handler of the code's impl exports
+    // and carries its arguments; each ticket the domain minted is distinct and below its counter,
+    // which a `+ 1` does not overflow; a frozen handler sits in a live fiber; a reply wait belongs to a
+    // context of this domain that a freeze abandons a call in (the root's, a live vCPU's, a live
+    // fiber's). A wait's ticket is its callee's, checked across the cut by the codec (D5).
+    let s = serve;
+    ok(s.next_ticket <= TASK_MAX)?;
+    ok(s.queue.iter().all(|d| {
+        code.handlers
+            .get(d.export as usize)
+            .and_then(|ops| ops.get(d.op as usize))
+            .is_some_and(|&n| n == Some(d.args.len()))
+    }))?;
+    let mut minted: Vec<u64> = s
+        .queue
+        .iter()
+        .map(|d| d.ticket)
+        .chain(s.results.iter().map(|r| r.0))
+        .chain(s.handlers.iter().map(|h| h.1))
+        .collect();
+    ok(minted.iter().all(|&t| t < s.next_ticket))?;
+    minted.sort_unstable();
+    ok(minted.windows(2).all(|w| w[0] != w[1]))?;
+    let live_fiber = |slot: usize| r.fibers.get(slot).is_some_and(|f| !f.is_free());
+    ok(s.handlers
+        .iter()
+        .all(|&(slot, _)| live_fiber(slot as usize)))?;
+    ok(s.waits.iter().all(|&(ctx, _)| {
+        let ctx = ctx as usize;
+        ctx == root_ctx || (ctx < 64 && held & (1 << ctx) != 0) || (ctx >= 1 && live_fiber(ctx - 1))
+    }))?;
     Ok(())
 }
 

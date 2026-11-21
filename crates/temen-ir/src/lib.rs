@@ -4424,6 +4424,12 @@ impl Memory {
 /// maps nothing past it.
 pub const DEFAULT_RESERVED_LOG2: u8 = 37;
 
+/// The largest **reserved** virtual range (the mask domain, `log2`) any engine builds a window in:
+/// `2^40` was the default reservation until #2305 lowered it to [`DEFAULT_RESERVED_LOG2`], so a window
+/// frozen under it still thaws at the reservation its artifact records. An artifact asking for more is
+/// not one a run made (#3100), and the reference JIT reserves no more for any request.
+pub const MAX_RESERVED_LOG2: u8 = 40;
+
 /// #2517 — the log2 of the mask domain each window of this process reserves when what builds it
 /// names none: the root of every entry point that takes no reservation, and every detached child,
 /// on every engine (raised to the window's size, [`window_reserved_log2`]). The embedder's choice

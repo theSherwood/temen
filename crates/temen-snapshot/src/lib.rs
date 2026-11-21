@@ -58,11 +58,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 use temen_encode::{digest256, encode_module, wire};
 use temen_interp::{
-    capture_cut_regions, Attestation, BudgetState, BudgetThawRefused, CapturedDetached,
+    capture_cut_regions, post_fits, Attestation, BudgetState, BudgetThawRefused, CapturedDetached,
     CapturedTwin, DurableBinding, DurableBudget, DurableHandle, DurableJitTable, DurableJitUnit,
     DurableNamedCap, DurablePipe, DurableRegion, FrozenDetached, FrozenFiber, FrozenTwin,
-    FrozenVCpu, Host, MemLayout, NonDurableHandle, RegionBacking, RegionNotCaptured, RegionRefusal,
-    Reply, ShadowArena, StreamRole, SvcDispatch, ThawedDetached, ThawedTwin,
+    FrozenVCpu, Host, MemLayout, NamedGrants, NonDurableHandle, PreparedJit, RegionBacking,
+    RegionNotCaptured, RegionRefusal, Reply, ShadowArena, StreamRole, SvcDispatch, ThawedDetached,
+    ThawedTwin, PIPE_CAP,
 };
 use temen_ir::thaw::{self, LiveDetached, LiveTwin, RawResidue, TrapCode};
 use temen_ir::Module;
@@ -167,7 +168,7 @@ use temen_ir::Module;
 /// reservation to the guest's original mask domain (its future growth bound), not just the extent.
 /// v19 (#1296, invariant 14 nesting axis): a **frozen child's** inline host state (the v14 block in a
 /// nested record) gains its §22 guest-JIT unit tables — a presence byte, then the same `table_log2`
-/// header + domains shape Section 5 uses (`write_jit`), rebuilt by `Host::restore_durable_jit` on the
+/// header + domains shape Section 5 uses (`write_jit`), rebuilt by `Host::prepare_durable_jit` on the
 /// re-created child at thaw. A child holding a `Jit` cap previously froze fine but its unit table was
 /// dropped, dangling its `JitTable` handle on thaw; now the subtree snapshot round-trips it. A child
 /// with no `Jit` cap writes the presence byte `0`, so a JIT-free subtree's child block grows by one
@@ -577,7 +578,9 @@ pub enum RestoreError {
 /// quantities, and a 4 GiB reservation (`reserved_log2 == 32`) is ordinary even on a 32-bit host
 /// (wasm32, the browser engine). Only `mapped` — the image itself — has to fit a `usize`.
 fn geometry_ok(module: &Module, mapped: u64, reserved_log2: u8) -> bool {
-    if reserved_log2 as u32 >= u64::BITS {
+    // #3100 — no engine reserves more ([`temen_ir::MAX_RESERVED_LOG2`]): an artifact's own
+    // reservation is what bounds the image it asks to have allocated.
+    if reserved_log2 > temen_ir::MAX_RESERVED_LOG2 {
         return false;
     }
     if mapped == 0 || !mapped.is_multiple_of(PAGE as u64) || mapped > 1u64 << reserved_log2 {
@@ -1762,7 +1765,7 @@ pub fn restore_layout(
     module: &Module,
     host: &mut Host,
 ) -> Result<(MemLayout, u8), RestoreError> {
-    restore_at(artifact, module, host, 0, 0, &mut ThawCut::default())
+    restore_cut(artifact, module, host)
 }
 
 /// [`restore`] that also recovers the per-page protection map (§12.3) and the mask-domain
@@ -1786,84 +1789,234 @@ pub fn restore_with_prots(
     Ok((window, prots, reserved_log2))
 }
 
-/// The cut as the depth-0 restore rebuilt it, for every artifact in it to name by number: each budget
-/// node's new live id (#1944) and each §13 region's new backing (#2025), and whether any artifact of
-/// the cut named it (canonical: a freeze carries only what some domain names, which is checked once
-/// every detached child is restored).
+/// #2941 — what the depth-0 restore decodes once for its whole cut, which every artifact in it names
+/// by number: each §13 region's bytes (#2025) and each budget node (#1944), and whether some artifact
+/// of the cut named it (canonical: a freeze carries only what some domain names, which is checked once
+/// every nested artifact is decoded).
 #[derive(Default)]
-struct ThawCut {
-    ids: Vec<u32>,
-    reached: Vec<bool>,
-    regions: Vec<RegionBacking>,
+struct DecodeCut {
+    regions: Vec<Vec<u8>>,
     regions_reached: Vec<bool>,
+    budgets: Vec<DurableBudget>,
+    reached: Vec<bool>,
 }
 
-/// [`restore_layout`] at detached-nesting `depth` (0 for the artifact an embedder handed in), for a
-/// domain whose root runs in shadow context `root_ctx` (`0`, or a fork twin's forking context).
-fn restore_at(
+/// #2941 — the cut as [`apply`] rebuilt it on the restoring host: each budget node's new id and each
+/// region's backing, by number.
+struct LiveCut {
+    ids: Vec<u32>,
+    regions: Vec<RegionBacking>,
+}
+
+/// #2941 — one domain's artifact, decoded and checked ([`decode`]): everything restore reads, none
+/// of it applied. Its numbers (budget nodes, pipes, regions) are still the artifact's.
+struct Decoded {
+    reserved_log2: u8,
+    /// The module's declared memory: the window's head.
+    declared: u64,
+    window: Vec<u8>,
+    prots: Vec<PageProt>,
+    tail: Vec<(u64, PageProt, Option<Vec<u8>>)>,
+    generations: Vec<u32>,
+    handles: Vec<DurableHandle>,
+    pipes: Vec<DurablePipe>,
+    jit_table_log2: u8,
+    jit: PreparedJit,
+    named: Vec<Option<DurableNamedCap>>,
+    attest: Option<Attestation>,
+    end: Option<(u32, u32, u64)>,
+    /// The region numbers this domain holds: its pages', its handles' and its end post's.
+    regions: BTreeSet<u32>,
+    /// Its residue and serve state, admitted against its module ([`thaw::validate`]).
+    thaw: thaw::Thaw<DecodedDetached, DecodedTwin>,
+}
+
+/// A live detached child of a [`Decoded`] domain: what its spawner held, and its own domain.
+struct DecodedDetached {
+    digest: [u8; 32],
+    names: Vec<(String, i32)>,
+    pager: Option<u32>,
+    domain: Box<Decoded>,
+}
+
+/// A live fork twin of a [`Decoded`] domain: what its parent held, and its own domain.
+struct DecodedTwin {
+    servicer: bool,
+    names: Vec<(String, i32)>,
+    domain: Box<Decoded>,
+}
+
+/// #2941 — what a domain's restore asked the restoring embedder for and was granted ([`grant`]): its
+/// named capabilities, and each nested domain's powerbox (built from the restoring host's thaw seams,
+/// [`Host::detached_thaw_host`]) with its own grants, in the order its residue lists them.
+struct Grant {
+    named: NamedGrants,
+    detached: Vec<(Host, Grant)>,
+    twins: Vec<(Host, Grant)>,
+}
+
+/// A nested domain's powerbox, holding the seams it borrowed from `parent` ([`Host::detached_thaw_host`])
+/// until it is dropped or finished, when they go back: on every path out of [`grant`].
+struct Lent<'a> {
+    parent: &'a mut Host,
+    child: Option<Host>,
+}
+
+impl<'a> Lent<'a> {
+    fn new(parent: &'a mut Host) -> Self {
+        let child = Some(parent.detached_thaw_host());
+        Lent { parent, child }
+    }
+
+    fn host(&mut self) -> &mut Host {
+        self.child.as_mut().expect("held until finished")
+    }
+
+    /// The powerbox, its seams given back.
+    fn finish(mut self) -> Host {
+        let mut child = self.child.take().expect("held until finished");
+        self.parent.reclaim_thaw_seams(&mut child);
+        child
+    }
+}
+
+impl Drop for Lent<'_> {
+    fn drop(&mut self) {
+        if let Some(child) = &mut self.child {
+            self.parent.reclaim_thaw_seams(child);
+        }
+    }
+}
+
+/// [`restore_layout`]: [`decode`] (pure: every section, every check, every nested artifact), then
+/// [`grant`] (the restoring embedder's answers: its budget hook, its registrar, its region backings),
+/// then [`apply`], which cannot fail. On `Err` the restoring host holds what it held (#2941): only
+/// `grant` and `apply` take it `&mut`, and what `grant` takes from it goes back on every path (its
+/// hooks, by [`Lent`] and their own take-and-put; a region's charge, by its backing's `Drop`).
+fn restore_cut(
     artifact: &[u8],
     module: &Module,
     host: &mut Host,
-    depth: usize,
-    root_ctx: usize,
-    cut: &mut ThawCut,
 ) -> Result<(MemLayout, u8), RestoreError> {
-    // The unified TEMEN wire header (WIRE.md): magic, then this codec's own kind/version/flags,
-    // each fail-closed at the header before any section is read.
-    let (hdr, payload) = wire::read_header(artifact).map_err(|e| match e {
-        wire::HeaderError::Truncated => RestoreError::Truncated,
-        wire::HeaderError::BadMagic => RestoreError::BadMagic,
-    })?;
-    if hdr.kind != wire::KIND_SNAPSHOT {
-        return Err(RestoreError::BadMagic); // a TEMEN blob, but not a snapshot
-    }
-    if hdr.version != FORMAT_VERSION {
-        return Err(RestoreError::UnsupportedVersion(hdr.version));
-    }
-    if hdr.flags != 0 {
-        return Err(RestoreError::Malformed); // reserved flag bits
-    }
-    let mut r = Reader::new(payload);
-
-    let (mut header, mut win_body, mut handles_body, mut control_body) = (None, None, None, None);
-    let mut serve_body = None;
-    let mut jit_body = None;
-    let mut attest_body = None;
-    let mut named_body = None;
-    let mut detached_body = None;
-    let mut pipes_body = None;
-    let mut budgets_body = None;
-    let mut regions_body = None;
-    let mut twins_body = None;
-    let mut children_body = None;
-    let mut end_body = None;
-    while !r.at_end() {
-        let tag = r.uleb()?;
-        let len = r.uleb()? as usize;
-        let body = r.take(len)?;
-        match tag {
-            TAG_HEADER => header = Some(body),
-            TAG_WINDOW => win_body = Some(body),
-            TAG_CONTROL => control_body = Some(body),
-            TAG_HANDLES => handles_body = Some(body),
-            TAG_SERVE => serve_body = Some(body),
-            TAG_JIT => jit_body = Some(body),
-            TAG_ATTEST => attest_body = Some(body),
-            TAG_NAMED => named_body = Some(body),
-            TAG_DETACHED => detached_body = Some(body),
-            TAG_PIPES => pipes_body = Some(body),
-            TAG_BUDGETS => budgets_body = Some(body),
-            TAG_REGIONS => regions_body = Some(body),
-            TAG_TWINS => twins_body = Some(body),
-            TAG_CHILDREN => children_body = Some(body),
-            TAG_END => end_body = Some(body),
-            // Fail closed on an unknown tag (#915/§8). The version gate above already pins
-            // `version == FORMAT_VERSION`, so no artifact this build emits can carry one — silently
-            // skipping it was dead "forward-compat" that only opened a canonicality hole (a
-            // junk-section artifact restoring identically to a clean one). Reject it.
-            _ => return Err(RestoreError::Malformed),
+    let mut cut = DecodeCut::default();
+    let decoded = decode(artifact, module, host, 0, 0, &mut cut)?;
+    // #1944: every carried budget node is one some domain of the cut named, or an ancestor of one,
+    // and every region is one some domain holds (canonical), known only now that every nested
+    // artifact is decoded.
+    for i in (0..cut.budgets.len()).rev() {
+        if let (true, Some(p)) = (cut.reached[i], cut.budgets[i].parent) {
+            cut.reached[p as usize] = true;
         }
     }
+    if cut.reached.contains(&false) || cut.regions_reached.contains(&false) {
+        return Err(RestoreError::Malformed);
+    }
+    replies_owed(&decoded)?;
+    let granted = grant(&decoded, host, Some(&mut cut.budgets))?;
+    // #2306 — last of what can refuse: a region's backing is charged to the restoring domain's node
+    // and may be an OS object. One rebuilt before a refusal is dropped with the `Vec`, which refunds
+    // its charge.
+    let regions = cut
+        .regions
+        .iter()
+        .map(|b| host.rebuild_region(b))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(RestoreError::RegionRefused)?;
+    // Nothing below refuses. Re-mint the nodes, parents first ([`decode_budgets`] checked that each
+    // parent numbers below its child, the one thing `restore_durable_budgets` refuses).
+    let ids = host
+        .restore_durable_budgets(&cut.budgets)
+        .expect("decode_budgets: each parent numbers below its child");
+    let live = LiveCut { ids, regions };
+    Ok(apply(decoded, granted, host, &live))
+}
+
+/// #3034 D5 — every reply wait of the cut names a ticket its callee owes, where its callee is in the
+/// cut. A wait's ticket is in its callee's ticket space; its callee is a live detached child some
+/// `LiveImpl` handle of the waiting domain names by task. A domain holding a `LiveImpl` whose callee
+/// the cut does not carry may be waiting on that one: the cut's boundary (as a pipe's end outside it,
+/// #1680), so its waits are admitted. One with no `LiveImpl` has no live call to wait on.
+fn replies_owed(root: &Decoded) -> Result<(), RestoreError> {
+    // Every live detached domain of the cut, by its task, with the serve state that owes replies.
+    fn callees<'a>(d: &'a Decoded, out: &mut Vec<(u64, &'a thaw::Serve)>) {
+        for l in &d.thaw.parts().live_detached {
+            out.push((l.task, l.payload.domain.thaw.serve()));
+            callees(&l.payload.domain, out);
+        }
+        for t in &d.thaw.parts().twins {
+            callees(&t.payload.domain, out);
+        }
+    }
+    fn check(d: &Decoded, all: &[(u64, &thaw::Serve)]) -> bool {
+        let tasks: Vec<u64> = d
+            .handles
+            .iter()
+            .filter_map(|h| match h.binding {
+                DurableBinding::LiveImpl { task, .. } => Some(task),
+                _ => None,
+            })
+            .collect();
+        let named = |task: u64| all.iter().filter(move |c| c.0 == task);
+        let boundary = tasks.iter().any(|&t| named(t).next().is_none());
+        let waits_ok = d.thaw.serve().waits.iter().all(|&(_, ticket)| {
+            !tasks.is_empty()
+                && (boundary || tasks.iter().any(|&t| named(t).any(|c| c.1.owes(ticket))))
+        });
+        waits_ok
+            && d.thaw
+                .parts()
+                .live_detached
+                .iter()
+                .all(|l| check(&l.payload.domain, all))
+            && d.thaw
+                .parts()
+                .twins
+                .iter()
+                .all(|t| check(&t.payload.domain, all))
+    }
+    let mut all = Vec::new();
+    callees(root, &mut all);
+    if check(root, &all) {
+        Ok(())
+    } else {
+        Err(RestoreError::Malformed)
+    }
+}
+
+/// #2941 — decode and check one domain's artifact at detached-nesting `depth` (0 for the artifact an
+/// embedder handed in), for a domain whose root runs in shadow context `root_ctx` (`0`, or a fork
+/// twin's forking context), and every artifact nested in it. Pure: `host` is read for the module
+/// grants an artifact names, and nothing is written but `cut`.
+fn decode(
+    artifact: &[u8],
+    module: &Module,
+    host: &Host,
+    depth: usize,
+    root_ctx: usize,
+    cut: &mut DecodeCut,
+) -> Result<Decoded, RestoreError> {
+    let (_, mut sec) = sections(artifact)?;
+    let mut take = |tag| sec.remove(&tag);
+    let (header, win_body, control_body, handles_body) = (
+        take(TAG_HEADER),
+        take(TAG_WINDOW),
+        take(TAG_CONTROL),
+        take(TAG_HANDLES),
+    );
+    let (serve_body, jit_body, attest_body, named_body) = (
+        take(TAG_SERVE),
+        take(TAG_JIT),
+        take(TAG_ATTEST),
+        take(TAG_NAMED),
+    );
+    let (detached_body, pipes_body, budgets_body, regions_body) = (
+        take(TAG_DETACHED),
+        take(TAG_PIPES),
+        take(TAG_BUDGETS),
+        take(TAG_REGIONS),
+    );
+    let (twins_body, children_body, end_body) =
+        (take(TAG_TWINS), take(TAG_CHILDREN), take(TAG_END));
     let header = header.ok_or(RestoreError::MissingSection(TAG_HEADER))?;
     let win_body = win_body.ok_or(RestoreError::MissingSection(TAG_WINDOW))?;
     let handles_body = handles_body.ok_or(RestoreError::MissingSection(TAG_HANDLES))?;
@@ -1885,27 +2038,40 @@ fn restore_at(
     if page_size != PAGE || !geometry_ok(module, mapped as u64, reserved_log2) {
         return Err(RestoreError::GeometryMismatch);
     }
+    // #3100 — the image is allocated before any page is read, so it is bounded first by what the
+    // restoring host would let this domain grow to: its window past the declared memory, against the
+    // memory its budget chain has left (a read; the thaw charges it). A domain with no bound on its
+    // memory may ask for what a running guest under that budget could commit, and the allocation is
+    // fallible: a window this process cannot hold is a refusal, never an abort.
+    let declared = module.memory.map_or(0, |mc| 1u64 << mc.size_log2);
+    if host
+        .mem_left()
+        .is_some_and(|left| (mapped as u64).saturating_sub(declared) > left)
+    {
+        return Err(RestoreError::GeometryMismatch);
+    }
     let reserved = 1u64 << reserved_log2;
 
     // ---- Regions inside the cut (#2025, v39), by number: the depth-0 artifact carries the whole
-    // cut's, rebuilt first so a `Backed` page and a region handle can be checked against them. ----
+    // cut's, decoded first so a `Backed` page and a region handle can be checked against them. ----
     let carried = decode_regions(regions_body)?;
     if depth > 0 && !carried.is_empty() {
         return Err(RestoreError::Malformed);
     }
     if depth == 0 {
-        cut.regions = carried
-            .iter()
-            .map(|b| host.rebuild_region(b))
-            .collect::<Result<_, _>>()
-            .map_err(RestoreError::RegionRefused)?;
         cut.regions_reached = vec![false; carried.len()];
+        cut.regions = carried;
     }
-    let mut region_named = BTreeSet::new();
+    let region_len = |region: u32| cut.regions.get(region as usize).map(|b| b.len() as u64);
+    let mut regions = BTreeSet::new();
 
     // ---- Window image: the head zeroed (default `Rw`), each stored page + its prot splatted over it;
     // past the head, each page the window holds (#2427). ----
-    let mut window = vec![0u8; mapped];
+    let mut window = Vec::new();
+    window
+        .try_reserve_exact(mapped)
+        .map_err(|_| RestoreError::GeometryMismatch)?;
+    window.resize(mapped, 0u8);
     let mut prots = vec![PageProt::Rw; mapped / PAGE];
     let mut tail: Vec<(u64, PageProt, Option<Vec<u8>>)> = Vec::new();
     let mut w = Reader::new(win_body);
@@ -1943,17 +2109,13 @@ fn restore_at(
                     1 => true,
                     _ => return Err(RestoreError::Malformed),
                 };
-                let len = cut
-                    .regions
-                    .get(region as usize)
-                    .ok_or(RestoreError::Malformed)?
-                    .size();
+                let len = region_len(region).ok_or(RestoreError::Malformed)?;
                 if !off.is_multiple_of(PAGE as u64)
                     || off.checked_add(PAGE as u64).is_none_or(|end| end > len)
                 {
                     return Err(RestoreError::Malformed);
                 }
-                region_named.insert(region);
+                regions.insert(region);
                 PageProt::Backed {
                     region,
                     off,
@@ -1980,7 +2142,7 @@ fn restore_at(
         return Err(RestoreError::Malformed);
     }
 
-    // ---- Handle table: decode, bounds-check, re-grant. ----
+    // ---- Handle table: decode and bounds-check. ----
     let mut hr = Reader::new(handles_body);
     let generations = read_generations(&mut hr, Host::handle_capacity())?;
     let n = hr.count()?;
@@ -2023,8 +2185,9 @@ fn restore_at(
     let (fibers, vcpus, root_sp, detached) =
         decode_control(control_body, fiber_count, spawned_count)?;
     // ---- Pipes inside the cut (#1680, v32): every end must name a carried pipe, and every carried
-    // pipe must be named (canonical: a freeze carries only pipes with an end in the cut). ----
-    // Each pipe's end counts are the ends the cut carries, so they are rebuilt here, not stored.
+    // pipe must be named (canonical: a freeze carries only pipes with an end in the cut), holding no
+    // more than a pipe can. Each pipe's end counts are the ends the cut carries, so they are rebuilt
+    // here, not stored. ----
     let mut pipes = decode_pipes(pipes_body)?;
     for h in &handles {
         if let DurableBinding::PipeEnd { pipe, write } = h.binding {
@@ -2038,32 +2201,35 @@ fn restore_at(
             } += 1;
         }
     }
-    if pipes.iter().any(|p| p.writers + p.readers == 0) {
+    if pipes
+        .iter()
+        .any(|p| p.writers + p.readers == 0 || p.bytes.len() > PIPE_CAP)
+    {
         return Err(RestoreError::Malformed);
     }
     // ---- Budget nodes (#1944, v37): the depth-0 artifact carries the whole cut's; a detached
-    // child's names them by number.
-    let mut budgets = decode_budgets(budgets_body)?;
+    // child's names them by number. ----
+    let budgets = decode_budgets(budgets_body)?;
     if depth > 0 && !budgets.is_empty() {
         return Err(RestoreError::Malformed);
     }
-    let named_budgets = handles
-        .iter()
-        .filter_map(|h| match h.binding {
-            DurableBinding::Budget { node } => Some(node as usize),
-            _ => None,
-        })
-        .max();
-    if named_budgets.is_some_and(|n| n >= budgets.len().max(cut.ids.len())) {
-        return Err(RestoreError::Malformed);
+    if depth == 0 {
+        cut.reached = vec![false; budgets.len()];
+        cut.budgets = budgets;
+    }
+    for h in &handles {
+        if let DurableBinding::Budget { node } = h.binding {
+            *cut.reached
+                .get_mut(node as usize)
+                .ok_or(RestoreError::Malformed)? = true;
+        }
     }
 
-    // ---- Durable guest-JIT state (§12.5 Slice 2, v16): decode Section 5, bounds-check the handle
-    // table's JIT indices against it, and rebuild the domains (each unit re-verified). Do this
-    // *before* re-granting the table so a forged `JitTable`/`JitCode` index that names no restored
+    // ---- Durable guest-JIT state (§12.5 Slice 2, v16): decode Section 5 and bounds-check the handle
+    // table's JIT indices against it, so a forged `JitTable`/`JitCode` index that names no restored
     // domain/unit is rejected here — otherwise the guest's first `compile`/`invoke` would index
     // `jit_tables` out of bounds. Absent section ⇒ no JIT granted (any JIT binding then fails the
-    // bounds check). ----
+    // bounds check). Each unit is decoded and re-verified now. ----
     let (jit_table_log2, jit) = decode_jit(jit_body)?;
     // #3034 — each re-applied `install` is one the guest's own made: into a padding slot of the
     // dispatch table (a run's `install` takes the first free one past the module's functions, never a
@@ -2084,10 +2250,9 @@ fn restore_at(
             }
         }
     }
-    // #1455: the same treatment for named host capabilities — decode Section 7, bounds-check every
-    // `B_NAMED` index against it, then re-grant through the embedder's registrar *before* the handle
-    // table is pinned. A forged index that names no captured entry is rejected here rather than
-    // reaching `host_procs` out of bounds at the guest's first `call.cap`.
+    // #1455: the same treatment for named host capabilities — decode Section 7 and bounds-check every
+    // `B_NAMED` index against it, so a forged index that names no captured entry is rejected here
+    // rather than reaching `host_procs` out of bounds at the guest's first `call.cap`.
     let named = decode_named(named_body)?;
     for h in &handles {
         let ok = match h.binding {
@@ -2106,88 +2271,50 @@ fn restore_at(
             return Err(RestoreError::JitReconstruct);
         }
     }
-    host.restore_durable_named(&named)
-        .map_err(|e| RestoreError::NamedCapRefused(e.name))?;
-    // #1361: the module twin of the registrar step above — every carried module digest must name a
-    // durable grant *this* host holds, checked before any slot is pinned. The bytes are D-scope, so
-    // a restore the embedder did not re-grant the module for fails here rather than thawing a
-    // domain whose handle resolves to nothing.
-    host.check_modules_for_thaw(&handles)
-        .map_err(|e| RestoreError::ModuleUnresolved(e.digest))?;
-    host.restore_durable_jit(&jit)
-        .map_err(|_| RestoreError::JitReconstruct)?;
-    // v17: restore the call.dyn table reservation so the thaw run's dispatch table has the
-    // padding the re-applied installs land in (a fresh host defaults to 0).
-    host.set_jit_table_log2(jit_table_log2);
-    // #1502, #1944: offer every carried budget node's ceilings to the embedder's hook before the
-    // table is pinned — the budget twin of the named-cap registrar step above. Attenuate-only; a
-    // refusal fails the restore here, with nothing granted. Then re-mint the nodes, parents first,
-    // and rewrite each handle's node number to the id its node was minted.
+    let jit_domains = jit.len();
+    let jit = Host::prepare_durable_jit(&jit).map_err(|_| RestoreError::JitReconstruct)?;
+    // #1361: every carried module digest must name a durable grant the restoring host holds. The
+    // bytes are D-scope, so a restore the embedder did not re-grant the module for fails here rather
+    // than thawing a domain whose handle resolves to nothing. A nested domain's powerbox holds the
+    // restoring host's durable grants ([`Host::detached_thaw_host`]).
     if depth == 0 {
-        host.attenuate_budgets_for_thaw(&mut budgets, &handles)
-            .map_err(RestoreError::BudgetRefused)?;
-        cut.ids = host
-            .restore_durable_budgets(&budgets)
-            .ok_or(RestoreError::Malformed)?;
-        cut.reached = vec![false; budgets.len()];
-    }
-    for h in handles.iter_mut() {
-        if let DurableBinding::Budget { node } = &mut h.binding {
-            cut.reached[*node as usize] = true;
-            *node = cut.ids[*node as usize];
+        host.check_modules_for_thaw(&handles)
+            .map_err(|e| RestoreError::ModuleUnresolved(e.digest))?;
+    } else if let Some(digest) = handles.iter().find_map(|h| match h.binding {
+        DurableBinding::Module { digest } if host.durable_module_by_digest(&digest).is_none() => {
+            Some(digest)
         }
-    }
-    // The interpreter names a pipe by its live id: rewrite each carried end's artifact number to the
-    // id its rebuilt pipe was minted.
-    let ids = host
-        .restore_durable_pipes(&pipes)
-        .map_err(|_| RestoreError::Malformed)?;
-    for h in handles.iter_mut() {
-        if let DurableBinding::PipeEnd { pipe, .. } = &mut h.binding {
-            *pipe = ids[*pipe as usize];
-        }
-    }
-    // #2025: every region handle names a region of the cut. This domain holds each region it names
-    // under one new id, adopted in number order, and each number is rewritten to it.
-    // #1936 — and so does the domain's end post, which Section 14 carries apart from its handles.
-    let end = end_body.map(decode_end).transpose()?;
-    for region in handles
-        .iter()
-        .filter_map(|h| h.binding.region())
-        .chain(end.map(|(region, ..)| region))
-    {
-        if region as usize >= cut.regions.len() {
-            return Err(RestoreError::Malformed);
-        }
-        region_named.insert(region);
-    }
-    let region_ids: BTreeMap<u32, u32> = region_named
-        .into_iter()
-        .map(|n| {
-            cut.regions_reached[n as usize] = true;
-            (n, host.adopt_region(Arc::clone(&cut.regions[n as usize])))
-        })
-        .collect();
-    for h in handles.iter_mut() {
-        if let Some(region) = h.binding.region_mut() {
-            *region = region_ids[region];
-        }
-    }
-    for p in prots.iter_mut().chain(tail.iter_mut().map(|t| &mut t.1)) {
-        if let PageProt::Backed { region, .. } = p {
-            *region = region_ids[region];
-        }
-    }
-    host.restore_durable_handles(&generations, &handles);
-    if let Some((region, off, badge)) = end {
-        host.restore_end_post(region_ids[&region], off, badge);
+        _ => None,
+    }) {
+        return Err(RestoreError::ModuleUnresolved(digest));
     }
 
-    // ---- Serve state (§13.4 step 3, v13): decode the serve trio and the reply waits (v35, #1901)
-    // and restore them. The section is present iff either is non-empty (canonical); its absence
-    // restores the empty default. ----
+    // #2025: every region handle names a region of the cut, and so does the domain's end post (#1936),
+    // which Section 14 carries apart from its handles. A post's 12 bytes lie inside its region, 8-aligned,
+    // as the guest's mint made it (#3034).
+    let end = end_body.map(decode_end).transpose()?;
+    for (region, post) in handles
+        .iter()
+        .filter_map(|h| match h.binding {
+            DurableBinding::RegionPost { region, off, .. } => Some((region, Some(off))),
+            _ => h.binding.region().map(|r| (r, None)),
+        })
+        .chain(end.map(|(region, off, _)| (region, Some(off))))
+    {
+        let len = region_len(region).ok_or(RestoreError::Malformed)?;
+        if post.is_some_and(|off| !post_fits(off.into(), len)) {
+            return Err(RestoreError::Malformed);
+        }
+        regions.insert(region);
+    }
+    for &n in &regions {
+        cut.regions_reached[n as usize] = true;
+    }
+
+    // ---- Serve state (§13.4 step 3, v13): the serve trio and the reply waits (v35, #1901). The
+    // section is present iff either is non-empty (canonical); its absence is the empty default. ----
     let serve = match serve_body {
-        None => None,
+        None => thaw::Serve::default(),
         Some(body) => {
             let mut sr = Reader::new(body);
             let (queue, results, next_ticket) = read_serve_trio(&mut sr)?;
@@ -2196,54 +2323,55 @@ fn restore_at(
             if !sr.at_end() {
                 return Err(RestoreError::Malformed);
             }
-            let serve = temen_interp::Serve {
+            let serve = thaw::Serve {
                 queue,
                 results,
                 next_ticket,
                 waits,
                 handlers,
             };
-            if serve == temen_interp::Serve::default() {
+            if serve.is_empty() {
                 return Err(RestoreError::Malformed); // non-canonical: an empty section is elided
             }
-            Some(serve) // seeded once the residue is admitted: its handlers name fibers of it
+            serve
         }
     };
 
-    // ---- Attestation (#1289 R1, O14, v20): decode Section 6 and re-stamp the host, so the domain's
-    // placement/exposure survives the thaw. The section is present iff the attestation is non-default
-    // (canonical); its absence leaves the host as the embedder configured it (a plain root's default). ----
-    if let Some(body) = attest_body {
-        let mut ar = Reader::new(body);
-        let tier = ar.u8()?;
-        let window_exposed = match ar.u8()? {
-            0 => false,
-            1 => true,
-            _ => return Err(RestoreError::Malformed),
-        };
-        let freeze_exposed = match ar.u8()? {
-            0 => false,
-            1 => true,
-            _ => return Err(RestoreError::Malformed),
-        };
-        if !ar.at_end() {
-            return Err(RestoreError::Malformed);
+    // ---- Attestation (#1289 R1, O14, v20): Section 6, the domain's placement/exposure. The section
+    // is present iff the attestation is non-default (canonical); its absence leaves the host as the
+    // embedder configured it (a plain root's default). ----
+    let attest = match attest_body {
+        None => None,
+        Some(body) => {
+            let mut ar = Reader::new(body);
+            let tier = ar.u8()?;
+            let window_exposed = match ar.u8()? {
+                0 => false,
+                1 => true,
+                _ => return Err(RestoreError::Malformed),
+            };
+            let freeze_exposed = match ar.u8()? {
+                0 => false,
+                1 => true,
+                _ => return Err(RestoreError::Malformed),
+            };
+            if !ar.at_end() {
+                return Err(RestoreError::Malformed);
+            }
+            let attest = Attestation {
+                tier,
+                window_exposed,
+                freeze_exposed,
+            };
+            if attest == Attestation::default() {
+                return Err(RestoreError::Malformed); // non-canonical: a default attestation elides it
+            }
+            Some(attest)
         }
-        let attest = Attestation {
-            tier,
-            window_exposed,
-            freeze_exposed,
-        };
-        if attest == Attestation::default() {
-            return Err(RestoreError::Malformed); // non-canonical: a default attestation elides the section
-        }
-        host.set_attestation(attest);
-    }
+    };
 
-    // ---- Live detached children (#1361 step 4, v29): each restored from its own nested artifact into
-    // its own powerbox, against the module grant its launch record names. Last, so the parent's own
-    // handle table (and so the registrar's answers for it) is settled first; all-or-nothing — any
-    // child failing fails this restore. ----
+    // ---- Live detached children (#1361 step 4, v29): each decoded from its own nested artifact,
+    // against the module grant its launch record names. ----
     let live_detached = match detached_body {
         Some(body) => decode_detached(body, module, host, depth, cut)?,
         None => Vec::new(),
@@ -2260,14 +2388,14 @@ fn restore_at(
         }
         None => Vec::new(),
     };
-    // ---- Fork twins (#1688, v49): each live one restored from its own nested artifact into its own
-    // powerbox, against its parent's program, as a detached child is. ----
+    // ---- Fork twins (#1688, v49): each live one decoded from its own nested artifact, against its
+    // parent's program, as a detached child is. ----
     let (twins, exited_twins) = match twins_body {
         Some(body) => decode_twins(body, module, host, depth, cut)?,
         None => (Vec::new(), Vec::new()),
     };
-    // ---- The thaw residue (§12.4, #3034): admitted whole by the one pass every engine's thaw goes
-    // through, against this domain's module, then seeded for the next (REWINDING) run. ----
+    // ---- The thaw residue (§12.4, #3034) and the serve state beside it: admitted whole by the one
+    // pass every engine's thaw goes through, against this domain's module. ----
     let raw = RawResidue {
         fibers,
         vcpus,
@@ -2278,33 +2406,300 @@ fn restore_at(
         twins,
         exited_twins,
     };
-    let installs = host.installs_code();
-    host.set_thaw(
-        thaw::validate(module, installs, root_ctx, raw).map_err(|_| RestoreError::Malformed)?,
-    );
-    if let Some(serve) = serve {
-        host.set_serve(serve).map_err(|_| RestoreError::Malformed)?;
+    // The domain installs code when it holds a `Jit` domain ([`Host::installs_code`]): the ones
+    // Section 5 rebuilds.
+    let thaw = thaw::validate(module, jit_domains > 0, root_ctx, raw, serve)
+        .map_err(|_| RestoreError::Malformed)?;
+    Ok(Decoded {
+        reserved_log2,
+        declared,
+        window,
+        prots,
+        tail,
+        generations,
+        handles,
+        pipes,
+        jit_table_log2,
+        jit,
+        named,
+        attest,
+        end,
+        regions,
+        thaw,
+    })
+}
+
+/// #2941 — ask the restoring embedder for what a decoded domain, and every domain nested in it, needs
+/// granted: its named capabilities ([`Host::regrant_named`]), and at depth 0 its budget nodes'
+/// ceilings (`budgets`, [`Host::attenuate_budgets_for_thaw`]), in the order a restore always asked them.
+/// Each nested domain is asked through a powerbox of its own, built from `host`'s thaw seams and handed
+/// them back on every path ([`Lent`]). Nothing on `host` is written that survives an `Err`.
+fn grant(
+    d: &Decoded,
+    host: &mut Host,
+    budgets: Option<&mut Vec<DurableBudget>>,
+) -> Result<Grant, RestoreError> {
+    let named = host
+        .regrant_named(&d.named)
+        .map_err(|e| RestoreError::NamedCapRefused(e.name))?;
+    if let Some(budgets) = budgets {
+        host.attenuate_budgets_for_thaw(budgets, &d.handles)
+            .map_err(RestoreError::BudgetRefused)?;
     }
-    // #1944: every carried budget node is one some domain of the cut named, or an ancestor of one
-    // (canonical), known only now that every detached child's handles are in.
-    if depth == 0 {
-        for i in (0..budgets.len()).rev() {
-            if let (true, Some(p)) = (cut.reached[i], budgets[i].parent) {
-                cut.reached[p as usize] = true;
+    let mut nested = |domain: &Decoded| {
+        let mut lent = Lent::new(host);
+        let g = grant(domain, lent.host(), None)?;
+        Ok::<_, RestoreError>((lent.finish(), g))
+    };
+    let parts = d.thaw.parts();
+    let detached = parts
+        .live_detached
+        .iter()
+        .map(|l| nested(&l.payload.domain))
+        .collect::<Result<_, _>>()?;
+    let twins = parts
+        .twins
+        .iter()
+        .map(|t| nested(&t.payload.domain))
+        .collect::<Result<_, _>>()?;
+    Ok(Grant {
+        named,
+        detached,
+        twins,
+    })
+}
+
+/// #2941 — apply a decoded, granted domain to `host`, and each nested one to the powerbox [`grant`]
+/// built for it: what a restore writes, none of which refuses. Returns its window and reservation.
+fn apply(d: Decoded, g: Grant, host: &mut Host, live: &LiveCut) -> (MemLayout, u8) {
+    let Decoded {
+        reserved_log2,
+        declared,
+        window,
+        mut prots,
+        mut tail,
+        generations,
+        mut handles,
+        pipes,
+        jit_table_log2,
+        jit,
+        named: _,
+        attest,
+        end,
+        regions,
+        thaw,
+    } = d;
+    host.install_named(g.named);
+    host.install_durable_jit(jit);
+    // v17: the call.dyn table reservation, so the thaw run's dispatch table has the padding the
+    // re-applied installs land in (a fresh host defaults to 0).
+    host.set_jit_table_log2(jit_table_log2);
+    // The interpreter names a budget node, a pipe and a region by its live id: rewrite each carried
+    // number to the id its node was minted, its pipe rebuilt, its region adopted at.
+    let pipe_ids = host.restore_durable_pipes(&pipes);
+    let region_ids: BTreeMap<u32, u32> = regions
+        .into_iter()
+        .map(|n| (n, host.adopt_region(Arc::clone(&live.regions[n as usize]))))
+        .collect();
+    for h in handles.iter_mut() {
+        match &mut h.binding {
+            DurableBinding::Budget { node } => *node = live.ids[*node as usize],
+            DurableBinding::PipeEnd { pipe, .. } => *pipe = pipe_ids[*pipe as usize],
+            b => {
+                if let Some(region) = b.region_mut() {
+                    *region = region_ids[region];
+                }
             }
         }
-        if cut.reached.iter().any(|r| !r) || cut.regions_reached.contains(&false) {
-            return Err(RestoreError::Malformed);
+    }
+    for p in prots.iter_mut().chain(tail.iter_mut().map(|t| &mut t.1)) {
+        if let PageProt::Backed { region, .. } = p {
+            *region = region_ids[region];
         }
     }
-
+    host.restore_durable_handles(&generations, &handles);
+    if let Some((region, off, badge)) = end {
+        host.restore_end_post(region_ids[&region], off, badge);
+    }
+    if let Some(attest) = attest {
+        host.set_attestation(attest);
+    }
+    // Each nested domain into its own powerbox, in the order `grant` built them.
+    let (mut detached, mut twins) = (g.detached.into_iter(), g.twins.into_iter());
+    let thaw = thaw.map(
+        |l| {
+            let (mut child, g) = detached.next().expect("grant built one per live child");
+            let DecodedDetached {
+                digest,
+                names,
+                pager,
+                domain,
+            } = l.payload;
+            let (window, reserved_log2) = apply(*domain, g, &mut child, live);
+            ThawedDetached {
+                window,
+                reserved_log2,
+                host: child,
+                digest,
+                names,
+                pager,
+            }
+        },
+        |t| {
+            let (mut twin, g) = twins.next().expect("grant built one per live twin");
+            let DecodedTwin {
+                servicer,
+                names,
+                domain,
+            } = t.payload;
+            let (window, reserved_log2) = apply(*domain, g, &mut twin, live);
+            ThawedTwin {
+                window,
+                reserved_log2,
+                host: twin,
+                servicer,
+                names,
+            }
+        },
+    );
+    host.set_thaw(thaw);
     // The window: its head under the module's declared memory, then each page it holds past it.
-    let declared = module.memory.map_or(0, |mc| 1u64 << mc.size_log2);
     let mut layout = MemLayout::from_dense(window, &prots, declared);
     for (off, prot, bytes) in tail {
         layout.hold(off, prot, bytes);
     }
-    Ok((layout, reserved_log2))
+    (layout, reserved_log2)
+}
+
+/// Decode Section 12 ([`write_twins`]) and each live twin's own artifact, against `module`, its
+/// parent's program: the live twins, then the exited ones.
+#[allow(clippy::type_complexity)]
+fn decode_twins(
+    body: &[u8],
+    module: &Module,
+    host: &Host,
+    depth: usize,
+    cut: &mut DecodeCut,
+) -> Result<(Vec<LiveTwin<DecodedTwin>>, Vec<FrozenTwin>), RestoreError> {
+    if depth >= MAX_DETACHED_DEPTH {
+        return Err(RestoreError::Malformed);
+    }
+    let mut r = Reader::new(body);
+    let n = r.uleb()? as usize;
+    if n == 0 {
+        return Err(RestoreError::Malformed); // canonical: an empty list elides the section
+    }
+    let (mut twins, mut exited) = (Vec::new(), Vec::new());
+    let mut last: Option<u64> = None;
+    for _ in 0..n {
+        let pid = r.uleb()?;
+        if last.is_some_and(|p| p >= pid) {
+            return Err(RestoreError::Malformed); // canonical: strictly ascending pid
+        }
+        last = Some(pid);
+        let (servicer, entry, ctx, names, art) = match read_twin_record(&mut r)? {
+            TwinRecord::Exited(outcome) => {
+                exited.push(FrozenTwin { pid, outcome });
+                continue;
+            }
+            TwinRecord::Live {
+                servicer,
+                entry,
+                ctx,
+                names,
+                artifact,
+            } => (servicer, entry, ctx, names, artifact),
+        };
+        // Its root runs in the forking vCPU's context, which its own residue's extent lies in. A
+        // context past the arena is refused here, before the nested pass reads it (and again by the
+        // parent's pass with the rest of the record).
+        if ctx as usize >= temen_ir::durable_abi::MAX_SHADOW_CONTEXTS {
+            return Err(RestoreError::Malformed);
+        }
+        let domain = decode(art, module, host, depth + 1, ctx as usize, cut)?;
+        twins.push(LiveTwin {
+            pid,
+            entry,
+            ctx,
+            payload: DecodedTwin {
+                servicer,
+                names,
+                domain: Box::new(domain),
+            },
+        });
+    }
+    if !r.at_end() {
+        return Err(RestoreError::Malformed);
+    }
+    Ok((twins, exited))
+}
+
+/// Decode Section 8 ([`write_detached`]) and each child's own artifact. A child whose module the
+/// restoring host no longer grants is `ModuleUnresolved`, the same answer as for a handle. `spawner`
+/// is the program whose Section 8 this is: a paged child's pager must be one of its pager exports.
+fn decode_detached(
+    body: &[u8],
+    spawner: &Module,
+    host: &Host,
+    depth: usize,
+    cut: &mut DecodeCut,
+) -> Result<Vec<LiveDetached<DecodedDetached>>, RestoreError> {
+    if depth >= MAX_DETACHED_DEPTH {
+        return Err(RestoreError::Malformed);
+    }
+    let mut r = Reader::new(body);
+    let n = r.uleb()? as usize;
+    if n == 0 {
+        return Err(RestoreError::Malformed); // canonical: an empty list elides the section
+    }
+    let mut out: Vec<LiveDetached<DecodedDetached>> = Vec::with_capacity(n.min(64));
+    for _ in 0..n {
+        let DetachedRecord {
+            parent_task,
+            slot,
+            task,
+            digest,
+            lane,
+            names,
+            pager,
+            joinable,
+            artifact: art,
+        } = read_detached_record(&mut r)?;
+        let parent_task = usize::try_from(parent_task).map_err(|_| RestoreError::Malformed)?;
+        let slot = usize::try_from(slot).map_err(|_| RestoreError::Malformed)?;
+        if out
+            .last()
+            .is_some_and(|p| (p.parent_task, p.slot) >= (parent_task, slot))
+        {
+            return Err(RestoreError::Malformed); // canonical: strictly ascending `(parent_task, slot)`
+        }
+        // #2438 — op 17 admits only a `{ page: (i64) -> (i64) }` export of the spawner's program as a
+        // pager (`Module::is_pager_export`), so an artifact naming anything else is malformed.
+        if pager.is_some_and(|e| !spawner.is_pager_export(e)) {
+            return Err(RestoreError::Malformed);
+        }
+        let module = host
+            .durable_module_by_digest(&digest)
+            .ok_or(RestoreError::ModuleUnresolved(digest))?;
+        let domain = decode(art, &module, host, depth + 1, 0, cut)?;
+        out.push(LiveDetached {
+            parent_task,
+            slot,
+            joinable,
+            task,
+            lane,
+            payload: DecodedDetached {
+                digest,
+                names,
+                pager,
+                domain: Box::new(domain),
+            },
+        });
+    }
+    if !r.at_end() {
+        return Err(RestoreError::Malformed);
+    }
+    Ok(out)
 }
 
 /// #3034 — the rest of a live detached child's Section 8 record: what the thaw pass does not check.
@@ -2333,16 +2728,37 @@ pub struct TwinRest {
 #[doc(hidden)]
 pub type ResidueEdit = RawResidue<DetachedRest, TwinRest>;
 
-/// An artifact's wire header and its sections by tag (the last of a repeated tag).
+/// An artifact's wire header and its sections by tag: the one walker every reader goes through
+/// (#2941). The header is this codec's (magic, kind, version, no flags), and the sections come in the
+/// one canonical order, each tag strictly above the last: a repeated tag, a reordered pair and an
+/// unknown tag are each `Malformed` (§12.1). The encoder writes them so at every nesting level
+/// ([`freeze_at`] is the only writer).
 fn sections(artifact: &[u8]) -> Result<(wire::Header, BTreeMap<u64, &[u8]>), RestoreError> {
     let (hdr, payload) = wire::read_header(artifact).map_err(|e| match e {
         wire::HeaderError::Truncated => RestoreError::Truncated,
         wire::HeaderError::BadMagic => RestoreError::BadMagic,
     })?;
+    if hdr.kind != wire::KIND_SNAPSHOT {
+        return Err(RestoreError::BadMagic); // a TEMEN blob, but not a snapshot
+    }
+    if hdr.version != FORMAT_VERSION {
+        return Err(RestoreError::UnsupportedVersion(hdr.version));
+    }
+    if hdr.flags != 0 {
+        return Err(RestoreError::Malformed); // reserved flag bits
+    }
     let mut r = Reader::new(payload);
     let mut map = BTreeMap::new();
+    let mut prev = None;
     while !r.at_end() {
         let tag = r.uleb()?;
+        // Fail closed on an unknown tag (#915/§8): the version gate pins `FORMAT_VERSION`, so no
+        // artifact this build emits carries one. And on a tag at or below the last (#2941): a second
+        // copy or a reordered pair is a second artifact restoring identically to the canonical one.
+        if tag > TAG_END || prev.is_some_and(|p| tag <= p) {
+            return Err(RestoreError::Malformed);
+        }
+        prev = Some(tag);
         let len = r.uleb()? as usize;
         map.insert(tag, r.take(len)?);
     }
@@ -2532,148 +2948,6 @@ pub fn encode_residue(artifact: &[u8], edit: &ResidueEdit) -> Result<Vec<u8>, Re
     Ok(out)
 }
 
-/// Decode Section 12 ([`write_twins`]) and restore each live twin's artifact into a fresh powerbox
-/// holding the restoring host's thaw seams ([`Host::detached_thaw_host`]), against `module`, its
-/// parent's program: the live twins, then the exited ones.
-fn decode_twins(
-    body: &[u8],
-    module: &Module,
-    host: &mut Host,
-    depth: usize,
-    cut: &mut ThawCut,
-) -> Result<(Vec<LiveTwin<ThawedTwin>>, Vec<FrozenTwin>), RestoreError> {
-    if depth >= MAX_DETACHED_DEPTH {
-        return Err(RestoreError::Malformed);
-    }
-    let mut r = Reader::new(body);
-    let n = r.uleb()? as usize;
-    if n == 0 {
-        return Err(RestoreError::Malformed); // canonical: an empty list elides the section
-    }
-    let (mut twins, mut exited) = (Vec::new(), Vec::new());
-    let mut last: Option<u64> = None;
-    for _ in 0..n {
-        let pid = r.uleb()?;
-        if last.is_some_and(|p| p >= pid) {
-            return Err(RestoreError::Malformed); // canonical: strictly ascending pid
-        }
-        last = Some(pid);
-        let (servicer, entry, ctx, names, art) = match read_twin_record(&mut r)? {
-            TwinRecord::Exited(outcome) => {
-                exited.push(FrozenTwin { pid, outcome });
-                continue;
-            }
-            TwinRecord::Live {
-                servicer,
-                entry,
-                ctx,
-                names,
-                artifact,
-            } => (servicer, entry, ctx, names, artifact),
-        };
-        // Its root runs in the forking vCPU's context, which its own residue's extent lies in. A
-        // context past the arena is refused here, before the nested pass reads it (and again by the
-        // parent's pass with the rest of the record).
-        if ctx as usize >= temen_ir::durable_abi::MAX_SHADOW_CONTEXTS {
-            return Err(RestoreError::Malformed);
-        }
-        let mut twin = host.detached_thaw_host();
-        let restored = restore_at(art, module, &mut twin, depth + 1, ctx as usize, cut);
-        host.reclaim_thaw_seams(&mut twin);
-        let (window, reserved_log2) = restored?;
-        twins.push(LiveTwin {
-            pid,
-            entry,
-            ctx,
-            payload: ThawedTwin {
-                window,
-                reserved_log2,
-                host: twin,
-                servicer,
-                names,
-            },
-        });
-    }
-    if !r.at_end() {
-        return Err(RestoreError::Malformed);
-    }
-    Ok((twins, exited))
-}
-
-/// Decode Section 8 ([`write_detached`]) and restore each child's artifact into a fresh powerbox that
-/// holds the restoring host's thaw seams ([`Host::detached_thaw_host`]). A child whose module the
-/// restoring host no longer grants is `ModuleUnresolved`, the same answer as for a handle. `spawner`
-/// is the program whose Section 8 this is: a paged child's pager must be one of its pager exports.
-fn decode_detached(
-    body: &[u8],
-    spawner: &Module,
-    host: &mut Host,
-    depth: usize,
-    cut: &mut ThawCut,
-) -> Result<Vec<LiveDetached<ThawedDetached>>, RestoreError> {
-    if depth >= MAX_DETACHED_DEPTH {
-        return Err(RestoreError::Malformed);
-    }
-    let mut r = Reader::new(body);
-    let n = r.uleb()? as usize;
-    if n == 0 {
-        return Err(RestoreError::Malformed); // canonical: an empty list elides the section
-    }
-    let mut out: Vec<LiveDetached<ThawedDetached>> = Vec::with_capacity(n.min(64));
-    for _ in 0..n {
-        let DetachedRecord {
-            parent_task,
-            slot,
-            task,
-            digest,
-            lane,
-            names,
-            pager,
-            joinable,
-            artifact: art,
-        } = read_detached_record(&mut r)?;
-        let parent_task = usize::try_from(parent_task).map_err(|_| RestoreError::Malformed)?;
-        let slot = usize::try_from(slot).map_err(|_| RestoreError::Malformed)?;
-        if out
-            .last()
-            .is_some_and(|p| (p.parent_task, p.slot) >= (parent_task, slot))
-        {
-            return Err(RestoreError::Malformed); // canonical: strictly ascending `(parent_task, slot)`
-        }
-        // #2438 — op 17 admits only a `{ page: (i64) -> (i64) }` export of the spawner's program as a
-        // pager (`Module::is_pager_export`), so an artifact naming anything else is malformed.
-        if pager.is_some_and(|e| !spawner.is_pager_export(e)) {
-            return Err(RestoreError::Malformed);
-        }
-        let module = host
-            .durable_module_by_digest(&digest)
-            .ok_or(RestoreError::ModuleUnresolved(digest))?;
-        let mut child = host.detached_thaw_host();
-        let restored = restore_at(art, &module, &mut child, depth + 1, 0, cut);
-        host.reclaim_thaw_seams(&mut child);
-        let (window, reserved_log2) = restored?;
-        out.push(LiveDetached {
-            parent_task,
-            slot,
-            joinable,
-            task,
-            lane,
-            payload: ThawedDetached {
-                window,
-                reserved_log2,
-                host: child,
-                digest,
-                names,
-                pager,
-            },
-        });
-    }
-    if !r.at_end() {
-        return Err(RestoreError::Malformed);
-    }
-    Ok(out)
-}
-
 /// Decode Section 2: the frozen-fiber residue (canonical ascending slot), then — appended only when
 /// `spawned_count > 0` (slice 3.2.1) — the spawned-vCPU residue (canonical ascending task) and the
 /// root's extent, then — present iff bytes remain — the completed detached-child residue (canonical
@@ -2817,7 +3091,7 @@ fn decode_control(
 /// Decode Section 5: the `table_log2` header and the durable guest-JIT domains (v17). A `None` body
 /// ⇒ no JIT granted (`table_log2 = 0`, empty set). Enforces canonical minimal encoding via the
 /// shared [`Reader`]; a unit's IR is carried opaquely here (its decode + re-verify happens in
-/// [`Host::restore_durable_jit`]). Returns `(table_log2, domains)`.
+/// [`Host::prepare_durable_jit`]). Returns `(table_log2, domains)`.
 fn decode_jit(body: Option<&[u8]>) -> Result<(u8, Vec<DurableJitTable>), RestoreError> {
     let Some(body) = body else {
         return Ok((0, Vec::new()));
@@ -3308,10 +3582,177 @@ mod decoder_bounds_tests {
     }
 }
 
-/// #3034 — a forged serve section, put through `restore`: the decoder seeds the serve state through
-/// `Host::set_serve`, whose rule refuses a counter past `TASK_MAX`, a ticket at or past the counter, and
-/// a frozen handler naming no live fiber of the admitted residue. A run cannot write any of them (the
-/// setter refuses them first), so the section is rebuilt with the codec's own writers.
+/// #2941 — one canonical form: the sections in strictly ascending tag order, each once; and #3034, a
+/// region post's `off` as the guest's mint makes it. Each of these restored on `11ada7d`.
+#[cfg(test)]
+mod canonical_tests {
+    use super::*;
+
+    const ARENA: ShadowArena = ShadowArena::new(16448, 65536);
+
+    fn module() -> Module {
+        let mut m = temen_text::parse_module(
+            "func () -> (i64) {\nblock 0 () {\n  v0 = i64.const 1\n  return v0\n  }\n}\n",
+        )
+        .expect("parse");
+        m.memory = Some(temen_ir::Memory {
+            size_log2: 17,
+            shadow: Some(ARENA),
+        });
+        temen_durable::transform_module(&m).expect("transform")
+    }
+
+    /// An artifact's sections, in the order its bytes hold them.
+    fn split(art: &[u8]) -> (wire::Header, Vec<(u64, Vec<u8>)>) {
+        let (hdr, payload) = wire::read_header(art).expect("a header");
+        let mut r = Reader::new(payload);
+        let mut out = Vec::new();
+        while !r.at_end() {
+            let tag = r.uleb().unwrap();
+            let len = r.uleb().unwrap() as usize;
+            out.push((tag, r.take(len).unwrap().to_vec()));
+        }
+        (hdr, out)
+    }
+
+    /// The artifact holding `sections`, in the order given.
+    fn join(hdr: &wire::Header, sections: &[(u64, Vec<u8>)]) -> Vec<u8> {
+        let mut out = Vec::new();
+        wire::write_header(&mut out, hdr.kind, hdr.version, hdr.flags);
+        for (tag, body) in sections {
+            section(&mut out, *tag, |b| b.extend_from_slice(body));
+        }
+        out
+    }
+
+    /// A host holding a shared region and a post to it, and a stdout: an artifact with six sections.
+    fn artifact(m: &Module) -> Vec<u8> {
+        let mut host = Host::new();
+        host.grant_stream(StreamRole::Out);
+        let region = host.grant_shared_region(PAGE);
+        host.cap_call(temen_ir::cap_id::SHARED_REGION, 6, region, &[0, 1], 1, None)
+            .expect("a post to the region");
+        let win = temen_durable::init_durable_window(1 << 17, ARENA);
+        let prots = vec![PageProt::Rw; win.len() / PAGE];
+        freeze_with_prots(m, &win, &prots, 17, &host).expect("freeze")
+    }
+
+    fn restores(art: &[u8], m: &Module) -> Result<(), RestoreError> {
+        restore(art, m, &mut Host::new()).map(|_| ())
+    }
+
+    #[test]
+    fn a_repeated_or_reordered_section_is_refused() {
+        let m = module();
+        let art = artifact(&m);
+        assert_eq!(restores(&art, &m), Ok(()), "the control");
+        let (hdr, secs) = split(&art);
+        assert!(
+            secs.len() >= 4,
+            "a header, a window, handles, regions: {secs:?}"
+        );
+        for i in 0..secs.len() {
+            let mut twice = secs.clone();
+            twice.insert(i + 1, secs[i].clone());
+            assert_eq!(
+                restores(&join(&hdr, &twice), &m),
+                Err(RestoreError::Malformed),
+                "section {} twice (the last copy won)",
+                secs[i].0
+            );
+        }
+        for i in 0..secs.len() - 1 {
+            let mut swapped = secs.clone();
+            swapped.swap(i, i + 1);
+            assert_eq!(
+                restores(&join(&hdr, &swapped), &m),
+                Err(RestoreError::Malformed),
+                "sections {} and {} swapped (it restored as the canonical order)",
+                secs[i].0,
+                secs[i + 1].0
+            );
+        }
+    }
+
+    /// `sections()` is the walker restore uses, and refuses what restore refuses.
+    #[test]
+    fn the_test_and_fuzz_walker_is_restores() {
+        let m = module();
+        let (hdr, secs) = split(&artifact(&m));
+        let mut swapped = secs.clone();
+        swapped.swap(0, 1);
+        assert_eq!(
+            sections(&join(&hdr, &swapped)).err(),
+            Some(RestoreError::Malformed)
+        );
+        assert!(decode_residue(&join(&hdr, &swapped)).is_err());
+    }
+
+    /// The artifact with a `RegionPost` at `off` in Section 3 and its end post at `end` in
+    /// Section 14 (region 0, one page).
+    fn with_posts(art: &[u8], off: u32, end: u32) -> Vec<u8> {
+        let (hdr, mut secs) = split(art);
+        for (tag, body) in secs.iter_mut() {
+            if *tag == TAG_HANDLES {
+                let mut r = Reader::new(body);
+                let generations = read_generations(&mut r, Host::handle_capacity()).unwrap();
+                let mut handles = Vec::new();
+                for _ in 0..r.uleb().unwrap() {
+                    let slot = r.uleb().unwrap() as u32;
+                    let type_id = r.uleb().unwrap() as u32;
+                    let binding = match read_binding(&mut r).unwrap() {
+                        DurableBinding::RegionPost { region, badge, .. } => {
+                            DurableBinding::RegionPost { region, off, badge }
+                        }
+                        b => b,
+                    };
+                    handles.push(DurableHandle {
+                        slot,
+                        generation: generations[slot as usize],
+                        type_id,
+                        binding,
+                    });
+                }
+                let mut b = Vec::new();
+                write_generations(&mut b, &generations);
+                write_handle_recs(&mut b, &handles);
+                *body = b;
+            }
+        }
+        let mut b = Vec::new();
+        write_uleb(&mut b, 0);
+        write_uleb(&mut b, end as u64);
+        write_uleb(&mut b, 1);
+        secs.push((TAG_END, b));
+        join(&hdr, &secs)
+    }
+
+    #[test]
+    fn a_post_the_guests_mint_would_refuse_is_refused() {
+        let m = module();
+        let art = artifact(&m);
+        assert_eq!(restores(&with_posts(&art, 0, 8), &m), Ok(()), "the control");
+        let last = (PAGE - 16) as u32; // its 12 bytes end 4 short of the page
+        assert_eq!(restores(&with_posts(&art, last, last), &m), Ok(()));
+        for (what, off, end) in [
+            ("a handle's post off 8-alignment", 4, 8),
+            ("a handle's post past the region", PAGE as u32 - 8, 8),
+            ("an end post off 8-alignment", 0, 12),
+            ("an end post past the region", 0, PAGE as u32 - 8),
+        ] {
+            assert_eq!(
+                restores(&with_posts(&art, off, end), &m),
+                Err(RestoreError::Malformed),
+                "{what}"
+            );
+        }
+    }
+}
+
+/// #3034 — a forged serve section, put through `restore`: the thaw pass admits the serve state beside
+/// the residue, and refuses a counter past `TASK_MAX`, a ticket at or past the counter, and a frozen
+/// handler naming no live fiber of the residue. A run cannot write any of them (the seed refuses them
+/// first), so the section is rebuilt with the codec's own writers.
 #[cfg(test)]
 mod forged_serve_tests {
     use super::*;
@@ -3320,7 +3761,11 @@ mod forged_serve_tests {
 
     fn module() -> Module {
         let mut m = temen_text::parse_module(
-            "func (i32) -> (i64) {\nblock 0 (v0: i32) {\n  v1 = i32.const 0\n  v2 = call.cap 2 0 (i32) -> (i64) v0 (v1)\n  return v2\n  }\n}\n",
+            // A serving module: export 0's op 0 is function 1, `() -> (i64)`, which a dispatch with
+            // no arguments names (#3034).
+            "type 0 func () -> (i64)\ntype 1 interface { get: 0 }\nexport 0 interface \"g\" 1 { get: 1 }\n\
+             func (i32) -> (i64) {\nblock 0 (v0: i32) {\n  v1 = i32.const 0\n  v2 = call.cap 2 0 (i32) -> (i64) v0 (v1)\n  return v2\n  }\n}\n\
+             func () -> (i64) {\nblock 0 () {\n  v0 = i64.const 1\n  return v0\n  }\n}\n",
         )
         .expect("parse");
         m.memory = Some(temen_ir::Memory {

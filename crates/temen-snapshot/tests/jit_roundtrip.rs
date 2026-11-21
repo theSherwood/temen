@@ -214,7 +214,6 @@ fn no_jit_domain_elides_section_5() {
 /// this failure; here we exercise the `Host` primitive directly (deterministic, no byte-fiddling).
 #[test]
 fn restore_rejects_a_corrupt_unit() {
-    let mut host = Host::new();
     let bad = vec![DurableJitTable {
         mem_log2: Some(SIZE_LOG2),
         units_left: 10,
@@ -226,8 +225,8 @@ fn restore_rejects_a_corrupt_unit() {
         installed: Vec::new(),
     }];
     assert_eq!(
-        host.restore_durable_jit(&bad),
-        Err(JitRestoreError::Decode),
+        Host::prepare_durable_jit(&bad).err(),
+        Some(JitRestoreError::Decode),
         "a corrupt unit IR is rejected fail-closed"
     );
 }
