@@ -877,9 +877,9 @@ impl Drop for GateAside {
 /// until the handler steps back ([`Window::self_calls`]).
 pub fn handler_steps_aside(vm: &VmCtx, self_call: bool) -> Option<GateAside> {
     let window = vm.handler_window.load(Ordering::Acquire);
-    // A guest fiber's park parks the fiber alone, and the handler's own code runs on, as the fiber's
-    // resumer, with the gate.
-    if window.is_null() || crate::in_guest_fiber() {
+    // #3133 — a guest fiber's code runs on a context of its own, which names no window, so a guest
+    // fiber's park finds none here and parks the fiber alone.
+    if window.is_null() {
         return None;
     }
     let me = fiber_rt::context_id();
@@ -3765,7 +3765,7 @@ enum Outcome {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::{
         activation_ctx, CarriedBy, Carrier, ChildExec, Entry, HeldCaller, ServeSite, Wake,
         HANDLERS_ENDING,
@@ -3778,7 +3778,7 @@ mod tests {
     /// its gate and its domain's handler count, which is all a claim touches. With it, one task of
     /// the pool, parked and carried by this thread, so a wake the claim causes shows as its park
     /// ending and starts no worker.
-    fn parked_site() -> (Arc<ServeSite>, Arc<ChildExec>) {
+    pub(crate) fn parked_site() -> (Arc<ServeSite>, Arc<ChildExec>) {
         let exec = ChildExec::new();
         let vm = Arc::new(VmCtx::new(InstanceAddrs::NONE, crate::Window::NONE));
         let window = Arc::new(super::Window {

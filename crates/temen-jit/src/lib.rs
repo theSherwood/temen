@@ -3294,8 +3294,8 @@ pub struct VarMachineInfo {
 /// over it ([`CompiledModule::begin_fibers`]). A local of the run ([`CompiledModule::run_code_raw`]),
 /// so the run owns them on every way out of it: when it is dropped the root's runtime is unpublished
 /// and every fiber goes, its stack and charge with it ([`fiber_rt::SharedFiberTable::end`]). A fiber
-/// lives no longer than the run that made it: it holds that run's window base and context, which
-/// die with the run.
+/// lives no longer than the run that made it: it holds that run's window base, and a context of its
+/// own whose pointers are the run's (#3133), which die with the run.
 #[cfg(fiber_rt)]
 struct RunFibers {
     table: Arc<fiber_rt::SharedFiberTable>,
@@ -11248,7 +11248,8 @@ fn lower_block(
             // fiber_new(vmctx, funcref:i32, arg0:i64) -> i32 handle. The running vCPU's fiber
             // runtime is read from a thread-local, so threads + fibers compose. The fiber's window,
             // function table and fuel cell (whose first entry refunds the prologue charge its
-            // starting `cont.resume` already paid, #1642) are its creator's, read from `vmctx`.
+            // starting `cont.resume` already paid, #1642) are its creator's, read from `vmctx`,
+            // which the fiber's own context copies (#3133).
             let vmctx = b.use_var(lower.vmctx_var);
             let funcref = get(&vals, *func)?;
             let arg0 = get(&vals, *arg0)?;
@@ -13190,7 +13191,7 @@ enum Callee {
     /// enough, and the check stays one load on the hot path.
     Guest,
     /// The host, which may have seen another vCPU end the domain (a join, a park, a fiber that
-    /// trapped on its creator's context): read the domain's end, and copy it into the stop word
+    /// trapped on its own context, #3133): read the domain's end, and copy it into the stop word
     /// before returning.
     Host,
 }

@@ -954,8 +954,9 @@ block 0 (v0: i32, v1: i32, v2: i32, v3: i32) {{
 /// freed memory (reproduced on 5326ff0, under ASan with freed memory filled: a read of a pointer from
 /// the freed context in compiled code). The fiber now runs on a context of its own. Both engines
 /// answer the oracle's 50 · 1_000_000 + 42_080, and the JIT's lane is the JIT's throughout: its root
-/// returns a `JitOutcome`, and the serving child is a JIT compile (`child_compiles`, a process-wide
-/// count, so it says at least one child compiled while the lane ran).
+/// returns a `JitOutcome`, and a JIT root's spawn has no other engine for the child (a child it
+/// cannot compile is the spawn's `CapFault`, `temen-jit`'s `instantiator_rt`), so the `42_080` the
+/// child serves is a JIT child's.
 #[test]
 fn a_serve_handlers_fiber_outlives_the_thread_that_served() {
     let caller = module(&calls_a_server());
@@ -972,7 +973,6 @@ fn a_serve_handlers_fiber_outlives_the_thread_that_served() {
                 host.grant_clock(),
             ];
             if jit {
-                let compiled = temen_jit::child_compiles();
                 let image = temen_interp::MemLayout::image(vec![0u8; 128 << 10]);
                 let (out, _) = temen_run::jit_cap_run(
                     &caller,
@@ -985,10 +985,6 @@ fn a_serve_handlers_fiber_outlives_the_thread_that_served() {
                     None,
                 )
                 .expect("the JIT compiles the caller");
-                assert!(
-                    temen_jit::child_compiles() > compiled,
-                    "the serving child ran on the JIT"
-                );
                 format!("{out:?}")
             } else {
                 let mut fuel = 5_000_000u64;

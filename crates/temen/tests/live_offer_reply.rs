@@ -1222,6 +1222,54 @@ fn a_fibers_serve_op_is_the_running_vcpus() {
     }
 }
 
+/// #3133 (review D) — a `call.cap` a fiber makes on another vCPU than its maker's: the root makes the
+/// fiber and a spawned thread resumes it to its end; the fiber reads the clock it was handed, from
+/// the thread. Its cap thunk leases the running vCPU's view (`RunView`, through `VmCtx::runner`),
+/// the thread's, not its maker's. The root also calls `addmul`, which its server waits for. TW and
+/// JIT. (A fiber's live call from a spawned thread can trap `ThreadFault` on the JIT, on main too:
+/// #3144, so this row's fiber makes a call that does not park.)
+#[test]
+fn a_fiber_made_on_one_vcpu_calls_on_another() {
+    let call = r#"
+  va = i64.const 40
+  vb = i64.const 2
+  vsum, vprod = call.cap 268435456 0 (i64, i64) -> (i64, i64) v7 (va, vb)
+  vthousand = i64.const 1000
+  vsh = i64.mul vsum vthousand
+  vserved = i64.add vsh vprod
+  vf = ref.func 1
+  vclk = i64.extend_i32_u v3
+  vfk = cont.new vf vclk
+  vz = i64.const 0
+  vt = thread.spawn 2 vfk vz
+  vt_st, vfr = thread.join vt
+  vcall = i64.add vserved vfr"#;
+    let fibers = r#"
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, varg: i64) {
+  vc = i32.wrap_i64 vsp
+  vnow = call.cap 2 0 () -> (i64) vc ()
+  vd = i64.sub vnow vnow
+  vseven = i64.const 7
+  vr = i64.add vd vseven
+  return vr
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vk: i64, vz: i64) {
+  vs, vv = cont.resume vk vz
+  return vv
+  }
+}
+"#;
+    let r = agree(
+        &caller(call, fibers),
+        &server(ADDMUL_TYPES, ADDMUL),
+        &[ENGINES[0], ENGINES[3]],
+    );
+    assert_eq!(r, served(42_087));
+}
+
 /// `hang` (func 2) and `add` (func 3) of [`HANG_ADD`]'s interface.
 const HANG_ADD_HANDLERS: &str = r#"func (i64, i64) -> (i64) {
 block 0 (va: i64, vb: i64) {
@@ -1450,4 +1498,30 @@ block 0 (va: i64, vb: i64) {
         Value::I64(CAP_REVOKED),
         "a killed child joins as 0, and the call is revoked"
     );
+}
+
+/// #3133 (review E) — a handler that parks, called from a caller's guest fiber, with the direct
+/// handoff off and on: the case in which a handler's code could have run inside a guest fiber with
+/// its window set, which `handler_steps_aside` once excluded by asking `in_guest_fiber`. A fiber's
+/// context names no window now, and the handler's park steps aside on its own context. TW and JIT.
+#[test]
+fn a_parking_handler_called_from_a_callers_fiber() {
+    let handler = r#"func (i64, i64) -> (i64, i64) {
+block 0 (va: i64, vb: i64) {
+  vw = i64.const 2048
+  vexp = i32.const 0
+  vto = i64.const 1000000
+  vst = i32.atomic.wait vw vexp vto
+  vs = i64.add va vb
+  vm = i64.mul va vb
+  return vs, vm
+  }
+}
+"#;
+    let r = agree(
+        &caller(IN_A_FIBER, ADDMUL_FIBER),
+        &server(ADDMUL_TYPES, handler),
+        &[ENGINES[0], ENGINES[3]],
+    );
+    assert_eq!(r, served(42_080));
 }

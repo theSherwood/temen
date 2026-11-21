@@ -352,8 +352,6 @@ pub(crate) fn abandon_after_fault(depth: (usize, usize)) {
 /// still blocked reports this again (the cooperative poll).
 const FIBER_PARKED: i64 = 3;
 
-/// One slot of the domain-shared fiber table (D57 3b-ii/3c). The `Arc` keeps a resolved slot stable
-/// while the table grows (a re-entrant `cont.new` from inside a running fiber pushes new slots).
 /// #3133 — a fiber's stack and, for a guest fiber, the context its code runs on
 /// ([`crate::VmCtx::fiber`]): one value, so the context goes wherever the stack goes (a return, a
 /// slot's reuse, its table's end) and never before it. The fields drop in order, the stack first.
@@ -372,6 +370,8 @@ impl Stack {
     }
 }
 
+/// One slot of the domain-shared fiber table (D57 3b-ii/3c). The `Arc` keeps a resolved slot stable
+/// while the table grows (a re-entrant `cont.new` from inside a running fiber pushes new slots).
 pub(crate) struct FiberSlot {
     /// The loom-verified single-owner state word (`fiber_registry`): the migration arbiter — a
     /// `cont.resume` claims through it, from **any** vCPU (3c).
@@ -1031,12 +1031,12 @@ impl SharedFiberTable {
     }
 }
 
-/// Per-vCPU fiber execution context: the shared table plus this vCPU's identity and switch
-/// bookkeeping. The table (the storage) is domain-shared; everything here is touched only by the
-/// one OS thread running this vCPU.
 /// #3133 — how many returned fibers' contexts a vCPU keeps for its next `cont.new`s.
 const SPARE_CTXS: usize = 16;
 
+/// Per-vCPU fiber execution context: the shared table plus this vCPU's identity and switch
+/// bookkeeping. The table (the storage) is domain-shared; everything here is touched only by the
+/// one OS thread running this vCPU.
 pub(crate) struct FiberRuntime {
     /// The domain-shared fiber table (storage + ownership arbiter).
     table: Arc<SharedFiberTable>,
@@ -1080,6 +1080,13 @@ pub(crate) struct FiberRuntime {
     /// reuse ([`guest_fiber`]), as a finished slot is reused (#2486): a warmed `cont.new` allocates
     /// none. At most [`SPARE_CTXS`]. Boxed: a fiber's code holds its context's address, so a context
     /// never moves once a fiber is made on it.
+    ///
+    /// A spare holds nothing ([`crate::VmCtx::holds_nothing`], asserted where a context becomes one):
+    /// a fiber's context owns no cell, serve site, cap thunk state, end or handler count (a fiber's
+    /// serve site and thunk state are its runner's), and names no runner once its fiber is out. So a
+    /// spare kept past its run, in an idle shell's `FiberRuntime`, keeps nothing of the run alive but
+    /// the copied pointers, which it never reads again. #3143 would keep the context inline in its
+    /// slot, which the slot's recycling would reuse, and remove this list.
     #[allow(clippy::vec_box)]
     spare_ctxs: Vec<Box<crate::VmCtx>>,
     /// **Durable freeze residue** (slice 3.2/3.3.3): fibers this vCPU flattened during a freeze
@@ -1181,8 +1188,9 @@ unsafe fn fault(vm: u64) {
 
 /// Build a suspended native fiber that, on first resume, runs guest `funcref(arg0, arg)` through the
 /// call-trampoline — resolving + type-checking the funcref against the function table on that first
-/// resume, like the interpreter. Shared by `cont.new` ([`fiber_new`]) and durable thaw re-seeding
-/// ([`SharedFiberTable::seed_frozen`]), so a thawed fiber re-enters its entry identically.
+/// resume, like the interpreter. Called only by [`guest_fiber`], which `cont.new` ([`fiber_new`]) and
+/// a thaw's re-seeding ([`seed_frozen_fibers`]) both go through, so a thawed fiber re-enters its entry
+/// identically.
 ///
 /// Returns `None` if the OS refuses the control-stack reservation — the caller turns it into a
 /// `FiberFault`, never an abort, so a guest spawning many fibers can't crash the host (ISSUES.md I1).
@@ -1247,6 +1255,26 @@ unsafe fn make_fiber(
     })
 }
 
+#[cfg(test)]
+thread_local! {
+    /// #3133 — how many spares this thread's `cont.new`s reused, for the spare rows.
+    static SPARES_REUSED: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+}
+
+/// Count a reused spare on this thread.
+#[cfg(test)]
+#[inline(never)]
+fn spare_reused() {
+    SPARES_REUSED.with(|n| n.set(n.get() + 1));
+}
+
+/// How many spares this thread's `cont.new`s have reused.
+#[cfg(test)]
+#[inline(never)]
+pub(crate) fn spares_reused() -> usize {
+    SPARES_REUSED.with(|n| n.get())
+}
+
 /// #3133 — a guest fiber over `creator`'s instance: a context of its own made from `creator`'s
 /// ([`crate::VmCtx::fiber`]), which its code runs on, and the stack, which [`make_fiber`] builds
 /// over that context. `cont.new` and a thaw's re-seeding both make theirs here, so no guest fiber
@@ -1269,6 +1297,8 @@ unsafe fn guest_fiber(
 ) -> Option<Stack> {
     let ctx = match (*rt).spare_ctxs.pop() {
         Some(mut spare) => {
+            #[cfg(test)]
+            spare_reused();
             *spare = creator.fiber();
             spare
         }
@@ -1279,8 +1309,8 @@ unsafe fn guest_fiber(
         "a fiber's context names no window (#3133)"
     );
     debug_assert!(
-        ctx.at_rest(),
-        "a new fiber's context names no runner (#3133)"
+        ctx.holds_nothing(),
+        "a new fiber's context holds nothing (#3133)"
     );
     let vm = &*ctx as *const crate::VmCtx as u64;
     let fiber = make_fiber(
@@ -1359,7 +1389,8 @@ pub(crate) unsafe fn make_handler_fiber(
 ///
 /// The fiber runs over its creator's window and function table, charging its counted-fuel cell
 /// (null ⇒ un-armed, for [`make_fiber`]'s start refund): all read from `vm`, its creator's context,
-/// never taken from the code (#2534).
+/// never taken from the code (#2534), and copied into the fiber's own context ([`guest_fiber`],
+/// #3133).
 ///
 /// # Safety
 /// `vm` is the threaded context. The running vCPU's fiber runtime is read from the [`CURRENT_RT`]
@@ -1739,7 +1770,7 @@ pub(crate) unsafe extern "C" fn fiber_resume(
             }) = stack
             {
                 drop(fiber);
-                debug_assert!(ctx.at_rest(), "a spare names no runner (#3133)");
+                debug_assert!(ctx.holds_nothing(), "a spare holds nothing (#3133)");
                 let spares = &mut (*current()).spare_ctxs;
                 if spares.len() < SPARE_CTXS {
                     spares.push(ctx);
@@ -2053,11 +2084,14 @@ pub(crate) unsafe fn seed_frozen_fibers(
     fn_table_base: u64,
     vm: u64,
 ) -> bool {
-    let r = &*rt;
-    let (mask, type_id, call_tramp) = (
-        r.fn_table_mask,
-        r.fiber_type_id,
-        r.call_tramp
+    // What the seeding needs of `rt`, taken out first: `guest_fiber` writes `(*rt).spare_ctxs`, so
+    // no borrow of `*rt` lives across it.
+    let (table, mask, type_id, call_tramp) = (
+        Arc::clone(&(*rt).table),
+        (*rt).fn_table_mask,
+        (*rt).fiber_type_id,
+        (*rt)
+            .call_tramp
             .expect("call-trampoline set before seeding thawed fibers"),
     );
     let mut seed = seed.to_vec();
@@ -2066,18 +2100,20 @@ pub(crate) unsafe fn seed_frozen_fibers(
         // #2878 — the residue is untrusted (DURABILITY.md §4): a slot whose context would lie past
         // the arena is not seeded, as `cont.new` refuses one, and the rewound `cont.resume` that
         // names it fails closed. The oracle's thaw stops at the same slot.
-        if !r.table.seed_fits() {
+        if !table.seed_fits() {
             // #3034 — the thaw pass admitted each slot's context; this refusal stays in front of the
             // raw stores at `region_base(slot + 1)`, loud in debug.
             temen_ir::thaw::backstop("the thaw pass admits only a fiber slot inside the arena");
             break;
         }
         if f.is_free() {
-            let got = r.table.seed_free(f.generation);
+            let got = table.seed_free(f.generation);
             debug_assert_eq!(got, f.slot, "re-seeded slot matches the recorded handle");
             continue;
         }
-        // No counted-fuel entry runs durable, so the context names no cell to refund into.
+        // The fiber's context names the root's cell, so its entry refunds the unit its rewound
+        // `cont.resume` charged, as a `cont.new` fiber's does: the tree-walker's count
+        // (`durable_fibers_jit.rs`, `a_thawed_fibers_start_is_charged_as_the_tree_walker_charges_it`).
         let Some(fiber) = guest_fiber(
             rt,
             crate::VmCtx::at(vm),
@@ -2093,9 +2129,7 @@ pub(crate) unsafe fn seed_frozen_fibers(
             fault(vm);
             return false;
         };
-        let got = r
-            .table
-            .seed_frozen(fiber, f.func, f.arg0, f.shadow_sp, f.generation, f.consumed);
+        let got = table.seed_frozen(fiber, f.func, f.arg0, f.shadow_sp, f.generation, f.consumed);
         debug_assert_eq!(got, expected, "frozen fibers re-seed densely from slot 0");
         debug_assert_eq!(got, f.slot, "re-seeded slot matches the recorded handle");
     }
@@ -2536,11 +2570,6 @@ mod flatten_claim_tests {
     use std::sync::Arc;
     use temen_ir::durable_abi::ShadowArena;
 
-    /// #2032 — two freeze drivers walk one table: each snapshots the parked fibers, then claims
-    /// them. A rival that claimed and flattened one first leaves its slot free at the next
-    /// generation, as the race left it, so this driver's claim of its snapshot's handle loses. That
-    /// is a stale snapshot, not a forgery: a flattening resume skips the fiber. A guest's resume of
-    /// the same handle finds it spent (#2667), and only a generation the slot never reached faults.
     /// #3133 — a context a returned fiber left on its vCPU is the next `cont.new`'s, rewritten whole:
     /// whatever the earlier fiber's left in it (its domain's end in its stop word, a cap thunk's
     /// state, the cell it charged) the new fiber's context is its own maker's, and it is the same
@@ -2583,6 +2612,11 @@ mod flatten_claim_tests {
         drop(unsafe { Box::from_raw(rt) });
     }
 
+    /// #2032 — two freeze drivers walk one table: each snapshots the parked fibers, then claims
+    /// them. A rival that claimed and flattened one first leaves its slot free at the next
+    /// generation, as the race left it, so this driver's claim of its snapshot's handle loses. That
+    /// is a stale snapshot, not a forgery: a flattening resume skips the fiber. A guest's resume of
+    /// the same handle finds it spent (#2667), and only a generation the slot never reached faults.
     #[test]
     fn a_flattening_resume_that_loses_its_claim_skips_the_fiber() {
         let table = Arc::new(SharedFiberTable::new(4, ShadowArena::EMPTY, None));

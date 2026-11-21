@@ -1038,7 +1038,7 @@ jobs:
   asan-held:
     # AddressSanitizer over the held JIT domain's lifetimes (#3000, #2993): an activation's fuel cell,
     # the pool an uncarried activation runs on, and the run's teardown; and a kernel run's vCPU
-    # contexts, which its fibers outlive their vCPUs on (#3078). The bugs there are reads and
+    # contexts and a guest fiber's own context, which outlives the vCPU that made it (#3078, #3133). The bugs there are reads and
     # lock writes of freed heap, which a plain debug build does not see: `held_domain`'s JIT cases
     # passed there while ASan reported a heap-use-after-free in 25 of 30 runs.
     name: ASan (held JIT domains)

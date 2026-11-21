@@ -886,9 +886,11 @@ pub(crate) struct Domain {
 
 /// #2488 — a spawned vCPU's own context ([`crate::VmCtx::vcpu`]) and the fuel cell it charges: the
 /// vCPUs of a domain once shared one cell, and every fuel check stored to its cache line. Boxed,
-/// since compiled code holds the context's address, and a fiber the vCPU made goes on holding it
-/// after the vCPU ends, charging its cell wherever it runs. So an ended vCPU's context is kept for
-/// the next spawn, not freed, and the run frees them all when its vCPUs are joined.
+/// since compiled code holds the context's address. A fiber the vCPU made runs on a context of its
+/// own (#3133), but that context copies this one's `fuel`, a pointer into `cell`, and charges it
+/// wherever the fiber runs, after the vCPU ends too, until #3080 charges the running vCPU's cell. So
+/// what is still load-bearing is the cell: an ended vCPU's context is kept for the next spawn, not
+/// freed, and the run frees them all when its vCPUs are joined.
 struct VcpuCtx {
     vm: crate::VmCtx,
     /// `None` when the run is unmetered.
