@@ -11,6 +11,9 @@
 //! contract (may return FIBER_PARKED; loop for completion). The composite reads only the final
 //! `(status, value)`, never the poll count, so idle-vs-spin is invisible to it.
 
+#[path = "support/kernel_lane.rs"]
+mod kernel_lane;
+
 use temen_run::{instantiate, Backend, Outcome, RunConfig, Value};
 
 fn run_on(src: &str, backend: Backend) -> i64 {
@@ -33,6 +36,8 @@ fn pin_all(src: &str, want: i64) {
     for backend in [Backend::TreeWalk, Backend::Bytecode, Backend::Jit] {
         assert_eq!(run_on(src, backend), want, "{backend:?}");
     }
+    // #3078 slice 3 — a native fiber's wait is the kernel's.
+    assert_eq!(kernel_lane::i64_on_kernel(src), want, "the kernel route");
 }
 
 /// A poll loop over `cont.resume.block` of a fiber that does a 10 ms timed `atomic.wait` (never
@@ -168,6 +173,11 @@ fn no_loop_blocking_resume_idles_on_all_backends() {
             "{backend:?}: a no-loop cont.resume.block must idle-and-complete, not spin to 300"
         );
     }
+    assert_eq!(
+        kernel_lane::i64_on_kernel(BLOCK_NO_LOOP_TIMED),
+        102,
+        "the kernel route"
+    );
 }
 
 /// I48 parity, the **cross-vCPU notify** wake path (the OS-thread case, not just the timer): the
@@ -234,6 +244,8 @@ fn no_loop_blocking_resume_wakes_on_cross_vcpu_notify_all_backends() {
             "{backend:?}: a no-loop blocking resume must idle until the notify and complete (17/117), got {r}"
         );
     }
+    let r = kernel_lane::i64_on_kernel(BLOCK_NO_LOOP_NOTIFY);
+    assert!(r == 17 || r == 117, "the kernel route: {r}");
 }
 
 /// **#1631 — a vCPU idling on a *timed* fiber wait is a notifier, not a deadlock.**
@@ -355,4 +367,15 @@ fn an_unsatisfiable_fiber_wait_faults_promptly_on_the_oracle_and_the_jit() {
             "{backend:?}: verdict must come from the predicate, not the 10 s backstop: {dt:?}"
         );
     }
+    // #3078 slice 3 — on the kernel route the verdict is the rules' (`Stalled`), as an interpreted
+    // fiber's on executor 2: every task asleep, the one fiber's wait untimed.
+    let t0 = std::time::Instant::now();
+    let (o, _, _) = kernel_lane::on_kernel(UNSATISFIABLE_FIBER_WAIT);
+    let dt = t0.elapsed();
+    assert_eq!(
+        o,
+        temen_jit::JitOutcome::Trapped(temen_jit::TrapKind::ThreadFault),
+        "the kernel route, in {dt:?}"
+    );
+    assert!(dt < PROMPT, "the kernel route's verdict took {dt:?}");
 }

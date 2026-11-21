@@ -448,6 +448,63 @@ fibers, no park (ns per round trip / per notify):"
             "ns",
         );
     }
+    // #3078 slice 3 — exit row 3: a poll of a still-parked fiber, by 1, 2 and 4 threads each polling
+    // a fiber of its own.
+    let m = parse(crate::kernel_spike_ir::POLL_PARKED_IR);
+    for w in [1i64, 2, 4] {
+        let mut lanes = [
+            ("today", today(&m, 0, Host::new(), true)),
+            ("kernel", kernel(&m, 0, Host::new)),
+        ];
+        let label = format!("poll of a parked fiber, {w} pollers (wall per n)");
+        per_iter(
+            &label,
+            &mut lanes,
+            move |n| vec![n, w],
+            (1_000, 2_001_000),
+            1.0,
+            reps,
+            1.0,
+            "ns",
+        );
+    }
+    // #3078 slice 3 — exit row 4's not-equal variant (and the notify beside it): the no-wake ops of a
+    // thread beside `k` fibers parked on another word, or `k` that waited on its word and left.
+    let (ir, entry) = crate::kernel_spike_ir::nowake_fibers_in_a_thread_ir();
+    let m = parse(&ir);
+    for (mode, what) in [(0i64, "notify, none"), (1, "wait, not-equal")] {
+        for (same, where_) in [
+            (0i64, "parked on another word"),
+            (1, "waited here and left"),
+        ] {
+            for k in [0i64, 100, 1_000] {
+                if same == 1 && k == 0 {
+                    continue;
+                }
+                let mut lanes = [
+                    ("today", today(&m, entry, Host::new(), true)),
+                    ("kernel", kernel(&m, entry, Host::new)),
+                ];
+                let label = format!("{what}, K = {k} fibers {where_}");
+                per_iter(
+                    &label,
+                    &mut lanes,
+                    move |n| vec![n, k, mode, same],
+                    (1_000, 2_001_000),
+                    1.0,
+                    reps,
+                    1.0,
+                    "ns",
+                );
+            }
+        }
+    }
+    // #3078 slice 3 — exit row 2: the always-block hand-off, the root's wait in a fiber it blocks on.
+    run_always_of(
+        reps,
+        "\nfibers, always block: a fiber's wait, its resumer blocked on it (us per hand-off):",
+        true,
+    );
     let m = parse(crate::kernel_spike_ir::NOWAKE_SUSPENDED_IR);
     for k in [0i64, 100, 1_000] {
         let mut lanes = [
@@ -555,7 +612,7 @@ block 2 (vres: i64) {{
     );
 }
 
-/// #2985 — the always-block hand-off ([`crate::kernel_spike_ir::always_ir`]): the pingpong with a
+/// #2985 — the always-block hand-off ([`crate::kernel_spike_ir::always_ir_of`]): the pingpong with a
 /// turn of work before each notify, long enough that the waiter is asleep before every notify comes.
 /// The zero-delay pingpong is a race between a notify and its waiter reaching its sleep (#2963), so
 /// its cost is the lane's block rate as much as its path; here every lane blocks on every hand-off
@@ -566,10 +623,18 @@ block 2 (vres: i64) {{
 /// on that lane, and the work alone ([`crate::kernel_spike_ir::always_work_ir`]) is measured again
 /// in every rep, interleaved with the pingpong, and taken out.
 fn run_always(reps: usize) {
-    println!(
-        "\nalways block: the pingpong with a turn of work before each notify (us per hand-off):"
+    run_always_of(
+        reps,
+        "\nalways block: the pingpong with a turn of work before each notify (us per hand-off):",
+        false,
     );
-    let pp = parse(&crate::kernel_spike_ir::always_ir());
+}
+
+/// [`run_always`], its title `title`, the root's waits made in a fiber it blocks on when `fiber`
+/// (#3078 slice 3, exit row 2: [`crate::kernel_spike_ir::always_ir_of`]).
+fn run_always_of(reps: usize, title: &str, fiber: bool) {
+    println!("{title}");
+    let pp = parse(&crate::kernel_spike_ir::always_ir_of(fiber));
     let alone = parse(&crate::kernel_spike_ir::always_work_ir());
     let targets: Vec<f64> = std::env::var("SPIKE_WORK_US")
         .map(|v| {

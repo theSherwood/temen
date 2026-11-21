@@ -40,6 +40,9 @@ libm = "0.2"
 # from its dependency graph — see `host_page_size`.
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 page_size = "0.6"
+# #3078 slice 3 — the wall clock a fiber's real deadline is on, shared with the Cranelift JIT's poll
+# of a kernel-parked fiber (`temen_ir::seams::wall_now`). Wasm keeps its poll-tick clock.
+temen-ir = { workspace = true, features = ["clock"] }
 
 # Test-only: parse Temen text kernels for the parallel-driver Miri check (THREADS.md step 4c). Pure
 # parser (only depends on `temen-ir`), so it keeps the test crate Miri-buildable — unlike the `temen`

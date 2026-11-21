@@ -4794,12 +4794,8 @@ block 0 (vsp: i64, varg: i64) {{
                 u64::MAX,
                 Some("fiber only"),
             ),
-            (
-                fibered(true, wait),
-                Host::new(),
-                u64::MAX,
-                Some("fiber parks"),
-            ),
+            // #3078 slice 3 — a fiber's `memory.wait` is the kernel's: admitted.
+            (fibered(true, wait), Host::new(), u64::MAX, None),
             (call(0, 0), pipe(), u64::MAX, Some("fiber parks")),
             (call(0, 1), pipe(), u64::MAX, Some("fiber parks")),
             (call(0, 0), blocking_stdin(), u64::MAX, Some("fiber parks")),
@@ -5855,5 +5851,327 @@ block 0 (va: i64, vb: i64) {
         for _ in 0..20 {
             assert_eq!(on_kernel_as_oracle(&m), Ok(vec![7]));
         }
+    }
+
+    // ----- #3078 slice 3: a native fiber's `memory.wait` is the kernel's ----------------------------
+
+    /// The fiber body slice 3's rows share, function 3 of [`waits_in_a_fiber`]: it waits on the word at
+    /// 16400 for it to leave `expected`, for `timeout` ns (negative: no deadline), and returns the
+    /// wait's status plus 40.
+    fn waiting_fiber(expected: i32, timeout: i64) -> String {
+        format!(
+            "func (i64, i64) -> (i64) {{
+block 0 (vsp: i64, varg: i64) {{
+  vq = i64.const 16400
+  ve = i32.const {expected}
+  vto = i64.const {timeout}
+  vw = i32.atomic.wait vq ve vto
+  vw64 = i64.extend_i32_u vw
+  v40 = i64.const 40
+  vr = i64.add vw64 v40
+  return vr
+  }}
+}}
+"
+        )
+    }
+
+    /// A threaded module whose root makes fiber `vk` (function 3, `fiber`) and runs `root`, which
+    /// defines `vr`; function 1 notifies the word at 16400 once and answers how many it woke, and
+    /// function 2 is `extra` (a whole function, or a trivial one).
+    fn waits_in_a_fiber(root: &str, fiber: &str, extra: Option<&str>) -> temen_ir::Module {
+        let trivial =
+            "func (i64, i64) -> (i64) {\nblock 0 (va: i64, vb: i64) {\n  return va\n  }\n}\n";
+        module(&format!(
+            "memory 16
+func () -> (i64) {{
+block 0 () {{
+  vz = i64.const 0
+  vf = ref.func 3
+  vk = cont.new vf vz
+{root}
+  return vr
+  }}
+}}
+func (i64, i64) -> (i64) {{
+block 0 (va: i64, vb: i64) {{
+  vq = i64.const 16400
+  vone = i32.const 1
+  vn = atomic.notify vq vone
+  vn64 = i64.extend_i32_u vn
+  return vn64
+  }}
+}}
+{}{fiber}",
+            extra.unwrap_or(trivial)
+        ))
+    }
+
+    /// `vs`, an `i32` status, widened as `v`.
+    fn wide(v: &str, vs: &str) -> String {
+        format!("  {v} = i64.extend_i32_s {vs}\n")
+    }
+
+    /// #3078 slice 3 — a fiber's `memory.wait` parks the fiber, not its vCPU, on the kernel route as
+    /// on the oracle, and answers every status the oracle's does:
+    /// - **woken:** the resume reports `FIBER_PARKED` (3); a spawned thread's notify wakes 1; the next
+    ///   resume runs it on with `WAIT_WOKEN`;
+    /// - **not-equal:** one transient `FIBER_PARKED`, then `WAIT_NOT_EQUAL` (the park-time re-check);
+    /// - **timed out at a poll:** a busy `cont.resume` loop ends at the wait's 1 ms deadline, which the
+    ///   poll fires (the jacl shape);
+    /// - **timed out while blocked:** `cont.resume.block` idles the task until the deadline.
+    #[test]
+    fn a_fiber_wait_answers_every_status_as_the_oracle_on_the_kernel_route() {
+        let spawn_join = "  vt = thread.spawn 1 vz vz\n  vts, vn = thread.join vt\n";
+        // s0 * 1000 + n * 100 + s1 * 10 + (status + 40): 3, 1, returned (1), WAIT_WOKEN (0).
+        let woken = format!(
+            "  vs0, vv0 = cont.resume vk vz\n{spawn_join}  vs1, vv1 = cont.resume vk vz\n{}{}\
+  vk1000 = i64.const 1000\n  va = i64.mul vs0w vk1000\n  vk100 = i64.const 100\n  vb = i64.mul vn vk100\n\
+  vk10 = i64.const 10\n  vc = i64.mul vs1w vk10\n  vab = i64.add va vb\n  vabc = i64.add vab vc\n  vr = i64.add vabc vv1",
+            wide("vs0w", "vs0"),
+            wide("vs1w", "vs1"),
+        );
+        // s0 * 100 + s1 * 10 + (status + 40): 3, 1, WAIT_NOT_EQUAL (1).
+        let two = |s0: &str, s1: &str, v: &str| {
+            format!(
+                "{}{}  vk100 = i64.const 100\n  va = i64.mul vs0w vk100\n  vk10 = i64.const 10\n  vb = i64.mul vs1w vk10\n  vab = i64.add va vb\n  vr = i64.add vab {v}",
+                wide("vs0w", s0),
+                wide("vs1w", s1)
+            )
+        };
+        let not_equal = format!(
+            "{spawn_join}  vs0, vv0 = cont.resume vk vz\n  vs1, vv1 = cont.resume vk vz\n{}",
+            two("vs0", "vs1", "vv1")
+        );
+        // The poll loop's last resume: returned (1), WAIT_TIMED_OUT (2): 0 * 100 + 10 + 42.
+        let poll_loop = format!(
+            "{spawn_join}  br 1(vk)\n}}\nblock 1 (vk1: i64) {{\n  vz1 = i64.const 0\n  vs, vv = cont.resume vk1 vz1\n  vthree = i32.const 3\n  vagain = i32.eq vs vthree\n  br_if vagain 1(vk1) 2(vs, vv)\n}}\nblock 2 (vs1: i32, vv1: i64) {{\n  vs0 = i32.const 0\n{}",
+            two("vs0", "vs1", "vv1")
+        );
+        let blocked = format!(
+            "{spawn_join}  vs1, vv1 = cont.resume.block vk vz\n  vs0 = i32.const 0\n{}",
+            two("vs0", "vs1", "vv1")
+        );
+        for (what, root, fiber, want) in [
+            ("woken", woken, waiting_fiber(0, -1), 3_000 + 100 + 10 + 40),
+            ("not-equal", not_equal, waiting_fiber(1, -1), 300 + 10 + 41),
+            (
+                "timed out at a poll",
+                poll_loop,
+                waiting_fiber(0, 1_000_000),
+                10 + 42,
+            ),
+            (
+                "timed out while blocked",
+                blocked,
+                waiting_fiber(0, 1_000_000),
+                10 + 42,
+            ),
+        ] {
+            let m = waits_in_a_fiber(&root, &fiber, None);
+            assert_eq!(on_kernel_as_oracle(&m), Ok(vec![want]), "{what}");
+        }
+    }
+
+    /// #3078 slice 3 — `cont.resume.block` of a kernel-parked fiber idles its task until the fiber can
+    /// be claimed, then resumes it, as the oracle's does: whichever of the notify and the block comes
+    /// first. The root parks the fiber, spawns a thread that notifies it, and blocks on it.
+    #[test]
+    fn a_blocking_resume_of_a_parked_fiber_waits_for_its_wake_on_the_kernel_route() {
+        let root = format!(
+            "  vs0, vv0 = cont.resume vk vz\n  vt = thread.spawn 1 vz vz\n  vs1, vv1 = cont.resume.block vk vz\n  vts, vn = thread.join vt\n{}\
+  vk10 = i64.const 10\n  va = i64.mul vs1w vk10\n  vr = i64.add va vv1",
+            wide("vs1w", "vs1")
+        );
+        let m = waits_in_a_fiber(&root, &waiting_fiber(0, -1), None);
+        for _ in 0..20 {
+            assert_eq!(on_kernel_as_oracle(&m), Ok(vec![10 + 40]));
+        }
+    }
+
+    /// #3078 slice 3 — a fiber parked by thread A, woken by thread C's notify, and claimed by thread B
+    /// runs on on B, with its wait's status: its park record is the run's, not A's. `ended`: A has
+    /// ended by then; else A is alive, spinning on a flag the root sets once B has finished.
+    fn parked_on_a_woken_by_c_resumed_on_b(ended: bool) -> temen_ir::Module {
+        let (wait_for_a, release_a) = match ended {
+            true => ("  vas, vav = thread.join va\n", ""),
+            // A sets 16404 once it has parked the fiber; the root waits for that before C notifies.
+            false => (
+                "  br 1(vk, va)\n}\nblock 1 (vk1: i64, va1: i64) {\n  vp = i64.const 16404\n  vpa = i32.atomic.load vp\n  br_if vpa 2(vk1, va1) 1(vk1, va1)\n}\nblock 2 (vk: i64, va: i64) {\n  vz = i64.const 0\n",
+                "  vg = i64.const 16408\n  vgo = i32.const 1\n  i32.atomic.store vg vgo\n  vas, vav = thread.join va\n",
+            ),
+        };
+        let root = format!(
+            "  va = thread.spawn 2 vk vz\n{wait_for_a}  vc = thread.spawn 1 vz vz\n  vcs, vn = thread.join vc\n  vb = thread.spawn 4 vk vz\n  vbs, vbv = thread.join vb\n{release_a}\
+  vk1000 = i64.const 1000\n  vx = i64.mul vav vk1000\n  vk100 = i64.const 100\n  vy = i64.mul vn vk100\n  vxy = i64.add vx vy\n  vr = i64.add vxy vbv"
+        );
+        // A: resumes the fiber once (it parks), flags it, then (alive) spins on 16408; answers the
+        // resume's status.
+        let a = match ended {
+            true => "func (i64, i64) -> (i64) {\nblock 0 (vk: i64, vb: i64) {\n  vz = i64.const 0\n  vs, vv = cont.resume vk vz\n  vs64 = i64.extend_i32_s vs\n  return vs64\n  }\n}\n".to_string(),
+            false => "func (i64, i64) -> (i64) {\nblock 0 (vk: i64, vb: i64) {\n  vz = i64.const 0\n  vs, vv = cont.resume vk vz\n  vp = i64.const 16404\n  vone = i32.const 1\n  i32.atomic.store vp vone\n  br 1(vs)\n}\nblock 1 (vs1: i32) {\n  vg = i64.const 16408\n  vgo = i32.atomic.load vg\n  br_if vgo 2(vs1) 1(vs1)\n}\nblock 2 (vs2: i32) {\n  vs64 = i64.extend_i32_s vs2\n  return vs64\n  }\n}\n".to_string(),
+        };
+        // B: `cont.resume.block` of the fiber; answers its value.
+        let b = "func (i64, i64) -> (i64) {\nblock 0 (vk: i64, vb: i64) {\n  vz = i64.const 0\n  vs, vv = cont.resume.block vk vz\n  return vv\n  }\n}\n";
+        waits_in_a_fiber(&root, &format!("{}{b}", waiting_fiber(0, -1)), Some(&a))
+    }
+
+    #[test]
+    fn a_fiber_parked_on_one_vcpu_and_woken_runs_on_on_the_vcpu_that_claims_it() {
+        for ended in [true, false] {
+            // A's resume: FIBER_PARKED (3); C woke 1; B's value: WAIT_WOKEN + 40.
+            assert_eq!(
+                on_kernel_as_oracle(&parked_on_a_woken_by_c_resumed_on_b(ended)),
+                Ok(vec![3_000 + 100 + 40]),
+                "ended: {ended}"
+            );
+        }
+    }
+
+    /// #3078 slice 3 (#3079's shape) — two threads poll one kernel-parked fiber at once: each answers
+    /// `FIBER_PARKED`, as the oracle's do, since a poll of a parked fiber never claims it (on today's
+    /// route a poll claims it to re-check, and a racing poll can trap `FiberFault`). The root then
+    /// notifies and resumes it.
+    #[test]
+    fn two_threads_polling_one_parked_fiber_each_see_it_parked_on_the_kernel_route() {
+        let poller = "func (i64, i64) -> (i64) {\nblock 0 (vk: i64, vb: i64) {\n  vz = i64.const 0\n  vs, vv = cont.resume vk vz\n  vs64 = i64.extend_i32_s vs\n  return vs64\n  }\n}\n";
+        let root = format!(
+            "  vs0, vv0 = cont.resume vk vz\n  vp1 = thread.spawn 2 vk vz\n  vp2 = thread.spawn 2 vk vz\n  vp1s, vp1v = thread.join vp1\n  vp2s, vp2v = thread.join vp2\n\
+  vt = thread.spawn 1 vz vz\n  vts, vn = thread.join vt\n  vs1, vv1 = cont.resume vk vz\n{}\
+  vk1000 = i64.const 1000\n  va = i64.mul vp1v vk1000\n  vk100 = i64.const 100\n  vb = i64.mul vp2v vk100\n  vk10 = i64.const 10\n  vc = i64.mul vs1w vk10\n  vab = i64.add va vb\n  vabc = i64.add vab vc\n  vr = i64.add vabc vv1",
+            wide("vs1w", "vs1")
+        );
+        let m = waits_in_a_fiber(&root, &waiting_fiber(0, -1), Some(poller));
+        for _ in 0..20 {
+            assert_eq!(on_kernel_as_oracle(&m), Ok(vec![3_000 + 300 + 10 + 40]));
+        }
+    }
+
+    /// #3078 slice 3 (the review's change) — a stale handle to a recycled slot never reaches the park
+    /// of the fiber that took the slot: the first fiber returns, a second takes its slot and parks, and
+    /// a `cont.resume` of the first's handle answers `-EBADF` (spent) before the second is woken and
+    /// after, as the oracle's does. Then the second runs on with `WAIT_WOKEN`.
+    #[test]
+    fn a_stale_handle_to_a_recycled_slot_is_spent_while_its_new_fiber_parks_and_wakes() {
+        let returns = "func (i64, i64) -> (i64) {\nblock 0 (va: i64, vb: i64) {\n  v5 = i64.const 5\n  return v5\n  }\n}\n";
+        let root = format!(
+            "  vs0, vv0 = cont.resume vk vz\n  vg = ref.func 2\n  vk2 = cont.new vg vz\n  vp, vpv = cont.resume vk2 vz\n\
+  vsa, vva = cont.resume vk vz\n  vt = thread.spawn 1 vz vz\n  vts, vn = thread.join vt\n  vsb, vvb = cont.resume vk vz\n  vs1, vv1 = cont.resume vk2 vz\n\
+{}{}{}{}  vk1000 = i64.const 1000\n  va = i64.mul vsaw vk1000\n  vab = i64.add va vsbw\n  vabk = i64.mul vab vk1000\n  vk100 = i64.const 100\n  vc = i64.mul vpw vk100\n  vk10 = i64.const 10\n  vd = i64.mul vs1w vk10\n  vabc = i64.add vabk vc\n  vabcd = i64.add vabc vd\n  vr = i64.add vabcd vv1",
+            wide("vsaw", "vsa"),
+            wide("vsbw", "vsb"),
+            wide("vpw", "vp"),
+            wide("vs1w", "vs1"),
+        );
+        // Function 3 returns at once (the first fiber); function 2 waits (the second, in its slot).
+        let m = waits_in_a_fiber(&root, returns, Some(&waiting_fiber(0, -1)));
+        let ebadf = temen_ir::errno::EBADF;
+        let want = (ebadf * 1000 + ebadf) * 1000 + 300 + 10 + 40;
+        assert_eq!(on_kernel_as_oracle(&m), Ok(vec![want]));
+    }
+
+    /// #3078 slice 3 — a run that ends with a fiber parked on a word nobody notifies ends as the oracle's
+    /// does, however it ends: the root's return, a trap, an `Exit` (on host handle `exit`), and with a
+    /// task idling on the fiber (`cont.resume.block` in a spawned thread) while the root ends it. The
+    /// fiber's record leaves the wait index with its registry, and its stack goes with the run's table.
+    fn ends_with_a_fiber_parked(end: &str, exit: i32) -> temen_ir::Module {
+        let tail = match end {
+            "trap" => "  unreachable\n}\nblock 1 () {\n  vr = i64.const 9".to_string(),
+            "exit" => format!("  ve = i32.const {exit}\n  vcode = i64.const 7\n  vr = call.cap 1 0 (i64) -> (i64) ve(vcode)"),
+            _ => "  vr = i64.const 9".to_string(),
+        };
+        let idle = match end {
+            // A thread idles on the fiber; the root flags 16404 once it has started, then ends.
+            "idle" => "  vt = thread.spawn 2 vk vz\n  br 1(vk)\n}\nblock 1 (vk1: i64) {\n  vp = i64.const 16404\n  vpa = i32.atomic.load vp\n  br_if vpa 2() 1(vk1)\n}\nblock 2 () {\n",
+            _ => "  vt = thread.spawn 1 vz vz\n  vts, vn = thread.join vt\n",
+        };
+        let blocker = "func (i64, i64) -> (i64) {\nblock 0 (vk: i64, vb: i64) {\n  vz = i64.const 0\n  vp = i64.const 16404\n  vone = i32.const 1\n  i32.atomic.store vp vone\n  vs, vv = cont.resume.block vk vz\n  return vv\n  }\n}\n";
+        let root = format!("  vs0, vv0 = cont.resume vk vz\n{idle}{tail}");
+        waits_in_a_fiber(
+            &root,
+            &waiting_fiber(5, -1).replace("ve = i32.const 5", "ve = i32.const 0"),
+            Some(blocker),
+        )
+    }
+
+    #[test]
+    fn a_run_ending_with_a_fiber_parked_ends_as_the_oracles_on_the_kernel_route() {
+        for (end, want) in [
+            ("return", Ok(vec![9])),
+            ("trap", Err(Trap::Unreachable)),
+            ("idle", Ok(vec![9])),
+        ] {
+            assert_eq!(
+                on_kernel_as_oracle(&ends_with_a_fiber_parked(end, 0)),
+                want,
+                "{end}"
+            );
+        }
+        // An `Exit` beside it, on the host's exit grant.
+        let mut host = Host::new();
+        let exit = host.grant_exit();
+        let m = ends_with_a_fiber_parked("exit", exit);
+        let (got, vcpus) = bounded("the exiting run", move || {
+            let admitted = jit_kernel::admit(&m, &host, false, u64::MAX).expect("in scope");
+            let end =
+                jit_kernel::run(admitted, fresh_start(u64::MAX), &mut host).expect("compiles");
+            (end.result, end.vcpus)
+        });
+        assert!(vcpus >= 2, "it ran as kernel tasks");
+        assert_eq!(got, Err(Trap::Exit(7)));
+    }
+
+    /// #3078 slice 3 — the kill door ends a kernel run whose fiber is parked and whose root idles on it
+    /// (`cont.resume.block`): the idle task is woken by the run's end, and the run ends `OutOfFuel`.
+    #[test]
+    fn the_kill_door_ends_a_kernel_run_idling_on_a_parked_fiber() {
+        let kill = temen_jit::Interrupt::new();
+        let door = std::sync::Arc::clone(&kill);
+        let fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let saw = std::sync::Arc::clone(&fired);
+        let (mut host, handle) = answering(move || {
+            saw.store(true, std::sync::atomic::Ordering::SeqCst);
+            door.fire();
+            0
+        });
+        // The root parks the fiber, a thread fires the kill door through the host procedure, and the
+        // root idles on the fiber, which nothing notifies.
+        let killer = format!(
+            "func (i64, i64) -> (i64) {{\nblock 0 (va: i64, vb: i64) {{\n  vc = i32.const {handle}\n  vz = i64.const 0\n  vp = call.cap 13 0 (i64) -> (i64) vc(vz)\n  return vp\n  }}\n}}\n"
+        );
+        let root = "  vs0, vv0 = cont.resume vk vz\n  vt = thread.spawn 2 vz vz\n  vs1, vv1 = cont.resume.block vk vz\n  vr = i64.const 9";
+        let m = waits_in_a_fiber(root, &waiting_fiber(0, -1), Some(&killer));
+        let (got, vcpus) = bounded("the killed run", move || {
+            let admitted = jit_kernel::admit(&m, &host, false, u64::MAX).expect("in scope");
+            let start = jit_kernel::Start {
+                kill: Some(&kill),
+                ..fresh_start(u64::MAX)
+            };
+            let end = jit_kernel::run(admitted, start, &mut host).expect("compiles");
+            (end.result, end.vcpus)
+        });
+        assert!(
+            fired.load(std::sync::atomic::Ordering::SeqCst),
+            "the door fired"
+        );
+        assert!(vcpus >= 2, "it ran as kernel tasks");
+        assert_eq!(got, Err(Trap::OutOfFuel));
+    }
+
+    /// #3078 slice 3 — each way a native fiber's wait leaves the run's wait index counts it out: after a
+    /// notify's wake and its claim, a notify on the word with no waiter takes executor 2's fast path
+    /// (a debug build counts it, `futex_no_wakes`).
+    #[test]
+    #[cfg(debug_assertions)]
+    fn a_native_fiber_wait_counts_out_as_it_leaves() {
+        // After the fiber's wait is woken and claimed, the root notifies its word 64 times.
+        let root = "  vs0, vv0 = cont.resume vk vz\n  vt = thread.spawn 1 vz vz\n  vts, vn = thread.join vt\n  vs1, vv1 = cont.resume vk vz\n  br 1(vv1)\n}\nblock 1 (vacc: i64) {\n  vq = i64.const 16400\n  vone = i32.const 1\n  vnn = atomic.notify vq vone\n  vone64 = i64.const 1\n  vnext = i64.add vacc vone64\n  vend = i64.const 104\n  vdone = i64.eq vnext vend\n  br_if vdone 2(vnext) 1(vnext)\n}\nblock 2 (vr: i64) {\n";
+        let m = waits_in_a_fiber(root, &waiting_fiber(0, -1), None);
+        let before = temen_interp::bytecode::futex_no_wakes();
+        assert_eq!(kernel(&m), Ok(vec![104]));
+        assert!(
+            temen_interp::bytecode::futex_no_wakes() >= before + 64,
+            "the word went back to the no-wake fast path"
+        );
     }
 }

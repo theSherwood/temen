@@ -25,6 +25,9 @@
 //! arrives), so it is additionally pinned on the explorer; the poll-shaped kernels
 //! (`IMMEDIATE_REPOLL` / `ONE_RESUME`) are Real-scheduler contracts and are not run there.
 
+#[path = "support/kernel_lane.rs"]
+mod kernel_lane;
+
 use temen_run::{instantiate, Backend, Outcome, RunConfig, Value};
 
 /// Run `src` on `backend` and return the single i64 result.
@@ -49,6 +52,8 @@ fn pin_all(src: &str, want: i64) {
     for backend in [Backend::TreeWalk, Backend::Bytecode, Backend::Jit] {
         assert_eq!(run_on(src, backend), want, "{backend:?}");
     }
+    // #3078 slice 3 — a native fiber's wait is the kernel's, its poll the kernel's parked word.
+    assert_eq!(kernel_lane::i64_on_kernel(src), want, "the kernel route");
 }
 
 /// The fiber body every kernel shares: a timed `i32.atomic.wait` on a never-notified zero cell

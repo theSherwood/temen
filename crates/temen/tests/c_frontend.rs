@@ -3943,13 +3943,12 @@ int run(int n) {
     }
 }
 
-/// #3078 slice 2 — the two stackful-fiber scheduler demos keep today's route on the Cranelift JIT:
-/// their libc's locks and joins make `memory.wait`s, which a fiber may reach, so `fiber parks`
-/// declines them on an unmetered run as on a metered one (`fiber fuel` comes after it). Slice 3,
-/// which moves a fiber's wait to the kernel's rules, flips this row to the kernel route.
+/// #3078 slice 3 — the two stackful-fiber scheduler demos run on the Cranelift JIT's kernel route:
+/// their libc's locks and joins make `memory.wait`s, which a fiber may reach, and a fiber's wait is the
+/// kernel's now. Unmetered; a metered run keeps today's route until #3080 (`fiber fuel`).
 #[test]
 #[cfg(all(unix, target_arch = "x86_64"))]
-fn c_guest_fiber_scheduler_demos_keep_todays_route_until_fiber_waits_move() {
+fn c_guest_fiber_scheduler_demos_take_the_kernel_route() {
     for src in [
         include_str!("../../temen-run/demos/mn_sched/mn_sched.c"),
         include_str!("../../temen-run/demos/steal_fibers/steal_fibers.c"),
@@ -3959,8 +3958,8 @@ fn c_guest_fiber_scheduler_demos_keep_todays_route_until_fiber_waits_move() {
         let inst = temen_run::instantiate(m).unwrap_or_else(|e| panic!("instantiate: {e}"));
         let mut unmetered = temen_run::RunConfig::default();
         unmetered.limits.fuel = Some(u64::MAX);
-        assert_eq!(inst.kernel_route(&unmetered), Err("fiber parks"));
+        assert_eq!(inst.kernel_route(&unmetered), Ok(()));
         let metered = temen_run::RunConfig::default();
-        assert_eq!(inst.kernel_route(&metered), Err("fiber parks"));
+        assert_eq!(inst.kernel_route(&metered), Err("fiber fuel"));
     }
 }
