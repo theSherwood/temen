@@ -321,7 +321,7 @@ pub const MAX_JIT_WINDOW_LOG2: u8 = 31; // 2 GiB (the backed `mapped` extent)
 /// so a window frozen under it still thaws at the reservation its artifact records. A real host
 /// chooses this per its VA budget; the reference just caps it so a fuzzed/oversized request
 /// can't ask for an absurd reservation.
-const MAX_JIT_RESERVED_LOG2: u8 = temen_ir::MAX_RESERVED_LOG2; // 1 TiB of reserved VA (lazy)
+const MAX_JIT_RESERVED_LOG2: u8 = 40; // 1 TiB of reserved VA (lazy)
 
 /// Escape-oracle snapshot span (the `_with_host` capture): byte-compare the low `SNAP_CAP` bytes of
 /// the window across interp + JIT, *including* reserved-tail pages the guest grew via the Memory cap
@@ -753,6 +753,35 @@ pub use temen_ir::thaw::{FrozenFiber, FrozenVCpu};
 /// carries no fork twins: this engine does not re-create them (#3098), so a thaw holding one is
 /// refused ([`CompiledModule::set_durable`]) and the embedder thaws on the tree-walker.
 pub type JitThaw = temen_ir::thaw::Thaw<JitDetached, ()>;
+
+/// #3034 — a thaw seed [`CompiledModule::set_durable`] refused, handed back: a fork twin this engine
+/// does not re-create, or a residue no run of the module at context 0 makes. Its relaunch payloads
+/// are the caller's to release ([`release_thaw`]).
+pub struct SeedRefused {
+    pub seed: Box<JitThaw>,
+}
+
+impl core::fmt::Debug for SeedRefused {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("SeedRefused")
+    }
+}
+
+/// #3034 — release the relaunch payloads of a thaw seed that will not run ([`SeedRefused`]), and
+/// those of their own seeds, at every depth: each holds two counted refs on its powerbox.
+///
+/// # Safety
+/// `release` is the releaser of the powerboxes the seed's relaunch payloads name, each of which holds
+/// two live counted refs owned by the seed, released once, here.
+pub unsafe fn release_thaw(release: GrantChildReleaser, thaw: JitThaw) {
+    for l in thaw.into_held().0.live_detached {
+        if let JitDetached::Relaunch(seed) = l.payload {
+            release(seed.child.ctx);
+            release(seed.child.retained_ctx);
+            release_thaw(release, seed.residue);
+        }
+    }
+}
 
 /// The durable snapshot's window-image page granularity (must match `temen-snapshot`'s `PAGE` /
 /// `temen-interp`'s `DURABLE_SNAPSHOT_PAGE`): a restored protection map has one entry per this many
@@ -2522,7 +2551,13 @@ pub fn compile_and_run_durable(
             prots: run.init_prots,
             tail: Vec::new(),
         });
-        cm.set_durable(run.seed)?;
+        // A `DurableRun` seed is built by its caller, who holds no releaser this entry could call:
+        // only `temen_run` builds relaunch payloads, and it seeds through `set_durable` itself.
+        cm.set_durable(run.seed).map_err(|_| {
+            JitError::Unsupported(
+                "durable JIT thaw: a fork twin the JIT cannot re-create, or a residue not admitted for this module",
+            )
+        })?;
         cm.freeze_ctl = run.freeze;
         let (outcome, win) = cm.run(args, Some(init_mem), Some(SNAP_CAP))?;
         Ok((outcome, win, cm.take_durable_residue()))
@@ -5093,12 +5128,13 @@ impl CompiledModule {
     /// caller's, so an embedder like `temen_run::jit_cap_run` needs no second durable entry point.
     /// `seed` is the thaw seed: the residue to re-create before a `REWINDING` run (empty for a freeze
     /// or an ordinary durable run). The freeze residue comes back via [`Self::take_durable_residue`].
-    pub fn set_durable(&mut self, seed: JitThaw) -> Result<(), JitError> {
-        let Ok(Seeded { residue, detached }) = seeded(seed, &self.facts) else {
-            return Err(JitError::Unsupported(
-                "durable JIT thaw: a fork twin the JIT cannot re-create, or a residue not admitted for this module",
-            ));
-        };
+    ///
+    /// #3034 — refused, and handed back whole ([`SeedRefused`]), for a seed this module does not admit
+    /// (it holds a fork twin, or values no run of this module's code at context 0 makes): its relaunch
+    /// payloads hold powerbox refs, which are the caller's to release ([`release_thaw`]).
+    pub fn set_durable(&mut self, seed: JitThaw) -> Result<(), SeedRefused> {
+        let Seeded { residue, detached } =
+            seeded(seed, &self.facts).map_err(|seed| SeedRefused { seed })?;
         self.seed.fibers = residue.fibers;
         self.seed.vcpus = residue.vcpus;
         self.seed.root_sp = residue.root_sp;

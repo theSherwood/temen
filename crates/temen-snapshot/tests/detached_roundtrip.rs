@@ -525,3 +525,155 @@ fn a_budget_node_the_parent_and_child_share_is_one_node_after_a_thaw() {
     rhost.set_captured_detached(thawed.into_iter().map(|t| recaptured(t, &c)).collect());
     assert_eq!(freeze(&p, &win, &rhost).expect("re-freeze"), art);
 }
+
+/// #2941 — a nested domain's registrar refusing, after the root's has answered, leaves the restoring
+/// host as it found it: the root's grant not installed, its registrar back in place (the nested
+/// powerbox borrowed it, `Lent`). The same host then restores the tree whose child asks for nothing
+/// the registrar refuses, and the restored tree re-freezes byte-identically.
+#[test]
+fn a_nested_registrars_refusal_leaves_the_host_and_its_registrar_as_they_were() {
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+    let (p, c) = (parent(), child());
+    let tree = |child_fs: bool| {
+        let (window, mut chost) = frozen_root(&c);
+        if child_fs {
+            temen_fs::grant_vm_fs(&mut chost, None);
+        }
+        let (win, mut host) = parent_with(&c, (window, chost), launch(&c));
+        let fs = host.grant_host_proc(temen_interp::HostProcGrant::new(
+            temen_interp::ProcHandler::Sync(Box::new(|_op, _args, out, _mem, _| {
+                temen_interp::put_results(out, &[0])
+            })),
+            temen_interp::CapState::Stateless,
+        ));
+        host.register_cap_name("fs", fs);
+        (freeze(&p, &win, &host).expect("freeze the tree"), win)
+    };
+    let (bad, win) = tree(true);
+    let (good, _) = tree(false);
+    let asked = std::sync::Arc::new(AtomicUsize::new(0));
+    let restoring = || {
+        let mut h = Host::new();
+        h.set_durable(true);
+        h.grant_durable_module(&c);
+        let a = std::sync::Arc::clone(&asked);
+        h.set_named_cap_registrar(Box::new(move |name, _state, _payer| {
+            a.fetch_add(1, SeqCst);
+            (name == "fs").then(|| temen_interp::NamedCapGrant {
+                grant: temen_interp::HostProcGrant::new(
+                    temen_interp::ProcHandler::Sync(Box::new(|_op, _args, out, _mem, _| {
+                        temen_interp::put_results(out, &[1])
+                    })),
+                    temen_interp::CapState::Stateless,
+                ),
+                process: None,
+            })
+        }));
+        h
+    };
+    let fresh = restoring();
+    let mut h = restoring();
+    assert_eq!(
+        restore_with_prots(&bad, &p, &mut h).map(|_| ()),
+        Err(RestoreError::NamedCapRefused("vm_fs".to_string()))
+    );
+    assert_eq!(
+        asked.load(SeqCst),
+        2,
+        "the root's `fs`, then the child's `vm_fs`"
+    );
+    assert_eq!(h.restore_footprint(), fresh.restore_footprint());
+    assert!(h.residue().is_empty());
+    assert_eq!(
+        freeze(&p, &win, &h).unwrap(),
+        freeze(&p, &win, &fresh).unwrap()
+    );
+    let (rwin, rprots, _) =
+        restore_with_prots(&good, &p, &mut h).expect("the same host, its registrar back");
+    let (live, generations) = thawed(&mut h);
+    let recapt: Vec<_> = live.into_iter().map(|t| recaptured(t, &c)).collect();
+    h.admit_thaw(
+        &p,
+        Residue {
+            children: generations,
+            ..Residue::default()
+        },
+        h.serve(),
+    )
+    .expect("the child table the restore admitted");
+    h.set_captured_detached(recapt);
+    assert_eq!(
+        freeze_with_prots(&p, &rwin, &rprots, 17, &h).expect("re-freeze"),
+        good,
+        "the restored tree re-freezes byte-identically"
+    );
+}
+
+/// #2941 — the canonical section order holds in a nested artifact too: a child's artifact with two of
+/// its sections swapped refuses its parent's restore. The identity control re-encodes it unchanged.
+#[test]
+fn a_nested_artifacts_sections_are_in_the_one_order_too() {
+    let (p, c) = (parent(), child());
+    let (win, host) = parent_with_child(&c);
+    let art = freeze(&p, &win, &host).expect("freeze the tree");
+    let restores = |a: &[u8]| {
+        let mut h = Host::new();
+        h.set_durable(true);
+        h.grant_durable_module(&c);
+        restore_with_prots(a, &p, &mut h).map(|_| ())
+    };
+    let bent = |swap: bool| {
+        let mut edit = temen_snapshot::decode_residue(&art).expect("decode");
+        let child = &mut edit.live_detached[0].payload.artifact;
+        *child = swap_first_two_sections(child, swap);
+        temen_snapshot::encode_residue(&art, &edit).expect("encode")
+    };
+    assert_eq!(restores(&bent(false)), Ok(()), "the identity control");
+    assert_eq!(restores(&bent(true)), Err(RestoreError::Malformed));
+}
+
+/// `art` with its first two sections swapped (`swap`), or re-encoded as it is.
+fn swap_first_two_sections(art: &[u8], swap: bool) -> Vec<u8> {
+    fn uleb(b: &[u8], at: &mut usize) -> u64 {
+        let (mut v, mut shift) = (0u64, 0);
+        loop {
+            let byte = b[*at];
+            *at += 1;
+            v |= u64::from(byte & 0x7f) << shift;
+            if byte & 0x80 == 0 {
+                return v;
+            }
+            shift += 7;
+        }
+    }
+    fn put(out: &mut Vec<u8>, mut v: u64) {
+        loop {
+            let b = (v & 0x7f) as u8;
+            v >>= 7;
+            out.push(if v == 0 { b } else { b | 0x80 });
+            if v == 0 {
+                return;
+            }
+        }
+    }
+    let (hdr, payload) = temen_encode::wire::read_header(art).expect("a header");
+    let mut secs = Vec::new();
+    let mut at = 0;
+    while at < payload.len() {
+        let tag = uleb(payload, &mut at);
+        let len = uleb(payload, &mut at) as usize;
+        secs.push((tag, payload[at..at + len].to_vec()));
+        at += len;
+    }
+    if swap {
+        secs.swap(0, 1);
+    }
+    let mut out = Vec::new();
+    temen_encode::wire::write_header(&mut out, hdr.kind, hdr.version, hdr.flags);
+    for (tag, body) in secs {
+        put(&mut out, tag);
+        put(&mut out, body.len() as u64);
+        out.extend_from_slice(&body);
+    }
+    out
+}

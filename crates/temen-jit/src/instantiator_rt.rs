@@ -423,21 +423,7 @@ unsafe fn release_seed(release: crate::GrantChildReleaser, seed: crate::Detached
     if let crate::DetachedSeed::Captured { seed, .. } = seed {
         release(seed.child.ctx);
         release(seed.child.retained_ctx);
-        release_thaw(release, seed.residue);
-    }
-}
-
-/// [`release_seed`] for the live children of a thaw that was not re-created.
-///
-/// # Safety
-/// As [`release_seed`].
-unsafe fn release_thaw(release: crate::GrantChildReleaser, thaw: crate::JitThaw) {
-    for l in thaw.into_held().0.live_detached {
-        if let crate::JitDetached::Relaunch(seed) = l.payload {
-            release(seed.child.ctx);
-            release(seed.child.retained_ctx);
-            release_thaw(release, seed.residue);
-        }
+        crate::release_thaw(release, seed.residue);
     }
 }
 
@@ -1401,7 +1387,7 @@ impl Nursery {
                 );
                 release(gc.ctx);
                 release(gc.retained_ctx);
-                release_thaw(release, *thaw);
+                crate::release_thaw(release, *thaw);
                 return false;
             }
         };

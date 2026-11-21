@@ -444,10 +444,6 @@ fn serve_state_no_run_makes_is_refused() {
             s(vec![call(0, 1, vec![1, 2], 3)], vec![], vec![]),
         ),
         (
-            "an argument short",
-            s(vec![call(0, 0, vec![1], 3)], vec![], vec![]),
-        ),
-        (
             "a ticket both queued and settled",
             s(
                 vec![call(0, 0, vec![1, 2], 3)],
@@ -473,6 +469,33 @@ fn serve_state_no_run_makes_is_refused() {
     assert!(
         serve_admitted(&m, fiber(), s(vec![], vec![], vec![(1, 0)])),
         "a wait in a live fiber's context"
+    );
+    // The runtime's enqueue admits any argument count, and its serve loop answers a wrong one
+    // `EINVAL`: a queue a run can freeze with.
+    assert!(
+        serve_admitted(
+            &m,
+            Raw::default(),
+            s(vec![call(0, 0, vec![1], 3)], vec![], vec![])
+        ),
+        "an argument short"
+    );
+    // A module with no arena has no residue, but its serve state rides any freeze whose counter
+    // moved, and the same rules admit it; a handler needs a fiber it cannot have.
+    let bare = module(None);
+    assert!(
+        serve_admitted(
+            &bare,
+            Raw::default(),
+            s(vec![], vec![(4, Reply::Failed(-9))], vec![(0, 1)])
+        ),
+        "serve state of an arena-less module"
+    );
+    let mut handler = s(vec![], vec![], vec![]);
+    handler.handlers = vec![(0, 2)];
+    assert!(
+        !serve_admitted(&bare, Raw::default(), handler),
+        "a handler with no fiber"
     );
     assert!(
         !serve_admitted(

@@ -651,7 +651,7 @@ fn a_region_shared_with_a_detached_child_rides_and_stays_shared() {
         })
         .collect();
     again
-        .admit_thaw(&parent, residue, temen_interp::Serve::default())
+        .admit_thaw(&parent, residue, again.serve())
         .expect("the rest of the residue the restore admitted");
     again.set_captured_detached(recaptured);
     assert_eq!(
@@ -1744,7 +1744,7 @@ fn a_detached_childs_end_post_rides_a_freeze() {
         })
         .collect();
     again
-        .admit_thaw(&parent, residue, temen_interp::Serve::default())
+        .admit_thaw(&parent, residue, again.serve())
         .expect("the rest of the residue the restore admitted");
     again.set_captured_detached(recaptured);
     assert_eq!(

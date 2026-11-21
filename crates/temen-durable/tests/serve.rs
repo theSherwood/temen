@@ -117,14 +117,7 @@ fn a_mid_handler_freeze_thaws_and_the_handler_replies() {
     // Thaw: the serve loop adopts the handler, which rewinds, finishes and replies. The residue and
     // the serve state the freeze left are seeded together: the handler names a fiber of the residue.
     let fibers = h.frozen_fibers().to_vec();
-    let (queue, results, next_ticket) = h.svc_state();
-    let serve = temen_interp::Serve {
-        queue,
-        results,
-        next_ticket,
-        waits: h.reply_waits(),
-        handlers: h.frozen_handlers(),
-    };
+    let serve = h.serve();
     h.admit_thaw(
         &inst,
         temen_interp::Residue {

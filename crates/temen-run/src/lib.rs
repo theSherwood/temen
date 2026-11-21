@@ -1714,7 +1714,14 @@ fn jit_durable_enter(cm: &mut CompiledModule, host: &mut Host) -> Result<(), tem
     let thaw = jit_thaw(host, cm.thaw_facts(), 0).ok_or(temen_jit::JitError::Unsupported(
         "durable JIT thaw: a residue the thaw pass refuses",
     ))?;
-    cm.set_durable(thaw)
+    cm.set_durable(thaw).map_err(|refused| {
+        // Unreachable as the take is the check (and the twins were declined above), but the seed's
+        // relaunch payloads hold refs on the child powerboxes this crate built: hand them back.
+        // SAFETY: each payload was built by `relaunch_payload`, whose powerboxes `grant_child_release`
+        // releases, and is released once, here.
+        unsafe { temen_jit::release_thaw(grant_child_release, *refused.seed) };
+        temen_jit::JitError::Unsupported("durable JIT thaw: a seed the compiled module refuses")
+    })
 }
 
 /// #3034 — the residue a restore left on `host` (a run root's, or a captured detached child's on its

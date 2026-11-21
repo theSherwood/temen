@@ -578,9 +578,7 @@ pub enum RestoreError {
 /// quantities, and a 4 GiB reservation (`reserved_log2 == 32`) is ordinary even on a 32-bit host
 /// (wasm32, the browser engine). Only `mapped` — the image itself — has to fit a `usize`.
 fn geometry_ok(module: &Module, mapped: u64, reserved_log2: u8) -> bool {
-    // #3100 — no engine reserves more ([`temen_ir::MAX_RESERVED_LOG2`]): an artifact's own
-    // reservation is what bounds the image it asks to have allocated.
-    if reserved_log2 > temen_ir::MAX_RESERVED_LOG2 {
+    if reserved_log2 as u32 >= u64::BITS {
         return false;
     }
     if mapped == 0 || !mapped.is_multiple_of(PAGE as u64) || mapped > 1u64 << reserved_log2 {
@@ -1911,7 +1909,6 @@ fn restore_cut(
     if cut.reached.contains(&false) || cut.regions_reached.contains(&false) {
         return Err(RestoreError::Malformed);
     }
-    replies_owed(&decoded)?;
     let granted = grant(&decoded, host, Some(&mut cut.budgets))?;
     // #2306 — last of what can refuse: a region's backing is charged to the restoring domain's node
     // and may be an OS object. One rebuilt before a refusal is dropped with the `Vec`, which refunds
@@ -1929,58 +1926,6 @@ fn restore_cut(
         .expect("decode_budgets: each parent numbers below its child");
     let live = LiveCut { ids, regions };
     Ok(apply(decoded, granted, host, &live))
-}
-
-/// #3034 D5 — every reply wait of the cut names a ticket its callee owes, where its callee is in the
-/// cut. A wait's ticket is in its callee's ticket space; its callee is a live detached child some
-/// `LiveImpl` handle of the waiting domain names by task. A domain holding a `LiveImpl` whose callee
-/// the cut does not carry may be waiting on that one: the cut's boundary (as a pipe's end outside it,
-/// #1680), so its waits are admitted. One with no `LiveImpl` has no live call to wait on.
-fn replies_owed(root: &Decoded) -> Result<(), RestoreError> {
-    // Every live detached domain of the cut, by its task, with the serve state that owes replies.
-    fn callees<'a>(d: &'a Decoded, out: &mut Vec<(u64, &'a thaw::Serve)>) {
-        for l in &d.thaw.parts().live_detached {
-            out.push((l.task, l.payload.domain.thaw.serve()));
-            callees(&l.payload.domain, out);
-        }
-        for t in &d.thaw.parts().twins {
-            callees(&t.payload.domain, out);
-        }
-    }
-    fn check(d: &Decoded, all: &[(u64, &thaw::Serve)]) -> bool {
-        let tasks: Vec<u64> = d
-            .handles
-            .iter()
-            .filter_map(|h| match h.binding {
-                DurableBinding::LiveImpl { task, .. } => Some(task),
-                _ => None,
-            })
-            .collect();
-        let named = |task: u64| all.iter().filter(move |c| c.0 == task);
-        let boundary = tasks.iter().any(|&t| named(t).next().is_none());
-        let waits_ok = d.thaw.serve().waits.iter().all(|&(_, ticket)| {
-            !tasks.is_empty()
-                && (boundary || tasks.iter().any(|&t| named(t).any(|c| c.1.owes(ticket))))
-        });
-        waits_ok
-            && d.thaw
-                .parts()
-                .live_detached
-                .iter()
-                .all(|l| check(&l.payload.domain, all))
-            && d.thaw
-                .parts()
-                .twins
-                .iter()
-                .all(|t| check(&t.payload.domain, all))
-    }
-    let mut all = Vec::new();
-    callees(root, &mut all);
-    if check(root, &all) {
-        Ok(())
-    } else {
-        Err(RestoreError::Malformed)
-    }
 }
 
 /// #2941 — decode and check one domain's artifact at detached-nesting `depth` (0 for the artifact an
@@ -2038,18 +1983,7 @@ fn decode(
     if page_size != PAGE || !geometry_ok(module, mapped as u64, reserved_log2) {
         return Err(RestoreError::GeometryMismatch);
     }
-    // #3100 — the image is allocated before any page is read, so it is bounded first by what the
-    // restoring host would let this domain grow to: its window past the declared memory, against the
-    // memory its budget chain has left (a read; the thaw charges it). A domain with no bound on its
-    // memory may ask for what a running guest under that budget could commit, and the allocation is
-    // fallible: a window this process cannot hold is a refusal, never an abort.
     let declared = module.memory.map_or(0, |mc| 1u64 << mc.size_log2);
-    if host
-        .mem_left()
-        .is_some_and(|left| (mapped as u64).saturating_sub(declared) > left)
-    {
-        return Err(RestoreError::GeometryMismatch);
-    }
     let reserved = 1u64 << reserved_log2;
 
     // ---- Regions inside the cut (#2025, v39), by number: the depth-0 artifact carries the whole
@@ -2067,11 +2001,7 @@ fn decode(
 
     // ---- Window image: the head zeroed (default `Rw`), each stored page + its prot splatted over it;
     // past the head, each page the window holds (#2427). ----
-    let mut window = Vec::new();
-    window
-        .try_reserve_exact(mapped)
-        .map_err(|_| RestoreError::GeometryMismatch)?;
-    window.resize(mapped, 0u8);
+    let mut window = vec![0u8; mapped];
     let mut prots = vec![PageProt::Rw; mapped / PAGE];
     let mut tail: Vec<(u64, PageProt, Option<Vec<u8>>)> = Vec::new();
     let mut w = Reader::new(win_body);
@@ -3650,6 +3580,11 @@ mod canonical_tests {
         assert!(
             secs.len() >= 4,
             "a header, a window, handles, regions: {secs:?}"
+        );
+        assert_eq!(
+            restores(&join(&hdr, &secs), &m),
+            Ok(()),
+            "the identity control"
         );
         for i in 0..secs.len() {
             let mut twice = secs.clone();

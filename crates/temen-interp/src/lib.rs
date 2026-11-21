@@ -12738,6 +12738,23 @@ pub mod thaw_backstop {
 /// admitted ([`Host::set_thaw`]); taken by the next run.
 pub type Residue = temen_ir::thaw::RawResidue<ThawedDetached, ThawedTwin>;
 
+/// #2941 — test support: [`Host::restore_footprint`].
+#[doc(hidden)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RestoreFootprint {
+    pub host_procs: usize,
+    pub thaw_names: usize,
+    pub regions: usize,
+    pub pipes: usize,
+    pub jit_domains: usize,
+    pub live_impls: usize,
+    pub end_post: bool,
+    pub budget_nodes: usize,
+    pub own_used: [i64; BUDGET_DIMS],
+    pub registrar: bool,
+    pub budget_hook: bool,
+}
+
 /// An admitted thaw residue for this crate's engines ([`temen_ir::thaw::validate`]).
 pub type Thaw = temen_ir::thaw::Thaw<ThawedDetached, ThawedTwin>;
 
@@ -22612,14 +22629,6 @@ impl BudgetTree {
             .unwrap_or(-1)
     }
 
-    /// [`Self::left`], read under the lock: `None` when every level is unbounded.
-    fn left_of(&self, n: u32, d: usize) -> Option<u64> {
-        let nodes = self.0.lock_unpoisoned();
-        ((n as usize) < nodes.len())
-            .then(|| Self::left(&nodes, n, d))
-            .and_then(|l| u64::try_from(l).ok())
-    }
-
     /// The room a guest sees along `n`'s chain ([`Self::bound`]): what `read` reports.
     fn room(&self, n: u32) -> Option<[i64; BUDGET_DIMS]> {
         let nodes = self.0.lock_unpoisoned();
@@ -30223,12 +30232,6 @@ impl Host {
         self.capture_budget_chains(&self.budget_nodes_held())
     }
 
-    /// #3100 — the memory this domain's budget chain has left, `None` when no level bounds it: a read,
-    /// which charges nothing. What a restore bounds the window an artifact asks for by.
-    pub fn mem_left(&self) -> Option<u64> {
-        self.budgets.left_of(self.own_budget, BUDGET_MEM)
-    }
-
     /// #1944 slice 2 — the budget nodes this domain's handles name, by live id.
     pub fn budget_nodes_held(&self) -> Vec<u32> {
         self.table
@@ -32344,6 +32347,42 @@ impl Host {
     /// order (the artifact's canonical order).
     pub fn frozen_handlers(&self) -> Vec<(u32, u64)> {
         self.frozen_handlers.iter().map(|(&s, &t)| (s, t)).collect()
+    }
+
+    /// #2941 — test support: what a restore writes on this powerbox that a freeze may not read back,
+    /// to compare a refused restore's host with a fresh one: the host procs and their names, the
+    /// regions it holds, the pipes it rebuilt, the guest-JIT domains, the live impls, its end post, the
+    /// nodes of its budget tree and its own node's charges, and whether its registrar and budget hook
+    /// are in place.
+    #[doc(hidden)]
+    pub fn restore_footprint(&self) -> RestoreFootprint {
+        let budget_nodes = self.budgets.0.lock_unpoisoned().len();
+        RestoreFootprint {
+            host_procs: self.host_procs.len(),
+            thaw_names: self.thaw_names.len(),
+            regions: self.regions.iter().filter(|r| r.is_some()).count(),
+            pipes: self.thaw_pipes.len(),
+            jit_domains: self.jit_tables.len(),
+            live_impls: self.live_impls.len(),
+            end_post: self.end.is_some(),
+            budget_nodes,
+            own_used: core::array::from_fn(|d| self.budgets.used(self.own_budget, d)),
+            registrar: self.named_cap_registrar.is_some(),
+            budget_hook: self.budget_thaw_hook.is_some(),
+        }
+    }
+
+    /// #3034 — this domain's serve state, whole ([`Serve`]): what a freeze carries, and what a caller
+    /// re-seeding this powerbox ([`Host::admit_thaw`], which replaces it) passes back.
+    pub fn serve(&self) -> Serve {
+        let (queue, results, next_ticket) = self.svc_state();
+        Serve {
+            queue,
+            results,
+            next_ticket,
+            waits: self.reply_waits(),
+            handlers: self.frozen_handlers(),
+        }
     }
 
     /// DURABILITY.md §13.3 — this domain's stable identity (see the field doc).

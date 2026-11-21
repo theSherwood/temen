@@ -1011,7 +1011,16 @@ block 0 (vsp: i64, vcap: i64) {
 }
 "#;
 
-fn reply_from(site: ParkSite, engine: Engine, t: &str) {
+/// [`reply_from`]'s program, with `t` as its caller: the instrumented root, `C`'s image, and a fresh
+/// powerbox with its arguments.
+#[allow(clippy::type_complexity)]
+fn reply_program(
+    t: &str,
+) -> (
+    Arc<Module>,
+    Arc<Module>,
+    Box<dyn Fn() -> (Host, Vec<Value>)>,
+) {
     let src = r#"
 memory 17
 type 0 func (i64) -> (i64)
@@ -1081,14 +1090,20 @@ block 0 (vx: i64) {
     );
     let inst = instrumented(&src);
     let c = instrumented_image(&src, 2);
-    let powerbox = || {
-        let mut h = durable_host(&inst);
+    let (pi, pc) = (inst.clone(), c.clone());
+    let powerbox = move || {
+        let mut h = durable_host(&pi);
         let i = h.grant_instantiator();
-        let m = h.grant_durable_module(&c);
+        let m = h.grant_durable_module(&pc);
         let b = h.grant_budget(-1, 1 << 20, -1);
         h.grant_freeze_authority();
         (h, vec![Value::I32(i), Value::I32(m), Value::I32(b)])
     };
+    (inst, c, Box::new(powerbox))
+}
+
+fn reply_from(site: ParkSite, engine: Engine, t: &str) {
+    let (inst, c, powerbox) = reply_program(t);
 
     let (h, args) = powerbox();
     let (res, _, _) = run(
@@ -1125,117 +1140,6 @@ block 0 (vx: i64) {
         "{site:?}: the thaw waits on the same ticket, and C serves it once"
     );
     assert!(th.reply_waits().is_empty(), "{site:?}: the wait was taken");
-
-    // #3034 D5 — the wait's ticket is one its callee, in the cut, owes. A ticket C does not owe is a
-    // wait no run makes: refused at restore (on `11ada7d` it restored, and the thaw waited on a reply
-    // that never comes).
-    let forged = with_wait_ticket(&art, |t| t + 1000);
-    let mut fh = durable_host(&inst);
-    fh.grant_durable_module(&c);
-    assert_eq!(
-        temen_snapshot::restore(&forged, &inst, &mut fh).err(),
-        Some(temen_snapshot::RestoreError::Malformed),
-        "{site:?}: a ticket its callee does not owe"
-    );
-    // A callee the cut does not carry is the cut's boundary: the wait is admitted, and the thaw
-    // answers. Here C rides under another task than the one the caller's `LiveImpl` names, so no
-    // child of the cut is its callee, as for a callee outside it: the `LiveImpl` stays unlinked, and
-    // the run ends `CapFault` (the oracle; the JIT and the bytecode engine thaw no reply wait yet,
-    // [`jit_row`], #1904).
-    let mut edit = temen_snapshot::decode_residue(&art).expect("decode");
-    edit.live_detached[0].task += 100;
-    let outside = temen_snapshot::encode_residue(&art, &edit).expect("encode");
-    let mut oh = durable_host(&inst);
-    oh.grant_durable_module(&c);
-    let mut owin =
-        temen_snapshot::restore(&outside, &inst, &mut oh).expect("the cut's boundary restores");
-    begin_thaw(&mut owin, TEST_ARENA, 0);
-    let (res, _, _) = run(engine, &inst, &args, &owin, oh);
-    assert_eq!(
-        res,
-        Err("CapFault".into()),
-        "{site:?}: a wait on a callee outside the cut answers, never hangs"
-    );
-}
-
-/// `art` with each reply wait its root's serve section (Section 4) carries re-ticketed by `f`.
-fn with_wait_ticket(art: &[u8], f: impl Fn(u64) -> u64) -> Vec<u8> {
-    fn uleb(b: &[u8], at: &mut usize) -> u64 {
-        let (mut v, mut shift) = (0u64, 0);
-        loop {
-            let byte = b[*at];
-            *at += 1;
-            v |= u64::from(byte & 0x7f) << shift;
-            if byte & 0x80 == 0 {
-                return v;
-            }
-            shift += 7;
-        }
-    }
-    fn put(out: &mut Vec<u8>, mut v: u64) {
-        loop {
-            let b = (v & 0x7f) as u8;
-            v >>= 7;
-            out.push(if v == 0 { b } else { b | 0x80 });
-            if v == 0 {
-                return;
-            }
-        }
-    }
-    let (hdr, payload) = temen_encode::wire::read_header(art).expect("a header");
-    let mut out = Vec::new();
-    temen_encode::wire::write_header(&mut out, hdr.kind, hdr.version, hdr.flags);
-    let mut at = 0;
-    while at < payload.len() {
-        let tag = uleb(payload, &mut at);
-        let len = uleb(payload, &mut at) as usize;
-        let body = &payload[at..at + len];
-        at += len;
-        let mut nb = Vec::new();
-        if tag == 4 {
-            // The trio: the queue, the settled replies, the counter; then the waits, re-ticketed.
-            let mut r = 0;
-            let start = r;
-            for _ in 0..uleb(body, &mut r) {
-                uleb(body, &mut r);
-                uleb(body, &mut r);
-                for _ in 0..uleb(body, &mut r) {
-                    uleb(body, &mut r);
-                }
-                uleb(body, &mut r);
-            }
-            for _ in 0..uleb(body, &mut r) {
-                uleb(body, &mut r);
-                match uleb(body, &mut r) {
-                    0 => {
-                        for _ in 0..uleb(body, &mut r) {
-                            uleb(body, &mut r);
-                        }
-                    }
-                    _ => {
-                        uleb(body, &mut r);
-                    }
-                }
-            }
-            uleb(body, &mut r);
-            nb.extend_from_slice(&body[start..r]);
-            let n = uleb(body, &mut r);
-            put(&mut nb, n);
-            for _ in 0..n {
-                let ctx = uleb(body, &mut r);
-                let t = uleb(body, &mut r);
-                put(&mut nb, ctx);
-                put(&mut nb, f(t));
-            }
-            nb.extend_from_slice(&body[r..]);
-        } else {
-            nb.extend_from_slice(body);
-        }
-        put(&mut out, tag);
-        put(&mut out, nb.len() as u64);
-        out.extend_from_slice(&nb);
-    }
-    out
 }
 
 /// #1677 — a **fiber** parked at a re-issue site freezes as a vCPU parked there does: the freeze
@@ -1505,4 +1409,76 @@ block 0 (vsp: i64, va: i64) {{
         |h| h.push_stdin(b"x"),
         Ok(1000 + i64::from(b'x') + 7),
     );
+}
+
+/// #3034 — the serve rules a restore applies refuse nothing a real freeze makes: a live call's whole
+/// exchange (the caller issues it, `C` queues it, serves it in a handler, settles the reply, the
+/// caller takes it), frozen at every countdown point until the run ends unfrozen, for a caller that
+/// makes the call itself and one that makes it in a fiber. Every artifact restores and thaws to the
+/// uninterrupted answer. The drained variant closes every non-durable handle before each freeze, as
+/// an embedder's pre-freeze step does (`Host::drain_non_durable`), which leaves the reply waits: its
+/// artifacts restore too, and thaw to an answer, never a hang (the run is bounded). On the tree-walker:
+/// the JIT and the bytecode engine freeze no reply wait yet ([`jit_row`], #1904). `C`'s handler here
+/// runs to its reply without parking, so no cut holds it frozen: a frozen handler's serve state goes
+/// through the same pass in `temen-durable`'s `a_mid_handler_freeze_thaws_and_the_handler_replies`.
+#[test]
+fn a_live_calls_exchange_frozen_at_every_point_restores_and_thaws() {
+    let mut report = Vec::new();
+    for (name, t) in [
+        ("T calls", T_CALLS),
+        ("T calls in a fiber", T_CALLS_IN_A_FIBER),
+    ] {
+        let (inst, c, powerbox) = reply_program(t);
+        for drained in [false, true] {
+            let (mut artifacts, mut declined, mut k) = (0, 0, 0i64);
+            let (mut waits, mut handlers) = (0, 0);
+            loop {
+                let (h, args) = powerbox();
+                let mut win = init_durable_window(WINDOW, TEST_ARENA);
+                arm_freeze_after(&mut win, TEST_ARENA, k);
+                let (res, snap, mut h) = run(Engine::Interp, &inst, &args, &win, h);
+                assert!(k < 10_000, "{name}: the run never ends unfrozen");
+                k += 1;
+                if h.take_freeze_declined().is_some() {
+                    declined += 1; // the run finished as the uninterrupted one does
+                    continue;
+                }
+                if res == Ok(1042) {
+                    k -= 1;
+                    break; // the countdown outlived the run: it ended unfrozen
+                }
+                waits += usize::from(!h.reply_waits().is_empty());
+                handlers += usize::from(
+                    h.captured_detached()
+                        .iter()
+                        .any(|c| !c.host.lock().unwrap().frozen_handlers().is_empty()),
+                );
+                if drained {
+                    h.drain_non_durable();
+                }
+                let Ok(art) = temen_snapshot::freeze(&inst, &snap, &h) else {
+                    declined += 1;
+                    continue;
+                };
+                artifacts += 1;
+                let mut th = durable_host(&inst);
+                th.grant_durable_module(&c);
+                let mut twin = temen_snapshot::restore(&art, &inst, &mut th).unwrap_or_else(|e| {
+                    panic!("{name} at {}: a real freeze refused: {e:?}", k - 1)
+                });
+                begin_thaw(&mut twin, TEST_ARENA, 0);
+                let (res, _, _) = run(Engine::Interp, &inst, &args, &twin, th);
+                if !drained {
+                    assert_eq!(res, Ok(1042), "{name} at {}: the thaw's answer", k - 1);
+                }
+            }
+            assert!(artifacts > 0, "{name}: some point froze");
+            report.push(format!(
+                "{name}{}: N = {k}, {artifacts} artifacts ({waits} with a reply wait, {handlers} with \
+                 the callee's handler frozen), {declined} declined",
+                if drained { " (drained)" } else { "" }
+            ));
+        }
+    }
+    eprintln!("{}", report.join("\n"));
 }

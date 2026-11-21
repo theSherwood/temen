@@ -313,16 +313,13 @@ the same pass, and a powerbox holds it in its live serve state (`Host::set_thaw`
 
 **Restore is decode, then grant, then apply (#2941).** `decode` reads every section of the artifact
 and of every artifact nested in it, in the one canonical order (§12.1), and runs every check above,
-the pass and the cross-domain ones (each reply wait names a ticket its callee owes, where its callee
-is in the cut) included, without writing the restoring host. `grant` asks the restoring embedder:
+the pass and the cut-wide ones included, without writing the restoring host. (A reply wait's
+ticket is not checked against its callee: the wait record does not say which callee it is on.) `grant` asks the restoring embedder:
 its registrar for each domain's named capabilities, its budget hook, and last its region backings,
 the one answer that acts (a region is charged and may be an OS object; one rebuilt before a refusal
 is dropped, which hands its charge back). `apply` then writes what was decoded and granted and
-cannot fail. A restore that refuses leaves the host as it found it. The image a restore allocates
-is bounded first (#3100): a reservation no engine builds is refused, and the window's growth past
-the module's declared memory against the memory the restoring domain's budget has left. A domain
-whose memory no level bounds may ask for what a running guest under that budget could commit, and
-the allocation is fallible. The checks at each use that predate the pass (#2945) stay only in front of a raw host store
+cannot fail. A restore that refuses leaves the host as it found it. (Open: the image a restore
+allocates is bounded only by the artifact's own reservation, #3100.) The checks at each use that predate the pass (#2945) stay only in front of a raw host store
 or an unchecked index, as a backstop that is loud in debug. Open: whether an artifact may set the
 attestation and the guest-JIT quotas at all, or only narrow what the restoring host grants (#3096).
 

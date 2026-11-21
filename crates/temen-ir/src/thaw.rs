@@ -212,14 +212,6 @@ impl Serve {
     pub fn is_empty(&self) -> bool {
         *self == Serve::default()
     }
-
-    /// #3034 D5 — whether `ticket` is one this domain owes a reply to: queued, in a frozen handler,
-    /// or settled and not yet claimed. A caller's wait on this domain names one of these.
-    pub fn owes(&self, ticket: u64) -> bool {
-        self.queue.iter().any(|d| d.ticket == ticket)
-            || self.handlers.iter().any(|h| h.1 == ticket)
-            || self.results.iter().any(|r| r.0 == ticket)
-    }
 }
 
 /// A domain's thaw residue as the codec decodes it, **not yet admitted**: no engine takes one. Hand it
@@ -447,7 +439,8 @@ impl Drop for BackstopsExpected {
 pub struct Malformed;
 
 /// A residue [`validate`] refused, handed back whole: a caller that declines the thaw leaves it where
-/// it found it.
+/// it found it. The serve state passed beside it is not handed back: a caller that declines no longer
+/// holds it.
 pub struct Refused<D, T> {
     pub residue: Box<RawResidue<D, T>>,
 }
@@ -497,8 +490,9 @@ pub struct CodeFacts {
     /// Per function, whether it is a spawn entry, `(i64, i64) -> (i64)`.
     spawn: Vec<bool>,
     arena: ShadowArena,
-    /// Per impl export, per op: its handler's parameter count, `None` for a function out of range.
-    handlers: Vec<Vec<Option<usize>>>,
+    /// Per impl export, per op: whether its handler is a function in range, as the runtime's
+    /// enqueue requires (`svc_admits`).
+    handlers: Vec<Vec<bool>>,
 }
 
 impl Default for CodeFacts {
@@ -555,7 +549,7 @@ impl CodeFacts {
                 .map(|e| {
                     e.ops
                         .iter()
-                        .map(|&f| code.funcs.get(f as usize).map(|f| f.params.len()))
+                        .map(|&f| (f as usize) < code.funcs.len())
                         .collect()
                 })
                 .collect(),
@@ -737,7 +731,7 @@ fn check<D, T>(
 
     // A module without a shadow arena is not freezable (INVARIANTS #16): it has no residue at all.
     if !a.region_fits(root_ctx) {
-        return ok(r.is_empty() && serve.is_empty());
+        return ok(r.is_empty() && serve_ok(code, root_ctx, 0, r, serve));
     }
 
     // Only a kind of record the domain's code can make.
@@ -834,19 +828,29 @@ fn check<D, T>(
         .iter()
         .all(|t| t.pid >= 1 && t.pid <= TASK_MAX && t.outcome.err().is_none_or(surfaced_trap)))?;
 
-    // ---- Serve state (#1676, #1901): each queued dispatch names a handler of the code's impl exports
-    // and carries its arguments; each ticket the domain minted is distinct and below its counter,
-    // which a `+ 1` does not overflow; a frozen handler sits in a live fiber; a reply wait belongs to a
-    // context of this domain that a freeze abandons a call in (the root's, a live vCPU's, a live
-    // fiber's). A wait's ticket is its callee's, checked across the cut by the codec (D5).
-    let s = serve;
-    ok(s.next_ticket <= TASK_MAX)?;
-    ok(s.queue.iter().all(|d| {
+    ok(serve_ok(code, root_ctx, held, r, serve))
+}
+
+/// [`check`]'s serve rules (#1676, #1901), arena or none (a freeze writes serve state for any domain
+/// whose ticket counter moved): each queued dispatch names an op the code serves, as the runtime's
+/// enqueue requires (its argument count is the serve loop's to answer, `EINVAL`); each ticket the
+/// domain minted is distinct and below its counter, which a `+ 1` does not overflow; a frozen handler
+/// sits in a live fiber; a reply wait belongs to a context of this domain that a freeze abandons a
+/// call in (the root's, a live vCPU's in `held`, a live fiber's). A wait's ticket is its callee's,
+/// and the record does not say which callee, so no rule here or in the codec ties the two (#3034).
+fn serve_ok<D, T>(
+    code: &CodeFacts,
+    root_ctx: usize,
+    held: u64,
+    r: &RawResidue<D, T>,
+    s: &Serve,
+) -> bool {
+    let servable = s.queue.iter().all(|d| {
         code.handlers
             .get(d.export as usize)
             .and_then(|ops| ops.get(d.op as usize))
-            .is_some_and(|&n| n == Some(d.args.len()))
-    }))?;
+            .is_some_and(|&ok| ok)
+    });
     let mut minted: Vec<u64> = s
         .queue
         .iter()
@@ -854,18 +858,22 @@ fn check<D, T>(
         .chain(s.results.iter().map(|r| r.0))
         .chain(s.handlers.iter().map(|h| h.1))
         .collect();
-    ok(minted.iter().all(|&t| t < s.next_ticket))?;
+    let below = minted.iter().all(|&t| t < s.next_ticket);
     minted.sort_unstable();
-    ok(minted.windows(2).all(|w| w[0] != w[1]))?;
     let live_fiber = |slot: usize| r.fibers.get(slot).is_some_and(|f| !f.is_free());
-    ok(s.handlers
-        .iter()
-        .all(|&(slot, _)| live_fiber(slot as usize)))?;
-    ok(s.waits.iter().all(|&(ctx, _)| {
-        let ctx = ctx as usize;
-        ctx == root_ctx || (ctx < 64 && held & (1 << ctx) != 0) || (ctx >= 1 && live_fiber(ctx - 1))
-    }))?;
-    Ok(())
+    s.next_ticket <= TASK_MAX
+        && servable
+        && below
+        && minted.windows(2).all(|w| w[0] != w[1])
+        && s.handlers
+            .iter()
+            .all(|&(slot, _)| live_fiber(slot as usize))
+        && s.waits.iter().all(|&(ctx, _)| {
+            let ctx = ctx as usize;
+            ctx == root_ctx
+                || (ctx < 64 && held & (1 << ctx) != 0)
+                || (ctx >= 1 && live_fiber(ctx - 1))
+        })
 }
 
 #[cfg(test)]
