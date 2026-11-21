@@ -14049,6 +14049,8 @@ mod native_park_loom {
         NoRecheck,
         /// The claim compares the slot only, not the incarnation.
         SlotOnly,
+        /// The poll of a timed park does not read the word again after its deadline.
+        NoReread,
     }
 
     impl World {
@@ -14072,12 +14074,13 @@ mod native_park_loom {
         }
     }
 
-    /// The resumer files incarnation `gen`'s wait, as `native_fiber_wait` does under the lock.
-    fn file(w: &World, gen: u64, broken: Broken) {
+    /// The resumer files incarnation `gen`'s wait, for `timeout` ns at most, as `native_fiber_wait`
+    /// does under the lock.
+    fn file(w: &World, gen: u64, timeout: Option<u64>, broken: Broken) {
         let mut g = w.run.lock().unwrap();
         let r = &mut *g;
         let read = || Some(w.guest.load(Ordering::SeqCst) as u64);
-        let wait = fiber_wait(&mut r.tasks, KEY, read, 0, 0, None, 0, K).unwrap();
+        let wait = fiber_wait(&mut r.tasks, KEY, read, 0, 0, timeout, 0, K).unwrap();
         let word = std::sync::Arc::clone(&w.word);
         let fibers = &mut r.domains[0].fibers;
         if matches!(fibers.fibers.get(K), Some(FiberState::Engine) | None) {
@@ -14087,9 +14090,9 @@ mod native_park_loom {
         match broken {
             Broken::WordLate => {
                 drop(g);
-                w.word.park(gen, woken, None);
+                w.word.park(gen, woken, wait.real_deadline);
             }
-            _ => w.word.park(gen, woken, None),
+            _ => w.word.park(gen, woken, wait.real_deadline),
         }
     }
 
@@ -14207,7 +14210,7 @@ mod native_park_loom {
         loom::model(move || {
             let w = std::sync::Arc::new(World::new());
             let (w1, w2) = (std::sync::Arc::clone(&w), std::sync::Arc::clone(&w));
-            let resumer = loom::thread::spawn(move || file(&w1, 0, broken));
+            let resumer = loom::thread::spawn(move || file(&w1, 0, None, broken));
             let poller = loom::thread::spawn(move || poll(&w2, 0, broken));
             notify(&w, broken);
             resumer.join().unwrap();
@@ -14220,7 +14223,7 @@ mod native_park_loom {
     fn two_claimants(broken: Broken) {
         loom::model(move || {
             let w = std::sync::Arc::new(World::new());
-            file(&w, 0, broken);
+            file(&w, 0, None, broken);
             let (w1, w2) = (std::sync::Arc::clone(&w), std::sync::Arc::clone(&w));
             let a = loom::thread::spawn(move || poll(&w1, 0, broken));
             let b = loom::thread::spawn(move || poll(&w2, 0, broken));
@@ -14235,7 +14238,7 @@ mod native_park_loom {
     fn block_notify(broken: Broken) {
         loom::model(move || {
             let w = std::sync::Arc::new(World::new());
-            file(&w, 0, broken);
+            file(&w, 0, None, broken);
             let w1 = std::sync::Arc::clone(&w);
             let blocker = loom::thread::spawn(move || {
                 if w1.word.poll(0, || 0) == ParkPoll::Parked {
@@ -14248,17 +14251,31 @@ mod native_park_loom {
         });
     }
 
-    /// A stale handle: incarnation 0's park is filed and woken; one vCPU claims it and the slot's
-    /// next incarnation (1) parks, woken at once too, while a vCPU holding incarnation 0's handle
-    /// polls and claims. It may take incarnation 0's park, or find none; never incarnation 1's.
-    fn recycle(broken: Broken) {
+    /// A stale handle: incarnation 0's park is filed and can be claimed; one vCPU claims it and the
+    /// slot's next incarnation (1) parks, while a vCPU holding incarnation 0's handle polls and
+    /// claims. It may take incarnation 0's park, or find none; never incarnation 1's. Untimed, each
+    /// park is woken at once (its re-check fires). `timed`: each waits on a deadline instead,
+    /// incarnation 0's passed as it parks and incarnation 1's far off, so a poll that read the next
+    /// incarnation's deadline as its own would answer it parked.
+    fn recycle(broken: Broken, timed: bool) {
         loom::model(move || {
             let w = std::sync::Arc::new(World::new());
-            w.guest.store(1, Ordering::Relaxed); // each re-check fires: woken at once
-            file(&w, 0, broken);
+            let (first, next) = match timed {
+                true => (Some(0), Some(1 << 60)),
+                // Each re-check fires: woken at once.
+                false => {
+                    w.guest.store(1, Ordering::Relaxed);
+                    (None, None)
+                }
+            };
+            file(&w, 0, first, broken);
             let (w1, w2) = (std::sync::Arc::clone(&w), std::sync::Arc::clone(&w));
             let stale = loom::thread::spawn(move || {
-                let p = w2.word.poll(0, || 0);
+                let now = temen_ir::seams::wall_now;
+                let p = match broken {
+                    Broken::NoReread => w2.word.poll_without_recheck(0, now),
+                    _ => w2.word.poll(0, now),
+                };
                 assert_ne!(
                     p,
                     ParkPoll::Parked,
@@ -14275,7 +14292,7 @@ mod native_park_loom {
             });
             let recycler = loom::thread::spawn(move || {
                 if claim(&w1, 0, broken) != NativeClaim::NotParked {
-                    file(&w1, 1, broken);
+                    file(&w1, 1, next, broken);
                 }
             });
             recycler.join().unwrap();
@@ -14308,7 +14325,18 @@ mod native_park_loom {
 
     #[test]
     fn loom_a_stale_handle_never_reaches_the_next_incarnations_park() {
-        recycle(Broken::None);
+        recycle(Broken::None, false);
+    }
+
+    #[test]
+    fn loom_a_stale_handle_never_reads_the_next_incarnations_deadline() {
+        recycle(Broken::None, true);
+    }
+
+    #[test]
+    #[should_panic(expected = "a stale handle read the next incarnation's park")]
+    fn loom_a_timed_poll_that_does_not_reread_its_word_takes_the_next_deadline() {
+        recycle(Broken::NoReread, true);
     }
 
     #[test]
@@ -14332,7 +14360,7 @@ mod native_park_loom {
     #[test]
     #[should_panic(expected = "a stale handle claimed the next incarnation's park")]
     fn loom_a_claim_by_slot_alone_takes_the_next_incarnations_park() {
-        recycle(Broken::SlotOnly);
+        recycle(Broken::SlotOnly, false);
     }
 }
 

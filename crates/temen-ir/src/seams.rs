@@ -319,7 +319,9 @@ impl ParkWord {
             (true, _) => WOKEN,
             (false, None) => UNTIMED,
             (false, Some(d)) => {
-                self.deadline.store(d, Ordering::Relaxed);
+                // Release: a poller that reads this deadline then sees every earlier store to the
+                // word, so its re-read tells an earlier incarnation's park from this one's.
+                self.deadline.store(d, Ordering::Release);
                 TIMED
             }
         };
@@ -339,14 +341,39 @@ impl ParkWord {
     }
 
     /// What a `cont.resume` of incarnation `gen` does with its park, `now` read only for a timed one.
+    ///
+    /// A timed park's deadline is a second word, which a later incarnation of the slot may have
+    /// written by the time it is read: so the word is read again after it, and a park that changed
+    /// meanwhile is not this incarnation's to answer (`Idle`: the slot's own claim decides).
     pub fn poll(&self, gen: u64, now: impl FnOnce() -> u64) -> ParkPoll {
+        self.poll_checked(gen, now, true)
+    }
+
+    /// [`Self::poll`] without its re-read of the word: the model's broken variant of it.
+    #[cfg(loom)]
+    #[doc(hidden)]
+    pub fn poll_without_recheck(&self, gen: u64, now: impl FnOnce() -> u64) -> ParkPoll {
+        self.poll_checked(gen, now, false)
+    }
+
+    fn poll_checked(&self, gen: u64, now: impl FnOnce() -> u64, recheck: bool) -> ParkPoll {
         let w = self.word.load(Ordering::Acquire);
         if w & STATE == IDLE || w >> 2 != gen {
             return ParkPoll::Idle;
         }
         match w & STATE {
             WOKEN => ParkPoll::Claim,
-            TIMED if now() >= self.deadline.load(Ordering::Relaxed) => ParkPoll::Claim,
+            TIMED => {
+                // Acquire, pairing with the deadline's release ([`Self::park`]).
+                let d = self.deadline.load(Ordering::Acquire);
+                if recheck && self.word.load(Ordering::Acquire) != w {
+                    return ParkPoll::Idle;
+                }
+                match now() >= d {
+                    true => ParkPoll::Claim,
+                    false => ParkPoll::Parked,
+                }
+            }
             _ => ParkPoll::Parked,
         }
     }
