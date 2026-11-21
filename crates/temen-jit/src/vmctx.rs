@@ -276,20 +276,20 @@ impl VmCtx {
     }
 
     /// #3133 — a fiber's own context, made by its `cont.new` from the context of the code that made
-    /// it: the same instance, end and run, charging the same cell, and holding that cell's owner
-    /// alive (an activation's, #3000), so nothing of the code that made it is reached through it
-    /// once that code's own context has gone (a held activation's, a serve handler's window's). Not
-    /// a handler's context (`handler_window` is null) and not a site's (`serve_site` is empty). It
-    /// lives with the fiber's stack ([`crate::fiber_rt`]'s `Stack`).
+    /// it: the same instance, end and run, charging the same cell, so nothing of the code that made
+    /// it is reached through it once that code's own context has gone (a serve handler's window's).
+    /// Not a handler's context (`handler_window` is null) and not a site's (`serve_site` is empty).
+    /// It lives with the fiber's stack ([`crate::fiber_rt`]'s `Stack`). The cell it charges lives as
+    /// long as the run: a vCPU's or the run's. No held activation, whose cell is the call's own
+    /// (`cell`), makes a fiber on the JIT: `temen_run::hold` declines a domain that can (#3080).
     pub(crate) fn fiber(&self) -> VmCtx {
-        // SAFETY: the end is this domain's own, which outlives the domain's fibers.
-        #[allow(unused_mut)]
-        let mut ctx = unsafe { self.vcpu_ending(self.end, self.fuel) };
         #[cfg(fiber_rt)]
-        {
-            ctx.cell = self.cell.clone();
-        }
-        ctx
+        debug_assert!(
+            self.cell.is_none(),
+            "a held activation makes no fiber on the JIT (#3080)"
+        );
+        // SAFETY: the end is this domain's own, which outlives the domain's fibers.
+        unsafe { self.vcpu_ending(self.end, self.fuel) }
     }
 
     /// #2958 — [`Self::vcpu`] over the end word `end` in place of this context's own: a kernel
@@ -645,16 +645,13 @@ block 0 (v0: i64, v1: i64) {
     /// #3133 — a fiber's context is its maker's instance, end and cell, and nothing that names a
     /// window, a site or a vCPU of the maker's: a maker that is a serve handler's window context
     /// hands its fiber no `handler_window` (a fiber outlives the window, and never steps aside for
-    /// it), no serve site, no cap-thunk state and no end of its own, and the cell's owner it shares
-    /// is held, not borrowed.
+    /// it), no serve site, no cap-thunk state and no end of its own; it charges the maker's cell.
     #[cfg(fiber_rt)]
     #[test]
     fn a_fibers_context_names_no_window_site_or_vcpu_of_its_maker() {
         let root = VmCtx::new(InstanceAddrs::NONE, Window::NONE);
-        let mut maker = root.vcpu(core::ptr::null_mut());
-        let owner = crate::fuel::SharedCell::fixed(10);
-        maker.fuel = owner.get();
-        maker.cell = Some(std::sync::Arc::clone(&owner));
+        let mut run_cell = crate::FuelCell::fixed(10);
+        let maker = root.vcpu(&mut *run_cell);
         maker.handler_window.store(
             core::ptr::NonNull::<crate::child_exec::Window>::dangling().as_ptr(),
             core::sync::atomic::Ordering::Release,
@@ -668,18 +665,9 @@ block 0 (v0: i64, v1: i64) {
         assert!(f.serve_site.get().is_none());
         assert!(f.thunk_state.get().is_none());
         assert!(f.owned_end.is_none() && f.owned_handlers.is_none());
+        assert!(f.cell.is_none());
         assert_eq!(f.domain_key(), maker.domain_key(), "the maker's end");
         assert_eq!(f.fuel, maker.fuel, "the maker's cell");
-        assert!(f
-            .cell
-            .as_ref()
-            .is_some_and(|c| std::sync::Arc::ptr_eq(c, &owner)));
-        drop(maker);
-        assert_eq!(
-            std::sync::Arc::strong_count(&owner),
-            2,
-            "the fiber holds the cell's owner"
-        );
     }
 
     /// #3133 — and the fiber's creator, running when the fiber traps on another vCPU, stops too: no

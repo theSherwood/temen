@@ -2523,8 +2523,8 @@ mod flatten_claim_tests {
     /// the same handle finds it spent (#2667), and only a generation the slot never reached faults.
     /// #3133 — a context a returned fiber left on its vCPU is the next `cont.new`'s, rewritten whole:
     /// whatever the earlier fiber's left in it (its domain's end in its stop word, a cap thunk's
-    /// state, the cell of the code that made it) the new fiber's context is its own maker's, and
-    /// it is the same allocation.
+    /// state, the cell it charged) the new fiber's context is its own maker's, and it is the same
+    /// allocation.
     #[test]
     fn a_reused_fiber_context_starts_as_its_makers() {
         if !temen_fiber::supported() {
@@ -2535,12 +2535,10 @@ mod flatten_claim_tests {
         }
         let table = Arc::new(SharedFiberTable::new(4, ShadowArena::EMPTY, None));
         let rt = Box::into_raw(Box::new(FiberRuntime::new(table, 0, 0)));
-        // The earlier fiber's: another domain, ended; a cap thunk's state; a held cell.
+        // The earlier fiber's: another domain, ended; a cap thunk's state; another cell.
         let other = crate::VmCtx::new(crate::InstanceAddrs::NONE, crate::Window::NONE);
-        let mut earlier = other.vcpu(core::ptr::null_mut());
-        let owner = crate::fuel::SharedCell::fixed(10);
-        earlier.fuel = owner.get();
-        earlier.cell = Some(Arc::clone(&owner));
+        let mut other_cell = crate::FuelCell::fixed(10);
+        let earlier = other.vcpu(&mut *other_cell);
         let spare = Box::new(earlier.fiber());
         spare.raise(crate::TrapKind::Unreachable as i64);
         let _ = spare.thunk_state(|| 7u32);
@@ -2557,13 +2555,8 @@ mod flatten_claim_tests {
         assert_eq!(ctx.domain_key(), maker.domain_key(), "its maker's end");
         assert!(!ctx.has_thunk_state(), "no cap thunk's state");
         assert!(
-            ctx.cell.is_none() && ctx.fuel.is_null(),
-            "its maker's (no) cell"
-        );
-        assert_eq!(
-            Arc::strong_count(&owner),
-            2,
-            "the earlier fiber's cell let go"
+            ctx.fuel.is_null(),
+            "its maker's (no) cell, not the earlier one's"
         );
         drop(stack);
         // SAFETY: made by `Box::into_raw` above, and nothing else holds it.
