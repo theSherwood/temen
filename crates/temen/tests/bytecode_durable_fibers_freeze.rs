@@ -51,6 +51,7 @@ fn durable_host(inst: &Module, frozen: Vec<FrozenFiber>) -> Host {
             fibers: frozen,
             ..Default::default()
         },
+        temen_interp::Serve::default(),
     )
     .expect("a residue a run made");
     h

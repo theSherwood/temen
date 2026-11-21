@@ -262,8 +262,12 @@ fn a_live_detached_child_freezes_and_thaws_on_the_jit_through_the_codec() {
     let (mut granted, twin) = restore();
     let mut bare = Host::new();
     bare.set_durable(true);
-    bare.admit_thaw(&parent, granted.take_residue())
-        .expect("a residue a run made");
+    bare.admit_thaw(
+        &parent,
+        granted.take_residue(),
+        temen_interp::Serve::default(),
+    )
+    .expect("a residue a run made");
     let refused = temen_run::jit_cap_run(
         &parent,
         0,
@@ -281,7 +285,7 @@ fn a_live_detached_child_freezes_and_thaws_on_the_jit_through_the_codec() {
     );
     assert_eq!(bare.thawed_detached().len(), 1, "and keeps the residue");
     granted
-        .admit_thaw(&parent, bare.take_residue())
+        .admit_thaw(&parent, bare.take_residue(), temen_interp::Serve::default())
         .expect("a residue a run made");
 
     // Thaw on the JIT: the child re-launches at its slot and the join delivers the total.
@@ -1309,8 +1313,12 @@ fn a_thaw_that_drops_a_child_hands_back_its_subtree() {
     );
     let mut bare = Host::new();
     bare.set_durable(true);
-    bare.admit_thaw(&root, granted.take_residue())
-        .expect("a residue a run made");
+    bare.admit_thaw(
+        &root,
+        granted.take_residue(),
+        temen_interp::Serve::default(),
+    )
+    .expect("a residue a run made");
     // The thaw on the bare host ends as it may: its root holds none of its own capabilities.
     let _ = nest_run(Engine::Interp, &root, &args, &twin, &mut bare, None);
     assert_eq!(
@@ -1759,9 +1767,11 @@ fn the_jit_declines_a_nested_record_kind_it_stands_up_no_runtime_for() {
             generation: 1,
             consumed: false,
         });
-        c.admit_thaw(&child, own).expect("admitted under the grant");
+        c.admit_thaw(&child, own, temen_interp::Serve::default())
+            .expect("admitted under the grant");
     }
-    h.admit_thaw(&parent, residue).expect("the cut");
+    h.admit_thaw(&parent, residue, temen_interp::Serve::default())
+        .expect("the cut");
     let r = temen_run::jit_cap_run(
         &parent,
         0,

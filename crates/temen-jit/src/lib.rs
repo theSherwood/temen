@@ -321,7 +321,7 @@ pub const MAX_JIT_WINDOW_LOG2: u8 = 31; // 2 GiB (the backed `mapped` extent)
 /// so a window frozen under it still thaws at the reservation its artifact records. A real host
 /// chooses this per its VA budget; the reference just caps it so a fuzzed/oversized request
 /// can't ask for an absurd reservation.
-const MAX_JIT_RESERVED_LOG2: u8 = 40; // 1 TiB of reserved VA (lazy)
+const MAX_JIT_RESERVED_LOG2: u8 = temen_ir::MAX_RESERVED_LOG2; // 1 TiB of reserved VA (lazy)
 
 /// Escape-oracle snapshot span (the `_with_host` capture): byte-compare the low `SNAP_CAP` bytes of
 /// the window across interp + JIT, *including* reserved-tail pages the guest grew via the Memory cap
@@ -2230,9 +2230,14 @@ pub(crate) struct Seeded {
     pub(crate) detached: Vec<DetachedSeed>,
 }
 
-/// Take `thaw` apart for this runtime. `Err` (it, untouched) for one holding a fork twin, which this
+/// Take `thaw` apart for this runtime, running the code `facts` describe: admitted again for that
+/// code ([`temen_ir::thaw::Thaw::seed`]), so a thaw validated for another program cannot seed this
+/// one. `Err` (it, untouched) for one it does not admit, and for one holding a fork twin, which this
 /// engine does not re-create (#3098): the caller refuses the thaw whole, never part of it (#1690).
-pub(crate) fn seeded(thaw: JitThaw) -> Result<Seeded, Box<JitThaw>> {
+pub(crate) fn seeded(
+    thaw: JitThaw,
+    facts: &temen_ir::thaw::CodeFacts,
+) -> Result<Seeded, Box<JitThaw>> {
     if !thaw.parts().twins.is_empty() || !thaw.parts().exited_twins.is_empty() {
         return Err(Box::new(thaw));
     }
@@ -2246,7 +2251,7 @@ pub(crate) fn seeded(thaw: JitThaw) -> Result<Seeded, Box<JitThaw>> {
         live_detached,
         twins,
         exited_twins,
-    } = thaw.into_parts();
+    } = thaw.seed(facts, 0)?;
     debug_assert!(twins.is_empty() && exited_twins.is_empty(), "checked above");
     let completed = detached.into_iter().map(|d| {
         let (result, trap) = match d.completed_result {
@@ -3464,6 +3469,9 @@ pub struct CompiledModule {
     data: Vec<Data>,
     /// #3024 — the next run's seed: a thaw's window and residue, taken whole as the run starts.
     seed: RunSeed,
+    /// #3034 — what the thaw pass needs to know of the code this module was compiled from: a seed is
+    /// admitted against it ([`Self::set_durable`]), never against code a caller names.
+    facts: Arc<temen_ir::thaw::CodeFacts>,
     /// #2427 — the pages a durable run's capture read past its declared window, by byte offset
     /// ([`Self::take_tail_out`]).
     tail_out: Vec<(u64, Vec<u8>)>,
@@ -4715,6 +4723,7 @@ impl CompiledModule {
             mem_size_log2: m.memory.map(|mc| mc.size_log2),
             data: m.data.clone(),
             seed: RunSeed::default(),
+            facts: Arc::new(temen_ir::thaw::CodeFacts::of(m)),
             tail_out: Vec::new(),
             durable: false,
             shadow,
@@ -4998,6 +5007,7 @@ impl CompiledModule {
             mem_size_log2: self.mem_size_log2,
             data: self.data.clone(),
             seed: RunSeed::default(),
+            facts: Arc::clone(&self.facts),
             tail_out: Vec::new(),
             durable: false,
             shadow: self.shadow,
@@ -5081,9 +5091,9 @@ impl CompiledModule {
     /// `seed` is the thaw seed: the residue to re-create before a `REWINDING` run (empty for a freeze
     /// or an ordinary durable run). The freeze residue comes back via [`Self::take_durable_residue`].
     pub fn set_durable(&mut self, seed: JitThaw) -> Result<(), JitError> {
-        let Ok(Seeded { residue, detached }) = seeded(seed) else {
+        let Ok(Seeded { residue, detached }) = seeded(seed, &self.facts) else {
             return Err(JitError::Unsupported(
-                "durable JIT thaw: a fork twin the JIT cannot re-create",
+                "durable JIT thaw: a fork twin the JIT cannot re-create, or a residue not admitted for this module",
             ));
         };
         self.seed.fibers = residue.fibers;
@@ -5118,6 +5128,13 @@ impl CompiledModule {
     /// residue with another kind whole, before it takes it.
     pub fn reseeds(&self) -> [bool; 3] {
         [self.fibers, self.threads, self.makes_nursery()]
+    }
+
+    /// #3034 — what the thaw pass knows of this module's code: an embedder takes a residue for it
+    /// admitted against these ([`temen_ir::thaw::validate`]), which is the check [`Self::set_durable`]
+    /// repeats, so the seed that follows the take cannot be refused.
+    pub fn thaw_facts(&self) -> &temen_ir::thaw::CodeFacts {
+        &self.facts
     }
 
     /// The residue the last durable run's freeze produced (empty unless a freeze caught something);
@@ -9089,6 +9106,11 @@ fn compile_child_windowed(
         mem_size_log2: Some(mapped_log2),
         data: Vec::new(), // a child's data segments are materialized into its window by the spawner
         seed: RunSeed::default(),
+        facts: Arc::new(temen_ir::thaw::CodeFacts::of(temen_ir::thaw::Code {
+            funcs,
+            arena: shadow,
+            impl_exports,
+        })),
         tail_out: Vec::new(),
         durable: false,
         frozen: DurableResidue::default(),
@@ -10746,7 +10768,7 @@ fn fiber_func_type() -> FuncType {
 pub fn child_reseeds(m: &IrModule) -> [bool; 3] {
     #[cfg(fiber_rt)]
     {
-        [module_uses_fibers(m), true, module_uses_instantiator(m)]
+        temen_ir::thaw::CodeFacts::of(m).reseeds()
     }
     #[cfg(not(fiber_rt))]
     {

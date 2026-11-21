@@ -184,6 +184,7 @@ fn children(host: &mut Host, generations: Vec<u32>) {
             children: generations,
             ..Residue::default()
         },
+        temen_interp::Serve::default(),
     )
     .expect("a child table a run makes");
 }

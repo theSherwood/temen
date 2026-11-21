@@ -220,7 +220,11 @@ fn a_live_detached_child_is_captured_and_its_thaw_completes_the_join() {
     let (mut thost, targs) = powerbox(&child);
     let live = captured.into_iter().map(thawed).collect();
     thost
-        .admit_thaw(&parent, residue(&fhost, live, Vec::new()))
+        .admit_thaw(
+            &parent,
+            residue(&fhost, live, Vec::new()),
+            crate::Serve::default(),
+        )
         .expect("a residue a run made");
     let (tr, tsnap) = run(&parent, &mut thost, &targs, &twin);
     assert_eq!(
@@ -280,7 +284,11 @@ block 0 (v0: i64) {
     begin_thaw(&mut twin, ARENA, 0);
     let (mut thost, targs) = powerbox(&child);
     thost
-        .admit_thaw(&parent, residue(&fhost, Vec::new(), frozen))
+        .admit_thaw(
+            &parent,
+            residue(&fhost, Vec::new(), frozen),
+            crate::Serve::default(),
+        )
         .expect("a residue a run made");
     let (tr, _) = run(&parent, &mut thost, &targs, &twin);
     assert_eq!(tr, Ok(vec![Value::I64(4950)]), "the join took the result");
@@ -433,7 +441,11 @@ fn a_child_the_thaw_does_not_relaunch_ends_with_thread_fault() {
     let (mut thost, targs) = powerbox(&summing(7));
     let live = captured.into_iter().map(thawed).collect();
     thost
-        .admit_thaw(&parent, residue(&fhost, live, Vec::new()))
+        .admit_thaw(
+            &parent,
+            residue(&fhost, live, Vec::new()),
+            crate::Serve::default(),
+        )
         .expect("a residue a run made");
     let (tr, _) = run(&parent, &mut thost, &targs, &twin);
     assert_eq!(

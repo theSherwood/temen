@@ -228,6 +228,7 @@ fn freeze_after_detached_child_joined_thaws_and_reloads_the_join_result() {
                 fibers: fhost.frozen_fibers().to_vec(),
                 ..Default::default()
             },
+            temen_interp::Serve::default(),
         )
         .expect("a residue a run made");
     let mut fuel = 5_000_000u64;

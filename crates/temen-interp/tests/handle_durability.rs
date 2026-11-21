@@ -347,8 +347,8 @@ fn a_registrar_re_grants_named_caps_and_the_handles_still_dispatch() {
             process: None,
         })
     }));
-    b.restore_durable_named(&named)
-        .expect("the registrar serves `fs`");
+    let granted = b.regrant_named(&named).expect("the registrar serves `fs`");
+    b.install_named(granted);
     b.restore_durable_handles(&a.slot_generations(), &handles);
 
     assert_eq!(
@@ -407,8 +407,8 @@ fn a_restored_named_cap_is_as_forkable_as_its_registrar_says() {
                 process: None,
             })
         }));
-        b.restore_durable_named(&named)
-            .expect("the registrar serves it");
+        let granted = b.regrant_named(&named).expect("the registrar serves it");
+        b.install_named(granted);
         b.restore_durable_handles(&a.slot_generations(), &handles);
         let lease = Lease {
             budget: b.grant_budget(-1, 1 << 20, -1),
@@ -479,8 +479,10 @@ fn a_restored_named_cap_keeps_the_shape_it_was_granted() {
             process: None,
         })
     }));
-    b.restore_durable_named(&named)
+    let granted = b
+        .regrant_named(&named)
         .expect("the registrar serves all three");
+    b.install_named(granted);
     b.restore_durable_handles(&a.slot_generations(), &handles);
     assert!(
         !b.host_proc_is_sync(pool) && !b.parks_on_host(pool),
@@ -513,7 +515,7 @@ fn a_restore_refuses_a_name_the_embedder_does_not_serve() {
     // No registrar at all: nothing is granted.
     let mut bare = Host::new();
     assert_eq!(
-        bare.restore_durable_named(&named).unwrap_err().name,
+        bare.regrant_named(&named).err().expect("refused").name,
         "fs",
         "a host with no registrar refuses, naming what it could not serve"
     );
@@ -529,7 +531,10 @@ fn a_restore_refuses_a_name_the_embedder_does_not_serve() {
             process: None,
         })
     }));
-    assert_eq!(picky.restore_durable_named(&named).unwrap_err().name, "fs");
+    assert_eq!(
+        picky.regrant_named(&named).err().expect("refused").name,
+        "fs"
+    );
 }
 
 /// #1458: the restored table is **exactly** the captured set. An embedder that grants its powerbox
