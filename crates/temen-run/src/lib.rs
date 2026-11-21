@@ -3179,8 +3179,9 @@ unsafe fn serve_locked(
         .clone()
         .filter(|_| bell.is_some() && freeze.is_none())
         .and_then(|cell| {
+            // #3133 — the site is the running vCPU's (or task's), also when this code is a fiber's.
             temen_jit::ServeSite::of(
-                vm,
+                vm.runner(),
                 serve_ctx as *const c_void,
                 mem_base,
                 mem_reserved,
