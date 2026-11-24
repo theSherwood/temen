@@ -14,14 +14,14 @@
 //! Everything `native_scope` declines runs on [`crate::os_thread_rt`], unchanged.
 //!
 //! **The thread's record (#3078 slice 2).** A kernel vCPU's hook is found by the thread of control
-//! running now, never through the context the code carries: a fiber's code carries its creator's
-//! context ([`crate::VmCtx`], `vmctx.rs`'s note), so a fiber made on one vCPU and resumed on another
-//! must reach the hook of the vCPU it runs on. The context says only whether it is a kernel run's
+//! running now, never through the context the code carries: a fiber's code carries a context of its
+//! own, made from its creator's ([`crate::VmCtx::fiber`], #3133), not the context of the vCPU it runs
+//! on, so a fiber made on one vCPU and resumed on another must reach the hook of the vCPU it runs on. The context says only whether it is a kernel run's
 //! (`VmCtx::kernel`, a fact of the run): a context of no kernel run never reads the record, so code
 //! of another run that a synchronous host procedure runs on this thread (a held domain's call, a
 //! nested `jit_run`) takes the JIT's own runtime, as on any other thread. A kernel run's context
 //! asks the record, which names its run by the run's one end word (every context of the run, a
-//! fiber's creator context included, points at it): one whose thread's record names another run, or
+//! fiber's included, points at it): one whose thread's record names another run, or
 //! none, traps `Malformed`, since only a vCPU of the run runs its code.
 //!
 //! [`KernelRun::run_vcpu`] publishes the record for its guarded call, and one guard restores the
@@ -559,10 +559,11 @@ impl KernelRun {
     /// A context for a vCPU about to run, over the run's end word `end`, charging `fuel`, its calls
     /// through `cap_ctx`: one an ended vCPU left ([`Self::ctxs`]), or a new one.
     ///
-    /// A reused context may still be run on by a fiber its last vCPU made, on another thread, so its
-    /// fields are only written where they differ: in a run whose module has fibers, every context's
-    /// are the run's (`cap_ctx`, the domain's host cell, and a null `fuel`, `fiber fuel` declining a
-    /// metered one), so none is written there.
+    /// No fiber runs on a vCPU's context (#3133): a fiber its last vCPU made runs on a context of its
+    /// own, which copied this one's pointers when it was made, so a reused context is only this run's
+    /// next vCPU's. Its fields are written only where they differ: in a run whose module has fibers,
+    /// every context's are the run's (`cap_ctx`, the domain's host cell, and a null `fuel`, `fiber
+    /// fuel` declining a metered one), so none is written there.
     fn take_ctx(
         &self,
         end: &AtomicI64,

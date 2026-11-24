@@ -321,6 +321,7 @@ block 0 (v0: i64, v1: i64) {
                 fibers: frozen,
                 ..Default::default()
             },
+            temen_interp::Serve::default(),
         )
         .expect("a residue a run made");
     let mut tfuel = 1_000_000u64;
@@ -448,6 +449,7 @@ block 0 (v0: i64, v1: i64) {
                 fibers: frozen,
                 ..Default::default()
             },
+            temen_interp::Serve::default(),
         )
         .expect("a residue a run made");
         let mut fuel = 1_000_000u64;
@@ -704,6 +706,7 @@ block 0 (v0: i64, v1: i64) {
                     fibers: frozen,
                     ..Default::default()
                 },
+                temen_interp::Serve::default(),
             )
             .expect("a residue a run made");
         let mut tfuel = 1_000_000u64;
@@ -835,6 +838,7 @@ fn a_futex_event_parked_fiber_freezes_and_the_thawed_wait_reissues() {
                 root_sp: Some(root_sp),
                 ..Default::default()
             },
+            temen_interp::Serve::default(),
         )
         .expect("a residue a run made");
         let mut fuel = 1_000_000u64;
@@ -1004,6 +1008,7 @@ fn an_unwoken_cap_parked_fiber_freezes_and_its_thaw_reissues_the_read() {
             fibers,
             ..Default::default()
         },
+        temen_interp::Serve::default(),
     )
     .expect("a residue a run made");
     let mut twin = snap;
@@ -1151,6 +1156,7 @@ fn a_woken_event_park_thaws_through_a_post_rewind_claim() {
                 root_sp: Some(root_sp),
                 ..Default::default()
             },
+            temen_interp::Serve::default(),
         )
         .expect("a residue a run made");
         let mut fuel = 1_000_000u64;
@@ -1263,6 +1269,7 @@ fn a_consumed_park_delivers_the_next_resume_after_thaw() {
             fibers: frozen,
             ..Default::default()
         },
+        temen_interp::Serve::default(),
     )
     .expect("a residue a run made");
     let mut fuel = 100_000u64;

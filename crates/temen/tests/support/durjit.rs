@@ -351,6 +351,7 @@ pub fn fuzz_recycle_fiber_one_xbackend(g: &mut Gen) {
                 fibers: jfibers.to_vec(),
                 ..Default::default()
             },
+            temen_interp::Serve::default(),
         )
         .expect("a residue a run made");
     let art_j = freeze(&inst, &jsnap, &jhost2).expect("JIT recycle freeze serializes");
@@ -410,5 +411,5 @@ fn jit_thaw(
     m: &temen_ir::Module,
     raw: temen_ir::thaw::RawResidue<temen_jit::JitDetached, ()>,
 ) -> temen_jit::JitThaw {
-    temen_ir::thaw::validate(m, false, 0, raw).expect("a residue a run made")
+    temen_ir::thaw::validate(m, false, 0, raw, Default::default()).expect("a residue a run made")
 }

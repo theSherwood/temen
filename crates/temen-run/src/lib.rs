@@ -527,8 +527,11 @@ unsafe fn cap_thunk_impl(
     // windows — the same software-page-map model, only the syscalls differ. The page map is the
     // **per-run** one from the `Host` (keyed by window base), so growth committed in an earlier
     // `call.cap` is still seen committed here — a borrow of a guest-grown page doesn't fail-closed.
-    // #2319 — the view is the run's, kept on the calling context ([`RunView`]); a call made while
-    // another holds it builds a view of its own.
+    // #2319 — the view is the run's, kept on the running vCPU's (or task's) context ([`RunView`]):
+    // a fiber's code uses the view of the vCPU it runs on (#3133, `VmCtx::runner`), so a fiber's
+    // context keeps none. A call made while another holds it builds a view of its own. The lease is
+    // this function's and every park is the thunk's, after it returns, so no stack switch happens
+    // while a call holds a view: only the runner's own thread reaches it.
     #[cfg(any(unix, windows))]
     let (mut lease, mut own);
     #[cfg(any(unix, windows))]
@@ -536,6 +539,7 @@ unsafe fn cap_thunk_impl(
         None
     } else {
         lease = vm
+            .runner()
             .thunk_state(RunView::default)
             .and_then(|run| run.lease(host, mem_base, mem_size, mem_reserved));
         match &mut lease {
@@ -1605,7 +1609,7 @@ pub fn jit_cap_run(
             let mut hg = host_cell.lock().unwrap_or_else(|e| e.into_inner());
             // Either failing hands the embedder its powerbox back (it moved into the cell above).
             let prepared = reconstruct_jit_units(&mut cm, &mut hg)
-                .and_then(|()| jit_durable_enter(&mut cm, m, &mut hg));
+                .and_then(|()| jit_durable_enter(&mut cm, &mut hg));
             drop(hg);
             if let Err(e) = prepared {
                 *host = Host::from_cell(host_cell);
@@ -1658,7 +1662,7 @@ pub fn jit_cap_run(
     // this fresh module so a native `invoke` of them runs their own code. A no-op for a fresh run (no
     // restored units); the guest is not yet running, so `define_extra` is at a quiescent point.
     let prepared =
-        reconstruct_jit_units(&mut cm, host).and_then(|()| jit_durable_enter(&mut cm, m, host));
+        reconstruct_jit_units(&mut cm, host).and_then(|()| jit_durable_enter(&mut cm, host));
     if let Err(e) = prepared {
         host.set_jit_native_ctx(0);
         host.set_park_hub(0);
@@ -1690,11 +1694,7 @@ fn ended<B>(r: &Result<(JitOutcome, B), temen_jit::JitError>) -> bool {
 /// Residue the JIT cannot yet re-create is refused whole (`Unsupported`), never dropped (#1690): the
 /// detached children [`jit_relaunches`] refuses. The embedder then thaws on the interpreter, which
 /// carries all of it.
-fn jit_durable_enter(
-    cm: &mut CompiledModule,
-    m: &Module,
-    host: &mut Host,
-) -> Result<(), temen_jit::JitError> {
+fn jit_durable_enter(cm: &mut CompiledModule, host: &mut Host) -> Result<(), temen_jit::JitError> {
     if !host.is_durable() {
         return Ok(());
     }
@@ -1713,21 +1713,34 @@ fn jit_durable_enter(
             "durable JIT thaw: a record kind this run stands up no runtime for",
         ));
     }
-    let thaw = jit_thaw(host, m, 0).ok_or(temen_jit::JitError::Unsupported(
+    // Taken admitted against the compiled module's own facts, the check `set_durable` repeats: it
+    // cannot refuse what this take admitted, so no residue is lost between them.
+    let thaw = jit_thaw(host, cm.thaw_facts(), 0).ok_or(temen_jit::JitError::Unsupported(
         "durable JIT thaw: a residue the thaw pass refuses",
     ))?;
-    cm.set_durable(thaw)
+    cm.set_durable(thaw).map_err(|refused| {
+        // Unreachable as the take is the check (and the twins were declined above), but the seed's
+        // relaunch payloads hold refs on the child powerboxes this crate built: hand them back.
+        // SAFETY: each payload was built by `relaunch_payload`, whose powerboxes `grant_child_release`
+        // releases, and is released once, here.
+        unsafe { temen_jit::release_thaw(grant_child_release, *refused.seed) };
+        temen_jit::JitError::Unsupported("durable JIT thaw: a seed the compiled module refuses")
+    })
 }
 
 /// #3034 — the residue a restore left on `host` (a run root's, or a captured detached child's on its
-/// powerbox, #2010, #2031), taken and admitted again for the JIT against `m`, the program it thaws:
+/// powerbox, #2010, #2031), taken and admitted again for the JIT against `facts`, the program it thaws:
 /// each live detached child prepared for re-launch exactly as the interpreter's thaw prepares it
 /// ([`relaunch_payload`]). `task` is the id its root had in the frozen run, which the vCPUs it spawned
 /// name as their parent: a JIT domain's root is task 0. `None`, the residue left on `host`, if the pass
-/// refuses it, which a restore against `m` never leaves.
-fn jit_thaw(host: &mut Host, m: &Module, task: u64) -> Option<temen_jit::JitThaw> {
+/// refuses it, which a restore against the same program never leaves.
+fn jit_thaw(
+    host: &mut Host,
+    facts: &temen_ir::thaw::CodeFacts,
+    task: u64,
+) -> Option<temen_jit::JitThaw> {
     // Refused, the residue stays on `host` for the engine the caller declines to (#3034).
-    let thaw = host.take_thaw(m).ok()?;
+    let thaw = host.take_thaw(facts).ok()?;
     Some(
         thaw.rerooted(task)
             .map(|l| relaunch_payload(host, l), |_| ()),
@@ -1778,7 +1791,8 @@ fn relaunch_payload(host: &mut Host, l: temen_interp::LiveDetached) -> temen_jit
     }
     // Its own thaw, its captured children with it. Its root is task 0 in its domain, as in a JIT
     // capture: the vCPUs it spawned are re-parented from the id an interpreter capture gave it.
-    let Some(residue) = jit_thaw(&mut child, &r.module, launch.task) else {
+    let facts = temen_ir::thaw::CodeFacts::of(&*r.module);
+    let Some(residue) = jit_thaw(&mut child, &facts, launch.task) else {
         debug_assert!(
             false,
             "a detached child's residue the restore admitted, refused"
@@ -3179,8 +3193,9 @@ unsafe fn serve_locked(
         .clone()
         .filter(|_| bell.is_some() && freeze.is_none())
         .and_then(|cell| {
+            // #3133 — the site is the running vCPU's (or task's), also when this code is a fiber's.
             temen_jit::ServeSite::of(
-                vm,
+                vm.runner(),
                 serve_ctx as *const c_void,
                 mem_base,
                 mem_reserved,

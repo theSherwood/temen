@@ -352,6 +352,24 @@ pub(crate) fn abandon_after_fault(depth: (usize, usize)) {
 /// still blocked reports this again (the cooperative poll).
 const FIBER_PARKED: i64 = 3;
 
+/// #3133 — a fiber's stack and, for a guest fiber, the context its code runs on
+/// ([`crate::VmCtx::fiber`]): one value, so the context goes wherever the stack goes (a return, a
+/// slot's reuse, its table's end) and never before it. The fields drop in order, the stack first.
+pub(crate) struct Stack {
+    fiber: Fiber,
+    /// The fiber's code holds its address: it drops with the stack, or outlives it only as a spare
+    /// no code holds (`FiberRuntime::spare_ctxs`).
+    ctx: Option<Box<crate::VmCtx>>,
+}
+
+impl Stack {
+    /// A platform fiber's (a §14 task's, a serve handler's, a test's), whose code runs on a context
+    /// its owner keeps.
+    pub(crate) fn bare(fiber: Fiber) -> Stack {
+        Stack { fiber, ctx: None }
+    }
+}
+
 /// One slot of the domain-shared fiber table (D57 3b-ii/3c). The `Arc` keeps a resolved slot stable
 /// while the table grows (a re-entrant `cont.new` from inside a running fiber pushes new slots).
 pub(crate) struct FiberSlot {
@@ -370,7 +388,7 @@ pub(crate) struct FiberSlot {
     /// (suspended); it stays in place during a resume (`RUNNING` guarantees the claimant exclusive
     /// access, and the slot's `Arc` keeps it at one address) and is dropped, its stack unmapped,
     /// when the fiber returns (`finish`).
-    fiber: Mutex<Option<Fiber>>,
+    fiber: Mutex<Option<Stack>>,
     /// **Durable** (DURABILITY.md §12.8): this fiber's saved shadow-SP — the extent of its
     /// continuation in its in-window shadow region. Initialized to the region base (empty); on a
     /// durable run the resume/return swap saves the live word here and restores it on the next
@@ -607,7 +625,7 @@ impl SharedFiberTable {
     /// ([`Self::fiber_charge`]), held while the slot is its; a refusal drops it, handing it back.
     fn create(
         &self,
-        fiber: Fiber,
+        fiber: Stack,
         func: i32,
         arg0: i64,
         charge: FiberCharge,
@@ -722,7 +740,14 @@ impl FiberSlot {
     /// A durable child's shadow region is seeded per residency by the executor (#1361 step 4).
     pub(crate) fn platform(fiber: Fiber) -> Arc<FiberSlot> {
         let own = Ownership::new_owned_at(0);
-        Arc::new(FiberSlot::new(own, Some(fiber), 0, -1, 0, false))
+        Arc::new(FiberSlot::new(
+            own,
+            Some(Stack::bare(fiber)),
+            0,
+            -1,
+            0,
+            false,
+        ))
     }
 
     /// A slot holding `fiber` (`None`: a free slot), owned per `own`, its shadow-SP at `shadow_sp`
@@ -730,7 +755,7 @@ impl FiberSlot {
     /// event-parked, with nothing pending.
     fn new(
         own: Ownership,
-        fiber: Option<Fiber>,
+        fiber: Option<Stack>,
         shadow_sp: u64,
         func: i32,
         arg0: i64,
@@ -757,7 +782,7 @@ impl FiberSlot {
     fn reset(
         &mut self,
         own: Ownership,
-        fiber: Option<Fiber>,
+        fiber: Option<Stack>,
         shadow_sp: u64,
         func: i32,
         arg0: i64,
@@ -853,7 +878,7 @@ impl FiberSlot {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .as_mut()
-            .map(|f| f as *mut Fiber)
+            .map(|s| &mut s.fiber as *mut Fiber)
     }
 }
 
@@ -865,7 +890,7 @@ impl SharedFiberTable {
     /// with its flattened shadow-SP restored so the swap re-points the active word to its region.
     fn seed_frozen(
         &self,
-        fiber: Fiber,
+        fiber: Stack,
         func: i32,
         arg0: i64,
         shadow_sp: u64,
@@ -890,7 +915,7 @@ impl SharedFiberTable {
     /// #3078 — a test's fiber, in a fresh slot of this table.
     #[cfg(test)]
     pub(crate) fn create_for_test(&self, fiber: Fiber) -> Option<i64> {
-        self.create(fiber, 0, 0, FiberCharge::none(), false)
+        self.create(Stack::bare(fiber), 0, 0, FiberCharge::none(), false)
     }
 
     /// #2878 — whether the next slot a thaw seeds owns a context inside the arena, as `create`
@@ -979,7 +1004,7 @@ impl SharedFiberTable {
             return None; // a running fiber's `ctx` is the stale pre-resume context (see parked_extent)
         }
         let guard = slot.fiber.lock().unwrap_or_else(|e| e.into_inner());
-        let fib = guard.as_ref()?;
+        let fib = &guard.as_ref()?.fiber;
         if fib.is_done() {
             return None;
         }
@@ -1005,6 +1030,9 @@ impl SharedFiberTable {
             .collect()
     }
 }
+
+/// #3133 — how many returned fibers' contexts a vCPU keeps for its next `cont.new`s.
+const SPARE_CTXS: usize = 16;
 
 /// Per-vCPU fiber execution context: the shared table plus this vCPU's identity and switch
 /// bookkeeping. The table (the storage) is domain-shared; everything here is touched only by the
@@ -1048,6 +1076,19 @@ pub(crate) struct FiberRuntime {
     /// The context currently running on this vCPU (`None` = the root, context 0; `Some` = a fiber).
     /// The resume swap reads it to know whose SP to save before switching in, and restores it after.
     cur_shadow: Option<Arc<FiberSlot>>,
+    /// #3133 — the contexts of guest fibers that returned on this vCPU, for its next `cont.new` to
+    /// reuse ([`guest_fiber`]), as a finished slot is reused (#2486): a warmed `cont.new` allocates
+    /// none. At most [`SPARE_CTXS`]. Boxed: a fiber's code holds its context's address, so a context
+    /// never moves once a fiber is made on it.
+    ///
+    /// A spare holds nothing ([`crate::VmCtx::holds_nothing`], asserted where a context becomes one):
+    /// a fiber's context owns no cell, serve site, cap thunk state, end or handler count (a fiber's
+    /// serve site and thunk state are its runner's), and names no runner once its fiber is out. So a
+    /// spare kept past its run, in an idle shell's `FiberRuntime`, keeps nothing of the run alive but
+    /// the copied pointers, which it never reads again. #3143 would keep the context inline in its
+    /// slot, which the slot's recycling would reuse, and remove this list.
+    #[allow(clippy::vec_box)]
+    spare_ctxs: Vec<Box<crate::VmCtx>>,
     /// **Durable freeze residue** (slice 3.2/3.3.3): fibers this vCPU flattened during a freeze
     /// (`fiber_resume`'s `Complete` arm records each that unwound). Read back by `run_code_raw` into
     /// the durable entry's returned residue. Empty on a non-freeze run.
@@ -1079,6 +1120,7 @@ impl FiberRuntime {
             mem_base: 0,
             root_shadow_sp,
             cur_shadow: None,
+            spare_ctxs: Vec::new(),
             frozen: Vec::new(),
             flattening: false,
         }
@@ -1146,8 +1188,9 @@ unsafe fn fault(vm: u64) {
 
 /// Build a suspended native fiber that, on first resume, runs guest `funcref(arg0, arg)` through the
 /// call-trampoline — resolving + type-checking the funcref against the function table on that first
-/// resume, like the interpreter. Shared by `cont.new` ([`fiber_new`]) and durable thaw re-seeding
-/// ([`SharedFiberTable::seed_frozen`]), so a thawed fiber re-enters its entry identically.
+/// resume, like the interpreter. Called only by [`guest_fiber`], which `cont.new` ([`fiber_new`]) and
+/// a thaw's re-seeding ([`seed_frozen_fibers`]) both go through, so a thawed fiber re-enters its entry
+/// identically.
 ///
 /// Returns `None` if the OS refuses the control-stack reservation — the caller turns it into a
 /// `FiberFault`, never an abort, so a guest spawning many fibers can't crash the host (ISSUES.md I1).
@@ -1165,7 +1208,6 @@ unsafe fn make_fiber(
     mask: u64,
     type_id: u32,
     call_tramp: FiberCallTramp,
-    fuel_addr: u64,
 ) -> Option<Fiber> {
     Fiber::new(FIBER_STACK, move |y: &Yielder, arg: u64| -> u64 {
         // The *resuming* vCPU's runtime — read dynamically at **each** use, never carried across
@@ -1188,9 +1230,11 @@ unsafe fn make_fiber(
                 // one fuel a start costs — on the interpreters that resume is the *whole* cost of
                 // entering a fiber. The entry's prologue is about to charge again, unable to tell a
                 // start from a call, so refund one. It cannot underflow or trap: the resume's check
-                // passed, so the cell holds at least the one this adds back. `0` ⇒ un-armed.
-                if fuel_addr != 0 {
-                    *(fuel_addr as *mut u64) += 1;
+                // passed, so the cell holds at least the one this adds back. Null ⇒ un-armed. The
+                // cell is the fiber's context's, which its owner keeps alive with the fiber (#3133).
+                let cell = (*(vm as *const crate::VmCtx)).fuel;
+                if !cell.is_null() {
+                    (*cell).left += 1;
                 }
                 // §2b path B: this fiber runs on its own control stack; pass its low bound as the
                 // stack-limit so the guest's prologue checks trap before overflowing it (per-vCPU by
@@ -1208,6 +1252,80 @@ unsafe fn make_fiber(
             (*current()).yielders.pop();
             result
         }
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    /// #3133 — how many spares this thread's `cont.new`s reused, for the spare rows.
+    static SPARES_REUSED: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+}
+
+/// Count a reused spare on this thread.
+#[cfg(test)]
+#[inline(never)]
+fn spare_reused() {
+    SPARES_REUSED.with(|n| n.set(n.get() + 1));
+}
+
+/// How many spares this thread's `cont.new`s have reused.
+#[cfg(test)]
+#[inline(never)]
+pub(crate) fn spares_reused() -> usize {
+    SPARES_REUSED.with(|n| n.get())
+}
+
+/// #3133 — a guest fiber over `creator`'s instance: a context of its own made from `creator`'s
+/// ([`crate::VmCtx::fiber`]), which its code runs on, and the stack, which [`make_fiber`] builds
+/// over that context. `cont.new` and a thaw's re-seeding both make theirs here, so no guest fiber
+/// runs on the context of the code that made it, which may end first (a held activation's, a serve
+/// handler's window's).
+///
+/// # Safety
+/// As [`make_fiber`]'s; `creator` is a live context of the run.
+#[allow(clippy::too_many_arguments)]
+unsafe fn guest_fiber(
+    rt: *mut FiberRuntime,
+    creator: &crate::VmCtx,
+    funcref: i32,
+    arg0: u64,
+    mem_base: u64,
+    fn_table_base: u64,
+    mask: u64,
+    type_id: u32,
+    call_tramp: FiberCallTramp,
+) -> Option<Stack> {
+    let ctx = match (*rt).spare_ctxs.pop() {
+        Some(mut spare) => {
+            #[cfg(test)]
+            spare_reused();
+            *spare = creator.fiber();
+            spare
+        }
+        None => Box::new(creator.fiber()),
+    };
+    debug_assert!(
+        ctx.handler_window.load(Ordering::Relaxed).is_null(),
+        "a fiber's context names no window (#3133)"
+    );
+    debug_assert!(
+        ctx.holds_nothing(),
+        "a new fiber's context holds nothing (#3133)"
+    );
+    let vm = &*ctx as *const crate::VmCtx as u64;
+    let fiber = make_fiber(
+        funcref,
+        arg0,
+        mem_base,
+        fn_table_base,
+        vm,
+        mask,
+        type_id,
+        call_tramp,
+    )?;
+    Some(Stack {
+        fiber,
+        ctx: Some(ctx),
     })
 }
 
@@ -1271,7 +1389,8 @@ pub(crate) unsafe fn make_handler_fiber(
 ///
 /// The fiber runs over its creator's window and function table, charging its counted-fuel cell
 /// (null ⇒ un-armed, for [`make_fiber`]'s start refund): all read from `vm`, its creator's context,
-/// never taken from the code (#2534).
+/// never taken from the code (#2534), and copied into the fiber's own context ([`guest_fiber`],
+/// #3133).
 ///
 /// # Safety
 /// `vm` is the threaded context. The running vCPU's fiber runtime is read from the [`CURRENT_RT`]
@@ -1279,11 +1398,7 @@ pub(crate) unsafe fn make_handler_fiber(
 /// interpreter.
 pub(crate) unsafe extern "C" fn fiber_new(vm: u64, funcref: i32, arg0: u64) -> i64 {
     let ctx = crate::VmCtx::at(vm);
-    let (mem_base, fn_table_base, fuel_addr) = (
-        ctx.window().base as u64,
-        ctx.window().fn_table as u64,
-        ctx.fuel as u64,
-    );
+    let (mem_base, fn_table_base) = (ctx.window().base as u64, ctx.window().fn_table as u64);
     let rt = current();
     if rt.is_null() {
         fault(vm);
@@ -1313,16 +1428,16 @@ pub(crate) unsafe extern "C" fn fiber_new(vm: u64, funcref: i32, arg0: u64) -> i
         )
     };
 
-    let fiber = match make_fiber(
+    let fiber = match guest_fiber(
+        rt,
+        ctx,
         funcref,
         arg0,
         mem_base,
         fn_table_base,
-        vm,
         mask,
         type_id,
         call_tramp,
-        fuel_addr,
     ) {
         Some(f) => f,
         None => {
@@ -1383,7 +1498,7 @@ pub(crate) unsafe extern "C" fn fiber_resume(
     // somewhere in a resume chain), a racing resume, or a finished fiber all *lose the claim* and
     // fault. No lock or `&mut` is held past this block; the `Arc` keeps the slot (and the boxed
     // fiber it owns) stable across the switch.
-    let (slot_idx, slot, fib): (usize, Arc<FiberSlot>, *mut Fiber) = {
+    let (slot_idx, slot, fib, fctx): (usize, Arc<FiberSlot>, *mut Fiber, *const crate::VmCtx) = {
         let rt = &*rt;
         let Some((slot_idx, slot)) = rt.table.resolve(handle) else {
             fault(vm);
@@ -1446,7 +1561,12 @@ pub(crate) unsafe extern "C" fn fiber_resume(
             .unwrap_or_else(|e| e.into_inner())
             .as_mut()
         {
-            Some(f) => f as *mut Fiber,
+            Some(s) => (
+                &mut s.fiber as *mut Fiber,
+                s.ctx
+                    .as_deref()
+                    .map_or(core::ptr::null(), |c| c as *const crate::VmCtx),
+            ),
             // Unreachable by invariant (a claimable slot holds its fiber); fail closed, leaving
             // the slot claimed (inert thereafter) rather than aliasing anything.
             None => {
@@ -1455,7 +1575,8 @@ pub(crate) unsafe extern "C" fn fiber_resume(
                 return 0;
             }
         };
-        (slot_idx, slot, fib)
+        let (fib, fctx) = fib;
+        (slot_idx, slot, fib, fctx)
     };
     // Durable shadow-SP swap (DURABILITY.md §12.8, D-fiber-cont option A): `fiber_resume` brackets a
     // fiber's residency, so the whole swap lives here (no change to `fiber_suspend`). On entry save
@@ -1530,7 +1651,16 @@ pub(crate) unsafe extern "C" fn fiber_resume(
         // the body's yielder push), so the futex thunk can park the RUNNING fiber; popped when the
         // resume returns, on this same OS thread.
         (*current()).active_slots.push(Arc::clone(&slot));
+        // #3133 — the one switch into a guest fiber names its runner: the resumer's own, which a
+        // fiber resumed by a fiber inherits; cleared once the fiber is back here, so none rests in a
+        // suspended fiber.
+        if let Some(c) = fctx.as_ref() {
+            c.fiber_switched_in(crate::VmCtx::at(vm).runner());
+        }
         let st = (*fib).resume(arg as u64);
+        if let Some(c) = fctx.as_ref() {
+            c.fiber_switched_out();
+        }
         (*current()).active_slots.pop();
         temen_set_current_fiber(prev_fiber);
         // Exit swap: back in the resumer (possibly on a different OS thread — re-read the runtime).
@@ -1632,7 +1762,20 @@ pub(crate) unsafe extern "C" fn fiber_resume(
             // Drop the fiber (unmapping its stack) and free the slot — `finish` bumps the
             // generation, so any stale claim of this slot keeps failing; the slot returns to the free
             // list for recycling (step 3).
-            slot.fiber.lock().unwrap_or_else(|e| e.into_inner()).take();
+            let stack = slot.fiber.lock().unwrap_or_else(|e| e.into_inner()).take();
+            // #3133 — its context, once its stack is gone, for this vCPU's next `cont.new`.
+            if let Some(Stack {
+                fiber,
+                ctx: Some(ctx),
+            }) = stack
+            {
+                drop(fiber);
+                debug_assert!(ctx.holds_nothing(), "a spare holds nothing (#3133)");
+                let spares = &mut (*current()).spare_ctxs;
+                if spares.len() < SPARE_CTXS {
+                    spares.push(ctx);
+                }
+            }
             slot.running_on.store(NOT_RUNNING, Ordering::Release);
             slot.own.finish();
             (*current()).table.free_slot(slot_idx);
@@ -1941,11 +2084,14 @@ pub(crate) unsafe fn seed_frozen_fibers(
     fn_table_base: u64,
     vm: u64,
 ) -> bool {
-    let r = &*rt;
-    let (mask, type_id, call_tramp) = (
-        r.fn_table_mask,
-        r.fiber_type_id,
-        r.call_tramp
+    // What the seeding needs of `rt`, taken out first: `guest_fiber` writes `(*rt).spare_ctxs`, so
+    // no borrow of `*rt` lives across it.
+    let (table, mask, type_id, call_tramp) = (
+        Arc::clone(&(*rt).table),
+        (*rt).fn_table_mask,
+        (*rt).fiber_type_id,
+        (*rt)
+            .call_tramp
             .expect("call-trampoline set before seeding thawed fibers"),
     );
     let mut seed = seed.to_vec();
@@ -1954,36 +2100,36 @@ pub(crate) unsafe fn seed_frozen_fibers(
         // #2878 — the residue is untrusted (DURABILITY.md §4): a slot whose context would lie past
         // the arena is not seeded, as `cont.new` refuses one, and the rewound `cont.resume` that
         // names it fails closed. The oracle's thaw stops at the same slot.
-        if !r.table.seed_fits() {
+        if !table.seed_fits() {
             // #3034 — the thaw pass admitted each slot's context; this refusal stays in front of the
             // raw stores at `region_base(slot + 1)`, loud in debug.
             temen_ir::thaw::backstop("the thaw pass admits only a fiber slot inside the arena");
             break;
         }
         if f.is_free() {
-            let got = r.table.seed_free(f.generation);
+            let got = table.seed_free(f.generation);
             debug_assert_eq!(got, f.slot, "re-seeded slot matches the recorded handle");
             continue;
         }
-        // `0`: no counted-fuel entry runs durable, so a thawed fiber has no budget to refund into.
-        let Some(fiber) = make_fiber(
+        // The fiber's context names the root's cell, so its entry refunds the unit its rewound
+        // `cont.resume` charged, as a `cont.new` fiber's does: the tree-walker's count
+        // (`durable_fibers_jit.rs`, `a_thawed_fibers_start_is_charged_as_the_tree_walker_charges_it`).
+        let Some(fiber) = guest_fiber(
+            rt,
+            crate::VmCtx::at(vm),
             f.func,
             f.arg0 as u64,
             mem_base,
             fn_table_base,
-            vm,
             mask,
             type_id,
             call_tramp,
-            0,
         ) else {
             // The OS refused a thaw control-stack reservation — recoverable, not an abort (I1).
             fault(vm);
             return false;
         };
-        let got = r
-            .table
-            .seed_frozen(fiber, f.func, f.arg0, f.shadow_sp, f.generation, f.consumed);
+        let got = table.seed_frozen(fiber, f.func, f.arg0, f.shadow_sp, f.generation, f.consumed);
         debug_assert_eq!(got, expected, "frozen fibers re-seed densely from slot 0");
         debug_assert_eq!(got, f.slot, "re-seeded slot matches the recorded handle");
     }
@@ -2146,7 +2292,7 @@ pub(crate) unsafe extern "C" fn gc_roots(vm: u64, args: *const GcRootsArgs) -> i
         let t = rt.table.lock();
         for slot in t.slots.iter() {
             let guard = slot.fiber.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(fib) = guard.as_ref() {
+            if let Some(fib) = guard.as_ref().map(|s| &s.fiber) {
                 let (lo, hi) = if slot.own.is_running() {
                     // §3.3 stop-the-world sanity check: a fiber running on *another* vCPU means the
                     // caller is **not** under STW — scanning its live, mutating native stack would be
@@ -2423,6 +2569,48 @@ mod flatten_claim_tests {
     use crate::TrapKind;
     use std::sync::Arc;
     use temen_ir::durable_abi::ShadowArena;
+
+    /// #3133 — a context a returned fiber left on its vCPU is the next `cont.new`'s, rewritten whole:
+    /// whatever the earlier fiber's left in it (its domain's end in its stop word, a cap thunk's
+    /// state, the cell it charged) the new fiber's context is its own maker's, and it is the same
+    /// allocation.
+    #[test]
+    fn a_reused_fiber_context_starts_as_its_makers() {
+        if !temen_fiber::supported() {
+            return;
+        }
+        extern "C" fn never(_: u64, _: u64, _: u64, _: u64, _: u64, _: u64, _: u64) -> u64 {
+            unreachable!("the fiber is never resumed")
+        }
+        let table = Arc::new(SharedFiberTable::new(4, ShadowArena::EMPTY, None));
+        let rt = Box::into_raw(Box::new(FiberRuntime::new(table, 0, 0)));
+        // The earlier fiber's: another domain, ended; a cap thunk's state; another cell.
+        let other = crate::VmCtx::new(crate::InstanceAddrs::NONE, crate::Window::NONE);
+        let mut other_cell = crate::FuelCell::fixed(10);
+        let earlier = other.vcpu(&mut *other_cell);
+        let spare = Box::new(earlier.fiber());
+        spare.raise(crate::TrapKind::Unreachable as i64);
+        let _ = spare.thunk_state(|| 7u32);
+        let at = &*spare as *const crate::VmCtx;
+        // SAFETY: `rt` is this test's, alive below; nothing resumes the fiber made here.
+        unsafe { (*rt).spare_ctxs.push(spare) };
+        let maker = crate::VmCtx::new(crate::InstanceAddrs::NONE, crate::Window::NONE);
+        let stack =
+            unsafe { super::guest_fiber(rt, &maker, 0, 0, 0, 0, 0, 0, never) }.expect("a stack");
+        let ctx = stack.ctx.as_deref().expect("a guest fiber's context");
+        assert_eq!(ctx as *const crate::VmCtx, at, "the spare, reused");
+        assert_eq!(ctx.stop_word(), 0, "not the earlier domain's end");
+        assert_eq!(ctx.ended(), None);
+        assert_eq!(ctx.domain_key(), maker.domain_key(), "its maker's end");
+        assert!(!ctx.has_thunk_state(), "no cap thunk's state");
+        assert!(
+            ctx.fuel.is_null(),
+            "its maker's (no) cell, not the earlier one's"
+        );
+        drop(stack);
+        // SAFETY: made by `Box::into_raw` above, and nothing else holds it.
+        drop(unsafe { Box::from_raw(rt) });
+    }
 
     /// #2032 — two freeze drivers walk one table: each snapshots the parked fibers, then claims
     /// them. A rival that claimed and flattened one first leaves its slot free at the next

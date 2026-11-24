@@ -1070,6 +1070,7 @@ fn interp_durable_run(
                 children: cut.children,
                 ..Default::default()
             },
+            temen_interp::Serve::default(),
         )
         .expect("a residue a run made");
     }
@@ -1281,6 +1282,7 @@ fn the_embedder_jit_path_carries_the_vcpu_residue_both_ways() {
             children: h.child_generations().to_vec(),
             ..Default::default()
         },
+        temen_interp::Serve::default(),
     )
     .expect("a residue a run made");
     let (tout, _) = temen_run::jit_cap_run(
@@ -1352,6 +1354,7 @@ fn the_embedder_jit_path_refuses_residue_it_cannot_recreate_and_keeps_it() {
             live_detached: vec![child],
             ..Default::default()
         },
+        temen_interp::Serve::default(),
     )
     .expect("a residue a run made");
     let r = temen_run::jit_cap_run(
@@ -1382,5 +1385,5 @@ fn jit_thaw(
     m: &temen_ir::Module,
     raw: temen_ir::thaw::RawResidue<temen_jit::JitDetached, ()>,
 ) -> temen_jit::JitThaw {
-    temen_ir::thaw::validate(m, false, 0, raw).expect("a residue a run made")
+    temen_ir::thaw::validate(m, false, 0, raw, Default::default()).expect("a residue a run made")
 }

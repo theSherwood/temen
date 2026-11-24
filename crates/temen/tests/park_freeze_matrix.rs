@@ -1011,7 +1011,16 @@ block 0 (vsp: i64, vcap: i64) {
 }
 "#;
 
-fn reply_from(site: ParkSite, engine: Engine, t: &str) {
+/// [`reply_from`]'s program, with `t` as its caller: the instrumented root, `C`'s image, and a fresh
+/// powerbox with its arguments.
+#[allow(clippy::type_complexity)]
+fn reply_program(
+    t: &str,
+) -> (
+    Arc<Module>,
+    Arc<Module>,
+    Box<dyn Fn() -> (Host, Vec<Value>)>,
+) {
     let src = r#"
 memory 17
 type 0 func (i64) -> (i64)
@@ -1081,14 +1090,20 @@ block 0 (vx: i64) {
     );
     let inst = instrumented(&src);
     let c = instrumented_image(&src, 2);
-    let powerbox = || {
-        let mut h = durable_host(&inst);
+    let (pi, pc) = (inst.clone(), c.clone());
+    let powerbox = move || {
+        let mut h = durable_host(&pi);
         let i = h.grant_instantiator();
-        let m = h.grant_durable_module(&c);
+        let m = h.grant_durable_module(&pc);
         let b = h.grant_budget(-1, 1 << 20, -1);
         h.grant_freeze_authority();
         (h, vec![Value::I32(i), Value::I32(m), Value::I32(b)])
     };
+    (inst, c, Box::new(powerbox))
+}
+
+fn reply_from(site: ParkSite, engine: Engine, t: &str) {
+    let (inst, c, powerbox) = reply_program(t);
 
     let (h, args) = powerbox();
     let (res, _, _) = run(
@@ -1394,4 +1409,76 @@ block 0 (vsp: i64, va: i64) {{
         |h| h.push_stdin(b"x"),
         Ok(1000 + i64::from(b'x') + 7),
     );
+}
+
+/// #3034 — the serve rules a restore applies refuse nothing a real freeze makes: a live call's whole
+/// exchange (the caller issues it, `C` queues it, serves it in a handler, settles the reply, the
+/// caller takes it), frozen at every countdown point until the run ends unfrozen, for a caller that
+/// makes the call itself and one that makes it in a fiber. Every artifact restores and thaws to the
+/// uninterrupted answer. The drained variant closes every non-durable handle before each freeze, as
+/// an embedder's pre-freeze step does (`Host::drain_non_durable`), which leaves the reply waits: its
+/// artifacts restore too, and thaw to an answer, never a hang (the run is bounded). On the tree-walker:
+/// the JIT and the bytecode engine freeze no reply wait yet ([`jit_row`], #1904). `C`'s handler here
+/// runs to its reply without parking, so no cut holds it frozen: a frozen handler's serve state goes
+/// through the same pass in `temen-durable`'s `a_mid_handler_freeze_thaws_and_the_handler_replies`.
+#[test]
+fn a_live_calls_exchange_frozen_at_every_point_restores_and_thaws() {
+    let mut report = Vec::new();
+    for (name, t) in [
+        ("T calls", T_CALLS),
+        ("T calls in a fiber", T_CALLS_IN_A_FIBER),
+    ] {
+        let (inst, c, powerbox) = reply_program(t);
+        for drained in [false, true] {
+            let (mut artifacts, mut declined, mut k) = (0, 0, 0i64);
+            let (mut waits, mut handlers) = (0, 0);
+            loop {
+                let (h, args) = powerbox();
+                let mut win = init_durable_window(WINDOW, TEST_ARENA);
+                arm_freeze_after(&mut win, TEST_ARENA, k);
+                let (res, snap, mut h) = run(Engine::Interp, &inst, &args, &win, h);
+                assert!(k < 10_000, "{name}: the run never ends unfrozen");
+                k += 1;
+                if h.take_freeze_declined().is_some() {
+                    declined += 1; // the run finished as the uninterrupted one does
+                    continue;
+                }
+                if res == Ok(1042) {
+                    k -= 1;
+                    break; // the countdown outlived the run: it ended unfrozen
+                }
+                waits += usize::from(!h.reply_waits().is_empty());
+                handlers += usize::from(
+                    h.captured_detached()
+                        .iter()
+                        .any(|c| !c.host.lock().unwrap().frozen_handlers().is_empty()),
+                );
+                if drained {
+                    h.drain_non_durable();
+                }
+                let Ok(art) = temen_snapshot::freeze(&inst, &snap, &h) else {
+                    declined += 1;
+                    continue;
+                };
+                artifacts += 1;
+                let mut th = durable_host(&inst);
+                th.grant_durable_module(&c);
+                let mut twin = temen_snapshot::restore(&art, &inst, &mut th).unwrap_or_else(|e| {
+                    panic!("{name} at {}: a real freeze refused: {e:?}", k - 1)
+                });
+                begin_thaw(&mut twin, TEST_ARENA, 0);
+                let (res, _, _) = run(Engine::Interp, &inst, &args, &twin, th);
+                if !drained {
+                    assert_eq!(res, Ok(1042), "{name} at {}: the thaw's answer", k - 1);
+                }
+            }
+            assert!(artifacts > 0, "{name}: some point froze");
+            report.push(format!(
+                "{name}{}: N = {k}, {artifacts} artifacts ({waits} with a reply wait, {handlers} with \
+                 the callee's handler frozen), {declined} declined",
+                if drained { " (drained)" } else { "" }
+            ));
+        }
+    }
+    eprintln!("{}", report.join("\n"));
 }

@@ -804,6 +804,7 @@ pub fn fuzz_fiber_one(g: &mut Gen) {
                 fibers: frozen,
                 ..Default::default()
             },
+            temen_interp::Serve::default(),
         )
         .expect("a residue a run made");
         let mut fuel = 1_000_000u64;
@@ -1033,6 +1034,7 @@ pub fn fuzz_recycle_fiber_one(g: &mut Gen) {
                 fibers: frozen,
                 ..Default::default()
             },
+            temen_interp::Serve::default(),
         )
         .expect("a residue a run made");
         let mut fuel = 1_000_000u64;

@@ -31,10 +31,11 @@ use crate::{jit_proc, CAP_REVOKED};
 /// takes its calls first, which the JIT's do not reach yet (#2895), so the tree-walker holds it
 /// (INVARIANTS #9).
 ///
-/// #3133 (stop-gap) — the JIT also declines a module that can make a fiber: one with a fiber op, or
-/// one whose host lets its submitted units host fibers. A fiber made in an activation keeps that
-/// activation's context and fuel cell, which end with the call, and a later resume would run on
-/// them. The tree-walker holds it until a fiber has a context of its own (#3080).
+/// #3133, #3080 — the JIT also declines a module that can make a fiber: one with a fiber op, or one
+/// whose host lets its submitted units host fibers. A fiber runs on a context of its own, but it
+/// charges the fuel of the code that made it: a fiber made in one call would burn that call's
+/// leftover loan in every later call, where the tree-walker charges the call that resumes it. The
+/// tree-walker holds such a domain until a fiber charges the vCPU running it (#3080).
 pub fn hold(
     on: Executor,
     m: Arc<Module>,

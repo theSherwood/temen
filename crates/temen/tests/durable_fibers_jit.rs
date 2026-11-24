@@ -28,7 +28,8 @@ use temen_interp::{
     Value,
 };
 use temen_jit::{
-    compile_and_run_durable, DurableResidue, DurableRun, FrozenFiber as JitFrozen, JitOutcome,
+    compile_and_run_durable, DurableResidue, DurableRun, FrozenFiber as JitFrozen, JitError,
+    JitOutcome,
 };
 use temen_snapshot::{freeze, restore};
 use temen_text::parse_module;
@@ -309,6 +310,7 @@ fn jit_and_interp_freeze_a_fiber_to_an_identical_artifact() {
                 fibers: residue.to_vec(),
                 ..Default::default()
             },
+            temen_interp::Serve::default(),
         )
         .expect("a residue a run made");
     let artifact_j = freeze(&inst, &jsnap, &jhost2).expect("JIT artifact");
@@ -1024,5 +1026,191 @@ fn jit_thaw(
     m: &temen_ir::Module,
     raw: temen_ir::thaw::RawResidue<temen_jit::JitDetached, ()>,
 ) -> temen_jit::JitThaw {
-    temen_ir::thaw::validate(m, false, 0, raw).expect("a residue a run made")
+    temen_ir::thaw::validate(m, false, 0, raw, Default::default()).expect("a residue a run made")
+}
+
+/// **#3034 slice 2 — a thaw is bound to the code it was admitted for.** The JIT admits a seed again
+/// against the facts of the module it compiled, never against code its caller names: a residue
+/// admitted for `FIBER_SRC` (one frozen fiber) cannot seed a module that makes no fiber, and one
+/// whose root extent lies in shadow context 3 (a fork twin's root) cannot seed a JIT root, which runs
+/// in context 0. On `11ada7d` `set_durable` seeded either.
+#[test]
+fn a_thaw_admitted_for_one_module_cannot_seed_another() {
+    let inst = transform_module(&parse_module(FIBER_SRC).expect("parse")).expect("transform");
+    let other = transform_module(
+        &parse_module(
+            "memory 17 shadow 16448 65536\nfunc () -> (i64) {\nblock 0 () {\n  v0 = i64.const 1\n  return v0\n  }\n}\n",
+        )
+        .expect("parse"),
+    )
+    .expect("transform");
+    verify_module(&other).expect("verify");
+    // A real freeze's fiber, through the codec.
+    let mut ihost = Host::new();
+    ihost.set_durable(true);
+    let mut iwin = init_durable_window(WINDOW, TEST_ARENA);
+    write_state(&mut iwin, TEST_ARENA, STATE_UNWINDING);
+    let mut ifuel = 1_000_000u64;
+    let (ires, isnap) =
+        run_capture_reserved_with_host(&inst, 0, &[], &mut ifuel, &iwin, WINDOW_LOG2, &mut ihost);
+    assert!(ires.is_ok());
+    let artifact = freeze(&inst, &isnap, &ihost).expect("freeze");
+    let mut thost = Host::new();
+    let mut thaw_win = restore(&artifact, &inst, &mut thost).expect("restore");
+    begin_thaw(&mut thaw_win, TEST_ARENA, 0);
+    let raw = || temen_ir::thaw::RawResidue {
+        fibers: jit_seed(thost.frozen_fibers()),
+        ..Default::default()
+    };
+    let run = |m: &temen_ir::Module, seed| {
+        let mut jhost = Host::new();
+        compile_and_run_durable(
+            m,
+            0,
+            &[],
+            &thaw_win,
+            WINDOW_LOG2,
+            temen_run::cap_thunk,
+            &mut jhost as *mut Host as *mut c_void,
+            DurableRun {
+                seed,
+                ..Default::default()
+            },
+        )
+        .map(|(o, ..)| o)
+    };
+    assert!(
+        matches!(run(&inst, jit_thaw(&inst, raw())), Ok(JitOutcome::Returned(ref s)) if s == &[107]),
+        "the control: admitted for the module it seeds"
+    );
+    assert!(
+        matches!(
+            run(&other, jit_thaw(&inst, raw())),
+            Err(JitError::Unsupported(_))
+        ),
+        "admitted for `FIBER_SRC`, refused by a module that makes no fiber"
+    );
+    let arena = temen_ir::thaw::CodeFacts::of(&inst).arena();
+    let twin_root = temen_ir::thaw::RawResidue {
+        root_sp: Some(arena.frame_base(3) + 8),
+        ..raw()
+    };
+    let twin = temen_ir::thaw::validate(&inst, false, 3, twin_root, Default::default())
+        .expect("a residue a twin's root, in context 3, could hold");
+    assert!(
+        matches!(run(&inst, twin), Err(JitError::Unsupported(_))),
+        "a root extent in context 3, refused by a root in context 0"
+    );
+    // The embedder's take is the check the seed repeats: refused against another module's facts, it
+    // leaves the residue on the host for the tree-walker (INVARIANTS #9).
+    let facts = temen_ir::thaw::CodeFacts::of(&other);
+    assert!(thost.take_thaw(&facts).is_err());
+    assert_eq!(
+        thost.frozen_fibers().len(),
+        1,
+        "the residue is where it was"
+    );
+}
+
+/// A durable loop of 10 back-edges returning 42: no fibers.
+const LOOP_SRC: &str = "memory 17 shadow 16448 65536\n\
+    func () -> (i64) {\n\
+    block 0 () {\n\
+    \x20 v0 = i64.const 0\n\
+    \x20 br 1(v0)\n\
+    }\n\
+    block 1 (v1: i64) {\n\
+    \x20 v2 = i64.const 10\n\
+    \x20 v3 = i64.lt_u v1 v2\n\
+    \x20 br_if v3 2(v1) 3()\n\
+    }\n\
+    block 2 (v4: i64) {\n\
+    \x20 v5 = i64.const 1\n\
+    \x20 v6 = i64.add v4 v5\n\
+    \x20 br 1(v6)\n\
+    }\n\
+    block 3 () {\n\
+    \x20 v7 = i64.const 42\n\
+    \x20 return v7\n\
+      }\n\
+    }\n";
+
+/// #3139 — what a thaw through `jit_cap_run` burns past the tree-walker's thaw, fibers or none: its
+/// entry. A fix makes it 0.
+const THAW_ENTRY_GAP: u64 = 1;
+
+/// `src` frozen at its first safepoint on the tree-walker, then thawed metered on the tree-walker
+/// (on a budget) and on the JIT (through [`temen_run::jit_cap_run`], which meters every run on its
+/// host's node): what each thaw returned and burned.
+fn metered_thaws(src: &str) -> ((Vec<Value>, u64), (JitOutcome, u64)) {
+    let m = parse_module(src).expect("parse");
+    let inst = transform_module(&m).expect("transform");
+    verify_module(&inst).expect("verify");
+    let mut ihost = Host::new();
+    ihost.set_durable(true);
+    let mut iwin = init_durable_window(WINDOW, TEST_ARENA);
+    write_state(&mut iwin, TEST_ARENA, STATE_UNWINDING);
+    let mut ifuel = 1_000_000u64;
+    let (ires, isnap) =
+        run_capture_reserved_with_host(&inst, 0, &[], &mut ifuel, &iwin, WINDOW_LOG2, &mut ihost);
+    assert!(ires.is_ok(), "the freeze: {ires:?}");
+    let artifact = freeze(&inst, &isnap, &ihost).expect("freeze");
+    let restored = || {
+        let mut h = Host::new();
+        let mut win = restore(&artifact, &inst, &mut h).expect("restore");
+        begin_thaw(&mut win, TEST_ARENA, 0);
+        h.set_durable(true);
+        (h, win)
+    };
+    let budget = temen_interp::DEFAULT_FUEL;
+    let (mut h, win) = restored();
+    let mut left = budget;
+    let (tree, _) =
+        run_capture_reserved_with_host(&inst, 0, &[], &mut left, &win, WINDOW_LOG2, &mut h);
+    let tree = (tree.expect("tree-walker thaw"), budget - left);
+    let (mut h, win) = restored();
+    let (jit, _) = temen_run::jit_cap_run(
+        &inst,
+        0,
+        &[],
+        &temen_interp::MemLayout::image(win),
+        WINDOW_LOG2,
+        0,
+        &mut h,
+        None,
+    )
+    .expect("JIT thaw");
+    (tree, (jit, budget - h.fuel_left()))
+}
+
+/// #3133 (review A) — a thawed fiber's start is charged as the tree-walker charges it. The thaw
+/// re-seeds the fiber (frozen suspended) and its rewound `cont.resume` re-enters the fiber's entry;
+/// the fiber's context names the root's cell, so the entry refunds the one unit the resume charged,
+/// as `cont.new`'s fibers do. (Main passed no cell to a seeded fiber, so it did not refund: its thaw
+/// burned 2 past the tree-walker's.) The JIT's thaw burns [`THAW_ENTRY_GAP`] past the tree-walker's
+/// with a fiber as without one, so the fiber adds the same on both engines.
+#[test]
+fn a_thawed_fibers_start_is_charged_as_the_tree_walker_charges_it() {
+    let ((tv, tree), (jo, jit)) = metered_thaws(FIBER_SRC);
+    assert_eq!(tv, vec![Value::I64(107)], "tree-walker thaw");
+    assert!(
+        matches!(&jo, JitOutcome::Returned(v) if *v == vec![107]),
+        "JIT thaw: {jo:?}"
+    );
+    let ((lv, ltree), (lo, ljit)) = metered_thaws(LOOP_SRC);
+    assert_eq!(lv, vec![Value::I64(42)], "tree-walker thaw, no fibers");
+    assert!(
+        matches!(&lo, JitOutcome::Returned(v) if *v == vec![42]),
+        "JIT thaw, no fibers: {lo:?}"
+    );
+    assert_eq!(
+        ljit - ltree,
+        THAW_ENTRY_GAP,
+        "a thaw with no fibers (#3139)"
+    );
+    assert_eq!(
+        jit - tree,
+        THAW_ENTRY_GAP,
+        "a thaw with a fiber: {tree} {jit}"
+    );
 }

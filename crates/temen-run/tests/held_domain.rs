@@ -952,8 +952,11 @@ block 0 (v0: i32, v1: i32, v2: i32, v3: i32) {{
 /// window's context, and a fiber it makes lands in the run's table. When the vCPU that served ended,
 /// its serve site went, and the window's context with it, so the child's root resumed the fiber onto
 /// freed memory (reproduced on 5326ff0, under ASan with freed memory filled: a read of a pointer from
-/// the freed context in compiled code). The run now keeps a retired site until it ends. Both engines
-/// answer the oracle's 50 · 1_000_000 + 42_080.
+/// the freed context in compiled code). The fiber now runs on a context of its own. Both engines
+/// answer the oracle's 50 · 1_000_000 + 42_080, and the JIT's lane is the JIT's throughout: its root
+/// returns a `JitOutcome`, and a JIT root's spawn has no other engine for the child (a child it
+/// cannot compile is the spawn's `CapFault`, `temen-jit`'s `instantiator_rt`), so the `42_080` the
+/// child serves is a JIT child's.
 #[test]
 fn a_serve_handlers_fiber_outlives_the_thread_that_served() {
     let caller = module(&calls_a_server());

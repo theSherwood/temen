@@ -16300,6 +16300,7 @@ impl SchedCore {
         let code = temen_ir::thaw::Code {
             funcs: primary.lazy.ir.funcs(),
             arena: primary.shadow.unwrap_or(super::ShadowArena::EMPTY),
+            impl_exports: &[], // `admit` takes no serve state
         };
         if !admits_thaw(&h) {
             return Err(Trap::Malformed);
@@ -16338,7 +16339,7 @@ impl SchedCore {
         let mut fibers = FiberTables::default();
         {
             // Only the fibers: a residue with more was refused above ([`admits_thaw`]).
-            let mut seed = thaw.into_parts().fibers;
+            let mut seed = thaw.fibers;
             seed.sort_by_key(|f| f.slot);
             for (expected, ff) in seed.into_iter().enumerate() {
                 debug_assert_eq!(

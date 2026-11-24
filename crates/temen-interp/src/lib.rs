@@ -2724,6 +2724,7 @@ fn drive_arc(
         .map_or(ShadowArena::EMPTY, |m| m.shadow_arena());
     let code = temen_ir::thaw::Code {
         funcs: &funcs,
+        impl_exports: &[], // `admit` takes no serve state
         arena,
     };
     let Ok(thaw) = host.take_admitted(code, 0) else {
@@ -2831,11 +2832,8 @@ struct ThawResidue {
 impl ThawResidue {
     /// A domain's admitted residue ([`Host::take_admitted`]), for its root that had id `task` in the
     /// frozen run. Empty for a freeze or an ordinary run.
-    fn of(thaw: Thaw, task: TaskId) -> Self {
-        ThawResidue {
-            task,
-            residue: thaw.into_parts(),
-        }
+    fn of(residue: Residue, task: TaskId) -> Self {
+        ThawResidue { task, residue }
     }
 
     /// #1688 — every pid this residue's twins take back, at any depth: its own twins', live or
@@ -3269,6 +3267,7 @@ fn relaunch_twin(s: &mut Sched, sched: &Arc<Scheduler>, parent: &VCpu, tt: LiveT
         let code = temen_ir::thaw::Code {
             funcs,
             arena: pm.shadow,
+            impl_exports: &[], // `admit` takes no serve state
         };
         host.take_admitted(code, ctx).ok()
     });
@@ -3433,6 +3432,7 @@ fn relaunch_detached(s: &mut Sched, sched: &Arc<Scheduler>, spawner: &mut VCpu, 
         // #3034 — its residue, admitted for the module it runs, before anything is filed for it.
         let code = temen_ir::thaw::Code {
             funcs: &relaunch.funcs,
+            impl_exports: &[], // `admit` takes no serve state
             arena: relaunch.shadow.unwrap_or(ShadowArena::EMPTY),
         };
         let Ok(thaw) = host.take_admitted(code, 0) else {
@@ -3450,7 +3450,7 @@ fn relaunch_detached(s: &mut Sched, sched: &Arc<Scheduler>, spawner: &mut VCpu, 
             runs,
         );
         let Ok(lease) = filed else {
-            host.set_thaw(thaw); // what a refused child hands back reads it there
+            host.leave_freeze(thaw); // what a refused child hands back reads it there
             break 'ready Err(false);
         };
         let lease = lease.map(|lease| (Arc::clone(&spawner.domain.host), lease));
@@ -3469,7 +3469,7 @@ fn relaunch_detached(s: &mut Sched, sched: &Arc<Scheduler>, spawner: &mut VCpu, 
             if let Some((spawner_host, lease)) = &lease {
                 spawner_host.lock_unpoisoned().release_detached(*lease);
             }
-            host.set_thaw(thaw);
+            host.leave_freeze(thaw);
             break 'ready Err(lease.is_some());
         };
         Ok((relaunch, lease, mem, thaw))
@@ -12738,16 +12738,21 @@ pub mod thaw_backstop {
 /// admitted ([`Host::set_thaw`]); taken by the next run.
 pub type Residue = temen_ir::thaw::RawResidue<ThawedDetached, ThawedTwin>;
 
-/// #3034 — a domain's serve state as a snapshot carries it (DURABILITY.md §13.4, #1676, #1901), for
-/// [`Host::set_serve`]: the dispatches queued and the replies settled, the ticket counter, the
-/// abandoned reply waits `(context, ticket)`, and the frozen handlers `(fiber slot, ticket)`.
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct Serve {
-    pub queue: Vec<SvcDispatch>,
-    pub results: Vec<(u64, Reply)>,
-    pub next_ticket: u64,
-    pub waits: Vec<(u32, u64)>,
-    pub handlers: Vec<(u32, u64)>,
+/// #2941 — test support: [`Host::restore_footprint`].
+#[doc(hidden)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RestoreFootprint {
+    pub host_procs: usize,
+    pub thaw_names: usize,
+    pub regions: usize,
+    pub pipes: usize,
+    pub jit_domains: usize,
+    pub live_impls: usize,
+    pub end_post: bool,
+    pub budget_nodes: usize,
+    pub own_used: [i64; BUDGET_DIMS],
+    pub registrar: bool,
+    pub budget_hook: bool,
 }
 
 /// An admitted thaw residue for this crate's engines ([`temen_ir::thaw::validate`]).
@@ -21170,6 +21175,13 @@ fn signal_post(backing: &RegionBacking, off: u64, badge: u64) -> RegionWake {
     }
 }
 
+/// #1936 — whether a post to the notification at `off` fits a region of `size` bytes: `off` 8-aligned,
+/// and its 12 bytes (the bits, then the sequence word) inside the region. The one rule a guest's mint
+/// (`SharedRegion` op 6) and a restore's (#3034, a post a handle or Section 14 carries) both apply.
+pub fn post_fits(off: u64, size: u64) -> bool {
+    off.is_multiple_of(8) && off.checked_add(12).is_some_and(|end| end <= size)
+}
+
 /// #1936, #2800 — a domain's end post, taken as the domain ends ([`Host::release_memory`]) and
 /// signalled once the end is published: after the spawner's `poll` and `join` can see it, so a
 /// waiter it wakes finds the end it was told of, and while the domain still counts as live, so none
@@ -21351,7 +21363,8 @@ fn next_pipe_gid() -> u32 {
 /// FORK.md §8.6 — the **pipe FIFO capacity** (bytes): a `write` never grows the buffer past this; a
 /// write to a full pipe blocks (backpressure) until the reader drains. Linux's default pipe buffer is
 /// 64 KiB — matched here so a runaway producer (`yes | head`) is bounded to one buffer, not RAM.
-const PIPE_CAP: usize = 64 * 1024;
+/// The most bytes a pipe buffers.
+pub const PIPE_CAP: usize = 64 * 1024;
 
 /// The reference [`SharedBacking`]: a plain in-process buffer behind a `Mutex` (so it is `Send +
 /// Sync` and safe to alias across vCPU threads). The interpreter models aliasing by reading/writing
@@ -23762,7 +23775,7 @@ impl DurableHandle {
 /// One §22 guest-JIT **unit** captured for snapshot (DURABILITY.md §12.5 Slice 2). The durable
 /// state is the unit's already-instrumented+verified IR (encoded as a module image, `unit_ir`)
 /// plus its B2 `install` type id; the native/wasm code pointers are process-local and re-derived
-/// on thaw. `unit_ir` re-clears the verifier on restore ([`Host::restore_durable_jit`]), so a
+/// on thaw. `unit_ir` re-clears the verifier on restore ([`Host::prepare_durable_jit`]), so a
 /// tampered artifact can never inject unverified funcs into a domain.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct DurableJitUnit {
@@ -23778,7 +23791,7 @@ pub struct DurableJitUnit {
 /// memory-match precondition, the compile quotas, and the table's units in index order (dead
 /// units included, so a live [`DurableBinding::JitCode`]'s `(table, unit)` index stays valid).
 /// Captured as a set by [`Host::capture_durable_jit`] and rebuilt positionally by
-/// [`Host::restore_durable_jit`], so the handle-table `JitTable`/`JitCode` indices re-resolve.
+/// [`Host::prepare_durable_jit`], so the handle-table `JitTable`/`JitCode` indices re-resolve.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct DurableJitTable {
     pub mem_log2: Option<u8>,
@@ -23789,6 +23802,17 @@ pub struct DurableJitTable {
     /// install-durability). Re-applied to the thaw run's dispatch table so a `call.dyn`
     /// through an installed slot resolves after a freeze/thaw.
     pub installed: Vec<(u32, u32)>,
+}
+
+/// #2941 — a restore's guest-JIT domains, each unit decoded and re-verified
+/// ([`Host::prepare_durable_jit`]), not yet installed ([`Host::install_durable_jit`]).
+pub struct PreparedJit(Vec<JitTableState>);
+
+impl PreparedJit {
+    /// Whether it holds no domain: the domain installs no code ([`Host::installs_code`]).
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
 }
 
 /// Why restoring a §22 guest-JIT domain from an artifact failed (DURABILITY.md §12.5 Slice 2).
@@ -23977,12 +24001,6 @@ pub enum RegionRefusal {
 pub struct RegionNotCaptured {
     pub region: u32,
     pub why: RegionRefusal,
-}
-
-/// #1680 — a restore offered a pipe larger than a pipe can hold.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct PipeRestoreError {
-    pub key: u32,
 }
 
 /// Why a handle table can't be snapshotted in v1: a live slot holds a binding that carries
@@ -25162,6 +25180,14 @@ impl DoorSet {
     }
 }
 
+/// #2941 — the named host capabilities a restore's registrar re-granted ([`Host::regrant_named`]),
+/// not yet installed ([`Host::install_named`]).
+pub struct NamedGrants {
+    procs: Vec<HostProcEntry>,
+    doors: DoorSet,
+    names: Vec<Option<String>>,
+}
+
 /// Why a thaw could not re-grant a named host capability (#1455): the restoring embedder's registrar
 /// does not serve `name` — or there was no registrar at all. Fail-closed, and named, so an embedder
 /// can tell "I forgot to register `fs`" from "this artifact wants something I do not provide".
@@ -25327,18 +25353,7 @@ pub struct OfferEntry {
     pub policy: OfferPolicy,
 }
 
-/// §3.6 slice 2 — one queued inbound dispatch (the serve-loop core): a call targeting this
-/// domain's impl-export `export`, op `op`, args in the i64-slot ABI, completion posted under
-/// `ticket`. Admitted as a handler over the domain's **one world** at a `svc.poll` service
-/// point — run-to-completion this slice (handler parking rides the fiber-admission slice),
-/// which is exactly the passive instance's serialized observable behavior (the oracle).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SvcDispatch {
-    pub export: u32,
-    pub op: u32,
-    pub args: Vec<i64>,
-    pub ticket: u64,
-}
+pub use temen_ir::thaw::{Reply, Serve, SvcDispatch};
 
 /// §3.6 bounded dispatch-queue depth. Small and fixed: a full queue refuses the enqueue
 /// fail-closed (probeable at the enqueuer) — backpressure, not buffering (the pinned design).
@@ -25813,29 +25828,6 @@ fn translate_cap_slots(
         }
     }
     Ok(())
-}
-
-/// INVARIANTS #8 — what a call through a live offer (a call queued into another running domain)
-/// answers: the handler's results, or a failure of the transport. The caller lays it out by its
-/// own call's signature ([`complete_call`]).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Reply {
-    /// The handler returned: its results as slots, any handle among them still the callee's.
-    Results(Vec<i64>),
-    /// The transport failed — a full queue, a refused dispatch, a callee that ended unserved: a
-    /// negative errno.
-    Failed(i64),
-}
-
-impl Reply {
-    /// The reply as one status, for a call whose op answers one integer (a pager's `page`): its first
-    /// result, or the failure's errno.
-    pub fn status(&self) -> i64 {
-        match self {
-            Reply::Results(r) => r.first().copied().unwrap_or(0),
-            Reply::Failed(errno) => *errno,
-        }
-    }
 }
 
 /// INVARIANTS #8 — where a call through a live offer goes: the callee's cell, the export it serves,
@@ -27106,7 +27098,7 @@ pub struct Host {
     /// #1680 — the pipes a restore rebuilt ([`Host::restore_durable_pipes`]), by their new global id,
     /// for [`Host::restore_durable_handles`] to re-open ends on.
     thaw_pipes: BTreeMap<u32, PipeBacking>,
-    /// #1859 — the names [`Host::restore_durable_named`] rebuilt `host_procs` under, by index, for
+    /// #1859 — the names [`Host::regrant_named`] rebuilt `host_procs` under, by index, for
     /// [`Host::restore_durable_handles`] to register at each re-pinned `Named { idx }` handle.
     thaw_names: Vec<Option<String>>,
     /// §7 the **capability-name directory** (Followup F7): name → handle for the powerbox grants, so a
@@ -27124,7 +27116,7 @@ pub struct Host {
     /// embedder drains with [`Host::take_notes`].
     notes: Arc<Mutex<Vec<String>>>,
     /// #1455 — the embedder's thaw-side re-granter for named host capabilities, consulted by
-    /// [`Host::restore_durable_named`]. `None` on every host that is not restoring one (which is
+    /// [`Host::regrant_named`]. `None` on every host that is not restoring one (which is
     /// every host in a normal run), and never consulted outside a restore.
     named_cap_registrar: Option<NamedCapRegistrar>,
     /// #1502 — the embedder's thaw-side attenuator for carried budget nodes' ceilings, consulted by
@@ -28812,33 +28804,39 @@ impl Host {
         self.cap_record.is_some()
     }
 
-    /// #3034 — seed the residue the next (thaw) run re-creates: what a restore admitted, as a [`Thaw`],
-    /// which only [`temen_ir::thaw::validate`] builds. A freeze leaves its own residue here unsealed
-    /// ([`Host::leave_freeze`]); every engine's thaw takes what it seeds through the pass
-    /// ([`Host::take_admitted`], [`Host::take_thaw`]). Replaces whatever is there.
+    /// #3034 — seed what the next (thaw) run re-creates: what a restore admitted, as a [`Thaw`], which
+    /// only [`temen_ir::thaw::validate`] builds. Its serve state goes into this domain's live serve
+    /// state; its residue is held at rest, and every engine's thaw admits it again for the code it
+    /// runs ([`Host::take_admitted`], [`Host::take_thaw`]). A freeze leaves its own residue here
+    /// unsealed ([`Host::leave_freeze`]). Replaces whatever is there.
     pub fn set_thaw(&mut self, thaw: Thaw) {
-        self.residue = thaw.into_parts();
+        let (residue, s) = thaw.into_held();
+        self.residue = residue;
+        self.set_svc_state(s.queue, s.results, s.next_ticket);
+        self.reply_waits = s.waits.into_iter().collect();
+        self.frozen_handlers = s.handlers.into_iter().collect();
     }
 
-    /// #3034 — admit `raw` as the residue of a domain of `m` whose root runs in context 0, and seed it
-    /// ([`Host::set_thaw`]): what an embedder assembling a cut by hand, or a JIT freeze's harvest,
-    /// hands a powerbox. Refused, leaving the powerbox as it was, when a value in it is one no run of
-    /// `m` makes.
+    /// #3034 — admit `raw` as the residue of a domain of `m` whose root runs in context 0, and `serve`
+    /// as its serve state, and seed them ([`Host::set_thaw`]): what an embedder assembling a cut by
+    /// hand, or a JIT freeze's harvest, hands a powerbox. Refused, leaving the powerbox as it was,
+    /// when a value in them is one no run of `m` makes.
     pub fn admit_thaw(
         &mut self,
         m: &Module,
         raw: Residue,
+        serve: Serve,
     ) -> Result<(), temen_ir::thaw::Malformed> {
         let installs = self.installs_code();
-        self.set_thaw(temen_ir::thaw::validate(m, installs, 0, raw)?);
+        self.set_thaw(temen_ir::thaw::validate(m, installs, 0, raw, serve)?);
         Ok(())
     }
 
     /// #3034 — what a freeze left for the codec on this powerbox: the residue a JIT freeze harvested
-    /// for a domain (the tree-walker's freeze writes its own as it unwinds). It is the engine's state,
-    /// not a thaw's input: each extent in it was checked where the freeze read it out of the window
-    /// ([`temen_ir::thaw::extent_fits`]), and whatever thaws from it admits it then
-    /// ([`temen_ir::thaw::validate`]). Replaces whatever is there.
+    /// for a domain (the tree-walker's freeze writes its own as it unwinds), or the residue a declined
+    /// thaw hands back. It is engine state, not a thaw's input: each extent in it was checked where the
+    /// freeze read it out of the window ([`temen_ir::thaw::extent_fits`]), and whatever thaws from it
+    /// admits it then ([`temen_ir::thaw::admit`]). Replaces whatever is there.
     pub fn leave_freeze(&mut self, raw: Residue) {
         self.residue = raw;
     }
@@ -28851,24 +28849,34 @@ impl Host {
         self.frozen_handlers.clear();
     }
 
-    /// #3034 — the residue this powerbox holds, admitted for a run of `m` and taken: what an engine
-    /// that thaws it seeds. Refused, and left in place, when a value in it is one no run of `m` makes
-    /// (an artifact restored against another module), so a declining engine hands it to the next.
-    pub fn take_thaw(&mut self, m: &Module) -> Result<Thaw, temen_ir::thaw::Malformed> {
-        self.take_admitted(m.into(), 0)
+    /// #3034 — the residue this powerbox holds, admitted for a JIT run of the code `facts` describe
+    /// (the compiled module's own, so the take is the check the seed repeats) and taken, as a
+    /// [`Thaw`] the embedder maps for that engine. Refused, and left in place, when a value in it is
+    /// one no run of that code makes (an artifact restored against another module), so a declining
+    /// engine hands it to the next.
+    pub fn take_thaw(
+        &mut self,
+        facts: &temen_ir::thaw::CodeFacts,
+    ) -> Result<Thaw, temen_ir::thaw::Malformed> {
+        let installs = self.installs_code();
+        let raw = self.take_residue();
+        temen_ir::thaw::validate(facts, installs, 0, raw, Serve::default()).map_err(|r| {
+            self.residue = *r.residue;
+            temen_ir::thaw::Malformed
+        })
     }
 
     /// #3034 — the residue this powerbox holds, admitted for a domain running `code` from shadow
-    /// context `root_ctx`, and taken: the only way an engine's thaw gets a residue (a freeze leaves
-    /// one here unsealed, [`Host::leave_freeze`]). Refused, and left in place, when a value in it is
-    /// one no run of `code` makes.
+    /// context `root_ctx`, and taken: the only way an interpreter's thaw gets a residue (a freeze
+    /// leaves one here unsealed, [`Host::leave_freeze`]). Refused, and left in place, when a value in
+    /// it is one no run of `code` makes.
     pub(crate) fn take_admitted(
         &mut self,
         code: temen_ir::thaw::Code<'_>,
         root_ctx: usize,
-    ) -> Result<Thaw, temen_ir::thaw::Malformed> {
+    ) -> Result<Residue, temen_ir::thaw::Malformed> {
         let installs = self.installs_code();
-        temen_ir::thaw::validate(code, installs, root_ctx, self.take_residue()).map_err(|r| {
+        temen_ir::thaw::admit(code, installs, root_ctx, self.take_residue()).map_err(|r| {
             self.residue = *r.residue;
             temen_ir::thaw::Malformed
         })
@@ -30156,7 +30164,7 @@ impl Host {
                     Binding::LiveImpl(idx)
                 }
                 // Slice 2: re-pin the guest-JIT handle at its captured index. The domain's units are
-                // rebuilt separately by `restore_durable_jit` (positionally), so the index re-resolves.
+                // rebuilt separately by `prepare_durable_jit` (positionally), so the index re-resolves.
                 DurableBinding::JitTable { idx } => Binding::JitTable(idx),
                 DurableBinding::JitCode { domain, unit } => Binding::JitCode { domain, unit },
                 // #1680: re-open the end on the pipe `restore_durable_pipes` rebuilt under this key.
@@ -30194,7 +30202,7 @@ impl Host {
                     None => continue,
                 },
                 // #1455: re-pin the named capability at its captured index. The handler behind it was
-                // re-granted by `restore_durable_named` (positionally, before this), so the index
+                // re-granted by `regrant_named` (positionally, before this), so the index
                 // resolves — and a name the registrar declined never reaches here, because that
                 // restore fails closed before any handle is pinned. #1859: its name goes back in the
                 // directory with it, so the thawed domain resolves it and can freeze again. First
@@ -30472,17 +30480,15 @@ impl Host {
     /// #1680 — rebuild the cut's pipes before [`Self::restore_durable_handles`] re-opens their ends:
     /// each gets its bytes, a fresh global id, the cut's end counts (every end the tree carries), and
     /// a channel charge on this domain (the thawing root holds the tree's pipe memory). Replaces any earlier set.
-    /// Refuses, with nothing rebuilt, a pipe holding more than a pipe can.
+    /// The codec has refused a pipe holding more than a pipe can ([`PIPE_CAP`]).
     ///
     /// Returns each pipe's new global id, in order: the caller rewrites the carried ends' keys to
     /// them before re-pinning any ([`DurableBinding::PipeEnd`]).
-    pub fn restore_durable_pipes(
-        &mut self,
-        pipes: &[DurablePipe],
-    ) -> Result<Vec<u32>, PipeRestoreError> {
-        if let Some(p) = pipes.iter().find(|p| p.bytes.len() > PIPE_CAP) {
-            return Err(PipeRestoreError { key: p.key });
-        }
+    pub fn restore_durable_pipes(&mut self, pipes: &[DurablePipe]) -> Vec<u32> {
+        debug_assert!(
+            pipes.iter().all(|p| p.bytes.len() <= PIPE_CAP),
+            "the codec refuses a pipe holding more than a pipe can"
+        );
         let count = |n| Arc::new(std::sync::atomic::AtomicUsize::new(n));
         self.thaw_pipes.clear();
         let mut ids = Vec::with_capacity(pipes.len());
@@ -30501,12 +30507,12 @@ impl Host {
             self.thaw_pipes.insert(gid, b);
             ids.push(gid);
         }
-        Ok(ids)
+        ids
     }
 
     /// #1361 — check every carried [`DurableBinding::Module`] digest against this host's re-granted
     /// modules, **before** [`Self::restore_durable_handles`] pins anything. The module twin of
-    /// [`Self::restore_durable_named`]'s registrar step, and fail-closed for the same reason: an
+    /// [`Self::regrant_named`]'s registrar step, and fail-closed for the same reason: an
     /// artifact *names* a module, it never carries one, so a restore that cannot find it must fail
     /// rather than thaw a domain holding a handle to nothing.
     ///
@@ -30538,7 +30544,7 @@ impl Host {
     /// #1455 — capture the named host capabilities' out-of-line state for a snapshot, the parallel
     /// half of [`DurableBinding::Named`] (and the exact shape [`Self::capture_durable_jit`] uses for
     /// §22 domains). Positional over `host_procs`, dead entries included, so a captured binding's
-    /// index re-resolves against the table [`Self::restore_durable_named`] rebuilds.
+    /// index re-resolves against the table [`Self::regrant_named`] rebuilds.
     ///
     /// Each live, named entry contributes its name plus its provider's state ([`CapState`]); an entry no name reaches is `None` — nothing to re-grant,
     /// and no live handle can be naming it, because [`Self::capture_durable_handles`] refuses such a
@@ -30569,10 +30575,11 @@ impl Host {
             .collect()
     }
 
-    /// #1455 — rebuild the named host capabilities from a captured set, the counterpart of
-    /// [`Self::capture_durable_named`] and the step that must run **before**
-    /// [`Self::restore_durable_handles`] (which re-pins `Named { idx }` bindings against the table
-    /// this builds).
+    /// #1455 — re-grant the named host capabilities of a captured set, the counterpart of
+    /// [`Self::capture_durable_named`]: what [`Self::install_named`] installs, which must run **before**
+    /// [`Self::restore_durable_handles`] (which re-pins `Named { idx }` bindings against the table it
+    /// builds). #2941 — it asks and installs nothing, so a restore asks every registrar before its
+    /// first write.
     ///
     /// Each captured entry is handed to the embedder's registrar
     /// ([`Self::set_named_cap_registrar`]) as `(name, state)`; the registrar returns the handler to
@@ -30587,10 +30594,10 @@ impl Host {
     /// registrar does not know, nothing is granted and the restore reports the offending name. An
     /// artifact therefore cannot conjure a capability — it can only ask, and the restoring embedder
     /// decides (INVARIANTS #3).
-    pub fn restore_durable_named(
+    pub fn regrant_named(
         &mut self,
         caps: &[Option<DurableNamedCap>],
-    ) -> Result<(), NamedCapRestoreError> {
+    ) -> Result<NamedGrants, NamedCapRestoreError> {
         let mut registrar = self.named_cap_registrar.take();
         let mut out = Vec::with_capacity(caps.len());
         let mut refused = None;
@@ -30639,20 +30646,28 @@ impl Host {
         self.named_cap_registrar = registrar;
         match refused {
             Some(name) => Err(NamedCapRestoreError { name }),
-            None => {
-                doors.install(self);
-                self.host_procs = out;
-                self.thaw_names = caps
+            None => Ok(NamedGrants {
+                procs: out,
+                doors,
+                names: caps
                     .iter()
                     .map(|c| c.as_ref().map(|c| c.name.clone()))
-                    .collect();
-                Ok(())
-            }
+                    .collect(),
+            }),
         }
     }
 
+    /// #1455, #2941 — install what [`Self::regrant_named`] granted: the host-proc table its handles'
+    /// `Named { idx }` bindings re-pin against ([`Self::restore_durable_handles`]), its signal doors,
+    /// and the names. Cannot fail: every refusal was the regrant's.
+    pub fn install_named(&mut self, g: NamedGrants) {
+        g.doors.install(self);
+        self.host_procs = g.procs;
+        self.thaw_names = g.names;
+    }
+
     /// #1455 — install the registrar a thaw consults to re-grant named host capabilities
-    /// ([`Self::restore_durable_named`]). Called on the **fresh** host before a restore, by the
+    /// ([`Self::regrant_named`]). Called on the **fresh** host before a restore, by the
     /// embedder that would have granted those capabilities in the first place.
     pub fn set_named_cap_registrar(&mut self, registrar: NamedCapRegistrar) {
         self.named_cap_registrar = Some(registrar);
@@ -30666,7 +30681,7 @@ impl Host {
     }
 
     /// #1502, #1944 — the budget half of the authority seam, run by the snapshot restore **before**
-    /// the carried nodes are re-minted and the handle table is pinned (as `restore_durable_named` is
+    /// the carried nodes are re-minted and the handle table is pinned (as `regrant_named` is
     /// for named capabilities): each carried node's ceilings are offered to the hook and rewritten in
     /// place to what it returns. Fail-closed and attenuate-only: the hook may return the carried
     /// ceilings or less on every field (a bounded field may shrink, an unbounded one may become
@@ -30774,11 +30789,11 @@ impl Host {
     /// window-containment gate). Domains are rebuilt positionally, so the handle table's re-pinned
     /// `JitTable`/`JitCode` indices resolve. Native/wasm code pointers restore to `0` (an
     /// interpreter run invokes the funcs directly; a native `invoke` of a not-yet-recompiled unit
-    /// fails closed — the Slice-3 boundary). Fail-closed: a bad unit reconstructs no domains.
-    pub fn restore_durable_jit(
-        &mut self,
+    /// fails closed — the Slice-3 boundary). Fail-closed: a bad unit reconstructs no domains. #2941 —
+    /// it touches no host, so a restore checks every unit before its first write.
+    pub fn prepare_durable_jit(
         domains: &[DurableJitTable],
-    ) -> Result<(), JitRestoreError> {
+    ) -> Result<PreparedJit, JitRestoreError> {
         let mut rebuilt = Vec::with_capacity(domains.len());
         for d in domains {
             let mut units = Vec::with_capacity(d.units.len());
@@ -30804,8 +30819,13 @@ impl Host {
                 installed: d.installed.clone(),
             });
         }
-        self.jit_tables = rebuilt;
-        Ok(())
+        Ok(PreparedJit(rebuilt))
+    }
+
+    /// Install the guest-JIT domains [`Self::prepare_durable_jit`] rebuilt, replacing any. Cannot
+    /// fail: every refusal was the preparation's.
+    pub fn install_durable_jit(&mut self, jit: PreparedJit) {
+        self.jit_tables = jit.0;
     }
 
     /// §13.4 slice 4d — take the restored-but-unlinked live impls, for the thaw to patch once the
@@ -32285,30 +32305,6 @@ impl Host {
         )
     }
 
-    /// #3034 — seed this domain's serve state ([`Serve`]): what a restore decoded, or an embedder
-    /// assembles. Refused, changing nothing, when it is state no run makes: a counter a `+ 1`
-    /// overflows, a ticket at or past it, or a frozen handler in a fiber slot the admitted residue
-    /// ([`Host::set_thaw`]) does not hold live. Seed the residue first.
-    pub fn set_serve(&mut self, s: Serve) -> Result<(), temen_ir::thaw::Malformed> {
-        let minted = s.queue.iter().map(|d| d.ticket);
-        let minted = minted.chain(s.results.iter().map(|r| r.0));
-        let fibers = &self.residue.fibers;
-        if s.next_ticket > temen_ir::thaw::TASK_MAX
-            || minted
-                .chain(s.handlers.iter().map(|h| h.1))
-                .any(|t| t >= s.next_ticket)
-            || s.handlers
-                .iter()
-                .any(|&(slot, _)| fibers.get(slot as usize).is_none_or(|f| f.is_free()))
-        {
-            return Err(temen_ir::thaw::Malformed);
-        }
-        self.set_svc_state(s.queue, s.results, s.next_ticket);
-        self.reply_waits = s.waits.into_iter().collect();
-        self.frozen_handlers = s.handlers.into_iter().collect();
-        Ok(())
-    }
-
     /// DURABILITY.md §13.4 step 3 — restore this domain's serve state from a checkpoint (the inverse
     /// of [`Host::svc_state`]). Replaces whatever is present.
     fn set_svc_state(&mut self, queue: Vec<SvcDispatch>, results: Vec<(u64, Reply)>, next: u64) {
@@ -32351,6 +32347,42 @@ impl Host {
     /// order (the artifact's canonical order).
     pub fn frozen_handlers(&self) -> Vec<(u32, u64)> {
         self.frozen_handlers.iter().map(|(&s, &t)| (s, t)).collect()
+    }
+
+    /// #2941 — test support: what a restore writes on this powerbox that a freeze may not read back,
+    /// to compare a refused restore's host with a fresh one: the host procs and their names, the
+    /// regions it holds, the pipes it rebuilt, the guest-JIT domains, the live impls, its end post, the
+    /// nodes of its budget tree and its own node's charges, and whether its registrar and budget hook
+    /// are in place.
+    #[doc(hidden)]
+    pub fn restore_footprint(&self) -> RestoreFootprint {
+        let budget_nodes = self.budgets.0.lock_unpoisoned().len();
+        RestoreFootprint {
+            host_procs: self.host_procs.len(),
+            thaw_names: self.thaw_names.len(),
+            regions: self.regions.iter().filter(|r| r.is_some()).count(),
+            pipes: self.thaw_pipes.len(),
+            jit_domains: self.jit_tables.len(),
+            live_impls: self.live_impls.len(),
+            end_post: self.end.is_some(),
+            budget_nodes,
+            own_used: core::array::from_fn(|d| self.budgets.used(self.own_budget, d)),
+            registrar: self.named_cap_registrar.is_some(),
+            budget_hook: self.budget_thaw_hook.is_some(),
+        }
+    }
+
+    /// #3034 — this domain's serve state, whole ([`Serve`]): what a freeze carries, and what a caller
+    /// re-seeding this powerbox ([`Host::admit_thaw`], which replaces it) passes back.
+    pub fn serve(&self) -> Serve {
+        let (queue, results, next_ticket) = self.svc_state();
+        Serve {
+            queue,
+            results,
+            next_ticket,
+            waits: self.reply_waits(),
+            handlers: self.frozen_handlers(),
+        }
     }
 
     /// DURABILITY.md §13.3 — this domain's stable identity (see the field doc).
@@ -34009,7 +34041,7 @@ impl Host {
 
     /// A unit's emitted wasm (`f0(win, env, args…)`), **emitting it on first read** — the one emit
     /// site (#1346): every wasm-JIT driver resolves a unit through this, whether the unit was just
-    /// `compile`d or `compile_linked`, restored by a snapshot (`restore_durable_jit` rebuilds units
+    /// `compile`d or `compile_linked`, restored by a snapshot (`prepare_durable_jit` rebuilds units
     /// from their captured IR with no code, the process-local pointers do not ride the artifact;
     /// DURABILITY.md §12.5 Slice 3, #1301), or cloned into a fork twin. The unit's validated
     /// post-link IR is re-encoded and run through the installed [`JitWasmEmitter`] once, then cached
@@ -34192,7 +34224,7 @@ impl Host {
     /// signal nothing, or an `off` not 8-aligned or whose 12 bytes (the bits, then the sequence
     /// word) leave the region; `-EMFILE` for a full table.
     fn mint_post(&mut self, region: u32, size: u64, off: u64, badge: u64) -> i64 {
-        let fits = off.is_multiple_of(8) && off.checked_add(12).is_some_and(|end| end <= size);
+        let fits = post_fits(off, size);
         let Ok(off) = u32::try_from(off) else {
             return EINVAL;
         };
@@ -42243,7 +42275,8 @@ mod fork_powerbox_tests {
         };
         // No emitter: restored units stay code-less on every read (the interpreter fallback).
         let mut bare = Host::new();
-        bare.restore_durable_jit(std::slice::from_ref(&captured))
+        Host::prepare_durable_jit(std::slice::from_ref(&captured))
+            .map(|j| bare.install_durable_jit(j))
             .expect("restore");
         assert!(bare.jit_unit_wasm(0, 0).is_none());
         assert!(bare.jit_unit_wasm_or_emit(0, 0).is_none());
@@ -42251,7 +42284,8 @@ mod fork_powerbox_tests {
         // cached (a second read hands back the same bytes without re-emitting).
         let mut host = Host::new();
         host.set_jit_wasm_emitter(echo);
-        host.restore_durable_jit(std::slice::from_ref(&captured))
+        Host::prepare_durable_jit(std::slice::from_ref(&captured))
+            .map(|j| host.install_durable_jit(j))
             .expect("restore");
         assert!(host.jit_unit_wasm(0, 0).is_none(), "restore emits nothing");
         let emitted = host

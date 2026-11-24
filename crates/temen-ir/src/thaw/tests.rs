@@ -27,7 +27,7 @@ type Raw = RawResidue<(), ()>;
 
 /// [`validate`] for a domain that holds a `Jit` grant (its code may make every record kind), in context 0.
 fn admit(m: &Module, r: Raw) -> Result<Thaw<(), ()>, Malformed> {
-    validate(m, true, 0, r).map_err(Malformed::from)
+    validate(m, true, 0, r, Serve::default()).map_err(Malformed::from)
 }
 
 /// A residue a run makes: two fibers (one free), a live vCPU in the top context, a completed one, a
@@ -98,7 +98,7 @@ fn real() -> Raw {
 #[test]
 fn a_residue_a_run_makes_is_admitted_whole() {
     let t = admit(&module(Some(A)), real()).expect("admitted");
-    assert_eq!(t.into_parts(), real());
+    assert_eq!(t.into_held().0, real());
     assert!(admit(&module(Some(A)), Raw::default())
         .expect("empty")
         .is_empty());
@@ -291,17 +291,17 @@ fn a_record_kind_the_domains_code_cannot_make_is_refused() {
     for (k, (name, _, inst)) in kinds.iter().enumerate() {
         let bare = module(Some(A));
         assert!(
-            validate(&bare, false, 0, only(k)).is_err(),
+            validate(&bare, false, 0, only(k), Serve::default()).is_err(),
             "{name}: no site, no Jit grant"
         );
         assert!(
-            validate(&bare, true, 0, only(k)).is_ok(),
+            validate(&bare, true, 0, only(k), Serve::default()).is_ok(),
             "{name}: under a Jit grant"
         );
         let mut m = module(Some(A));
         site(&mut m, inst.clone());
         assert!(
-            validate(&m, false, 0, only(k)).is_ok(),
+            validate(&m, false, 0, only(k), Serve::default()).is_ok(),
             "{name}: at its site"
         );
     }
@@ -318,7 +318,7 @@ fn a_record_kind_the_domains_code_cannot_make_is_refused() {
         })),
     );
     assert!(
-        validate(&m, false, 0, only(0)).is_ok(),
+        validate(&m, false, 0, only(0), Serve::default()).is_ok(),
         "fibers: at a serve op"
     );
 }
@@ -329,7 +329,7 @@ fn a_refused_residue_is_handed_back() {
     let mut r = real();
     r.vcpus[1].func = 99;
     let want = r.clone();
-    match validate(&module(Some(A)), true, 0, r) {
+    match validate(&module(Some(A)), true, 0, r, Serve::default()) {
         Err(r) => assert_eq!(r.residue.vcpus, want.vcpus),
         Ok(_) => panic!("admitted"),
     }
@@ -343,7 +343,7 @@ fn an_unsorted_residue_is_admitted_in_seeding_order() {
     r.fibers.reverse();
     r.vcpus.reverse();
     assert_eq!(
-        admit(&module(Some(A)), r).expect("admitted").into_parts(),
+        admit(&module(Some(A)), r).expect("admitted").into_held().0,
         real()
     );
 }
@@ -373,4 +373,181 @@ fn an_extent_fits_only_inside_its_own_region() {
         !extent_fits(ShadowArena::EMPTY, 0, 0),
         "no arena: no extent"
     );
+}
+
+/// #3034 slice 2 — serve state is admitted beside the residue, by the same pass. `module` with an
+/// impl export whose op 0 is `func 1`, `(i64, i64) -> (i64)`.
+fn serving() -> Module {
+    let mut m = module(Some(A));
+    m.impl_exports = vec![ImplExport {
+        name: "s".into(),
+        interface: 0,
+        ops: vec![1],
+        threaded: false,
+    }];
+    m
+}
+
+/// [`validate`] for a domain whose code may make any record kind (a `Jit` grant), so only the serve
+/// rules decide.
+fn serve_admitted(m: &Module, r: Raw, s: Serve) -> bool {
+    validate(m, true, 0, r, s).is_ok()
+}
+
+#[test]
+fn serve_state_no_run_makes_is_refused() {
+    let m = serving();
+    let call = |export, op, args: Vec<i64>, ticket| SvcDispatch {
+        export,
+        op,
+        args,
+        ticket,
+    };
+    let s = |queue, results, waits| Serve {
+        queue,
+        results,
+        next_ticket: 10,
+        waits,
+        handlers: vec![],
+    };
+    // A fiber in slot 0 (context 1): one a serve loop's handler runs as.
+    let fiber = || RawResidue {
+        fibers: vec![FrozenFiber {
+            slot: 0,
+            func: 1,
+            arg0: 0,
+            shadow_sp: A.frame_base(1) + 8,
+            generation: 0,
+            consumed: false,
+        }],
+        ..Raw::default()
+    };
+    assert!(
+        serve_admitted(
+            &m,
+            Raw::default(),
+            s(
+                vec![call(0, 0, vec![1, 2], 3)],
+                vec![(4, Reply::Failed(-9))],
+                vec![(0, 99)]
+            )
+        ),
+        "the control: a dispatch to an op it serves, a settled reply, a wait in the root's context"
+    );
+    for (what, serve) in [
+        (
+            "an export it does not serve",
+            s(vec![call(1, 0, vec![1, 2], 3)], vec![], vec![]),
+        ),
+        (
+            "an op past its interface",
+            s(vec![call(0, 1, vec![1, 2], 3)], vec![], vec![]),
+        ),
+        (
+            "a ticket both queued and settled",
+            s(
+                vec![call(0, 0, vec![1, 2], 3)],
+                vec![(3, Reply::Failed(-9))],
+                vec![],
+            ),
+        ),
+        (
+            "a ticket queued twice",
+            s(
+                vec![call(0, 0, vec![1, 2], 3), call(0, 0, vec![1, 2], 3)],
+                vec![],
+                vec![],
+            ),
+        ),
+        (
+            "a wait in a context it does not run",
+            s(vec![], vec![], vec![(2, 0)]),
+        ),
+    ] {
+        assert!(!serve_admitted(&m, Raw::default(), serve), "{what}");
+    }
+    assert!(
+        serve_admitted(&m, fiber(), s(vec![], vec![], vec![(1, 0)])),
+        "a wait in a live fiber's context"
+    );
+    // The runtime's enqueue admits any argument count, and its serve loop answers a wrong one
+    // `EINVAL`: a queue a run can freeze with.
+    assert!(
+        serve_admitted(
+            &m,
+            Raw::default(),
+            s(vec![call(0, 0, vec![1], 3)], vec![], vec![])
+        ),
+        "an argument short"
+    );
+    // A module with no arena has no residue, but its serve state rides any freeze whose counter
+    // moved, and the same rules admit it; a handler needs a fiber it cannot have.
+    let bare = module(None);
+    assert!(
+        serve_admitted(
+            &bare,
+            Raw::default(),
+            s(vec![], vec![(4, Reply::Failed(-9))], vec![(0, 1)])
+        ),
+        "serve state of an arena-less module"
+    );
+    let mut handler = s(vec![], vec![], vec![]);
+    handler.handlers = vec![(0, 2)];
+    assert!(
+        !serve_admitted(&bare, Raw::default(), handler),
+        "a handler with no fiber"
+    );
+    assert!(
+        !serve_admitted(
+            &module(Some(A)),
+            Raw::default(),
+            s(vec![call(0, 0, vec![1, 2], 3)], vec![], vec![])
+        ),
+        "a dispatch to a module that serves nothing"
+    );
+}
+
+/// #3034 slice 2 — a `Thaw` reaches an engine only through [`Thaw::seed`], which admits it again
+/// for the engine's own code and root context: it seeds where a run could have made it, whatever it
+/// was first admitted for.
+#[test]
+fn a_thaw_seeds_only_code_and_a_context_a_run_there_could_have_made_it_for() {
+    let m = module(Some(A));
+    let r = || RawResidue {
+        vcpus: vec![real().vcpus[1].clone()],
+        root_sp: Some(A.frame_base(0) + 16),
+        children: vec![1, 1],
+        ..Raw::default()
+    };
+    let mut threads = m.clone();
+    threads.funcs[0].blocks = vec![crate::Block {
+        parent: 0,
+        params: vec![],
+        captures: vec![],
+        insts: vec![Inst::ThreadSpawn {
+            func: 1,
+            arg0: 0,
+            arg1: 0,
+        }],
+        term: crate::Terminator::Unreachable,
+    }];
+    let facts = CodeFacts::of(&threads);
+    let thaw = |ctx| validate(&threads, false, ctx, r(), Serve::default()).expect("admitted");
+    assert!(thaw(0).seed(&facts, 0).is_ok(), "the control");
+    assert!(
+        thaw(0).seed(&CodeFacts::of(&m), 0).is_err(),
+        "a module with no `thread.spawn` makes no vCPU"
+    );
+    assert!(
+        thaw(0).seed(&facts, 3).is_err(),
+        "the root extent lies in context 0, not 3"
+    );
+    // Admitted at context 3 with nothing that names the root's context: a run at 0 makes it too.
+    let fiberless = || RawResidue {
+        children: vec![1],
+        detached: real().detached[..0].to_vec(),
+        ..Raw::default()
+    };
+    let at3 = validate(&threads, false, 3, fiberless(), Serve::default()).expect("admitted");
+    assert!(at3.seed(&facts, 0).is_ok(), "valid where it is seeded");
 }
