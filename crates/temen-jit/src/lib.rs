@@ -251,6 +251,11 @@ mod durable_shadow;
 #[cfg(fiber_rt)]
 mod fiber_registry;
 
+// #2804 — a serving window's handler admission, as a durable freeze reads it (B′). Not yet wired in.
+#[cfg(fiber_rt)]
+#[allow(dead_code)]
+mod admission;
+
 // §14 nesting runtime: the host side of the `Instantiator` capability for the JIT — a spawn compiles
 // the child's module for a window of its own (nesting cost paid at setup) and runs it on the child
 // executor; `join` returns its result. Available where children can run (`fiber_rt`).
