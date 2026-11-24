@@ -6485,6 +6485,50 @@ pub struct JitPaging {
     pub table: Arc<[AtomicU8]>,
     /// The declared window's length: the extent its pager supplies.
     pub mapped: u64,
+    /// #3166 — whether the window is still the child's: cleared at the child's teardown, under its
+    /// pager's lock and before the window is freed ([`JitPaging::retire`]). A page request's sink
+    /// writes only while it is set ([`JitPaging::sink`]).
+    live: Arc<AtomicBool>,
+}
+
+impl JitPaging {
+    /// The paging of a window `mapped` bytes long whose pages `table` admits.
+    pub fn new(table: Arc<[AtomicU8]>, mapped: u64) -> JitPaging {
+        JitPaging {
+            table,
+            mapped,
+            live: Arc::new(AtomicBool::new(true)),
+        }
+    }
+
+    /// #3166 — the child's window is going: no sink writes to it again. The caller holds the
+    /// pager's lock, which every settle runs under, so no supply is mid-write when this returns.
+    pub fn retire(&self, _pager: &Host) {
+        self.live.store(false, Ordering::Release);
+    }
+
+    /// #3166 — `window`, the child's, as a page request's sink writes to it: only until the
+    /// child's teardown retires it. A request still queued then is served into nothing, as an
+    /// interpreter's is served into its dead child's `Mem`, which the sink keeps.
+    pub fn sink(&self, window: Box<dyn ChildWindow>, page: u64, len: u64, off: u64) -> PageSink {
+        let window = Box::new(LiveWindow {
+            window,
+            live: Arc::clone(&self.live),
+        });
+        PageSink::new(window, page, len, off)
+    }
+}
+
+/// #3166 — a JIT child's window as its page sinks write to it ([`JitPaging::sink`]).
+struct LiveWindow {
+    window: Box<dyn ChildWindow>,
+    live: Arc<AtomicBool>,
+}
+
+impl ChildWindow for LiveWindow {
+    fn supply(&self, page: u64, bytes: &[u8]) -> bool {
+        !self.live.load(Ordering::Acquire) || self.window.supply(page, bytes)
+    }
 }
 
 /// §2.2 / #1862 — where a pager's reply lands: a view of the faulting child's window and the page
@@ -6536,7 +6580,10 @@ impl PageSink {
 
     /// The sink for a recoverable fault in `child`: the page at child-relative `page`, `len` bytes of
     /// it (one host page, or less when the window is smaller), with the fault address `off` into it.
-    pub fn new(child: Box<dyn ChildWindow>, page: u64, len: u64, off: u64) -> PageSink {
+    ///
+    /// Private to this crate (#3166): an embedder's sink is a JIT window's, built only through
+    /// [`JitPaging::sink`], which stops its writes at the child's teardown.
+    pub(crate) fn new(child: Box<dyn ChildWindow>, page: u64, len: u64, off: u64) -> PageSink {
         PageSink {
             child,
             page,
