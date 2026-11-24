@@ -1400,8 +1400,8 @@ pub fn grant_module_loader(host: &mut Host) -> i32 {
 }
 
 /// Like [`grant_jit`], but the granted domain may host §12 **fibers** (`cont.*`) in submitted units
-/// (DESIGN.md §22 "Concurrency", renegotiated 2026-07-30): [`jit_cap_run`] stands up the parent's
-/// fiber runtime (`CompiledModule::enable_fiber_hosting`) so a unit's `cont.*` resolve, and the
+/// (DESIGN.md §22 "Concurrency", renegotiated 2026-07-30): [`jit_cap_run`] compiles a parent that
+/// drives `Jit` with `hosts_fibers`, which stands its fiber runtime up so a unit's `cont.*` resolve, and the
 /// interpreter runs them in its eval loop — so the backends stay in differential lockstep.
 /// **Threads/futex** in a submitted unit are admitted at compile (CONSOLIDATION.md §11); `invoke`
 /// still refuses them at runtime (seam-free), `install` + dispatch runs them. Same handle value +
@@ -1581,7 +1581,7 @@ pub fn jit_cap_run(
             None, // fast_resolver
             node,
             table_reserve_log2,
-            hosts_fibers, // #3080 — lowered for the fiber hosting enabled below
+            hosts_fibers, // #3080 — lowered for, and standing up, the fiber hosting
         )?;
         // The granted §14 spawns (named, separate-module, detached) — the hooks the CLI path installs
         // (`jit_proc::run_image`); without them a granted spawn here was an inert `CapFault`.
@@ -1641,7 +1641,7 @@ pub fn jit_cap_run(
         None, // fast_resolver
         run_node(host),
         table_reserve_log2,
-        hosts_fibers, // #3080 — lowered for the fiber hosting enabled below
+        hosts_fibers, // #3080 — lowered for, and standing up, the fiber hosting
     )?;
     // The granted §14 spawns, as in the locked branch above.
     cm.set_grant_child_hooks(Some(production_grant_hooks(cc)));
@@ -2104,7 +2104,7 @@ pub fn recompact_jit(
         None, // fast_resolver
         run_node(host),
         table_reserve_log2,
-        old.hosts_fibers(), // #3080 — lowered as the old code was
+        old.reloads_fuel_cell(), // #3080 — lowered as the old code was
     )?;
     fresh.set_window_ready(Some(CapCtx::Raw(host).window_ready()));
     recompact_into(&mut fresh, host, domain, old)?;
@@ -2395,7 +2395,7 @@ impl JitSession {
             None, // fast_resolver
             node,
             self.table_reserve_log2,
-            self.cm.hosts_fibers(), // #3080 — lowered as the old code was
+            self.cm.reloads_fuel_cell(), // #3080 — lowered as the old code was
         )?;
         fresh.set_window_ready(Some(CapCtx::Locked(&*self.host).window_ready()));
         {
@@ -6977,8 +6977,8 @@ fn grant_powerbox_prefix(h: &mut Host, win: u64) -> [i32; 7] {
     // The powerbox `Jit` grant hosts §12 **fibers** (`cont.*`) in submitted units (DESIGN.md §22
     // "Concurrency"): the maximal CLI grant admits a unit running its own cooperative scheduler —
     // e.g. `[interpret …]` of concurrent JACL source (spawn/await), whose in-guest entry runs the
-    // program body on a scheduler root fiber. `jit_proc::compile_image` reads this to `enable_fiber_hosting`
-    // on the top-level module so a submitted unit's `cont.*` resolve even when the top-level program
+    // program body on a scheduler root fiber. `jit_proc::compile_image` reads this to compile a top-level module
+    // that drives `Jit` with `hosts_fibers` so a submitted unit's `cont.*` resolve even when the top-level program
     // uses no fibers of its own. Threads/futex in a submitted unit stay rejected (they would outlive
     // the synchronous `call.cap`). In-domain stack switches, not an escape vector.
     h.set_jit_hosts_fibers(true);

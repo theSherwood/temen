@@ -802,10 +802,7 @@ fn a_domain_that_makes_fibers_is_held_on_the_jit_and_charges_as_the_tree_walker(
                     let (d, results) =
                         started.unwrap_or_else(|(t, _)| panic!("the entry ends in {t:?}"));
                     assert_eq!(d.executor(), on, "start {start}, loan {loan}");
-                    assert!(
-                        matches!(results[..], [Value::I64(s)] if s > 0),
-                        "install: {results:?}"
-                    );
+                    assert_eq!(results, vec![Value::I64(1)]);
                     let mut calls = Vec::new();
                     let mut fuel = loan;
                     calls.push((d.call(0, 0, &[start], &mut fuel), fuel));
@@ -955,10 +952,7 @@ fn a_domain_whose_units_may_host_fibers_is_held_on_the_jit() {
                 let (d, results) =
                     started.unwrap_or_else(|(t, _)| panic!("the entry ends in {t:?}"));
                 assert_eq!(d.executor(), on, "hosting fibers: {hosts}");
-                assert!(
-                    matches!(results[..], [Value::I64(s)] if s > 0),
-                    "install: {results:?}"
-                );
+                assert_eq!(results, vec![Value::I64(1)]);
                 let mut fuel = 1_000_000;
                 (d.call(0, 0, &[], &mut fuel), fuel)
             };

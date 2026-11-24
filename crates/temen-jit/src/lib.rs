@@ -3610,8 +3610,8 @@ pub struct CompiledModule {
     /// The §6 structured type graph (`debug_info.types`), emitted as `DW_TAG_*_type` DIEs (W5
     /// JIT/DWARF Stage 3b). Empty unless the module carried `-g` types. Host-side tooling.
     debug_types: Vec<temen_ir::TypeDef>,
-    /// #1825 — whether a §22 hosting entry stood a runtime up after the compile
-    /// ([`Self::enable_fiber_hosting`], [`Self::enable_thread_hosting`]): one [`Self::instance`] does
+    /// #1825 — whether a §22 hosting entry stood a runtime up for the compile (a `hosts_fibers`
+    /// compile's fiber hosting, [`Self::enable_thread_hosting`]): one [`Self::instance`] does
     /// not make, so the code cannot be shared. Every runtime the compile itself stands up (the thread
     /// domain, the §14 nursery, the `setjmp` table) an instance makes anew (temen#2389); the fiber
     /// table and root runtime each run makes (#3020). A §14 child's runtimes are its task's and its nursery its spawn's
@@ -5153,7 +5153,7 @@ impl CompiledModule {
     }
 
     /// Make the next run **durable** (DURABILITY.md §12.8) on a caller-built module — the
-    /// fiber-hosting / `Jit`-domain setup (`enable_fiber_hosting`, reconstructed units) stays the
+    /// `Jit`-domain setup (a `hosts_fibers` compile, reconstructed units) stays the
     /// caller's, so an embedder like `temen_run::jit_cap_run` needs no second durable entry point.
     /// `seed` is the thaw seed: the residue to re-create before a `REWINDING` run (empty for a freeze
     /// or an ordinary durable run). The freeze residue comes back via [`Self::take_durable_residue`].
@@ -6253,7 +6253,7 @@ impl CompiledModule {
     ///
     /// A unit may use §12 fibers or threads only when the domain runs them: the module's own ops or a
     /// nesting module's Instantiator calls stood the runtime up at compile, or the grant did
-    /// ([`Self::enable_fiber_hosting`] / [`Self::enable_thread_hosting`]); and
+    /// (a `hosts_fibers` compile / [`Self::enable_thread_hosting`]); and
     /// `setjmp`/`longjmp` only when the module has a `setjmp` table. Every unit is asked the module's
     /// one-stack rule too ([`setjmp_rt::admits`], #2877). A refusal is `Unsupported`, before anything
     /// is recorded.
@@ -6557,7 +6557,7 @@ impl CompiledModule {
     /// Stand up the §12 **thread scheduler** on an already-compiled module so guest-submitted units
     /// (`define_extra` / `install`) may host `thread.spawn`/`thread.join` and the `memory.wait`/
     /// `notify` futex (CONSOLIDATION.md §11 — installed units join the caller's concurrency model).
-    /// The twin of [`Self::enable_fiber_hosting`]: a `Jit`-granting parent that itself uses no threads
+    /// The twin of a `hosts_fibers` compile's fiber hosting: a `Jit`-granting parent that itself uses no threads
     /// stood up no thread domain at `compile`, so `define_extra` rejects a thread-using submitted
     /// unit (its `thread.*` sites would have none to run on). This installs the
     /// **same** runtime `compile` builds for a threaded module: the 1:1 OS-thread executor `Domain`
@@ -6759,11 +6759,12 @@ impl CompiledModule {
         (!self.instance.fuel.is_null()).then_some(self.instance.fuel)
     }
 
-    /// #3080 — whether this module's code can run on a guest fiber's stack, so reloads its fuel
-    /// cell at every charge: its own fiber ops, or a compile made with `hosts_fibers`. The
-    /// `hosts_fibers` a recompaction compiles the fresh module with, so its code is lowered as the
-    /// old's was.
-    pub fn hosts_fibers(&self) -> bool {
+    /// #3080 — whether this module's code reloads its fuel cell at every charge, because it can run
+    /// on a guest fiber's stack: it has fiber ops of its own, or was compiled with `hosts_fibers`.
+    /// A recompaction passes it as the fresh compile's `hosts_fibers`, so the new code is lowered as
+    /// the old was (for a module with fiber ops of its own, hosting is what its compile stood up
+    /// already, so the flag changes nothing there).
+    pub fn reloads_fuel_cell(&self) -> bool {
         self.fuel_moves
     }
 
@@ -8017,7 +8018,7 @@ mod fiber_hosting_tests {
                     "lazy {lazy}: the eager plan, hosting {hosts}"
                 );
                 // A lazy module lowers each function at its first call, by the plan its code keeps.
-                assert_eq!(cm.compiles_lazily(), lazy);
+                // Whether a compile is lazy is the mode's (`TEMEN_JIT_LAZY`) as well as the size's.
                 if let Some(service) = &cm.module.lazy {
                     assert_eq!(
                         service.fuel_moves(),

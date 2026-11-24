@@ -27034,8 +27034,8 @@ pub struct Host {
     jit_table_log2: u8,
     /// Whether guest-submitted `Jit` units in this domain may host §12 **fibers** (`cont.*`) —
     /// DESIGN.md §22 "Concurrency" (renegotiated 2026-07-30). Off by default (a fiber-using unit is
-    /// rejected); a fiber-hosting grant sets it, and the JIT run entry stands up the parent's fiber
-    /// runtime (`CompiledModule::enable_fiber_hosting`) so a submitted unit's `cont.*` resolve. The
+    /// rejected); a fiber-hosting grant sets it, and the JIT compiles a parent that drives `Jit` to
+    /// host fibers (`CompiledModule::compile`'s `hosts_fibers`) so a submitted unit's `cont.*` resolve. The
     /// interpreter's `INVOKE_MODULE` already runs `cont.*` in its eval loop, so it needs no runtime
     /// stand-up — the flag only records the grant for backend parity.
     jit_hosts_fibers: bool,
@@ -33684,8 +33684,8 @@ impl Host {
     }
 
     /// Mark this run's granted `Jit` domain(s) as **fiber-hosting** — a submitted unit may use §12
-    /// fibers (`cont.*`), DESIGN.md §22 "Concurrency". The JIT run entry then stands up the parent's
-    /// fiber runtime (`enable_fiber_hosting`); the interpreter needs no setup. Set before the run.
+    /// fibers (`cont.*`), DESIGN.md §22 "Concurrency". The JIT then compiles a parent that drives
+    /// `Jit` to host them (`hosts_fibers`); the interpreter needs no setup. Set before the run.
     pub fn set_jit_hosts_fibers(&mut self, on: bool) {
         self.jit_hosts_fibers = on;
     }

@@ -247,8 +247,10 @@ impl FuelCell {
     /// vCPU does (invariant 3). The cell keeps its chain, so code that still charges it draws again.
     ///
     /// # Safety
-    /// `cell` is a live cell that no code charges meanwhile: its vCPU ended, and a fiber charges
-    /// only the cell of the vCPU running it (#3080).
+    /// `cell` is a live cell. Its callers are a vCPU's end (no code charges the cell after it: a
+    /// fiber charges only the cell of the vCPU running it, #3080) and a held call from inside a run
+    /// (`activation_ctx`), whose caller waits in the call; there the cell can be an instance's that
+    /// serve handlers on other threads share and charge meanwhile, the race #3094 records.
     pub(crate) unsafe fn settle(cell: *mut FuelCell) {
         let src = (*cell).src.lock().unwrap_or_else(|e| e.into_inner());
         let left = core::ptr::addr_of_mut!((*cell).left);

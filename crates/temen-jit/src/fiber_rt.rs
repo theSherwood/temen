@@ -1498,7 +1498,7 @@ pub(crate) unsafe extern "C" fn fiber_resume(
     // somewhere in a resume chain), a racing resume, or a finished fiber all *lose the claim* and
     // fault. No lock or `&mut` is held past this block; the `Arc` keeps the slot (and the boxed
     // fiber it owns) stable across the switch.
-    let (slot_idx, slot, fib, fctx): (usize, Arc<FiberSlot>, *mut Fiber, *mut crate::VmCtx) = {
+    let (slot_idx, slot, fib, fctx): (usize, Arc<FiberSlot>, *mut Fiber, *const crate::VmCtx) = {
         let rt = &*rt;
         let Some((slot_idx, slot)) = rt.table.resolve(handle) else {
             fault(vm);
@@ -1563,9 +1563,11 @@ pub(crate) unsafe extern "C" fn fiber_resume(
         {
             Some(s) => (
                 &mut s.fiber as *mut Fiber,
+                // #3080 (review S1) — read through `*const`: host frames parked on the fiber's
+                // stack hold `&VmCtx` borrows of its context, so no `&mut` to it is made here.
                 s.ctx
-                    .as_deref_mut()
-                    .map_or(core::ptr::null_mut(), |c| c as *mut crate::VmCtx),
+                    .as_deref()
+                    .map_or(core::ptr::null(), |c| c as *const crate::VmCtx),
             ),
             // Unreachable by invariant (a claimable slot holds its fiber); fail closed, leaving
             // the slot claimed (inert thereafter) rather than aliasing anything.

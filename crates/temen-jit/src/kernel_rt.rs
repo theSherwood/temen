@@ -405,15 +405,18 @@ impl KernelRun {
             || cm.nests
             || cm.durable
             || cm.call_tramp.is_none() && (cm.spawns || cm.fibers)
+            // What the context pool's removal rests on (review S2): a metered fiber's code reloads
+            // its cell at every charge, so it never charges a vCPU's cell after that vCPU's thread
+            // let it go. Every compile with fibers is lowered so (`fuel_moves`), which the assertion
+            // checks; release builds refuse one that is not rather than run it.
+            || cm.fibers && cm.fuel && !cm.fuel_moves
         {
+            debug_assert!(
+                !(cm.fibers && cm.fuel) || cm.fuel_moves,
+                "a metered fibered kernel run reloads its cell (#3080)"
+            );
             return None;
         }
-        // What the context pool's removal rests on: a metered fiber's code reloads its cell at every
-        // charge, so it never charges a vCPU's cell after that vCPU's thread let it go.
-        debug_assert!(
-            !(cm.fibers && cm.fuel) || cm.fuel_moves,
-            "a metered fibered kernel run reloads its cell (#3080)"
-        );
         #[cfg(fiber_rt)]
         let fibers = match (cm.fibers, cm.fiber_cfg, cm.call_tramp) {
             (false, _, _) => None,
