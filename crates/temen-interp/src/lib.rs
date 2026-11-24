@@ -29613,7 +29613,6 @@ impl Host {
         use temen_ir::PageState as ps;
         let pages: BTreeMap<u64, ps> = map
             .thawed(host_page_size())
-            .into_iter()
             .filter_map(|(p, prot)| match prot {
                 PageProt::Rw => Some((p, ps::Rw)),
                 PageProt::Ro => Some((p, ps::Ro)),
@@ -37427,8 +37426,7 @@ impl PageMap {
     pub fn entries(&self) -> Vec<(u64, u8)> {
         // The encoding has no held span: it carries a restored map's span page by page.
         self.thawed(self.page)
-            .iter()
-            .map(|(&page, prot)| {
+            .map(|(page, prot)| {
                 let kind = match prot {
                     PageProt::Ro => 0,
                     PageProt::Rw => 1,
@@ -37461,13 +37459,20 @@ impl PageMap {
     /// #3137 — this map as a thawed window holds it page by page, in `page`-byte pages: its entries
     /// ([`rebased_to`](Self::rebased_to)), and each page of the [`held_span`](Self::held_span) with no
     /// entry read-write. The one place the span is expanded; a §13 page in it keeps its entry.
-    pub(crate) fn thawed(&self, page: u64) -> BTreeMap<u64, PageProt> {
-        let mut out = self.rebased_to(page);
+    /// Ascending, so each reader collects it into its own map once.
+    pub(crate) fn thawed(&self, page: u64) -> impl Iterator<Item = (u64, PageProt)> {
         let span = self.held_span();
-        for p in span.start.div_ceil(page)..span.end.div_ceil(page) {
-            out.entry(p).or_insert(PageProt::Rw);
-        }
-        out
+        let mut entries = self.rebased_to(page).into_iter().peekable();
+        let mut held = (span.start.div_ceil(page)..span.end.div_ceil(page)).peekable();
+        core::iter::from_fn(move || match (entries.peek(), held.peek()) {
+            (Some(&(p, _)), Some(&q)) if q < p => held.next().map(|q| (q, PageProt::Rw)),
+            (Some(&(p, _)), Some(&q)) if q == p => {
+                held.next();
+                entries.next()
+            }
+            (Some(_), _) => entries.next(),
+            (None, _) => held.next().map(|q| (q, PageProt::Rw)),
+        })
     }
 
     /// #2025 — renumber each §13 page's region by `to`: a restore's, from the artifact's numbers to
@@ -39977,10 +39982,11 @@ impl Mem {
         }
         // #3137 — the held span is this window's page by page, as a `map` past the declared window
         // leaves it: the thaw's to hold, and its budget's to pay.
-        space.prot = layout.map.thawed(self.page);
-        space
-            .prot
-            .retain(|_, p| !matches!(p, PageProt::Backed { .. }));
+        space.prot = layout
+            .map
+            .thawed(self.page)
+            .filter(|(_, p)| !matches!(p, PageProt::Backed { .. }))
+            .collect();
         // The NULL guard is this window's, not the layout's (#964): a layout captured where the
         // guard disengaged, on a host whose page is larger than it, still faults here as a fresh
         // window does, and as the JIT's restore re-seeds it.

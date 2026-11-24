@@ -2153,3 +2153,135 @@ fn a_childs_own_trap_with_a_live_grandchild_refuses_the_freeze() {
 fn a_childs_fiber_that_fails_its_extent_check_ends_the_child() {
     own_trap_rides(&fiber_extent_nest(), 1);
 }
+
+/// [`CHILD`]'s loop, then a load 8 bytes past its declared 128 KiB, and a store and a load two pages
+/// further: pages the child holds only as its artifact's head past the declared window (#3137), the
+/// first listed with a marker, the second unlisted (zero, writable).
+const SPAN_CHILD: &str = "memory 17 shadow 16448 65536
+func (i64, i64) -> (i64) {
+block 0 (v0: i64, va: i64) {
+  vas = i32.wrap_i64 va
+  vz = i64.const 0
+  vu = call.cap 5 1 (i64, i64) -> (i64) vas (vz, vz)
+  v1 = i64.const 0
+  v2 = i64.const 0
+  br 1(v1, v2)
+}
+block 1 (v3: i64, v4: i64) {
+  v5 = i64.const 100
+  v6 = i64.lt_s v3 v5
+  br_if v6 2(v3, v4) 3(v4)
+}
+block 2 (v7: i64, v8: i64) {
+  v9 = i64.add v8 v7
+  v10 = i64.const 1
+  v11 = i64.add v7 v10
+  br 1(v11, v9)
+}
+block 3 (v12: i64) {
+  vat = i64.const 131080
+  vm = i64.load vat
+  vzp = i64.const 139272
+  vthree = i64.const 3
+  i64.store vzp vthree
+  vz3 = i64.load vzp
+  vs = i64.add v12 vm
+  vr = i64.add vs vz3
+  return vr
+  }
+}
+";
+
+/// #3137 — a live detached child whose artifact's head runs past its declared window: the child,
+/// frozen on the JIT, is captured with a held span of four pages past its declared 128 KiB, the first
+/// carrying a marker. Restored, it re-launches on the JIT (its window committing the span in one run,
+/// `CapturedSeed::held`) and on the tree-walker, reads the marker and writes and reads the unlisted
+/// page after its loop: 4950 + 7 + 3. Without the span committed in one run, the unlisted page is
+/// not committed (only a listed one is, page by page) and the store faults.
+#[test]
+fn a_detached_childs_held_span_thaws_on_the_jit_and_the_tree_walker() {
+    let parent = parent();
+    let child = confined(SPAN_CHILD);
+    let (mut fhost, fargs) = powerbox(&child);
+    let mut win = init_durable_window(1 << PARENT_LOG2, ARENA);
+    write_state(&mut win, ARENA, STATE_UNWINDING);
+    let froze = temen_run::jit_cap_run(
+        &parent,
+        0,
+        &fargs,
+        &MemLayout::image(win.to_vec()),
+        PARENT_LOG2,
+        0,
+        &mut fhost,
+        None,
+    );
+    let fsnap = match froze {
+        Ok((_, snap)) => snap,
+        Err(JitError::Unsupported(_)) => return, // a target without the child executor
+        Err(e) => panic!("JIT freeze: {e:?}"),
+    };
+    // The child's window, held as a restore of an artifact whose head runs past it holds it.
+    assert_eq!(
+        fhost.captured_detached().len(),
+        1,
+        "the live child was captured"
+    );
+    let c = &fhost.captured_detached()[0];
+    let declared = 1u64 << 17;
+    let mut page = vec![0u8; 4096];
+    page[8] = 7;
+    let mut window = c.window.clone();
+    window.hold_span(declared + 4 * 4096);
+    window.hold(declared, temen_interp::CapturedProt::Rw, Some(page));
+    let captured = temen_interp::CapturedDetached {
+        parent_task: c.parent_task,
+        slot: c.slot,
+        window,
+        reserved_log2: c.reserved_log2,
+        host: std::sync::Arc::clone(&c.host),
+        module: std::sync::Arc::clone(&c.module),
+        launch: c.launch.clone(),
+    };
+    fhost.set_captured_detached(vec![captured]);
+    let art = temen_snapshot::freeze(&parent, fsnap.bytes(), &fhost).expect("serialize");
+
+    let restore = || {
+        let mut h = Host::new();
+        h.set_durable(true);
+        h.grant_durable_module(&child);
+        let mut w = temen_snapshot::restore(&art, &parent, &mut h).expect("restore");
+        begin_thaw(&mut w, ARENA, 0);
+        (h, w)
+    };
+    let (mut thost, twin) = restore();
+    let (tout, _) = temen_run::jit_cap_run(
+        &parent,
+        0,
+        &fargs,
+        &MemLayout::image(twin.to_vec()),
+        PARENT_LOG2,
+        0,
+        &mut thost,
+        None,
+    )
+    .expect("JIT thaw");
+    assert_eq!(returned(tout), vec![4960], "the JIT's child reads its span");
+
+    let (mut ihost, iwin) = restore();
+    let iargs: Vec<Value> = fargs.iter().map(|&a| Value::I32(a as i32)).collect();
+    let mut fuel = 50_000_000u64;
+    let (ir, _) = run_capture_reserved_with_host(
+        &parent,
+        0,
+        &iargs,
+        &mut fuel,
+        &iwin,
+        PARENT_LOG2,
+        &mut ihost,
+    );
+    assert_eq!(
+        ir,
+        Ok(vec![Value::I64(4960)]),
+        "the tree-walker's child reads it"
+    );
+}

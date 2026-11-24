@@ -933,7 +933,12 @@ fn a_thaw_with_an_empty_page_map_keeps_its_data_segment() {
 /// #3137 — a window whose artifact's head runs past its declared memory (a flat grown window's
 /// freeze: 48 pages over 32) restores with that head held as one span, and every engine's thaw holds
 /// it as the frozen window did: a page of it with bytes reads them, an unlisted page reads zero and is
-/// writable, and a page listed `Ro` in it keeps its protection.
+/// writable, and a page listed `Ro` or `Unmapped` in it keeps its protection.
+///
+/// The round trip goes through an engine: the tree-walker thaws, stores, and its window is frozen
+/// and restored again. An engine's capture writes the sparse canonical form (the span page by page,
+/// and its NULL guard below the declared window), not the dense head the artifact came in, so the
+/// equality is on the bytes and protections above the declared window, not on the artifact.
 const SPAN_SRC: &str = "memory 17
 func () -> (i64) {
 block 0 () {
