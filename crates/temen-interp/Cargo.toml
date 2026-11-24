@@ -61,13 +61,12 @@ temen-ir.workspace = true
 temen-encode.workspace = true
 
 # #2958 slice 2 — the futex count's model (`src/futex_count.rs`, `loom_tests`), run as
-# `RUSTFLAGS="--cfg loom" cargo test -p temen-interp --lib loom`, on its own: its atomics are loom's
-# only in this crate's own test build. #3078 slice 3 — so is `temen-ir`'s parked word (`loom-park`),
-# for the native fiber park's model (`bytecode::native_park_loom`). Run with another crate in one
-# invocation, the feature would unify into that crate's build too, so CI's loom job runs each alone.
+# `RUSTFLAGS="--cfg loom" cargo test -p temen-interp --lib loom`. Its atomics are loom's only in this
+# crate's own test build. Not so `temen-ir`'s: #3078 slice 3's parked word (`seams::ParkWord`, for
+# `bytecode::native_park_loom`) takes loom's atomics in every `--cfg loom` build, temen-jit's loom
+# lane's `FiberSlot`s included.
 [target.'cfg(loom)'.dev-dependencies]
 loom = "0.7"
-temen-ir = { workspace = true, features = ["loom-park"] }
 
 [lints.rust]
 # `--cfg loom` is set manually for loom model-checking runs; tell rustc it's expected.

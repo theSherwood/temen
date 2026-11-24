@@ -420,7 +420,8 @@ pub(crate) struct FiberSlot {
     /// `cont.resume` makes reads no line of its own. The rules write it, under the run lock, through
     /// the slot the park's record holds ([`temen_ir::seams::ParkSite`]). Idle on every other route.
     /// While a park is filed the slot stays `RUNNING`, so no claim of the slot's own takes it; the
-    /// rules' claim hands it on.
+    /// rules' claim hands it on. Under `--cfg loom` its atomics are loom's: a loom test that makes
+    /// a slot must make it inside `loom::model`.
     pub(crate) kpark: temen_ir::seams::ParkWord,
     /// The **runtime single-owner assert** (empirical-net layer #3, DESIGN.md §23): the vCPU token
     /// currently running this fiber, [`NOT_RUNNING`] when parked. Set (AcqRel swap) right after a

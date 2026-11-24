@@ -171,8 +171,15 @@ fn jit(m: &temen_ir::Module, args: &[i32; 4], host: &mut Host) -> Result<Vec<Val
 }
 
 /// Run `caller` with the serving child `server` on `entry`, direct handoff on or off. The run is on
-/// its own thread, so a call no engine answers fails the test instead of stalling the suite.
-fn run_on(entry: Entry, caller: &str, server: &str, handoff: bool) -> Result<Vec<Value>, Trap> {
+/// its own thread, so a call no engine answers fails the test instead of stalling the suite, naming
+/// the test, its row (`row`, empty for a test of one), the engine (`name`) and the handoff.
+fn run_on(
+    (row, name): (&str, &str),
+    entry: Entry,
+    caller: &str,
+    server: &str,
+    handoff: bool,
+) -> Result<Vec<Value>, Trap> {
     let (a, b) = (module(caller), module(server));
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
@@ -189,8 +196,11 @@ fn run_on(entry: Entry, caller: &str, server: &str, handoff: bool) -> Result<Vec
         ];
         let _ = tx.send(entry(&a, &args, &mut host));
     });
+    let test = std::thread::current().name().unwrap_or("?").to_string();
     rx.recv_timeout(std::time::Duration::from_secs(60))
-        .expect("the run hung")
+        .unwrap_or_else(|e| {
+            panic!("the run hung ({e:?}): {test}, row {row:?}, on {name}, the handoff {handoff}")
+        })
 }
 
 /// Run `caller` with the serving child `server` on the tree-walker, natively on the bytecode engine's
@@ -202,7 +212,7 @@ fn run(caller: &str, server: &str) -> Result<Vec<Value>, Trap> {
         "the bytecode engine runs the caller"
     );
     assert!(bytecode::admits(&module(server)), "and the serving child");
-    agree(caller, server, &ENGINES)
+    agree("", caller, server, &ENGINES)
 }
 
 /// Every engine of this file, by name.
@@ -215,16 +225,21 @@ const ENGINES: [(&str, Entry); 4] = [
 
 /// Run `caller` with the serving child `server` on each of `engines` (the tree-walker first, the
 /// oracle), each with the direct handoff off and on, and answer the oracle's result, which every
-/// other run must give.
-fn agree(caller: &str, server: &str, engines: &[(&str, Entry)]) -> Result<Vec<Value>, Trap> {
-    let oracle = run_on(engines[0].1, caller, server, false);
+/// other run must give. `row` names the test's row in a hang's message (empty for a test of one).
+fn agree(
+    row: &str,
+    caller: &str,
+    server: &str,
+    engines: &[(&str, Entry)],
+) -> Result<Vec<Value>, Trap> {
+    let oracle = run_on((row, engines[0].0), engines[0].1, caller, server, false);
     for &(name, entry) in engines {
         for handoff in [false, true] {
             if (name, handoff) == (engines[0].0, false) {
                 continue;
             }
             assert_eq!(
-                run_on(entry, caller, server, handoff),
+                run_on((row, name), entry, caller, server, handoff),
                 oracle,
                 "{name} with the handoff {} answers as {} does",
                 if handoff { "on" } else { "off" },
@@ -907,6 +922,7 @@ fn a_serve_loop_that_returns_revokes_its_parked_handler_s_call() {
   vb = i64.const 2
   vcall = call.cap 268435456 0 (i64, i64) -> (i64) v7 (va, vb)"#;
     let r = agree(
+        "",
         &caller(call, ""),
         POLL_UNTIL_PARKED,
         &[ENGINES[0], ENGINES[3]],
@@ -1016,7 +1032,7 @@ block 0 (va: i64, vb: i64) {
         "the bytecode engine runs the caller"
     );
     assert!(bytecode::admits(&module(server)), "and the serving child");
-    let r = agree(&caller, server, &ENGINES);
+    let r = agree("", &caller, server, &ENGINES);
     assert_eq!(r, Ok(vec![Value::I64(77 * 1_000_000 + CAP_REVOKED)]));
 }
 
@@ -1060,8 +1076,12 @@ fn a_serving_vcpu_s_end_revokes_its_parked_handler_s_call_at_once() {
   vthou = i64.const 1000
   vf = i64.mul vfirst vthou
   vcall = i64.add vf vsecond"#;
-    for server in [SERVED_BY_A_THREAD, A_THREAD_OUTLIVES_THE_ROOT] {
+    for (row, server) in [
+        ("served by a thread", SERVED_BY_A_THREAD),
+        ("a thread outlives the root", A_THREAD_OUTLIVES_THE_ROOT),
+    ] {
         let r = agree(
+            row,
             &caller(call, ""),
             &format!("{HANG_ADD}{server}"),
             &[ENGINES[0], ENGINES[3]],
@@ -1210,6 +1230,7 @@ fn a_fibers_serve_op_is_the_running_vcpus() {
         ("a fiber on another vCPU", A_FIBER_SERVES_ON_ANOTHER_VCPU),
     ] {
         let r = agree(
+            row,
             &caller(call, ""),
             &format!("{HANG_ADD}{server}{HANG_ADD_HANDLERS}{POLL_IN_A_FIBER}"),
             &[ENGINES[0], ENGINES[3]],
@@ -1263,6 +1284,7 @@ block 0 (vk: i64, vz: i64) {
 }
 "#;
     let r = agree(
+        "",
         &caller(call, fibers),
         &server(ADDMUL_TYPES, ADDMUL),
         &[ENGINES[0], ENGINES[3]],
@@ -1395,7 +1417,7 @@ fn a_serve_loop_that_traps_revokes_its_parked_handler_s_call() {
         "block 2 () {\n  unreachable\n  }",
     );
     assert_ne!(server, POLL_UNTIL_PARKED);
-    let r = agree(&caller(call, ""), &server, &[ENGINES[0], ENGINES[3]]);
+    let r = agree("", &caller(call, ""), &server, &[ENGINES[0], ENGINES[3]]);
     assert_eq!(r, Ok(vec![Value::I64(CAP_REVOKED)]));
 }
 
@@ -1489,7 +1511,7 @@ block 0 (va: i64, vb: i64) {
 "#,
     )
     .replace("memory 12", "memory 17");
-    let r = agree(&caller(call, fiber), &server, &[ENGINES[0], ENGINES[3]]);
+    let r = agree("", &caller(call, fiber), &server, &[ENGINES[0], ENGINES[3]]);
     let Ok(v) = &r else {
         panic!("the parent ran: {r:?}")
     };
@@ -1519,6 +1541,7 @@ block 0 (va: i64, vb: i64) {
 }
 "#;
     let r = agree(
+        "",
         &caller(IN_A_FIBER, ADDMUL_FIBER),
         &server(ADDMUL_TYPES, handler),
         &[ENGINES[0], ENGINES[3]],

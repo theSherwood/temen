@@ -570,12 +570,8 @@ jobs:
         with: { toolchain: "${{ env.RUST_STABLE }}" }
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: loom model check
-        # temen-interp's: the futex count protocol (#2958 slice 2, `src/futex_count.rs`) and the native
-        # fiber park (#3078 slice 3, `bytecode::native_park_loom`). One invocation per crate: the
-        # interp lane turns on `temen-ir/loom-park`, which must not unify into temen-jit's build.
-        run: |
-          cargo test -p temen-interp --lib loom
-          cargo test -p temen-jit --lib loom
+        # temen-interp's: the futex count protocol (#2958 slice 2, `src/futex_count.rs`).
+        run: cargo test -p temen-jit -p temen-interp --lib loom
         env:
           RUSTFLAGS: "--cfg loom"
 

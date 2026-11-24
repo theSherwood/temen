@@ -755,6 +755,9 @@ dependencies = [
 [[package]]
 name = "temen-ir"
 version = "0.0.0"
+dependencies = [
+ "loom",
+]
 
 [[package]]
 name = "temen-jit"

@@ -265,9 +265,9 @@ pub const FIBER_STILL_PARKED: i64 = 0;
 /// claimed by another, or the handle is stale).
 pub const FIBER_NOT_PARKED: i64 = 2;
 
-#[cfg(not(feature = "loom-park"))]
+#[cfg(not(loom))]
 use core::sync::atomic::{AtomicU64, Ordering};
-#[cfg(feature = "loom-park")]
+#[cfg(loom)]
 use loom::sync::atomic::{AtomicU64, Ordering};
 
 /// #3078 slice 3 — a native fiber's **parked word**: whether its kernel park can be claimed, read by
@@ -366,7 +366,7 @@ impl ParkWord {
     }
 
     /// [`Self::poll`] without its re-read of the word: the model's broken variant of it.
-    #[cfg(feature = "loom-park")]
+    #[cfg(loom)]
     #[doc(hidden)]
     pub fn poll_without_recheck(&self, gen: u64, now: impl FnOnce() -> u64) -> ParkPoll {
         self.poll_checked(gen, now, false)
