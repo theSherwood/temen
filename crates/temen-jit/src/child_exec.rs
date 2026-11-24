@@ -2253,9 +2253,10 @@ fn cores() -> usize {
     })
 }
 
-/// #3158 — the quantum ends a pool task let pass because a guarded call nested in its frames was
-/// live ([`quantum_end`]): what a test reads to see that the task did not park with that call's
-/// recovery scope open on its stack. Process-wide; a reader takes a difference.
+/// #3158 — the parks a pool task's quantum end would have made (a full pool, a task queued) and did
+/// not, because a guarded call nested in its frames was live ([`quantum_end`]): what a test reads
+/// to see that the task did not park with that call's recovery scope open on its stack.
+/// Process-wide; a reader takes a difference.
 static QUANTUM_ENDS_HELD: AtomicU64 = AtomicU64::new(0);
 
 /// #3158 — [`QUANTUM_ENDS_HELD`]: a statistic for tests, not an interface.
@@ -2276,12 +2277,6 @@ pub(crate) fn quantum_end() {
     if exec.is_null() {
         return;
     }
-    // #3158 — nor while a guarded call nested in the task's frames is live (a handler run inline, a
-    // unit `Jit.invoke`d): the task cannot park whole there, so its quantum runs on to that call's end.
-    if !fiber_rt::task_parks_whole() {
-        QUANTUM_ENDS_HELD.fetch_add(1, Ordering::Relaxed);
-        return;
-    }
     {
         // SAFETY: a residency publishes its worker's reference, which outlives the residency.
         let exec = unsafe { &*exec };
@@ -2293,6 +2288,14 @@ pub(crate) fn quantum_end() {
         if exec.find_worker(&mut g, id) {
             return;
         }
+    }
+    // #3158 — a full pool: the task would give its worker up here. Not while a guarded call nested in
+    // its frames is live (a handler run inline, a unit `Jit.invoke`d): the task cannot park whole
+    // there, so it keeps its worker to that call's end. The due wakes and the worker hand-out above
+    // ran all the same.
+    if !fiber_rt::task_parks_whole() {
+        QUANTUM_ENDS_HELD.fetch_add(1, Ordering::Relaxed);
+        return;
     }
     if let fiber_rt::ParkAs::Fiber(slot) = fiber_rt::park_as() {
         // SAFETY: inside the task's residency, on one of its fibers; the park hands the worker back

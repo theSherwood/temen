@@ -1827,8 +1827,9 @@ fn qh_spinner() -> String {
 /// the spinners queued, the handler's quanta end there. Before the yield floor each such end parked
 /// the task with the handler's recovery scope open on its stack, and the task resumed on another
 /// worker could leave that scope there and fault into the first worker's frames (traced on main: 3
-/// in 12 rounds). Now the task runs on to the handler's end, and each end let pass is counted
-/// (`temen_jit::quantum_ends_held`); without the floor nothing counts them, so this fails every run.
+/// in 12 rounds). Now the task keeps its worker to the handler's end, and each park it would have
+/// made is counted (`temen_jit::quantum_ends_held`); without the floor nothing counts them, so this
+/// fails every run.
 ///
 /// A normal lane: the ASan build does not run the handler inline (see #3158), so `asan-held` cannot
 /// cover this shape.
@@ -1856,6 +1857,6 @@ fn a_quantum_ending_inside_a_handler_run_inline_on_a_pool_task_does_not_park_it(
     );
     assert!(
         temen_jit::quantum_ends_held() > held,
-        "the handler's quanta ended under its inline scope, and were let pass"
+        "the handler's quanta ended under its inline scope with the pool full, and the task kept its worker"
     );
 }
