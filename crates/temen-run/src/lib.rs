@@ -3192,8 +3192,6 @@ unsafe fn serve_locked(
     let site = cell
         .clone()
         .filter(|_| bell.is_some() && freeze.is_none())
-        // #2804 PROBE ONLY (not for merge): force the inline route to time it against the fiber's.
-        .filter(|_| std::env::var_os("TEMEN_PROBE_SERVE_INLINE").is_none())
         .and_then(|cell| {
             // #3133 — the site is the running vCPU's (or task's), also when this code is a fiber's.
             temen_jit::ServeSite::of(
