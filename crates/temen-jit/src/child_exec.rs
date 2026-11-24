@@ -74,18 +74,27 @@ thread_local! {
     /// task, or a held domain's activation its carrier resumes. `0` outside one. A call that task
     /// makes into a held domain is carried by it ([`Carrier`]).
     static RUNNING_TASK: Cell<u64> = const { Cell::new(0) };
-    /// #3158 — the lanes the residency running on this thread holds: a child task's own chain, on
-    /// the executor's domain, which took it at the task's pick. `None` outside one, and for a
-    /// handler's residency, which holds none (its gate is its window's).
+    /// #3158 — the lanes the residency running on this thread holds ([`resident_lanes`]).
     static RESIDENT_LANES: Cell<Option<HeldLanes>> = const { Cell::new(None) };
 }
 
 /// #3158 — a residency's lanes: the domain that counts them, and the chain.
 type HeldLanes = (*const Domain, *const [(usize, i64)]);
 
-/// #3158 — the lanes the residency running on this thread holds, on the domain that holds their
-/// counts ([`RESIDENT_LANES`]): what a wait that blocks this thread outside the pool gives back and
-/// re-takes. `None` outside a residency, and in a handler's.
+/// #3158 — the lanes the residency running on this thread holds, on the domain that counts them:
+/// what a wait that blocks this thread outside the pool gives back and re-takes.
+/// * A child task's residency: its own chain, on the executor's domain. The executor took that very
+///   chain on that domain at the task's pick ([`ChildExec::pick`]'s `lane_try_enter_first`), and
+///   gives it back there after the residency (`lane_leave(task.chain())`), unless the task keeps it.
+/// * A handler's residency on a pool worker (a serve handler's shell, a held activation): `None`.
+///   The worker holds no lane, and the handler's gate is its window's.
+/// * A handler's residency on the thread that started it ([`ChildExec::run_here`]): the starter's.
+///   Inside a child task's serve op, that task's chain, published by its residency. On an OS
+///   vCPU's thread, `None`: the vCPU keeps its lanes through the wait, giving back nothing and
+///   re-taking nothing. That is balanced, and costs parallelism only while the wait lasts. A punt
+///   waits on no pool task ([`crate::os_thread_rt::wait_outside`]).
+///
+/// `None` outside a residency.
 ///
 /// # Safety
 /// The answer lives as long as the residency that published it: use it within the call.
@@ -2109,7 +2118,7 @@ struct Residency<'a> {
     /// The durable shadow region the task spills into, if it is durable.
     shadow: Option<u64>,
     /// The lanes the task holds while it resides, on the domain that counts them: a child's chain;
-    /// none for a handler ([`resident_lanes`]).
+    /// none for a handler, which holds its starter's or none ([`resident_lanes`]).
     lanes: Option<HeldLanes>,
 }
 
@@ -3356,7 +3365,14 @@ impl ChildExec {
         let prev_handlers = vcpu_tls::serve_handlers();
         vcpu_tls::set_serve_handlers(r.serve_handlers);
         let prev_dom = os_thread_rt::set_current_domain(r.domain);
-        let prev_lanes = RESIDENT_LANES.with(|c| c.replace(r.lanes));
+        // A handler run on the thread that started it holds what its starter holds.
+        let prev_lanes = RESIDENT_LANES.with(|c| {
+            if r.lanes.is_some() || pool {
+                c.replace(r.lanes)
+            } else {
+                c.get()
+            }
+        });
         r.rt.push_active(Arc::clone(r.slot));
         // #1991 — a worker's task's quantum ends against this pool ([`quantum_end`]); a handler on
         // the thread that admitted it runs on until it parks or returns.

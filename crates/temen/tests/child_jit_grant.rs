@@ -310,10 +310,15 @@ fn a_childs_uninstall_leaves_the_parents_slot_mirror_alone() {
 }
 
 /// #3158 — a whole-vCPU park made inside a `Jit.invoke`, on a pool task. The child [`joining_src`]
-/// spawns a grandchild (function 4's image: it spins forever, so it is live until teardown and no
-/// join's outcome is ever in early, however slow the run), then compiles a unit and invokes it. The
-/// unit `call.dyn`s the child's function 2 (new→old), which makes a fiber over function 3 and
-/// resumes it, and that fiber joins the grandchild. A join blocks the child's vCPU on every engine.
+/// spawns a grandchild (function 4's image), then compiles a unit and invokes it. The unit
+/// `call.dyn`s the child's function 2 (new→old), which makes a fiber over function 3 and resumes it,
+/// and that fiber joins the grandchild. A join blocks the child's vCPU on every engine. The
+/// grandchild waits with no deadline on a word nothing notifies. On the JIT a task cannot decide the
+/// deadlock verdict: an OS vCPU's park decides it once the run is quiescent
+/// (`ChildExec::wake_vcpus_if_quiescent`), and the run is not while the child runs to its join. So
+/// the grandchild is live at the join, however slow the run, with no clock and no fuel in it. On
+/// the oracle it reaches its verdict, which the oracle's answer does not read: the oracle's invoke
+/// child refuses the join itself.
 fn joining_src(blob: &[u8]) -> String {
     let blob_data: String = blob.iter().map(|b| format!("\\x{b:02x}")).collect();
     let spawn = SpawnRec {
@@ -396,10 +401,12 @@ block 0 (vsp: i64, varg: i64) {{
 }}
 func (i64) -> (i64) {{
 block 0 (v0: i64) {{
-  br 1()
-}}
-block 1 () {{
-  br 1()
+  vp = i64.const 70000
+  vw0 = i32.const 0
+  vto = i64.const -1
+  vw = i32.atomic.wait vp vw0 vto
+  v7 = i64.const 7
+  return v7
   }}
 }}
 data 16484 "jit"
@@ -429,26 +436,41 @@ fn a_join_inside_an_invoke_on_a_pool_task_fails_closed_at_its_door() {
     let b = encode_module(&parse_module(unit).expect("parse unit"));
     let m = parse_module(&joining_src(&b)).expect("parse");
     verify_module(&m).expect("verify");
-    let setup = || {
+    fn setup(m: &temen_ir::Module) -> (Host, [i32; 5]) {
         let mut host = Host::new();
         let ih = host.grant_instantiator();
-        let jh = grant_jit(&mut host, &m, 0);
+        let jh = grant_jit(&mut host, m, 0);
         let bh = host.grant_budget(-1, 1 << 20, -1);
-        let ch = host.grant_module(&temen_ir::child_image_at(&m, 1).expect("child image"));
-        let gh = host.grant_module(&temen_ir::child_image_at(&m, 4).expect("grandchild image"));
+        let ch = host.grant_module(&temen_ir::child_image_at(m, 1).expect("child image"));
+        let gh = host.grant_module(&temen_ir::child_image_at(m, 4).expect("grandchild image"));
         (host, [ih, jh, bh, ch, gh])
-    };
+    }
     // The parent answers `status * 1000 + value` of its join of the child.
     let trapped = |code: i64| code * 1000;
-    let (mut host, h) = setup();
-    let mut fuel = 50_000_000u64;
-    let r = run_with_host(&m, 0, &h.map(Value::I32), &mut fuel, &mut host);
+    // On its own thread with a bound in time, so a run that does not end fails rather than hangs.
+    let r = {
+        let m = m.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let (mut host, h) = setup(&m);
+            let mut fuel = 50_000_000u64;
+            let _ = tx.send(run_with_host(
+                &m,
+                0,
+                &h.map(Value::I32),
+                &mut fuel,
+                &mut host,
+            ));
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(60))
+            .expect("the oracle's run ends")
+    };
     assert_eq!(
         r,
         Ok(vec![Value::I64(trapped(temen_ir::trap_code::CAP_FAULT))]),
         "oracle"
     );
-    let (mut host, h) = setup();
+    let (mut host, h) = setup(&m);
     let (out, _) = temen_run::jit_cap_run(
         &m,
         0,
@@ -533,9 +555,11 @@ const LANE_UNIT: &str = "memory 17\nfunc () -> (i64) {\nblock 0 () {\n  va = i64
 /// #3158 review B1 — the serving child. Its entry resolves `"jit"` and `"prc"`, compiles
 /// [`LANE_UNIT`] (the blob at [`BLOB_OFF`]), spawns a notifier vCPU (function 2), and serves one
 /// call. The handler, `run(a)`, waits with no deadline on a word the notifier notifies until a notify
-/// wakes a waiter (sleeping a millisecond on a word of its own between tries), so the handler's
-/// fiber parks once, however late its wait begins, and a pool worker resumes it. Then it invokes the
-/// unit, whose call the host punts, and answers the unit's 105 plus `a`.
+/// wakes a waiter, so the handler's fiber parks once, however late its wait begins, and a pool
+/// worker resumes it. The notifier sleeps a millisecond on a word of its own between tries: that
+/// only paces it. What makes the park certain is the wait's lack of a deadline and the notifier
+/// trying until one of its notifies wakes a waiter. Then the handler invokes the unit, whose call
+/// the host punts, and answers the unit's 105 plus `a`.
 fn lane_server(blob: &[u8]) -> String {
     let blob_data: String = blob.iter().map(|b| format!("\\x{b:02x}")).collect();
     format!(

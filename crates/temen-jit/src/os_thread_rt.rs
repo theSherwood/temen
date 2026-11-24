@@ -406,14 +406,15 @@ pub enum HostPark {
 }
 
 /// #2164 — whose park a host call's is ([`park_host_call`]); #3158 — the kind of park every park
-/// door asks [`fiber_rt::park_as`] about.
+/// door asks `fiber_rt::park_as` about.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Parks {
     /// The calling fiber's alone: a guest fiber yields `FIBER_PARKED` to its resumer, which runs on
-    /// (#1952). A host call's park, on every engine.
+    /// (#1952). A host call's park, and a futex wait, on every engine.
     Fiber,
-    /// The calling vCPU's, whatever fiber it is in: a demand-paged child's page fault, which blocks
-    /// its whole vCPU on every engine, as a join does (#2322).
+    /// The calling vCPU's, whatever fiber it is in: a demand-paged child's page fault, a join (of a
+    /// thread or a §14 child), a blocking resume of a parked fiber, a pool task's quantum end. It
+    /// blocks the whole vCPU on every engine (#2322); in a pool task, the task.
     Vcpu,
 }
 
@@ -489,15 +490,19 @@ unsafe fn park_host_call_here(
         fiber_rt::ParkAs::Fiber(slot) => Some(slot),
         fiber_rt::ParkAs::Thread => None,
         // #3158 — a pool task below a guarded call's floor can park neither a fiber of its own nor
-        // the task: fail closed, before the park, where it would park. A landed freeze, or an event
-        // that already came, answers as on every other path, before any park.
+        // the task: fail closed, before the park, where it would park. One that need not park
+        // answers as the thread's park below does, in its order: a kill or its domain's end (whose
+        // own code stands), an event already in, a landed freeze.
         fiber_rt::ParkAs::Refused => {
-            if let Some(f) = frozen() {
-                f.mark_reissue();
-                return HostPark::Frozen;
+            if epoch_fired(vm.epoch as usize) || vm.ended().is_some() {
+                return HostPark::Ended;
             }
             if !still_parked() {
                 return HostPark::Woken;
+            }
+            if let Some(f) = frozen() {
+                f.mark_reissue();
+                return HostPark::Frozen;
             }
             vm.raise(crate::TrapKind::ThreadFault as i64);
             return HostPark::Ended;
@@ -572,8 +577,11 @@ unsafe fn park_host_call_here(
 }
 
 /// #2047 — wait outside the run for a host call's answer (a job punted to the offload pool, which
-/// may wait on the world), as a park waits: the calling vCPU gives its lane back for the wait (D66)
-/// and takes it again after, and a kill or its domain's end stops the wait. It is not counted
+/// may wait on the world), as a park waits: the calling context gives back the lanes it holds for
+/// the wait (D66) and takes them again after (`held_lanes`: an OS vCPU's domain chain, a child
+/// task's own chain, none for a handler on a pool worker), and a kill or its domain's end stops the
+/// wait. #3158 — a punted job waits on no pool task: it is a self-contained job on the domain's
+/// offload pool, or a call the embedder answers. It is not counted
 /// parked: the answer comes from outside, so it may yet end a peer's wait. `wait(stop)` blocks until
 /// the answer (`Some`) or until `stop()` holds (`None`), checking `stop` again whenever `rouse`
 /// wakes it. `None`: the run was killed (its domain now ends with `OutOfFuel`, as a join's does) or
@@ -2109,10 +2117,10 @@ pub(crate) unsafe fn current_domain<'a>(sched: *const Domain) -> &'a Domain {
 
 /// #3158 — the lanes the running context holds, on the domain that counts them: what a wait that
 /// blocks this thread outside the pool gives back first and re-takes after. An OS vCPU holds its
-/// domain's chain. A pool task holds what its residency holds ([`crate::child_exec::resident_lanes`]):
-/// a child's own chain, which the executor took at its pick, and nothing for a serve handler's shell
-/// or a held activation, whose gate is their window's. The current domain is not the answer there:
-/// a handler shell's is its serving vCPU's. `None` with no domain (`sched` null) or no lanes.
+/// domain's chain. Code in a residency (a pool task's, or a handler's) holds what the residency
+/// holds ([`crate::child_exec::resident_lanes`] says which, case by case). The current domain is
+/// not the answer there: a handler shell's is its serving vCPU's, whose lanes the shell does not
+/// hold. `None` with no domain (`sched` null) or no lanes.
 ///
 /// # Safety
 /// As [`current_domain`], when `sched` is non-null; the answer is used within the call.
@@ -3432,8 +3440,9 @@ unsafe fn thread_wait_here(
         fiber_rt::ParkAs::Thread => {}
         // #3158 — a pool task below a guarded call's floor parks neither a fiber of its own nor the
         // task. A wait that need not park answers as [`futex_wait`] does, in its order: a value that
-        // no longer matches, a landed freeze, a deadline already reached. One that would park fails
-        // closed.
+        // no longer matches, a kill or its domain's end (woken: its trailing guard unwinds, the
+        // kill's own code standing), a landed freeze, a deadline already reached. One that would
+        // park fails closed.
         fiber_rt::ParkAs::Refused => {
             return match read_phys(vm, phys, width) {
                 None => {
@@ -3441,6 +3450,7 @@ unsafe fn thread_wait_here(
                     0
                 }
                 Some(v) if v & mask != expected & mask => WAIT_NOT_EQUAL,
+                Some(_) if epoch_fired(dom.env().epoch_addr) || vm.ended().is_some() => WAIT_WOKEN,
                 // SAFETY: a watched window is the run's, live while the run is.
                 Some(_) if freeze.is_some_and(|f| unsafe { f.landed() }) => {
                     temen_ir::durable_abi::WAIT_FROZEN

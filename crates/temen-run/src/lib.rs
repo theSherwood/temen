@@ -322,8 +322,9 @@ impl HostParkReq {
 }
 
 /// F3, #2047 — wait for punted call `id`'s completion as a park. A fiber parks alone
-/// ([`fiber_cap_wait`]); a vCPU waits outside the run with its lane given back
-/// ([`temen_jit::wait_outside`]). A run that ends meanwhile leaves the answer unclaimed and the
+/// ([`fiber_cap_wait`]); anything else waits outside the run with the lanes its context holds given
+/// back ([`temen_jit::wait_outside`]: an OS vCPU's, a child task's own, none for a handler on a pool
+/// worker). A run that ends meanwhile leaves the answer unclaimed and the
 /// trap cell set, so the caller writes no result.
 ///
 /// # Safety
@@ -952,7 +953,7 @@ pub unsafe extern "C" fn cap_thunk_locked(
             }
             // F3, #2047 — the lock is already released: wait as a park ([`cap_wait`]). A punt
             // inside a FIBER parks the fiber, so its vCPU keeps polling its other fibers; any other
-            // waits as its vCPU, with the vCPU's lane given back.
+            // waits outside on its thread, with the lanes its context holds given back.
             let fiber = n_results == 1 && temen_jit::fiber_active() && !durable;
             let r = cap_wait(&comps, id, fiber, vm);
             if vm.ended().is_some() {
