@@ -3591,11 +3591,6 @@ fn wait_deregister(
     true
 }
 
-/// [`fiber_rt::fiber_resume`]'s `FIBER_PARKED` status (the fiber hit an event park, not a guest
-/// `suspend`/return). Kept in sync with `fiber_rt::FIBER_PARKED`; the differential harness pins the
-/// numeric value across backends.
-const FIBER_PARKED_STATUS: i64 = 3;
-
 /// I48 — the **blocking** fiber resume (`cont.resume.block`). Like [`fiber_rt::fiber_resume`], but
 /// when the resumed fiber is still event-parked (`FIBER_PARKED`) it **idles this vCPU's OS thread**
 /// instead of returning the poll status to the guest, then re-resumes: on the fiber's futex wait
@@ -3645,7 +3640,7 @@ pub(crate) unsafe extern "C" fn fiber_resume_block(
         let value = fiber_rt::fiber_resume(handle, arg, status_out, vm as *const _ as u64);
         // Done (guest suspend / return), a trap in flight, or not event-parked: hand back to the
         // guest exactly as `cont.resume` would (its `status_out`/value are already set).
-        if *status_out != FIBER_PARKED_STATUS || vm.ended().is_some() {
+        if *status_out != fiber_rt::FIBER_PARKED || vm.ended().is_some() {
             return value;
         }
         // #2757 — a kill ends the idle too: the fiber's own park may not see it (an outside

@@ -10468,7 +10468,7 @@ enum Cont {
     /// whose incarnation `gen` parked; `word` is that slot's parked word, which the rules set as they
     /// file, wake and claim the park, and the engine's pollers read without the run lock.
     Native {
-        word: std::sync::Arc<temen_ir::seams::ParkWord>,
+        word: temen_ir::seams::ParkRef,
         gen: u64,
     },
 }
@@ -10510,13 +10510,13 @@ struct NativePark {
     expected: u64,
     width: u32,
     timeout: Option<u64>,
-    word: std::sync::Arc<temen_ir::seams::ParkWord>,
+    word: temen_ir::seams::ParkRef,
 }
 
 impl FiberTables {
     /// #3078 slice 3 — put `record` at slot `k` of a native tier's registry, which grows with
     /// [`FiberState::Engine`] up to it. The native table's size bounds `k`, so it bounds this too.
-    fn place(&mut self, k: usize, record: FiberState) {
+    fn place(&mut self, k: usize, record: FiberState) -> Result<(), Trap> {
         while self.fibers.len() <= k {
             self.fibers.push(FiberState::Engine);
             self.sp.push(0);
@@ -10526,11 +10526,13 @@ impl FiberTables {
                 charge: LiveFiber::none(),
             });
         }
-        debug_assert!(
-            matches!(self.fibers[k], FiberState::Engine),
-            "a native fiber parks only from the engine's own state"
-        );
+        // A native fiber parks only from the engine's own state: anything else here would orphan
+        // the filed entry, which a later wake reaches as a record that is not there. Fail closed.
+        if !matches!(self.fibers[k], FiberState::Engine) {
+            return Err(Trap::Malformed);
+        }
         self.fibers[k] = record;
+        Ok(())
     }
 
     /// These tables, owned by the caller, as the registry a fiber transition runs over. `waits` is
@@ -10844,7 +10846,7 @@ fn claim_fiber(
         // terminates) — the resume delivers the wait's status into the fiber and continues it.
         Some(slot @ FiberState::WaitParked { .. }) => {
             // Still blocked: its deadline is already in the idle scan, and a notify wakes it too.
-            let Some(st) = wait_fired(slot, k, waits) else {
+            let Some(st) = wait_fired(slot, k, waits, sched_wall_now) else {
                 return Ok(blocked());
             };
             let FiberState::WaitParked {
@@ -10922,10 +10924,17 @@ fn claim_fiber(
 /// has passed, which a poll fires (so a cooperative resume-poll loop terminates; the jacl timed-wait
 /// shape) and which takes it out of the run's wait index `waits`. `None` while it still waits. The one
 /// rule an interpreted claim ([`claim_fiber`]) and a native one ([`claim_native`]) share.
-fn wait_fired(slot: &mut FiberState, k: usize, waits: Option<&mut Waits>) -> Option<i32> {
+fn wait_fired(
+    slot: &mut FiberState,
+    k: usize,
+    waits: Option<&mut Waits>,
+    now: impl FnOnce() -> u64,
+) -> Option<i32> {
+    if still_waiting(slot, now) {
+        return None;
+    }
     let FiberState::WaitParked {
         woken,
-        real_deadline,
         key,
         arrived,
         ..
@@ -10941,7 +10950,6 @@ fn wait_fired(slot: &mut FiberState, k: usize, waits: Option<&mut Waits>) -> Opt
         // a deadlock. Fuel bounds it like any other guest loop, at the identical safepoint on all
         // three engines (`jit_fuel.rs`). Before #1638 this engine alone ended it, with a
         // `WAIT_TIMED_OUT` at 10 s that the guest never asked for.
-        real_deadline.filter(|dl| sched_wall_now() >= *dl)?;
         // #3078 slice 1 — its wait leaves the index as it times out, as one the clock times out
         // does ([`Tasks::time_out`]).
         let w = (waits.expect("a waiting fiber's registry carries its run's wait index"))
@@ -10949,6 +10957,21 @@ fn wait_fired(slot: &mut FiberState, k: usize, waits: Option<&mut Waits>) -> Opt
         debug_assert!(w.is_fiber(k), "the entry it leaves is its own");
         Some(super::WAIT_TIMED_OUT)
     })
+}
+
+/// #3078 slice 3 — whether futex-parked fiber record `slot` still waits: no event has fired, and its
+/// real deadline, if any, has not passed by `now` (read only for a timed wait, on
+/// [`sched_wall_now`]'s clock). The one test a claim ([`wait_fired`]) and a block
+/// ([`native_blocks`]) make.
+fn still_waiting(slot: &FiberState, now: impl FnOnce() -> u64) -> bool {
+    match slot {
+        FiberState::WaitParked {
+            woken: None,
+            real_deadline,
+            ..
+        } => real_deadline.is_none_or(|dl| now() < dl),
+        _ => false,
+    }
 }
 
 /// #3078 slice 3 — what a native fiber's claim of its kernel park found ([`claim_native`]).
@@ -10972,7 +10995,13 @@ enum NativeClaim {
 /// domain's registry), under the run lock that guards it and `waits`: once its wait has ended
 /// ([`wait_fired`]), the record gives way to [`FiberState::Engine`] and its word goes idle, and the
 /// claimant switches into the fiber with the status.
-fn claim_native(fibers: &mut [FiberState], k: usize, gen: u64, waits: &mut Waits) -> NativeClaim {
+fn claim_native(
+    fibers: &mut [FiberState],
+    k: usize,
+    gen: u64,
+    waits: &mut Waits,
+    now: impl FnOnce() -> u64,
+) -> NativeClaim {
     let Some(slot) = fibers.get_mut(k) else {
         return NativeClaim::NotParked;
     };
@@ -10980,7 +11009,7 @@ fn claim_native(fibers: &mut [FiberState], k: usize, gen: u64, waits: &mut Waits
         return NativeClaim::NotParked;
     }
     let pending = matches!(slot, FiberState::WaitParked { woken: None, .. });
-    let Some(status) = wait_fired(slot, k, Some(waits)) else {
+    let Some(status) = wait_fired(slot, k, Some(waits), now) else {
         return NativeClaim::Parked;
     };
     if let FiberState::WaitParked {
@@ -10988,7 +11017,7 @@ fn claim_native(fibers: &mut [FiberState], k: usize, gen: u64, waits: &mut Waits
         ..
     } = std::mem::replace(slot, FiberState::Engine)
     {
-        word.idle();
+        word.park_word().idle();
     }
     NativeClaim::Claimed {
         status,
@@ -10999,12 +11028,58 @@ fn claim_native(fibers: &mut [FiberState], k: usize, gen: u64, waits: &mut Waits
 /// #3078 slice 3 — whether a `cont.resume.block` of native fiber `k`, incarnation `gen`, idles its task
 /// ([`VcpuStop::FiberBlock`]): its kernel park is filed in `fibers` and still waits, its real deadline
 /// not passed. Asked under the run lock its wake takes, so a wake since the resumer's poll is seen.
-fn native_blocks(fibers: &[FiberState], k: usize, gen: u64) -> bool {
-    fibers.get(k).is_some_and(|f| {
-        native_park_of(f, gen)
-            && matches!(f, FiberState::WaitParked { woken: None, real_deadline, .. }
-                if real_deadline.is_none_or(|dl| sched_wall_now() < dl))
-    })
+fn native_blocks(fibers: &[FiberState], k: usize, gen: u64, now: impl FnOnce() -> u64) -> bool {
+    fibers
+        .get(k)
+        .is_some_and(|f| native_park_of(f, gen) && still_waiting(f, now))
+}
+
+/// #3078 slice 3 — a native fiber's claim of its kernel park, as the rules apply it
+/// ([`VcpuStop::FiberClaim`]): the claim ([`claim_native`]), what the claimant's cell gets
+/// (`[status, how]`), and what the stop applied. A claim that ended the wait itself (its real
+/// deadline passed) told no task idling on the fiber, so the settle scans ([`fiber_woken`]); a notify's
+/// or a timeout's wake already did. Every other claim moved only the record and its word.
+fn fiber_claim_rule(
+    fibers: &mut [FiberState],
+    k: usize,
+    gen: u64,
+    waits: &mut Waits,
+    now: impl FnOnce() -> u64,
+) -> (NativeClaim, [i64; 2], Applied) {
+    let claim = claim_native(fibers, k, gen, waits, now);
+    let cell = match claim {
+        NativeClaim::Claimed { status, .. } => [status as i64, FIBER_CLAIMED],
+        NativeClaim::Parked => [0, FIBER_STILL_PARKED],
+        NativeClaim::NotParked => [0, FIBER_NOT_PARKED],
+    };
+    let applied = match claim {
+        NativeClaim::Claimed { fired: true, .. } => Applied::All,
+        _ => Applied::Futex,
+    };
+    (claim, cell, applied)
+}
+
+/// #3078 slice 3 — a native `cont.resume.block` of a kernel-parked fiber its poll found parked, as the
+/// rules apply it ([`VcpuStop::FiberBlock`]): whether the task idles on it ([`native_blocks`]), and
+/// what the stop applied, `Applied::Futex` either way. Its re-check reads, under this hold, the wake a
+/// notify or a timeout writes under its own; a wake after it finds the task idling, and that wake's
+/// own settle scan rouses it ([`notify_rule`], [`fiber_claim_rule`]).
+fn fiber_block_rule(
+    fibers: &[FiberState],
+    k: usize,
+    gen: u64,
+    now: impl FnOnce() -> u64,
+) -> (bool, Applied) {
+    (native_blocks(fibers, k, gen, now), Applied::Futex)
+}
+
+/// What a `memory.notify` that woke `woke` applied: only futex task state when it woke no fiber; a
+/// fiber it woke may have a task idling on it, which only the settle's scan finds ([`fiber_woken`]).
+fn notify_rule(woke: Woke) -> Applied {
+    match woke.fibers {
+        0 => Applied::Futex,
+        _ => Applied::All,
+    }
 }
 
 /// #3078 slice 3 — whether `slot` holds the kernel park of a native fiber's incarnation `gen`.
@@ -13999,18 +14074,20 @@ mod wait_index_loom {
 }
 
 /// #3078 slice 3 — **model 1: a native fiber's kernel park.** The real rules run under a loom mutex
-/// for the run lock: the shared fiber wait ([`fiber_wait`]) and the record it writes, the notify
-/// ([`Tasks::notify`], [`Tasks::end_taken`]), the claim ([`claim_native`]), the block's re-check
-/// ([`native_blocks`]) and the settle's scan ([`fiber_woken`]), over the real [`Waits`] and
-/// `FutexCount`, and the real parked word (`temen_ir::seams::ParkWord`, loom's atomics under
+/// for the run lock, each as the stop arm that applies it calls it: the park ([`native_fiber_wait`],
+/// over a model window on the guest's word), the claim ([`fiber_claim_rule`]), the block
+/// ([`fiber_block_rule`]), the notify ([`Tasks::notify`] and [`notify_rule`]), the logical timeout
+/// ([`Tasks::time_out`]), and, where a rule answers [`Applied::All`], the settle's scan
+/// ([`fiber_woken`]), as `ThreadRun::apply` runs a settle for anything but a futex stop. Over the
+/// real [`Waits`], `FutexCount` and parked word (`temen_ir::seams::ParkWord`, loom's atomics under
 /// `--cfg loom`), which pollers read without the lock. What the native slot's own claim does with an
 /// idle word (its CAS, which a kernel-parked slot never grants: it stays `RUNNING`) is
 /// `fiber_registry`'s `loom_running_fiber_is_never_stealable`.
 ///
-/// Asserted in every interleaving: no lost wake (a woken record's word polls `Claim`); a filed
-/// park's word never polls `Idle`; at most one claim takes a park; a blocker is never left idling
-/// on a fiber it could claim; a stale handle never reaches the next incarnation's park; and the
-/// stripes end at zero. Each broken variant below must fail.
+/// Asserted in every interleaving: the word says what the record is (pending, woken, or no park);
+/// at most one claim takes a park; a blocker is never left idling on a fiber it could claim; a stale
+/// handle never reaches the next incarnation's park; and the stripes end at zero. Each broken
+/// variant below must fail.
 #[cfg(all(loom, test))]
 mod native_park_loom {
     use super::*;
@@ -14021,6 +14098,30 @@ mod native_park_loom {
 
     const KEY: FutexKey = FutexKey::Anon(1, 8);
     const K: usize = 0;
+    /// The model's clocks: before any deadline the model arms, and after all of them.
+    const EARLY: u64 = 0;
+    const LATE: u64 = u64::MAX;
+
+    /// The guest's word, as the rules read it: a window of one word, keyed `KEY`.
+    struct Word<'a>(&'a AtomicU32);
+
+    impl crate::FutexWindow for Word<'_> {
+        fn prepare_wait(&self, addr: u64, _: u32) -> Result<u64, Trap> {
+            Ok(addr)
+        }
+        fn confine_for_notify(&self, addr: u64) -> Result<u64, Trap> {
+            Ok(addr)
+        }
+        fn wait_word(&self, _: u64, _: u32) -> Option<u64> {
+            Some(self.0.load(Ordering::SeqCst) as u64)
+        }
+        fn futex_site(&self, base: u64) -> crate::FutexSite {
+            crate::FutexSite::Anon(base)
+        }
+        fn site_key(&self, _: crate::FutexSite) -> FutexKey {
+            KEY
+        }
+    }
 
     /// What the run lock guards: the rules' state, and the model's own book-keeping.
     struct Rules {
@@ -14030,6 +14131,8 @@ mod native_park_loom {
         blocked: bool,
         /// How many claims took a park, by incarnation.
         claims: [u32; 2],
+        /// The statuses the claims delivered.
+        statuses: Vec<i32>,
     }
 
     struct World {
@@ -14043,9 +14146,9 @@ mod native_park_loom {
     #[derive(Clone, Copy, PartialEq)]
     enum Broken {
         None,
-        /// The word is stored after the lock is let go.
+        /// The word is stored again after the lock is let go (a park that publishes late).
         WordLate,
-        /// The wake sets the record's `woken` without storing `WOKEN`.
+        /// The wake leaves the word pending (as if `end_taken` did not store `WOKEN`).
         NoWake,
         /// The block idles without its re-check.
         NoRecheck,
@@ -14053,6 +14156,8 @@ mod native_park_loom {
         SlotOnly,
         /// The poll of a timed park does not read the word again after its deadline.
         NoReread,
+        /// A claim that ended the wait itself answers a futex stop: no settle.
+        FiredNoSettle,
     }
 
     impl World {
@@ -14071,35 +14176,45 @@ mod native_park_loom {
                     domains: vec![root],
                     blocked: false,
                     claims: [0; 2],
+                    statuses: Vec::new(),
                 }),
             }
         }
     }
 
-    /// The resumer files incarnation `gen`'s wait, for `timeout` ns at most, as `native_fiber_wait`
-    /// does under the lock.
-    fn file(w: &World, gen: u64, timeout: Option<u64>, broken: Broken) {
-        let mut g = w.run.lock().unwrap();
-        let r = &mut *g;
-        let read = || Some(w.guest.load(Ordering::SeqCst) as u64);
-        let wait = fiber_wait(&mut r.tasks, KEY, read, 0, 0, timeout, 0, K).unwrap();
-        let word = std::sync::Arc::clone(&w.word);
-        let fibers = &mut r.domains[0].fibers;
-        if matches!(fibers.fibers.get(K), Some(FiberState::Engine) | None) {
-            fibers.place(K, wait.record(Cont::Native { word, gen }, 0));
-        }
-        let woken = wait.woken.is_some();
-        match broken {
-            Broken::WordLate => {
-                drop(g);
-                w.word.park(gen, woken, wait.real_deadline);
-            }
-            _ => w.word.park(gen, woken, wait.real_deadline),
+    /// Whatever applied, as `ThreadRun::apply` follows it up: a settle (its scan of a task idling
+    /// on the fiber) for anything but a futex stop.
+    fn follow(r: &mut Rules, applied: Applied) {
+        if !matches!(applied, Applied::Futex) && r.blocked && fiber_woken(&r.domains[0], K) {
+            r.blocked = false;
         }
     }
 
-    /// The notifier: the guest's store, the fast path's read, then the rules' notify and the settle's
-    /// scan under the lock.
+    /// The resumer files incarnation `gen`'s wait, for `timeout` (logical and real) at most: the
+    /// `FiberPark` arm, [`native_fiber_wait`] itself, a futex stop.
+    fn file(w: &World, gen: u64, timeout: Option<u64>, broken: Broken) {
+        let mut g = w.run.lock().unwrap();
+        let r = &mut *g;
+        let win = Word(&w.guest);
+        let park = NativePark {
+            slot: K,
+            gen,
+            base: 8,
+            expected: 0,
+            width: 4,
+            timeout,
+            word: std::sync::Arc::clone(&w.word) as temen_ir::seams::ParkRef,
+        };
+        let (tasks, fibers) = (&mut r.tasks, &mut r.domains[0].fibers);
+        native_fiber_wait(tasks, 0, fibers, Some(&win), 0, park).unwrap();
+        drop(g);
+        if broken == Broken::WordLate {
+            w.word.park(gen, false, None);
+        }
+    }
+
+    /// The notifier: the guest's store, the fast path's read, then the rules' notify and what it
+    /// applied, under the lock.
     fn notify(w: &World, broken: Broken) {
         w.guest.store(1, Ordering::Relaxed);
         if w.count.quiet(&KEY) {
@@ -14107,46 +14222,43 @@ mod native_park_loom {
         }
         let mut g = w.run.lock().unwrap();
         let r = &mut *g;
-        let woke = match broken {
-            Broken::NoWake => {
-                // `end_taken` without its store of the word.
-                let mut n = 0;
-                if let Some(t) = r.tasks.waits.take(KEY) {
-                    if let FiberState::WaitParked { woken, .. } = &mut r.domains[0].fibers.fibers[K]
-                    {
-                        *woken = Some(crate::WAIT_WOKEN);
-                    }
-                    let _ = t;
-                    n = 1;
-                }
-                n
+        let woke = r.tasks.notify(KEY, 1, &mut r.domains);
+        if broken == Broken::NoWake && woke.fibers != 0 {
+            if let Some(FiberState::WaitParked {
+                cont: Cont::Native { gen, .. },
+                ..
+            }) = r.domains[0].fibers.fibers.get(K)
+            {
+                w.word.park(*gen, false, None);
             }
-            _ => r.tasks.notify(KEY, 1, &mut r.domains).fibers,
+        }
+        follow(r, notify_rule(woke));
+    }
+
+    /// The logical clock passes every deadline: `Tasks::time_out`, and the settle a driver runs
+    /// after it.
+    fn time_out(w: &World) {
+        let mut g = w.run.lock().unwrap();
+        let r = &mut *g;
+        r.tasks.time_out(LATE, &mut r.domains);
+        follow(r, Applied::All);
+    }
+
+    /// A `cont.resume` of incarnation `gen` at time `now`: the word's poll without the lock, then
+    /// the claim under it.
+    fn poll(w: &World, gen: u64, now: u64, broken: Broken) -> ParkPoll {
+        let p = match broken {
+            Broken::NoReread => w.word.poll_without_recheck(gen, || now),
+            _ => w.word.poll(gen, || now),
         };
-        if woke != 0 {
-            scan(r);
-        }
-    }
-
-    /// The settle's scan of a task idling on fiber `K`.
-    fn scan(r: &mut Rules) {
-        if r.blocked && fiber_woken(&r.domains[0], K) {
-            r.blocked = false;
-        }
-    }
-
-    /// A `cont.resume` of incarnation `gen`: the word's poll without the lock, then the claim under it.
-    fn poll(w: &World, gen: u64, broken: Broken) -> ParkPoll {
-        let p = w
-            .word
-            .poll(gen, || unreachable!("an untimed park reads no clock"));
         if p == ParkPoll::Claim {
-            claim(w, gen, broken);
+            claim(w, gen, now, broken);
         }
         p
     }
 
-    fn claim(w: &World, gen: u64, broken: Broken) -> NativeClaim {
+    /// The `FiberClaim` arm at time `now`.
+    fn claim(w: &World, gen: u64, now: u64, broken: Broken) -> NativeClaim {
         let mut g = w.run.lock().unwrap();
         let r = &mut *g;
         let gen = match (broken, &r.domains[0].fibers.fibers.get(K)) {
@@ -14159,23 +14271,29 @@ mod native_park_loom {
             ) => *gen,
             _ => gen,
         };
-        let c = claim_native(&mut r.domains[0].fibers.fibers, K, gen, &mut r.tasks.waits);
-        if let NativeClaim::Claimed { fired, .. } = c {
+        let fibers = &mut r.domains[0].fibers.fibers;
+        let (c, _, applied) = fiber_claim_rule(fibers, K, gen, &mut r.tasks.waits, || now);
+        if let NativeClaim::Claimed { status, .. } = c {
             r.claims[gen as usize] += 1;
-            if fired {
-                scan(r);
-            }
+            r.statuses.push(status);
         }
+        let applied = match broken {
+            Broken::FiredNoSettle => Applied::Futex,
+            _ => applied,
+        };
+        follow(r, applied);
         c
     }
 
-    /// A `cont.resume.block` its poll found parked: the re-check under the lock, then the idle.
-    fn block(w: &World, gen: u64, broken: Broken) {
+    /// The `FiberBlock` arm at time `now`, its poll having found the fiber parked.
+    fn block(w: &World, gen: u64, now: u64, broken: Broken) {
         let mut g = w.run.lock().unwrap();
         let r = &mut *g;
-        if broken == Broken::NoRecheck || native_blocks(&r.domains[0].fibers.fibers, K, gen) {
+        let (idles, applied) = fiber_block_rule(&r.domains[0].fibers.fibers, K, gen, || now);
+        if idles || broken == Broken::NoRecheck {
             r.blocked = true;
         }
+        follow(r, applied);
     }
 
     /// What holds once every thread has gone, before the run's end retires the fiber.
@@ -14190,17 +14308,25 @@ mod native_park_loom {
             !(r.blocked && fiber_woken(&r.domains[0], K)),
             "a blocker idles on a fiber it could claim"
         );
-        if let Some(FiberState::WaitParked {
-            cont: Cont::Native { gen, .. },
-            woken,
-            ..
-        }) = r.domains[0].fibers.fibers.get(K)
-        {
-            let p = w.word.poll(*gen, || 0);
-            assert_ne!(p, ParkPoll::Idle, "a filed park's word polls idle");
-            if woken.is_some() {
-                assert_eq!(p, ParkPoll::Claim, "a woken park's word does not say so");
+        // The word says what the record is.
+        match r.domains[0].fibers.fibers.get(K) {
+            Some(FiberState::WaitParked {
+                cont: Cont::Native { gen, .. },
+                woken,
+                real_deadline,
+                ..
+            }) => {
+                let p = w.word.poll(*gen, || EARLY);
+                match (woken, real_deadline) {
+                    (Some(_), _) => {
+                        assert_eq!(p, ParkPoll::Claim, "a woken park's word does not say so")
+                    }
+                    (None, _) => {
+                        assert_eq!(p, ParkPoll::Parked, "a pending park's word does not say so")
+                    }
+                }
             }
+            _ => assert!(w.word.is_idle(), "a word names a park no record holds"),
         }
         r.tasks.retire_fibers(&r.domains[0].fibers.fibers);
         assert_eq!(r.tasks.waits.count.total(), 0, "the stripes end at zero");
@@ -14213,7 +14339,7 @@ mod native_park_loom {
             let w = std::sync::Arc::new(World::new());
             let (w1, w2) = (std::sync::Arc::clone(&w), std::sync::Arc::clone(&w));
             let resumer = loom::thread::spawn(move || file(&w1, 0, None, broken));
-            let poller = loom::thread::spawn(move || poll(&w2, 0, broken));
+            let poller = loom::thread::spawn(move || poll(&w2, 0, EARLY, broken));
             notify(&w, broken);
             resumer.join().unwrap();
             poller.join().unwrap();
@@ -14227,8 +14353,8 @@ mod native_park_loom {
             let w = std::sync::Arc::new(World::new());
             file(&w, 0, None, broken);
             let (w1, w2) = (std::sync::Arc::clone(&w), std::sync::Arc::clone(&w));
-            let a = loom::thread::spawn(move || poll(&w1, 0, broken));
-            let b = loom::thread::spawn(move || poll(&w2, 0, broken));
+            let a = loom::thread::spawn(move || poll(&w1, 0, EARLY, broken));
+            let b = loom::thread::spawn(move || poll(&w2, 0, EARLY, broken));
             notify(&w, broken);
             a.join().unwrap();
             b.join().unwrap();
@@ -14236,19 +14362,69 @@ mod native_park_loom {
         });
     }
 
-    /// A blocking resume's block against the notify, after the park.
-    fn block_notify(broken: Broken) {
+    /// A blocking resume's poll and block, against the notify, after the park; with a second poller
+    /// beside them when `poller`.
+    fn block_notify(broken: Broken, poller: bool) {
         loom::model(move || {
             let w = std::sync::Arc::new(World::new());
             file(&w, 0, None, broken);
-            let w1 = std::sync::Arc::clone(&w);
+            let (w1, w2) = (std::sync::Arc::clone(&w), std::sync::Arc::clone(&w));
             let blocker = loom::thread::spawn(move || {
-                if w1.word.poll(0, || 0) == ParkPoll::Parked {
-                    block(&w1, 0, broken);
+                if w1.word.poll(0, || EARLY) == ParkPoll::Parked {
+                    block(&w1, 0, EARLY, broken);
                 }
             });
+            let other = poller.then(|| loom::thread::spawn(move || poll(&w2, 0, EARLY, broken)));
             notify(&w, broken);
             blocker.join().unwrap();
+            if let Some(p) = other {
+                p.join().unwrap();
+            }
+            settled(&w);
+        });
+    }
+
+    /// A timed park: a blocker's poll and block before its deadline, against another poller's claim
+    /// after it, which ends the wait itself (the one claim that settles).
+    fn block_against_a_firing_claim(broken: Broken) {
+        loom::model(move || {
+            let w = std::sync::Arc::new(World::new());
+            file(&w, 0, Some(5), broken);
+            let w1 = std::sync::Arc::clone(&w);
+            let blocker = loom::thread::spawn(move || {
+                if w1.word.poll(0, || EARLY) == ParkPoll::Parked {
+                    block(&w1, 0, EARLY, broken);
+                }
+            });
+            poll(&w, 0, LATE, broken);
+            blocker.join().unwrap();
+            let g = w.run.lock().unwrap();
+            assert_eq!(
+                g.statuses,
+                [crate::WAIT_TIMED_OUT],
+                "the claim timed it out"
+            );
+            drop(g);
+            settled(&w);
+        });
+    }
+
+    /// A timed park: the logical clock's timeout against a poller's claim past the real deadline.
+    fn time_out_against_a_claim(broken: Broken) {
+        loom::model(move || {
+            let w = std::sync::Arc::new(World::new());
+            file(&w, 0, Some(5), broken);
+            let w1 = std::sync::Arc::clone(&w);
+            let t = loom::thread::spawn(move || time_out(&w1));
+            poll(&w, 0, LATE, broken);
+            t.join().unwrap();
+            let g = w.run.lock().unwrap();
+            assert_eq!(
+                g.statuses,
+                [crate::WAIT_TIMED_OUT],
+                "one timeout, claimed once"
+            );
+            drop(g);
             settled(&w);
         });
     }
@@ -14264,7 +14440,6 @@ mod native_park_loom {
             let w = std::sync::Arc::new(World::new());
             let (first, next) = match timed {
                 true => (Some(0), Some(1 << 60)),
-                // Each re-check fires: woken at once.
                 false => {
                     w.guest.store(1, Ordering::Relaxed);
                     (None, None)
@@ -14273,10 +14448,11 @@ mod native_park_loom {
             file(&w, 0, first, broken);
             let (w1, w2) = (std::sync::Arc::clone(&w), std::sync::Arc::clone(&w));
             let stale = loom::thread::spawn(move || {
-                let now = temen_ir::seams::wall_now;
+                // Past incarnation 0's deadline, before incarnation 1's.
+                let now = temen_ir::seams::wall_now();
                 let p = match broken {
-                    Broken::NoReread => w2.word.poll_without_recheck(0, now),
-                    _ => w2.word.poll(0, now),
+                    Broken::NoReread => w2.word.poll_without_recheck(0, || now),
+                    _ => w2.word.poll(0, || now),
                 };
                 assert_ne!(
                     p,
@@ -14284,7 +14460,7 @@ mod native_park_loom {
                     "a stale handle read the next incarnation's park"
                 );
                 if p == ParkPoll::Claim {
-                    let c = claim(&w2, 0, broken);
+                    let c = claim(&w2, 0, now, broken);
                     assert_ne!(
                         c,
                         NativeClaim::Parked,
@@ -14293,7 +14469,7 @@ mod native_park_loom {
                 }
             });
             let recycler = loom::thread::spawn(move || {
-                if claim(&w1, 0, broken) != NativeClaim::NotParked {
+                if claim(&w1, 0, temen_ir::seams::wall_now(), broken) != NativeClaim::NotParked {
                     file(&w1, 1, next, broken);
                 }
             });
@@ -14322,7 +14498,22 @@ mod native_park_loom {
 
     #[test]
     fn loom_a_native_block_sees_a_wake_since_its_poll() {
-        block_notify(Broken::None);
+        block_notify(Broken::None, false);
+    }
+
+    #[test]
+    fn loom_a_native_block_beside_a_poller_sees_the_wake() {
+        block_notify(Broken::None, true);
+    }
+
+    #[test]
+    fn loom_a_block_beside_a_claim_that_fires_the_deadline_is_roused() {
+        block_against_a_firing_claim(Broken::None);
+    }
+
+    #[test]
+    fn loom_a_timeout_and_a_claim_end_a_wait_once() {
+        time_out_against_a_claim(Broken::None);
     }
 
     #[test]
@@ -14336,13 +14527,7 @@ mod native_park_loom {
     }
 
     #[test]
-    #[should_panic(expected = "a stale handle read the next incarnation's park")]
-    fn loom_a_timed_poll_that_does_not_reread_its_word_takes_the_next_deadline() {
-        recycle(Broken::NoReread, true);
-    }
-
-    #[test]
-    #[should_panic(expected = "only a filed park is woken")]
+    #[should_panic(expected = "does not say so")]
     fn loom_a_word_stored_after_the_lock_loses_a_wake() {
         park_notify_poll(Broken::WordLate);
     }
@@ -14356,13 +14541,25 @@ mod native_park_loom {
     #[test]
     #[should_panic(expected = "a blocker idles on a fiber it could claim")]
     fn loom_a_block_without_its_recheck_sleeps_through_a_wake() {
-        block_notify(Broken::NoRecheck);
+        block_notify(Broken::NoRecheck, false);
+    }
+
+    #[test]
+    #[should_panic(expected = "a blocker idles on a fiber it could claim")]
+    fn loom_a_firing_claim_that_does_not_settle_leaves_its_blocker() {
+        block_against_a_firing_claim(Broken::FiredNoSettle);
     }
 
     #[test]
     #[should_panic(expected = "a stale handle claimed the next incarnation's park")]
     fn loom_a_claim_by_slot_alone_takes_the_next_incarnations_park() {
         recycle(Broken::SlotOnly, false);
+    }
+
+    #[test]
+    #[should_panic(expected = "a stale handle read the next incarnation's park")]
+    fn loom_a_timed_poll_that_does_not_reread_its_word_takes_the_next_deadline() {
+        recycle(Broken::NoReread, true);
     }
 }
 
@@ -14520,7 +14717,7 @@ impl Tasks {
                     *w = Some(status);
                     // #3078 slice 3 — a native fiber's pollers read its word without the lock.
                     if let Cont::Native { word, .. } = cont {
-                        word.wake();
+                        word.park_word().wake();
                     }
                 }
                 _ => unreachable!("a fiber in the wait index waits there"),
@@ -17081,14 +17278,23 @@ enum Applied {
     /// The pump pauses for its host: a tier-up, a task's entry included, or an emitted `Jit.invoke`,
     /// recorded in the `EmitTier`.
     Pause(CoopStep),
-    /// #2963 — a futex stop that moved only futex task state: the stopping task, which runs on or
-    /// waits aside, and the tasks its notify woke, which [`Waits::woken`] holds until the stop's
-    /// executor takes them under the same lock hold ([`ThreadRun::apply`]). No task ended, no fiber
-    /// moved, and no park of any other kind began or ended, so a settle after it would find only
-    /// what the last one found and what the world did since, which wakes its own waiters
-    /// ([`ThreadRun::apply`]). It relies on no task being runnable yet held back by something a
-    /// futex park could release: a dispatch-time lane on the bytecode drivers (#1600) would make a
-    /// lane-freeing park [`Applied::All`].
+    /// #2963 — a futex stop that moved only futex state: the stopping task, which runs on or waits
+    /// aside, and the tasks its notify woke, which [`Waits::woken`] holds until the stop's executor
+    /// takes them under the same lock hold ([`ThreadRun::apply`]). No task ended and no task was
+    /// made runnable but those, so a settle after it would find only what the last one found and
+    /// what the world did since, which wakes its own waiters ([`ThreadRun::apply`]).
+    ///
+    /// #3078 slice 3 — a native fiber's three stops are futex stops too, each moving only the wait
+    /// index, a native fiber's record and its word, and at most the stopping task's own park:
+    /// - a park files a record nobody idles on yet: no task has seen it;
+    /// - a claim takes a woken record (the wake that woke it ran the settle that roused any idler)
+    ///   or answers that none is claimable; a claim that ends the wait itself is [`Applied::All`];
+    /// - a block idles the stopping task only after re-checking, under this hold, the wake that a
+    ///   notify or a timeout writes under its own: a wake after it runs its own settle.
+    ///
+    /// It relies on no task being runnable yet held back by something a futex park could release:
+    /// a dispatch-time lane on the bytecode drivers (#1600) would make a lane-freeing park
+    /// [`Applied::All`].
     Futex,
     /// Anything may have changed.
     All,
@@ -17208,32 +17414,29 @@ impl SchedCore {
             // be claimed.
             Ok(VcpuStop::FiberClaim { slot, gen }) => {
                 let e = &mut domains[tasks[ti].domain];
-                let claim = claim_native(&mut e.fibers.fibers, slot, gen, &mut tasks.waits);
-                let (status, how) = match claim {
-                    NativeClaim::Claimed { status, .. } => (status as i64, FIBER_CLAIMED),
-                    NativeClaim::Parked => (0, FIBER_STILL_PARKED),
-                    NativeClaim::NotParked => (0, FIBER_NOT_PARKED),
-                };
+                let (_, [status, how], applied) = fiber_claim_rule(
+                    &mut e.fibers.fibers,
+                    slot,
+                    gen,
+                    &mut tasks.waits,
+                    sched_wall_now,
+                );
                 tasks[ti].deliver(0, Reg::from_i64(status));
                 tasks[ti].deliver(1, Reg::from_i64(how));
-                // A claim that ended the wait itself (its real deadline passed) told no task idling
-                // on the fiber: the settle's scan does ([`fiber_woken`]). A notify's or a timeout's
-                // wake already ran it.
-                if !matches!(claim, NativeClaim::Claimed { fired: true, .. }) {
-                    return Applied::Futex;
+                if let Applied::Futex = applied {
+                    return applied;
                 }
             }
             // #3078 slice 3 — a native `cont.resume.block` of a kernel-parked fiber that its poll
             // found still parked: re-checked here, under the lock its wake takes, so a wake since
             // the poll is never slept through.
             Ok(VcpuStop::FiberBlock { slot, gen }) => {
-                // Either way only this task's state moved: its re-check reads, under this hold, the
-                // wake a notify or a timeout writes under its own, and a wake after it finds the
-                // task idling, which that wake's settle scan rouses ([`fiber_woken`]).
-                if native_blocks(&domains[tasks[ti].domain].fibers.fibers, slot, gen) {
+                let fibers = &domains[tasks[ti].domain].fibers.fibers;
+                let (idles, applied) = fiber_block_rule(fibers, slot, gen, sched_wall_now);
+                if idles {
                     tasks[ti].state = TaskState::BlockedOnFiber { fiber: slot };
                 }
-                return Applied::Futex;
+                return applied;
             }
             // §3.6 (I36 slice 2) — the serve/call/offer trio, cooperative form.
             Ok(VcpuStop::SvcWait) => {
@@ -18060,7 +18263,7 @@ impl SchedCore {
                 tasks[ti].deliver(dst, Reg::from_i32(woke.total() as i32));
                 // #2963 — only the tasks it woke moved ([`Waits::woken`]); a woken fiber's resumer
                 // is anything's business.
-                if woke.fibers == 0 {
+                if let Applied::Futex = notify_rule(woke) {
                     return Applied::Futex;
                 }
             }
@@ -21858,7 +22061,9 @@ impl ThreadRun {
             stop,
             Ok(VcpuStop::Notify { .. }
                 | VcpuStop::Wait { timeout: None, .. }
-                | VcpuStop::FiberPark(NativePark { timeout: None, .. }))
+                | VcpuStop::FiberPark(NativePark { timeout: None, .. })
+                | VcpuStop::FiberClaim { .. }
+                | VcpuStop::FiberBlock { .. })
         );
         if !untimed {
             g.core.clock = self.now();
@@ -22892,7 +23097,7 @@ fn futex_wait(
 /// ([`futex_wait`]) and a native one's ([`native_fiber_wait`]) share: what its record keeps. The
 /// caller writes the record ([`Self::record`]) under the same hold of the run lock.
 #[derive(Clone, Copy)]
-struct FiberWait {
+struct FiledWait {
     key: super::FutexKey,
     /// `Some(WAIT_NOT_EQUAL)` when the park-time re-check fired.
     woken: Option<i32>,
@@ -22901,7 +23106,7 @@ struct FiberWait {
     arrived: u64,
 }
 
-impl FiberWait {
+impl FiledWait {
     /// The wait's record, with `cont` its fiber's continuation and `wait_dst` its status register.
     fn record(self, cont: Cont, wait_dst: u32) -> FiberState {
         FiberState::WaitParked {
@@ -22934,7 +23139,7 @@ fn fiber_wait(
     timeout: Option<u64>,
     domain: usize,
     slot: usize,
-) -> Result<FiberWait, Trap> {
+) -> Result<FiledWait, Trap> {
     tasks.waits.count.enter(&key);
     let Some(cur) = word() else {
         tasks.waits.count.leave(&key);
@@ -22949,7 +23154,7 @@ fn fiber_wait(
         Some(_) => tasks.waits.count.leave(&key),
         None => (tasks.waits).file(key, arrived, Waiter::Fiber { domain, slot }, deadline),
     }
-    Ok(FiberWait {
+    Ok(FiledWait {
         key,
         woken,
         deadline,
@@ -22959,7 +23164,7 @@ fn fiber_wait(
 }
 
 /// #3078 slice 3 — native fiber `slot`'s futex wait, made in its engine and filed by its resumer
-/// after the fiber's switch-out ([`NativeStop::FiberWait`]): [`fiber_wait`] over the domain's window
+/// after the fiber's switch-out ([`temen_ir::seams::FiberWait`]): [`fiber_wait`] over the domain's window
 /// `win`, read as a task's wait reads it ([`wait_task`]), its record at the slot's index in `fibers`
 /// with [`Cont::Native`], and its word set for the engine's pollers, all under the one hold of the
 /// run lock. `Err` is the trap the wait ends its task with, the fiber unfiled.
@@ -22984,10 +23189,14 @@ fn native_fiber_wait(
     let site = win.map_or(super::FutexSite::Anon(base), |m| m.futex_site(base));
     let key = site_key_in(win, base, site);
     let read = || win.map_or(Some(0), |m| m.wait_word(base, width));
+    if !matches!(fibers.fibers.get(slot), Some(FiberState::Engine) | None) {
+        // Checked before the wait files anything, so a refusal leaves the index as it was.
+        return Err(Trap::Malformed);
+    }
     let wait = fiber_wait(tasks, key, read, expected, clock, timeout, domain, slot)?;
-    word.park(gen, wait.woken.is_some(), wait.real_deadline);
-    fibers.place(slot, wait.record(Cont::Native { word, gen }, 0));
-    Ok(())
+    word.park_word()
+        .park(gen, wait.woken.is_some(), wait.real_deadline);
+    fibers.place(slot, wait.record(Cont::Native { word, gen }, 0))
 }
 
 /// Nothing is runnable: advance the logical `clock` to the earliest futex-wait deadline, a task's

@@ -653,6 +653,80 @@ block 1 () {
 "#
 );
 
+/// #3078 slice 3 (review Q2) — many fibers round-robin, `mn_sched`-shaped: each of `w` threads makes
+/// 512 fibers that suspend in a loop, keeps their handles in memory, and resumes them in turn, `n`
+/// resumes in all, so every resume reaches a slot (and its parked word) the last 511 did not. Entry
+/// `(n, w)`; answers 0.
+pub const ROUND_ROBIN_IR: &str = concat!(
+    "memory 16\n",
+    w_threads_root!(),
+    r#"func (i64, i64) -> (i64) {
+block 0 (vn: i64, vi: i64) {
+  vf = ref.func 2
+  vk4096 = i64.const 4096
+  voff = i64.mul vi vk4096
+  vbase0 = i64.const 32768
+  vbase = i64.add vbase0 voff
+  vz = i64.const 0
+  br 1(vn, vbase, vz)
+}
+block 1 (vn1: i64, vb1: i64, vj1: i64) {
+  vfibers1 = i64.const 512
+  vmore1 = i64.lt_u vj1 vfibers1
+  br_if vmore1 2(vn1, vb1, vj1) 3(vn1, vb1)
+}
+block 2 (vn2: i64, vb2: i64, vj2: i64) {
+  vf2 = ref.func 2
+  vz2 = i64.const 0
+  vk2 = cont.new vf2 vz2
+  veight2 = i64.const 8
+  vo2 = i64.mul vj2 veight2
+  vat2 = i64.add vb2 vo2
+  i64.store vat2 vk2
+  vone2 = i64.const 1
+  vnext2 = i64.add vj2 vone2
+  br 1(vn2, vb2, vnext2)
+}
+block 3 (vn3: i64, vb3: i64) {
+  vz3 = i64.const 0
+  br 4(vn3, vb3, vz3, vz3)
+}
+block 4 (vn4: i64, vb4: i64, vi4: i64, vx4: i64) {
+  vmore4 = i64.lt_u vi4 vn4
+  br_if vmore4 5(vn4, vb4, vi4, vx4) 6()
+}
+block 5 (vn5: i64, vb5: i64, vi5: i64, vx5: i64) {
+  veight5 = i64.const 8
+  vo5 = i64.mul vx5 veight5
+  vat5 = i64.add vb5 vo5
+  vk5 = i64.load vat5
+  vz5 = i64.const 0
+  vs5, vv5 = cont.resume vk5 vz5
+  vone5 = i64.const 1
+  vnext5 = i64.add vi5 vone5
+  vx15 = i64.add vx5 vone5
+  vmask5 = i64.const 511
+  vnx5 = i64.and vx15 vmask5
+  br 4(vn5, vb5, vnext5, vnx5)
+}
+block 6 () {
+  vz6 = i64.const 0
+  return vz6
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, varg: i64) {
+  br 1()
+}
+block 1 () {
+  vz = i64.const 0
+  vx = suspend vz
+  br 1()
+  }
+}
+"#
+);
+
 /// #3078 slice 2 — exit row 4: a thread makes `k` fibers and leaves each suspended, then makes `n`
 /// `memory.notify`s on a word nothing waits on; the root joins it. Entry `(n, k)`; answers 0.
 pub const NOWAKE_SUSPENDED_IR: &str = r#"memory 16

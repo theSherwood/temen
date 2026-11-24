@@ -12,7 +12,7 @@
 //!
 //! `SPIKE_SECTIONS` picks sections, comma-separated: `compute`, `spawn`, `park` (the default three),
 //! `k1000`, `nowake`, `alias` (#2958 slice 4), `pairs`, `always` (#2985), `pipes` (#2958 slice 5), `fibers`
-//! (#3078 slice 2). `SPIKE_K` picks the park section's K values (`0,100,1000` by
+//! (#3078 slice 2), `roundrobin` (#3078 slice 3). `SPIKE_K` picks the park section's K values (`0,100,1000` by
 //! default), `SPIKE_LANES` its lanes.
 
 use std::time::{Duration, Instant};
@@ -415,6 +415,36 @@ pub fn run(reps: usize) {
     }
     if on("fibers") {
         run_fibers(reps);
+    }
+    if on("roundrobin") {
+        run_round_robin(reps);
+    }
+}
+
+/// #3078 slice 3 (review Q2) — a resume of each of 512 fibers in turn per vCPU, so the poll's load of
+/// the slot's parked word is a cold line each time, on both lanes.
+fn run_round_robin(reps: usize) {
+    println!(
+        "
+fibers, round-robin over 512 per vCPU (ns per resume):"
+    );
+    let m = parse(crate::kernel_spike_ir::ROUND_ROBIN_IR);
+    for w in [1i64, 4] {
+        let mut lanes = [
+            ("today", today(&m, 0, Host::new(), true)),
+            ("kernel", kernel(&m, 0, Host::new)),
+        ];
+        let label = format!("round-robin resume, {w} vCPU (wall per n)");
+        per_iter(
+            &label,
+            &mut lanes,
+            move |n| vec![n, w],
+            (1_000, 2_001_000),
+            1.0,
+            reps,
+            1.0,
+            "ns",
+        );
     }
 }
 

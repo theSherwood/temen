@@ -229,7 +229,7 @@ pub enum NativeStop {
 /// which its resumer files with the rules as the fiber's park: its record in the run's registry, its
 /// entry in the wait index, and `word`, the slot's parked word, set for pollers. The wait's operands
 /// are [`NativeStop::Wait`]'s.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct FiberWait {
     pub slot: u32,
     pub gen: u32,
@@ -237,8 +237,25 @@ pub struct FiberWait {
     pub expected: u64,
     pub wide: bool,
     pub timeout: i64,
-    pub word: alloc::sync::Arc<ParkWord>,
+    pub word: ParkRef,
 }
+
+/// #3078 slice 3 — what holds a native fiber's parked word: its slot, which keeps the word inline
+/// beside the slot's own claim word, so a poll reads one line it reads anyway. The rules hold the
+/// slot through [`ParkRef`] while the park is filed, and write the word through it.
+pub trait ParkSite: Send + Sync {
+    fn park_word(&self) -> &ParkWord;
+}
+
+/// A word on its own is its own site: the models' and the unit rows'.
+impl ParkSite for ParkWord {
+    fn park_word(&self) -> &ParkWord {
+        self
+    }
+}
+
+/// The rules' hold of a parked word's site ([`ParkSite`]).
+pub type ParkRef = alloc::sync::Arc<dyn ParkSite>;
 
 /// [`NativeStop::FiberClaim`]'s answer in `[1]`: the claim took the park, and `[0]` is its status.
 pub const FIBER_CLAIMED: i64 = 1;
@@ -248,9 +265,9 @@ pub const FIBER_STILL_PARKED: i64 = 0;
 /// claimed by another, or the handle is stale).
 pub const FIBER_NOT_PARKED: i64 = 2;
 
-#[cfg(not(loom))]
+#[cfg(not(feature = "loom-park"))]
 use core::sync::atomic::{AtomicU64, Ordering};
-#[cfg(loom)]
+#[cfg(feature = "loom-park")]
 use loom::sync::atomic::{AtomicU64, Ordering};
 
 /// #3078 slice 3 — a native fiber's **parked word**: whether its kernel park can be claimed, read by
@@ -349,7 +366,7 @@ impl ParkWord {
     }
 
     /// [`Self::poll`] without its re-read of the word: the model's broken variant of it.
-    #[cfg(loom)]
+    #[cfg(feature = "loom-park")]
     #[doc(hidden)]
     pub fn poll_without_recheck(&self, gen: u64, now: impl FnOnce() -> u64) -> ParkPoll {
         self.poll_checked(gen, now, false)

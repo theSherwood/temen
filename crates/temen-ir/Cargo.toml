@@ -14,11 +14,11 @@ std = []
 # #3078 slice 3 — the one wall clock a kernel fiber park's deadline is on (`seams::wall_now`), which
 # the bytecode engine and the Cranelift JIT both read. It needs the host's clock, so it is opt-in.
 clock = []
+# #3078 slice 3 — `seams::ParkWord`'s atomics are loom's, so temen-interp's model of a native fiber's
+# park runs the real word. Only temen-interp's `cfg(loom)` dev-dependency turns it on, so no product
+# build sees it, and a `--cfg loom` build of another crate (temen-jit's loom lane, run as its own
+# invocation so features do not unify) keeps the real atomics its code runs on outside a model.
+loom-park = ["dep:loom"]
 
-# #3078 slice 3 — `seams::ParkWord`'s atomics are loom's under `--cfg loom`, so temen-interp's model
-# of a native fiber's park runs the real word. A target-cfg dependency: no product build sees it.
-[target.'cfg(loom)'.dependencies]
-loom = "0.7"
-
-[lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
+[dependencies]
+loom = { version = "0.7", optional = true }
