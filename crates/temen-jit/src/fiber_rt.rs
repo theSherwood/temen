@@ -1231,7 +1231,7 @@ unsafe fn make_fiber(
                 // entering a fiber. The entry's prologue is about to charge again, unable to tell a
                 // start from a call, so refund one. It cannot underflow or trap: the resume's check
                 // passed, so the cell holds at least the one this adds back. Null ⇒ un-armed. The
-                // cell is the fiber's context's, which its owner keeps alive with the fiber (#3133).
+                // cell is the one this resume named, its runner's (#3080).
                 let cell = (*(vm as *const crate::VmCtx)).fuel;
                 if !cell.is_null() {
                     (*cell).left += 1;
@@ -1387,10 +1387,10 @@ pub(crate) unsafe fn make_handler_fiber(
 /// Returns the fiber handle (the domain-shared table's slot index — the same numbering as the interp
 /// registry), or traps (`-1`) on a fiber-bomb (the **per-domain** bound, or its `Budget.mem`).
 ///
-/// The fiber runs over its creator's window and function table, charging its counted-fuel cell
-/// (null ⇒ un-armed, for [`make_fiber`]'s start refund): all read from `vm`, its creator's context,
-/// never taken from the code (#2534), and copied into the fiber's own context ([`guest_fiber`],
-/// #3133).
+/// The fiber runs over its creator's window and function table, read from `vm`, its creator's
+/// context, never taken from the code (#2534), and copied into the fiber's own context
+/// ([`guest_fiber`], #3133). It charges the cell of whatever runs it: each resume names that
+/// ([`crate::VmCtx::fiber_switched_in`], #3080).
 ///
 /// # Safety
 /// `vm` is the threaded context. The running vCPU's fiber runtime is read from the [`CURRENT_RT`]
@@ -2112,8 +2112,8 @@ pub(crate) unsafe fn seed_frozen_fibers(
             debug_assert_eq!(got, f.slot, "re-seeded slot matches the recorded handle");
             continue;
         }
-        // The fiber's context names the root's cell, so its entry refunds the unit its rewound
-        // `cont.resume` charged, as a `cont.new` fiber's does: the tree-walker's count
+        // Its rewound `cont.resume` names its runner's cell, so its entry refunds the unit that
+        // resume charged, as a `cont.new` fiber's does: the tree-walker's count
         // (`durable_fibers_jit.rs`, `a_thawed_fibers_start_is_charged_as_the_tree_walker_charges_it`).
         let Some(fiber) = guest_fiber(
             rt,

@@ -722,7 +722,7 @@ block 0 (v0: i64, v1: i64) {
     /// #3133 — a fiber's context is its maker's instance, end and cell, and nothing that names a
     /// window, a site or a vCPU of the maker's: a maker that is a serve handler's window context
     /// hands its fiber no `handler_window` (a fiber outlives the window, and never steps aside for
-    /// it), no serve site, no cap-thunk state and no end of its own; it charges the maker's cell.
+    /// it), no serve site, no cap-thunk state, no end of its own, and no cell until a resume (#3080).
     #[cfg(fiber_rt)]
     #[test]
     fn a_fibers_context_names_no_window_site_or_vcpu_of_its_maker() {

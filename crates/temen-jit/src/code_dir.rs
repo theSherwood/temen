@@ -294,6 +294,7 @@ pub(crate) fn root_key(
     fast: bool,
     reserved_log2: u8,
     table_reserve_log2: u8,
+    hosts_fibers: bool,
 ) -> [u8; 32] {
     let mut k = b"temen-jit root\0".to_vec();
     k.extend(digest);
@@ -304,6 +305,9 @@ pub(crate) fn root_key(
         fast as u8,
         reserved_log2,
         table_reserve_log2,
+        // #3080 — a compile that hosts fibers reloads its fuel cell at every charge
+        // (`Lower::fuel_moves`); the module's own fiber ops are a function of `digest`.
+        hosts_fibers as u8,
     ]);
     temen_encode::digest256(&k)
 }

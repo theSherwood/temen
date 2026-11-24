@@ -4148,6 +4148,7 @@ impl CompiledModule {
                     fast_resolver.is_some(),
                     reserved_log2,
                     table_reserve_log2,
+                    hosts_fibers,
                 );
                 (dir, key)
             });
@@ -4204,6 +4205,8 @@ impl CompiledModule {
         // #3034 — one pass over the code for what the thaw pass needs and which runtimes this
         // instance stands up.
         let facts = Arc::new(temen_ir::thaw::CodeFacts::of(m));
+        // #3080 — whether this code can run on a guest fiber's stack ([`Lower::fuel_moves`]).
+        let fuel_moves = facts.uses_fibers() || hosts_fibers;
         #[cfg(fiber_rt)]
         if facts.uses_fibers() {
             intern_type(&mut distinct, &fiber_func_type())?;
@@ -4410,7 +4413,7 @@ impl CompiledModule {
             guard_offset: guard_offset_of(win_reserved as u64),
             epoch: epoch_addr != 0,
             fuel: fuel_addr != 0,
-            fuel_moves: uses_fibers || hosts_fibers,
+            fuel_moves,
             domain_poll: threads, // spawned vCPUs run this code beside the root
             fn_table_mask: (table_len as u64) - 1, // the (possibly B2-reserved) table mask
             slots: FuncSlots::Own { words: false },
@@ -4711,7 +4714,7 @@ impl CompiledModule {
                     guard_offset: guard_offset_of(win_reserved as u64),
                     epoch: epoch_addr != 0,
                     fuel: fuel_addr != 0,
-                    fuel_moves: uses_fibers || hosts_fibers,
+                    fuel_moves,
                     domain_poll: threads,
                     fn_table_mask: (table_len as u64) - 1,
                     window: guest.window,
@@ -4759,7 +4762,7 @@ impl CompiledModule {
             mask,
             epoch: epoch_addr != 0,
             fuel: fuel_addr != 0,
-            fuel_moves: uses_fibers || hosts_fibers,
+            fuel_moves,
             instance,
             fn_table_mask: (table_len as u64) - 1,
             next_extra: 0,

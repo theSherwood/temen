@@ -1264,7 +1264,7 @@ impl Domain {
     /// next vCPU on the context starts a window of its own.
     fn put_vcpu_ctx(&self, mut ctx: Box<VcpuCtx>) {
         if let Some(cell) = ctx.cell.as_deref_mut() {
-            // SAFETY: a live cell; a fiber still charging it is `settle`'s documented race.
+            // SAFETY: a live cell, which no code charges once its vCPU ended (#3080).
             unsafe { crate::FuelCell::settle(cell) };
         }
         if let Some(site) = ctx.vm.serve_site.take() {

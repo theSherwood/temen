@@ -788,9 +788,6 @@ fn jit_fuel_a_parked_thread_holds_none_of_the_roots_fuel() {
     );
 }
 
-/// Thread A makes a fiber that counts back-edges and suspends after each 3, and returns its handle.
-/// The root joins A, resumes the fiber once (it charges A's cell, wherever it runs, and refills it
-/// after A ended), spawns a thread that only returns and joins it, then resumes the fiber to its end.
 /// #3080 — the root makes [`A_FIBER_OUTLIVES_ITS_VCPU`]'s fiber and resumes it once (it suspends
 /// after 3 back-edges, its frame holding the cell it charged); a thread resumes it to its end and
 /// returns what it yielded and returned, and the root joins it. The fiber's frame spans the suspend
@@ -845,6 +842,9 @@ block 3 (vend: i64) {
 }
 ";
 
+/// Thread A makes a fiber that counts back-edges and suspends after each 3, and returns its handle.
+/// The root joins A, resumes the fiber once (after A ended, so on the root's cell), spawns a thread
+/// C that only returns and joins it, then resumes the fiber to its end.
 const A_FIBER_OUTLIVES_ITS_VCPU: &str = "memory 16
 func () -> (i64) {
 block 0 () {
@@ -902,17 +902,14 @@ block 0 (va: i64, vb: i64) {
 }
 ";
 
-/// **A spawn's entry throws away nothing a recycled cell held** (PR #3091's review). The spawned
-/// thread takes the context A left, whose cell A's fiber refilled after A ended. Seeding its paid
-/// entry hands what that cell held back to the chain first, then holds the unit, so nothing the
-/// chain was charged for is thrown away, and
-/// every engine charges alike, the root's entry, A's, the thread's, the fiber's three resumes and its
-/// five taken back-edges. The first version of #3081's payment assumed the cell empty: a debug
-/// build aborted in `thread_spawn`, and a release build dropped the fiber's draw.
+/// A fiber that outlives the vCPU that made it costs the same on all three engines: the root's
+/// entry, A's, C's, the fiber's three resumes and its five taken back-edges. (PR #3091's review
+/// wrote this row for a recycled cell that A's fiber had refilled after A ended; since #3080 a fiber
+/// charges only the vCPU running it, a recycled cell is settled, and `seed_entry` asserts it. The
+/// sweep, `jit_fuel_a_fiber_charges_the_vcpu_that_runs_it`, checks every budget on the JIT's routes;
+/// this row adds the bytecode engine at the cost.)
 #[test]
-fn jit_fuel_a_spawn_keeps_what_a_fiber_left_in_a_recycled_cell() {
-    // With slack: near the limit the JIT's fiber draws from its creator's cell, not the resumer's
-    // (#3080), so where the run runs out there follows which cell holds a draw, not this fix.
+fn jit_fuel_a_fiber_outliving_its_vcpu_costs_the_same_on_every_engine() {
     assert_eq!(
         assert_three_way(A_FIBER_OUTLIVES_ITS_VCPU, 1 << 40),
         (Ended::Returned(3 + 6 + 6 + 7), 11)

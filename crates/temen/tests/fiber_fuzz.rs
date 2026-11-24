@@ -604,7 +604,7 @@ fn generated_migration_schedules_agree_on_interp_and_jit() {
         });
         // JIT — the real cross-thread stack switches; must match exactly, on both of its routes
         // while both exist (#2958): today's thread runtime, and the kernel's, which runs every
-        // worker as a kernel task (#3078 slice 2), unmetered (`fiber fuel`, #3080).
+        // worker as a kernel task (#3078 slice 2), metered since #3080.
         for (route, jit) in Route::BOTH
             .map(|r| match r {
                 Route::Today => compile_and_run(&m, 0, &[]).expect("jit compile/run"),

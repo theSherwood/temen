@@ -4710,10 +4710,10 @@ block 0 (vsp: i64, varg: i64) {{
         k
     }
 
-    /// #3078 slice 2 — `fibers` is three clauses now. A module with fibers and no `thread.spawn` keeps
-    /// its single-vCPU path (`fiber only`); one whose fibers might park (a `memory.wait`, or a call that
-    /// can park) keeps today's route (`fiber parks`); a metered run of one keeps it too (`fiber fuel`,
-    /// #3080). Every other fibered module is admitted: a join, spawn, notify or region `signal` made in a
+    /// #3078 slice 2 — `fibers` is two clauses now (#3080 removed `fiber fuel`). A module with fibers
+    /// and no `thread.spawn` keeps its single-vCPU path (`fiber only`); one whose fibers might park (a
+    /// `memory.wait`, or a call that can park) keeps today's route (`fiber parks`). Every other
+    /// fibered module is admitted, metered or not: a join, spawn, notify or region `signal` made in a
     /// fiber is the stop of the task that runs it.
     #[test]
     fn each_fiber_clause_declines_what_it_names_and_admits_the_rest() {

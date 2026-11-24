@@ -1187,7 +1187,7 @@ fn metered_thaws(src: &str) -> ((Vec<Value>, u64), (JitOutcome, u64)) {
 
 /// #3133 (review A) — a thawed fiber's start is charged as the tree-walker charges it. The thaw
 /// re-seeds the fiber (frozen suspended) and its rewound `cont.resume` re-enters the fiber's entry;
-/// the fiber's context names the root's cell, so the entry refunds the one unit the resume charged,
+/// the resume names its runner's cell (the root's), so the entry refunds the one unit it charged,
 /// as `cont.new`'s fibers do. (Main passed no cell to a seeded fiber, so it did not refund: its thaw
 /// burned 2 past the tree-walker's.) The JIT's thaw burns [`THAW_ENTRY_GAP`] past the tree-walker's
 /// with a fiber as without one, so the fiber adds the same on both engines.

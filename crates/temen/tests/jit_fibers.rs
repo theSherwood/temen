@@ -53,8 +53,8 @@ fn assert_jit_matches_interp(src: &str) {
 
 /// #3078 slice 2 — a fiber-only module keeps its single-vCPU path (`fiber only`), so each case whose
 /// entry is `() -> (i64)` also runs inside one `thread.spawn`ed vCPU, which the kernel route admits:
-/// a wrapper entry spawns a thread that calls the case's entry, and joins it. That run, unmetered
-/// (`fiber fuel`, #3080), answers as the oracle's run of it.
+/// a wrapper entry spawns a thread that calls the case's entry, and joins it. That run, metered
+/// (since #3080), answers as the oracle's run of it.
 fn in_a_thread_on_the_kernel_route(src: &str, m: &temen_ir::Module) {
     use temen_run::jit_kernel;
     let entry = &m.funcs[0];
