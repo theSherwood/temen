@@ -2353,9 +2353,10 @@ block 0 (va: i64, vb: i64) {
 /// recovery scope nested in the task's frames. A park there would switch the task out with that scope
 /// still open, so the JIT refuses the park: the child ends `ThreadFault`, the parent's call through
 /// the offer fails, and its join reads the trap. The oracle's handler waits and answers. The JIT's
-/// half is the stop-gap's divergence (decision 33): #3167, the recovery point travelling with the
-/// stack, lets the task park there, and this row then agrees with the oracle. Without the yield floor
-/// the JIT answers the oracle's triple by parking the task with the handler's scope open.
+/// half is the stop-gap's divergence (decisions 33 and 35): #2804 gives a durable domain's handlers
+/// fibers of their own, off the serve op's stack, and this row then agrees with the oracle. Without
+/// the yield floor the JIT answers the oracle's triple by parking the task with the handler's scope
+/// open.
 #[test]
 fn a_durable_childs_handler_that_parks_ends_the_child_on_the_jit() {
     let parent = serving_parent();
