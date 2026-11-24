@@ -556,10 +556,11 @@ pub enum RestoreError {
     /// restored: a thaw never runs without a region its artifact names.
     RegionRefused(i64),
     /// #3100 — the restoring domain's budget does not cover what the cut holds: `need` bytes
-    /// against `room`. Its windows (each declared window and its growth, as a running guest is
-    /// charged for it) against `mem` — the restoring host's own node and each carried node's ceiling
-    /// as the hook left it — or its §13 regions against the restoring host's `channel`. A running
-    /// guest under that budget could not have held them.
+    /// against `room`. Its windows against `mem` — the root's growth and every nested window (its
+    /// declared size and its growth), as a running guest is charged for them, against each carried
+    /// node's ceiling as the hook left it, or against the restoring host's own `mem` less the root's
+    /// declared window, which an activation charges past any ceiling — or its §13 regions against
+    /// the restoring host's `channel`. A running guest under that budget could not have held them.
     WindowOverBudget { need: u64, room: u64 },
     /// #3100 — a window's reservation is larger than the one the restoring host builds it in: the
     /// root's, the one its entry passes ([`Restoring::reserved_log2`]); a detached child's, its lease's
@@ -1879,9 +1880,10 @@ struct DecodeCut {
     regions_reached: Vec<bool>,
     budgets: Vec<DurableBudget>,
     reached: Vec<bool>,
-    /// #3100 — the `mem` and `channel` the restoring host's own node has left
-    /// ([`Host::restore_room`]), and the declared heads `decode` has allocated so far against its
-    /// `mem`: the number of nested domains is the artifact's.
+    /// #3100 — the `mem` the restoring host's own node has left past the root's declared window, and
+    /// its `channel` ([`Host::restore_room`]); and the nested domains' declared windows `decode` has
+    /// allocated heads for so far, against that `mem`: the number of nested domains is the
+    /// artifact's.
     room: (Option<u64>, Option<u64>),
     heads: u64,
 }
@@ -1989,7 +1991,11 @@ pub fn restore_into(
     // The root's declared window is charged past any ceiling at its activation (INVARIANTS #3): the
     // room the rest of the cut must fit is what the restoring host has past it.
     let (mem, channel) = host.restore_room();
-    let root = module.memory.map_or(0, |mc| 1u64 << mc.size_log2);
+    // Checked: `decode`'s geometry check is what refuses a module whose `size_log2` is out of range.
+    let root = module
+        .memory
+        .map_or(Some(0), |mc| 1u64.checked_shl(mc.size_log2.into()))
+        .unwrap_or(u64::MAX);
     let mut cut = DecodeCut {
         room: (mem.map(|m| m.saturating_sub(root)), channel),
         ..DecodeCut::default()
@@ -2063,24 +2069,31 @@ fn growth(layout: &MemLayout, declared: u64, flat: bool) -> u64 {
         false => layout.page_map().grown_bytes(),
         true => {
             let page = temen_interp::host_page_size();
-            layout.span().saturating_sub(declared).div_ceil(page) * page
+            // From the declared window's last host page, as the sparse rule counts from it
+            // (`grown_bytes`): a sub-page window's own first page is not growth.
+            let base = declared.div_ceil(page) * page;
+            layout.span().saturating_sub(base).div_ceil(page) * page
         }
     }
 }
 
 /// #3100 — whether the cut's windows and §13 regions fit the budgets their thaws hold them under.
 ///
-/// Each domain's window is charged its declared memory and its [`growth`] (the root's held flat
-/// when `flat`) to its node: the root's is the restoring host's own, a detached child's the carried
-/// node its `"budget"` names (its spawner's when it names none, as its relaunch keeps it), a fork
-/// twin's its parent's. One pass up the carried nodes (each parent numbers below its child) gives
+/// Each nested domain's window is charged its declared memory and its [`growth`], and the root's its
+/// growth alone (held flat when `flat`): the root's declared window is what the embedder chose to run,
+/// which an activation charges past any ceiling. Each goes to its node: the root's is the restoring
+/// host's own, a detached child's the carried node its `"budget"` names
+/// ([`temen_interp::carried_budget_node`]) or, naming none, its spawner's (its relaunch leaves it on
+/// the run's own node, the same node only for a direct child of the root; either way under the
+/// restoring host's own, whose room bounds it), a fork twin's its parent's. One pass up the carried nodes (each parent numbers below its child) gives
 /// each node its subtree's sum, bounded by its `mem` ceiling as the hook left it; the whole cut's is
 /// bounded by the `mem` the restoring host's own node has, under which every carried node is minted.
 /// The cut's §13 regions are charged `channel` to the restoring host's own node, so their bytes are
 /// bounded by its `channel`. A thaw charges a restored window past every ceiling (`Fits::Pool`), or
 /// not at all (a child's rides its carried node's `used`, #3149), and a region's rebuild past them
 /// too, so this is where a ceiling meets a restored cut's windows and regions. (What else a thaw
-/// re-creates — pipes, page-map runs, fibers, threads — it charges past every ceiling, #3160.)
+/// re-creates — named-capability stores, pipes, page-map runs, fibers, threads — it charges past
+/// every ceiling, #3160; a store's is charged in `grant`, before this check.)
 fn windows_fit(d: &Decoded, cut: &DecodeCut, flat: bool) -> Result<(), RestoreError> {
     let budgets = &cut.budgets;
     let mut sums = vec![0u64; budgets.len()];
@@ -2207,7 +2220,8 @@ fn decode(
     // what the embedder chose to run, charged past any ceiling at its activation (INVARIANTS #3), so
     // the room is what is left past it.
     if depth > 0 {
-        cut.heads = cut.heads.saturating_add(head_len);
+        // In the unit `windows_fit` and a live spawn's lease count it: the declared size.
+        cut.heads = cut.heads.saturating_add(declared);
         if let Some(room) = cut.room.0.filter(|&room| cut.heads > room) {
             return Err(RestoreError::WindowOverBudget {
                 need: cut.heads,

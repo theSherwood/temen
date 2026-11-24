@@ -455,6 +455,36 @@ fn a_module_declaring_less_than_a_page_round_trips() {
         freeze_with_prots(&m, &window, &[PageProt::Rw, PageProt::Ro], 13, &host()).expect("freeze");
     let (w, p, _) = restore_with_prots(&art, &m, &mut host()).expect("restore");
     assert_eq!((w, p), (window, vec![PageProt::Rw, PageProt::Ro]));
+    // Hostile: the honest one-page artifact reheaded to a reservation under a page, and to heads
+    // past it. Each answers, and none panics.
+    let one = freeze_with_prots(&m, &[0u8; PAGE], &[PageProt::Rw], 12, &host()).expect("freeze");
+    for (reserved, mapped) in [(11, P), (12, 2 * P), (12, 0), (13, 3 * P)] {
+        let bent = rehead(&one, reserved, mapped);
+        let _ = restore_layout(&bent, &m, &mut host());
+        let _ = restore_with_prots(&bent, &m, &mut host());
+    }
+    assert_eq!(
+        restore_layout(&rehead(&one, 11, P), &m, &mut host()).err(),
+        Some(RestoreError::GeometryMismatch),
+        "a head past its reservation"
+    );
+}
+
+/// #3100 — a sub-page module's own first page is not growth, on any holder: the honest un-grown
+/// `memory 10` artifact restores under a grant of one page through the sparse, flat and dense entries
+/// (its 1 KiB declared window is charged past any ceiling, and the rest of its page is its head).
+#[test]
+fn a_sub_page_modules_first_page_is_not_growth_on_any_holder() {
+    let m = module_of(10);
+    let mut window = vec![0u8; PAGE];
+    window[7] = 9;
+    let art = freeze_with_prots(&m, &window, &[PageProt::Rw], 12, &host()).expect("freeze");
+    for holder in [Holder::Sparse, Holder::Flat, Holder::Dense] {
+        let mut h = host();
+        h.set_mem_grant(PAGE as i64);
+        let got = restore_into(&art, &m, &mut h, Restoring::of(&m, holder)).map(|_| ());
+        assert_eq!(got, Ok(()), "{holder:?}");
+    }
 }
 
 /// #3100 — the root's declared window is what the embedder chose to run: an activation charges it
@@ -488,6 +518,12 @@ fn the_roots_declared_window_is_charged_past_the_ceiling_and_its_growth_is_not()
         Ok(()),
         "the declared window alone"
     );
+    for holder in [Holder::Flat, Holder::Dense] {
+        let mut h = host();
+        h.set_mem_grant(small as i64);
+        let got = restore_into(&freeze(0), &m, &mut h, Restoring::of(&m, holder)).map(|_| ());
+        assert_eq!(got, Ok(()), "the declared window alone, {holder:?}");
+    }
     assert_eq!(
         restore(&freeze(hp), small),
         Err(RestoreError::WindowOverBudget { need: hp, room: 0 }),

@@ -321,11 +321,13 @@ is dropped, which hands its charge back). `apply` then writes what was decoded a
 cannot fail. A restore that refuses leaves the host as it found it. What a restore allocates is the module's declared window and the bytes the
 artifact carries: a window's head past its declared memory is held as one committed span
 (`PageMap::held_to`), which the thaw holds page by page and its budget pays for (#3137). Before
-anything acts, every window and §13 region of the cut is checked against the memory its thaw holds
-it under, counted in host pages by the rule the thaw charges by: the windows against each carried
-node's attenuated `mem` ceiling and the restoring host's own `mem`, the regions against its
-`channel` (`WindowOverBudget`), since the thaw charges a restored window past every ceiling, or not
-at all (#3149). A window's reservation is bounded by the one the restoring host builds (`Restoring`,
+the region rebuild, the cut's windows and §13 regions are checked against the budgets their thaws
+hold them under, in host pages: each nested window (its declared size and its growth, counted by the
+rule the thaw charges by, or by its span for a flat holder) and the root's growth against each
+carried node's attenuated `mem` ceiling and against the restoring host's own `mem` past the root's
+declared window — which, like a fresh run's, is charged past any ceiling — and the regions against
+its `channel` (`WindowOverBudget`), since the thaw charges a restored window past every ceiling, or
+not at all (#3149). What else a thaw re-creates is still charged past every ceiling (#3160). A window's reservation is bounded by the one the restoring host builds (`Restoring`,
 `ReservationRefused`), not by the artifact (#3100). The checks at each use that predate the pass (#2945) stay only in front of a raw host store
 or an unchecked index, as a backstop that is loud in debug. Open: whether an artifact may set the
 attestation and the guest-JIT quotas at all, or only narrow what the restoring host grants (#3096).

@@ -25555,9 +25555,12 @@ fn cap_name(names: &[(String, i32)], name: &str) -> Option<i32> {
 /// #3100 — the carried budget node a thawed detached child runs under, read from its artifact before
 /// anything is restored: the `"budget"` its launch record names, by [`Host::resolve_cap_name`]'s
 /// rule, resolved in its carried handle table as [`Host::budget_node`] resolves it (its slot, its
-/// generation, a `Budget` binding). The one rule its relaunch keeps
+/// generation, a `Budget` binding). The one name rule its relaunch keeps
 /// ([`Host::prepare_detached_relaunch`]), so a restore bounds a child's window by the node its thaw
-/// runs it under.
+/// runs it under. Not literally the live resolve in two places, neither of which lets an artifact
+/// past a bound: it checks no type beyond the binding (the live resolve checks the handle's type
+/// too), and the live thaw reads the child powerbox's names, which a re-pinned named capability
+/// registered as `"budget"` could shadow.
 pub fn carried_budget_node(names: &[(String, i32)], handles: &[DurableHandle]) -> Option<u32> {
     let h = cap_name(names, "budget")?;
     let (slot, generation) = (
@@ -31271,8 +31274,9 @@ impl Host {
         leased: bool,
     ) -> Vec<RegionWake> {
         let map = window.page_map();
-        let budget = launch.names.iter().find(|(name, _)| name == "budget");
-        if let Some(node) = budget.and_then(|&(_, h)| self.budget_node(h)) {
+        // The one name rule a relaunch and a restore's bound read ([`carried_budget_node`]).
+        let budget = cap_name(&launch.names, "budget");
+        if let Some(node) = budget.and_then(|h| self.budget_node(h)) {
             if !leased {
                 self.budgets
                     .refund_set(node, &[(BUDGET_MEM, map.mapped()), (BUDGET_SPAWN, 1)]);

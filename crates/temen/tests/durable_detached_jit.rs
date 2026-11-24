@@ -2196,7 +2196,7 @@ block 3 (v12: i64) {
 /// #3137 — a live detached child whose artifact's head runs past its declared window: the child,
 /// frozen on the JIT, is captured with a held span of 128 KiB past its declared 128 KiB, the first
 /// carrying a marker. Restored, it re-launches on the JIT (its window committing the span in one run,
-/// `CapturedSeed::held`) and on the tree-walker, reads the marker and writes and reads the unlisted
+/// `WindowRestore::held` in its `CapturedSeed`) and on the tree-walker, reads the marker and writes and reads the unlisted
 /// page after its loop: 4950 + 7 + 3. Without the span committed in one run, the unlisted page is
 /// not committed (only a listed one is, page by page) and the store faults.
 #[test]
