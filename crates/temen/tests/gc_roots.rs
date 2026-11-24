@@ -297,6 +297,93 @@ fn gc_roots_buffer_past_the_window_is_a_memory_fault() {
     ));
 }
 
+/// #3170 — a heap range past the window reports no word at or above the window's reservation.
+/// The range is window offsets (GC.md §3); the JIT scans raw native stack words, and filtered them
+/// by the guest's `heap_hi` alone, so `[0, -1)` handed the guest host return addresses and
+/// pointers. The root resumes a fiber that suspends (a parked stack to scan), asks for up to 256
+/// roots in `[0, -1)`, and returns the count it got and the largest word written: below the
+/// reservation on the JIT, and the tree-walker, which scans guest values, takes the same range.
+/// The count is at most 256, so the buffer holds every word found, the large ones included (the
+/// op writes the smallest). This pins the clamp only: a host word below the reservation, which
+/// some hosts' layouts allow, is in range and this row cannot tell it from a root.
+#[cfg(any(
+    all(unix, target_arch = "x86_64"),
+    all(unix, target_arch = "aarch64"),
+    all(windows, target_arch = "x86_64")
+))]
+#[test]
+fn gc_roots_over_a_range_past_the_window_reports_no_word_past_it() {
+    use temen_jit::{compile_and_run, JitOutcome};
+    let src = "memory 16
+func () -> (i64, i64) {
+block 0 () {
+  v0 = ref.func 1
+  v1 = i64.const 4096
+  vk = cont.new v0 v1
+  v3 = i64.const 28752
+  v4, v5 = cont.resume vk v3
+  vlo = i64.const 0
+  vhi = i64.const -1
+  vmask = i64.const -1
+  vbuf = i64.const 16384
+  vcap = i64.const 256
+  vn = gc.roots vlo vhi vmask vbuf vcap
+  vlt = i64.lt_u vn vcap
+  vm = select vlt vn vcap
+  vz = i64.const 0
+  br 1(vz, vz, vm, vn)
+}
+block 1 (vi: i64, vmax: i64, vm1: i64, vn1: i64) {
+  vmore = i64.lt_u vi vm1
+  br_if vmore 2(vi, vmax, vm1, vn1) 3(vmax, vn1)
+}
+block 2 (vi2: i64, vmax2: i64, vm2: i64, vn2: i64) {
+  v8 = i64.const 8
+  voff = i64.mul vi2 v8
+  vb = i64.const 16384
+  va = i64.add vb voff
+  vw = i64.load va
+  vgt = i64.gt_u vw vmax2
+  vmax3 = select vgt vw vmax2
+  vone = i64.const 1
+  vi3 = i64.add vi2 vone
+  br 1(vi3, vmax3, vm2, vn2)
+}
+block 3 (vmaxf: i64, vnf: i64) {
+  return vnf vmaxf
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (v0: i64, v1: i64) {
+  v2 = i64.const 0
+  v3 = suspend v2
+  return v1
+  }
+}
+";
+    let m = parse_module(src).unwrap_or_else(|e| panic!("parse: {e:?}"));
+    verify_module(&m).expect("verify");
+    let mut fuel = 1_000_000u64;
+    let oracle = run(&m, 0, &[], &mut fuel).expect("the tree-walker takes the range");
+    assert!(
+        matches!(oracle[..], [Value::I64(n), Value::I64(max)] if n >= 1 && (max as u64) < 1 << 16),
+        "the tree-walker reports guest values: {oracle:?}"
+    );
+    let window = 1u64 << temen_ir::default_reserved_log2();
+    match compile_and_run(&m, 0, &[]).expect("jit compile/run") {
+        JitOutcome::Returned(v) => {
+            let (n, max) = (v[0], v[1] as u64);
+            assert!(n >= 1, "the fiber's root is found (count {n})");
+            assert!(n <= 256, "every word found is in the buffer (count {n})");
+            assert!(
+                max < window,
+                "a reported word {max:#x} is past the window ({window:#x})"
+            );
+        }
+        other => panic!("jit did not return: {other:?}"),
+    }
+}
+
 /// **`gc.roots` captures caller roots parked in callee-saved registers** — the register-flush path
 /// (`fiber_rt::temen_gc_roots_flush`). The Tail ABI preserves the callee-saved registers, so under
 /// register pressure Cranelift keeps some values live-across-a-call in them rather than spilling. The
