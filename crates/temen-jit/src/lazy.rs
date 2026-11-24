@@ -552,6 +552,13 @@ pub(crate) struct Service {
 }
 
 impl Service {
+    /// #3080 — the [`crate::Lower::fuel_moves`] every function of this module is lowered with
+    /// ([`Code::plan`]), for a test.
+    #[cfg(test)]
+    pub(crate) fn fuel_moves(&self) -> bool {
+        self.lazy.code.fuel_moves
+    }
+
     /// Start the service of `code`, whose functions' records are `records` and whose lazy entries
     /// are at `entries` (an address and the function it runs, in any order). Nothing is compiled
     /// until a guest enters a function.

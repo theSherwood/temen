@@ -1066,8 +1066,9 @@ fn jit_fuel_the_kernel_route_admits_a_metered_fiber_run() {
 /// ended, so the tree-walker charges the root's hand; the JIT charged A's cell, which its end had
 /// settled, so it drew afresh and stranded the root's chunk (main traps `OutOfFuel` with budget to
 /// spare). Both JIT routes now end and charge as the tree-walker does at the exact cost, one below
-/// it, and every budget from 1 to three times the cost. The kernel route's vCPU contexts are locals
-/// of their threads now (no pool): the fiber reaches none after its vCPU ended (`asan-held` runs it).
+/// it, and every budget from 1 to three times the cost. A kernel vCPU's context is a local of its
+/// `run_vcpu` and its cell a box of its `tier_run` now (no pool): the fiber reaches neither once its
+/// vCPU ended (the `asan-held` job runs this binary).
 #[test]
 fn jit_fuel_a_fiber_charges_the_vcpu_that_runs_it() {
     let (ended, _) = on_the_oracle(A_FIBER_OUTLIVES_ITS_VCPU, 1 << 40);
@@ -1082,6 +1083,81 @@ fn jit_fuel_a_migrated_fiber_charges_its_new_vcpu() {
     let (ended, _) = on_the_oracle(A_FIBER_MIGRATES, 1 << 40);
     assert_eq!(ended, Ended::Returned(3 + 6 + 6));
     assert_jit_routes_sweep_as_the_oracle(A_FIBER_MIGRATES);
+}
+
+/// #3080 (review F8b) — a nested resume that migrates: the root resumes F1, which makes F2 and
+/// resumes it (F2 suspends 3 inside a loop), and F1 suspends that 3 to the root; a thread resumes
+/// F1, which resumes F2 again (it loops 3 more and returns 7), and returns 3 + 7. F2's frame spans its
+/// suspend under F1's on the root and goes on under F1's on the thread, so both fibers must charge
+/// the thread from their next safepoint: a fiber resumed by a fiber names the vCPU under both.
+const A_NESTED_FIBER_MIGRATES: &str = "memory 16
+func () -> (i64) {
+block 0 () {
+  vz = i64.const 0
+  vf = ref.func 2
+  vk = cont.new vf vz
+  vs1, vv1 = cont.resume vk vz
+  vc = thread.spawn 1 vk vz
+  vcs, vcv = thread.join vc
+  vr = i64.add vv1 vcv
+  return vr
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vk: i64, vb: i64) {
+  vz = i64.const 0
+  vs, vv = cont.resume vk vz
+  return vv
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, varg: i64) {
+  vf = ref.func 3
+  vz = i64.const 0
+  vk2 = cont.new vf vz
+  vs, vv = cont.resume vk2 vz
+  vx = suspend vv
+  vs2, vv2 = cont.resume vk2 vz
+  vr = i64.add vv vv2
+  return vr
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, varg: i64) {
+  vz = i64.const 0
+  br 1(vz)
+}
+block 1 (vi: i64) {
+  vone = i64.const 1
+  vj = i64.add vi vone
+  vthree = i64.const 3
+  vlt = i64.lt_u vj vthree
+  br_if vlt 1(vj) 2(vj)
+}
+block 2 (vk: i64) {
+  vx = suspend vk
+  vz2 = i64.const 0
+  br 3(vz2)
+}
+block 3 (vi2: i64) {
+  vone2 = i64.const 1
+  vj2 = i64.add vi2 vone2
+  vthree2 = i64.const 3
+  vlt2 = i64.lt_u vj2 vthree2
+  br_if vlt2 3(vj2) 4()
+}
+block 4 () {
+  v7 = i64.const 7
+  return v7
+  }
+}
+";
+
+#[test]
+fn jit_fuel_a_nested_fiber_that_migrates_charges_its_new_vcpu() {
+    let (ended, _) = on_the_oracle(A_NESTED_FIBER_MIGRATES, 1 << 40);
+    assert_eq!(ended, Ended::Returned(3 + 3 + 7));
+    assert_jit_routes_sweep_as_the_oracle(A_NESTED_FIBER_MIGRATES);
 }
 
 /// Both JIT routes end `src` and charge as the tree-walker does on every budget from 1 to three

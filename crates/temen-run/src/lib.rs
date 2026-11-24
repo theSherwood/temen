@@ -1542,7 +1542,7 @@ pub fn jit_cap_run(
     let durable = host.is_durable();
     // Fiber-hosting grant (`grant_jit_fibers`): the parent must stand up its fiber runtime so a
     // submitted unit's `cont.*` resolve (DESIGN.md §22 "Concurrency"). Read before any `mem::take`.
-    let hosts_fibers = host.jit_hosts_fibers();
+    let hosts_fibers = jit_proc::hosts_fibers(m, host);
     // Thread-hosting grant (`grant_jit_threads`, CONSOLIDATION.md §11): the parent stands up its
     // thread scheduler so an installed unit's `thread.*` / futex resolve. A hosted unit spawns real
     // vCPU threads that make **concurrent** `call.cap`s, so — like a top-level concurrent module — it
@@ -1592,9 +1592,6 @@ pub fn jit_cap_run(
         cm.set_window_ready(Some(cc.window_ready()));
         cm.set_restore(restore);
         cm.set_freeze_controller(freeze);
-        if hosts_fibers {
-            cm.enable_fiber_hosting()?;
-        }
         if hosts_threads {
             cm.enable_thread_hosting()?;
         }
@@ -1654,9 +1651,6 @@ pub fn jit_cap_run(
     cm.set_window_ready(Some(cc.window_ready()));
     cm.set_restore(restore);
     cm.set_freeze_controller(freeze);
-    if hosts_fibers {
-        cm.enable_fiber_hosting()?;
-    }
     let cm_ptr: *mut CompiledModule = &mut cm;
     host.set_jit_native_ctx(cm_ptr as usize);
     host.set_park_hub(cm.park_hub());
@@ -2110,7 +2104,7 @@ pub fn recompact_jit(
         None, // fast_resolver
         run_node(host),
         table_reserve_log2,
-        false,
+        old.hosts_fibers(), // #3080 — lowered as the old code was
     )?;
     fresh.set_window_ready(Some(CapCtx::Raw(host).window_ready()));
     recompact_into(&mut fresh, host, domain, old)?;
@@ -2401,7 +2395,7 @@ impl JitSession {
             None, // fast_resolver
             node,
             self.table_reserve_log2,
-            false,
+            self.cm.hosts_fibers(), // #3080 — lowered as the old code was
         )?;
         fresh.set_window_ready(Some(CapCtx::Locked(&*self.host).window_ready()));
         {
@@ -6737,19 +6731,15 @@ impl PowerboxProgram {
                 // node's tree lives as long as the code, and holds the default grant.
                 run_node(&host),
                 CLI_JIT_TABLE_LOG2,
-                host.jit_hosts_fibers(), // #3080 — set up below, so lowered for it here
+                jit_proc::hosts_fibers(&inst.module, &host), // #3080 — stands up hosting
             )
             .map_err(|e| format!("JIT compile failed: {e:?}"))?,
         );
-        // Mirror `jit_proc::compile_image`'s unlocked shape: stand up the fiber runtime if the
-        // powerbox grant hosts fibers (so a submitted-unit `cont.*` resolves), install the production
-        // granted-child hooks + budget taker. Done once — the run-many path reuses this `cm`. Thread
-        // hosting is *not* enabled: that is the locked (concurrent) arm's job, and `uses_concurrency`
-        // modules — the only ones that could reach it — are refused above.
-        if host.jit_hosts_fibers() {
-            cm.enable_fiber_hosting()
-                .map_err(|e| format!("JIT fiber-hosting setup failed: {e:?}"))?;
-        }
+        // Mirror `jit_proc::compile_image`'s unlocked shape (the compile stood up fiber hosting if
+        // the program hosts fibers, `jit_proc::hosts_fibers`): install the production granted-child
+        // hooks + budget taker. Done once — the run-many path reuses this `cm`. Thread hosting is
+        // *not* enabled: that is the locked (concurrent) arm's job, and `uses_concurrency` modules —
+        // the only ones that could reach it — are refused above.
         cm.set_grant_child_hooks(Some(production_grant_hooks(cc)));
         cm.set_window_ready(Some(cc.window_ready()));
         Ok(PowerboxProgram {

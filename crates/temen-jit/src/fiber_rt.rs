@@ -1232,7 +1232,7 @@ unsafe fn make_fiber(
                 // start from a call, so refund one. It cannot underflow or trap: the resume's check
                 // passed, so the cell holds at least the one this adds back. Null ⇒ un-armed. The
                 // cell is the one this resume named, its runner's (#3080).
-                let cell = (*(vm as *const crate::VmCtx)).fuel;
+                let cell = (*(vm as *const crate::VmCtx)).fuel();
                 if !cell.is_null() {
                     (*cell).left += 1;
                 }
@@ -1656,11 +1656,11 @@ pub(crate) unsafe extern "C" fn fiber_resume(
         // suspended fiber.
         // #3080 — and its cell: the fiber charges the vCPU that runs it.
         if !fctx.is_null() {
-            crate::VmCtx::fiber_switched_in(fctx, crate::VmCtx::at(vm).runner());
+            (*fctx).fiber_switched_in(crate::VmCtx::at(vm).runner());
         }
         let st = (*fib).resume(arg as u64);
         if !fctx.is_null() {
-            crate::VmCtx::fiber_switched_out(fctx);
+            (*fctx).fiber_switched_out();
         }
         (*current()).active_slots.pop();
         temen_set_current_fiber(prev_fiber);
@@ -2573,8 +2573,8 @@ mod flatten_claim_tests {
 
     /// #3133 — a context a returned fiber left on its vCPU is the next `cont.new`'s, rewritten whole:
     /// whatever the earlier fiber's left in it (its domain's end in its stop word, a cap thunk's
-    /// state, the cell it charged) the new fiber's context is its own maker's, and it is the same
-    /// allocation.
+    /// state, the cell it charged) the new fiber's context is its own maker's, with no cell until a
+    /// resume names one (#3080), and it is the same allocation.
     #[test]
     fn a_reused_fiber_context_starts_as_its_makers() {
         if !temen_fiber::supported() {
@@ -2589,13 +2589,17 @@ mod flatten_claim_tests {
         let other = crate::VmCtx::new(crate::InstanceAddrs::NONE, crate::Window::NONE);
         let mut other_cell = crate::FuelCell::fixed(10);
         let earlier = other.vcpu(&mut *other_cell);
-        let spare = Box::new(earlier.fiber());
+        let mut spare = Box::new(earlier.fiber());
+        // As a fiber's context is while it runs: naming its runner's cell (#3080).
+        spare.set_fuel(&mut *other_cell);
         spare.raise(crate::TrapKind::Unreachable as i64);
         let _ = spare.thunk_state(|| 7u32);
         let at = &*spare as *const crate::VmCtx;
         // SAFETY: `rt` is this test's, alive below; nothing resumes the fiber made here.
         unsafe { (*rt).spare_ctxs.push(spare) };
-        let maker = crate::VmCtx::new(crate::InstanceAddrs::NONE, crate::Window::NONE);
+        let mut maker = crate::VmCtx::new(crate::InstanceAddrs::NONE, crate::Window::NONE);
+        let mut maker_cell = crate::FuelCell::fixed(10);
+        maker.set_fuel(&mut *maker_cell);
         let stack =
             unsafe { super::guest_fiber(rt, &maker, 0, 0, 0, 0, 0, 0, never) }.expect("a stack");
         let ctx = stack.ctx.as_deref().expect("a guest fiber's context");
@@ -2605,8 +2609,8 @@ mod flatten_claim_tests {
         assert_eq!(ctx.domain_key(), maker.domain_key(), "its maker's end");
         assert!(!ctx.has_thunk_state(), "no cap thunk's state");
         assert!(
-            ctx.fuel.is_null(),
-            "its maker's (no) cell, not the earlier one's"
+            ctx.fuel().is_null(),
+            "no cell until a resume names its runner's: neither the earlier one's nor its maker's"
         );
         drop(stack);
         // SAFETY: made by `Box::into_raw` above, and nothing else holds it.

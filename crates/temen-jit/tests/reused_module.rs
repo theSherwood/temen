@@ -135,6 +135,11 @@ fn module(src: &str) -> temen_ir::Module {
 }
 
 fn compile(m: &temen_ir::Module) -> CompiledModule {
+    compile_hosting(m, false)
+}
+
+/// [`compile`], hosting submitted units' fibers or not (`hosts_fibers`).
+fn compile_hosting(m: &temen_ir::Module, hosts_fibers: bool) -> CompiledModule {
     CompiledModule::compile(
         m,
         0,
@@ -147,7 +152,7 @@ fn compile(m: &temen_ir::Module) -> CompiledModule {
         None,
         None,
         0,
-        false,
+        hosts_fibers,
     )
     .expect("jit compile")
 }
@@ -556,7 +561,7 @@ fn a_trap_inside_a_fiber_leaves_nothing_for_the_next_run() {
 }
 
 /// #3020 — a hosted unit's fiber is its run's too. The parent's code makes no fiber; a unit
-/// defined into it under fiber hosting ([`CompiledModule::enable_fiber_hosting`]) does, over the
+/// defined into it under fiber hosting (a compile with `hosts_fibers`) does, over the
 /// parent's body at table slot 1, and leaves it suspended; the unit's next run cannot resume it.
 #[test]
 fn a_later_run_cannot_resume_a_hosted_units_fiber() {
@@ -601,10 +606,10 @@ block 2 (vh2: i64) {
 }
 ";
     let parent = module(PARENT);
-    let mut cm = compile(&parent);
-    if cm.enable_fiber_hosting().is_err() {
+    if !temen_fiber::supported() {
         return;
     }
+    let mut cm = compile_hosting(&parent, true);
     let unit = temen_text::parse_module(UNIT).expect("parse unit");
     let defined = cm
         .define_extra(&unit.funcs, &unit.types)

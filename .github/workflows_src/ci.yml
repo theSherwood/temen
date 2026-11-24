@@ -1056,8 +1056,8 @@ jobs:
           set -euo pipefail
           asan="--features temen-jit/asan -Z build-std --target x86_64-unknown-linux-gnu"
           # Each binary and the test filter it runs: held_domain and pool_after_teardown whole;
-          # jit_kernel's slice-2 rows and kernel_fiber_stacks (#3078); the #2990 test in temen-run's
-          # lib (`held::tests`); child_exec's unit tests in temen-jit's lib.
+          # jit_kernel's slice-2 rows and kernel_fiber_stacks (#3078); temen's jit_fuel whole (#3080);
+          # the #2990 test in temen-run's lib (`held::tests`); child_exec's unit tests in temen-jit's lib.
           run_binary() {
             local bin="$1" filter="$2" n
             [ -n "$bin" ] || { echo "no test binary built"; exit 1; }
@@ -1069,11 +1069,14 @@ jobs:
           run_binary "$(cargo test -p temen-run $asan --test held_domain --no-run --message-format=json | exe held_domain)" ""
           run_binary "$(cargo test -p temen-run $asan --test pool_after_teardown --no-run --message-format=json | exe pool_after_teardown)" ""
           # #3078 slice 2, #3080 — a kernel run's fibers outlive the vCPUs that made them: since #3080 a
-          # vCPU's context and cell are locals of its thread (no pool), and a fiber charges only the
-          # vCPU running it, so these rows read freed heap if a fiber reaches an ended vCPU's; and the
-          # run ends its fiber table as it returns (kernel_fiber_stacks).
+          # vCPU's context is a local of its `run_vcpu` and its cell a box of its `tier_run` (no pool),
+          # and a fiber charges only the vCPU running it, so a fiber that reached an ended vCPU's
+          # would read a dead stack frame or freed heap; and the run ends its fiber table as it
+          # returns (kernel_fiber_stacks). jit_fuel's sweeps run fibers that outlive their vCPU and
+          # migrate, metered, on both JIT routes.
           run_binary "$(cargo test -p temen-run $asan --test jit_kernel --no-run --message-format=json | exe jit_kernel)" "kernel_fibers::"
           run_binary "$(cargo test -p temen-run $asan --test kernel_fiber_stacks --no-run --message-format=json | exe kernel_fiber_stacks)" ""
+          run_binary "$(cargo test -p temen $asan --test jit_fuel --no-run --message-format=json | exe jit_fuel)" ""
           run_binary "$(cargo test -p temen-run $asan --lib --no-run --message-format=json | exe temen_run)" "held::tests::"
           run_binary "$(cargo test -p temen-jit --features asan -Z build-std --target x86_64-unknown-linux-gnu --lib --no-run --message-format=json | exe temen_jit)" "child_exec::tests::"
         env:

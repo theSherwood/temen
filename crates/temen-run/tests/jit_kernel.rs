@@ -4848,11 +4848,12 @@ block 0 (va: i64, vb: i64) {
 
     /// #3078 slice 2 — finding 0b and 0a: a fiber thread A made, claimed by thread B, runs B's thunks.
     /// Its spawn, notify and join are B's task's stops, reached through B's thread's record, never
-    /// through the context the fiber carries, which is A's.
+    /// through the context the fiber carries, which was made from A's (#3133).
     ///
-    /// - `ended`: A has ended before B claims the fiber, so its context waits in the run's pool, and no
-    ///   task of A's could apply a stop: had the stops gone to A's hook, they would read a freed one.
-    ///   This is also the context's lifetime row: a run without the pool frees A's context as A ends.
+    /// - `ended`: A has ended before B claims the fiber, so no task of A's could apply a stop: had the
+    ///   stops gone to A's hook, they would read a freed one. This is also the lifetime row: A's
+    ///   context and cell go as A ends (#3080: no pool), and the fiber, which runs on a context of its
+    ///   own charging B's cell, reaches neither.
     /// - not `ended`: A is alive and parked in its join of B, its hook borrowed on A's thread: had the
     ///   stops gone to A's hook, they would alias that borrow.
     fn a_to_b(ended: bool) -> temen_ir::Module {
@@ -5739,12 +5740,12 @@ block 0 (vsp: i64, varg: i64) {{
         assert!(wrong.is_empty(), "{wrong:#?}");
     }
 
-    /// #3078 slice 2 (review R4) — the case the run's context pool exists for: thread A makes fiber F
-    /// and ends, so A's context waits in the pool; thread D starts, takes that context, flags 16408 and
-    /// spins until 16412 is set; only then does thread B claim F. F runs on A's context, which live D
-    /// runs on too, from B's thread: its spawn, notify and join must be B's task's stops, found by B's
-    /// thread's record, where a lookup through the context would find D's. The root then releases D.
-    /// Every spin is a guest loop the bounded kernel run fails the test on, should it not end.
+    /// #3078 slice 2 (review R4) — written for the run's context pool (gone since #3080): thread A
+    /// makes fiber F and ends; thread D starts (it took A's pooled context then; it makes its own
+    /// now), flags 16408 and spins until 16412 is set; only then does thread B claim F. F runs from
+    /// B's thread, on a context of its own (#3133): its spawn, notify and join must be B's task's
+    /// stops, found by B's thread's record, never a lookup through a context. The root then releases
+    /// D. Every spin is a guest loop the bounded kernel run fails the test on, should it not end.
     const ON_A_CONTEXT_A_LIVE_VCPU_TOOK: &str = "memory 16
 func () -> (i64) {
 block 0 () {

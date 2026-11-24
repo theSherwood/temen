@@ -105,6 +105,14 @@ pub(crate) fn drives_jit(calls: &BTreeSet<(u32, u32)>, host: &Host) -> bool {
         .any(|&(t, o)| may_reach(t, o, host, |t, _| t == cap_id::JIT))
 }
 
+/// #3080 — whether `m`'s compile under `host` hosts fibers (`CompiledModule::compile`'s
+/// `hosts_fibers`): its host lets submitted units host them, and `m` can reach `Jit` to submit one.
+/// A program that cannot reach `Jit` hosts no unit, so its code is lowered as before. The one rule
+/// for every JIT entry that compiles a root over a powerbox.
+pub(crate) fn hosts_fibers(m: &Module, host: &Host) -> bool {
+    host.jit_hosts_fibers() && drives_jit(&host_calls(m), host)
+}
+
 /// #2695 — whether a program making `calls` can serve its offers in a serve loop over `host`: reach
 /// `svc.poll` or `svc.wait` ([`temen_ir::durable_abi::is_serve_op`]).
 pub(crate) fn serves(calls: &BTreeSet<(u32, u32)>, host: &Host) -> bool {
@@ -1048,7 +1056,7 @@ pub(crate) unsafe fn compile_image(
         CapCtx::Raw(_) => (module_resolver, Some(fast_cap_resolver)),
         CapCtx::Locked(_) => (module_resolver_locked, None),
     };
-    let (fibers, threads) = cc.with_host(|h| (h.jit_hosts_fibers(), h.jit_hosts_threads()));
+    let (fibers, threads) = cc.with_host(|h| (hosts_fibers(module, h), h.jit_hosts_threads()));
     let mut cm = CompiledModule::compile_kept(
         kept,
         module,
@@ -1062,11 +1070,8 @@ pub(crate) unsafe fn compile_image(
         fast,
         cc.with_host(|h| crate::run_node(h)), // #2113 — what its vCPUs, fibers and processes charge
         CLI_JIT_TABLE_LOG2,
-        jit && fibers, // #3080 — a unit's fiber can run this code: lower its fuel loads to reload
+        fibers, // #3080 — stands up hosting over code lowered for it
     )?;
-    if jit && fibers {
-        cm.enable_fiber_hosting()?;
-    }
     if jit && threads && cc.is_locked() {
         cm.enable_thread_hosting()?;
     }

@@ -4420,6 +4420,8 @@ impl CompiledModule {
             srclocs: srcloc_map.as_ref(),
             var_labels,
         };
+        #[cfg(test)]
+        LOWERED_FUEL_MOVES.with(|l| l.borrow_mut().push(plan.fuel_moves));
         let base_bytes = match &entries {
             Some(e) => {
                 let words = LowerPlan {
@@ -4740,7 +4742,7 @@ impl CompiledModule {
                 })
             }
         };
-        Ok(CompiledModule {
+        let mut cm = CompiledModule {
             hosted: false,
             #[cfg(fiber_rt)]
             run_lane: std::sync::Mutex::new(None),
@@ -4829,7 +4831,13 @@ impl CompiledModule {
                 .map(|di| di.types.clone())
                 .unwrap_or_default(),
             module,
-        })
+        };
+        // #3080 — a compile whose units may host fibers stands their runtime up itself, over code
+        // lowered for it (`fuel_moves`): one declaration, no state in which the two disagree.
+        if hosts_fibers {
+            cm.enable_fiber_hosting()?;
+        }
+        Ok(cm)
     }
 
     /// Run the compiled entry over a **fresh guest window** on slot-encoded `args` (the run half
@@ -6479,8 +6487,8 @@ impl CompiledModule {
     /// trampoline — reusing the incremental define+finalize path (`define_extra`'s, W^X-safe: only
     /// the fresh trampoline page is mprotected; running code is untouched).
     ///
-    /// Called by the `Jit` run entries between `compile` and `run` for a **fiber-hosting** grant.
-    /// The subsequent `run` publishes `CURRENT_RT` from `self.fiber_rt` (set here), so a submitted
+    /// #3080 — called by `compile` itself for a compile made with `hosts_fibers` (a **fiber-hosting**
+    /// grant's), whose code it lowered to reload its fuel cell. The subsequent `run` publishes `CURRENT_RT` from `self.fiber_rt` (set here), so a submitted
     /// unit's `cont.*`, running on the caller's stack inside the synchronous `call.cap`, resolve it.
     /// A submitted unit whose own scheduler creates fibers over unit-local entries needs those
     /// entries reachable as funcrefs (§22 install / the shared `fn_table`) — same as any `cont.new`.
@@ -6488,17 +6496,13 @@ impl CompiledModule {
     /// **Idempotent** and behavior-preserving: a no-op if fibers are already hosted (the parent used
     /// `cont.*`/`gc.roots`), reusing an existing table/trampoline a thread-only parent already built.
     #[cfg(fiber_rt)]
-    pub fn enable_fiber_hosting(&mut self) -> Result<(), JitError> {
+    fn enable_fiber_hosting(&mut self) -> Result<(), JitError> {
         if self.fibers {
             return Ok(()); // already hosting fibers (parent used cont.*/gc.roots at compile time)
         }
-        // #3080 — a unit's fiber can run the parent's own code on its stack, whose fuel cell each
-        // resume re-points: metered code must have been lowered to reload it (`hosts_fibers`).
-        if self.fuel && !self.fuel_moves {
-            return Err(JitError::Unsupported(
-                "a metered compile hosts fibers only when compiled with `hosts_fibers`",
-            ));
-        }
+        // #3080 — only a compile made with `hosts_fibers` comes here, so its code reloads its fuel
+        // cell at every charge (`fuel_moves`): a unit's fiber can run it on its stack.
+        debug_assert!(self.fuel_moves, "hosting fibers on code lowered for them");
         // Append the fiber-entry signature to the per-domain type registry (idempotent; an id never
         // remaps — DESIGN.md §22). A later `define_extra` interning the same signature gets this id,
         // so id-equality stays ≡ structural equality. Consulted only here, guest not yet running.
@@ -6544,7 +6548,7 @@ impl CompiledModule {
     /// Fiber hosting on a target without stack-switch support: a no-op — fibers stay unsupported, so
     /// a fiber-using submitted unit remains rejected by `define_extra`'s fiber gate.
     #[cfg(not(fiber_rt))]
-    pub fn enable_fiber_hosting(&mut self) -> Result<(), JitError> {
+    fn enable_fiber_hosting(&mut self) -> Result<(), JitError> {
         Ok(())
     }
 
@@ -6751,6 +6755,14 @@ impl CompiledModule {
     /// recompaction compiles the fresh module against, so the fresh code meters as the old did.
     pub fn fuel_cell(&self) -> Option<*mut FuelCell> {
         (!self.instance.fuel.is_null()).then_some(self.instance.fuel)
+    }
+
+    /// #3080 — whether this module's code can run on a guest fiber's stack, so reloads its fuel
+    /// cell at every charge: its own fiber ops, or a compile made with `hosts_fibers`. The
+    /// `hosts_fibers` a recompaction compiles the fresh module with, so its code is lowered as the
+    /// old's was.
+    pub fn hosts_fibers(&self) -> bool {
+        self.fuel_moves
     }
 
     /// #2878 — the code a thawed vCPU's recorded `func` names, as its `thread.spawn` resolved it: a
@@ -7934,9 +7946,9 @@ fn host_ret(name: &str) -> validate::Ret {
         .map_or(validate::Ret::Unknown, |h| h.ret())
 }
 
-/// #3080 — a compile that hosts fibers after it was lowered must have been lowered for them: a
-/// unit's fiber can run the parent's own code on its stack, whose fuel cell each resume re-points,
-/// so metered code that kept its cell's address across a `suspend` would charge another vCPU's.
+/// #3080 — a compile that hosts fibers is lowered for them: a unit's fiber can run the parent's own
+/// code on its stack, whose fuel cell each resume re-points, so metered code that kept its cell's
+/// address across a `suspend` would charge another vCPU's.
 #[cfg(all(test, fiber_rt))]
 mod fiber_hosting_tests {
     use super::*;
@@ -7963,22 +7975,83 @@ mod fiber_hosting_tests {
         .expect("compile")
     }
 
+    /// Both of a compile's plans lower every function for hosting fibers when it hosts them: the
+    /// eager one (a small module) and the lazy one (a module large enough to compile each function
+    /// at its first call, #2594), and neither does when it does not.
     #[test]
-    fn a_metered_compile_hosts_fibers_only_when_lowered_for_them() {
+    fn every_function_of_a_hosting_compile_is_lowered_to_reload_its_cell() {
+        if !fiber_supported() {
+            return;
+        }
+        let small = "func () -> (i64) {\nblock 0 () {\n  v0 = i64.const 7\n  return v0\n  }\n}\n";
+        let mut large = String::from(small);
+        for _ in 0..64 {
+            large += "func (i64) -> (i64) {\nblock 0 (v0: i64) {\n  return v0\n  }\n}\n";
+        }
+        let mut cell = FuelCell::fixed(100);
+        for (src, lazy) in [(small, false), (large.as_str(), true)] {
+            let m = temen_text::parse_module(src).expect("parse");
+            for hosts in [false, true] {
+                super::LOWERED_FUEL_MOVES.with(|l| l.borrow_mut().clear());
+                let mut cm = CompiledModule::compile(
+                    &m,
+                    0,
+                    empty_cap_thunk,
+                    core::ptr::null_mut(),
+                    0,
+                    None,
+                    None,
+                    Some(&mut *cell as *mut FuelCell),
+                    None,
+                    None,
+                    0,
+                    hosts,
+                )
+                .expect("compile");
+                let lowered = super::LOWERED_FUEL_MOVES.with(|l| l.borrow_mut().split_off(0));
+                assert_eq!(
+                    lowered,
+                    [hosts],
+                    "lazy {lazy}: the eager plan, hosting {hosts}"
+                );
+                // A lazy module lowers each function at its first call, by the plan its code keeps.
+                assert_eq!(cm.compiles_lazily(), lazy);
+                if let Some(service) = &cm.module.lazy {
+                    assert_eq!(
+                        service.fuel_moves(),
+                        hosts,
+                        "the lazy plan, hosting {hosts}"
+                    );
+                }
+                assert!(matches!(
+                    cm.run(&[], None, None),
+                    Ok((JitOutcome::Returned(_), _))
+                ));
+            }
+        }
+    }
+
+    /// The compile stands the hosting up itself, over code lowered for it: there is no compile
+    /// that hosts fibers and charges a cell its code would keep across a `suspend`.
+    #[test]
+    fn a_compile_that_hosts_fibers_stands_them_up_over_code_lowered_for_them() {
         if !fiber_supported() {
             return;
         }
         let mut cell = FuelCell::fixed(100);
         let metered = Some(&mut *cell as *mut FuelCell);
-        assert!(matches!(
-            compile(metered, false).enable_fiber_hosting(),
-            Err(JitError::Unsupported(_))
-        ));
-        assert!(compile(metered, true).enable_fiber_hosting().is_ok());
-        assert!(
-            compile(None, false).enable_fiber_hosting().is_ok(),
-            "unmetered code charges no cell"
-        );
+        for fuel in [metered, None] {
+            let hosted = compile(fuel, true);
+            assert!(
+                hosted.fibers && hosted.fuel_moves,
+                "hosted, and lowered to reload"
+            );
+            let plain = compile(fuel, false);
+            assert!(
+                !plain.fibers && !plain.fuel_moves,
+                "neither, for a module with no fiber op"
+            );
+        }
     }
 }
 
@@ -8160,6 +8233,13 @@ fn define_verified(
     #[cfg(test)]
     record_emitted(module, code.code_buffer(), &relocs);
     Ok(code)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// #3080 — the [`Lower::fuel_moves`] of each root's eager plan this thread built, for the row
+    /// that pins that it honours `hosts_fibers` (a lazy module's own is `lazy::Service::fuel_moves`).
+    pub(crate) static LOWERED_FUEL_MOVES: core::cell::RefCell<Vec<bool>> = const { core::cell::RefCell::new(Vec::new()) };
 }
 
 #[cfg(test)]
@@ -11373,10 +11453,10 @@ fn lower_block(
         // (forged handle, bad funcref, fiber-bomb, root suspend) propagates here.
         if let Inst::ContNew { func, arg0 } = inst {
             // fiber_new(vmctx, funcref:i32, arg0:i64) -> i32 handle. The running vCPU's fiber
-            // runtime is read from a thread-local, so threads + fibers compose. The fiber's window,
-            // function table and fuel cell (whose first entry refunds the prologue charge its
-            // starting `cont.resume` already paid, #1642) are its creator's, read from `vmctx`,
-            // which the fiber's own context copies (#3133).
+            // runtime is read from a thread-local, so threads + fibers compose. The fiber's window
+            // and function table are its creator's, read from `vmctx`, which the fiber's own context
+            // copies (#3133); its fuel cell is whatever runs it, named at each resume (#3080), whose
+            // first entry refunds the prologue charge its starting `cont.resume` already paid (#1642).
             let vmctx = b.use_var(lower.vmctx_var);
             let funcref = get(&vals, *func)?;
             let arg0 = get(&vals, *arg0)?;
@@ -12760,16 +12840,16 @@ fn frame_pointer(b: &mut FunctionBuilder, lower: &Lower) -> Result<Value, JitErr
 /// The leading context arguments threaded into every guest call: `(mem_base,
 /// fn_table_base, vmctx, stack_limit)`.
 /// Load one of the instance's per-run addresses from its [`VmCtx`] (a field offset from
-/// [`vmctx`](crate::vmctx)). The fields are written before an entry and never during it, so the load is
-/// `readonly` + `can_move`: Cranelift may hoist it out of a loop or share it between uses — the
-/// address is loop-invariant; what it points *at* (the interrupt cell, the armed flag) is still read
-/// by the caller with its own ordering.
+/// [`vmctx`](crate::vmctx)). The fields are written before an entry and never during it — but a
+/// guest fiber's `fuel`, which each resume rewrites, so code that can run on a fiber's stack loads
+/// that one with [`fuel_cell_addr`] — so the load is `readonly` + `can_move`: Cranelift may hoist it
+/// out of a loop or share it between uses — the address is loop-invariant; what it points *at* (the
+/// interrupt cell, the armed flag) is still read by the caller with its own ordering.
 fn vmctx_load(b: &mut FunctionBuilder, lower: &Lower, field: i32) -> Value {
     let vmctx = b.use_var(lower.vmctx_var);
     vmctx_field(b, vmctx, field)
 }
 
-/// [`vmctx_load`] from the context at `vmctx`.
 /// #3080 — the address of the cell this code charges: plain where the cell can move under the code
 /// ([`Lower::fuel_moves`]), reloaded at every charge, so a fiber charges the vCPU that runs it now;
 /// [`vmctx_load`]'s `readonly` load otherwise.
@@ -12781,6 +12861,7 @@ fn fuel_cell_addr(b: &mut FunctionBuilder, lower: &Lower) -> Value {
     b.ins().load(I64, MemFlags::trusted(), vmctx, vmctx::FUEL)
 }
 
+/// [`vmctx_load`] from the context at `vmctx`.
 fn vmctx_field(b: &mut FunctionBuilder, vmctx: Value, field: i32) -> Value {
     let flags = MemFlags::trusted().with_readonly().with_can_move();
     b.ins().load(I64, flags, vmctx, field)

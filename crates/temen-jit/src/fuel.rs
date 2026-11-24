@@ -273,9 +273,15 @@ impl FuelCell {
         *slot = src;
     }
 
-    /// What this cell's vCPUs can still burn: `left` plus the chain's room, `u64::MAX` unmetered.
+    /// What this cell's vCPUs can still burn: `left` (unless it is free) plus the chain's room,
+    /// `u64::MAX` unmetered.
     pub fn can_burn(&self) -> u64 {
-        let left = unsafe { core::ptr::read_volatile(&self.left) };
+        // #3138 — a free `left` is none of the chain's: a quantum drawn from nothing, or an entry's
+        // seeded unit, which no caller lent (`seed_entry`). Unbounded chains answer `MAX` anyway.
+        let left = match unsafe { core::ptr::read_volatile(&self.free) } {
+            true => 0,
+            false => unsafe { core::ptr::read_volatile(&self.left) },
+        };
         match self.chain().room() {
             r if r < 0 => u64::MAX,
             r => left.saturating_add(r as u64),
@@ -859,6 +865,29 @@ block 2 (v8: i64) {
         assert_eq!(spent.pay_entry(), Some(false));
         let unbounded = FuelCell::fixed(u64::MAX);
         assert_eq!(unbounded.pay_entry(), None);
+    }
+
+    /// #3138 — an activation's entry unit, seeded on its fresh cell, is none of its caller's: an
+    /// activation that ends before its handler's prologue charges it (a domain poll first, or the
+    /// domain ending meanwhile) reads back its loan exactly, and hands its chain nothing; one whose
+    /// prologue spends it reads back the same.
+    #[test]
+    fn an_activations_entry_unit_is_none_of_its_callers() {
+        use super::Allowance;
+        for spent in [false, true] {
+            let lent = Arc::new(Allowance::new(1000));
+            let mut cell = FuelCell::drawing(lent.clone());
+            let cell = &mut *cell as *mut FuelCell;
+            // SAFETY: `cell` is live and fresh, and nothing else charges it.
+            unsafe { FuelCell::seed_entry(cell) };
+            if spent {
+                // The prologue's charge of its entry.
+                unsafe { (*cell).left -= 1 };
+            }
+            assert_eq!(unsafe { (*cell).can_burn() }, 1000, "spent: {spent}");
+            unsafe { FuelCell::settle(cell) };
+            assert_eq!(lent.room(), 1000, "nothing handed back, spent: {spent}");
+        }
     }
 
     #[test]

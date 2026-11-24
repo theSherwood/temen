@@ -71,8 +71,12 @@ pub struct VmCtx {
     /// The §5 kill door whose cell a compile with epoch checks polls (null when not armed). The cell
     /// is the door's first field, so compiled code loads it through this pointer as a `u64`.
     pub epoch: *const crate::Interrupt,
-    /// The counted-fuel cell a compile with fuel checks charges (null when not armed).
-    pub fuel: *mut crate::FuelCell,
+    /// The counted-fuel cell a compile with fuel checks charges (null when not armed). Compiled code
+    /// loads it as a plain pointer at [`FUEL`]. #3080 — a guest fiber's context has it rewritten at
+    /// each resume (`fiber_switched_in`) while host frames parked on the fiber's stack hold `&VmCtx`
+    /// borrows of it, so it is an atomic (`Relaxed`; the resume's switch orders it): read it with
+    /// [`Self::fuel`].
+    fuel: core::sync::atomic::AtomicPtr<crate::FuelCell>,
     /// #932 — the host `armed` flag a compile with signal checks polls (null when not armed).
     pub sig_armed: *const AtomicBool,
     /// #932 — the signal-delivery ctx handed to the take/return thunks (null when not armed).
@@ -249,7 +253,7 @@ impl VmCtx {
             end: &*owned_end,
             cap_ctx: a.cap_ctx,
             epoch: a.epoch,
-            fuel: a.fuel,
+            fuel: core::sync::atomic::AtomicPtr::new(a.fuel),
             sig_armed: a.sig_armed,
             sig_ctx: a.sig_ctx,
             embedder: a.embedder,
@@ -319,35 +323,44 @@ impl VmCtx {
         unsafe { &*r }
     }
 
-    /// #3133 — a resume of the fiber whose context `this` is: `runner` is the thread of control that
+    /// The counted-fuel cell this context's code charges now (null when not armed).
+    pub fn fuel(&self) -> *mut crate::FuelCell {
+        self.fuel.load(Ordering::Relaxed)
+    }
+
+    /// Point this context at `cell` (a test's, or a context being made).
+    #[cfg(test)]
+    pub(crate) fn set_fuel(&mut self, cell: *mut crate::FuelCell) {
+        *self.fuel.get_mut() = cell;
+    }
+
+    /// #3133 — a resume of the fiber whose context this is: `runner` is the thread of control that
     /// runs it from now until [`Self::fiber_switched_out`]. #3080 — and the fiber charges the
     /// runner's cell: its code reads `fuel` plainly at every safepoint (`fuel_cell_addr`), so it
     /// charges the vCPU (or task, or activation) that runs it, as the tree-walker charges the hand
     /// of the vCPU whose loop runs a fiber's frames.
     ///
     /// # Safety
-    /// `this` is a guest fiber's context that no code runs on (its fiber is claimed for this resume
-    /// and not yet switched in), so nothing reads `fuel` while it is written.
-    pub(crate) unsafe fn fiber_switched_in(this: *mut VmCtx, runner: &VmCtx) {
-        debug_assert!((*this).is_fiber, "only a fiber's context names a runner");
-        core::ptr::addr_of_mut!((*this).fuel).write(runner.fuel);
-        (*this)
-            .runner
+    /// No compiled code runs on this context: its fiber is claimed for this resume and not yet
+    /// switched in. Host frames parked on the fiber's stack may hold `&VmCtx` borrows of it (which
+    /// is why the fields are atomics); they run again only after the switch, and read the new cell.
+    pub(crate) unsafe fn fiber_switched_in(&self, runner: &VmCtx) {
+        debug_assert!(self.is_fiber, "only a fiber's context names a runner");
+        self.fuel.store(runner.fuel(), Ordering::Relaxed);
+        self.runner
             .store(runner as *const VmCtx as *mut VmCtx, Ordering::Release);
     }
 
     /// #3133 — the resume that ran this fiber is back in its resumer: no thread of control runs it.
-    /// #3080 — in debug builds its cell is nulled too, so a charge made outside a resume faults
-    /// loudly instead of charging a vCPU that no longer runs it.
+    /// #3080 — its cell is nulled too, in every build, so a charge made outside a resume faults on a
+    /// null cell instead of charging a vCPU (or a loan) that no longer runs it.
     ///
     /// # Safety
-    /// As [`Self::fiber_switched_in`]: the fiber is back in its resumer, and no code runs on `this`.
-    pub(crate) unsafe fn fiber_switched_out(this: *mut VmCtx) {
-        #[cfg(debug_assertions)]
-        core::ptr::addr_of_mut!((*this).fuel).write(core::ptr::null_mut());
-        (*this)
-            .runner
-            .store(core::ptr::null_mut(), Ordering::Release);
+    /// As [`Self::fiber_switched_in`]: the fiber is back in its resumer, and no compiled code runs on
+    /// this context until the next resume.
+    pub(crate) unsafe fn fiber_switched_out(&self) {
+        self.fuel.store(core::ptr::null_mut(), Ordering::Relaxed);
+        self.runner.store(core::ptr::null_mut(), Ordering::Release);
     }
 
     /// #3133 — whether no thread of control runs this fiber (a spare's, or one at rest).
@@ -372,7 +385,7 @@ impl VmCtx {
             end,
             cap_ctx: self.cap_ctx,
             epoch: self.epoch,
-            fuel,
+            fuel: core::sync::atomic::AtomicPtr::new(fuel),
             sig_armed: self.sig_armed,
             sig_ctx: self.sig_ctx,
             embedder: self.embedder,
@@ -730,7 +743,7 @@ block 0 (v0: i64, v1: i64) {
         // serve site, a window to step aside for, a cap thunk's state and a cell.
         let mut maker = VmCtx::new(InstanceAddrs::NONE, Window::NONE);
         let mut run_cell = crate::FuelCell::fixed(10);
-        maker.fuel = &mut *run_cell;
+        maker.set_fuel(&mut *run_cell);
         let (site, _exec) = crate::child_exec::tests::parked_site();
         assert!(maker.serve_site.set(site).is_ok());
         maker.handler_window.store(
@@ -756,7 +769,7 @@ block 0 (v0: i64, v1: i64) {
             "the maker's handler count"
         );
         assert!(
-            f.fuel.is_null(),
+            f.fuel().is_null(),
             "no cell until a resume names its runner's (#3080)"
         );
     }

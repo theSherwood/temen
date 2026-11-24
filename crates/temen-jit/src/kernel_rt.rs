@@ -389,7 +389,7 @@ impl KernelRun {
     /// segments made read-only, which the embedder's page map starts with. `armed` is the fuel cell
     /// `cm` was compiled with, if any, kept for as long as its code; `node` is the run's budget
     /// node, which its fibers' stacks are charged to (#2112), as executor 2 charges its own. `None` when `cm` is one the
-    /// kernel does not run (§14 nesting, a metered module with fibers, durability, a target without the fiber runtime);
+    /// kernel does not run (§14 nesting, durability, a target without the fiber runtime);
     /// `Some(None)` when the OS refuses the window or a protection it needs (#2305, #2286), a run that
     /// ends as one the process cannot hold.
     pub fn new(
@@ -408,6 +408,12 @@ impl KernelRun {
         {
             return None;
         }
+        // What the context pool's removal rests on: a metered fiber's code reloads its cell at every
+        // charge, so it never charges a vCPU's cell after that vCPU's thread let it go.
+        debug_assert!(
+            !(cm.fibers && cm.fuel) || cm.fuel_moves,
+            "a metered fibered kernel run reloads its cell (#3080)"
+        );
         #[cfg(fiber_rt)]
         let fibers = match (cm.fibers, cm.fiber_cfg, cm.call_tramp) {
             (false, _, _) => None,
@@ -493,7 +499,7 @@ impl KernelRun {
     /// Whether `cm`'s code carries fuel checks, so each vCPU's own cell must be handed to it
     /// ([`Self::run_vcpu`]).
     pub fn metered(&self) -> bool {
-        !self.root.fuel.is_null()
+        !self.root.fuel().is_null()
     }
 
     /// Run `entry` on this thread as a vCPU with `vcpu.tls` seed `tls`, over the run's end word `end`

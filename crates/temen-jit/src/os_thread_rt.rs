@@ -1248,10 +1248,10 @@ impl Domain {
         }
         let root = env.ctx();
         // SAFETY: a non-null `fuel` is the run's live cell, which outlives the run's vCPUs.
-        let mut cell = unsafe { root.fuel.as_ref() }.map(crate::FuelCell::sibling);
+        let mut cell = unsafe { root.fuel().as_ref() }.map(crate::FuelCell::sibling);
         let fuel = cell
             .as_deref_mut()
-            .map_or(root.fuel, |c| c as *mut crate::FuelCell);
+            .map_or(root.fuel(), |c| c as *mut crate::FuelCell);
         Box::new(VcpuCtx {
             vm: root.vcpu(fuel),
             cell,
@@ -2424,7 +2424,7 @@ pub(crate) unsafe extern "C" fn thread_spawn(
     // spawner out of fuel, as the oracle's does, after the durable context is reserved and before
     // any other refusal (its order). A refusal after it keeps the unit paid, as the oracle's does.
     // SAFETY: a non-null `fuel` is the run's live cell, which outlives the run's vCPUs.
-    let paid = unsafe { env.ctx().fuel.as_ref() }.and_then(crate::FuelCell::pay_entry);
+    let paid = unsafe { env.ctx().fuel().as_ref() }.and_then(crate::FuelCell::pay_entry);
     if paid == Some(false) {
         if let Some(dc) = &durable_child {
             if let Some(table) = dom.fiber_table() {
