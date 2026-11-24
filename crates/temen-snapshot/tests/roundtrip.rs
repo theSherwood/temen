@@ -2855,3 +2855,43 @@ fn a_dispatch_with_the_wrong_argument_count_rides_a_freeze_and_is_answered_einva
     assert_eq!(thawed, want, "the thaw ends as the uninterrupted run");
     assert_eq!(rhost.svc_result(t), einval, "thawed: answered EINVAL");
 }
+
+/// #3100 — a restore's §13 regions count with its windows against the restoring host's room: a
+/// region's rebuild is charged to that node past every ceiling (`Fits::Pool`), so the restore is
+/// where a ceiling meets it. A domain holding two one-page regions over its window restores under
+/// exactly the window and both regions, and is refused at one page less, the host as it was.
+#[test]
+fn a_restores_regions_count_with_its_windows() {
+    let inst = instrument(SRC);
+    let mut fhost = Host::new();
+    fhost.grant_shared_region(4096);
+    fhost.grant_shared_region(4096);
+    let mut win = init_durable_window(WINDOW, TEST_ARENA);
+    write_state(&mut win, TEST_ARENA, STATE_UNWINDING);
+    let prots = vec![temen_snapshot::PageProt::Rw; WINDOW / 4096];
+    let art =
+        temen_snapshot::freeze_with_prots(&inst, &win, &prots, SIZE_LOG2, &fhost).expect("freeze");
+    let need = (WINDOW + 2 * 4096) as u64;
+    let restore = |room: u64| {
+        let mut h = Host::new();
+        h.set_mem_grant(room as i64);
+        let fresh = h.restore_footprint();
+        let got = temen_snapshot::restore_layout(&art, &inst, &mut h).map(|_| ());
+        (got, fresh == h.restore_footprint())
+    };
+    assert_eq!(
+        restore(need - 4096),
+        (
+            Err(RestoreError::WindowOverBudget {
+                need,
+                room: need - 4096
+            }),
+            true
+        )
+    );
+    assert_eq!(
+        restore(need).0,
+        Ok(()),
+        "room for the window and both regions"
+    );
+}

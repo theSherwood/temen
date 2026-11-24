@@ -318,8 +318,14 @@ ticket is not checked against its callee: the wait record does not say which cal
 its registrar for each domain's named capabilities, its budget hook, and last its region backings,
 the one answer that acts (a region is charged and may be an OS object; one rebuilt before a refusal
 is dropped, which hands its charge back). `apply` then writes what was decoded and granted and
-cannot fail. A restore that refuses leaves the host as it found it. (Open: the image a restore
-allocates is bounded only by the artifact's own reservation, #3100.) The checks at each use that predate the pass (#2945) stay only in front of a raw host store
+cannot fail. A restore that refuses leaves the host as it found it. What a restore allocates is the module's declared window and the bytes the
+artifact carries: a window's head past its declared memory is held as one committed span
+(`PageMap::held_to`), which the thaw holds page by page and its budget pays for (#3137). Before
+anything acts, every window and §13 region of the cut is checked against the memory its thaw holds
+it under: each carried node's attenuated ceiling and the restoring host's own room
+(`WindowOverBudget`), since the thaw charges a restored window past every ceiling, or not at all
+(#3149). A window's reservation is bounded by the one the restoring host builds (`Restoring`,
+`ReservationRefused`), not by the artifact (#3100). The checks at each use that predate the pass (#2945) stay only in front of a raw host store
 or an unchecked index, as a backstop that is loud in debug. Open: whether an artifact may set the
 attestation and the guest-JIT quotas at all, or only narrow what the restoring host grants (#3096).
 

@@ -1766,3 +1766,49 @@ block 0 (v0: i64, v1: i64) {{
         "JIT: {jit:?}"
     );
 }
+
+/// #3100 — the windows a restore holds are counted over the whole cut, not each domain against the
+/// root's room: K fork twins (about 60 bytes each, no grant needed) each fit the restoring host's
+/// memory, and together they do not. Each twin's declared window counts before it is allocated, so
+/// the restore refuses at the head that passes the room, the host as it was; with room for every
+/// window it restores. On `257f553` each nested domain was checked against nothing, and every head
+/// was built.
+#[test]
+fn k_fork_twins_that_each_fit_and_together_do_not_are_refused() {
+    const K: u64 = 8;
+    let inst = instrument(FIBERS);
+    let root = frozen(&inst);
+    let art = bent(&root, |r| {
+        for pid in 0..K {
+            r.twins.push(LiveTwin {
+                pid: 5 + pid,
+                entry: 0,
+                ctx: 5,
+                payload: TwinRest {
+                    servicer: true,
+                    names: Vec::new(),
+                    artifact: root.clone(),
+                },
+            });
+        }
+    });
+    let windows = (K + 1) * WINDOW as u64;
+    let restore = |room: u64| {
+        let mut h = Host::new();
+        h.set_mem_grant(room as i64);
+        let fresh = h.restore_footprint();
+        let got = temen_snapshot::restore(&art, &inst, &mut h).map(|_| ());
+        (got, fresh == h.restore_footprint())
+    };
+    assert_eq!(
+        restore(windows - 4096),
+        (
+            Err(RestoreError::WindowOverBudget {
+                need: windows,
+                room: windows - 4096
+            }),
+            true
+        )
+    );
+    assert_eq!(restore(windows).0, Ok(()), "room for every window");
+}

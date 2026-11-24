@@ -4890,7 +4890,12 @@ impl OnrampReactor {
 
         // Bound to `m`, the module the guest was frozen over, and not to the outlined copy the
         // reactor runs: an artifact binds the guest, not an emitter's rewrite of it.
-        let (layout, _reserved) = temen_snapshot::restore_layout(artifact, m, &mut host)
+        // A flat holder: its buffer runs through the last page the window holds (#3100).
+        let flat = temen_snapshot::Restoring {
+            flat: true,
+            ..temen_snapshot::Restoring::of(m)
+        };
+        let (layout, _reserved) = temen_snapshot::restore_into(artifact, m, &mut host, flat)
             .map_err(|_| STATUS_UNSUPPORTED)?;
 
         let (mut inst, back) =
