@@ -613,8 +613,11 @@ unsafe fn wait_outside_here<R>(
     rouse: Box<dyn Fn() + Send + Sync>,
     wait: impl FnOnce(&dyn Fn() -> bool) -> Option<R>,
 ) -> Option<R> {
-    let dom = own_lanes_domain(vm.sched as *const Domain);
-    let lane = dom.map(|d| d.lane_chain()).unwrap_or_default();
+    let held = held_lanes(vm.sched as *const Domain);
+    let (dom, lane) = match held {
+        Some((d, lane)) => (Some(d), lane),
+        None => (None, Vec::new()),
+    };
     if let Some(d) = dom {
         d.lane_give_back(&lane);
     }
@@ -2104,17 +2107,25 @@ pub(crate) unsafe fn current_domain<'a>(sched: *const Domain) -> &'a Domain {
     &*(if cur.is_null() { sched } else { cur })
 }
 
-/// #3158 — the domain whose lanes the running context holds as one of its 1:1 vCPUs: what a wait
-/// that blocks this thread outside the pool gives back first and re-takes after. `None` in a pool
-/// task (a child's vCPU, a serve handler's shell, a held activation on a worker): the executor holds
-/// a task's lanes, taken at its pick and given back only when it parks through the executor, and
-/// the current domain there can be another context's (a handler shell's is its serving vCPU's).
-/// `None` too with no domain (`sched` null).
+/// #3158 — the lanes the running context holds, on the domain that counts them: what a wait that
+/// blocks this thread outside the pool gives back first and re-takes after. An OS vCPU holds its
+/// domain's chain. A pool task holds what its residency holds ([`crate::child_exec::resident_lanes`]):
+/// a child's own chain, which the executor took at its pick, and nothing for a serve handler's shell
+/// or a held activation, whose gate is their window's. The current domain is not the answer there:
+/// a handler shell's is its serving vCPU's. `None` with no domain (`sched` null) or no lanes.
 ///
 /// # Safety
-/// As [`current_domain`], when `sched` is non-null.
-pub(crate) unsafe fn own_lanes_domain<'a>(sched: *const Domain) -> Option<&'a Domain> {
-    (!sched.is_null() && !crate::fiber_rt::in_task()).then(|| current_domain(sched))
+/// As [`current_domain`], when `sched` is non-null; the answer is used within the call.
+pub(crate) unsafe fn held_lanes<'a>(
+    sched: *const Domain,
+) -> Option<(&'a Domain, Vec<(usize, i64)>)> {
+    if crate::fiber_rt::in_task() {
+        return crate::child_exec::resident_lanes().map(|(d, chain)| (d, chain.to_vec()));
+    }
+    (!sched.is_null()).then(|| {
+        let d = current_domain(sched);
+        (d, d.lane_chain())
+    })
 }
 
 std::thread_local! {

@@ -2329,12 +2329,18 @@ pub(crate) unsafe fn join_named(
     // cell's lock, re-taken after — blocking for a lane while holding that lock would stop the child
     // from publishing the very outcome being waited for. They are the lanes of the joining vCPU's
     // own domain (#1956: a detached child's thread runs under the child's chain). A task's join
-    // leaves its lanes to the executor ([`crate::os_thread_rt::own_lanes_domain`]). SAFETY: a
-    // nonzero `futex_sched` is the run's live `Domain`, which outlives every child.
-    let dom = unsafe {
-        crate::os_thread_rt::own_lanes_domain(rt.futex_sched as *const crate::os_thread_rt::Domain)
+    // parks the task, whose lanes the executor gives back; one that answers an outcome already in
+    // (#3158) has no wait to give them back for. SAFETY: a nonzero `futex_sched` is the run's live
+    // `Domain`, which outlives every child.
+    let held = (task.is_none() && !crate::fiber_rt::in_task())
+        .then(|| unsafe {
+            crate::os_thread_rt::held_lanes(rt.futex_sched as *const crate::os_thread_rt::Domain)
+        })
+        .flatten();
+    let (dom, lane) = match held {
+        Some((d, lane)) => (Some(d), lane),
+        None => (None, Vec::new()),
     };
-    let lane = dom.map(|d| d.lane_chain()).unwrap_or_default();
     if let Some(d) = dom {
         d.lane_give_back(&lane);
     }

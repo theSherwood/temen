@@ -2447,20 +2447,22 @@ fn serve_on_both(
 
 /// #3158 — a durable §14 child runs on a pool task, and its handler runs on the serve op's stack, in a
 /// recovery scope nested in the task's frames. A park there would switch the task out with that scope
-/// still open, so the JIT refuses the park: here a millisecond's wait on a word nothing notifies. The
-/// child ends `ThreadFault`, the parent's call through the offer fails, and its join reads the trap.
-/// The oracle's handler waits, times out (2) and answers. The JIT's half is the stop-gap's divergence
-/// (decisions 33 and 35): #2804 gives a durable domain's handlers fibers of their own, off the serve
-/// op's stack, and this row then agrees with the oracle. Without the yield floor the JIT answers the
-/// oracle's triple by parking the task with the handler's scope open.
+/// still open, so the JIT refuses the park: here a wait with no deadline on a word nothing notifies.
+/// Neither engine's answer depends on a clock. The JIT's door decides on the value alone (equal, no
+/// deadline, no freeze): the child ends `ThreadFault`, the parent's call through the offer fails
+/// (`CAP_REVOKED`), and its join reads the trap. The oracle's handler parks, and with the parent
+/// parked in its call every vCPU of the run is blocked: the run's deadlock verdict, `ThreadFault`.
+/// The JIT's half is the stop-gap's divergence (decisions 33 and 35): #2804 gives a durable
+/// domain's handlers fibers of their own, off the serve op's stack, and the JIT then answers as the
+/// oracle does. Without the yield floor the JIT parks the task with the handler's scope open and
+/// reaches the oracle's verdict.
 #[test]
 fn a_durable_childs_handler_that_parks_ends_the_child_on_the_jit() {
-    let (oracle, jit) = serve_on_both("", &waiting_handler(0, 1_000_000));
-    let served = 40 + 2 + 2 * 1000;
+    let (oracle, jit) = serve_on_both("", &waiting_handler(0, -1));
     assert_eq!(
         oracle,
-        Ok(vec![Value::I64(served), Value::I64(0), Value::I64(1)]),
-        "oracle: the handler times out and answers; the child served one call"
+        Err(temen_interp::Trap::ThreadFault),
+        "oracle: the handler parks, and every vCPU of the run is blocked"
     );
     if let Some(jit) = jit {
         let thread_fault = temen_ir::trap_code::THREAD_FAULT;

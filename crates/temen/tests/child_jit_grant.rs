@@ -531,9 +531,11 @@ data 16488 "prc"
 const LANE_UNIT: &str = "memory 17\nfunc () -> (i64) {\nblock 0 () {\n  va = i64.const 70000\n  vh = i32.load va\n  v5 = i64.const 5\n  vr = call.cap 13 0 (i64) -> (i64) vh (v5)\n  return vr\n  }\n}\n";
 
 /// #3158 review B1 — the serving child. Its entry resolves `"jit"` and `"prc"`, compiles
-/// [`LANE_UNIT`] (the blob at [`BLOB_OFF`]), and serves one call. The handler, `run(a)`, waits a
-/// millisecond on a word nothing notifies, so its fiber parks once and a pool worker resumes it;
-/// then it invokes the unit, whose call the host punts, and answers the unit's 105 plus `a`.
+/// [`LANE_UNIT`] (the blob at [`BLOB_OFF`]), spawns a notifier vCPU (function 2), and serves one
+/// call. The handler, `run(a)`, waits with no deadline on a word the notifier notifies until a notify
+/// wakes a waiter (sleeping a millisecond on a word of its own between tries), so the handler's
+/// fiber parks once, however late its wait begins, and a pool worker resumes it. Then it invokes the
+/// unit, whose call the host punts, and answers the unit's 105 plus `a`.
 fn lane_server(blob: &[u8]) -> String {
     let blob_data: String = blob.iter().map(|b| format!("\\x{b:02x}")).collect();
     format!(
@@ -557,6 +559,8 @@ block 0 (vci: i64) {{
   vc = call.cap 11 0 (i64, i64) -> (i64) hj (vb, vl)
   ac = i64.const 70008
   i64.store ac vc
+  vnz = i64.const 0
+  vnt = thread.spawn 2 vnz vnz
   vz = i32.const 0
   vn = svc.wait vz
   return vn
@@ -566,7 +570,7 @@ func (i64) -> (i64) {{
 block 0 (va: i64) {{
   vp = i64.const 70100
   vw0 = i32.const 0
-  vto = i64.const 1000000
+  vto = i64.const -1
   vw = i32.atomic.wait vp vw0 vto
   aj = i64.const 70004
   hj = i32.load aj
@@ -574,6 +578,30 @@ block 0 (va: i64) {{
   vc = i64.load ac
   vh = call.cap 11 1 (i64) -> (i64) hj (vc)
   vr = i64.add vh va
+  return vr
+  }}
+}}
+func (i64, i64) -> (i64) {{
+block 0 (vsp: i64, varg: i64) {{
+  br 1()
+}}
+block 1 () {{
+  vp = i64.const 70100
+  vone = i32.const 1
+  vn = atomic.notify vp vone
+  vz = i32.const 0
+  vnone = i32.eq vn vz
+  br_if vnone 2() 3(vn)
+}}
+block 2 () {{
+  vq = i64.const 70200
+  vq0 = i32.const 0
+  vqt = i64.const 1000000
+  vqw = i32.atomic.wait vq vq0 vqt
+  br 1()
+}}
+block 3 (vwoke: i32) {{
+  vr = i64.extend_i32_s vwoke
   return vr
   }}
 }}
