@@ -1359,9 +1359,7 @@ impl Nursery {
             shadow,
             digest,
             image,
-            prots,
-            tail,
-            held,
+            restore,
             child: gc,
             window,
             residue,
@@ -1470,7 +1468,7 @@ impl Nursery {
                 // Its protections as captured, and the pages it held past its window (#2427); the
                 // guard follows, as on every child window.
                 let mapped = rw.len() as u64;
-                w.apply_prots(&prots, mapped, &image, &tail, held)
+                w.apply_prots(&restore.prots, mapped, &image, &restore.tail, restore.held)
             },
             // Its page map was restored with the window's (`prots` above), read-only pages and all.
             |base, mapped, reserved| match premap_apply {

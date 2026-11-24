@@ -106,7 +106,14 @@ the caller's held past it goes back (#2106, #2110, #2332). A thaw re-charges wha
 threads it re-creates, a relaunched child's lease, its regions and stores. That is past any ceiling,
 since the artifact's use was granted, but never past the process's pools: one they have no room for
 is not rebuilt (a thread or a detached child ends with `ThreadFault`; a region or a store refuses the
-thaw), and what the thaw charged for it goes back (#2318). The run's own node holds
+thaw), and what the thaw charged for it goes back (#2318). *(2026-11-24, #3100: no longer the
+whole rule. The artifact is untrusted (owner decision 16), so before anything acts a restore bounds
+the cut's windows by `mem` — each carried node's ceiling as the hook left it, and the restoring
+host's own `mem` — and its §13 regions by the restoring host's `channel`, counted by the rule the
+thaw charges by; a cut that does not fit is refused, not thawed past the ceiling. Still past any
+ceiling: the root's declared window, which the embedder chose to run (its growth is bounded), and
+what a thaw re-creates beside the windows — rebuilt pipes' `channel`, page-map runs' `maps`,
+re-created fibers' `mem`, threads' `spawn` (#3160).)* The run's own node holds
 the embedder's grant (#2113): `Limits` sets its `mem`, `channel`, `spawn` and `maps` ceilings
 (`Host::set_grant`), and a run whose embedder names none holds modest defaults, since a default must
 not let a guest crash its host (owner, #2268): 4 GiB of `mem` and of `channel`, and no `maps` ceiling

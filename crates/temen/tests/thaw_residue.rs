@@ -1802,38 +1802,51 @@ fn with_twins(root: &[u8], twin: &[u8], k: u64) -> Vec<u8> {
     })
 }
 
-/// #3100 — the two checks apart. `decode`'s running sum of heads refuses at the head that passes the
-/// room (its `need` is the heads so far, not the cut's), before the rest is decoded; `windows_fit`
-/// refuses a cut whose heads fit and whose growth does not (its `need` is every window and its
-/// growth).
+/// #3100 — the two checks apart. The root's declared window is charged past any ceiling at its
+/// activation (INVARIANTS #3), so the room is what the grant has past it. `decode`'s running sum of
+/// nested heads refuses at the head that passes that room (its `need` is the heads so far, not the
+/// cut's), before the rest is decoded; `windows_fit` refuses a cut whose heads fit and whose growth
+/// does not (its `need` is every nested window and every growth). Either leaves the host as it was.
 #[test]
 fn the_head_sum_and_the_whole_cut_refuse_apart() {
     let inst = instrument(FIBERS);
     let w = WINDOW as u64;
     let root = frozen(&inst);
-    let restore = |art: &[u8], room: u64| {
+    let restore = |art: &[u8], grant: u64| {
         let mut h = Host::new();
-        h.set_mem_grant(room as i64);
-        temen_snapshot::restore(art, &inst, &mut h).map(|_| ())
+        h.set_mem_grant(grant as i64);
+        let fresh = {
+            let mut f = Host::new();
+            f.set_mem_grant(grant as i64);
+            f.restore_footprint()
+        };
+        let got = temen_snapshot::restore(art, &inst, &mut h).map(|_| ());
+        if got.is_err() {
+            assert!(
+                h.restore_footprint() == fresh,
+                "a refusal leaves the host as it was"
+            );
+        }
+        got
     };
-    // Eight twins of a plain window: the third head passes a room of three windows less a page.
+    // Eight twins of a plain window: past the root's, the second head passes two windows less a page.
     assert_eq!(
         restore(&with_twins(&root, &root, 8), 3 * w - 4096),
         Err(RestoreError::WindowOverBudget {
-            need: 3 * w,
-            room: 3 * w - 4096
+            need: 2 * w,
+            room: 2 * w - 4096
         }),
         "the head sum"
     );
-    // A root and two twins, each grown 64 KiB: room for the three heads and one growth.
+    // A root and two twins, each grown 64 KiB: room past the root for the two heads and one growth.
     let grown = frozen_grown(&inst);
     let growth = 16 * 4096;
-    let room = 3 * w + growth;
+    let grant = 3 * w + growth;
     assert_eq!(
-        restore(&with_twins(&grown, &grown, 2), room),
+        restore(&with_twins(&grown, &grown, 2), grant),
         Err(RestoreError::WindowOverBudget {
-            need: 3 * (w + growth),
-            room
+            need: 2 * w + 3 * growth,
+            room: grant - w
         }),
         "the whole cut"
     );

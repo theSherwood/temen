@@ -108,6 +108,17 @@ fn rehead(art: &[u8], reserved_log2: u8, mapped: u64) -> Vec<u8> {
     out
 }
 
+/// The refusal of a root window of `window` bytes (its declared memory and its growth) under a `mem`
+/// grant of `grant`. The root's declared memory is what the embedder chose to run, charged past any
+/// ceiling at its activation (INVARIANTS #3), so the refusal names the growth against what the grant
+/// has left past it.
+fn over(grant: u64, window: u64) -> RestoreError {
+    RestoreError::WindowOverBudget {
+        need: window - W,
+        room: grant - W,
+    }
+}
+
 /// A refused restore leaves `h` as a fresh host is.
 fn untouched(h: &Host, what: &str) {
     assert_eq!(h.restore_footprint(), host().restore_footprint(), "{what}");
@@ -142,10 +153,14 @@ fn a_header_asking_for_2_to_the_63_is_refused_before_anything_is_allocated() {
         reserved_log2: 63,
         holder: Holder::Sparse,
     };
-    assert!(matches!(
-        restore_into(&art, &m, &mut h, wide),
-        Err(RestoreError::WindowOverBudget { .. })
-    ));
+    let hp = temen_interp::host_page_size();
+    assert_eq!(
+        restore_into(&art, &m, &mut h, wide).map(|_| ()).err(),
+        Some(over(
+            temen_interp::DEFAULT_MEM,
+            ((1u64 << 62) - W).div_ceil(hp) * hp + W
+        ))
+    );
     untouched(&h, "a wide reservation");
 }
 
@@ -159,10 +174,7 @@ fn a_far_page_is_refused_by_span_for_a_flat_holder_and_held_alone_for_a_sparse_o
     let at = (1u64 << r) - P;
     let art = far_page(at, r);
     let mut h = host();
-    let over = RestoreError::WindowOverBudget {
-        need: at + P,
-        room: temen_interp::DEFAULT_MEM,
-    };
+    let over = over(temen_interp::DEFAULT_MEM, at + P);
     assert_eq!(
         restore_with_prots(&art, &m, &mut h).map(|_| ()).err(),
         Some(over.clone()),
@@ -276,11 +288,7 @@ fn a_window_restores_under_exactly_its_budget_and_not_a_page_less() {
     let hp = temen_interp::host_page_size();
     let need = W + 16 * P;
     let art = dense(WINDOW / PAGE + 16, 20);
-    let room = need - hp;
-    assert_eq!(
-        under(&art, room),
-        Err(RestoreError::WindowOverBudget { need, room })
-    );
+    assert_eq!(under(&art, need - hp), Err(over(need - hp, need)));
     assert_eq!(under(&art, need), Ok(()));
 }
 
@@ -319,11 +327,7 @@ fn growth_past_the_span_counts_the_pages_a_running_guest_was_charged_for() {
     l.hold(W + 12 * hp, backed, None);
     let art = freeze_layout(&module(), &l, 20, &fh).expect("freeze");
     let need = W + 2 * hp;
-    let room = need - hp;
-    assert_eq!(
-        under(&art, room),
-        Err(RestoreError::WindowOverBudget { need, room })
-    );
+    assert_eq!(under(&art, need - hp), Err(over(need - hp, need)));
     assert_eq!(under(&art, need), Ok(()));
 }
 
@@ -354,10 +358,7 @@ fn a_flat_holder_is_charged_its_span_whatever_its_pages() {
         art.len()
     );
     assert_eq!(under(&art, W), Ok(()), "sparse: the pages are the region's");
-    let want = RestoreError::WindowOverBudget {
-        need: W + N * P,
-        room: W,
-    };
+    let want = over(W, W + N * P);
     let mut h = host();
     h.set_mem_grant(W as i64);
     assert_eq!(
@@ -417,4 +418,122 @@ fn a_window_reserved_at_2_to_the_41_freezes_and_restores_where_its_entry_builds_
     };
     let (_, got) = restore_into(&art, &m, &mut h, wide).expect("restores at 2^41");
     assert_eq!(got, 41);
+}
+
+/// A [`module`] whose declared memory is `1 << size_log2`.
+fn module_of(size_log2: u8) -> Module {
+    let mut m = module();
+    m.memory = Some(Memory {
+        size_log2,
+        shadow: None,
+    });
+    m
+}
+
+/// #3100 — a module that declares less than a page (`memory 10`: 1 KiB). Its head is one page, as
+/// the geometry rule lets it be (`declared <= mapped`): an honest dense artifact with bytes in page 0
+/// round-trips through both forms, and a hostile one listing page 0 is restored or refused, never a
+/// panic. (On `2d67be1` both indexed past a head sized by the declared 1 KiB.)
+#[test]
+fn a_module_declaring_less_than_a_page_round_trips() {
+    let m = module_of(10);
+    let mut window = vec![0u8; PAGE];
+    window[7] = 9;
+    let art = freeze_with_prots(&m, &window, &[PageProt::Rw], 12, &host()).expect("freeze");
+    let (w, p, _) = restore_with_prots(&art, &m, &mut host()).expect("dense restore");
+    assert_eq!((w, p), (window.clone(), vec![PageProt::Rw]));
+    let (layout, _) = restore_layout(&art, &m, &mut host()).expect("layout restore");
+    assert_eq!(layout.bytes(), &window[..], "the head is the page");
+    assert_eq!(
+        freeze_layout(&m, &layout, 12, &host()).expect("re-freeze"),
+        art
+    );
+    // A head of two pages, the second listed `Ro`: past the declared KiB, in the head span.
+    let mut window = vec![0u8; 2 * PAGE];
+    window[PAGE + 1] = 1;
+    let art =
+        freeze_with_prots(&m, &window, &[PageProt::Rw, PageProt::Ro], 13, &host()).expect("freeze");
+    let (w, p, _) = restore_with_prots(&art, &m, &mut host()).expect("restore");
+    assert_eq!((w, p), (window, vec![PageProt::Rw, PageProt::Ro]));
+}
+
+/// #3100 — the root's declared window is what the embedder chose to run: an activation charges it
+/// past any ceiling (INVARIANTS #3), so a module declaring 1 MiB runs, freezes, and restores under a
+/// grant of 64 KiB, as on main. Its growth is what the grant bounds, by what the grant has left past
+/// the declared window, as a running guest's `map` is: none here, so one host page of growth is
+/// refused; under a grant of the declared window and 64 KiB, 64 KiB of growth fits and a host page
+/// more does not.
+#[test]
+fn the_roots_declared_window_is_charged_past_the_ceiling_and_its_growth_is_not() {
+    let hp = temen_interp::host_page_size();
+    let m = module_of(20);
+    let declared = 1u64 << 20;
+    let freeze = |growth: u64| {
+        let window = vec![0u8; (declared + growth) as usize];
+        let prots = vec![PageProt::Rw; window.len() / PAGE];
+        freeze_with_prots(&m, &window, &prots, 24, &host()).expect("freeze")
+    };
+    let restore = |art: &[u8], grant: u64| {
+        let mut h = host();
+        h.set_mem_grant(grant as i64);
+        let got = restore_layout(art, &m, &mut h).map(|_| ());
+        if got.is_err() {
+            untouched(&h, "refused");
+        }
+        got
+    };
+    let small = 64 * 1024;
+    assert_eq!(
+        restore(&freeze(0), small),
+        Ok(()),
+        "the declared window alone"
+    );
+    assert_eq!(
+        restore(&freeze(hp), small),
+        Err(RestoreError::WindowOverBudget { need: hp, room: 0 }),
+        "a page of growth past a grant the declared window already passes"
+    );
+    let grant = declared + small;
+    assert_eq!(
+        restore(&freeze(small), grant),
+        Ok(()),
+        "growth under the grant"
+    );
+    assert_eq!(
+        restore(&freeze(small + hp), grant),
+        Err(RestoreError::WindowOverBudget {
+            need: small + hp,
+            room: small
+        })
+    );
+}
+
+/// #3137 — a held span with entries that are not plain: a `Backed` page in it is its region's, not
+/// held (`held_tail`), and a bare `Unmapped` one (no bytes) is held with its contents kept (#1909).
+/// The span's charge is its host pages less the `Backed` one; the window restores under exactly that
+/// and is refused one host page under.
+#[test]
+fn a_held_span_charges_its_pages_less_the_ones_a_region_holds() {
+    let hp = temen_interp::host_page_size();
+    let (fh, region) = with_region();
+    let mut l = MemLayout::from_parts(vec![0u8; WINDOW], P, W, &[]).expect("a page list");
+    let backed = PageProt::Backed {
+        region,
+        off: 0,
+        writable: true,
+    };
+    for k in 0..hp / P {
+        l.hold(W + 4 * hp + k * P, backed, None);
+        l.hold(W + 8 * hp + k * P, PageProt::Unmapped, None);
+    }
+    let art = rehead(
+        &freeze_layout(&module(), &l, 20, &fh).expect("freeze"),
+        20,
+        W + 16 * hp,
+    );
+    let (layout, _) = restore_layout(&art, &module(), &mut host()).expect("restore");
+    assert_eq!(layout.page_map().held_span(), W..W + 16 * hp);
+    let need = W + 15 * hp;
+    assert_eq!(under(&art, need - hp), Err(over(need - hp, need)));
+    assert_eq!(under(&art, need), Ok(()));
 }

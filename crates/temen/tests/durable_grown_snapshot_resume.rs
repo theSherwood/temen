@@ -213,7 +213,9 @@ fn a_grown_durable_guest_survives_freeze_serialize_restore_resume() {
 
     // A fresh backing sized to the restored reservation, pre-filled with the restored window image
     // (grown pages included). Leaked for the run's life; `Region::shared` borrows it.
-    // As `temen_durable_thaw_resume` builds it (#3100): a growable backing of the restored image's
+    // As `temen_durable_thaw_resume` builds it (#3100) — a copy of that entry's body, not a call to it
+    // (it is the browser's wasm32 FFI), so this row cannot see that entry regress; it pins that the
+    // bytecode resume runs over a growable backing of the image's length: a growable backing of the restored image's
     // length, not the artifact's reservation; past it the window grows by `map`, charged first.
     let back = Arc::new(Region::growable(rwin.len() as u64, PAGE as u64).expect("a backing"));
     back.write_from(0, &rwin);

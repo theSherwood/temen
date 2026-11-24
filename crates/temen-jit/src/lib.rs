@@ -2338,14 +2338,9 @@ pub struct CapturedSeed {
     pub digest: [u8; 32],
     /// Its restored window image.
     pub image: Vec<u8>,
-    /// Its restored page map over `image`, one entry per [`DURABLE_SNAPSHOT_PAGE`] (#1733); empty
-    /// when no page deviates from a fresh window's.
-    pub prots: Vec<WindowProt>,
-    /// #2427 — and each page it holds past `image`.
-    pub tail: Vec<TailPage>,
-    /// #3137 — and the committed span it holds past its declared window as one run
-    /// ([`WindowRestore::held`]).
-    pub held: core::ops::Range<u64>,
+    /// How its window restores over `image` (#1733, #2427, #3137): its page map, the pages it holds
+    /// past `image`, and its held span ([`WindowRestore`]).
+    pub restore: WindowRestore,
     /// Its restored powerbox, as a builder fills it: two counted refs (`ctx`, `retained_ctx`).
     pub child: GrantChild,
     /// #1971 — the lease its window was charged under, as the spawn filed it: the parent's handle on

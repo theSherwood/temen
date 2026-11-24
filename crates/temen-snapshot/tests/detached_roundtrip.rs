@@ -701,6 +701,11 @@ fn a_detached_childs_window_is_held_to_its_carried_nodes_ceiling() {
     let cb = chost
         .resolve_cap_name("budget")
         .expect("the child's budget");
+    // An empty grant under the name first: the child's `"budget"` is the first that is not one
+    // (`Host::resolve_cap_name`), on its relaunch and on the restore's bound alike.
+    launch
+        .names
+        .push(("budget".to_string(), temen_interp::GRANT_EMPTY as i32));
     launch.names.push(("budget".to_string(), cb));
     children(&mut host, vec![1, 1]);
     host.set_captured_detached(vec![CapturedDetached {

@@ -9490,6 +9490,7 @@ pub extern "C" fn temen_durable_thaw_resume(
     };
     let back = std::sync::Arc::new(back);
     back.write_from(0, &rwin);
+    drop(rwin); // the backing holds it now: one copy of the span, not two
     // A §13 region page (`Backed`) needs the region re-aliased, which this byte-backed resume
     // doesn't do — refuse it rather than resume over a private copy.
     let Some(entries) = rprots

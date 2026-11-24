@@ -1801,7 +1801,7 @@ fn relaunch_payload(host: &mut Host, l: temen_interp::LiveDetached) -> temen_jit
         return temen_jit::JitDetached::Dropped;
     };
     // A thawed child's window is always a whole window, never a seed.
-    let temen_jit::WindowRestore { prots, tail, held } = jit_restore(&window).unwrap_or_default();
+    let restore = jit_restore(&window).unwrap_or_default();
     // A thaw never re-launches a demand-paged child on this engine (#2438).
     let child = grant_child(host, child, 0, 0, None);
     temen_jit::JitDetached::Relaunch(Box::new(temen_jit::CapturedSeed {
@@ -1815,9 +1815,7 @@ fn relaunch_payload(host: &mut Host, l: temen_interp::LiveDetached) -> temen_jit
             .unwrap_or(temen_ir::durable_abi::ShadowArena::EMPTY),
         digest: launch.digest,
         image: window.bytes().to_vec(),
-        prots,
-        tail,
-        held,
+        restore,
         child,
         window: window_lease.map(|l| (l.budget, l.bytes, l.runs)),
         residue,

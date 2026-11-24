@@ -1089,11 +1089,8 @@ fn a_real_runs_growth_restores_under_exactly_the_grant_it_ran_under() {
         interp_run(&m, 0, &[Value::I32(ih)], &image, reserved, &mut h)
     };
     let (short, _) = run(grant - hp);
-    assert_ne!(
-        short,
-        Ok(vec![Value::I64(0)]),
-        "a page short, the run's map is refused"
-    );
+    // A page short, the run's `map` is refused (`-ENOMEM`), so the store after it faults.
+    assert_eq!(short, Err(temen_interp::Trap::MemoryFault), "a page short");
     let (ran, layout) = run(grant);
     assert_eq!(
         ran,
@@ -1108,9 +1105,11 @@ fn a_real_runs_growth_restores_under_exactly_the_grant_it_ran_under() {
     };
     assert_eq!(
         restore(grant - hp).map(|_| ()),
+        // The root's declared window is charged past any ceiling (INVARIANTS #3): its growth against
+        // what the grant has past it.
         Err(temen_snapshot::RestoreError::WindowOverBudget {
-            need: grant,
-            room: grant - hp
+            need: grant - WINDOW as u64,
+            room: grant - hp - WINDOW as u64
         })
     );
     let restored = restore(grant).expect("restores under exactly its grant");
