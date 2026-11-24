@@ -297,12 +297,15 @@ fn gc_roots_buffer_past_the_window_is_a_memory_fault() {
     ));
 }
 
-/// #3170 — a heap range past the window reports no word past it. The range is window offsets
-/// (GC.md §3); the JIT scans raw native stack words, and filtered them by the guest's `heap_hi`
-/// alone, so `[0, -1)` handed the guest host return addresses and pointers. The root resumes a
-/// fiber that suspends (a parked stack to scan), asks for up to 256 roots in `[0, -1)`, and returns
-/// the count it got and the largest word written: below the window's reservation on the JIT, and
-/// the tree-walker, which scans guest values, takes the same range.
+/// #3170 — a heap range past the window reports no word at or above the window's reservation.
+/// The range is window offsets (GC.md §3); the JIT scans raw native stack words, and filtered them
+/// by the guest's `heap_hi` alone, so `[0, -1)` handed the guest host return addresses and
+/// pointers. The root resumes a fiber that suspends (a parked stack to scan), asks for up to 256
+/// roots in `[0, -1)`, and returns the count it got and the largest word written: below the
+/// reservation on the JIT, and the tree-walker, which scans guest values, takes the same range.
+/// The count is at most 256, so the buffer holds every word found, the large ones included (the
+/// op writes the smallest). This pins the clamp only: a host word below the reservation, which
+/// some hosts' layouts allow, is in range and this row cannot tell it from a root.
 #[cfg(any(
     all(unix, target_arch = "x86_64"),
     all(unix, target_arch = "aarch64"),
@@ -371,6 +374,7 @@ block 0 (v0: i64, v1: i64) {
         JitOutcome::Returned(v) => {
             let (n, max) = (v[0], v[1] as u64);
             assert!(n >= 1, "the fiber's root is found (count {n})");
+            assert!(n <= 256, "every word found is in the buffer (count {n})");
             assert!(
                 max < window,
                 "a reported word {max:#x} is past the window ({window:#x})"

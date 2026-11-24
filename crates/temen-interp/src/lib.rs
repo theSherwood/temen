@@ -6580,7 +6580,10 @@ impl PageSink {
 
     /// The sink for a recoverable fault in `child`: the page at child-relative `page`, `len` bytes of
     /// it (one host page, or less when the window is smaller), with the fault address `off` into it.
-    pub fn new(child: Box<dyn ChildWindow>, page: u64, len: u64, off: u64) -> PageSink {
+    ///
+    /// Private to this crate (#3166): an embedder's sink is a JIT window's, built only through
+    /// [`JitPaging::sink`], which stops its writes at the child's teardown.
+    pub(crate) fn new(child: Box<dyn ChildWindow>, page: u64, len: u64, off: u64) -> PageSink {
         PageSink {
             child,
             page,

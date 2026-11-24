@@ -1255,7 +1255,8 @@ fn paged_child_with(body: &str, parent: &str, funcs: &str) -> String {
 /// then polls until it has served both: `42 + 2 serves * 1000`, on every backend. (It polls: a
 /// `svc.wait` once the child is joined answers `0` while nothing is queued, #1217.) The child's end once withdrew its
 /// requests at the root's return: the vCPU's next request was refused, a `MemoryFault` in place of
-/// its page, and one already filed was dropped without a wake.
+/// its page, and one already filed was dropped without a wake, so the parent polled forever. The
+/// run's fuel ends such a run (`OutOfFuel`), well inside the harness's bound.
 #[test]
 fn a_paged_childs_vcpu_is_served_after_its_root_returns() {
     let src = paged_child_with(
@@ -1287,8 +1288,20 @@ block 2 () {
 }
 ",
     );
+    let cfg = || RunConfig {
+        limits: temen_run::Limits {
+            fuel: Some(FUEL),
+            ..temen_run::Limits::default()
+        },
+        ..RunConfig::default()
+    };
+    const FUEL: u64 = 200_000_000;
     for b in BACKENDS {
-        assert_eq!(run_detached(b, &src).expect("run"), 2042, "{b:?}");
+        assert_eq!(
+            run_detached_with(b, &src, 1 << 20, cfg()).expect("run"),
+            2042,
+            "{b:?}"
+        );
     }
 }
 

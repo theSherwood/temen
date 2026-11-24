@@ -2323,10 +2323,13 @@ pub(crate) unsafe extern "C" fn gc_roots(vm: u64, args: *const GcRootsArgs) -> i
     // The window the buffer is confined to (#826: the **reserved** span bounds it), from the context.
     let w = *crate::VmCtx::at(vm).window();
     let (mem_base, mask, mapped) = (w.base as u64, w.reserved.saturating_sub(1), w.reserved);
-    // #3170 — the heap range is window offsets (GC.md §3): the scan reads raw native stack words,
-    // so the guest's own `heap_hi` alone would let `-1` admit host return addresses and pointers.
-    // Clamped to the window, as no trap: the interpreters scan guest values only and take any
-    // `heap_hi`, and a word past the window is no guest heap pointer.
+    // #3170 — the heap range is window offsets (GC.md §3), so it is clamped to the window: no
+    // reported word is at or above the reservation, as none of a guest heap pointer is. The
+    // interpreters take any `heap_hi`, so a clamp, not a trap. The scan reads raw native stack
+    // words, so this filters by value only: it keeps out every host address above the
+    // reservation, which is all of them where the host maps its image, stacks and heap high (a
+    // PIE build on Linux x86-64), but not one below it (as macOS arm64 can place them). That
+    // residual stays open on #3170.
     let heap_hi = heap_hi.min(mapped);
     let rt = current();
     if rt.is_null() {
