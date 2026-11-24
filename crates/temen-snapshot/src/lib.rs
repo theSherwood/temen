@@ -555,15 +555,34 @@ pub enum RestoreError {
     /// descriptor pool refused it, or its memory could not be had. Carries the errno. Nothing is
     /// restored: a thaw never runs without a region its artifact names.
     RegionRefused(i64),
-    /// #3100 — the restoring domain's memory does not cover the windows (and §13 regions) the cut
-    /// holds: `need` bytes against `room`, on the restoring host's own node or a carried node's
-    /// attenuated ceiling. A running guest under that budget could not have held them. `room == 0`
-    /// with a flat holder ([`Restoring::flat`]) is also the allocator refusing its dense buffer.
+    /// #3100 — the restoring domain's budget does not cover what the cut holds: `need` bytes
+    /// against `room`. Its windows (each declared window and its growth, as a running guest is
+    /// charged for it) against `mem` — the restoring host's own node and each carried node's ceiling
+    /// as the hook left it — or its §13 regions against the restoring host's `channel`. A running
+    /// guest under that budget could not have held them.
     WindowOverBudget { need: u64, room: u64 },
     /// #3100 — a window's reservation is larger than the one the restoring host builds it in: the
     /// root's, the one its entry passes ([`Restoring::reserved_log2`]); a detached child's, its lease's
     /// ([`temen_ir::window_reserved_log2`] of its declared memory); a fork twin's, its parent's.
     ReservationRefused { asked: u8, granted: u8 },
+    /// #3100 — a dense holder's image of `span` bytes ([`Holder::Dense`]) fits the budget, but this
+    /// host's allocator cannot supply it. Its own error: the budget answered yes.
+    DenseUnallocated { span: u64 },
+}
+
+/// #3100 — how the restoring host holds the root's window ([`Restoring::holder`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Holder {
+    /// The window as it was held: its declared bytes, the pages it holds past them, and its head
+    /// past them as one span ([`MemLayout`]). Charged what a running guest is charged for it.
+    Sparse,
+    /// A [`MemLayout`] the holder lays into one buffer through its [`span`](MemLayout::span) (a
+    /// reactor's window). Every page of the span is held, so the window is charged by it: a far page
+    /// with holes below it is refused, not materialised.
+    Flat,
+    /// [`Flat`](Self::Flat), with the buffer this restore fills: the dense image and its protections
+    /// ([`Window::Dense`]), reserved before anything is written to the host.
+    Dense,
 }
 
 /// #3100 — how the restoring host holds the root's window, which bounds what a restore accepts.
@@ -572,22 +591,27 @@ pub struct Restoring {
     /// The reservation (log2) the restoring host builds the root's window in: an artifact asking
     /// for more is `ReservationRefused`.
     pub reserved_log2: u8,
-    /// A **flat** holder: one buffer through the last page the window holds, every page of it held
-    /// (the dense form, [`MemLayout::to_dense`], or a reactor sized by [`MemLayout::span`]). Its
-    /// window is charged by that span, so a far page with holes below it is refused, not
-    /// materialised.
-    pub flat: bool,
+    pub holder: Holder,
 }
 
 impl Restoring {
     /// The reservation every entry that names none builds `module`'s window in
-    /// ([`temen_ir::window_reserved_log2`]), held sparsely.
-    pub fn of(module: &Module) -> Restoring {
+    /// ([`temen_ir::window_reserved_log2`]), held as `holder` says.
+    pub fn of(module: &Module, holder: Holder) -> Restoring {
         Restoring {
             reserved_log2: temen_ir::window_reserved_log2(declared_log2(module)),
-            flat: false,
+            holder,
         }
     }
+}
+
+/// #3100 — a restored root window, in the form its [`Holder`] asked for.
+pub enum Window {
+    /// [`Holder::Sparse`] and [`Holder::Flat`].
+    Layout(MemLayout),
+    /// [`Holder::Dense`]: the image through the last page the window holds, and one protection per
+    /// [`PAGE`] of it.
+    Dense(Vec<u8>, Vec<PageProt>),
 }
 
 /// The log2 of `module`'s declared memory (`0` for none).
@@ -1812,19 +1836,27 @@ pub fn restore_layout(
     module: &Module,
     host: &mut Host,
 ) -> Result<(MemLayout, u8), RestoreError> {
-    restore_into(artifact, module, host, Restoring::of(module))
+    match restore_into(
+        artifact,
+        module,
+        host,
+        Restoring::of(module, Holder::Sparse),
+    )? {
+        (Window::Layout(layout), reserved_log2) => Ok((layout, reserved_log2)),
+        (Window::Dense(..), _) => unreachable!("a sparse holder's window is a layout"),
+    }
 }
 
-/// #3100 — [`restore_layout`] for a host that holds the root's window as `restoring` says: in a
-/// reservation other than the default (a run frozen at one), or flat. The one restore every other
-/// entry is a shorthand for.
+/// #3100 — restore `artifact` for a host that holds the root's window as `restoring` says: in a
+/// reservation other than the default (a run frozen at one), sparse, flat or dense. The one restore
+/// [`restore_layout`], [`restore_with_prots`] and [`restore`] are shorthands for.
 pub fn restore_into(
     artifact: &[u8],
     module: &Module,
     host: &mut Host,
     restoring: Restoring,
-) -> Result<(MemLayout, u8), RestoreError> {
-    restore_cut(artifact, module, host, restoring, false).map(|(layout, r, _)| (layout, r))
+) -> Result<(Window, u8), RestoreError> {
+    restore_cut(artifact, module, host, restoring)
 }
 
 /// [`restore`] that also recovers the per-page protection map (§12.3) and the mask-domain
@@ -1834,8 +1866,8 @@ pub fn restore_into(
 /// a thaw rebuilds its `Mem` with the same mask domain (its future `vm_map` growth bound), not just
 /// the current extent. Re-applying `prots` to the runtime window is the escape-TCB restore step.
 ///
-/// The **dense** form ([`freeze_with_prots`], [`MemLayout::to_dense`]): the image runs through the
-/// last page the window holds, so a page between two it holds past the declared memory reads as an
+/// The **dense** form ([`freeze_with_prots`], [`Holder::Dense`]): the image runs through the last
+/// page the window holds, so a page between two it holds past the declared memory reads as an
 /// `Unmapped` zero one — the image a flat window, which holds its whole buffer, thaws from.
 /// [`restore_layout`] keeps the window as it was held (#2427).
 pub fn restore_with_prots(
@@ -1843,14 +1875,10 @@ pub fn restore_with_prots(
     module: &Module,
     host: &mut Host,
 ) -> Result<(Vec<u8>, Vec<PageProt>, u8), RestoreError> {
-    let restoring = Restoring {
-        flat: true,
-        ..Restoring::of(module)
-    };
-    let (layout, reserved_log2, dense) = restore_cut(artifact, module, host, restoring, true)?;
-    let (bytes, prots) = dense.expect("a dense restore reserves its buffers");
-    let (window, prots) = layout.dense_into(bytes, prots);
-    Ok((window, prots, reserved_log2))
+    match restore_into(artifact, module, host, Restoring::of(module, Holder::Dense))? {
+        (Window::Dense(window, prots), reserved_log2) => Ok((window, prots, reserved_log2)),
+        (Window::Layout(_), _) => unreachable!("a dense holder's window is dense"),
+    }
 }
 
 /// #2941 — what the depth-0 restore decodes once for its whole cut, which every artifact in it names
@@ -1863,9 +1891,10 @@ struct DecodeCut {
     regions_reached: Vec<bool>,
     budgets: Vec<DurableBudget>,
     reached: Vec<bool>,
-    /// #3100 — what the restoring host's own node has left ([`Host::mem_room`]), and the declared
-    /// heads `decode` has allocated so far against it: the number of nested domains is the artifact's.
-    room: Option<u64>,
+    /// #3100 — the `mem` and `channel` the restoring host's own node has left
+    /// ([`Host::restore_room`]), and the declared heads `decode` has allocated so far against its
+    /// `mem`: the number of nested domains is the artifact's.
+    room: (Option<u64>, Option<u64>),
     heads: u64,
 }
 
@@ -1882,19 +1911,9 @@ struct Decoded {
     reserved_log2: u8,
     /// The module's declared memory: the window's head.
     declared: u64,
-    window: Vec<u8>,
-    prots: Vec<PageProt>,
-    /// The artifact's head (its header's `mapped`): `[declared, held_to)` is committed, held as one
-    /// span (#3137).
-    held_to: u64,
-    /// Each page listed past the declared window, the held span's included.
-    tail: Vec<(u64, PageProt, Option<Vec<u8>>)>,
-    /// #3100 — what the window holds past its declared memory, as a running guest is charged for it
-    /// ([`temen_interp::PageMap::grown_bytes`]), held sparsely and held flat (every page through
-    /// `span`, the end of the last page it holds).
-    growth: u64,
-    flat_growth: u64,
-    span: u64,
+    /// The window as it was held: its declared head, each page listed past it, and the artifact's
+    /// head past it as one span (#3137). Its §13 pages still name the artifact's region numbers.
+    layout: MemLayout,
     generations: Vec<u32>,
     handles: Vec<DurableHandle>,
     pipes: Vec<DurablePipe>,
@@ -1971,16 +1990,14 @@ impl Drop for Lent<'_> {
 /// then [`apply`], which cannot fail. On `Err` the restoring host holds what it held (#2941): only
 /// `grant` and `apply` take it `&mut`, and what `grant` takes from it goes back on every path (its
 /// hooks, by [`Lent`] and their own take-and-put; a region's charge, by its backing's `Drop`).
-#[allow(clippy::type_complexity)]
 fn restore_cut(
     artifact: &[u8],
     module: &Module,
     host: &mut Host,
     restoring: Restoring,
-    dense: bool,
-) -> Result<(MemLayout, u8, Option<(Vec<u8>, Vec<PageProt>)>), RestoreError> {
+) -> Result<(Window, u8), RestoreError> {
     let mut cut = DecodeCut {
-        room: host.mem_room(),
+        room: host.restore_room(),
         ..DecodeCut::default()
     };
     let decoded = decode(
@@ -2006,12 +2023,12 @@ fn restore_cut(
     let granted = grant(&decoded, host, Some(&mut cut.budgets))?;
     // #3100 — every window and region of the cut, against the ceilings the hook left and the room
     // the restoring host's own node has. A read, before the one step that acts.
-    windows_fit(&decoded, &cut, restoring.flat)?;
-    // A dense holder's buffers, reserved fallibly now, before any host write; `apply`'s caller fills
-    // them.
-    let dense = match dense {
-        false => None,
-        true => Some(reserve_dense(decoded.span)?),
+    let flat = restoring.holder != Holder::Sparse;
+    windows_fit(&decoded, &cut, flat)?;
+    // A dense holder's buffers, reserved now, before any host write; filled once `apply` has run.
+    let dense = match restoring.holder {
+        Holder::Dense => Some(reserve_dense(decoded.layout.span())?),
+        Holder::Sparse | Holder::Flat => None,
     };
     // #2306 — last of what can refuse: a region's backing is charged to the restoring domain's node
     // and may be an OS object. One rebuilt before a refusal is dropped with the `Vec`, which refunds
@@ -2029,16 +2046,22 @@ fn restore_cut(
         .expect("decode_budgets: each parent numbers below its child");
     let live = LiveCut { ids, regions };
     let (layout, reserved_log2) = apply(decoded, granted, host, &live);
-    Ok((layout, reserved_log2, dense))
+    let window = match dense {
+        None => Window::Layout(layout),
+        Some((bytes, prots)) => {
+            let (bytes, prots) = layout
+                .dense_into(bytes, prots)
+                .expect("reserved for its span");
+            Window::Dense(bytes, prots)
+        }
+    };
+    Ok((window, reserved_log2))
 }
 
 /// #3100 — the buffers of a dense image `span` bytes long, reserved and not yet written:
-/// `WindowOverBudget` with `room == 0` when the allocator cannot supply them.
+/// `DenseUnallocated` when the allocator cannot supply them.
 fn reserve_dense(span: u64) -> Result<(Vec<u8>, Vec<PageProt>), RestoreError> {
-    let refused = RestoreError::WindowOverBudget {
-        need: span,
-        room: 0,
-    };
+    let refused = RestoreError::DenseUnallocated { span };
     let len = usize::try_from(span).map_err(|_| refused.clone())?;
     let (mut bytes, mut prots) = (Vec::new(), Vec::new());
     bytes.try_reserve_exact(len).map_err(|_| refused.clone())?;
@@ -2046,30 +2069,44 @@ fn reserve_dense(span: u64) -> Result<(Vec<u8>, Vec<PageProt>), RestoreError> {
     Ok((bytes, prots))
 }
 
-/// #3100 — whether the cut's windows and §13 regions fit the memory their thaws hold them under.
-/// Each domain is charged its declared window and its growth ([`Decoded::growth`]; the root's held
-/// flat, [`Decoded::flat_growth`], when `flat`), to its node and every node above it: the root's is
-/// the restoring host's own, a detached child's the carried node its `"budget"` names (its spawner's
-/// when it names none, as its relaunch keeps it), a fork twin's its parent's. Every carried node's sum
-/// is bounded by its MEM ceiling as the hook left it, and the whole cut's, regions included, by the
-/// room of the restoring host's own node, under which every carried node is minted. The thaw charges
-/// a restored window past those ceilings (`Fits::Pool`), or not at all (a child's rides its carried
-/// node's `used`, #3149), so this is the one place a ceiling meets restored memory.
+/// #3100 — what a domain's window holds past its declared memory, in this host's pages: what its
+/// running guest was charged for it ([`temen_interp::PageMap::grown_bytes`], the rule the thaw
+/// charges by). `flat`: every page through the window's [`span`](MemLayout::span), which a flat
+/// holder's buffer holds whatever the pages' state.
+fn growth(layout: &MemLayout, declared: u64, flat: bool) -> u64 {
+    match flat {
+        false => layout.page_map().grown_bytes(),
+        true => {
+            let page = temen_interp::host_page_size();
+            layout.span().saturating_sub(declared).div_ceil(page) * page
+        }
+    }
+}
+
+/// #3100 — whether the cut's windows and §13 regions fit the budgets their thaws hold them under.
+///
+/// Each domain's window is charged its declared memory and its [`growth`] (the root's held flat
+/// when `flat`) to its node: the root's is the restoring host's own, a detached child's the carried
+/// node its `"budget"` names (its spawner's when it names none, as its relaunch keeps it), a fork
+/// twin's its parent's. One pass up the carried nodes (each parent numbers below its child) gives
+/// each node its subtree's sum, bounded by its `mem` ceiling as the hook left it; the whole cut's is
+/// bounded by the `mem` the restoring host's own node has, under which every carried node is minted.
+/// The cut's §13 regions are charged `channel` to the restoring host's own node, so their bytes are
+/// bounded by its `channel`. A thaw charges a restored window past every ceiling (`Fits::Pool`), or
+/// not at all (a child's rides its carried node's `used`, #3149), and a region's rebuild past them
+/// too, so this is the one place a ceiling meets restored memory.
 fn windows_fit(d: &Decoded, cut: &DecodeCut, flat: bool) -> Result<(), RestoreError> {
     let budgets = &cut.budgets;
-    let index = |key: u32| budgets.iter().position(|b| b.key == key);
     let mut sums = vec![0u64; budgets.len()];
-    let mut total: u64 = cut.regions.iter().map(|r| r.len() as u64).sum();
-    // Depth first, with each domain's node.
+    let mut total = 0u64;
     let mut stack: Vec<(&Decoded, Option<usize>, bool)> = vec![(d, None, flat)];
     while let Some((d, node, flat)) = stack.pop() {
-        let growth = if flat { d.flat_growth } else { d.growth };
-        let charge = d.declared.saturating_add(growth);
+        let charge = d
+            .declared
+            .saturating_add(growth(&d.layout, d.declared, flat));
         total = total.saturating_add(charge);
-        let mut at = node;
-        while let Some(i) = at {
+        if let Some(i) = node {
             sums[i] = sums[i].saturating_add(charge);
-            at = budgets[i].parent.and_then(index);
         }
         let parts = d.thaw.parts();
         for l in &parts.live_detached {
@@ -2088,25 +2125,32 @@ fn windows_fit(d: &Decoded, cut: &DecodeCut, flat: bool) -> Result<(), RestoreEr
             stack.push((&t.payload.domain, node, false));
         }
     }
-    for (b, &need) in budgets.iter().zip(&sums) {
-        if b.ceiling.mem >= 0 && need > b.ceiling.mem as u64 {
+    for i in (0..budgets.len()).rev() {
+        let need = sums[i];
+        let ceiling = budgets[i].ceiling.mem;
+        if ceiling >= 0 && need > ceiling as u64 {
             return Err(RestoreError::WindowOverBudget {
                 need,
-                room: b.ceiling.mem as u64,
+                room: ceiling as u64,
             });
         }
+        if let Some(p) = budgets[i].parent {
+            sums[p as usize] = sums[p as usize].saturating_add(need);
+        }
     }
-    match cut.room {
-        Some(room) if total > room => Err(RestoreError::WindowOverBudget { need: total, room }),
+    let regions: u64 = cut.regions.iter().map(|r| r.len() as u64).sum();
+    let over = |need: u64, room: Option<u64>| match room {
+        Some(room) if need > room => Err(RestoreError::WindowOverBudget { need, room }),
         _ => Ok(()),
-    }
+    };
+    over(total, cut.room.0)?;
+    over(regions, cut.room.1)
 }
 
 /// #2941 — decode and check one domain's artifact at detached-nesting `depth` (0 for the artifact an
 /// embedder handed in), for a domain whose root runs in shadow context `root_ctx` (`0`, or a fork
 /// twin's forking context), and every artifact nested in it. Pure: `host` is read for the module
 /// grants an artifact names, and nothing is written but `cut`.
-#[allow(clippy::too_many_arguments)]
 fn decode(
     artifact: &[u8],
     module: &Module,
@@ -2171,7 +2215,7 @@ fn decode(
     // #3100 — the declared head is the module's size, but how many of them the cut holds is the
     // artifact's: each counts against the restoring host's room before it is allocated.
     cut.heads = cut.heads.saturating_add(declared);
-    if let Some(room) = cut.room.filter(|&room| cut.heads > room) {
+    if let Some(room) = cut.room.0.filter(|&room| cut.heads > room) {
         return Err(RestoreError::WindowOverBudget {
             need: cut.heads,
             room,
@@ -2198,9 +2242,6 @@ fn decode(
     let mut window = vec![0u8; head];
     let mut prots = vec![PageProt::Rw; head / PAGE];
     let mut tail: Vec<(u64, PageProt, Option<Vec<u8>>)> = Vec::new();
-    // Pages past the declared window: `Backed` ones in the held span and past it, and held ones past
-    // the span (#1909: `Rw`, `Ro`, or `Unmapped` with its contents kept; an alias is its region's).
-    let (mut span_backed, mut backed, mut held_past) = (0u64, 0u64, 0u64);
     let mut w = Reader::new(win_body);
     let n_pages = w.uleb()?;
     let mut floor = 0u64;
@@ -2263,23 +2304,18 @@ fn decode(
             }
             continue;
         }
-        match (prot, off < mapped) {
-            (PageProt::Backed { .. }, span) => {
-                backed += 1;
-                span_backed += span as u64;
-            }
-            (_, false) => held_past += 1,
-            (_, true) => {}
-        }
         tail.push((off, prot, bytes.map(<[u8]>::to_vec)));
     }
     if !w.at_end() {
         return Err(RestoreError::Malformed);
     }
-    let page = PAGE as u64;
-    let span = mapped.max(floor);
-    let growth = (mapped - declared - span_backed * page).saturating_add(held_past * page);
-    let flat_growth = span - declared - backed * page;
+    // The window as it was held, as large as the bytes the artifact carries: what [`windows_fit`]
+    // charges by the rule the thaw charges by.
+    let mut layout = MemLayout::from_dense(window, &prots, declared);
+    layout.hold_span(mapped);
+    for (off, prot, bytes) in tail {
+        layout.hold(off, prot, bytes);
+    }
 
     // ---- Handle table: decode and bounds-check. ----
     let mut hr = Reader::new(handles_body);
@@ -2552,13 +2588,7 @@ fn decode(
     Ok(Decoded {
         reserved_log2,
         declared,
-        window,
-        prots,
-        held_to: mapped,
-        tail,
-        growth,
-        flat_growth,
-        span,
+        layout,
         generations,
         handles,
         pipes,
@@ -2617,14 +2647,8 @@ fn grant(
 fn apply(d: Decoded, g: Grant, host: &mut Host, live: &LiveCut) -> (MemLayout, u8) {
     let Decoded {
         reserved_log2,
-        declared,
-        window,
-        mut prots,
-        held_to,
-        mut tail,
-        growth: _,
-        flat_growth: _,
-        span: _,
+        declared: _,
+        mut layout,
         generations,
         mut handles,
         pipes,
@@ -2659,11 +2683,7 @@ fn apply(d: Decoded, g: Grant, host: &mut Host, live: &LiveCut) -> (MemLayout, u
             }
         }
     }
-    for p in prots.iter_mut().chain(tail.iter_mut().map(|t| &mut t.1)) {
-        if let PageProt::Backed { region, .. } = p {
-            *region = region_ids[region];
-        }
-    }
+    layout.renumber_regions(|region| region_ids[&region]);
     host.restore_durable_handles(&generations, &handles);
     if let Some((region, off, badge)) = end {
         host.restore_end_post(region_ids[&region], off, badge);
@@ -2710,12 +2730,6 @@ fn apply(d: Decoded, g: Grant, host: &mut Host, live: &LiveCut) -> (MemLayout, u
         },
     );
     host.set_thaw(thaw);
-    // The window: its head under the module's declared memory, then each page it holds past it.
-    let mut layout = MemLayout::from_dense(window, &prots, declared);
-    layout.hold_span(held_to);
-    for (off, prot, bytes) in tail {
-        layout.hold(off, prot, bytes);
-    }
     (layout, reserved_log2)
 }
 

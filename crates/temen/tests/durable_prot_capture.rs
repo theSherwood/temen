@@ -959,10 +959,18 @@ block 0 () {
   return vone
   }
 }
+func () -> (i64) {
+block 0 () {
+  vun = i64.const 176128
+  vl = i64.load vun
+  return vl
+  }
+}
 ";
 
 #[test]
 fn a_held_span_thaws_on_every_engine_as_the_frozen_window_held_it() {
+    use temen_interp::Trap;
     let m = temen_text::parse_module(SPAN_SRC).expect("parse");
     temen_verify::verify_module(&m).expect("verify");
     let reserved = 20;
@@ -971,6 +979,7 @@ fn a_held_span_thaws_on_every_engine_as_the_frozen_window_held_it() {
     let mut prots = vec![PageProt::Rw; pages];
     window[40 * PAGE] = 0x77; // the marker, in the span
     prots[41] = PageProt::Ro; // listed in the span
+    prots[43] = PageProt::Unmapped; // listed in the span, protected to nothing
     let art = freeze_with_prots(&m, &window, &prots, reserved, &Host::new()).expect("freeze");
     let (restored, _) =
         temen_snapshot::restore_layout(&art, &m, &mut Host::new()).expect("restore");
@@ -985,11 +994,28 @@ fn a_held_span_thaws_on_every_engine_as_the_frozen_window_held_it() {
     );
     let want = 0x77 + 5; // the marker, a zero page, then what was stored in it
 
+    // The tree-walker, and a round trip through it: the window it leaves, frozen and restored again,
+    // is the frozen window with the guest's store in it. (Its capture holds the span page by page, as
+    // a running window does, so its artifact is the sparse canonical form, not the dense one.)
     let mut h = Host::new();
-    let (r, _) = interp_run(&m, 0, &[], &restored, reserved, &mut h);
+    let (r, left) = interp_run(&m, 0, &[], &restored, reserved, &mut h);
     assert_eq!(r, Ok(vec![Value::I64(want)]), "the tree-walker");
-    let (r, _) = interp_run(&m, 1, &[], &restored, reserved, &mut Host::new());
-    assert!(r.is_err(), "the tree-walker keeps the Ro page: {r:?}");
+    let again = temen_snapshot::freeze_layout(&m, &left, reserved, &h).expect("re-freeze");
+    let (back, _) = temen_snapshot::restore_layout(&again, &m, &mut Host::new()).expect("restore");
+    let mut stored = window.clone();
+    stored[42 * PAGE] = 5;
+    // Past the declared window (below it the engine's capture adds its NULL guard, #964).
+    let (bytes, got) = back.to_dense();
+    let at = WINDOW / PAGE;
+    assert!(
+        bytes[WINDOW..] == stored[WINDOW..],
+        "the engine round trip: the span's bytes"
+    );
+    assert_eq!(got[at..], prots[at..], "and its protections");
+    for (entry, trap) in [(1, Trap::MemoryFault), (2, Trap::MemoryFault)] {
+        let (r, _) = interp_run(&m, entry, &[], &restored, reserved, &mut Host::new());
+        assert_eq!(r, Err(trap), "the tree-walker, entry {entry}");
+    }
 
     let reactor = || {
         let mut r = temen_interp::bytecode::Reactor::open(&m).expect("open");
@@ -1002,10 +1028,13 @@ fn a_held_span_thaws_on_every_engine_as_the_frozen_window_held_it() {
         Ok(vec![Value::I64(want)]),
         "the bytecode engine"
     );
-    assert!(
-        reactor().call(1, &[], &mut fuel, &mut Host::new()).is_err(),
-        "the bytecode engine keeps the Ro page"
-    );
+    for entry in [1, 2] {
+        assert_eq!(
+            reactor().call(entry, &[], &mut fuel, &mut Host::new()),
+            Err(Trap::MemoryFault),
+            "the bytecode engine, entry {entry}"
+        );
+    }
 
     if !temen_jit::fiber_supported() {
         return;
@@ -1021,8 +1050,84 @@ fn a_held_span_thaws_on_every_engine_as_the_frozen_window_held_it() {
         temen_jit::JitOutcome::Returned(vec![want]),
         "the JIT"
     );
-    assert!(
-        matches!(jit(1), temen_jit::JitOutcome::Trapped(_)),
-        "the JIT keeps the Ro page"
+    for entry in [1, 2] {
+        assert_eq!(
+            jit(entry),
+            temen_jit::JitOutcome::Trapped(temen_jit::TrapKind::MemoryFault),
+            "the JIT, entry {entry}"
+        );
+    }
+}
+
+/// #3100 — the calibration on real input: [`FAR_SRC`]'s guest grows its window by `map` (16 KiB,
+/// 64 GiB up) under a `mem` grant of exactly its declared window and that growth, freezes, and its
+/// artifact restores under exactly that grant and is refused one host page under it — the rule the
+/// run was charged by is the rule the restore counts by. A grant a host page under it refuses the
+/// run's own `map`. The restored window thaws to the marker on the tree-walker, the bytecode engine
+/// and the JIT.
+#[test]
+fn a_real_runs_growth_restores_under_exactly_the_grant_it_ran_under() {
+    let m = temen_text::parse_module(FAR_SRC).expect("parse");
+    temen_verify::verify_module(&m).expect("verify");
+    let reserved = temen_ir::DEFAULT_RESERVED_LOG2;
+    let hp = temen_interp::host_page_size();
+    let grant = WINDOW as u64 + 16384u64.div_ceil(hp) * hp;
+    let image = MemLayout::image(vec![0u8; WINDOW]);
+    let run = |mem: u64| {
+        let mut h = Host::new();
+        h.set_mem_grant(mem as i64);
+        let ih = h.grant_memory();
+        interp_run(&m, 0, &[Value::I32(ih)], &image, reserved, &mut h)
+    };
+    let (short, _) = run(grant - hp);
+    assert_ne!(
+        short,
+        Ok(vec![Value::I64(0)]),
+        "a page short, the run's map is refused"
     );
+    let (ran, layout) = run(grant);
+    assert_eq!(
+        ran,
+        Ok(vec![Value::I64(0)]),
+        "the run maps under exactly its grant"
+    );
+    let art = temen_snapshot::freeze_layout(&m, &layout, reserved, &Host::new()).expect("freeze");
+    let restore = |mem: u64| {
+        let mut h = Host::new();
+        h.set_mem_grant(mem as i64);
+        temen_snapshot::restore_layout(&art, &m, &mut h).map(|(l, _)| l)
+    };
+    assert_eq!(
+        restore(grant - hp).map(|_| ()),
+        Err(temen_snapshot::RestoreError::WindowOverBudget {
+            need: grant,
+            room: grant - hp
+        })
+    );
+    let restored = restore(grant).expect("restores under exactly its grant");
+
+    let (ir, _) = interp_run(
+        &m,
+        1,
+        &[Value::I32(0)],
+        &restored,
+        reserved,
+        &mut Host::new(),
+    );
+    assert_eq!(ir, Ok(vec![Value::I64(424242)]), "the tree-walker");
+    let mut r = temen_interp::bytecode::Reactor::open(&m).expect("open");
+    assert!(r.restore_window(&restored, &Host::new()));
+    let mut fuel = 1_000_000;
+    assert_eq!(
+        r.call(1, &[Value::I32(0)], &mut fuel, &mut Host::new()),
+        Ok(vec![Value::I64(424242)]),
+        "the bytecode engine"
+    );
+    if temen_jit::fiber_supported() {
+        let mut hj = Host::new();
+        hj.set_durable(true);
+        let (jo, _) = temen_run::jit_cap_run(&m, 1, &[0], &restored, reserved, 0, &mut hj, None)
+            .expect("jit");
+        assert_eq!(jo, temen_jit::JitOutcome::Returned(vec![424242]), "the JIT");
+    }
 }

@@ -4891,12 +4891,11 @@ impl OnrampReactor {
         // Bound to `m`, the module the guest was frozen over, and not to the outlined copy the
         // reactor runs: an artifact binds the guest, not an emitter's rewrite of it.
         // A flat holder: its buffer runs through the last page the window holds (#3100).
-        let flat = temen_snapshot::Restoring {
-            flat: true,
-            ..temen_snapshot::Restoring::of(m)
+        let flat = temen_snapshot::Restoring::of(m, temen_snapshot::Holder::Flat);
+        let layout = match temen_snapshot::restore_into(artifact, m, &mut host, flat) {
+            Ok((temen_snapshot::Window::Layout(layout), _reserved)) => layout,
+            _ => return Err(STATUS_UNSUPPORTED),
         };
-        let (layout, _reserved) = temen_snapshot::restore_into(artifact, m, &mut host, flat)
-            .map_err(|_| STATUS_UNSUPPORTED)?;
 
         let (mut inst, back) =
             reactor_instance(&module, layout.span()).ok_or(STATUS_UNSUPPORTED)?;
@@ -9479,10 +9478,12 @@ pub extern "C" fn temen_durable_thaw_resume(
         return 0;
     };
     temen_durable::begin_thaw(&mut rwin, arena, 0); // clear the freeze word, set context 0 REWINDING
-                                                    // A fresh owned backing sized to the restored reservation, pre-filled with the restored (grown)
-                                                    // window image — the bytes `run_over_grown` resumes over; `seed_pages` re-establishes the map.
+    // A growable backing of the restored image's length, pre-filled with it — the bytes
+    // `run_over_grown` resumes over; `seed_pages` re-establishes the map. #3100: not the
+    // reservation, which the artifact names: past the image the window grows by `map`, which charges
+    // the run's `mem` grant first, as a fresh run's does.
     let Some(back) =
-        temen_interp::Region::owned_zeroed(1u64 << rreserved, temen_snapshot::PAGE as u64)
+        temen_interp::Region::growable(rwin.len() as u64, temen_snapshot::PAGE as u64)
     else {
         set(STATUS_UNSUPPORTED);
         return 0;

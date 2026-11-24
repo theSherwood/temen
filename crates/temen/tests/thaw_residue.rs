@@ -1767,19 +1767,27 @@ block 0 (v0: i64, v1: i64) {{
     );
 }
 
-/// #3100 — the windows a restore holds are counted over the whole cut, not each domain against the
-/// root's room: K fork twins (about 60 bytes each, no grant needed) each fit the restoring host's
-/// memory, and together they do not. Each twin's declared window counts before it is allocated, so
-/// the restore refuses at the head that passes the room, the host as it was; with room for every
-/// window it restores. On `257f553` each nested domain was checked against nothing, and every head
-/// was built.
-#[test]
-fn k_fork_twins_that_each_fit_and_together_do_not_are_refused() {
-    const K: u64 = 8;
-    let inst = instrument(FIBERS);
-    let root = frozen(&inst);
-    let art = bent(&root, |r| {
-        for pid in 0..K {
+/// [`frozen`], its window grown 16 pages past the declared memory and frozen under a 2^20
+/// reservation: a domain whose window has growth, as a flat grown window's freeze writes it.
+fn frozen_grown(inst: &Module) -> Vec<u8> {
+    let mut win = init_durable_window(WINDOW, TEST_ARENA);
+    write_state(&mut win, TEST_ARENA, STATE_UNWINDING);
+    let mut h = Host::new();
+    h.set_durable(true);
+    let mut fuel = 1_000_000u64;
+    let (r, mut snap) =
+        run_capture_reserved_with_host(inst, 0, &[], &mut fuel, &win, SIZE_LOG2, &mut h);
+    assert!(r.is_ok(), "{r:?}");
+    snap.resize(WINDOW + 16 * 4096, 0);
+    snap[WINDOW + 1] = 1;
+    let prots = vec![temen_snapshot::PageProt::Rw; snap.len() / 4096];
+    temen_snapshot::freeze_with_prots(inst, &snap, &prots, 20, &h).expect("freeze")
+}
+
+/// `root` carrying `k` live fork twins, each of whose own artifact is `twin`.
+fn with_twins(root: &[u8], twin: &[u8], k: u64) -> Vec<u8> {
+    bent(root, |r| {
+        for pid in 0..k {
             r.twins.push(LiveTwin {
                 pid: 5 + pid,
                 entry: 0,
@@ -1787,28 +1795,65 @@ fn k_fork_twins_that_each_fit_and_together_do_not_are_refused() {
                 payload: TwinRest {
                     servicer: true,
                     names: Vec::new(),
-                    artifact: root.clone(),
+                    artifact: twin.to_vec(),
                 },
             });
         }
-    });
-    let windows = (K + 1) * WINDOW as u64;
-    let restore = |room: u64| {
+    })
+}
+
+/// #3100 — the two checks apart. `decode`'s running sum of heads refuses at the head that passes the
+/// room (its `need` is the heads so far, not the cut's), before the rest is decoded; `windows_fit`
+/// refuses a cut whose heads fit and whose growth does not (its `need` is every window and its
+/// growth).
+#[test]
+fn the_head_sum_and_the_whole_cut_refuse_apart() {
+    let inst = instrument(FIBERS);
+    let w = WINDOW as u64;
+    let root = frozen(&inst);
+    let restore = |art: &[u8], room: u64| {
         let mut h = Host::new();
         h.set_mem_grant(room as i64);
-        let fresh = h.restore_footprint();
-        let got = temen_snapshot::restore(&art, &inst, &mut h).map(|_| ());
-        (got, fresh == h.restore_footprint())
+        temen_snapshot::restore(art, &inst, &mut h).map(|_| ())
     };
+    // Eight twins of a plain window: the third head passes a room of three windows less a page.
     assert_eq!(
-        restore(windows - 4096),
-        (
-            Err(RestoreError::WindowOverBudget {
-                need: windows,
-                room: windows - 4096
-            }),
-            true
-        )
+        restore(&with_twins(&root, &root, 8), 3 * w - 4096),
+        Err(RestoreError::WindowOverBudget {
+            need: 3 * w,
+            room: 3 * w - 4096
+        }),
+        "the head sum"
     );
-    assert_eq!(restore(windows).0, Ok(()), "room for every window");
+    // A root and two twins, each grown 64 KiB: room for the three heads and one growth.
+    let grown = frozen_grown(&inst);
+    let growth = 16 * 4096;
+    let room = 3 * w + growth;
+    assert_eq!(
+        restore(&with_twins(&grown, &grown, 2), room),
+        Err(RestoreError::WindowOverBudget {
+            need: 3 * (w + growth),
+            room
+        }),
+        "the whole cut"
+    );
+    assert_eq!(
+        restore(&with_twins(&grown, &grown, 2), 3 * (w + growth)),
+        Ok(())
+    );
+}
+
+/// #3100 — a fork twin copies its parent's window, reservation and all: a twin reserved above its
+/// parent is refused. On `257f553` its thaw built the window in the reservation its artifact named.
+#[test]
+fn a_twin_reserved_above_its_parent_is_refused() {
+    let inst = instrument(FIBERS);
+    let art = with_twins(&frozen(&inst), &frozen_grown(&inst), 1);
+    assert_eq!(
+        temen_snapshot::restore(&art, &inst, &mut Host::new()).map(|_| ()),
+        Err(RestoreError::ReservationRefused {
+            asked: 20,
+            granted: SIZE_LOG2
+        })
+    );
 }

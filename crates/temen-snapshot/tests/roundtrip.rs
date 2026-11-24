@@ -2856,10 +2856,11 @@ fn a_dispatch_with_the_wrong_argument_count_rides_a_freeze_and_is_answered_einva
     assert_eq!(rhost.svc_result(t), einval, "thawed: answered EINVAL");
 }
 
-/// #3100 — a restore's §13 regions count with its windows against the restoring host's room: a
-/// region's rebuild is charged to that node past every ceiling (`Fits::Pool`), so the restore is
-/// where a ceiling meets it. A domain holding two one-page regions over its window restores under
-/// exactly the window and both regions, and is refused at one page less, the host as it was.
+/// #3100 — a restore's §13 regions are bounded by the `channel` they are charged at their rebuild
+/// (`region_cost`, past every ceiling: `Fits::Pool`), its windows by `mem`, each against its own
+/// grant. Two one-page regions restore under exactly 8 KiB of `channel` and are refused one page
+/// under, the host as it was; and a cut whose window fills its `mem` grant exactly restores with the
+/// regions beside it.
 #[test]
 fn a_restores_regions_count_with_its_windows() {
     let inst = instrument(SRC);
@@ -2871,27 +2872,29 @@ fn a_restores_regions_count_with_its_windows() {
     let prots = vec![temen_snapshot::PageProt::Rw; WINDOW / 4096];
     let art =
         temen_snapshot::freeze_with_prots(&inst, &win, &prots, SIZE_LOG2, &fhost).expect("freeze");
-    let need = (WINDOW + 2 * 4096) as u64;
-    let restore = |room: u64| {
+    let regions = 2 * 4096u64;
+    let restore = |mem: u64, channel: u64| {
         let mut h = Host::new();
-        h.set_mem_grant(room as i64);
+        h.set_grant(mem as i64, channel as i64, -1, -1);
         let fresh = h.restore_footprint();
         let got = temen_snapshot::restore_layout(&art, &inst, &mut h).map(|_| ());
         (got, fresh == h.restore_footprint())
     };
+    let w = WINDOW as u64;
     assert_eq!(
-        restore(need - 4096),
+        restore(w, regions - 4096),
         (
             Err(RestoreError::WindowOverBudget {
-                need,
-                room: need - 4096
+                need: regions,
+                room: regions - 4096
             }),
             true
-        )
+        ),
+        "a page of channel short"
     );
     assert_eq!(
-        restore(need).0,
+        restore(w, regions).0,
         Ok(()),
-        "room for the window and both regions"
+        "exactly its mem and its channel"
     );
 }
