@@ -2310,36 +2310,30 @@ pub(crate) unsafe fn join_named(
     // park blocks the whole task, as a join blocks its vCPU on every engine, so its resumer neither
     // runs on nor sees `FIBER_PARKED` (`fiber_rt::fiber_resume` hands the park up to the task). An
     // outcome already in is returned below without parking, on any stack.
-    let task = if crate::fiber_rt::in_task() {
-        match crate::fiber_rt::park_as(crate::fiber_rt::Park::Whole) {
-            crate::fiber_rt::ParkAs::Fiber(s) => Some(s),
-            // #3158 — the task's code below a guarded call's yield floor cannot park the task whole:
-            // an outcome already in is returned below, with no park to make; a join that would park
-            // fails closed.
-            crate::fiber_rt::ParkAs::Refused if lock(&done.state).is_some() => None,
-            crate::fiber_rt::ParkAs::Thread | crate::fiber_rt::ParkAs::Refused => {
-                vm.raise(TrapKind::ThreadFault as i64);
-                return 0;
-            }
+    let task = match crate::fiber_rt::park_as(crate::os_thread_rt::Parks::Vcpu) {
+        // An OS vCPU parks its thread, below.
+        crate::fiber_rt::ParkAs::Thread => None,
+        crate::fiber_rt::ParkAs::Fiber(s) => Some(s),
+        // #3158 — the task's code below a guarded call's yield floor cannot park the task whole:
+        // an outcome already in is returned below, with no park to make; a join that would park
+        // fails closed.
+        crate::fiber_rt::ParkAs::Refused if lock(&done.state).is_some() => None,
+        crate::fiber_rt::ParkAs::Refused => {
+            vm.raise(TrapKind::ThreadFault as i64);
+            return 0;
         }
-    } else {
-        None
     };
     // D66 — a parent joining its §14 child holds no lane while it waits. Load-bearing under a cap of
     // 1: the child task cannot be dispatched at all until the joining vCPU steps aside, so without
     // this every bounded `instantiate`-then-`join` would deadlock. Released before the completion
     // cell's lock, re-taken after — blocking for a lane while holding that lock would stop the child
     // from publishing the very outcome being waited for. They are the lanes of the joining vCPU's
-    // own domain (#1956: a detached child's thread runs under the child's chain). SAFETY: a nonzero
-    // `futex_sched` is the run's live `Domain`, which outlives every child.
-    // A task's join holds the task's lanes (#1956), whether it parks or (#3158) answers an outcome
-    // already in from below a floor.
-    let dom =
-        (task.is_none() && !crate::fiber_rt::in_task() && rt.futex_sched != 0).then(|| unsafe {
-            crate::os_thread_rt::current_domain(
-                rt.futex_sched as *const crate::os_thread_rt::Domain,
-            )
-        });
+    // own domain (#1956: a detached child's thread runs under the child's chain). A task's join
+    // leaves its lanes to the executor ([`crate::os_thread_rt::own_lanes_domain`]). SAFETY: a
+    // nonzero `futex_sched` is the run's live `Domain`, which outlives every child.
+    let dom = unsafe {
+        crate::os_thread_rt::own_lanes_domain(rt.futex_sched as *const crate::os_thread_rt::Domain)
+    };
     let lane = dom.map(|d| d.lane_chain()).unwrap_or_default();
     if let Some(d) = dom {
         d.lane_give_back(&lane);

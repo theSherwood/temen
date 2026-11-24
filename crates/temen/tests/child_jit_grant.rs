@@ -465,3 +465,186 @@ fn a_join_inside_an_invoke_on_a_pool_task_fails_closed_at_its_door() {
         "jit: the child's join fails closed at its door: {out:?}"
     );
 }
+
+/// #3158 review B1 — the parent runs under a lane cap of 1. It spawns the serving child
+/// [`lane_server`] with its `Jit` and a punting host procedure granted by name, mints an
+/// offer over the child's export, calls `run(5)` through it, joins the child, and returns the reply
+/// plus 1000 times the join's status.
+fn lane_parent() -> String {
+    let spawn = SpawnRec {
+        grants_ptr: 16384,
+        grants_n: 2,
+        ..SpawnRec::default()
+    };
+    format!(
+        r#"memory 17
+type 0 func (i64) -> (i64)
+type 1 interface {{ run: 0 }}
+func (i32, i32, i32, i32, i32) -> (i64) {{
+block 0 (vinst: i32, vjit: i32, vbud: i32, vmod: i32, vproc: i32) {{
+  a0 = i64.const 16384
+  n0 = i32.const 16484
+  i32.store a0 n0
+  a4 = i64.const 16388
+  l3 = i32.const 3
+  i32.store a4 l3
+  a8 = i64.const 16392
+  i32.store a8 vjit
+  a12 = i64.const 16396
+  z0 = i32.const 0
+  i32.store a12 z0
+  b0 = i64.const 16400
+  n1 = i32.const 16488
+  i32.store b0 n1
+  b4 = i64.const 16404
+  i32.store b4 l3
+  b8 = i64.const 16408
+  i32.store b8 vproc
+  b12 = i64.const 16412
+  i32.store b12 z0
+  qm = i64.const 17544
+  i32.store qm vmod
+  qb = i64.const 17548
+  i32.store qb vbud
+  q0a0 = i64.const 17536
+  vch = call.cap 6 17 (i64) -> (i32) vinst (q0a0)
+  vz = i64.const 0
+  voff = call.cap 6 14 (i32, i64) -> (i32) vinst (vch, vz)
+  v5 = i64.const 5
+  vr = call.cap 268435456 0 (i64) -> (i64) voff (v5)
+  r_st, r = call.cap 6 1 (i32) -> (i64, i64) vinst (vch)
+  k1000 = i64.const 1000
+  rs1000 = i64.mul r_st k1000
+  out = i64.add rs1000 vr
+  return out
+  }}
+}}
+data 16484 "jit"
+data 16488 "prc"
+{rec}"#,
+        rec = rec::segment(17536, &spawn),
+    )
+}
+
+/// The unit [`lane_server`] compiles: it calls the punting procedure whose handle the child stored
+/// at 70000 with 5, answering the job's 105.
+const LANE_UNIT: &str = "memory 17\nfunc () -> (i64) {\nblock 0 () {\n  va = i64.const 70000\n  vh = i32.load va\n  v5 = i64.const 5\n  vr = call.cap 13 0 (i64) -> (i64) vh (v5)\n  return vr\n  }\n}\n";
+
+/// #3158 review B1 — the serving child. Its entry resolves `"jit"` and `"prc"`, compiles
+/// [`LANE_UNIT`] (the blob at [`BLOB_OFF`]), and serves one call. The handler, `run(a)`, waits a
+/// millisecond on a word nothing notifies, so its fiber parks once and a pool worker resumes it;
+/// then it invokes the unit, whose call the host punts, and answers the unit's 105 plus `a`.
+fn lane_server(blob: &[u8]) -> String {
+    let blob_data: String = blob.iter().map(|b| format!("\\x{b:02x}")).collect();
+    format!(
+        r#"memory 17
+type 0 func (i64) -> (i64)
+type 1 interface {{ run: 0 }}
+export 0 interface "svc" 1 {{ run: 1 }}
+func (i64) -> (i64) {{
+block 0 (vci: i64) {{
+  n0 = i64.const 16484
+  l3 = i64.const 3
+  hj = self.resolve n0 l3
+  n1 = i64.const 16488
+  hp = self.resolve n1 l3
+  ap = i64.const 70000
+  i32.store ap hp
+  aj = i64.const 70004
+  i32.store aj hj
+  vb = i64.const {BLOB_OFF}
+  vl = i64.const {len}
+  vc = call.cap 11 0 (i64, i64) -> (i64) hj (vb, vl)
+  ac = i64.const 70008
+  i64.store ac vc
+  vz = i32.const 0
+  vn = svc.wait vz
+  return vn
+  }}
+}}
+func (i64) -> (i64) {{
+block 0 (va: i64) {{
+  vp = i64.const 70100
+  vw0 = i32.const 0
+  vto = i64.const 1000000
+  vw = i32.atomic.wait vp vw0 vto
+  aj = i64.const 70004
+  hj = i32.load aj
+  ac = i64.const 70008
+  vc = i64.load ac
+  vh = call.cap 11 1 (i64) -> (i64) hj (vc)
+  vr = i64.add vh va
+  return vr
+  }}
+}}
+data 16484 "jit"
+data 16488 "prc"
+data {BLOB_OFF} "{blob_data}"
+"#,
+        len = blob.len(),
+    )
+}
+
+/// A host procedure whose every call the host punts: its job answers the argument plus 100. Forkable,
+/// so a spawn can re-grant it to a child.
+fn punting_proc() -> temen_interp::HostProcGrant {
+    fn handler() -> temen_interp::ProcHandler {
+        temen_interp::ProcHandler::Offloadable(Box::new(|_op, args, _out| {
+            let a = *args.first().unwrap_or(&0);
+            temen_interp::OffloadOutcome::Offload(Box::new(move || a + 100))
+        }))
+    }
+    temen_interp::HostProcGrant::new(handler(), temen_interp::CapState::Stateless).forkable(
+        std::sync::Arc::new(|_| {
+            Some(temen_interp::ForkedProc {
+                handler: handler(),
+                signal: None,
+                refork: None,
+                exit: None,
+                exec_remap: None,
+                state: temen_interp::CapState::Stateless,
+                abandon: None,
+            })
+        }),
+    )
+}
+
+/// #3158 review B1 — a punted call's wait outside the pool, from a serve handler's shell on a pool
+/// worker. The shell holds no lane, and while it runs the current domain is its serving child's: a
+/// wait that gave back and re-took that domain's lanes re-took a lane the shell never held, and
+/// under a cap of 1 the run then waited for it for good. The wait now gives back and re-takes only
+/// the lanes its context holds as a vCPU (none, in a pool task), and the run answers `5 + 105`.
+#[test]
+fn a_punt_from_a_resumed_handler_under_a_lane_cap_of_one_completes() {
+    let unit = encode_module(&parse_module(LANE_UNIT).expect("parse unit"));
+    let parent = parse_module(&lane_parent()).expect("parse parent");
+    verify_module(&parent).expect("verify parent");
+    let server = parse_module(&lane_server(&unit)).expect("parse server");
+    verify_module(&server).expect("verify server");
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut host = Host::new();
+        host.set_lane_cap(1);
+        let ih = host.grant_instantiator();
+        let jh = grant_jit(&mut host, &server, 0);
+        let bh = host.grant_budget(-1, 1 << 20, -1);
+        let sh = host.grant_module(&server);
+        let ph = host.grant_host_proc(punting_proc());
+        let out = temen_run::jit_cap_run(
+            &parent,
+            0,
+            &[ih, jh, bh, sh, ph].map(i64::from),
+            &MemLayout::image(Vec::new()),
+            DEFAULT_RESERVED_LOG2,
+            0,
+            &mut host,
+            None,
+        )
+        .map(|(o, _)| o);
+        let _ = tx.send(format!("{out:?}"));
+    });
+    let out = rx
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .expect("the run completes: it hung waiting for a lane");
+    assert_eq!(out, "Ok(Returned([110]))");
+}

@@ -2292,7 +2292,7 @@ pub(crate) fn quantum_end() {
     // nested in its frames is live (a handler run inline, a unit `Jit.invoke`d): the task cannot
     // park whole there, so it keeps its worker to that call's end. The due wakes and the worker
     // hand-out above ran all the same.
-    match fiber_rt::park_as(fiber_rt::Park::Whole) {
+    match fiber_rt::park_as(crate::os_thread_rt::Parks::Vcpu) {
         // SAFETY: inside the task's residency, on one of its fibers; the park hands the worker back
         // and returns when a worker resumes the task.
         fiber_rt::ParkAs::Fiber(slot) => unsafe {

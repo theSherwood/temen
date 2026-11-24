@@ -1166,9 +1166,12 @@ impl SendPtr {
 /// * a pipe **wake** (a write, or the last close of an end) rings the tree: a process blocked on
 ///   the other end may proceed.
 /// * a pipe **park** (a read of an empty pipe, or a write to a full one, with the other end open)
-///   in a vCPU's root context waits for the bell ([`tree_park`]): the other end may be another
-///   process's. A fiber parks alone and re-checks its pipe each time it is resumed, as outside a
-///   tree (#1952).
+///   waits for the bell ([`tree_park`]) where no fiber can park (`!temen_jit::fiber_active()`): the
+///   other end may be another process's. A fiber parks alone and re-checks its pipe each time it is
+///   resumed, as outside a tree (#1952).
+/// * #3158 — the gates below (`execve`, `fork`, `posix_spawn` of self) ask whether the call is the
+///   vCPU's root computation ([`temen_jit::at_root`]: no fiber on the stack, running or with a guarded
+///   call nested in its frames); the parks ask only how to park.
 /// * `execve` — admit and build the image through the one rule every engine shares
 ///   ([`Host::exec_image`]); admitted, park it and unwind the whole run
 ///   ([`temen_jit::HOST_UNWIND_CODE`]) — an image-replace never returns to its caller, so the
@@ -1183,7 +1186,7 @@ impl SendPtr {
 ///   unavailable here.
 /// * `posix_spawn` — start the process the op staged ([`Tree::spawn`]); the call completes with its
 ///   pid.
-/// * a blocking `waitpid` — in a root context, wait for the bell ([`tree_park`]) and run the op
+/// * a blocking `waitpid` — where no fiber can park, wait for the bell ([`tree_park`]) and run the op
 ///   again, which reaps a child that exited or waits on. In a fiber the op's `-ECHILD` stands, as on
 ///   the interpreters.
 /// * anything else — a blocking stdin read — parks as it would outside a tree

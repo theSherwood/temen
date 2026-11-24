@@ -5727,10 +5727,9 @@ impl CompiledModule {
         {
             // The OS-thread stack pointer in *this* (`run_inner`) frame — above the guarded guest
             // call below and every guest root frame it pushes — is the high bound for `gc.roots`'
-            // scan of the root computation's frames. Captured via a local's address here (not a
-            // sub-call) so it provably dominates the guest's frames.
-            let entry_probe = 0u8;
-            let entry_sp = std::hint::black_box(&entry_probe as *const u8 as usize);
+            // scan of the root computation's frames. Read in this frame (`stack_pointer` is always
+            // inlined), so it dominates the guest's frames.
+            let entry_sp = crate::stack_check::stack_pointer() as usize;
             let t = &mut *this;
             let durable = t.durable;
             // Durable **thaw** (slice 3.3.3): re-create the frozen fibers in the run-shared table
@@ -13082,12 +13081,13 @@ pub(crate) mod stack_check {
         crate::fiber_rt::running_stack_low(sp).unwrap_or(0)
     }
 
-    /// The machine stack pointer at the call, the stack the caller runs on. Read from the register:
-    /// a local's address is not always on that stack. Under ASan's use-after-return detection an
-    /// address-taken local lives on its fake stack, a heap block, which is neither the thread's stack
-    /// nor a fiber's, so [`thread_limit`] answered 0 and every check that compares against it (the
-    /// direct handoff's room, #3158) saw no stack at all.
-    #[inline(never)]
+    /// The machine stack pointer in the calling frame (always inlined, so it is that frame's): every
+    /// frame the caller pushes afterwards lies below it. Read from the register, since a local's
+    /// address is not always on the stack. Under ASan's use-after-return detection an address-taken
+    /// local lives on its fake stack, a heap block on neither the thread's stack nor a fiber's: with
+    /// it, [`thread_limit`] answered 0, every check against it (the direct handoff's room, #3158) saw
+    /// no stack at all, and `gc.roots`' scan bounds were heap addresses.
+    #[inline(always)]
     pub(crate) fn stack_pointer() -> u64 {
         let sp: u64;
         // SAFETY: reads the stack pointer register into a general register; no memory is touched.
