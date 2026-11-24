@@ -51,6 +51,12 @@ pub use temen_ir::seams::NativeStop;
 pub trait KernelPark {
     fn park(&mut self, stop: NativeStop) -> Result<[i64; 2], i64>;
 
+    /// #3078 slice 3 — file `wait`, the futex wait a fiber of this vCPU made before it switched out
+    /// to the code now running, as the fiber's park (`file_park`): applied as [`Self::park`]'s stops
+    /// are, without parking the thread. Kept apart from [`NativeStop`], which carries no `Arc`, so
+    /// every other §12 op's stop stays `Copy`.
+    fn park_fiber(&mut self, wait: temen_ir::seams::FiberWait) -> Result<[i64; 2], i64>;
+
     /// #2958 slice 5 — the park a capability call left its vCPU to take (a pipe or stdin read, a
     /// punted call, a region post's wake), from the embedder's `call.cap` thunk rather than the
     /// emitted code: `call` is the embedder's own decision, a value this crate cannot name, handed
@@ -268,9 +274,9 @@ pub(crate) unsafe fn file_park(vm: u64, k: usize, slot: &crate::fiber_rt::FiberS
         vm.raise(temen_ir::trap_code::MALFORMED);
         return FIBER_PARKED;
     };
-    let stop = NativeStop::FiberWait {
+    let wait = temen_ir::seams::FiberWait {
         slot: k as u32,
-        gen: crate::fiber_rt::slot_incarnation(slot),
+        gen: crate::fiber_rt::slot_incarnation(slot) as u32,
         addr,
         expected,
         wide,
@@ -278,7 +284,7 @@ pub(crate) unsafe fn file_park(vm: u64, k: usize, slot: &crate::fiber_rt::FiberS
         word: std::sync::Arc::clone(&slot.kpark),
     };
     // SAFETY: a resume thunk on the resumer's own thread, inside its vCPU's guarded call.
-    unsafe { through_hook(vm, |hook| hook.park(stop)) };
+    unsafe { through_hook(vm, |hook| hook.park_fiber(wait)) };
     FIBER_PARKED
 }
 
@@ -321,7 +327,7 @@ pub(crate) unsafe fn poll_parked(
             let vm = unsafe { VmCtx::at(vm) };
             let stop = NativeStop::FiberClaim {
                 slot: k as u32,
-                gen,
+                gen: gen as u32,
             };
             // SAFETY: a resume thunk on its vCPU's own thread, inside its guarded call.
             match unsafe { through_hook(vm, |hook| hook.park(stop)) } {
@@ -360,7 +366,7 @@ pub(crate) unsafe fn resume_block(vm: &VmCtx, handle: i64, arg: i64, status_out:
         };
         let stop = NativeStop::FiberBlock {
             slot: k as u32,
-            gen: crate::fiber_rt::handle_incarnation(handle),
+            gen: crate::fiber_rt::handle_incarnation(handle) as u32,
         };
         // SAFETY: a resume thunk on its vCPU's own thread, inside its guarded call.
         unsafe { through_hook(vm, |hook| hook.park(stop)) };
@@ -912,6 +918,9 @@ mod tests {
     impl<F: FnMut() -> Option<[i64; 2]>> KernelPark for Then<F> {
         fn park(&mut self, _: NativeStop) -> Result<[i64; 2], i64> {
             Ok((self.0)().unwrap_or([7, 7]))
+        }
+        fn park_fiber(&mut self, _: temen_ir::seams::FiberWait) -> Result<[i64; 2], i64> {
+            Ok([0, 0])
         }
         fn park_call(&mut self, _: &mut dyn std::any::Any) -> Result<[i64; 2], i64> {
             self.1 += 1;

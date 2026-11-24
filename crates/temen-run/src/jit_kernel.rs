@@ -589,6 +589,10 @@ impl KernelPark for Hook<'_, '_> {
         self.0.park(stop).map_err(|t| t.code())
     }
 
+    fn park_fiber(&mut self, wait: temen_ir::seams::FiberWait) -> Result<[i64; 2], i64> {
+        self.0.park_fiber(wait).map_err(|t| t.code())
+    }
+
     fn park_call(&mut self, call: &mut dyn std::any::Any) -> Result<[i64; 2], i64> {
         // What [`park_call`] sent; anything else is no call of this embedder's: the backstop.
         let park = (call.downcast_mut::<CallPayload>())

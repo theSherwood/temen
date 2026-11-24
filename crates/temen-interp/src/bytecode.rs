@@ -17227,10 +17227,13 @@ impl SchedCore {
             // found still parked: re-checked here, under the lock its wake takes, so a wake since
             // the poll is never slept through.
             Ok(VcpuStop::FiberBlock { slot, gen }) => {
-                if !native_blocks(&domains[tasks[ti].domain].fibers.fibers, slot, gen) {
-                    return Applied::Futex;
+                // Either way only this task's state moved: its re-check reads, under this hold, the
+                // wake a notify or a timeout writes under its own, and a wake after it finds the
+                // task idling, which that wake's settle scan rouses ([`fiber_woken`]).
+                if native_blocks(&domains[tasks[ti].domain].fibers.fibers, slot, gen) {
+                    tasks[ti].state = TaskState::BlockedOnFiber { fiber: slot };
                 }
-                tasks[ti].state = TaskState::BlockedOnFiber { fiber: slot };
+                return Applied::Futex;
             }
             // §3.6 (I36 slice 2) — the serve/call/offer trio, cooperative form.
             Ok(VcpuStop::SvcWait) => {
@@ -20513,6 +20516,15 @@ impl EmittedCall<'_> {
         self.seam.park(stop)
     }
 
+    /// #3078 slice 3 — file `wait`, the futex wait a native fiber of the task made before it
+    /// switched out to the task's code, as the fiber's park: through the same rules as
+    /// [`Self::park`], without parking the task. Answers `[0, 0]`. `Err` when the run ended
+    /// meanwhile, or the wait's word is no word of the window.
+    #[inline]
+    pub fn park_fiber(&mut self, wait: temen_ir::seams::FiberWait) -> Result<[i64; 2], Trap> {
+        self.seam.park_fiber(wait)
+    }
+
     /// #2958 slice 5 — carry out `park`, what a capability call the task's native code made left it
     /// to do ([`call_park`]), as the rules carry out an interpreted op's: the same rules and the same
     /// wait as [`Self::park`], whose stop the embedder's thunk made rather than the emitted code. A
@@ -20640,6 +20652,7 @@ type NewTask = (usize, Option<Mem>, Fuel);
 trait TaskSeam {
     fn bounce(&mut self, target: u32, io: &mut [i64], pushed: usize) -> Result<usize, Trap>;
     fn park(&mut self, stop: NativeStop) -> Result<[i64; 2], Trap>;
+    fn park_fiber(&mut self, wait: temen_ir::seams::FiberWait) -> Result<[i64; 2], Trap>;
     fn park_call(&mut self, park: CallPark) -> Result<[i64; 2], Trap>;
 }
 
@@ -20782,33 +20795,13 @@ impl TaskSeam for CallSeam<'_, '_, '_> {
                 count,
                 dst: 0,
             },
-            NativeStop::FiberWait {
-                slot,
-                gen,
-                addr,
-                expected,
-                wide,
-                timeout,
-                word,
-            } => {
-                let width = if wide { 8 } else { 4 };
-                VcpuStop::FiberPark(NativePark {
-                    slot: slot as usize,
-                    gen,
-                    base: m.ok_or(Trap::Malformed)?.prepare_wait(addr, width)?,
-                    expected: expected & super::width_mask(width),
-                    width,
-                    timeout: (timeout >= 0).then_some(timeout as u64),
-                    word,
-                })
-            }
             NativeStop::FiberClaim { slot, gen } => VcpuStop::FiberClaim {
                 slot: slot as usize,
-                gen,
+                gen: gen as u64,
             },
             NativeStop::FiberBlock { slot, gen } => VcpuStop::FiberBlock {
                 slot: slot as usize,
-                gen,
+                gen: gen as u64,
             },
         };
         let task = self.task.as_mut().ok_or(Trap::Malformed)?;
@@ -20816,6 +20809,29 @@ impl TaskSeam for CallSeam<'_, '_, '_> {
             return Ok([v.i64(), 0]);
         }
         self.park_stop(stop)
+    }
+
+    fn park_fiber(&mut self, wait: temen_ir::seams::FiberWait) -> Result<[i64; 2], Trap> {
+        let temen_ir::seams::FiberWait {
+            slot,
+            gen,
+            addr,
+            expected,
+            wide,
+            timeout,
+            word,
+        } = wait;
+        let width = if wide { 8 } else { 4 };
+        let m = futex_window(self.run, self.mem).ok_or(Trap::Malformed)?;
+        self.park_stop(VcpuStop::FiberPark(NativePark {
+            slot: slot as usize,
+            gen: gen as u64,
+            base: m.prepare_wait(addr, width)?,
+            expected: expected & super::width_mask(width),
+            width,
+            timeout: (timeout >= 0).then_some(timeout as u64),
+            word,
+        }))
     }
 
     fn park_call(&mut self, park: CallPark) -> Result<[i64; 2], Trap> {

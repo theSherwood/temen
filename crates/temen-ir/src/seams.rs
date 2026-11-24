@@ -184,12 +184,12 @@ pub fn handler_never_parks(funcs: &[Func], func: FuncIdx) -> bool {
 /// interpreted op's stop (`temen_interp::bytecode::EmittedCall::park`): the Cranelift JIT's, when its
 /// vCPUs run as executor 2's tasks. Addresses are window-relative, as the guest wrote them.
 ///
-/// #3078 slice 3 — and the three a native **fiber's** futex wait takes. The fiber's resumer files the
-/// park after the fiber's switch-out ([`NativeStop::FiberWait`]), and a `cont.resume` of a
-/// kernel-parked fiber claims it, or blocks its task on it, through the rules ([`NativeStop::FiberClaim`],
-/// [`NativeStop::FiberBlock`]). Each names the fiber's incarnation, its slot and generation, so a stale
-/// handle to a recycled slot never reaches another fiber's park ([`ParkWord`]).
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// #3078 slice 3 — and two a `cont.resume` of a kernel-parked **fiber** makes: its claim, or a block of
+/// its task on it, through the rules ([`NativeStop::FiberClaim`], [`NativeStop::FiberBlock`]). Each
+/// names the fiber's incarnation, its slot and generation, so a stale handle to a recycled slot never
+/// reaches another fiber's park ([`ParkWord`]). The park itself, which carries the slot's word, is a
+/// [`FiberWait`] of its own, so a stop stays `Copy` and as small as it was: every §12 op makes one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NativeStop {
     Spawn {
         func: u32,
@@ -210,31 +210,34 @@ pub enum NativeStop {
         addr: u64,
         count: i32,
     },
-    /// File the futex wait fiber `slot` (generation `gen`) made before it switched out, as the
-    /// fiber's park: its record in the run's registry, its entry in the wait index, and `word` set
-    /// for pollers. Answers `[0, 0]`; the resumer reports `FIBER_PARKED`.
-    FiberWait {
-        slot: u32,
-        gen: u64,
-        addr: u64,
-        expected: u64,
-        wide: bool,
-        timeout: i64,
-        word: alloc::sync::Arc<ParkWord>,
-    },
     /// Claim fiber `slot` (generation `gen`), kernel-parked: `[status, CLAIMED]` with its wait's
     /// status once it can be claimed (it is the claimant's to switch into), `[0, PARKED]` while it is
     /// still parked, `[0, NOT_PARKED]` when no park of that incarnation is filed.
     FiberClaim {
         slot: u32,
-        gen: u64,
+        gen: u32,
     },
     /// Block the task until fiber `slot` (generation `gen`), kernel-parked, can be claimed: answers
     /// at once when it already can, or when no park of that incarnation is filed.
     FiberBlock {
         slot: u32,
-        gen: u64,
+        gen: u32,
     },
+}
+
+/// #3078 slice 3 — the futex wait native fiber `slot` (generation `gen`) made before it switched out,
+/// which its resumer files with the rules as the fiber's park: its record in the run's registry, its
+/// entry in the wait index, and `word`, the slot's parked word, set for pollers. The wait's operands
+/// are [`NativeStop::Wait`]'s.
+#[derive(Clone, Debug)]
+pub struct FiberWait {
+    pub slot: u32,
+    pub gen: u32,
+    pub addr: u64,
+    pub expected: u64,
+    pub wide: bool,
+    pub timeout: i64,
+    pub word: alloc::sync::Arc<ParkWord>,
 }
 
 /// [`NativeStop::FiberClaim`]'s answer in `[1]`: the claim took the park, and `[0]` is its status.
@@ -294,15 +297,6 @@ impl Default for ParkWord {
         ParkWord::new()
     }
 }
-
-impl PartialEq for ParkWord {
-    /// One word is equal only to itself: a stop compares by which fiber's word it carries.
-    fn eq(&self, other: &ParkWord) -> bool {
-        core::ptr::eq(self, other)
-    }
-}
-
-impl Eq for ParkWord {}
 
 impl ParkWord {
     pub fn new() -> ParkWord {
