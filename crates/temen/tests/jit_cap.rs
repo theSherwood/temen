@@ -1865,3 +1865,24 @@ fn invoke_barrier_a_punt_from_an_invoked_unit_waits_as_the_root() {
         "{jout:?}"
     );
 }
+
+/// #3158 — the fault path: a guarded fault inside a fiber the invoked unit started, inside the
+/// invoke, under a caller fiber. The invoke's guard catches it, drops the fibers resumed inside it
+/// and their yielders back to its entry depth (`abandon_after_fault`), and restores the yield floor
+/// as it returns; the trap is the domain's (`MemoryFault`), on both engines, and nothing runs on a
+/// stack the recovery left. A trap in invoked code is terminal for the domain (DESIGN.md §22), so
+/// the caller does not go on: what this pins is that the recovery is clean, not a later suspend.
+#[test]
+fn invoke_barrier_a_fault_in_a_units_own_fiber_is_recovered_cleanly() {
+    // The unit makes a fiber over its parent's function 2, which loads from the NULL guard.
+    let b = blob("memory 16\nfunc () -> (i64) {\nblock 0 () {\n  vf = i32.const 2\n  vsp = i64.const 32768\n  vk = cont.new vf vsp\n  vz = i64.const 0\n  vs, vv = cont.resume vk vz\n  return vv\n  }\n}\n");
+    let guest = format!(
+        "{}func (i64, i64) -> (i64) {{\nblock 0 (vsp: i64, varg: i64) {{\n  vnull = i64.const 8\n  vq = i64.load vnull\n  return vq\n  }}\n}}\n",
+        invoking_fiber("  return vv1\n", b.len())
+    );
+    let (out, _) = diff_run_fibers(&guest, &b, &[]);
+    assert!(
+        matches!(out, JitOutcome::Trapped(TrapKind::MemoryFault)),
+        "{out:?}"
+    );
+}

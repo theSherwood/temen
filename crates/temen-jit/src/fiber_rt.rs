@@ -2040,7 +2040,9 @@ pub(crate) fn current_fiber_slot() -> Option<Arc<FiberSlot>> {
 ///
 /// # Safety
 /// Must be called from inside a running fiber, with `slot` = that fiber's own slot (the futex
-/// thunk resolves it via [`current_fiber_slot`]).
+/// thunk resolves it via [`current_fiber_slot`]). Every caller takes `slot` from
+/// [`current_fiber_slot`] on this thread with no guarded call begun since, so the fiber's yielder
+/// is above the yield floor (#3158) and the take below cannot miss.
 pub(crate) unsafe fn fiber_event_park(
     slot: &Arc<FiberSlot>,
     deadline: Option<Instant>,
