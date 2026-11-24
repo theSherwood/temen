@@ -310,10 +310,10 @@ fn a_childs_uninstall_leaves_the_parents_slot_mirror_alone() {
 }
 
 /// #3158 — a whole-vCPU park made inside a `Jit.invoke`, on a pool task. The child [`joining_src`]
-/// spawns a grandchild (function 4's image: it waits a second on a word nothing notifies, so it
-/// is live, and returns 7), then compiles a unit and invokes it. The unit `call.dyn`s the child's
-/// function 2 (new→old), which makes a fiber over function 3 and resumes it, and that fiber joins the
-/// grandchild. A join blocks the child's vCPU on every engine.
+/// spawns a grandchild (function 4's image: it spins forever, so it is live until teardown and no
+/// join's outcome is ever in early, however slow the run), then compiles a unit and invokes it. The
+/// unit `call.dyn`s the child's function 2 (new→old), which makes a fiber over function 3 and
+/// resumes it, and that fiber joins the grandchild. A join blocks the child's vCPU on every engine.
 fn joining_src(blob: &[u8]) -> String {
     let blob_data: String = blob.iter().map(|b| format!("\\x{b:02x}")).collect();
     let spawn = SpawnRec {
@@ -396,12 +396,10 @@ block 0 (vsp: i64, varg: i64) {{
 }}
 func (i64) -> (i64) {{
 block 0 (v0: i64) {{
-  vp = i64.const 70000
-  vw0 = i32.const 0
-  vto = i64.const 1000000000
-  vw = i32.atomic.wait vp vw0 vto
-  v7 = i64.const 7
-  return v7
+  br 1()
+}}
+block 1 () {{
+  br 1()
   }}
 }}
 data 16484 "jit"
