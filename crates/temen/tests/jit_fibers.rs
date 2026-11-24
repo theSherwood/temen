@@ -518,6 +518,108 @@ fn fiber_forged_generation_faults_identically() {
     );
 }
 
+/// #3166 — a module of four functions whose last is a fiber entry: the root makes a fiber with
+/// funcref `funcref` (an `i32` constant) and resumes it, after a spawned thread's join when `spawn`;
+/// the fiber runs `body`, which defines `vr`, and returns it. A funcref is masked to the table, so
+/// `-1` names the last function.
+fn last_slot_fiber(funcref: i32, spawn: bool, root: &str, body: &str) -> String {
+    let sp = match spawn {
+        true => "  vt = thread.spawn 1 vz vz\n  vts, vtv = thread.join vt\n",
+        false => "",
+    };
+    format!(
+        "memory 16
+func () -> (i64) {{
+block 0 () {{
+  vz = i64.const 0
+{sp}  vf = i32.const {funcref}
+  vk = cont.new vf vz
+{root}
+  return vr
+  }}
+}}
+func (i64, i64) -> (i64) {{
+block 0 (va: i64, vb: i64) {{
+  return va
+  }}
+}}
+func (i64, i64) -> (i64) {{
+block 0 (va: i64, vb: i64) {{
+  return va
+  }}
+}}
+func (i64, i64) -> (i64) {{
+block 0 (vsp: i64, varg: i64) {{
+{body}
+  return vr
+  }}
+}}
+"
+    )
+}
+
+/// #3166 — `cont.new -1` names the table's last function, which is a fiber entry here, and makes an
+/// ordinary guest fiber, on every engine: it suspends and returns as `cont.new 3` does. The JIT once
+/// took it for a pool task's own slot (`is_platform()` was `func == -1`), so its `suspend` trapped
+/// `FiberFault` as a task root's does. Here it suspends 7, then returns 9:
+/// `s0 * 1000 + v0 * 100 + s1 * 10 + v1` is 719 everywhere.
+#[test]
+fn a_fiber_made_from_funcref_minus_one_is_a_guest_fiber() {
+    let root = "  vs0, vv0 = cont.resume vk vz\n  vs1, vv1 = cont.resume vk vz\n  va = i64.extend_i32_s vs0\n  vb = i64.extend_i32_s vs1\n  vk1000 = i64.const 1000\n  vk100 = i64.const 100\n  vk10 = i64.const 10\n  vx = i64.mul va vk1000\n  vy = i64.mul vv0 vk100\n  vw = i64.mul vb vk10\n  vxy = i64.add vx vy\n  vxyw = i64.add vxy vw\n  vr = i64.add vxyw vv1";
+    let body = "  v7 = i64.const 7\n  vx = suspend v7\n  vr = i64.const 9";
+    for spawn in [false, true] {
+        for funcref in [3, -1] {
+            let src = last_slot_fiber(funcref, spawn, root, body);
+            let m = parse_module(&src).unwrap_or_else(|e| panic!("parse: {e:?}\n{src}"));
+            verify_module(&m).unwrap_or_else(|e| panic!("verify: {e:?}\n{src}"));
+            let mut fuel = 10_000_000u64;
+            let bytecode = temen_interp::bytecode::compile_and_run(&m, 0, &[], &mut fuel);
+            assert_eq!(
+                bytecode,
+                Some(Ok(vec![Value::I64(719)])),
+                "the bytecode engine, funcref {funcref}"
+            );
+            let jit = compile_and_run(&m, 0, &[]).expect("jit compile/run");
+            assert_eq!(
+                jit,
+                JitOutcome::Returned(vec![719]),
+                "the JIT, funcref {funcref}"
+            );
+            if !spawn {
+                // The tree-walker, and the kernel route inside a spawned vCPU.
+                assert_jit_matches_interp(&src);
+            }
+        }
+    }
+}
+
+/// #3166 — a fiber made from funcref `-1` scans its roots as any fiber does. The JIT took it for a
+/// task's slot and, with no fiber nested in it, started the root computation's scan at its own stack
+/// pointer, reading every word from the fiber's stack up to the root's OS stack: the process died
+/// with `SIGSEGV`. Here it returns, as `cont.new 3` does, on the JIT.
+#[test]
+fn a_fiber_made_from_funcref_minus_one_scans_its_roots_as_any_fiber() {
+    let root = "  vs0, vv0 = cont.resume vk vz\n  va = i64.extend_i32_s vs0\n  vk1000 = i64.const 1000\n  vx = i64.mul va vk1000\n  vr = i64.add vx vv0";
+    let body = "  vlo = i64.const 0\n  vhi = i64.const 65536\n  vmask = i64.const -1\n  vbuf = i64.const 16384\n  vcap = i64.const 16\n  vr = gc.roots vlo vhi vmask vbuf vcap";
+    for spawn in [false, true] {
+        let run = |funcref| {
+            let src = last_slot_fiber(funcref, spawn, root, body);
+            let m = parse_module(&src).unwrap_or_else(|e| panic!("parse: {e:?}\n{src}"));
+            verify_module(&m).unwrap_or_else(|e| panic!("verify: {e:?}\n{src}"));
+            compile_and_run(&m, 0, &[]).expect("jit compile/run")
+        };
+        // The roots are a conservative superset, which the stacks' other words can grow, so each
+        // run is asked only to return (status 1) with what it found.
+        for funcref in [3, -1] {
+            let got = run(funcref);
+            assert!(
+                matches!(&got, JitOutcome::Returned(v) if v.len() == 1 && v[0] / 1000 == 1),
+                "funcref {funcref}, spawn {spawn}: {got:?}"
+            );
+        }
+    }
+}
+
 /// A finished fiber's slot is recycled at a bumped generation: the next `cont.new` reuses slot 0 at
 /// generation 1 (handle `(1 << 24) | 0 == 16777216`), and the *stale* generation-0 handle to the
 /// former occupant then faults even though slot 0 is live. Both backends must agree on each.

@@ -26855,6 +26855,12 @@ pub struct Host {
     /// #2164 — a demand-paged Cranelift JIT child's window ([`JitPaging`]). It lives as long as the
     /// powerbox, as the code that reads its access table does.
     jit_paging: Option<JitPaging>,
+    /// #3166 — a demand-paged Cranelift JIT child's page requests still filed with its pager, by
+    /// ticket ([`Host::file_page_request`]), and whether its end has withdrawn them
+    /// ([`Host::close_page_requests`]). A request's sink writes into this child's window, so none
+    /// may outlive it, whatever became of the code that filed it.
+    page_requests: Vec<u64>,
+    page_requests_closed: bool,
     svc_next_ticket: u64,
     /// CALLS.md 4d — **direct-handoff** mode (the §10.2 arm-4 optimization). When set on the domain
     /// that becomes the root of a run, [`drive_arc`] copies it into the run-global
@@ -27727,6 +27733,8 @@ impl Host {
             pager: None,
             jit_pager: None,
             jit_paging: None,
+            page_requests: Vec::new(),
+            page_requests_closed: false,
             reply_waits: BTreeMap::new(),
             frozen_handlers: BTreeMap::new(),
             svc_next_ticket: 0,
@@ -32316,6 +32324,28 @@ impl Host {
     /// #2164 — the child has ended: its pager, to release (#1217).
     pub fn take_jit_pager(&mut self) -> Option<Arc<Mutex<Host>>> {
         self.jit_pager.take()
+    }
+
+    /// #3166 — record page request `ticket`, which this demand-paged JIT child just filed with its
+    /// pager, under the pager's lock: `false` once the child's end has withdrawn its requests, and
+    /// then the caller withdraws this one too.
+    pub fn file_page_request(&mut self, ticket: u64) -> bool {
+        if !self.page_requests_closed {
+            self.page_requests.push(ticket);
+        }
+        !self.page_requests_closed
+    }
+
+    /// #3166 — page request `ticket` is settled or withdrawn: it no longer needs withdrawing.
+    pub fn forget_page_request(&mut self, ticket: u64) {
+        self.page_requests.retain(|&t| t != ticket);
+    }
+
+    /// #3166 — this JIT child has ended: the page requests it still has filed, for its pager to
+    /// withdraw ([`Host::abandon_page`]) before its window goes, and none filed after.
+    pub fn close_page_requests(&mut self) -> Vec<u64> {
+        self.page_requests_closed = true;
+        std::mem::take(&mut self.page_requests)
     }
 
     /// #2164 — a demand-paged Cranelift JIT child's window ([`JitPaging`]).

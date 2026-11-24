@@ -3811,6 +3811,7 @@ unsafe fn park_until_rung(
 /// withdrawal both run under the pager's lock, so no supply reaches the window once it has.
 unsafe fn request_page(
     pager: &Mutex<Host>,
+    child: &Mutex<Host>,
     export: u32,
     sink: impl Fn() -> temen_interp::PageSink,
     vm: &temen_jit::VmCtx,
@@ -3826,6 +3827,16 @@ unsafe fn request_page(
             return Some(CAP_REVOKED);
         }
         if let Some(ticket) = guard.request_page(export, sink()) {
+            // #3166 — recorded on the child, under the pager's lock, so its end withdraws the
+            // request whatever becomes of this wait; refused once that end has run.
+            if !child
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .file_page_request(ticket)
+            {
+                guard.abandon_page(ticket);
+                return Some(CAP_REVOKED);
+            }
             break ticket;
         }
         let seen = bell_now(Some(&bell));
@@ -3843,6 +3854,10 @@ unsafe fn request_page(
             .unwrap_or_else(|e| e.into_inner())
             .abandon_page(ticket);
     }
+    child
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .forget_page_request(ticket);
     reply
 }
 
@@ -3900,7 +3915,7 @@ pub unsafe extern "C" fn page_miss(vm: &temen_jit::VmCtx, off: u64, len: u64, fl
                     off.max(start) - start,
                 )
             };
-            match request_page(pager, *export, sink, vm) {
+            match request_page(pager, cell, *export, sink, vm) {
                 None => return, // the end raised on `vm` unwinds the child
                 Some(r) if r < 0 => return fault(),
                 Some(_) => {} // supplied: check the page again
@@ -4456,10 +4471,24 @@ pub unsafe extern "C" fn budget_mem_give(
 pub unsafe extern "C" fn child_ended(child: *mut c_void) -> *mut c_void {
     let child = &*(child as *const Mutex<Host>);
     let mut g = child.lock().unwrap_or_else(|e| e.into_inner());
-    match g.release_memory() {
+    // #3166 — a demand-paged child's page requests still filed go before its window does (its
+    // teardown, after this): a request's sink writes into the window at its settle. Withdrawn with
+    // this lock let go, as `request_page` takes the two in the other order.
+    let pages = g
+        .jit_pager()
+        .map(|(pager, _)| (pager, g.close_page_requests()));
+    let post = match g.release_memory() {
         Some(end) => Box::into_raw(Box::new((end, g.park_hub()))) as *mut c_void,
         None => core::ptr::null_mut(),
+    };
+    drop(g);
+    if let Some((pager, tickets)) = pages {
+        let mut p = pager.lock().unwrap_or_else(|e| e.into_inner());
+        for t in tickets {
+            p.abandon_page(t);
+        }
     }
+    post
 }
 
 /// #2800 — [`temen_jit::ChildEndSignal`]: signal the end post [`child_ended`] answered, and wake its
@@ -10489,5 +10518,85 @@ mod run_view_tests {
         let mut other = Host::new();
         let mut held = run.lease(&mut other, base, 4096, 1 << 16).expect("free");
         assert!(shares(&other, held.window()));
+    }
+}
+
+#[cfg(test)]
+mod paged_child_end_tests {
+    //! #3166 — a demand-paged JIT child's end withdraws the page requests it still has filed with
+    //! its pager, before its teardown frees the window a request's sink writes into.
+    use super::*;
+
+    /// A child window that records whether a settle reached it.
+    struct Records(Arc<std::sync::atomic::AtomicBool>);
+
+    impl temen_interp::ChildWindow for Records {
+        fn supply(&self, _: u64, _: &[u8]) -> bool {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            true
+        }
+    }
+
+    /// A pager with a `{ page: (i64) -> (i64) }` export, and a JIT child paged by it.
+    fn pager_and_child() -> (Arc<Mutex<Host>>, Mutex<Host>) {
+        let m = temen_text::parse_module(
+            "type 0 func (i64) -> (i64)
+type 1 interface { page: 0 }
+export 0 interface \"pager\" 1 { page: 1 }
+func () -> (i64) {
+block 0 () {
+  vz = i64.const 0
+  return vz
+  }
+}
+func (i64) -> (i64) {
+block 0 (va: i64) {
+  return va
+  }
+}
+",
+        )
+        .expect("parse");
+        let pager = Arc::new(Mutex::new(Host::new()));
+        pager.lock().unwrap().set_self_module(&Arc::new(m));
+        let mut child = Host::new();
+        let paging = temen_interp::JitPaging {
+            table: Arc::from(vec![]),
+            mapped: 1 << 16,
+        };
+        child.set_jit_pager(Arc::clone(&pager), 0, paging);
+        (pager, Mutex::new(child))
+    }
+
+    /// A request still filed when its child ends (its waiter never came back for it) is withdrawn:
+    /// the pager's later settle of it reaches no sink. A request filed after the end is refused.
+    #[test]
+    fn a_paged_childs_end_withdraws_its_filed_page_requests() {
+        let (pager, child) = pager_and_child();
+        let reached = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let sink =
+            || temen_interp::PageSink::new(Box::new(Records(Arc::clone(&reached))), 0, 4096, 0);
+        // As `request_page` files one: on the pager, then recorded on the child under its lock.
+        let ticket = {
+            let mut p = pager.lock().unwrap();
+            let t = p
+                .request_page(0, sink())
+                .expect("the pager takes the request");
+            assert!(child.lock().unwrap().file_page_request(t));
+            t
+        };
+        // SAFETY: `child` is a live powerbox, as a task's end hands it.
+        let post = unsafe { child_ended(&child as *const Mutex<Host> as *mut c_void) };
+        assert!(post.is_null(), "no end post to signal");
+        // The pager serves it anyway: nothing is left to write through.
+        let value = pager.lock().unwrap().settle_page(ticket, 5, None);
+        assert_eq!(value, 5, "the settle found the request withdrawn");
+        assert!(!reached.load(std::sync::atomic::Ordering::SeqCst));
+        // A request the child files after its end is refused.
+        let mut p = pager.lock().unwrap();
+        let late = p
+            .request_page(0, sink())
+            .expect("the pager takes the request");
+        assert!(!child.lock().unwrap().file_page_request(late));
     }
 }
