@@ -327,6 +327,47 @@ pub(crate) fn active_depth() -> (usize, usize) {
     }
 }
 
+/// #3158 — the yield floor a guarded call holds for its span ([`FiberRuntime::yield_floor`]),
+/// restored as it drops, however the call ends.
+pub(crate) struct YieldFloor(*mut FiberRuntime, usize);
+
+/// #3158 — raise this thread's runtime's yield floor to its yielders' depth, for a guarded call
+/// starting now. The guard's recovery state lives on the stack it was entered on (`trap_shim.c`),
+/// and only a scope's own exit restores the one it replaced; so no yield may switch a stack out
+/// from under a live scope. A fiber resumed inside the call yields above the floor, back into the
+/// call; a fiber whose frames hold the call is, to the call, the root computation.
+pub(crate) fn raise_yield_floor() -> YieldFloor {
+    let rt = current();
+    if rt.is_null() {
+        return YieldFloor(rt, 0);
+    }
+    // SAFETY: `current()` is this thread's live runtime, and it outlives the guarded call (the
+    // call's recovery assumes the same runtime at its entry and its end, see `mem::guarded`).
+    unsafe {
+        let prev = (*rt).yield_floor;
+        (*rt).yield_floor = (*rt).yielders.len();
+        YieldFloor(rt, prev)
+    }
+}
+
+impl Drop for YieldFloor {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            // SAFETY: as at `raise_yield_floor`: the same live runtime, at the call's end.
+            unsafe { (*self.0).yield_floor = self.1 };
+        }
+    }
+}
+
+/// #3158 — the running fiber's yielder, for a yield: the top one, if it is above the yield floor.
+fn take_yielder(rt: &mut FiberRuntime) -> Option<*const Yielder> {
+    if rt.yielders.len() > rt.yield_floor {
+        rt.yielders.pop()
+    } else {
+        None
+    }
+}
+
 /// #3020 — a guarded call that started at resume depth `depth` ([`active_depth`]) faulted: its
 /// recovery jumped out of every fiber resumed inside it, past each resume's return and each body's
 /// yielder pop. Mark each abandoned ([`FAULTED`]) and drop it, and its yielder, from this thread's
@@ -1050,6 +1091,12 @@ pub(crate) struct FiberRuntime {
     /// returns, on this one OS thread). The futex thunk reads the top to fiber-park the
     /// RUNNING fiber ([`current_fiber_slot`]); empty means the root computation is running.
     active_slots: Vec<Arc<FiberSlot>>,
+    /// #3158 — the depth of `yielders` at the entry of the innermost live guarded call on this
+    /// runtime ([`raise_yield_floor`]). A yield takes only a yielder above it, and only a fiber
+    /// resumed above it is the running one ([`current_fiber_slot`]): a guarded call nested in a
+    /// fiber's frames (`Jit.invoke`, an inline handler) then cannot park that fiber with its
+    /// recovery scope still open on the fiber's stack, where a later fault would jump.
+    yield_floor: usize,
     /// The generated call-trampoline address (filled in after the module is finalized).
     call_tramp: Option<FiberCallTramp>,
     /// The structural type id every fiber entry must have (`(i64, i64) -> i64`), checked at
@@ -1112,6 +1159,7 @@ impl FiberRuntime {
             me,
             yielders: Vec::new(),
             active_slots: Vec::new(),
+            yield_floor: 0,
             call_tramp: None,
             fiber_type_id,
             fn_table_mask,
@@ -1840,10 +1888,12 @@ pub(crate) unsafe extern "C" fn fiber_suspend(value: i64, vm: u64) -> i64 {
     // switch sees *its* yielder on top.
     let y = {
         let rt = &mut *rt;
-        match rt.yielders.pop() {
+        match take_yielder(rt) {
             Some(y) => y,
             None => {
-                fault(vm); // root computation cannot suspend
+                // The root computation cannot suspend, nor a fiber whose frames hold a guarded
+                // call (#3158): a unit `Jit.invoke`d from it, as on the tree-walker.
+                fault(vm);
                 return 0;
             }
         }
@@ -1974,7 +2024,11 @@ pub(crate) fn current_fiber_slot() -> Option<Arc<FiberSlot>> {
         return None;
     }
     // SAFETY: `current()` is this thread's live runtime; the borrow is momentary.
-    unsafe { (*rt).active_slots.last().cloned() }
+    let rt = unsafe { &*rt };
+    // #3158 — below the yield floor the running code is, to its guarded call, the root's.
+    (rt.yielders.len() > rt.yield_floor)
+        .then(|| rt.active_slots.last().cloned())
+        .flatten()
 }
 
 /// §3.6 slice 5a — the **event-park yield**: hand control back to the resumer, which observes
@@ -1994,9 +2048,7 @@ pub(crate) unsafe fn fiber_event_park(
 ) {
     let y = {
         let rt = &mut *current();
-        rt.yielders
-            .pop()
-            .expect("event park only inside a running fiber")
+        take_yielder(rt).expect("event park only inside a running fiber")
     };
     slot.event_park.store(true, Ordering::Relaxed);
     // #1631 — published with the park marker and cleared with it, so the executor reading the seam

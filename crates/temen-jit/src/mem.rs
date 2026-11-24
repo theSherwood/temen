@@ -416,6 +416,9 @@ pub(crate) unsafe fn run_guarded(
 fn guarded(call: impl FnOnce() -> bool) -> bool {
     #[cfg(fiber_rt)]
     let depth = crate::fiber_rt::active_depth();
+    // #3158 — no yield switches a stack out from under this call's recovery scope.
+    #[cfg(fiber_rt)]
+    let _floor = crate::fiber_rt::raise_yield_floor();
     let faulted = call();
     #[cfg(fiber_rt)]
     if faulted {
