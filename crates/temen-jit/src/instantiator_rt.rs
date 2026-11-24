@@ -2317,7 +2317,15 @@ pub(crate) unsafe fn join_named(
         // #3158 — the task's code below a guarded call's yield floor cannot park the task whole:
         // an outcome already in is returned below, with no park to make; a join that would park
         // fails closed.
-        crate::fiber_rt::ParkAs::Refused if lock(&done.state).is_some() => None,
+        crate::fiber_rt::ParkAs::Refused
+            if done
+                .state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_some() =>
+        {
+            None
+        }
         crate::fiber_rt::ParkAs::Refused => {
             vm.raise(TrapKind::ThreadFault as i64);
             return 0;
