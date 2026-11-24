@@ -1761,11 +1761,12 @@ fn invoking_fiber(tail: &str, len: usize) -> String {
     with_len(&format!("memory 16\nfunc (i32) -> (i64) {{\nblock 0 (vj: i32) {{\n  vf = i32.const 1\n  vsp = i64.const 40960\n  vk = cont.new vf vsp\n  vj64 = i64.extend_i32_u vj\n  vs1, vv1 = cont.resume vk vj64\n{tail}  }}\n}}\nfunc (i64, i64) -> (i64) {{\nblock 0 (vsp: i64, varg: i64) {{\n  vj = i32.wrap_i64 varg\n  vb = i64.const 20480\n  vl = i64.const BLOBLEN\n  vu = call.cap 11 0 (i64, i64) -> (i64) vj (vb, vl)\n  vh = call.cap 11 1 (i64) -> (i64) vj (vu)\n  vc = i64.const 100\n  vr = i64.add vh vc\n  return vr\n  }}\n}}\n"), len)
 }
 
-/// #3158 — the unit's `suspend` faults on both engines, and a guarded fault the root then takes (a
-/// NULL-guard load) is a clean `MemoryFault`. Before the barrier the JIT parked F inside the invoke
-/// and the root's fault recovered onto F's stack: heap corruption, or a jump to a bad address.
+/// #3158 — the unit's `suspend` faults on both engines, whatever the root's code after it. That
+/// `FiberFault` ends the run, so with the barrier the tails never run (the punt row pins a later
+/// fault's clean recovery); before it, the JIT parked F inside the invoke and the root's NULL fault
+/// recovered onto F's stack: heap corruption, or a jump to a bad address.
 #[test]
-fn invoke_barrier_a_units_top_level_suspend_faults_and_a_later_fault_is_clean() {
+fn invoke_barrier_a_units_top_level_suspend_faults_whatever_follows() {
     let b = blob(SUSPENDS_AT_ITS_TOP);
     for tail in [
         "  return vv1\n",
@@ -1862,6 +1863,16 @@ fn invoke_barrier_a_punt_from_an_invoked_unit_waits_as_the_root() {
     );
     assert!(
         matches!(jout, JitOutcome::Returned(ref s) if s == &[1205]),
+        "{jout:?}"
+    );
+    // The invoke has returned, so the root's next guarded fault (a NULL-guard load) is recovered on
+    // the root's own scope: a clean `MemoryFault`.
+    let faults =
+        "  vnull = i64.const 8\n  vq = i64.load vnull\n  vr = i64.add vq vv1\n  return vr\n";
+    let guest = invoking_fiber(faults, b.len());
+    let (_, _, jout, _) = run_both(&guest, &b, &[], grant_punting_and_jit_fibers, 0);
+    assert!(
+        matches!(jout, JitOutcome::Trapped(TrapKind::MemoryFault)),
         "{jout:?}"
     );
 }

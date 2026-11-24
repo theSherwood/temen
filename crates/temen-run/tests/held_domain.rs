@@ -1701,3 +1701,161 @@ fn a_nested_activation_on_the_jit_can_burn_its_whole_loan() {
         (Reply::Failed(CAP_REVOKED), cost - 1)
     );
 }
+
+/// #3158 — the back-edges of [`qh_held`]'s `spin()`: many quanta of a pool task's fuel.
+const QH_HANDLER_TURNS: u64 = 200_000_000;
+/// #3158 — the back-edges of [`qh_spinner`]: it outlasts the handler, so a task stays queued.
+const QH_SPIN_TURNS: u64 = 2_000_000_000;
+
+/// #3158 — a held domain whose entry spawns three §14 children, which run as pool tasks: two spinners, and
+/// a caller holding the domain's own offer as `"exec"`. Its `spin()` never parks and runs
+/// [`QH_HANDLER_TURNS`] back-edges; `join_c()` joins the caller and answers `1000·status + value`.
+fn qh_held() -> String {
+    let c = SpawnRec {
+        grants_ptr: 16640,
+        grants_n: 1,
+        ..SpawnRec::default()
+    };
+    let d = SpawnRec::default();
+    format!(
+        r#"memory 17
+data 16684 "exec"
+{rec_c}{rec_d1}{rec_d2}type 0 func () -> (i64)
+type 1 interface {{ spin: 0, join_c: 0 }}
+export 0 interface "svc" 1 {{ spin: 1, join_c: 2 }}
+
+func (i32, i32, i32, i32) -> (i64) {{
+block 0 (vi: i32, vmc: i32, vmd: i32, vb: i32) {{
+  vsi = i64.const 16444
+  i32.store vsi vi
+  vd1m = i64.const {d1_module}
+  i32.store vd1m vmd
+  vd1b = i64.const {d1_budget}
+  i32.store vd1b vb
+  vd1r = i64.const 17536
+  vd1 = call.cap 6 17 (i64) -> (i32) vi (vd1r)
+  vd2m = i64.const {d2_module}
+  i32.store vd2m vmd
+  vd2b = i64.const {d2_budget}
+  i32.store vd2b vb
+  vd2r = i64.const 17664
+  vd2 = call.cap 6 17 (i64) -> (i32) vi (vd2r)
+  vcm = i64.const {c_module}
+  i32.store vcm vmc
+  vcb = i64.const {c_budget}
+  i32.store vcb vb
+  vgh = i32.const {tag}
+{grant}  vcr = i64.const 17408
+  vc = call.cap 6 17 (i64) -> (i32) vi (vcr)
+  vsc = i64.const 16440
+  i32.store vsc vc
+  vr = i64.const 1
+  return vr
+  }}
+}}
+
+func () -> (i64) {{
+block 0 () {{
+  vz = i64.const 0
+  br 1(vz)
+}}
+block 1 (vi: i64) {{
+  vone = i64.const 1
+  vj = i64.add vi vone
+  vn = i64.const {QH_HANDLER_TURNS}
+  vmore = i64.lt_u vj vn
+  br_if vmore 1(vj) 2()
+}}
+block 2 () {{
+  v42 = i64.const 42
+  return v42
+  }}
+}}
+
+func () -> (i64) {{
+block 0 () {{
+  vsi = i64.const 16444
+  vi = i32.load vsi
+  vsc = i64.const 16440
+  vc = i32.load vsc
+  vst, vv = call.cap 6 1 (i32) -> (i64, i64) vi (vc)
+  vk = i64.const 1000
+  vsk = i64.mul vst vk
+  vr = i64.add vsk vv
+  return vr
+  }}
+}}
+"#,
+        rec_c = rec::segment(17408, &c),
+        rec_d1 = rec::segment(17536, &d),
+        rec_d2 = rec::segment(17664, &d),
+        grant = rec::grant("ge", 16640, 16684, 4, "vgh"),
+        c_module = 17408 + SpawnRec::MODULE_AT,
+        c_budget = 17408 + SpawnRec::BUDGET_AT,
+        d1_module = 17536 + SpawnRec::MODULE_AT,
+        d1_budget = 17536 + SpawnRec::BUDGET_AT,
+        d2_module = 17664 + SpawnRec::MODULE_AT,
+        d2_budget = 17664 + SpawnRec::BUDGET_AT,
+        tag = GRANT_SERVE_LIVE_TAG as i32,
+    )
+}
+
+/// The caller child: answers what `spin()` through `"exec"` answers.
+const QH_CALLER: &str = r#"memory 15
+data 16384 "exec"
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vnp = i64.const 16384
+  vl = i64.const 4
+  vexec = self.resolve vnp vl
+  vr = call.cap 268435456 0 () -> (i64) vexec ()
+  return vr
+  }
+}
+"#;
+
+/// A child that spins [`QH_SPIN_TURNS`] back-edges and never parks.
+fn qh_spinner() -> String {
+    format!(
+        "memory 15\nfunc (i64) -> (i64) {{\nblock 0 (v0: i64) {{\n  vz = i64.const 0\n  br 1(vz)\n}}\nblock 1 (vi: i64) {{\n  vone = i64.const 1\n  vj = i64.add vi vone\n  vn = i64.const {QH_SPIN_TURNS}\n  vmore = i64.lt_u vj vn\n  br_if vmore 1(vj) 2()\n}}\nblock 2 () {{\n  vz2 = i64.const 0\n  return vz2\n  }}\n}}\n"
+    )
+}
+
+/// #3158 — a quantum that ends inside a handler run inline on a pool task's stack does not park the
+/// task. The caller child's call into its held parent runs the handler on the caller's own stack
+/// (`held_call` → `run_inline_as`, a guarded call nested in the task's frames); with one worker and
+/// the spinners queued, the handler's quanta end there. Before the yield floor each such end parked
+/// the task with the handler's recovery scope open on its stack, and the task resumed on another
+/// worker could leave that scope there and fault into the first worker's frames (traced on main: 3
+/// in 12 rounds). Now the task runs on to the handler's end, and each end let pass is counted
+/// (`temen_jit::quantum_ends_held`); without the floor nothing counts them, so this fails every run.
+///
+/// A normal lane: the ASan build does not run the handler inline (see #3158), so `asan-held` cannot
+/// cover this shape.
+#[test]
+fn a_quantum_ending_inside_a_handler_run_inline_on_a_pool_task_does_not_park_it() {
+    let held = temen_jit::quantum_ends_held();
+    let reply = bounded(move || {
+        let m = module(&qh_held());
+        let mut host = Host::new();
+        host.set_self_module(&m);
+        host.set_workers(1);
+        let args = vec![
+            Value::I32(host.grant_instantiator()),
+            Value::I32(host.grant_module(&module(QH_CALLER))),
+            Value::I32(host.grant_module(&module(&qh_spinner()))),
+            Value::I32(host.grant_budget(-1, 1 << 20, -1)),
+        ];
+        let (d, _) = hold(Executor::Jit, m, 0, &args, host);
+        call(&d, 1, &[])
+    });
+    assert_eq!(
+        reply,
+        Reply::Results(vec![42]),
+        "the caller joined, answering 42"
+    );
+    assert!(
+        temen_jit::quantum_ends_held() > held,
+        "the handler's quanta ended under its inline scope, and were let pass"
+    );
+}

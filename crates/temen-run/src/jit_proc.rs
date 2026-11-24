@@ -1218,7 +1218,9 @@ pub(crate) unsafe fn serve_request(
     if parks.wake_readers.is_some() || parks.wake_writers.is_some() {
         proc.tree.ring();
     }
-    let root = !temen_jit::fiber_active();
+    // #3158 — the root computation: no fiber on this vCPU's stack, so not code a fiber's `Jit.invoke`
+    // runs either (below its yield floor `fiber_active` is false, but the fiber is still there).
+    let root = temen_jit::at_root();
     if root && (parks.read_park.is_some() || parks.write_park.is_some()) {
         return tree_park(host, bell, vm, answer);
     }

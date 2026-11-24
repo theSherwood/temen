@@ -485,7 +485,15 @@ unsafe fn park_host_call_here(
         Parks::Fiber => fiber_rt::ParkOn::Event,
         Parks::Vcpu => fiber_rt::ParkOn::Page,
     };
-    let slot = fiber_rt::current_fiber_slot().filter(|_| !on.blocks_vcpu() || fiber_rt::in_task());
+    let slot = match fiber_rt::park_as() {
+        fiber_rt::ParkAs::Fiber(slot) if !on.blocks_vcpu() || fiber_rt::in_task() => Some(slot),
+        fiber_rt::ParkAs::Fiber(_) | fiber_rt::ParkAs::Thread => None,
+        // #3158 — a pool task below a guarded call's floor parks neither: fail closed.
+        fiber_rt::ParkAs::Refused => {
+            vm.raise(crate::TrapKind::ThreadFault as i64);
+            return HostPark::Ended;
+        }
+    };
     if let Some(slot) = slot {
         let ended = || epoch_fired(vm.epoch as usize) || vm.ended().is_some();
         loop {
@@ -3117,12 +3125,14 @@ pub(crate) unsafe fn join_thread(
     let cur = dom.current_task();
     // #1469 — inside a child-domain task the thread that would block is an executor worker, not a
     // vCPU: the task root parks the *task* instead (as `fiber_resume_block` does). A guest fiber
-    // inside the task fails closed rather than hold a worker the joined vCPU may need. (An
+    // inside the task, or the task's code below a guarded call's yield floor (#3158, where the
+    // task's slot is not the running one), fails closed rather than hold a worker the joined vCPU
+    // may need. (An
     // `Instantiator` join there parks the task through the fiber's resumers, #2322, a route this
     // join could share: `ParkOn::Thread` is passed up the same way.)
     let outcome = if fiber_rt::in_task() {
-        match fiber_rt::current_fiber_slot() {
-            Some(s) if s.is_platform() => task_join(dom, &s, done, vm),
+        match fiber_rt::park_as() {
+            fiber_rt::ParkAs::Fiber(s) if s.is_platform() => task_join(dom, &s, done, vm),
             _ => {
                 vm.raise(TrapKind::ThreadFault as i64);
                 return 0;
@@ -3372,17 +3382,25 @@ unsafe fn thread_wait_here(
     // resumer keeps running and sees `cont.resume` status `FIBER_PARKED`, exactly the tree-walk
     // oracle's fiber-park routing (`temen-interp/tests/fiber_parks.rs`; the timed-wait slice is
     // pinned by `temen/tests/fiber_timed_wait.rs`, the jacl consumer report).
-    if let Some(slot) = fiber_rt::current_fiber_slot() {
-        return fiber_futex_wait(
-            dom,
-            &slot,
-            phys,
-            expected & mask,
-            width,
-            deadline,
-            freeze,
-            vm,
-        );
+    match fiber_rt::park_as() {
+        fiber_rt::ParkAs::Fiber(slot) => {
+            return fiber_futex_wait(
+                dom,
+                &slot,
+                phys,
+                expected & mask,
+                width,
+                deadline,
+                freeze,
+                vm,
+            );
+        }
+        fiber_rt::ParkAs::Thread => {}
+        // #3158 — a pool task below a guarded call's floor parks neither: fail closed.
+        fiber_rt::ParkAs::Refused => {
+            vm.raise(crate::TrapKind::ThreadFault as i64);
+            return 0;
+        }
     }
     // #1904 — a wait that would park runs the deferred children first: the notifier may be one.
     match read_phys(vm, phys, width) {
@@ -3667,10 +3685,11 @@ pub(crate) unsafe extern "C" fn fiber_resume_block(
         // a vCPU of this Domain: its lanes and deadlock count are the task's, which the executor
         // keeps. So the task root parks the *task* on the one event park (counted, unless the
         // fiber waits on the outside, woken by every notify, poisoned at teardown) and re-polls
-        // when woken. A guest fiber inside the task fails closed rather than block a worker.
+        // when woken. A guest fiber inside the task, or the task's code below a guarded call's
+        // yield floor (#3158), fails closed rather than block a worker.
         if fiber_rt::in_task() {
-            match fiber_rt::current_fiber_slot() {
-                Some(s) if s.is_platform() => {
+            match fiber_rt::park_as() {
+                fiber_rt::ParkAs::Fiber(s) if s.is_platform() => {
                     let on = if outside {
                         fiber_rt::ParkOn::Outside
                     } else {

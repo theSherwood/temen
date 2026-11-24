@@ -2312,10 +2312,11 @@ pub(crate) unsafe fn join_named(
     // runs on nor sees `FIBER_PARKED` (`fiber_rt::fiber_resume` hands the park up to the task). An
     // outcome already in is returned below without parking, on any stack.
     let task = if crate::fiber_rt::in_task() {
-        match crate::fiber_rt::current_fiber_slot() {
-            Some(s) => Some(s),
-            // Unreachable: a task runs on its platform slot, the first of the resumes this reads.
-            None => {
+        match crate::fiber_rt::park_as() {
+            crate::fiber_rt::ParkAs::Fiber(s) => Some(s),
+            // The task's code below a guarded call's yield floor (#3158): it cannot park the task
+            // whole there, so the join fails closed.
+            crate::fiber_rt::ParkAs::Thread | crate::fiber_rt::ParkAs::Refused => {
                 vm.raise(TrapKind::ThreadFault as i64);
                 return 0;
             }

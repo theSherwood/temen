@@ -127,9 +127,54 @@ pub use os_thread_rt::{
 
 /// F3 (FIBER_PARK.md): whether a guest fiber is the current continuation on this OS thread —
 /// the host thunk's fiber-context probe (the futex thunk's `current_fiber_slot`, public face).
-/// `false` for the root computation, so a root-context punt keeps its inline/blocking wait.
+/// `false` for the root computation, so a root-context punt keeps its inline/blocking wait, and
+/// below a guarded call's yield floor (#3158: a unit `Jit.invoke`d from a fiber), where the fiber
+/// cannot park. Whether such code may park at all is [`park_refused`]'s; whether it is the root,
+/// [`at_root`]'s.
 pub fn fiber_active() -> bool {
     fiber_rt::current_fiber_slot().is_some()
+}
+
+/// #3158 — what a park an embedder's thunk makes here may take (`fiber_rt::ParkAs`, the one answer
+/// every park door asks): the running fiber, this OS thread, or none.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ParkHere {
+    /// The running fiber, alone: its resumer sees `FIBER_PARKED`.
+    Fiber,
+    /// This OS thread, a vCPU's own: block in place.
+    Thread,
+    /// None: a pool task's code below a guarded call's yield floor. Fail closed (`ThreadFault`).
+    Refused,
+}
+
+/// #3158 — [`ParkHere`] for the code running on this thread now.
+pub fn park_here() -> ParkHere {
+    #[cfg(fiber_rt)]
+    {
+        match fiber_rt::park_as() {
+            fiber_rt::ParkAs::Fiber(_) => ParkHere::Fiber,
+            fiber_rt::ParkAs::Thread => ParkHere::Thread,
+            fiber_rt::ParkAs::Refused => ParkHere::Refused,
+        }
+    }
+    #[cfg(not(fiber_rt))]
+    {
+        ParkHere::Thread
+    }
+}
+
+/// #3158 — whether the running code is its vCPU's root computation: no fiber on this thread's
+/// stack, whether running or holding a guarded call the code runs under (a `Jit.invoke` from a
+/// fiber is not the root). The process-tree gates' question.
+pub fn at_root() -> bool {
+    #[cfg(fiber_rt)]
+    {
+        fiber_rt::at_root()
+    }
+    #[cfg(not(fiber_rt))]
+    {
+        true
+    }
 }
 
 /// #1166 — whether this OS thread runs a `thread.spawn`ed vCPU, which only a concurrent guest has.
@@ -192,8 +237,8 @@ pub unsafe fn fiber_park_outside() {
 mod vcpu_tls;
 #[cfg(fiber_rt)]
 pub use child_exec::{
-    handler_steps_aside, handler_steps_back, Claim, GateAside, HandlerDone, HandlerEnd, HeldCaller,
-    HeldSite, Ran, ServeRefused, ServeSite,
+    handler_steps_aside, handler_steps_back, quantum_ends_held, Claim, GateAside, HandlerDone,
+    HandlerEnd, HeldCaller, HeldSite, Ran, ServeRefused, ServeSite,
 };
 
 /// #1952, #2742 — whether the running code is in a guest fiber (`cont.*`): a park there yields
