@@ -252,6 +252,12 @@ void temen_install_trap_handler(void) {
     sigaction(SIGILL, &sa, &g_old_ill);
 }
 
+/* #3167 — whether this thread's guard is armed (a guarded call's recovery point is installed). For
+ * the moved-scope rows only. `noipa`: each call reads the thread running it. */
+__attribute__((noinline, noipa)) int temen_guard_armed(void) {
+    return g_armed;
+}
+
 /* Run `fn(a, r, m, t, tc)` (a JIT entry trampoline) with faults in [lo, hi) caught.
  * Returns 0 if it ran to completion, 1 if a guarded fault was caught and unwound.
  *
