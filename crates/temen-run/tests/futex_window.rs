@@ -16,6 +16,8 @@
 use temen_interp::{FutexWindow, GuestMem};
 use temen_run::MprotectWindow;
 
+const EEXIST: i64 = -17;
+
 /// A window laid out like the JIT's: an inaccessible reservation with the backed prefix committed
 /// read-write.
 struct Reservation {
@@ -128,6 +130,8 @@ fn the_guarded_read_refuses_exactly_what_the_model_refuses() {
             let prot = [0, 1, 3][rng.below(3) as usize];
             let rp = rng.below(2);
             let which = rng.below(5);
+            // A map over a page an alias holds is refused, and changes nothing (#3173).
+            let aliased = (first..first + n).any(|p| alias[p as usize].is_some());
             let (rc, readable) = match which {
                 0 => (w.map(off, len, prot), prot & 1 != 0),
                 1 => (w.unmap(off, len), false),
@@ -157,7 +161,11 @@ fn the_guarded_read_refuses_exactly_what_the_model_refuses() {
                 }
                 ever |= which == 3;
             } else if rc < 0 {
-                assert!(first < guard, "seed {seed}: only the guard refuses: {rc}");
+                if first >= guard && which == 0 && aliased {
+                    assert_eq!(rc, EEXIST, "seed {seed}: a map over an alias");
+                } else {
+                    assert!(first < guard, "seed {seed}: only the guard refuses: {rc}");
+                }
                 // A refused op changes nothing, a region map's record of its region included.
                 if which == 3 && !ever {
                     assert!(
