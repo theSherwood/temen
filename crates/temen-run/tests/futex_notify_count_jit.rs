@@ -345,7 +345,8 @@ block 2 () {
 #[test]
 fn a_notify_of_one_wakes_the_oldest_of_a_fiber_and_a_vcpu_on_both_engines() {
     let m = module(NOTIFY_ONE_OF_A_FIBER_AND_A_VCPU);
-    let (interp, jit) = both(&m, Some("fiber parks"));
+    // #3078 slice 3 — a fiber's wait is the kernel's: it runs there too.
+    let (interp, jit) = both(&m, None);
     assert_eq!(
         interp, 110,
         "the oracle: one claimed, and it is the older waiter — the fiber"

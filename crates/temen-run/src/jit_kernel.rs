@@ -604,7 +604,7 @@ type CallPayload = Option<CallPark>;
 
 /// #2958 slice 5 — hand `park`, what a call the vCPU on `vm` just made left it to do
 /// ([`temen_interp::bytecode::call_park`]), to its task's rules ([`EmittedCall::park_call`]): `None`
-/// when `vm` is no kernel vCPU's. A park in a fiber traps `Malformed` (`fiber parks`).
+/// when `vm` is no kernel vCPU's. A call's park in a fiber traps `Malformed` (`fiber parks`).
 ///
 /// # Safety
 /// As [`temen_jit::kernel_rt::park_call`]'s: the caller is the cap thunk of code running on `vm`, on
@@ -711,20 +711,11 @@ block 0 (vsp: i64, varg: i64) {{
             .result
     }
 
-    /// #3078 slice 2 — the three backstops `fiber parks` keeps unreachable: a futex wait, a rewound
-    /// call park (an empty pipe's read) and a punted call's park, each made in a fiber, trap the
-    /// domain `Malformed` instead of parking the fiber's task. Run past `admit`, each meets the native
-    /// tier's assertion first in a build with debug assertions.
-    #[test]
-    #[cfg_attr(debug_assertions, should_panic(expected = "a native tier's image"))]
-    fn a_futex_wait_in_a_fiber_run_past_admit_meets_the_backstop() {
-        let wait = "  vq = i64.const 16400\n  vzw = i32.const 0\n  vto = i64.const -1\n  vw = i32.atomic.wait vq vzw vto\n  vr = i64.extend_i32_u vw";
-        assert_eq!(
-            a_fiber_parks_past_admit(wait, Host::new()),
-            Err(Trap::Malformed)
-        );
-    }
-
+    /// #3078 slice 2 — the two backstops `fiber parks` keeps unreachable: a rewound call park (an
+    /// empty pipe's read) and a punted call's park, each made in a fiber, trap the domain `Malformed`
+    /// instead of parking the fiber's task. Run past `admit`, each meets the native tier's assertion
+    /// first in a build with debug assertions. (A futex wait in a fiber is the kernel's since slice 3:
+    /// `temen-run/tests/jit_kernel.rs`'s `kernel_fibers::`.)
     #[test]
     #[cfg_attr(debug_assertions, should_panic(expected = "a native tier's image"))]
     fn a_pipe_read_in_a_fiber_run_past_admit_meets_the_backstop() {

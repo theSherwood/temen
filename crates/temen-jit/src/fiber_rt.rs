@@ -204,6 +204,37 @@ fn fiber_handle_generation(handle: i64) -> u64 {
     ((handle as u64) >> FIBER_GEN_SHIFT) & FIBER_HANDLE_GEN_MASK
 }
 
+/// #3078 slice 3 — the incarnation of `handle`'s fiber a kernel park is filed and claimed by: the
+/// generation it carries, as [`Ownership::claim_gen`] compares it.
+pub(crate) fn handle_incarnation(handle: i64) -> u64 {
+    fiber_handle_generation(handle)
+}
+
+/// #3078 slice 3 — the slot of `handle` in the table of this thread's fiber runtime, as `cont.resume`
+/// resolves it; `None` with no runtime, or out of range.
+pub(crate) fn resolve_slot(handle: i64) -> Option<usize> {
+    let rt = current();
+    // SAFETY: `current()` is this thread's live runtime; the borrow is momentary.
+    (!rt.is_null())
+        .then(|| unsafe { (*rt).table.resolve(handle) })
+        .flatten()
+        .map(|(k, _)| k)
+}
+
+impl FiberSlot {
+    /// #3078 slice 3 — the fiber, switched out to its resumer, is parked in the kernel's rules: no
+    /// vCPU runs it, and its slot stays `RUNNING` (unpublished), so only the rules' claim hands it on.
+    /// Cleared before the park is filed, so a claimant's swap of the seam finds it clear.
+    pub(crate) fn rest_in_kernel(&self) {
+        self.running_on.store(NOT_RUNNING, Ordering::Release);
+    }
+}
+
+/// #3078 slice 3 — the incarnation of the fiber in `slot` now, masked as a handle carries it.
+pub(crate) fn slot_incarnation(slot: &FiberSlot) -> u64 {
+    slot.own.generation() & FIBER_HANDLE_GEN_MASK
+}
+
 /// #3020 — whether `handle` names the fiber `canonical` names in a table of `slots` slots, as
 /// [`SharedFiberTable::resolve`] reads a handle: its slot masked to the table, its generation masked.
 pub(crate) fn names_same_fiber(canonical: i64, handle: i64, slots: usize) -> bool {
@@ -428,6 +459,12 @@ pub(crate) struct FiberSlot {
     /// What this event park waits for. Written and cleared beside [`Self::event_park`] by
     /// [`fiber_event_park`].
     park_on: Mutex<ParkOn>,
+    /// #3078 slice 3 — the slot's **parked word** on the kernel route: whether a kernel park of its
+    /// fiber is filed with executor 2's rules, and can be claimed, read by a `cont.resume` without
+    /// the run lock (`crate::kernel_rt::poll_parked`). The rules write it, under the run lock, through
+    /// the clone the park's record holds. Idle on every other route. While a park is filed the slot
+    /// stays `RUNNING`, so no claim of the slot's own takes it; the rules' claim hands it on.
+    pub(crate) kpark: Arc<temen_ir::seams::ParkWord>,
 }
 
 /// What an event park ([`fiber_event_park`]) waits for, as the fiber's resumer and a run's teardown
@@ -773,6 +810,7 @@ impl FiberSlot {
             event_park: AtomicBool::new(false),
             park_deadline: Mutex::new(None),
             park_on: Mutex::new(ParkOn::Event),
+            kpark: Arc::new(temen_ir::seams::ParkWord::new()),
         }
     }
 
@@ -800,7 +838,11 @@ impl FiberSlot {
             event_park,
             park_deadline,
             park_on,
+            kpark,
         } = self;
+        // A filed kernel park keeps its slot `RUNNING` until the rules' claim takes it, so a slot
+        // made again has none: its word stays, idle.
+        debug_assert!(kpark.is_idle(), "a slot made again holds no kernel park");
         *o = own;
         *running_on.get_mut() = NOT_RUNNING;
         *f.get_mut().unwrap_or_else(|e| e.into_inner()) = fiber;
@@ -1498,7 +1540,14 @@ pub(crate) unsafe extern "C" fn fiber_resume(
     // somewhere in a resume chain), a racing resume, or a finished fiber all *lose the claim* and
     // fault. No lock or `&mut` is held past this block; the `Arc` keeps the slot (and the boxed
     // fiber it owns) stable across the switch.
-    let (slot_idx, slot, fib, fctx): (usize, Arc<FiberSlot>, *mut Fiber, *const crate::VmCtx) = {
+    #[allow(clippy::type_complexity)]
+    let (slot_idx, slot, fib, fctx, kernel): (
+        usize,
+        Arc<FiberSlot>,
+        *mut Fiber,
+        *const crate::VmCtx,
+        Option<i64>,
+    ) = {
         let rt = &*rt;
         let Some((slot_idx, slot)) = rt.table.resolve(handle) else {
             fault(vm);
@@ -1512,10 +1561,22 @@ pub(crate) unsafe extern "C" fn fiber_resume(
         // **generation-checked** (recycling step 1): the generation carried in the guest handle must
         // match the slot's, so a stale handle to a recycled slot's former occupant faults. All
         // generations are 0 until recycling is wired, so this equals the old `claim()` (handle == slot).
+        // #3078 slice 3 — a fiber parked in the kernel's rules: its word answers a poll of it without
+        // the run lock, and its claim is the rules', under it, never the CAS below, which a
+        // kernel-parked slot (`RUNNING`) never grants. A slot with no park of this incarnation
+        // goes on to the CAS.
+        let kernel = match crate::kernel_rt::poll_parked(vm, slot_idx, &slot, handle) {
+            crate::kernel_rt::Polled::Own => None,
+            crate::kernel_rt::Polled::Answer(status) => {
+                *status_out = status;
+                return 0;
+            }
+            crate::kernel_rt::Polled::Claimed(status) => Some(status),
+        };
         // #1538: read before the claim — a suspended (`RUNNABLE`) fiber's park is what this
         // delivery consumes; a fresh (`OWNED`) one may be a thaw-seeded consumed fiber.
         let was_runnable = slot.own.is_runnable();
-        if !slot.own.claim_gen(fiber_handle_generation(handle)) {
+        if kernel.is_none() && !slot.own.claim_gen(fiber_handle_generation(handle)) {
             // #2032 — a freeze driver resumes the handles of its own snapshot of the table, and
             // another vCPU's driver (or a guest resume under the freeze) may have flattened one
             // since: that claimant records it, so this one skips it. Only a guest's lost claim is a
@@ -1576,7 +1637,7 @@ pub(crate) unsafe extern "C" fn fiber_resume(
             }
         };
         let (fib, fctx) = fib;
-        (slot_idx, slot, fib, fctx)
+        (slot_idx, slot, fib, fctx, kernel)
     };
     // Durable shadow-SP swap (DURABILITY.md §12.8, D-fiber-cont option A): `fiber_resume` brackets a
     // fiber's residency, so the whole swap lives here (no change to `fiber_suspend`). On entry save
@@ -1590,8 +1651,9 @@ pub(crate) unsafe extern "C" fn fiber_resume(
     // #2322 — one pass per residency of the fiber. A join inside it blocks this whole vCPU, as it
     // does on every engine, so the pass ends early only to hand that park on (below); when the vCPU
     // is resumed, the next pass switches into the fiber again. The claim stays this vCPU's
-    // throughout, as a running fiber's does.
-    let mut arg = arg;
+    // throughout, as a running fiber's does. A kernel claim hands the fiber its wait's status
+    // instead of `arg`, which its park returns (#3078 slice 3).
+    let mut arg = kernel.unwrap_or(arg);
     let st = loop {
         // §12.8 4A.5: each context keeps its shadow-SP word in its **own** region, so the swap
         // saves/loads *per-region* words (no shared `SHADOW_SP_OFF`) and re-points
@@ -1713,6 +1775,12 @@ pub(crate) unsafe extern "C" fn fiber_resume(
             // guest `suspend` keeps its `(0, value)`. Read before republishing, so a cross-vCPU
             // poll's claim-acquire orders it behind this seam.
             let parked = slot.event_park.load(Ordering::Relaxed);
+            // #3078 slice 3 — on a kernel vCPU an event park is a kernel park: the rules file it,
+            // and the slot is not published (`crate::kernel_rt::file_park`).
+            if parked && crate::VmCtx::at(vm).kernel {
+                *status_out = crate::kernel_rt::file_park(vm, slot_idx, &slot);
+                return 0;
+            }
             // Voluntarily suspended: **publish to the pool** — claimable by any vCPU now, on any
             // thread (the migration point; release-pairs with the next claimant's acquire).
             slot.running_on.store(NOT_RUNNING, Ordering::Release);
@@ -1986,12 +2054,14 @@ pub(crate) fn current_fiber_slot() -> Option<Arc<FiberSlot>> {
 ///
 /// # Safety
 /// Must be called from inside a running fiber, with `slot` = that fiber's own slot (the futex
-/// thunk resolves it via [`current_fiber_slot`]).
+/// thunk resolves it via [`current_fiber_slot`]). Returns what the resume that ends the park
+/// delivered: nothing on today's route (its polls pass 0), a kernel park's status on the kernel's
+/// (#3078 slice 3).
 pub(crate) unsafe fn fiber_event_park(
-    slot: &Arc<FiberSlot>,
+    slot: &FiberSlot,
     deadline: Option<Instant>,
     on: ParkOn,
-) {
+) -> u64 {
     let y = {
         let rt = &mut *current();
         rt.yielders
@@ -2003,7 +2073,8 @@ pub(crate) unsafe fn fiber_event_park(
     // sees the two together and never a stale answer from the previous park.
     *slot.park_deadline.lock().unwrap_or_else(|e| e.into_inner()) = deadline;
     *slot.park_on.lock().unwrap_or_else(|e| e.into_inner()) = on;
-    let _ = (*y).suspend(0); // the poll's resume arg is deliberately not delivered
+    // Today's route's poll delivers nothing; a kernel claim delivers the park's status (#3078 slice 3).
+    let delivered = (*y).suspend(0);
     slot.event_park.store(false, Ordering::Relaxed);
     *slot.park_deadline.lock().unwrap_or_else(|e| e.into_inner()) = None;
     *slot.park_on.lock().unwrap_or_else(|e| e.into_inner()) = ParkOn::Event;
@@ -2013,6 +2084,7 @@ pub(crate) unsafe fn fiber_event_park(
         let rt = &mut *current();
         rt.yielders.push(y);
     }
+    delivered
 }
 
 /// **Durable freeze driver** (DURABILITY.md §12.8 slice 3.3.2) — the JIT analogue of the

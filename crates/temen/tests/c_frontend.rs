@@ -3949,10 +3949,17 @@ int run(int n) {
 #[test]
 #[cfg(all(unix, target_arch = "x86_64"))]
 fn c_guest_fiber_scheduler_demos_take_the_kernel_route() {
-    for src in [
-        include_str!("../../temen-run/demos/mn_sched/mn_sched.c"),
-        include_str!("../../temen-run/demos/steal_fibers/steal_fibers.c"),
-    ] {
+    let demos: [(&str, &[u8]); 2] = [
+        (
+            include_str!("../../temen-run/demos/mn_sched/mn_sched.c"),
+            b"1024\n",
+        ),
+        (
+            include_str!("../../temen-run/demos/steal_fibers/steal_fibers.c"),
+            b"256\n121920\n",
+        ),
+    ];
+    for (src, want) in demos {
         let ir = c_to_ir(src);
         let m = parse_module(&ir).unwrap_or_else(|e| panic!("parse IR failed: {e:?}"));
         let inst = temen_run::instantiate(m).unwrap_or_else(|e| panic!("instantiate: {e}"));
@@ -3961,5 +3968,16 @@ fn c_guest_fiber_scheduler_demos_take_the_kernel_route() {
         assert_eq!(inst.kernel_route(&unmetered), Ok(()));
         let metered = temen_run::RunConfig::default();
         assert_eq!(inst.kernel_route(&metered), Err("fiber fuel"));
+        // It runs there, and prints the invariant totals the oracle's run prints
+        // (`c_guest_mn_scheduler_demo`, `c_guest_steal_fibers_demo`).
+        let before = temen_run::jit_kernel::kernel_runs();
+        let run = inst
+            .run(temen_run::Backend::Jit, &unmetered)
+            .unwrap_or_else(|e| panic!("the kernel route's run: {e}"));
+        assert!(
+            temen_run::jit_kernel::kernel_runs() > before,
+            "the run took the kernel route"
+        );
+        assert_eq!(run.stdout, want, "{:?}", run.outcome);
     }
 }

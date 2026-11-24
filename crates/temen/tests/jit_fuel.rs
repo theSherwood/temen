@@ -983,8 +983,8 @@ fn jit_fuel_a_refused_spawn_frees_no_context_a_fiber_charges() {
 /// vCPU's cell wherever it runs (#3080), so a fiber resumed on another vCPU can lose charges to its
 /// creator's at once: the kernel route declines every metered run of a module that uses fibers
 /// (`fiber fuel`) rather than diverge (INVARIANTS #9). Fiber-only modules keep their single-vCPU path
-/// (`fiber only`), and fibers that wait keep today's route (`fiber parks`). #3080's fix gives each
-/// row here its metered kernel lane.
+/// (`fiber only`). Since #3078 slice 3 a fiber that waits is the kernel's too, so a metered run of
+/// one meets `fiber fuel`. #3080's fix gives each row here its metered kernel lane.
 #[test]
 fn jit_fuel_the_kernel_route_declines_every_metered_fiber_run() {
     use temen_run::jit_kernel;
@@ -996,7 +996,7 @@ fn jit_fuel_the_kernel_route_declines_every_metered_fiber_run() {
     assert_eq!(declined(A_FIBER_OUTLIVES_ITS_VCPU), Some("fiber fuel"));
     assert_eq!(
         declined(A_REFUSED_SPAWN_UNDER_A_RUNNING_FIBER),
-        Some("fiber parks")
+        Some("fiber fuel")
     );
     assert_eq!(declined(&fibers_suspending(3, 2)), Some("fiber only"));
     assert_eq!(declined(&busy_poll(Some(3))), Some("fiber only"));

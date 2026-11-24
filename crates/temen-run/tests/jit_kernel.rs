@@ -5997,7 +5997,7 @@ block 0 (va: i64, vb: i64) {{
             true => ("  vas, vav = thread.join va\n", ""),
             // A sets 16404 once it has parked the fiber; the root waits for that before C notifies.
             false => (
-                "  br 1(vk, va)\n}\nblock 1 (vk1: i64, va1: i64) {\n  vp = i64.const 16404\n  vpa = i32.atomic.load vp\n  br_if vpa 2(vk1, va1) 1(vk1, va1)\n}\nblock 2 (vk: i64, va: i64) {\n  vz = i64.const 0\n",
+                "  br 1(vk, va)\n}\nblock 1 (vk1: i64, va1: i32) {\n  vp = i64.const 16404\n  vpa = i32.atomic.load vp\n  br_if vpa 2(vk1, va1) 1(vk1, va1)\n}\nblock 2 (vk: i64, va: i32) {\n  vz = i64.const 0\n",
                 "  vg = i64.const 16408\n  vgo = i32.const 1\n  i32.atomic.store vg vgo\n  vas, vav = thread.join va\n",
             ),
         };

@@ -340,6 +340,11 @@ impl ParkWord {
         self.word.store(IDLE, Ordering::Release);
     }
 
+    /// Whether the word names no park: what a slot holds when no kernel park of it is filed.
+    pub fn is_idle(&self) -> bool {
+        self.word.load(Ordering::Acquire) & STATE == IDLE
+    }
+
     /// What a `cont.resume` of incarnation `gen` does with its park, `now` read only for a timed one.
     ///
     /// A timed park's deadline is a second word, which a later incarnation of the slot may have

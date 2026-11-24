@@ -9068,10 +9068,11 @@ fn image_parks(host: &Host, m: &Module, census: &ImageCensus) -> Parks {
 /// - **`fiber only`**: a module with fibers and no `thread.spawn` keeps its single-vCPU path
 ///   (#3078, owner decision 21: removed by the slice that runs a run with no `thread.spawn` on the
 ///   kernel without locks);
-/// - **`fiber parks`**: a module with fibers that makes a `memory.wait` or a call that can park
-///   ([`fiber_parks`]): a fiber's park runs on the engine's fiber runtime, not the kernel's rules yet
-///   (#3078 slices 3 and 4). A join, a spawn, a notify and a region post's `signal` made in a fiber
-///   are the stops of the task that runs it, through that thread's hook;
+/// - **`fiber parks`**: a module with fibers that makes a call that can park ([`fiber_parks`]): a
+///   fiber's call park runs on the engine's fiber runtime, not the kernel's rules yet (#3078 slice
+///   4). A fiber's futex wait is the kernel's since slice 3: its park is a [`FiberState::WaitParked`]
+///   record with [`Cont::Native`]. A join, a spawn, a notify and a region post's `signal` made in a
+///   fiber are the stops of the task that runs it, through that thread's hook;
 /// - **`gc.roots`**: the rules scan an interpreted task's frames, not native ones (a later phase,
 ///   or for good if no consumer needs it);
 /// - **`signals`**: delivery into native code is the engine's safepoint redirect, not executor 2's
@@ -9484,8 +9485,9 @@ impl CallSite {
     }
 }
 
-/// #3078 slice 2 — the `fiber parks` clause: a module that uses fibers and makes a `memory.wait`,
-/// or a call [`kernel_op`] says can park (inline, or through a bound import's every op). Which code
+/// #3078 slice 2 — the `fiber parks` clause: a module that uses fibers and makes a call [`kernel_op`]
+/// says can park (inline, or through a bound import's every op). Since slice 3 a `memory.wait` is no
+/// part of it: a fiber's futex wait is the kernel's. Which code
 /// runs in a fiber cannot be known statically, so it is decided on the module. A target `kernel_op`
 /// declines is not asked: a later clause declines the module.
 fn fiber_parks(m: &Module, host: &Host) -> bool {
