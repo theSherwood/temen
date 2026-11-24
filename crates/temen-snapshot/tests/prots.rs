@@ -250,12 +250,16 @@ fn a_window_layout_round_trips_with_a_hole_under_the_high_water() {
     let mut rhost = Host::new();
     let (restored, reserved) = restore_layout(&art, &m, &mut rhost).expect("restore the layout");
     assert_eq!(reserved, RESERVED_LOG2);
+    // #3137 — the restored layout holds the declared window as bytes and the artifact's head past it
+    // as a span: its dense form is the window that was frozen.
     assert_eq!(
-        restored.dense_prots(),
-        want,
-        "the page map survives, holes included"
+        restored.bytes().len(),
+        WINDOW,
+        "the head is the declared window"
     );
-    assert_eq!(restored.bytes(), layout.bytes(), "the image survives");
+    let (image, prots) = restored.to_dense();
+    assert_eq!(prots, want, "the page map survives, holes included");
+    assert_eq!(image, layout.bytes(), "the image survives");
 }
 
 /// A **4 GiB mask domain** (`reserved_log2 == 32`) round-trips — the ordinary reservation an on-ramp

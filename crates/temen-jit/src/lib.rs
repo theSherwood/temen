@@ -759,6 +759,10 @@ pub struct TailPage {
 pub struct WindowRestore {
     pub prots: Vec<WindowProt>,
     pub tail: Vec<TailPage>,
+    /// #3137 — a committed span past the declared window, `[start, end)`, held read-write and zero
+    /// but where `tail` says otherwise: committed in one run. Empty but for a restored artifact
+    /// whose head runs past the declared window.
+    pub held: core::ops::Range<u64>,
 }
 
 /// The residue records a durable freeze writes and a thaw re-creates: one definition for every engine
@@ -1949,6 +1953,7 @@ pub fn compile_and_run_capture_reserved_with_host_prots(
     cm.seed.restore = (!init_prots.is_empty()).then(|| WindowRestore {
         prots: init_prots.to_vec(),
         tail: Vec::new(),
+        held: 0..0,
     });
     cm.run(args, Some(init_mem), Some(SNAP_CAP))
 }
@@ -2350,11 +2355,9 @@ pub struct CapturedSeed {
     pub digest: [u8; 32],
     /// Its restored window image.
     pub image: Vec<u8>,
-    /// Its restored page map over `image`, one entry per [`DURABLE_SNAPSHOT_PAGE`] (#1733); empty
-    /// when no page deviates from a fresh window's.
-    pub prots: Vec<WindowProt>,
-    /// #2427 — and each page it holds past `image`.
-    pub tail: Vec<TailPage>,
+    /// How its window restores over `image` (#1733, #2427, #3137): its page map, the pages it holds
+    /// past `image`, and its held span ([`WindowRestore`]).
+    pub restore: WindowRestore,
     /// Its restored powerbox, as a builder fills it: two counted refs (`ctx`, `retained_ctx`).
     pub child: GrantChild,
     /// #1971 — the lease its window was charged under, as the spawn filed it: the parent's handle on
@@ -2567,6 +2570,7 @@ pub fn compile_and_run_durable(
         cm.seed.restore = (!run.init_prots.is_empty()).then(|| WindowRestore {
             prots: run.init_prots,
             tail: Vec::new(),
+            held: 0..0,
         });
         // A `DurableRun` seed is built by its caller, who holds no releaser this entry could call:
         // only `temen_run` builds relaunch payloads, and it seeds through `set_durable` itself.
@@ -5536,6 +5540,7 @@ impl CompiledModule {
                 self.win_mapped as u64,
                 init_mem.unwrap_or(&[]),
                 &r.tail,
+                r.held.clone(),
             )
         });
         let seeded = restored
