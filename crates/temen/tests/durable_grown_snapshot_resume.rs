@@ -211,16 +211,13 @@ fn a_grown_durable_guest_survives_freeze_serialize_restore_resume() {
     let mut rwin = rwin;
     begin_thaw(&mut rwin, TEST_ARENA, 0); // clear the freeze word, set context 0 REWINDING
 
-    // A fresh backing sized to the restored reservation, pre-filled with the restored window image
-    // (grown pages included). Leaked for the run's life; `Region::shared` borrows it.
-    let size = 1usize << rreserved;
-    let layout = std::alloc::Layout::from_size_align(size, 8).unwrap();
-    // SAFETY: non-zero 8-aligned layout; leaked, so the Region borrow is sound for the test.
-    let base = unsafe { std::alloc::alloc_zeroed(layout) };
-    assert!(!base.is_null());
-    // SAFETY: `base` owns `size` bytes and `rwin.len() <= size` (mapped extent ≤ reservation).
-    unsafe { core::ptr::copy_nonoverlapping(rwin.as_ptr(), base, rwin.len()) };
-    let back = Arc::new(unsafe { Region::shared(base, size as u64) });
+    // A growable backing of the restored image's length, pre-filled with it, not the artifact's
+    // reservation: past it the window grows by `map`, charged first. As `temen_durable_thaw_resume`
+    // builds it (#3100) — a copy of that entry's body, not a call to it (it is the browser's wasm32
+    // FFI), so this row cannot see that entry regress; it pins that the bytecode resume runs over
+    // such a backing.
+    let back = Arc::new(Region::growable(rwin.len() as u64, PAGE as u64).expect("a backing"));
+    back.write_from(0, &rwin);
 
     // The restored per-page protection map, as `seed_pages` entries (kind: 0=Ro, 1=Rw, 2=Unmapped).
     let entries: Vec<(u64, u8)> = rprots
