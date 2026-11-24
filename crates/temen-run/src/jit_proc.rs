@@ -1056,7 +1056,8 @@ pub(crate) unsafe fn compile_image(
         CapCtx::Raw(_) => (module_resolver, Some(fast_cap_resolver)),
         CapCtx::Locked(_) => (module_resolver_locked, None),
     };
-    let (fibers, threads) = cc.with_host(|h| (hosts_fibers(module, h), h.jit_hosts_threads()));
+    let (fibers, threads) = cc.with_host(|h| (h.jit_hosts_fibers(), h.jit_hosts_threads()));
+    let fibers = jit && fibers; // #3080 — [`hosts_fibers`] with the caller's `drives_jit`
     let mut cm = CompiledModule::compile_kept(
         kept,
         module,

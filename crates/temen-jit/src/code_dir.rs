@@ -285,17 +285,16 @@ impl<'a> Reader<'a> {
 }
 
 /// The key a root compile's code is kept under: the module, by its content `digest`, and what else
-/// the compile bakes into its code ([`crate::CompiledModule::compile_kept`]).
+/// the compile bakes into its code ([`crate::CompiledModule::compile_kept`]): whether it polls an
+/// epoch, charges fuel, has the fast cap path and hosts fibers (`baked`, in that order).
 pub(crate) fn root_key(
     digest: &[u8; 32],
     entry: u32,
-    polls: bool,
-    fuel: bool,
-    fast: bool,
+    baked: [bool; 4],
     reserved_log2: u8,
     table_reserve_log2: u8,
-    hosts_fibers: bool,
 ) -> [u8; 32] {
+    let [polls, fuel, fast, hosts_fibers] = baked;
     let mut k = b"temen-jit root\0".to_vec();
     k.extend(digest);
     k.extend(entry.to_le_bytes());

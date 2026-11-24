@@ -4143,12 +4143,14 @@ impl CompiledModule {
                 let key = code_dir::root_key(
                     &digest,
                     func,
-                    epoch_addr != 0,
-                    fuel_addr != 0,
-                    fast_resolver.is_some(),
+                    [
+                        epoch_addr != 0,
+                        fuel_addr != 0,
+                        fast_resolver.is_some(),
+                        hosts_fibers,
+                    ],
                     reserved_log2,
                     table_reserve_log2,
-                    hosts_fibers,
                 );
                 (dir, key)
             });
