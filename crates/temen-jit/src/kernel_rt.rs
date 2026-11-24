@@ -255,6 +255,9 @@ fn fiber_wait(vm: &VmCtx, req: WaitReq) -> [i64; 2] {
     };
     if swap_req(Some(req)).is_some() {
         // One fiber wait at a time per thread: its resumer takes it before anything else runs here.
+        // Neither request is filed, so the record is left with none, and this thread's next fiber
+        // wait is judged on its own.
+        swap_req(None);
         vm.raise(temen_ir::trap_code::MALFORMED);
         return [0, 0];
     }
@@ -307,7 +310,7 @@ pub(crate) unsafe fn file_park(
         expected,
         wide,
         timeout,
-        word: std::sync::Arc::clone(slot) as temen_ir::seams::ParkRef,
+        site: std::sync::Arc::clone(slot) as temen_ir::seams::ParkRef,
     };
     // SAFETY: a resume thunk on the resumer's own thread, inside its vCPU's guarded call.
     unsafe { through_hook(vm, |hook| hook.park_fiber(wait)) };
@@ -943,7 +946,7 @@ extern "C" fn thread_entry(
 #[cfg(all(test, fiber_rt))]
 mod tests {
     use super::*;
-    use crate::fiber_rt::{FiberRuntime, SharedFiberTable};
+    use crate::fiber_rt::{FiberRuntime, FiberSlot, SharedFiberTable};
     use crate::vmctx::{InstanceAddrs, Window};
     use std::sync::atomic::Ordering;
     use std::sync::Arc;
@@ -1329,6 +1332,58 @@ block 0 (va: i64, vb: i64) {
         ] {
             assert_eq!(poll(word, answer, raise), want, "{what}");
         }
+    }
+
+    /// #3078 slice 3 (review A1) — a fiber's kernel wait holds no reference to its slot across the
+    /// yield: a fiber left parked as its run ends, whose stack is freed without unwinding, keeps no
+    /// slot alive. The fiber notes a `Weak` of its slot, then waits through `routed` (P0); its
+    /// resumer files the park with a hook that drops it, as the run's end drops the record. Once
+    /// the table has ended and the runtime gone, nothing holds the slot.
+    #[test]
+    fn a_fiber_parked_at_its_runs_end_leaves_no_hold_on_its_slot() {
+        let end = AtomicI64::new(0);
+        let vm = context(&end, true);
+        let vm_at = &vm as *const VmCtx as usize;
+        let table = Arc::new(SharedFiberTable::new(
+            4,
+            temen_ir::durable_abi::ShadowArena::EMPTY,
+            None,
+        ));
+        let noted = Arc::new(std::sync::Mutex::new(None::<std::sync::Weak<FiberSlot>>));
+        let note = Arc::clone(&noted);
+        // SAFETY: the body runs under the resume below, with this thread's runtime published.
+        let fiber = unsafe {
+            crate::fiber_rt::make_task_fiber(64 << 10, move |_| {
+                let slot = crate::fiber_rt::current_fiber_slot().expect("running in its slot");
+                *note.lock().unwrap() = Some(Arc::downgrade(&slot));
+                drop(slot);
+                // The context outlives the fiber's run (the enclosing block's contract).
+                routed(&*(vm_at as *const VmCtx), WAIT);
+            })
+        }
+        .expect("a stack");
+        let handle = table.create_for_test(fiber).expect("a slot");
+        let rt = Box::new(FiberRuntime::new(Arc::clone(&table), 0, 0));
+        let mut hook = Then(|| None, 0);
+        // SAFETY: `hook` outlives the guard.
+        let published = unsafe { Published::new(&end, &mut hook, Some(rt)) };
+        let mut status = 0i64;
+        // SAFETY: `vm` is a live context and `status` a live cell; this thread's runtime is published.
+        unsafe { crate::fiber_rt::fiber_resume(handle, 0, &mut status, vm_at as u64) };
+        drop(published);
+        assert_eq!(status, FIBER_PARKED, "the fiber parked in the kernel");
+        assert_eq!(vm.ended(), None, "and its park was filed");
+        table.end();
+        drop(table);
+        let weak = noted
+            .lock()
+            .unwrap()
+            .take()
+            .expect("the fiber noted its slot");
+        assert!(
+            weak.upgrade().is_none(),
+            "something still holds the parked fiber's slot"
+        );
     }
 
     /// #3078 slice 3 (#3130 item 3) — on a kernel vCPU, an event park with no kernel wait behind it

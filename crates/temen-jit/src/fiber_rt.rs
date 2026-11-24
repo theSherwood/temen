@@ -226,8 +226,26 @@ impl FiberSlot {
     }
 }
 
+/// #3078 slice 3 — the layout the poll's cost rests on: the slot's claim word and its parked word,
+/// each whole, on one cache line of the line-aligned slot, so a `cont.resume` that reads both reads
+/// one line. The field order is rustc's (no `repr(C)`), so this pins what it chose; a change that
+/// moves either off the line fails to compile here.
+const _: () = {
+    use core::mem::{offset_of, size_of};
+    let (own, word) = (offset_of!(FiberSlot, own), offset_of!(FiberSlot, kpark));
+    let (own_end, word_end) = (
+        own + size_of::<Ownership>() - 1,
+        word + size_of::<temen_ir::seams::ParkWord>() - 1,
+    );
+    assert!(own / 64 == own_end / 64 && word / 64 == word_end / 64);
+    assert!(
+        own / 64 == word / 64,
+        "the parked word shares the claim word's line"
+    );
+};
+
 /// #3078 slice 3 — a kernel park's record holds the slot itself, for the rules to write its word.
-impl temen_ir::seams::ParkSite for FiberSlot {
+impl temen_ir::seams::ParkHolder for FiberSlot {
     fn park_word(&self) -> &temen_ir::seams::ParkWord {
         &self.kpark
     }
@@ -418,7 +436,7 @@ pub(crate) struct FiberSlot {
     /// fiber is filed with executor 2's rules, and can be claimed, read by a `cont.resume` without
     /// the run lock (`crate::kernel_rt::poll_parked`). Inline, beside `own`, so the poll every
     /// `cont.resume` makes reads no line of its own. The rules write it, under the run lock, through
-    /// the slot the park's record holds ([`temen_ir::seams::ParkSite`]). Idle on every other route.
+    /// the slot the park's record holds ([`temen_ir::seams::ParkHolder`]). Idle on every other route.
     /// While a park is filed the slot stays `RUNNING`, so no claim of the slot's own takes it; the
     /// rules' claim hands it on. Under `--cfg loom` its atomics are loom's: a loom test that makes
     /// a slot must make it inside `loom::model`.
@@ -2054,7 +2072,7 @@ pub(crate) unsafe fn runs_a_fiber(rt: *const FiberRuntime) -> bool {
 /// # Safety
 /// `rt` is a live runtime of this thread's. The slot lives as long as its run's table holds it.
 pub(crate) unsafe fn running_slot_of(rt: *const FiberRuntime) -> Option<*const FiberSlot> {
-    if !std::ptr::eq(rt, current()) {
+    if rt.is_null() || !std::ptr::eq(rt, current()) {
         return None;
     }
     // SAFETY: the caller's contract; the borrow is momentary.

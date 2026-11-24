@@ -187,7 +187,7 @@ pub fn handler_never_parks(funcs: &[Func], func: FuncIdx) -> bool {
 /// #3078 slice 3 — and two a `cont.resume` of a kernel-parked **fiber** makes: its claim, or a block of
 /// its task on it, through the rules ([`NativeStop::FiberClaim`], [`NativeStop::FiberBlock`]). Each
 /// names the fiber's incarnation, its slot and generation, so a stale handle to a recycled slot never
-/// reaches another fiber's park ([`ParkWord`]). The park itself, which carries the slot's word, is a
+/// reaches another fiber's park ([`ParkWord`]). The park itself, which carries the slot that holds the word, is a
 /// [`FiberWait`] of its own, so a stop stays `Copy` and as small as it was: every §12 op makes one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NativeStop {
@@ -227,7 +227,7 @@ pub enum NativeStop {
 
 /// #3078 slice 3 — the futex wait native fiber `slot` (generation `gen`) made before it switched out,
 /// which its resumer files with the rules as the fiber's park: its record in the run's registry, its
-/// entry in the wait index, and `word`, the slot's parked word, set for pollers. The wait's operands
+/// entry in the wait index, and `site`, the slot that holds its parked word, set for pollers. The wait's operands
 /// are [`NativeStop::Wait`]'s.
 #[derive(Clone)]
 pub struct FiberWait {
@@ -237,25 +237,25 @@ pub struct FiberWait {
     pub expected: u64,
     pub wide: bool,
     pub timeout: i64,
-    pub word: ParkRef,
+    pub site: ParkRef,
 }
 
 /// #3078 slice 3 — what holds a native fiber's parked word: its slot, which keeps the word inline
 /// beside the slot's own claim word, so a poll reads one line it reads anyway. The rules hold the
 /// slot through [`ParkRef`] while the park is filed, and write the word through it.
-pub trait ParkSite: Send + Sync {
+pub trait ParkHolder: Send + Sync {
     fn park_word(&self) -> &ParkWord;
 }
 
 /// A word on its own is its own site: the models' and the unit rows'.
-impl ParkSite for ParkWord {
+impl ParkHolder for ParkWord {
     fn park_word(&self) -> &ParkWord {
         self
     }
 }
 
-/// The rules' hold of a parked word's site ([`ParkSite`]).
-pub type ParkRef = alloc::sync::Arc<dyn ParkSite>;
+/// The rules' hold of what holds a parked word ([`ParkHolder`]): a native fiber's slot.
+pub type ParkRef = alloc::sync::Arc<dyn ParkHolder>;
 
 /// [`NativeStop::FiberClaim`]'s answer in `[1]`: the claim took the park, and `[0]` is its status.
 pub const FIBER_CLAIMED: i64 = 1;
@@ -301,6 +301,17 @@ pub enum ParkPoll {
     Parked,
     /// Woken, or past its deadline: claim it through the rules.
     Claim,
+}
+
+/// How [`ParkWord::poll_checked`] re-reads a timed word: [`Recheck::Full`] is the poll's; the other
+/// two are the model's broken variants.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Recheck {
+    Full,
+    #[cfg_attr(not(loom), allow(dead_code))]
+    None,
+    #[cfg_attr(not(loom), allow(dead_code))]
+    AnyChangeIdle,
 }
 
 const IDLE: u64 = 0;
@@ -359,20 +370,31 @@ impl ParkWord {
     /// What a `cont.resume` of incarnation `gen` does with its park, `now` read only for a timed one.
     ///
     /// A timed park's deadline is a second word, which a later incarnation of the slot may have
-    /// written by the time it is read: so the word is read again after it, and a park that changed
-    /// meanwhile is not this incarnation's to answer (`Idle`: the slot's own claim decides).
+    /// written by the time it is read: so the word is read again after it. If it changed meanwhile,
+    /// the deadline read may not be this park's: a word now idle or another incarnation's is not
+    /// this incarnation's to answer (`Idle`: the slot's own claim decides), and any other change
+    /// (this park woken, or claimed and filed again) goes to the rules (`Claim`), which compare
+    /// the incarnation under the run lock and answer `FIBER_PARKED` for a park still pending.
     pub fn poll(&self, gen: u64, now: impl FnOnce() -> u64) -> ParkPoll {
-        self.poll_checked(gen, now, true)
+        self.poll_checked(gen, now, Recheck::Full)
     }
 
     /// [`Self::poll`] without its re-read of the word: the model's broken variant of it.
     #[cfg(loom)]
     #[doc(hidden)]
     pub fn poll_without_recheck(&self, gen: u64, now: impl FnOnce() -> u64) -> ParkPoll {
-        self.poll_checked(gen, now, false)
+        self.poll_checked(gen, now, Recheck::None)
     }
 
-    fn poll_checked(&self, gen: u64, now: impl FnOnce() -> u64, recheck: bool) -> ParkPoll {
+    /// [`Self::poll`] whose re-read answers `Idle` for any change, this incarnation's own wake
+    /// included: the model's broken variant of it.
+    #[cfg(loom)]
+    #[doc(hidden)]
+    pub fn poll_any_change_idle(&self, gen: u64, now: impl FnOnce() -> u64) -> ParkPoll {
+        self.poll_checked(gen, now, Recheck::AnyChangeIdle)
+    }
+
+    fn poll_checked(&self, gen: u64, now: impl FnOnce() -> u64, recheck: Recheck) -> ParkPoll {
         let w = self.word.load(Ordering::Acquire);
         if w & STATE == IDLE || w >> 2 != gen {
             return ParkPoll::Idle;
@@ -382,8 +404,15 @@ impl ParkWord {
             TIMED => {
                 // Acquire, pairing with the deadline's release ([`Self::park`]).
                 let d = self.deadline.load(Ordering::Acquire);
-                if recheck && self.word.load(Ordering::Acquire) != w {
-                    return ParkPoll::Idle;
+                if recheck != Recheck::None {
+                    let again = self.word.load(Ordering::Acquire);
+                    if again != w {
+                        let gone = again & STATE == IDLE || again >> 2 != gen;
+                        return match gone || recheck == Recheck::AnyChangeIdle {
+                            true => ParkPoll::Idle,
+                            false => ParkPoll::Claim,
+                        };
+                    }
                 }
                 match now() >= d {
                     true => ParkPoll::Claim,

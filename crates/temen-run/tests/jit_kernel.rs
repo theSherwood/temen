@@ -6296,14 +6296,17 @@ block 0 (va: i64, vb: i64) {{
     }
 
     /// #3078 slice 3 — a timed park woken by a notify leaves no deadline behind: the fiber's 1 ms wait
-    /// on 16400 is woken and claimed, and the fiber waits again, untimed, on 16404. The root then waits
+    /// on 16400 is woken by the root's own notify, made right after the resume that filed it, and
+    /// claimed; the fiber waits again, untimed, on 16404. Nothing reads the clock between the park and
+    /// its wake (a notify stop reads none, and the thread that keeps the run threaded was spawned and
+    /// joined, its notify waking none, before the park), so the wake always comes first. The root then waits
     /// past the old deadline (a 5 ms wait of its own on 16420, which times out), and a poll of the
     /// fiber still answers `FIBER_PARKED`; its notify of 16404 then lets the next resume run it out.
     #[test]
     fn a_timed_park_woken_by_a_notify_leaves_no_deadline_behind_on_the_kernel_route() {
         let fiber = "func (i64, i64) -> (i64) {\nblock 0 (vsp: i64, varg: i64) {\n  vq = i64.const 16400\n  ve = i32.const 0\n  vto = i64.const 1000000\n  vw = i32.atomic.wait vq ve vto\n  vq2 = i64.const 16404\n  vnever = i64.const -1\n  vw2 = i32.atomic.wait vq2 ve vnever\n  vw64 = i64.extend_i32_u vw\n  vk10 = i64.const 10\n  vx = i64.mul vw64 vk10\n  vw264 = i64.extend_i32_u vw2\n  vy = i64.add vx vw264\n  v40 = i64.const 40\n  vr = i64.add vy v40\n  return vr\n  }\n}\n";
         let root = format!(
-            "  vs0, vv0 = cont.resume vk vz\n  vt = thread.spawn 1 vz vz\n  vts, vn = thread.join vt\n  vs1, vv1 = cont.resume vk vz\n\
+            "  vt = thread.spawn 1 vz vz\n  vts, vn = thread.join vt\n  vs0, vv0 = cont.resume vk vz\n  vq0 = i64.const 16400\n  vone0 = i32.const 1\n  vn0 = atomic.notify vq0 vone0\n  vs1, vv1 = cont.resume vk vz\n\
   vq = i64.const 16420\n  vze = i32.const 0\n  vto = i64.const 5000000\n  vrw = i32.atomic.wait vq vze vto\n  vs2, vv2 = cont.resume vk vz\n\
   vq2 = i64.const 16404\n  vone = i32.const 1\n  vn2 = atomic.notify vq2 vone\n  vs3, vv3 = cont.resume vk vz\n{}{}{}{}{}\
   vk10 = i64.const 10\n  va = i64.mul vs0w vk10\n  vb = i64.add va vs1w\n  vc = i64.mul vb vk10\n  vd = i64.add vc vrww\n  ve = i64.mul vd vk10\n  vff = i64.add ve vs2w\n  vg = i64.mul vff vk10\n  vh = i64.add vg vs3w\n  vk100 = i64.const 100\n  vi = i64.mul vh vk100\n  vr = i64.add vi vv3",
