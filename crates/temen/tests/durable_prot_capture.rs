@@ -942,9 +942,9 @@ fn a_thaw_with_an_empty_page_map_keeps_its_data_segment() {
 const SPAN_SRC: &str = "memory 17
 func () -> (i64) {
 block 0 () {
-  vm = i64.const 163840
+  vm = i64.const 131072
   vmark = i64.load vm
-  vz = i64.const 172032
+  vz = i64.const 262144
   vb = i64.load vz
   vfive = i64.const 5
   i64.store vz vfive
@@ -958,7 +958,7 @@ block 0 () {
 }
 func () -> (i64) {
 block 0 () {
-  vro = i64.const 167936
+  vro = i64.const 196608
   vone = i64.const 1
   i64.store vro vone
   return vone
@@ -966,7 +966,7 @@ block 0 () {
 }
 func () -> (i64) {
 block 0 () {
-  vun = i64.const 176128
+  vun = i64.const 327680
   vl = i64.load vun
   return vl
   }
@@ -979,12 +979,16 @@ fn a_held_span_thaws_on_every_engine_as_the_frozen_window_held_it() {
     let m = temen_text::parse_module(SPAN_SRC).expect("parse");
     temen_verify::verify_module(&m).expect("verify");
     let reserved = 20;
-    let pages = WINDOW / PAGE + 16;
+    // Each state is a 64 KiB block of its own (16 codec pages), so every host page, whatever its
+    // size up to that, holds one state: a host page over codec pages of different states takes the
+    // last one's (`PageMap::rebased_to`).
+    let block = |b: usize| b * 16..(b + 1) * 16;
+    let pages = WINDOW / PAGE + 4 * 16;
     let mut window = vec![0u8; pages * PAGE];
     let mut prots = vec![PageProt::Rw; pages];
-    window[40 * PAGE] = 0x77; // the marker, in the span
-    prots[41] = PageProt::Ro; // listed in the span
-    prots[43] = PageProt::Unmapped; // listed in the span, protected to nothing
+    window[32 * PAGE] = 0x77; // the marker, in the span
+    prots[block(3)].fill(PageProt::Ro); // listed in the span
+    prots[block(5)].fill(PageProt::Unmapped); // listed in the span, protected to nothing
     let art = freeze_with_prots(&m, &window, &prots, reserved, &Host::new()).expect("freeze");
     let (restored, _) =
         temen_snapshot::restore_layout(&art, &m, &mut Host::new()).expect("restore");
@@ -1008,7 +1012,7 @@ fn a_held_span_thaws_on_every_engine_as_the_frozen_window_held_it() {
     let again = temen_snapshot::freeze_layout(&m, &left, reserved, &h).expect("re-freeze");
     let (back, _) = temen_snapshot::restore_layout(&again, &m, &mut Host::new()).expect("restore");
     let mut stored = window.clone();
-    stored[42 * PAGE] = 5;
+    stored[64 * PAGE] = 5;
     // Past the declared window (below it the engine's capture adds its NULL guard, #964).
     let (bytes, got) = back.to_dense();
     let at = WINDOW / PAGE;

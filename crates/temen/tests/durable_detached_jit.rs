@@ -2154,9 +2154,10 @@ fn a_childs_fiber_that_fails_its_extent_check_ends_the_child() {
     own_trap_rides(&fiber_extent_nest(), 1);
 }
 
-/// [`CHILD`]'s loop, then a load 8 bytes past its declared 128 KiB, and a store and a load two pages
+/// [`CHILD`]'s loop, then a load 8 bytes past its declared 128 KiB, and a store and a load 64 KiB
 /// further: pages the child holds only as its artifact's head past the declared window (#3137), the
-/// first listed with a marker, the second unlisted (zero, writable).
+/// first listed with a marker, the second unlisted (zero, writable), each in a host page of its own
+/// on any host.
 const SPAN_CHILD: &str = "memory 17 shadow 16448 65536
 func (i64, i64) -> (i64) {
 block 0 (v0: i64, va: i64) {
@@ -2181,7 +2182,7 @@ block 2 (v7: i64, v8: i64) {
 block 3 (v12: i64) {
   vat = i64.const 131080
   vm = i64.load vat
-  vzp = i64.const 139272
+  vzp = i64.const 196616
   vthree = i64.const 3
   i64.store vzp vthree
   vz3 = i64.load vzp
@@ -2193,7 +2194,7 @@ block 3 (v12: i64) {
 ";
 
 /// #3137 — a live detached child whose artifact's head runs past its declared window: the child,
-/// frozen on the JIT, is captured with a held span of four pages past its declared 128 KiB, the first
+/// frozen on the JIT, is captured with a held span of 128 KiB past its declared 128 KiB, the first
 /// carrying a marker. Restored, it re-launches on the JIT (its window committing the span in one run,
 /// `CapturedSeed::held`) and on the tree-walker, reads the marker and writes and reads the unlisted
 /// page after its loop: 4950 + 7 + 3. Without the span committed in one run, the unlisted page is
@@ -2231,7 +2232,7 @@ fn a_detached_childs_held_span_thaws_on_the_jit_and_the_tree_walker() {
     let mut page = vec![0u8; 4096];
     page[8] = 7;
     let mut window = c.window.clone();
-    window.hold_span(declared + 4 * 4096);
+    window.hold_span(declared + 32 * 4096);
     window.hold(declared, temen_interp::CapturedProt::Rw, Some(page));
     let captured = temen_interp::CapturedDetached {
         parent_task: c.parent_task,
