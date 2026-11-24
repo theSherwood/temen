@@ -1498,7 +1498,7 @@ pub(crate) unsafe extern "C" fn fiber_resume(
     // somewhere in a resume chain), a racing resume, or a finished fiber all *lose the claim* and
     // fault. No lock or `&mut` is held past this block; the `Arc` keeps the slot (and the boxed
     // fiber it owns) stable across the switch.
-    let (slot_idx, slot, fib, fctx): (usize, Arc<FiberSlot>, *mut Fiber, *const crate::VmCtx) = {
+    let (slot_idx, slot, fib, fctx): (usize, Arc<FiberSlot>, *mut Fiber, *mut crate::VmCtx) = {
         let rt = &*rt;
         let Some((slot_idx, slot)) = rt.table.resolve(handle) else {
             fault(vm);
@@ -1564,8 +1564,8 @@ pub(crate) unsafe extern "C" fn fiber_resume(
             Some(s) => (
                 &mut s.fiber as *mut Fiber,
                 s.ctx
-                    .as_deref()
-                    .map_or(core::ptr::null(), |c| c as *const crate::VmCtx),
+                    .as_deref_mut()
+                    .map_or(core::ptr::null_mut(), |c| c as *mut crate::VmCtx),
             ),
             // Unreachable by invariant (a claimable slot holds its fiber); fail closed, leaving
             // the slot claimed (inert thereafter) rather than aliasing anything.
@@ -1654,12 +1654,13 @@ pub(crate) unsafe extern "C" fn fiber_resume(
         // #3133 — the one switch into a guest fiber names its runner: the resumer's own, which a
         // fiber resumed by a fiber inherits; cleared once the fiber is back here, so none rests in a
         // suspended fiber.
-        if let Some(c) = fctx.as_ref() {
-            c.fiber_switched_in(crate::VmCtx::at(vm).runner());
+        // #3080 — and its cell: the fiber charges the vCPU that runs it.
+        if !fctx.is_null() {
+            crate::VmCtx::fiber_switched_in(fctx, crate::VmCtx::at(vm).runner());
         }
         let st = (*fib).resume(arg as u64);
-        if let Some(c) = fctx.as_ref() {
-            c.fiber_switched_out();
+        if !fctx.is_null() {
+            crate::VmCtx::fiber_switched_out(fctx);
         }
         (*current()).active_slots.pop();
         temen_set_current_fiber(prev_fiber);

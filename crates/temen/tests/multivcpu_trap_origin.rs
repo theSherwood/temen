@@ -56,6 +56,7 @@ fn compile(src: &str) -> CompiledModule {
         None,
         None,
         0,
+        false,
     )
     .expect("jit compiles")
 }

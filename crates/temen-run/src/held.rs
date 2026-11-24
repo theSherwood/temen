@@ -31,11 +31,9 @@ use crate::{jit_proc, CAP_REVOKED};
 /// takes its calls first, which the JIT's do not reach yet (#2895), so the tree-walker holds it
 /// (INVARIANTS #9).
 ///
-/// #3133, #3080 — the JIT also declines a module that can make a fiber: one with a fiber op, or one
-/// whose host lets its submitted units host fibers. A fiber runs on a context of its own, but it
-/// charges the fuel of the code that made it: a fiber made in one call would burn that call's
-/// leftover loan in every later call, where the tree-walker charges the call that resumes it. The
-/// tree-walker holds such a domain until a fiber charges the vCPU running it (#3080).
+/// #3080 — a module that makes fibers is held on the JIT too: a fiber made in one call charges the
+/// call that resumes it, as on the tree-walker, since each resume names the running activation's
+/// cell (`VmCtx::fiber_switched_in`).
 pub fn hold(
     on: Executor,
     m: Arc<Module>,
@@ -44,9 +42,7 @@ pub fn hold(
     fuel: u64,
     host: Host,
 ) -> Result<(HeldDomain, Vec<Value>), (Trap, Box<Host>)> {
-    let fibers = host.jit_hosts_fibers() || m.funcs.iter().any(temen_ir::Func::uses_fibers);
     let jit = on == Executor::Jit
-        && !fibers
         && !crate::folds_to_oracle(&m)
         && !jit_proc::serves(&jit_proc::host_calls(&m), &host);
     if jit {

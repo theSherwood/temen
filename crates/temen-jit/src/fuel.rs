@@ -213,10 +213,9 @@ impl FuelCell {
     /// first charge: a kill check or a domain poll comes first in the prologue, or lazy code never
     /// ran), nothing goes back. The refill that follows the burn rewrites the mark as any refill
     /// does: cleared on a bounded chain, set again on an unbounded one, whose quantum is drawn from
-    /// nothing. What a recycled cell held goes back to its chain first,
-    /// under the lock a refill takes and through the raw pointer, as [`Self::settle`] does; a fiber
-    /// of the cell's earlier vCPU that refills it in between races it as any shared charge does
-    /// (#3080).
+    /// nothing. What a recycled cell held goes back to its chain first, under the lock a refill takes
+    /// and through the raw pointer, as [`Self::settle`] does. (No fiber of the cell's earlier vCPU
+    /// charges it in between: a fiber charges the cell of the vCPU running it, #3080.)
     ///
     /// Both of the JIT's routes seed through it, each on the thread's own cell. The kernel route
     /// (temen-run's `jit_kernel::tier_run`) seeds every thread entry on a node-backed cell. Today's
@@ -226,7 +225,7 @@ impl FuelCell {
     /// raises a ceiling, and an activation's limit is set before its run starts.
     ///
     /// # Safety
-    /// - `cell` is a live cell that no context but this vCPU's (and #3080's fibers) charges.
+    /// - `cell` is a live cell that no context but this vCPU's (and the fibers it runs) charges.
     /// - It runs before this vCPU's first guest code: none of the vCPU's code charges the cell yet.
     /// - The vCPU's spawn completed: its entry is charged by the spawn alone (`pay_entry` answered
     ///   `Some(true)` or `None`), and the seed stands for the prologue's own charge of it.
@@ -331,9 +330,10 @@ impl Drop for FuelCell {
 /// A spent cell's refill, called by compiled code through [`refill_trampoline`]: it puts the new
 /// allowance (at least 1) in `left`, and in [`FuelCell::granted`] what the caller charges from: that
 /// allowance, or `0` when the chain is spent, on which the caller traps `OutOfFuel`. Each vCPU charges
-/// a cell of its own (#2488, #3069), but a fiber charges its creator's ([`crate::fiber_rt`]), wherever
-/// it is resumed, so two contexts can still share one: a refill another made while this one waited
-/// for the lock is kept, not drawn again, and what it left is granted.
+/// a cell of its own (#2488, #3069), and a fiber the cell of the vCPU running it (#3080), but serve
+/// handlers charge their instance's cell and a held activation's cell may be shared (#3094), so two
+/// contexts can still share one: a refill another made while this one waited for the lock is kept,
+/// not drawn again, and what it left is granted.
 ///
 /// The caller charges from `granted`, never from a reload of `left`. Contexts charge a shared cell
 /// with plain loads and stores, so one that loaded `1` before a refill can store its `0` just after

@@ -90,6 +90,7 @@ pub(crate) struct Code {
     pub(crate) guard_offset: u64,
     pub(crate) epoch: bool,
     pub(crate) fuel: bool,
+    pub(crate) fuel_moves: bool,
     pub(crate) domain_poll: bool,
     pub(crate) fn_table_mask: u64,
     pub(crate) window: Option<validate::WindowLayout>,
@@ -135,6 +136,7 @@ impl Code {
             guard_offset: self.guard_offset,
             epoch: self.epoch,
             fuel: self.fuel,
+            fuel_moves: self.fuel_moves,
             domain_poll: self.domain_poll,
             fn_table_mask: self.fn_table_mask,
             slots: FuncSlots::Own { words },
@@ -890,6 +892,7 @@ mod tests {
             None,
             None,
             0,
+            false,
         );
         FAULT.with(|f| f.set(None));
         Some(cm.expect("compile")).filter(CompiledModule::compiles_lazily)

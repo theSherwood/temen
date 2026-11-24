@@ -147,6 +147,7 @@ fn compile(m: &temen_ir::Module) -> CompiledModule {
         None,
         None,
         0,
+        false,
     )
     .expect("jit compile")
 }
@@ -438,6 +439,7 @@ fn a_run_s_fibers_hand_their_charges_back_when_it_ends() {
         None,
         Some(node.clone()),
         0,
+        false,
     )
     .expect("jit compile");
     for run in 1..=5 {

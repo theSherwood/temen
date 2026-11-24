@@ -35,15 +35,8 @@ use temen_jit::{CompiledModule, FuelCell, JitOutcome, TrapKind};
 /// A program [`admit`] admitted: only a [`run`] of it takes the kernel's route.
 pub struct Admitted<'m>(&'m Module);
 
-/// Whether `m`, under `host`, runs its vCPUs as the kernel's tasks, on a run granted `fuel`:
+/// Whether `m`, under `host`, runs its vCPUs as the kernel's tasks:
 /// `temen_interp::bytecode::native_scope`, plus the start's own clauses:
-/// - **`fiber fuel`**: the run is metered ([`metered`]) and `m` uses fibers. A fiber's code charges
-///   its creator vCPU's fuel cell wherever it runs, so a fiber resumed on another vCPU loses charges
-///   to its creator's at once, where the oracle charges the vCPU that runs it. It is a memory-safety
-///   gate too: a vCPU's cell is a local of its thread (`tier_run`), so a metered fiber resumed after
-///   its creator ended would write into a dead thread's stack; `KernelRun::new` refuses such a
-///   compile whatever admitted it. #3080's fix removes the clause, and must first move a vCPU's cell
-///   off its thread's stack;
 /// - **`kept code`**: the embedder keeps the run's compile for later runs (a `JitCodeCache`,
 ///   #2389), whose shared code the kernel route does not instance yet (#2981).
 ///
@@ -54,12 +47,8 @@ pub fn admit<'m>(
     m: &'m Module,
     host: &Host,
     kept_code: bool,
-    fuel: u64,
 ) -> Result<Admitted<'m>, &'static str> {
     temen_interp::bytecode::native_scope(m, host)?;
-    if metered(host, fuel) && m.funcs.iter().any(temen_ir::Func::uses_fibers) {
-        return Err("fiber fuel");
-    }
     if kept_code {
         return Err("kept code");
     }
@@ -139,7 +128,7 @@ pub fn run_fresh(
     fuel: u64,
 ) -> Result<(JitOutcome, u64), &'static str> {
     let mut host = Host::new();
-    let admitted = admit(m, &host, false, fuel)?;
+    let admitted = admit(m, &host, false)?;
     let start = Start {
         entry,
         args,
@@ -250,17 +239,6 @@ pub fn expect_kernel(
     }
 }
 
-/// Test-facing: the fuel a suite's kernel lane grants `m`: the default, or unmetered (`u64::MAX`) for
-/// a module that uses fibers, whose metered run `fiber fuel` declines until #3080. The one place the suites
-/// read it, so #3080's fix gives every fiber row its metered lane here.
-#[doc(hidden)]
-pub fn lane_fuel(m: &Module) -> u64 {
-    match m.funcs.iter().any(temen_ir::Func::uses_fibers) {
-        true => u64::MAX,
-        false => temen_interp::DEFAULT_FUEL,
-    }
-}
-
 /// What a run of `entry(args)` starts with and hands back.
 pub struct Start<'a> {
     pub entry: u32,
@@ -329,6 +307,7 @@ pub fn run(
         None,
         None,
         0,
+        false,
     )?;
     // The JIT's own window start, as a fresh run or a thaw of today's route starts it: the window
     // seeded and protected (`seed_window`), then the host's page map started over it with the
@@ -648,7 +627,7 @@ block 0 () {
         let m = temen_text::parse_module(SERVES).expect("parse");
         temen_verify::verify_module(&m).expect("verify");
         let mut host = Host::new();
-        assert_eq!(admit(&m, &host, false, u64::MAX).err(), Some("jit cap"));
+        assert_eq!(admit(&m, &host, false).err(), Some("jit cap"));
         let start = Start {
             entry: 0,
             args: &[],
@@ -695,7 +674,7 @@ block 0 (vsp: i64, varg: i64) {{
         );
         let m = temen_text::parse_module(&src).expect("parse");
         temen_verify::verify_module(&m).expect("verify");
-        assert_eq!(admit(&m, &host, false, u64::MAX).err(), Some("fiber parks"));
+        assert_eq!(admit(&m, &host, false).err(), Some("fiber parks"));
         let start = Start {
             entry: 0,
             args: &[],

@@ -1048,6 +1048,7 @@ pub(crate) unsafe fn compile_image(
         CapCtx::Raw(_) => (module_resolver, Some(fast_cap_resolver)),
         CapCtx::Locked(_) => (module_resolver_locked, None),
     };
+    let (fibers, threads) = cc.with_host(|h| (h.jit_hosts_fibers(), h.jit_hosts_threads()));
     let mut cm = CompiledModule::compile_kept(
         kept,
         module,
@@ -1061,8 +1062,8 @@ pub(crate) unsafe fn compile_image(
         fast,
         cc.with_host(|h| crate::run_node(h)), // #2113 — what its vCPUs, fibers and processes charge
         CLI_JIT_TABLE_LOG2,
+        jit && fibers, // #3080 — a unit's fiber can run this code: lower its fuel loads to reload
     )?;
-    let (fibers, threads) = cc.with_host(|h| (h.jit_hosts_fibers(), h.jit_hosts_threads()));
     if jit && fibers {
         cm.enable_fiber_hosting()?;
     }

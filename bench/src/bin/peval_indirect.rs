@@ -202,6 +202,7 @@ fn jit_compile(m: &Module) -> CompiledModule {
         None,
         None,
         0,
+        false,
     )
     .expect("jit compile")
 }

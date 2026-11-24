@@ -384,6 +384,7 @@ fn generated_fiber_programs_agree_on_interp_and_jit() {
             None,
             temen_run::run_node(&jhost),
             0,
+            false,
         ) {
             Ok(cm) => cm,
             Err(JitError::Unsupported(_)) => continue, // off a fiber_rt target / an unlowered op
@@ -612,7 +613,7 @@ fn generated_migration_schedules_agree_on_interp_and_jit() {
                     0,
                     &[],
                     None,
-                    jit_kernel::lane_fuel(&m),
+                    temen_interp::DEFAULT_FUEL,
                     jit_kernel::Expect::of(None),
                 )
                 .expect("the kernel route admits it"),

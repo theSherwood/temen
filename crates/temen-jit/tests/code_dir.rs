@@ -83,6 +83,7 @@ fn compile_and_run_here() {
         None,
         None,
         0,
+        false,
     )
     .expect("compile");
     let compiled = temen_jit::module_compiles() - before;

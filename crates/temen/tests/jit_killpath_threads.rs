@@ -57,7 +57,7 @@ fn run_killed(src: &str, delay_ms: u64) -> Vec<JitOutcome> {
                     0,
                     &[0i64],
                     Some(&interrupt),
-                    jit_kernel::lane_fuel(&m),
+                    temen_interp::DEFAULT_FUEL,
                     jit_kernel::Expect::of(None),
                 ),
             };

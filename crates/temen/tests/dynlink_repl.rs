@@ -51,6 +51,7 @@ impl Repl {
             None,
             None,
             4,
+            false,
         )
         .expect("compile the REPL host module");
         Repl {

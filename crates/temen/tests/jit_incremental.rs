@@ -41,6 +41,7 @@ fn compile(src: &str) -> CompiledModule {
         None,
         None,
         0,
+        false,
     )
     .expect("compile")
 }
@@ -402,6 +403,7 @@ fn install_makes_unit_call_indirectable() {
         None,
         None,
         4,
+        false,
     )
     .expect("compile");
 

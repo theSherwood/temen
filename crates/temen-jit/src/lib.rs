@@ -1548,6 +1548,7 @@ pub fn compile(m: &IrModule, func: FuncIdx) -> Result<CompiledModule, JitError> 
         None, // fast_resolver
         None, // node
         0,    // natural (non-B2-reserved) function-table size
+        false,
     )
 }
 
@@ -1928,6 +1929,7 @@ pub fn compile_and_run_capture_reserved_with_host_prots(
         None, // no fast cap resolver
         None, // no budget node
         0,    // one-shot path: natural table size
+        false,
     )?;
     cm.seed.restore = (!init_prots.is_empty()).then(|| WindowRestore {
         prots: init_prots.to_vec(),
@@ -2546,6 +2548,7 @@ pub fn compile_and_run_durable(
             None, // fast_resolver
             None, // node
             0,
+            false,
         )?;
         cm.seed.restore = (!run.init_prots.is_empty()).then(|| WindowRestore {
             prots: run.init_prots,
@@ -2659,6 +2662,7 @@ fn run_inner(
         0,      // one-shot path: natural table size (no B2 reservation)
         signal, // #932 — the one-shot signal-delivery arm (None on every non-signal entry)
         None,
+        false,
     )?;
     // PROCESS.md S2 (JIT parity): install the child-powerbox host callbacks into the §14 nursery
     // before the guest runs (the nursery only exists when the module holds an `Instantiator`). `None`
@@ -3446,6 +3450,9 @@ pub struct CompiledModule {
     /// / [`Lower::fuel`]) — the code's shape, which `define_extra` compiles new units to match.
     epoch: bool,
     fuel: bool,
+    /// #3080 — whether the code reloads its fuel cell at every charge ([`Lower::fuel_moves`]): code
+    /// that can run on a guest fiber's stack. Part of the code's shape, as `fuel` is.
+    fuel_moves: bool,
     /// #2164 — the page check a demand-paged child's code makes before each access (see
     /// [`PageEnv`]), which `define_extra` compiles new units to match. [`PageEnv::NONE`] otherwise.
     page: PageEnv,
@@ -3970,6 +3977,7 @@ impl CompiledModule {
         fast_resolver: Option<FastCapResolver>,
         node: Option<std::sync::Arc<dyn BudgetNode>>,
         table_reserve_log2: u8,
+        hosts_fibers: bool,
     ) -> Result<CompiledModule, JitError> {
         // #932 — the stable public signature: no async signal delivery armed (the common case). The
         // signal-arming variant is [`Self::compile_with_signal`], reached only by the one-shot
@@ -3988,6 +3996,7 @@ impl CompiledModule {
             table_reserve_log2,
             None,
             None,
+            hosts_fibers,
         )
     }
 
@@ -4010,6 +4019,7 @@ impl CompiledModule {
         fast_resolver: Option<FastCapResolver>,
         node: Option<std::sync::Arc<dyn BudgetNode>>,
         table_reserve_log2: u8,
+        hosts_fibers: bool,
     ) -> Result<CompiledModule, JitError> {
         Self::compile_with_signal(
             m,
@@ -4025,6 +4035,7 @@ impl CompiledModule {
             table_reserve_log2,
             None,
             kept,
+            hosts_fibers,
         )
     }
 
@@ -4046,6 +4057,7 @@ impl CompiledModule {
         table_reserve_log2: u8,
         signal: Option<SignalArm>,
         kept: Option<(&CodeDir, [u8; 32])>,
+        hosts_fibers: bool,
     ) -> Result<CompiledModule, JitError> {
         let entry = m.funcs.get(func as usize).ok_or(JitError::Malformed)?;
         let shadow = m
@@ -4398,6 +4410,7 @@ impl CompiledModule {
             guard_offset: guard_offset_of(win_reserved as u64),
             epoch: epoch_addr != 0,
             fuel: fuel_addr != 0,
+            fuel_moves: uses_fibers || hosts_fibers,
             domain_poll: threads, // spawned vCPUs run this code beside the root
             fn_table_mask: (table_len as u64) - 1, // the (possibly B2-reserved) table mask
             slots: FuncSlots::Own { words: false },
@@ -4698,6 +4711,7 @@ impl CompiledModule {
                     guard_offset: guard_offset_of(win_reserved as u64),
                     epoch: epoch_addr != 0,
                     fuel: fuel_addr != 0,
+                    fuel_moves: uses_fibers || hosts_fibers,
                     domain_poll: threads,
                     fn_table_mask: (table_len as u64) - 1,
                     window: guest.window,
@@ -4745,6 +4759,7 @@ impl CompiledModule {
             mask,
             epoch: epoch_addr != 0,
             fuel: fuel_addr != 0,
+            fuel_moves: uses_fibers || hosts_fibers,
             instance,
             fn_table_mask: (table_len as u64) - 1,
             next_extra: 0,
@@ -5030,6 +5045,7 @@ impl CompiledModule {
             mask: self.mask,
             epoch: self.epoch,
             fuel: self.fuel,
+            fuel_moves: self.fuel_moves,
             instance: addrs,
             fn_table_mask: self.fn_table_mask,
             next_extra: self.next_extra,
@@ -6353,6 +6369,7 @@ impl CompiledModule {
             guard_offset: guard_offset_of(self.win_reserved as u64),
             epoch: self.epoch,
             fuel: self.fuel, // charges the running instance's fuel cell, as the parent's functions do
+            fuel_moves: self.fuel_moves, // as the parent module's functions
             domain_poll: self.threads, // as the parent module's functions
             fn_table_mask: self.fn_table_mask, // the parent's table mask, NOT derived from this unit's size
             slots: FuncSlots::Unit(ref_slots.as_deref()),
@@ -6471,6 +6488,13 @@ impl CompiledModule {
     pub fn enable_fiber_hosting(&mut self) -> Result<(), JitError> {
         if self.fibers {
             return Ok(()); // already hosting fibers (parent used cont.*/gc.roots at compile time)
+        }
+        // #3080 — a unit's fiber can run the parent's own code on its stack, whose fuel cell each
+        // resume re-points: metered code must have been lowered to reload it (`hosts_fibers`).
+        if self.fuel && !self.fuel_moves {
+            return Err(JitError::Unsupported(
+                "a metered compile hosts fibers only when compiled with `hosts_fibers`",
+            ));
         }
         // Append the fiber-entry signature to the per-domain type registry (idempotent; an id never
         // remaps — DESIGN.md §22). A later `define_extra` interning the same signature gets this id,
@@ -7907,6 +7931,54 @@ fn host_ret(name: &str) -> validate::Ret {
         .map_or(validate::Ret::Unknown, |h| h.ret())
 }
 
+/// #3080 — a compile that hosts fibers after it was lowered must have been lowered for them: a
+/// unit's fiber can run the parent's own code on its stack, whose fuel cell each resume re-points,
+/// so metered code that kept its cell's address across a `suspend` would charge another vCPU's.
+#[cfg(all(test, fiber_rt))]
+mod fiber_hosting_tests {
+    use super::*;
+
+    fn compile(fuel: Option<*mut FuelCell>, hosts_fibers: bool) -> CompiledModule {
+        let m = temen_text::parse_module(
+            "func () -> (i64) {\nblock 0 () {\n  v0 = i64.const 7\n  return v0\n  }\n}\n",
+        )
+        .expect("parse");
+        CompiledModule::compile(
+            &m,
+            0,
+            empty_cap_thunk,
+            core::ptr::null_mut(),
+            0,
+            None,
+            None,
+            fuel,
+            None,
+            None,
+            0,
+            hosts_fibers,
+        )
+        .expect("compile")
+    }
+
+    #[test]
+    fn a_metered_compile_hosts_fibers_only_when_lowered_for_them() {
+        if !fiber_supported() {
+            return;
+        }
+        let mut cell = FuelCell::fixed(100);
+        let metered = Some(&mut *cell as *mut FuelCell);
+        assert!(matches!(
+            compile(metered, false).enable_fiber_hosting(),
+            Err(JitError::Unsupported(_))
+        ));
+        assert!(compile(metered, true).enable_fiber_hosting().is_ok());
+        assert!(
+            compile(None, false).enable_fiber_hosting().is_ok(),
+            "unmetered code charges no cell"
+        );
+    }
+}
+
 #[cfg(test)]
 mod cap_buffer_tests {
     use super::*;
@@ -8329,6 +8401,7 @@ block 2 (v7: i32) {
                 0,
                 signal,
                 None,
+                false,
             )
             .expect("a root's compile")
         };
@@ -8559,6 +8632,7 @@ block 2 (v7: i32) {
                 ctx: core::ptr::null_mut(),
             }),
             None,
+            false,
         )
         .expect("a signal-armed compile");
         let caps = validate::take_capture();
@@ -8963,11 +9037,12 @@ fn compile_child_windowed(
         guard_offset: guard_offset_of(reserved), // its own window's trailing guard
         epoch: epoch_addr != 0, // §5 kill-path: the child polls the parent's interrupt cell
         fuel: fuel_addr != 0, // counted fuel: the child charges its own budget cell (else un-metered)
-        domain_poll: true,    // a §14 child always runs beside its parent, which may tear it down
-        fn_table_mask,        // the child's own (reserved) table mask
+        fuel_moves: uses_fibers,
+        domain_poll: true, // a §14 child always runs beside its parent, which may tear it down
+        fn_table_mask,     // the child's own (reserved) table mask
         slots: FuncSlots::Own { words: false }, // §14 child: its own window and table
-        srclocs: None,        // nested-child units carry no source-loc map (W5 JIT/DWARF)
-        var_labels: None,     // …nor value-label points (Stage 3a)
+        srclocs: None,     // nested-child units carry no source-loc map (W5 JIT/DWARF)
+        var_labels: None,  // …nor value-label points (Stage 3a)
     };
     let base_bytes = define_funcs(
         &mut module,
@@ -9127,6 +9202,7 @@ fn compile_child_windowed(
         mask,
         epoch: epoch_addr != 0,
         fuel: fuel_addr != 0,
+        fuel_moves: uses_fibers,
         // The child's own instance: its powerbox, the parent's kill-path cell, its own budget cell,
         // the parent's domain its `thread.*` and futex sites run on, and its own nursery. §14
         // children are not signal-delivery armed.
@@ -9899,6 +9975,12 @@ struct Lower<'a> {
     /// plain (non-atomic); the store⇒load dependency on the same address keeps Cranelift from hoisting
     /// the check out of a loop.
     fuel: bool,
+    /// #3080 — whether this code can run on a guest fiber's stack, whose context's `fuel` each
+    /// resume points at the cell of the vCPU that runs it (`VmCtx::fiber_switched_in`). Then the
+    /// cell's address is loaded plainly at every charge ([`fuel_cell_addr`]): a `readonly` load is
+    /// pure to Cranelift's e-graph, so a frame that spans a `suspend` would go on charging the cell
+    /// it loaded before, on another vCPU. Off, the load stays `readonly` and the code is as before.
+    fuel_moves: bool,
     /// DESIGN §12 domain teardown for **running** vCPUs: poll the domain's end at every loop
     /// back-edge (and the entry of a function that tail-calls), and unwind once it holds one — a
     /// sibling's trap, the root's completion sentinel ([`DOMAIN_DONE_CODE`]), or a parent's teardown
@@ -10005,6 +10087,8 @@ struct LowerPlan<'a> {
     epoch: bool,
     /// Charge the counted-fuel cell.
     fuel: bool,
+    /// The cell can move under the code: [`Lower::fuel_moves`].
+    fuel_moves: bool,
     /// Poll the domain's end at loop back-edges (code that can run beside other vCPUs).
     domain_poll: bool,
     /// The `call.dyn` index mask, `next_pow2(table_len) - 1` for the table this code dispatches
@@ -10045,6 +10129,7 @@ fn open_function<'a>(
         guard_offset,
         epoch,
         fuel,
+        fuel_moves,
         domain_poll,
         fn_table_mask,
         slots,
@@ -10126,6 +10211,7 @@ fn open_function<'a>(
         signals,
         epoch,
         fuel,
+        fuel_moves,
         domain_poll,
         ids,
         distinct,
@@ -11156,7 +11242,7 @@ fn lower_block(
                 let v = if lower.fuel {
                     // #1944 slice 3 — what the domain can still burn: the cell's `left` plus its
                     // budget chain's room, asked of the cell (word 2).
-                    let addr = vmctx_load(b, lower, vmctx::FUEL);
+                    let addr = fuel_cell_addr(b, lower);
                     let rsig = {
                         let mut s = Signature::new(lower.callees.frontend.default_call_conv);
                         s.params.push(AbiParam::new(I64)); // the cell
@@ -12681,6 +12767,17 @@ fn vmctx_load(b: &mut FunctionBuilder, lower: &Lower, field: i32) -> Value {
 }
 
 /// [`vmctx_load`] from the context at `vmctx`.
+/// #3080 — the address of the cell this code charges: plain where the cell can move under the code
+/// ([`Lower::fuel_moves`]), reloaded at every charge, so a fiber charges the vCPU that runs it now;
+/// [`vmctx_load`]'s `readonly` load otherwise.
+fn fuel_cell_addr(b: &mut FunctionBuilder, lower: &Lower) -> Value {
+    if !lower.fuel_moves {
+        return vmctx_load(b, lower, vmctx::FUEL);
+    }
+    let vmctx = b.use_var(lower.vmctx_var);
+    b.ins().load(I64, MemFlags::trusted(), vmctx, vmctx::FUEL)
+}
+
 fn vmctx_field(b: &mut FunctionBuilder, vmctx: Value, field: i32) -> Value {
     let flags = MemFlags::trusted().with_readonly().with_can_move();
     b.ins().load(I64, flags, vmctx, field)
@@ -12956,8 +13053,9 @@ fn emit_signal_check(b: &mut FunctionBuilder, lower: &Lower) -> Result<(), JitEr
 ///
 /// Distinct from [`emit_epoch_check`] in two ways: (1) it is the **guest's own** budget, not written
 /// by the host from another thread, so a plain (non-atomic) load/store is enough — and cheaper.
-/// Each vCPU charges a cell of its own (#2488, #3069), but a fiber charges its creator's wherever it
-/// is resumed, so two threads can still share one and lose a charge (#3080); after a refill the
+/// Each vCPU charges a cell of its own (#2488, #3069), and a fiber the cell of the vCPU running it
+/// (#3080), but serve handlers share their instance's cell (#3094), so two threads can still share
+/// one and lose a charge; after a refill the
 /// check charges from the allowance it granted, so another's stale `0` in `left` is never read as a
 /// spent chain; (2)
 /// the store of `fuel-1` back to the same address it just loaded creates a store⇒load dependency that
@@ -12973,7 +13071,7 @@ fn emit_fuel_check(b: &mut FunctionBuilder, lower: &Lower) {
     let refill_blk = b.create_block();
     let trap_blk = b.create_block();
     b.append_block_param(cont, I64);
-    let addr = vmctx_load(b, lower, vmctx::FUEL);
+    let addr = fuel_cell_addr(b, lower);
     // Plain load (not `readonly`) — the store below writes the same address, so the load is not
     // loop-invariant and is re-evaluated each iteration. `trusted()` = aligned + notrap (a host-owned
     // aligned cell that never faults), no atomic ordering (the cell's `left`, word 0 of a `FuelCell`).
@@ -12997,7 +13095,7 @@ fn emit_fuel_check(b: &mut FunctionBuilder, lower: &Lower) {
         .ins()
         .load(I64, MemFlags::trusted(), addr, crate::fuel::REFILL_OFF);
     b.ins().call_indirect(sig, refill, &[addr]);
-    // What the refill granted, not a reload of `left`: another context's plain store (#3080) may
+    // What the refill granted, not a reload of `left`: another context's plain store (#3094) may
     // have put a stale `0` there since (see `fuel_refill`).
     let drawn = b
         .ins()
@@ -14456,6 +14554,7 @@ mod reused_nursery_tests {
             None,
             None,
             4, // install room
+            false,
         )
         .expect("compile");
         assert!(

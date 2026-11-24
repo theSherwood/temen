@@ -1507,7 +1507,7 @@ pub fn jit_cap_run(
     // A fresh window: its page map is `init`'s, none from an earlier run (see `reset_cap_pages`).
     host.reset_cap_pages(init.page_map());
     // #2958 — a program `jit_kernel::admit` admits runs its vCPUs as executor 2's tasks.
-    if let Ok(admitted) = jit_kernel::admit(m, host, false, temen_interp::DEFAULT_FUEL) {
+    if let Ok(admitted) = jit_kernel::admit(m, host, false) {
         let start = jit_kernel::Start {
             entry,
             args,
@@ -1581,6 +1581,7 @@ pub fn jit_cap_run(
             None, // fast_resolver
             node,
             table_reserve_log2,
+            hosts_fibers, // #3080 — lowered for the fiber hosting enabled below
         )?;
         // The granted §14 spawns (named, separate-module, detached) — the hooks the CLI path installs
         // (`jit_proc::run_image`); without them a granted spawn here was an inert `CapFault`.
@@ -1643,6 +1644,7 @@ pub fn jit_cap_run(
         None, // fast_resolver
         run_node(host),
         table_reserve_log2,
+        hosts_fibers, // #3080 — lowered for the fiber hosting enabled below
     )?;
     // The granted §14 spawns, as in the locked branch above.
     cm.set_grant_child_hooks(Some(production_grant_hooks(cc)));
@@ -2108,6 +2110,7 @@ pub fn recompact_jit(
         None, // fast_resolver
         run_node(host),
         table_reserve_log2,
+        false,
     )?;
     fresh.set_window_ready(Some(CapCtx::Raw(host).window_ready()));
     recompact_into(&mut fresh, host, domain, old)?;
@@ -2318,6 +2321,7 @@ impl JitSession {
             None, // fast_resolver
             node,
             table_reserve_log2,
+            false,
         )?;
         cm.set_window_ready(Some(CapCtx::Locked(&*host).window_ready()));
         Ok(JitSession {
@@ -2397,6 +2401,7 @@ impl JitSession {
             None, // fast_resolver
             node,
             self.table_reserve_log2,
+            false,
         )?;
         fresh.set_window_ready(Some(CapCtx::Locked(&*self.host).window_ready()));
         {
@@ -6732,6 +6737,7 @@ impl PowerboxProgram {
                 // node's tree lives as long as the code, and holds the default grant.
                 run_node(&host),
                 CLI_JIT_TABLE_LOG2,
+                host.jit_hosts_fibers(), // #3080 — set up below, so lowered for it here
             )
             .map_err(|e| format!("JIT compile failed: {e:?}"))?,
         );
@@ -7998,7 +8004,7 @@ fn jit_run(
     // level meters nothing, and the run's code compiles without fuel checks.
     limits.grant(host);
     // #2958 — a program `jit_kernel::admit` admits runs its vCPUs as executor 2's tasks.
-    if let Ok(admitted) = jit_kernel::admit(m, host, code.is_some(), limits.fuel()) {
+    if let Ok(admitted) = jit_kernel::admit(m, host, code.is_some()) {
         let mut end = with_deadline(limits.deadline, |kill| {
             let start = jit_kernel::Start {
                 entry: func,
@@ -9468,7 +9474,7 @@ impl Instance {
         let owned = self.window_override(config);
         let m = owned.as_ref().unwrap_or(&self.module);
         let host = self.diff_host(config, m.memory.map_or(0, |mc| 1u64 << mc.size_log2));
-        jit_kernel::admit(m, &host, config.jit_code.is_some(), config.limits.fuel()).map(|_| ())
+        jit_kernel::admit(m, &host, config.jit_code.is_some()).map(|_| ())
     }
 
     pub fn run_diff(&self, config: &RunConfig) -> Result<Run, String> {

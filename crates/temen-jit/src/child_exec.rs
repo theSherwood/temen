@@ -1850,6 +1850,7 @@ impl HeldSite {
             return revoked;
         }
         if self.site.inline_ok(func) {
+            credit_entry(&vm);
             let end = self.site.run_inline_as(&vm, Some(self.tls), func, args);
             // Back to its own caller: a direct call settles nothing in the pool.
             self.site.step_aside();
@@ -1884,6 +1885,7 @@ impl HeldSite {
                 return Err(refused);
             }
         };
+        credit_entry(vm);
         // Its end, wherever it ends: here, or in the pool's drain once its carrier is gone. With it,
         // what its cell has left, read while the cell is still the task's.
         let slot: Arc<Mutex<Option<(HandlerEnd, u64)>>> = Arc::new(Mutex::new(None));
@@ -1971,6 +1973,20 @@ unsafe fn activation_ctx(root: &VmCtx, caller: &HeldCaller<'_>) -> VmCtx {
     let mut ctx = root.vcpu(cell.get());
     ctx.cell = Some(cell);
     ctx
+}
+
+/// #3138 — an activation's entry costs nothing, as on the tree-walker, which charges a held call
+/// only for what its handler's code runs: credit the unit the handler's entry prologue is about to
+/// charge, as a fiber's start refunds the one its resume already paid (`fiber_rt::make_fiber`). Made
+/// only once the handler's code is sure to run next, so the credit is always spent: a cell gives
+/// back what it holds when it drops. A held compile is always metered.
+///
+/// # Safety
+/// `vm` is the activation's own context, whose cell no code charges yet.
+unsafe fn credit_entry(vm: &VmCtx) {
+    if let Some(cell) = vm.fuel.as_mut() {
+        cell.left = cell.left.saturating_add(1);
+    }
 }
 
 /// What the pool runs: a §14 child domain's vCPU, or a serve handler's fiber (#2742).

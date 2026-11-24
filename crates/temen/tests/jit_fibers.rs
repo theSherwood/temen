@@ -61,7 +61,7 @@ fn in_a_thread_on_the_kernel_route(src: &str, m: &temen_ir::Module) {
     if !entry.params.is_empty() || entry.results != [temen_ir::ValType::I64] {
         return;
     }
-    let declined = jit_kernel::admit(m, &temen_interp::Host::new(), false, u64::MAX).err();
+    let declined = jit_kernel::admit(m, &temen_interp::Host::new(), false).err();
     assert_eq!(declined, Some("fiber only"), "{src}");
     let n = m.funcs.len();
     let wrapped = format!(
@@ -427,6 +427,7 @@ fn fiber_backtrace_walks_a_suspended_fibers_guest_stack() {
         None,
         None,
         0,
+        false,
     )
     .expect("compile");
     // A run takes its parked fibers' backtraces as it ends only when asked (#3020).
@@ -591,6 +592,7 @@ fn fiber_backtrace_reaches_the_last_run_s_fibers_alone() {
         None,
         None,
         0,
+        false,
     )
     .expect("compile");
     let _ = cm.run(&[], None, None).expect("run 1");

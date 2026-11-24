@@ -110,6 +110,7 @@ fn a_child_gives_back_the_stacks_of_fibers_it_left_parked() {
         None,
         None,
         0,
+        false,
     )
     .expect("compile");
     cm.set_grant_child_hooks(Some(temen_run::production_grant_hooks(

@@ -928,6 +928,7 @@ fn a_reused_compile_freezes_a_fiber_thaws_it_and_a_later_run_cannot_reach_it() {
         None,
         None,
         0,
+        false,
     ) {
         Ok(cm) => cm,
         Err(temen_jit::JitError::Unsupported(_)) => return,
@@ -993,6 +994,7 @@ fn a_reused_compile_s_later_run_hands_back_no_earlier_freeze_s_residue() {
         None,
         None,
         0,
+        false,
     ) {
         Ok(cm) => cm,
         Err(temen_jit::JitError::Unsupported(_)) => return,

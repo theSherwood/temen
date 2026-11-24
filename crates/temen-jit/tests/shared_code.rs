@@ -65,6 +65,7 @@ fn compile(
         None,
         None,
         table_log2,
+        false,
     )
     .expect("compile")
 }
@@ -95,6 +96,7 @@ fn compile_metered(src: &str, cell: *mut FuelCell) -> CompiledModule {
         None,
         None,
         0,
+        false,
     )
     .expect("compile")
 }

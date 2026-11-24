@@ -42,7 +42,6 @@ use crate::{mem, slot_record, CompiledModule, FuelCell, JitFrameLoc, TrapKind, V
 use core::ptr::NonNull;
 use std::cell::Cell;
 use std::sync::atomic::AtomicI64;
-use std::sync::Mutex;
 pub use temen_ir::seams::NativeStop;
 
 /// The scheduling core's side of a vCPU's §12 ops: apply `stop`, park the thread until the task can
@@ -361,12 +360,6 @@ pub struct KernelRun {
     /// JIT's own hub's does (`publish_trap_capture`): when two vCPUs trap at once, any trapping frame's
     /// chain is a valid kill backtrace (#2499). A leaf lock, held for one `get_or_insert`.
     trap: std::sync::Mutex<Option<(usize, Vec<usize>, i64)>>,
-    /// #3078 slice 2 — every vCPU context the run has made, for the next vCPU to reuse once its own
-    /// ended: a context lives as long as its run, since a fiber its vCPU made goes on running on it
-    /// after the vCPU ends (`vmctx.rs`'s note), as today's route keeps them (`Domain::vcpu_ctxs`).
-    /// Boxed: code holds each one's address.
-    #[allow(clippy::vec_box)]
-    ctxs: Mutex<Vec<Box<VmCtx>>>,
     /// #3078 slice 2 — the run's one fiber table, when its module runs `cont.*`, and the config each
     /// vCPU's fiber runtime over it is built from.
     #[cfg(fiber_rt)]
@@ -405,15 +398,13 @@ impl KernelRun {
         init_mem: &[u8],
         node: Option<std::sync::Arc<dyn crate::BudgetNode>>,
     ) -> Option<Option<Started>> {
-        // A metered fiber is refused for memory safety, not only accounting: each vCPU's fuel cell
-        // lives on its thread's stack (`temen_run::jit_kernel`'s `tier_run`), a fiber's code charges
-        // its creator's cell wherever it runs (#3080), and a fiber may run after its creator ended.
-        // `fiber fuel` declines such a run before this; this keeps it refused whatever admitted it.
+        // #3080 — a metered fiber is a kernel run too: its code charges the cell of the vCPU that
+        // runs it, named at each resume, and only while it runs there (`VmCtx::fiber_switched_in`),
+        // so no fiber reaches a cell (a local of its vCPU's thread, `tier_run`) after its vCPU ended.
         if !crate::fiber_supported()
             || cm.nests
             || cm.durable
             || cm.call_tramp.is_none() && (cm.spawns || cm.fibers)
-            || cm.fibers && armed.is_some()
         {
             return None;
         }
@@ -440,7 +431,6 @@ impl KernelRun {
             window,
             root,
             _armed: armed,
-            ctxs: Mutex::new(Vec::new()),
             #[cfg(fiber_rt)]
             fibers,
             trap: std::sync::Mutex::new(None),
@@ -529,7 +519,11 @@ impl KernelRun {
             true => fuel,
             false => std::ptr::null_mut(),
         };
-        let vm = self.take_ctx(end, fuel, cap_ctx);
+        // #3080 — the vCPU's own context, a local of this call: no fiber reaches it once the vCPU
+        // ended (a fiber names it only as its runner, and only while this vCPU runs it).
+        // SAFETY: `end` is the run's, which outlives its vCPUs (executor 2 owns it for the run).
+        let mut vm = unsafe { self.root.vcpu_ending(end, fuel) };
+        vm.cap_ctx = cap_ctx;
         #[cfg(fiber_rt)]
         let fibers = self.fibers.as_ref().map(|f| {
             let mut rt = Box::new(crate::fiber_rt::FiberRuntime::new(
@@ -552,48 +546,7 @@ impl KernelRun {
         // SAFETY: this function's contract.
         let ran = unsafe { self.run_on(entry, tls, &vm) };
         drop(published);
-        self.give_ctx(vm);
         ran
-    }
-
-    /// A context for a vCPU about to run, over the run's end word `end`, charging `fuel`, its calls
-    /// through `cap_ctx`: one an ended vCPU left ([`Self::ctxs`]), or a new one.
-    ///
-    /// No fiber runs on a vCPU's context (#3133): a fiber its last vCPU made runs on a context of its
-    /// own, which copied this one's pointers when it was made, so a reused context is only this run's
-    /// next vCPU's. Its fields are written only where they differ: in a run whose module has fibers,
-    /// every context's are the run's (`cap_ctx`, the domain's host cell, and a null `fuel`, `fiber
-    /// fuel` declining a metered one), so none is written there.
-    fn take_ctx(
-        &self,
-        end: &AtomicI64,
-        fuel: *mut FuelCell,
-        cap_ctx: *mut core::ffi::c_void,
-    ) -> Box<VmCtx> {
-        let pooled = self.ctxs.lock().unwrap_or_else(|e| e.into_inner()).pop();
-        let mut vm = match pooled {
-            Some(vm) => vm,
-            // SAFETY: `end` is the run's, which outlives the run's contexts (executor 2 owns it for
-            // the run).
-            None => Box::new(unsafe { self.root.vcpu_ending(end, fuel) }),
-        };
-        debug_assert_eq!(
-            vm.domain_key(),
-            end as *const AtomicI64 as usize,
-            "one end word per run"
-        );
-        if vm.fuel != fuel {
-            vm.fuel = fuel;
-        }
-        if vm.cap_ctx != cap_ctx {
-            vm.cap_ctx = cap_ctx;
-        }
-        vm
-    }
-
-    /// A vCPU ended: its context waits for the next ([`Self::take_ctx`]).
-    fn give_ctx(&self, vm: Box<VmCtx>) {
-        self.ctxs.lock().unwrap_or_else(|e| e.into_inner()).push(vm);
     }
 
     /// [`Self::run_vcpu`]'s guarded call, on `vm`, with the thread's record published.
@@ -973,11 +926,11 @@ mod tests {
         assert_eq!(vm.ended(), Some(temen_ir::trap_code::MALFORMED));
     }
 
-    /// #3078 slice 2 (review R1) — a module with fibers compiled with fuel checks is never a kernel
-    /// run, whatever admitted it: a vCPU's cell lives on its thread's stack, and a fiber charges its
-    /// creator's cell wherever it runs, after its creator ended too (#3080). Unmetered, it is one.
+    /// #3080 — a module with fibers is a kernel run, metered or not: a fiber charges the cell of the
+    /// vCPU that runs it, only while it runs there. (Until #3080 a metered one was refused: a fiber
+    /// charged its creator's cell, a local of the creator's thread, after its creator ended too.)
     #[test]
-    fn a_metered_module_with_fibers_is_no_kernel_run() {
+    fn a_module_with_fibers_is_a_kernel_run_metered_or_not() {
         let m = temen_text::parse_module(
             "memory 16
 func () -> (i64) {
@@ -1012,12 +965,16 @@ block 0 (va: i64, vb: i64) {
                 None,
                 None,
                 0,
+                false,
             )
             .expect("compile")
         };
         let mut armed = FuelCell::fixed(0);
         let metered = compile(Some(&mut *armed as *mut FuelCell));
-        assert!(KernelRun::new(metered, Some(armed), &[], None).is_none());
+        assert!(matches!(
+            KernelRun::new(metered, Some(armed), &[], None),
+            Some(Some(_))
+        ));
         let unmetered = compile(None);
         assert!(matches!(
             KernelRun::new(unmetered, None, &[], None),

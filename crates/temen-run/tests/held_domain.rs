@@ -781,49 +781,139 @@ block 1 (vi: i64) {
 }
 "#;
 
-/// #3133 (stop-gap) — a domain that can make a fiber is held by the tree-walker when it is asked
-/// for on the JIT. A fiber made in an activation keeps that activation's context and fuel cell, which
-/// end with the call, so on the JIT a later resume ran on freed memory: a fiber that never started
-/// wrote its start refund into the freed cell, and one that suspended in its first call read its
-/// freed context once resumed in the next. Here each fiber is made in one call and resumed by the
-/// later ones, either never started in its first call or started and suspended there, each call on
-/// a loan and on none, and the domain answers as the oracle does. The context per fiber (#3080) lets the JIT hold it again,
-/// and these rows then assert the JIT.
+/// #3133, #3080 — a domain that makes fibers is held on the JIT, and each call there answers and
+/// leaves the fuel the tree-walker's does. A fiber made in an activation runs on a context of its own,
+/// which outlives the call, and each resume names the cell of the activation that runs it, so the
+/// call that resumes a fiber is the call that pays for it, as on the tree-walker. (Until #3080 the
+/// JIT declined it: its fiber charged the call that made it, and on the JIT a later resume ran on
+/// that call's freed context and cell, #3133.) Each fiber is made in one call and resumed by the
+/// later ones, never started in its first call or started and suspended there, each call on a loan
+/// and on none.
 #[test]
-fn a_domain_that_makes_fibers_is_held_by_the_tree_walker_on_the_jit() {
+fn a_domain_that_makes_fibers_is_held_on_the_jit_and_charges_as_the_tree_walker() {
     bounded(|| {
         for start in [0, 1] {
             for loan in [u64::MAX, 1_000_000] {
-                let m = module(FIBER_MAKER);
-                let mut host = Host::new();
-                host.set_self_module(&m);
-                let started = temen_run::hold(Executor::Jit, m, 0, &[], u64::MAX, host);
-                let (d, results) =
-                    started.unwrap_or_else(|(t, _)| panic!("the entry ends in {t:?}"));
-                assert_eq!(
-                    d.executor(),
-                    Executor::TreeWalker,
-                    "start {start}, loan {loan}"
-                );
-                assert_eq!(results, vec![Value::I64(1)]);
-                let mut fuel = loan;
-                assert_eq!(
-                    d.call(0, 0, &[start], &mut fuel),
-                    Reply::Results(vec![0]),
-                    "the fiber's handle"
-                );
-                for n in 0..3 {
+                let on = |on: Executor| {
+                    let m = module(FIBER_MAKER);
+                    let mut host = Host::new();
+                    host.set_self_module(&m);
+                    let started = temen_run::hold(on, m, 0, &[], u64::MAX, host);
+                    let (d, results) =
+                        started.unwrap_or_else(|(t, _)| panic!("the entry ends in {t:?}"));
+                    assert_eq!(d.executor(), on, "start {start}, loan {loan}");
+                    assert_eq!(results, vec![Value::I64(1)]);
+                    let mut calls = Vec::new();
                     let mut fuel = loan;
+                    calls.push((d.call(0, 0, &[start], &mut fuel), fuel));
+                    for _ in 0..3 {
+                        let mut fuel = loan;
+                        calls.push((d.call(0, 1, &[0], &mut fuel), fuel));
+                    }
+                    let (_host, trap) = d.end();
+                    assert_eq!(trap, None);
+                    calls
+                };
+                let oracle = on(Executor::TreeWalker);
+                let replies: Vec<&Reply> = oracle.iter().map(|(r, _)| r).collect();
+                let want: Vec<Reply> = [0, 42 + start, 43 + start, 44 + start]
+                    .map(|v| Reply::Results(vec![v]))
+                    .to_vec();
+                assert_eq!(
+                    replies,
+                    want.iter().collect::<Vec<_>>(),
+                    "the fiber's handle, then its counts"
+                );
+                // On no loan (`u64::MAX`) the JIT runs a call unmetered and reports none burned,
+                // where the tree-walker counts down from it (#3146): the replies are compared there.
+                let jit = on(Executor::Jit);
+                if loan == u64::MAX {
+                    let jit: Vec<&Reply> = jit.iter().map(|(r, _)| r).collect();
+                    assert_eq!(jit, replies, "start {start}, no loan: each call's reply");
+                } else {
                     assert_eq!(
-                        d.call(0, 1, &[0], &mut fuel),
-                        Reply::Results(vec![42 + start + n]),
-                        "start {start}, loan {loan}: resume {n} in a later call"
+                        jit, oracle,
+                        "start {start}, loan {loan}: each call's reply and fuel left"
                     );
                 }
-                let (_host, trap) = d.end();
-                assert_eq!(trap, None);
             }
         }
+    });
+}
+
+/// #3080 — `mk()` makes a fiber that runs 10,000 back-edges and returns 7, and answers its handle;
+/// `go(h)` resumes it to its end and answers what it returned.
+const A_LONG_FIBER: &str = r#"memory 16
+type 0 func (i64) -> (i64)
+type 1 interface { mk: 0, go: 0 }
+export 0 interface "svc" 1 { mk: 1, go: 2 }
+func () -> (i64) {
+block 0 () {
+  vr = i64.const 1
+  return vr
+  }
+}
+func (i64) -> (i64) {
+block 0 (va: i64) {
+  vf = ref.func 3
+  vz = i64.const 0
+  vk = cont.new vf vz
+  return vk
+  }
+}
+func (i64) -> (i64) {
+block 0 (vh: i64) {
+  vz = i64.const 0
+  vs, vv = cont.resume vh vz
+  return vv
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, varg: i64) {
+  vz = i64.const 0
+  br 1(vz)
+}
+block 1 (vi: i64) {
+  vone = i64.const 1
+  vj = i64.add vi vone
+  vn = i64.const 10000
+  vmore = i64.lt_u vj vn
+  br_if vmore 1(vj) 2()
+}
+block 2 () {
+  vr = i64.const 7
+  return vr
+  }
+}
+"#;
+
+/// #3080 — the call that resumes a fiber is the one it charges: a fiber made in a call lent plenty
+/// runs out of fuel in a later call lent 100, which ends the domain, on the JIT as on the
+/// tree-walker. (Until #3080 the JIT charged the first call's leftover loan and completed.)
+#[test]
+fn a_fiber_made_in_one_call_runs_out_in_the_call_that_resumes_it() {
+    bounded(|| {
+        let on = |on: Executor| {
+            let m = module(A_LONG_FIBER);
+            let mut host = Host::new();
+            host.set_self_module(&m);
+            let (d, _) = temen_run::hold(on, m, 0, &[], u64::MAX, host)
+                .unwrap_or_else(|(t, _)| panic!("the entry ends in {t:?}"));
+            assert_eq!(d.executor(), on);
+            let mut fuel = 1_000_000;
+            let made = (d.call(0, 0, &[0], &mut fuel), fuel);
+            let mut fuel = 100;
+            let resumed = (d.call(0, 1, &[0], &mut fuel), fuel);
+            let (_host, trap) = d.end();
+            (made, resumed, trap)
+        };
+        let oracle = on(Executor::TreeWalker);
+        assert_eq!(
+            oracle.2,
+            Some(Trap::OutOfFuel),
+            "the second call ends the domain"
+        );
+        assert_eq!(on(Executor::Jit), oracle);
     });
 }
 
@@ -846,22 +936,29 @@ block 0 () {
 }
 "#;
 
-/// #3133 (stop-gap) — the same for a domain with no fiber op whose host lets its submitted units host
-/// fibers: such a unit's `cont.new` in an activation would keep the activation's context alike. The
-/// same domain without the grant is the JIT's, so the grant is what declines it.
+/// #3080 — a domain whose host lets its submitted units host fibers is held on the JIT too (until
+/// #3080 the grant declined it), and a plain call there costs what it costs on the tree-walker: its
+/// handler's entry is free on both (#3138: the JIT charged it).
 #[test]
-fn a_domain_whose_units_may_host_fibers_is_held_by_the_tree_walker_on_the_jit() {
+fn a_domain_whose_units_may_host_fibers_is_held_on_the_jit() {
     bounded(|| {
-        for (hosts, held_on) in [(false, Executor::Jit), (true, Executor::TreeWalker)] {
-            let m = module(SEVEN);
-            let mut host = Host::new();
-            host.set_self_module(&m);
-            host.set_jit_hosts_fibers(hosts);
-            let started = temen_run::hold(Executor::Jit, m, 0, &[], u64::MAX, host);
-            let (d, results) = started.unwrap_or_else(|(t, _)| panic!("the entry ends in {t:?}"));
-            assert_eq!(d.executor(), held_on, "hosting fibers: {hosts}");
-            assert_eq!(results, vec![Value::I64(1)]);
-            assert_eq!(call(&d, 0, &[]), Reply::Results(vec![7]));
+        for hosts in [false, true] {
+            let on = |on: Executor| {
+                let m = module(SEVEN);
+                let mut host = Host::new();
+                host.set_self_module(&m);
+                host.set_jit_hosts_fibers(hosts);
+                let started = temen_run::hold(on, m, 0, &[], u64::MAX, host);
+                let (d, results) =
+                    started.unwrap_or_else(|(t, _)| panic!("the entry ends in {t:?}"));
+                assert_eq!(d.executor(), on, "hosting fibers: {hosts}");
+                assert_eq!(results, vec![Value::I64(1)]);
+                let mut fuel = 1_000_000;
+                (d.call(0, 0, &[], &mut fuel), fuel)
+            };
+            let oracle = on(Executor::TreeWalker);
+            assert_eq!(oracle, (Reply::Results(vec![7]), 1_000_000));
+            assert_eq!(on(Executor::Jit), oracle, "hosting fibers: {hosts}");
         }
     });
 }
@@ -1679,8 +1776,8 @@ fn nested_outer(on: Executor, loan: u64) -> (Reply, u64) {
 /// #3069 — a nested activation on a loan can burn all of it: the waiting caller hands back what its
 /// draw left before the call, as it cannot run meanwhile. Each activation draws a cell of its own
 /// from the loan, so a kept draw stranded half the loan, and the least loan was twice the cost.
-/// The JIT alone: the interpreters charge an activation no entry and the nested call nothing to the
-/// outer loan, so their least loan here is not the JIT's (#3093).
+/// The JIT alone: the interpreters charge the nested call nothing to the outer loan, so their least
+/// loan here is not the JIT's (#3093). An activation's entry is free on every engine (#3138).
 ///
 /// The read-back is ordered: `outer()` can call in, so it is carried (it may leave the caller's
 /// thread), and its end reads its cell's `can_burn` (`HeldSite::carry`'s `done`). `kept()` never
@@ -1691,7 +1788,10 @@ fn nested_outer(on: Executor, loan: u64) -> (Reply, u64) {
 fn a_nested_activation_on_the_jit_can_burn_its_whole_loan() {
     let (done, cost) = nested_outer(Executor::Jit, 1_000_000);
     assert_eq!(done, Reply::Results(vec![42]));
-    assert_eq!(cost, 101, "two entries and the inner loop's 99 back-edges");
+    assert_eq!(
+        cost, 99,
+        "the inner loop's 99 back-edges: an activation's entry is free (#3138)"
+    );
     assert_eq!(
         nested_outer(Executor::Jit, cost),
         (Reply::Results(vec![42]), cost)

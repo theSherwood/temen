@@ -46,6 +46,7 @@ fn compile_reserved(m: &Module, table_log2: u8) -> CompiledModule {
         None,
         None,
         table_log2,
+        false,
     )
     .expect("compile")
 }
@@ -319,6 +320,7 @@ fn run_repl(table_log2: u8, n: usize, compact_every: Option<usize>) -> (Vec<i64>
         None,
         None,
         table_log2,
+        false,
     )
     .expect("compile shell");
 
@@ -417,6 +419,7 @@ fn recompaction_carries_live_invoke_only_unit() {
         None,
         None,
         table_log2,
+        false,
     )
     .expect("compile shell");
 

@@ -1068,9 +1068,10 @@ jobs:
           exe() { jq -r "select(.target.name == \"$1\" and .profile.test and .executable != null) | .executable"; }
           run_binary "$(cargo test -p temen-run $asan --test held_domain --no-run --message-format=json | exe held_domain)" ""
           run_binary "$(cargo test -p temen-run $asan --test pool_after_teardown --no-run --message-format=json | exe pool_after_teardown)" ""
-          # #3078 slice 2 — a kernel run's vCPU contexts outlive their vCPUs, since a fiber a vCPU made
-          # runs on its context after it ends: the slice's rows read freed heap without the run's
-          # pool; and the run ends its fiber table as it returns (kernel_fiber_stacks).
+          # #3078 slice 2, #3080 — a kernel run's fibers outlive the vCPUs that made them: since #3080 a
+          # vCPU's context and cell are locals of its thread (no pool), and a fiber charges only the
+          # vCPU running it, so these rows read freed heap if a fiber reaches an ended vCPU's; and the
+          # run ends its fiber table as it returns (kernel_fiber_stacks).
           run_binary "$(cargo test -p temen-run $asan --test jit_kernel --no-run --message-format=json | exe jit_kernel)" "kernel_fibers::"
           run_binary "$(cargo test -p temen-run $asan --test kernel_fiber_stacks --no-run --message-format=json | exe kernel_fiber_stacks)" ""
           run_binary "$(cargo test -p temen-run $asan --lib --no-run --message-format=json | exe temen_run)" "held::tests::"
