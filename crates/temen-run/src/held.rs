@@ -33,7 +33,8 @@ use crate::{jit_proc, CAP_REVOKED};
 ///
 /// #3080 — a module that makes fibers is held on the JIT too: a fiber made in one call charges the
 /// call that resumes it, as on the tree-walker, since each resume names the running activation's
-/// cell (`VmCtx::fiber_switched_in`).
+/// cell (`VmCtx::fiber_switched_in`). Except where a fiber could call into a held domain
+/// ([`fiber_may_call_in`]): the tree-walker holds those until #3164.
 pub fn hold(
     on: Executor,
     m: Arc<Module>,
@@ -44,12 +45,36 @@ pub fn hold(
 ) -> Result<(HeldDomain, Vec<Value>), (Trap, Box<Host>)> {
     let jit = on == Executor::Jit
         && !crate::folds_to_oracle(&m)
-        && !jit_proc::serves(&jit_proc::host_calls(&m), &host);
+        && !jit_proc::serves(&jit_proc::host_calls(&m), &host)
+        && !fiber_may_call_in(&m, &host);
     if jit {
         hold_jit(m, entry, args, fuel, host)
     } else {
         HeldDomain::start(on, m, entry, args, fuel, host)
     }
+}
+
+/// #3080 (review B2) — whether a guest fiber of the domain could call through a guest interface, so
+/// into a held domain, its own included: on the JIT such a call runs under the calling activation's
+/// gate and then gives it away, where the tree-walker keeps it out until that activation parks or
+/// ends (#3164). Decided from what can run: the module's own code, when it makes fibers and makes a
+/// guest-interface call (a `call.cap` on a guest interface's id, or one dispatched by a handle or a
+/// bound import, whose interface is known only as it runs); and the units it may run, which no one
+/// can read before they arrive, when its host lets them host fibers and it can reach `Jit`
+/// ([`jit_proc::hosts_fibers`]), as every fiber-hosting domain was declined before #3080.
+fn fiber_may_call_in(m: &Module, host: &Host) -> bool {
+    use temen_ir::{cap_id::GUEST_IMPL_BASE, Inst, CAP_SELF_TYPE_ID};
+    let calls_a_guest = || {
+        (m.funcs.iter().flat_map(|f| &f.blocks))
+            .flat_map(|b| &b.insts)
+            .any(|i| match i {
+                Inst::CapCall(c) => c.type_id >= GUEST_IMPL_BASE && c.type_id != CAP_SELF_TYPE_ID,
+                Inst::CallImport(_) | Inst::CallSym(_) | Inst::CallImportDyn(_) => true,
+                _ => false,
+            })
+    };
+    jit_proc::hosts_fibers(m, host)
+        || m.funcs.iter().any(temen_ir::Func::uses_fibers) && calls_a_guest()
 }
 
 /// The domain's main thread: what its run answers, and its powerbox back.

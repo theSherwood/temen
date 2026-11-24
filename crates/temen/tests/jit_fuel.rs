@@ -1175,3 +1175,180 @@ fn assert_jit_routes_sweep_as_the_oracle(src: &str) {
         .collect();
     assert!(wrong.is_empty(), "cost {cost}: {wrong:#?}");
 }
+
+/// #3080 (review F8a) — the unit [`AN_INSTALLED_UNITS_FIBER_OUTLIVES_ITS_THREAD`] installs. Given
+/// mode 0 its entry makes a fiber over its own function 1, resumes it to its first suspend and
+/// answers its handle; given mode 1 it resumes the fiber `h` and answers what it returned. The
+/// fiber's body calls its parent's function 2 (slot 2, new to old) with the unit's suspender
+/// (function 2), so the parent's code is on the fiber's stack when it suspends.
+const A_UNIT_WHOSE_FIBER_RUNS_ITS_PARENT: &str = "memory 16
+func (i64, i64) -> (i64) {
+block 0 (vmode: i64, vh: i64) {
+  vz = i64.const 0
+  vresume = i64.ne vmode vz
+  br_if vresume 2(vh) 1()
+}
+block 1 () {
+  vf = ref.func 1
+  vsp = i64.const 32768
+  vk = cont.new vf vsp
+  vz1 = i64.const 0
+  vs, vv = cont.resume vk vz1
+  return vk
+}
+block 2 (vk2: i64) {
+  vz2 = i64.const 0
+  vs2, vv2 = cont.resume vk2 vz2
+  return vv2
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, varg: i64) {
+  vsus = ref.func 2
+  vparent = i32.const 2
+  vr = call.dyn (i32) -> (i64) vparent (vsus)
+  return vr
+  }
+}
+func (i64) -> (i64) {
+block 0 (vx: i64) {
+  vy = suspend vx
+  return vy
+  }
+}
+";
+
+/// #3080 (review F8a) — a program that drives `Jit` and has no fiber op of its own. It compiles
+/// [`A_UNIT_WHOSE_FIBER_RUNS_ITS_PARENT`] (at 20480, `LEN` bytes) and installs it. A spawned thread
+/// dispatches the unit to make a fiber, whose body runs the parent's function 2: 1,000 back-edges,
+/// then a suspend through the unit, with function 2's frame on the fiber's stack, which read the
+/// thread's cell. The thread ends. The root resumes the fiber through the unit, and function 2 runs
+/// 1,000 more back-edges on the root's vCPU and returns 7. The root answers `1000·spent + 7`, where
+/// `spent` is what its `fuel.remaining` fell by from its start to its end: the domain's whole
+/// charge as its root sees it.
+const AN_INSTALLED_UNITS_FIBER_OUTLIVES_ITS_THREAD: &str = "memory 16
+func (i32) -> (i64) {
+block 0 (vj: i32) {
+  vself = i32.const 0
+  vbefore = call.cap 4294967295 13 () -> (i64) vself ()
+  vb = i64.const 20480
+  vl = i64.const LEN
+  vu = call.cap 11 0 (i64, i64) -> (i64) vj (vb, vl)
+  vs = call.cap 11 3 (i64) -> (i64) vj (vu)
+  vz = i64.const 0
+  vt = thread.spawn 1 vs vz
+  vst, vk = thread.join vt
+  vs32 = i32.wrap_i64 vs
+  vone = i64.const 1
+  vr = call.dyn (i64, i64) -> (i64) vs32 (vone, vk)
+  vself2 = i32.const 0
+  vafter = call.cap 4294967295 13 () -> (i64) vself2 ()
+  vspent = i64.sub vbefore vafter
+  vk1000 = i64.const 1000
+  vspentk = i64.mul vspent vk1000
+  vans = i64.add vspentk vr
+  return vans
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vs: i64, varg: i64) {
+  vs32 = i32.wrap_i64 vs
+  vz = i64.const 0
+  vk = call.dyn (i64, i64) -> (i64) vs32 (vz, vz)
+  return vk
+  }
+}
+func (i32) -> (i64) {
+block 0 (vsus: i32) {
+  vz = i64.const 0
+  br 1(vz, vsus)
+}
+block 1 (vi: i64, vs1: i32) {
+  vone = i64.const 1
+  vj = i64.add vi vone
+  vn = i64.const 1000
+  vmore = i64.lt_u vj vn
+  br_if vmore 1(vj, vs1) 2(vs1)
+}
+block 2 (vs2: i32) {
+  vz1 = i64.const 0
+  vx = call.dyn (i64) -> (i64) vs2 (vz1)
+  vz2 = i64.const 0
+  br 3(vz2)
+}
+block 3 (vi2: i64) {
+  vone2 = i64.const 1
+  vj2 = i64.add vi2 vone2
+  vn2 = i64.const 1000
+  vmore2 = i64.lt_u vj2 vn2
+  br_if vmore2 3(vj2) 4()
+}
+block 4 () {
+  v7 = i64.const 7
+  return v7
+  }
+}
+";
+
+/// #3080 (review F8a) — an installed unit's fiber that runs its parent's code charges the vCPU that
+/// resumes it, on the JIT's own route as on the tree-walker: the answer and the whole charge agree.
+/// The parent has no fiber op, so only its fiber-hosting compile (`hosts_fibers`) lowers its code
+/// to reload its cell. Without that, function 2's frame goes on charging the cell it read on the
+/// thread, which ended before the root resumed the fiber: that cell (a recycled thread context's)
+/// draws for it from the run's chain while the root's own cell sits unspent, so what the root sees
+/// spent differs from the oracle's.
+#[test]
+fn jit_fuel_an_installed_units_fiber_charges_the_vcpu_that_resumes_it() {
+    let unit = parse_module(A_UNIT_WHOSE_FIBER_RUNS_ITS_PARENT).expect("parse the unit");
+    verify_module(&unit).expect("verify the unit");
+    let blob = temen_encode::encode_module(&unit);
+    let src = AN_INSTALLED_UNITS_FIBER_OUTLIVES_ITS_THREAD.replace("LEN", &blob.len().to_string());
+    let m = parse_module(&src).expect("parse");
+    verify_module(&m).expect("verify");
+    let mut init = vec![0u8; 20480 + blob.len()];
+    init[20480..].copy_from_slice(&blob);
+    // The tree-walker: its answer and what it charged.
+    let mut host = temen_interp::Host::new();
+    let jit = temen_run::grant_jit_fibers(&mut host, &m, 4);
+    let budget = 50_000_000u64;
+    let mut left = budget;
+    let oracle = temen_interp::run_capture_reserved_with_host(
+        &m,
+        0,
+        &[Value::I32(jit)],
+        &mut left,
+        &init,
+        temen_ir::DEFAULT_RESERVED_LOG2,
+        &mut host,
+    )
+    .0
+    .expect("the tree-walker runs it");
+    let [Value::I64(answer)] = oracle[..] else {
+        panic!("the tree-walker answered {oracle:?}");
+    };
+    assert_eq!(answer % 1000, 7, "the fiber returned 7");
+    let oracle_charge = budget - left;
+    // The JIT's own route (`jit_cap_run`, which meters the run on its host's node).
+    let mut host = temen_interp::Host::new();
+    let jit = temen_run::grant_jit_fibers(&mut host, &m, 4);
+    let (out, _) = temen_run::jit_cap_run(
+        &m,
+        0,
+        &[jit as i64],
+        &temen_interp::MemLayout::image(init),
+        temen_ir::DEFAULT_RESERVED_LOG2,
+        4,
+        &mut host,
+        None,
+    )
+    .expect("the JIT compiles it");
+    assert!(
+        matches!(out, JitOutcome::Returned(ref v) if v == &[answer]),
+        "{out:?}: what the root saw spent, and the fiber's 7, as the oracle's {answer}"
+    );
+    assert_eq!(
+        temen_interp::DEFAULT_FUEL - host.fuel_left(),
+        oracle_charge,
+        "the JIT charges what the oracle charges"
+    );
+}
