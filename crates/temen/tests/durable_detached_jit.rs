@@ -2153,3 +2153,113 @@ fn a_childs_own_trap_with_a_live_grandchild_refuses_the_freeze() {
 fn a_childs_fiber_that_fails_its_extent_check_ends_the_child() {
     own_trap_rides(&fiber_extent_nest(), 1);
 }
+
+/// #3158 — the parent [`serving_parent`] spawns [`SERVING_CHILD`] detached, mints an offer over its
+/// export, calls `add(40, 2)` through it, joins the child, and returns the reply and the join's
+/// status and value.
+const SERVING_PARENT: &str = "memory 18 shadow 16448 65536
+type 0 func (i64, i64) -> (i64)
+type 1 interface { add: 0 }
+func (i32, i32, i32) -> (i64, i64, i64) {
+block 0 (v0: i32, v1: i32, v2: i32) {
+  vrm = i64.const 65544
+  i32.store vrm v1
+  vrb = i64.const 65548
+  i32.store vrb v2
+  vrp = i64.const 65536
+  vc = call.cap 6 17 (i64) -> (i32) v0 (vrp)
+  vz = i64.const 0
+  voff = call.cap 6 14 (i32, i64) -> (i32) v0 (vc, vz)
+  va = i64.const 40
+  vb = i64.const 2
+  vr = call.cap 268435456 0 (i64, i64) -> (i64) voff (va, vb)
+  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) v0 (vc)
+  return vr vj_st vj
+  }
+}
+";
+
+/// [`SERVING_PARENT`] with its spawn record, instrumented.
+fn serving_parent() -> temen_ir::Module {
+    confined(&format!("{SERVING_PARENT}{}", spawn_rec(65536)))
+}
+
+/// #3158 — a durable serving child. Its entry serves one call (`svc.wait`) and returns the count, 1.
+/// The handler, `add`, waits a millisecond on a word nothing notifies, then answers `a + b` plus 1000
+/// times the wait's answer (2, timed out). A durable domain runs its handlers on its serve op's own
+/// stack, each in a recovery scope of its own (`temen_jit::invoke_handler`; a handler fiber cannot
+/// ride a freeze yet, #2804).
+const SERVING_CHILD: &str = "memory 17 shadow 16448 65536
+type 0 func (i64, i64) -> (i64)
+type 1 interface { add: 0 }
+export 0 interface \"adder\" 1 { add: 1 }
+func (i64, i64) -> (i64) {
+block 0 (v0: i64, v1: i64) {
+  vz = i32.const 0
+  vn = svc.wait vz
+  return vn
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (va: i64, vb: i64) {
+  vp = i64.const 66000
+  vw0 = i32.const 0
+  vto = i64.const 1000000
+  vw = i32.atomic.wait vp vw0 vto
+  vw64 = i64.extend_i32_s vw
+  vk = i64.const 1000
+  vm = i64.mul vw64 vk
+  vs = i64.add va vb
+  vr = i64.add vs vm
+  return vr
+  }
+}
+";
+
+/// #3158 — a durable §14 child runs on a pool task, and its handler runs on the serve op's stack, in a
+/// recovery scope nested in the task's frames. A park there would switch the task out with that scope
+/// still open, so the JIT refuses the park: the child ends `ThreadFault`, the parent's call through
+/// the offer fails, and its join reads the trap. The oracle's handler waits and answers. The JIT's
+/// half is the stop-gap's divergence (decision 33): #3167, the recovery point travelling with the
+/// stack, lets the task park there, and this row then agrees with the oracle. Without the yield floor
+/// the JIT answers the oracle's triple by parking the task with the handler's scope open.
+#[test]
+fn a_durable_childs_handler_that_parks_ends_the_child_on_the_jit() {
+    let parent = serving_parent();
+    let child = confined(SERVING_CHILD);
+    let win = init_durable_window(1 << PARENT_LOG2, ARENA);
+
+    let (mut host, h) = powerbox(&child);
+    let args: Vec<Value> = h.iter().map(|&v| Value::I32(v as i32)).collect();
+    let mut fuel = 50_000_000u64;
+    let (r, _) =
+        run_capture_reserved_with_host(&parent, 0, &args, &mut fuel, &win, PARENT_LOG2, &mut host);
+    let served = 40 + 2 + 2 * 1000;
+    assert_eq!(
+        r,
+        Ok(vec![Value::I64(served), Value::I64(0), Value::I64(1)]),
+        "oracle: the handler times out and answers; the child served one call"
+    );
+
+    let (mut host, h) = powerbox(&child);
+    let jit = temen_run::jit_cap_run(
+        &parent,
+        0,
+        &h,
+        &MemLayout::image(win.to_vec()),
+        PARENT_LOG2,
+        0,
+        &mut host,
+        None,
+    );
+    let thread_fault = temen_ir::trap_code::THREAD_FAULT;
+    match jit {
+        Ok((o, _)) => assert_eq!(
+            returned(o),
+            vec![-9, thread_fault, 0], // -9: the call finds the callee gone (`CAP_REVOKED`)
+            "jit: the call fails, and the join reads the child's ThreadFault"
+        ),
+        Err(JitError::Unsupported(_)) => {} // a target without the child executor
+        Err(e) => panic!("JIT run failed: {e:?}"),
+    }
+}

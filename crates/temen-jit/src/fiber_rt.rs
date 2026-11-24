@@ -1740,17 +1740,18 @@ pub(crate) unsafe extern "C" fn fiber_resume(
             if slot.event_park.load(Ordering::Relaxed) {
                 let on = slot.parked_on();
                 if on.blocks_vcpu() {
-                    match park_as() {
+                    match park_as(Park::Whole) {
                         ParkAs::Fiber(own) => {
                             fiber_event_park(&own, slot.took_park_deadline(), on);
                             arg = 0; // a park's poll delivers nothing (`fiber_event_park`)
                             continue;
                         }
                         ParkAs::Thread => {}
-                        // #3158 — a pool task's resumer below a guarded call's floor can hand the
-                        // park on to nothing: the task cannot park whole there. Fail closed rather
-                        // than report `FIBER_PARKED` for a park that blocks its vCPU.
+                        // #3158 — unreachable: a whole-vCPU park in a task under a guarded call is
+                        // refused at its own door, before it is made. A backstop that fails closed
+                        // rather than report `FIBER_PARKED` for a park that blocks its vCPU.
                         ParkAs::Refused => {
+                            debug_assert!(false, "a whole-vCPU park made under a guarded call");
                             crate::VmCtx::at(vm).raise(TrapKind::ThreadFault as i64);
                         }
                     }
@@ -2025,52 +2026,76 @@ pub(crate) unsafe fn runs_a_fiber(rt: *const FiberRuntime) -> bool {
 }
 
 pub(crate) fn current_fiber_slot() -> Option<Arc<FiberSlot>> {
-    match park_as() {
+    match park_as(Park::Fiber) {
         ParkAs::Fiber(slot) => Some(slot),
         ParkAs::Thread | ParkAs::Refused => None,
     }
 }
 
-/// #3158 — what a park made here may take: the one answer every park door asks.
+/// #3158 — what a park is: the running fiber's alone, or its whole vCPU's ([`ParkOn::blocks_vcpu`]:
+/// a page fault, a join, a quantum's end), which a task takes by parking the task.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Park {
+    Fiber,
+    Whole,
+}
+
+impl Park {
+    /// The kind of a park `on`.
+    pub(crate) fn of(on: &ParkOn) -> Park {
+        if on.blocks_vcpu() {
+            Park::Whole
+        } else {
+            Park::Fiber
+        }
+    }
+}
+
+/// #3158 — what a park made here may take: the one answer every park door asks, where the park is
+/// made (a wait that would not park asks nothing).
 pub(crate) enum ParkAs {
-    /// The running fiber, `slot`, resumed above the yield floor: the park yields it alone.
+    /// A fiber, `slot`: for a fiber's park, the running fiber, resumed above the yield floor; for a
+    /// whole-vCPU park in a task with no guarded call live in its frames, the running one, whose
+    /// park is handed up to the task's own (`fiber_resume`, #2322).
     Fiber(Arc<FiberSlot>),
-    /// This OS thread: a vCPU's own, at its root or below a floor. The park blocks it in place.
+    /// This OS thread: an OS vCPU's own, at its root, below a floor, or parking whole. The park
+    /// blocks it in place.
     Thread,
-    /// None: a pool task's code below a floor. Its root computation is the task's fiber, which
-    /// cannot park while a guarded call nested in its frames is live, and the worker thread is not
-    /// the vCPU's to block. The park fails closed (`ThreadFault`).
+    /// None: a pool task's code below a floor, or a whole-vCPU park in a task with a guarded call
+    /// live in its frames (a fiber above the floor included). The task's root computation is its
+    /// fiber, which cannot park while that call's recovery scope is on its stack, and the worker
+    /// thread is not the vCPU's to block. The park fails closed (`ThreadFault`), before it is made.
     Refused,
 }
 
-/// #3158 — [`ParkAs`] for the code running on this thread now.
-pub(crate) fn park_as() -> ParkAs {
+/// #3158 — [`ParkAs`] for a park of kind `park` made by the code running on this thread now.
+pub(crate) fn park_as(park: Park) -> ParkAs {
     let rt = current();
     if rt.is_null() {
         return ParkAs::Thread;
     }
     // SAFETY: `current()` is this thread's live runtime; the borrow is momentary.
     let rt = unsafe { &*rt };
+    let task = rt.runs_task();
+    if park == Park::Whole {
+        // A task parks whole by parking itself, which only an empty floor lets it do (its
+        // residency's guard sets 0, below the task's own yielder; a nested guarded call raises it).
+        return match (task, rt.yield_floor, rt.active_slots.last()) {
+            (false, _, _) => ParkAs::Thread,
+            (true, 0, Some(slot)) => ParkAs::Fiber(Arc::clone(slot)),
+            (true, _, _) => ParkAs::Refused,
+        };
+    }
     if rt.yielders.len() > rt.yield_floor {
         if let Some(slot) = rt.active_slots.last() {
             return ParkAs::Fiber(Arc::clone(slot));
         }
     }
-    if rt.runs_task() {
+    if task {
         ParkAs::Refused
     } else {
         ParkAs::Thread
     }
-}
-
-/// #3158 — whether a pool task running here can park whole: no guarded call is live in its frames
-/// (its residency's guard sets the floor at 0, below the task's own yielder; a nested one raises
-/// it). Only then may its quantum end: a fiber resumed under a nested call would hand its `Yield`
-/// park up to a resumer that cannot take it.
-pub(crate) fn task_parks_whole() -> bool {
-    let rt = current();
-    // SAFETY: `current()` is this thread's live runtime; the borrow is momentary.
-    !rt.is_null() && unsafe { (*rt).runs_task() && (*rt).yield_floor == 0 }
 }
 
 /// #3158 — whether the code running here is its vCPU's root computation: no fiber is on this
@@ -2241,13 +2266,10 @@ pub(crate) unsafe fn seed_frozen_fibers(
     true
 }
 
-/// This frame's stack pointer (approximately): the address of a local, slightly **below** the
-/// caller's frame — a sound *low* bound for scanning the caller's live region upward. `inline(never)`
-/// + `black_box` keep the probe from being optimized away or hoisted.
-#[inline(never)]
+/// The stack pointer, **below** the caller's frame: a sound *low* bound for scanning the caller's
+/// live region upward ([`crate::stack_check::stack_pointer`], the register, not a local's address).
 fn current_sp() -> usize {
-    let probe = 0usize;
-    std::hint::black_box(&probe as *const usize as usize)
+    crate::stack_check::stack_pointer() as usize
 }
 
 /// Scan raw native-stack words in `[low, high)` (host byte addresses), inserting every 8-byte word
@@ -2786,45 +2808,49 @@ mod yield_floor_tests {
 
     #[test]
     fn a_guarded_call_holds_the_floor_for_its_span_and_a_fault_leaves_it_as_it_began() {
+        let fiber = |p| matches!(park_as(p), ParkAs::Fiber(_));
+        let thread = |p| matches!(park_as(p), ParkAs::Thread);
+        let refused = |p| matches!(park_as(p), ParkAs::Refused);
         let table = Arc::new(SharedFiberTable::new(4, ShadowArena::EMPTY, None));
         let rt = Box::into_raw(Box::new(FiberRuntime::new(table, 0, 0)));
         let prev = set_current(rt);
         // SAFETY: `rt` is published on this thread for the test and touched by nothing else.
         let rt_ref = || unsafe { &mut *rt };
-        // A vCPU's root on its own thread, no fiber resumed: a park blocks the thread.
-        assert!(matches!(park_as(), ParkAs::Thread) && at_root() && !task_parks_whole());
+        // A vCPU's root on its own thread, no fiber resumed: every park blocks the thread.
+        assert!(thread(Park::Fiber) && thread(Park::Whole) && at_root());
         {
             // Below a guarded call there too (a unit invoked from the root): still the thread's.
             let _floor = raise_yield_floor();
-            assert!(matches!(park_as(), ParkAs::Thread) && at_root());
+            assert!(thread(Park::Fiber) && thread(Park::Whole) && at_root());
         }
         // A pool task running: its slot (the residency's resume) and its body's yielder.
         rt_ref().push_active(a_task_slot());
         rt_ref().yielders.push(stand_in());
         assert!(
-            matches!(park_as(), ParkAs::Fiber(_)),
+            fiber(Park::Fiber) && fiber(Park::Whole),
             "the task parks as its fiber"
         );
-        assert!(task_parks_whole() && !at_root());
+        assert!(!at_root());
         {
             // A guarded call nested in the task's frames (a unit `Jit.invoke`d, a handler run inline).
             let floor = raise_yield_floor();
             assert_eq!(floor.depth(), (1, 1));
             assert_eq!(rt_ref().yield_floor, 1);
             assert!(
-                matches!(park_as(), ParkAs::Refused),
+                refused(Park::Fiber) && refused(Park::Whole),
                 "the task cannot park whole"
             );
-            assert!(current_fiber_slot().is_none() && !task_parks_whole());
+            assert!(current_fiber_slot().is_none());
             assert!(
                 take_yielder(rt_ref()).is_none(),
                 "no yield takes the task's yielder"
             );
             assert_eq!(rt_ref().yielders.len(), 1);
-            // A fiber resumed inside the call runs above the floor, and may yield.
+            // A fiber resumed inside the call runs above the floor: it may park alone, and yield,
+            // but not park the whole vCPU, which would park the task under the call's scope.
             rt_ref().push_active(a_task_slot());
             rt_ref().yielders.push(stand_in());
-            assert!(matches!(park_as(), ParkAs::Fiber(_)));
+            assert!(fiber(Park::Fiber) && refused(Park::Whole));
             assert!(take_yielder(rt_ref()).is_some(), "its own yielder");
             rt_ref().yielders.push(stand_in());
             // A fault the call's guard catches: everything resumed inside it is dropped.
@@ -2839,14 +2865,14 @@ mod yield_floor_tests {
             0,
             "the floor is the enclosing call's again"
         );
-        assert!(matches!(park_as(), ParkAs::Fiber(_)) && task_parks_whole());
+        assert!(fiber(Park::Fiber) && fiber(Park::Whole));
         // No runtime of its own (a guarded call on a thread that publishes none): nothing to hold.
         rt_ref().active_slots.clear();
         rt_ref().yielders.clear();
         set_current(core::ptr::null_mut());
         let floor = raise_yield_floor();
         assert_eq!(floor.depth(), (0, 0));
-        assert!(matches!(park_as(), ParkAs::Thread) && at_root());
+        assert!(thread(Park::Fiber) && thread(Park::Whole) && at_root());
         drop(floor);
         set_current(prev);
         // SAFETY: `rt` came from `Box::into_raw` above and is no longer published.

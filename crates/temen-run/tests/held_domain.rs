@@ -1831,8 +1831,8 @@ fn qh_spinner() -> String {
 /// made is counted (`temen_jit::quantum_ends_held`); without the floor nothing counts them, so this
 /// fails every run.
 ///
-/// A normal lane: the ASan build does not run the handler inline (see #3158), so `asan-held` cannot
-/// cover this shape.
+/// Under ASan too (`asan-held`): the stack checks read the stack pointer's register, not a local's
+/// address, which ASan's fake stack puts on neither the thread's stack nor a fiber's.
 #[test]
 fn a_quantum_ending_inside_a_handler_run_inline_on_a_pool_task_does_not_park_it() {
     let held = temen_jit::quantum_ends_held();

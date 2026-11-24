@@ -595,8 +595,7 @@ const HANDOFF_ROOM: u64 = TASK_STACK as u64 / 2;
 /// #2742 — whether this stack has room for a handler run on it ([`HANDOFF_ROOM`]).
 fn handoff_room() -> bool {
     let limit = crate::stack_check::thread_limit();
-    let here = 0u8;
-    let sp = &here as *const u8 as u64;
+    let sp = crate::stack_check::stack_pointer();
     limit != 0 && sp.saturating_sub(limit) >= HANDOFF_ROOM
 }
 
@@ -2289,18 +2288,20 @@ pub(crate) fn quantum_end() {
             return;
         }
     }
-    // #3158 — a full pool: the task would give its worker up here. Not while a guarded call nested in
-    // its frames is live (a handler run inline, a unit `Jit.invoke`d): the task cannot park whole
-    // there, so it keeps its worker to that call's end. The due wakes and the worker hand-out above
-    // ran all the same.
-    if !fiber_rt::task_parks_whole() {
-        QUANTUM_ENDS_HELD.fetch_add(1, Ordering::Relaxed);
-        return;
-    }
-    if let fiber_rt::ParkAs::Fiber(slot) = fiber_rt::park_as() {
+    // A full pool: the task gives its worker up, a whole-vCPU park. #3158 — not while a guarded call
+    // nested in its frames is live (a handler run inline, a unit `Jit.invoke`d): the task cannot
+    // park whole there, so it keeps its worker to that call's end. The due wakes and the worker
+    // hand-out above ran all the same.
+    match fiber_rt::park_as(fiber_rt::Park::Whole) {
         // SAFETY: inside the task's residency, on one of its fibers; the park hands the worker back
         // and returns when a worker resumes the task.
-        unsafe { fiber_rt::fiber_event_park(&slot, None, fiber_rt::ParkOn::Yield) };
+        fiber_rt::ParkAs::Fiber(slot) => unsafe {
+            fiber_rt::fiber_event_park(&slot, None, fiber_rt::ParkOn::Yield)
+        },
+        fiber_rt::ParkAs::Refused => {
+            QUANTUM_ENDS_HELD.fetch_add(1, Ordering::Relaxed);
+        }
+        fiber_rt::ParkAs::Thread => {}
     }
 }
 

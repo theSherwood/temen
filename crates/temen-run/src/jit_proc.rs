@@ -1218,10 +1218,14 @@ pub(crate) unsafe fn serve_request(
     if parks.wake_readers.is_some() || parks.wake_writers.is_some() {
         proc.tree.ring();
     }
-    // #3158 — the root computation: no fiber on this vCPU's stack, so not code a fiber's `Jit.invoke`
-    // runs either (below its yield floor `fiber_active` is false, but the fiber is still there).
+    // #3158 — two questions. The process-tree gates (`exec`, `fork`, `spawn` of self) ask whether the
+    // code is the root computation: no fiber on this vCPU's stack, so not code a fiber's
+    // `Jit.invoke` runs either. The tree's parks ask whether the park blocks the thread rather than
+    // a fiber of the running code's own (below a yield floor no such fiber can park), and then take
+    // the tree's bell, which another process's write rings.
     let root = temen_jit::at_root();
-    if root && (parks.read_park.is_some() || parks.write_park.is_some()) {
+    let parks_the_thread = !temen_jit::fiber_active();
+    if parks_the_thread && (parks.read_park.is_some() || parks.write_park.is_some()) {
         return tree_park(host, bell, vm, answer);
     }
     match parks.request.take() {
@@ -1271,7 +1275,7 @@ pub(crate) unsafe fn serve_request(
             }
             None
         }
-        Some(ParkEvent::TaskExit(_) | ParkEvent::TaskExitAny) if root => {
+        Some(ParkEvent::TaskExit(_) | ParkEvent::TaskExitAny) if parks_the_thread => {
             tree_park(host, bell, vm, answer)
         }
         _ => crate::host_park(host, &parks, stdin_park, mem_base, results, n_results, vm),

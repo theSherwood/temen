@@ -308,3 +308,162 @@ fn a_childs_uninstall_leaves_the_parents_slot_mirror_alone() {
         "the root's mirror still names its own unit at slot 2"
     );
 }
+
+/// #3158 — a whole-vCPU park made inside a `Jit.invoke`, on a pool task. The child [`joining_src`]
+/// spawns a grandchild (function 4's image: it waits a second on a word nothing notifies, so it
+/// is live, and returns 7), then compiles a unit and invokes it. The unit `call.dyn`s the child's
+/// function 2 (new→old), which makes a fiber over function 3 and resumes it, and that fiber joins the
+/// grandchild. A join blocks the child's vCPU on every engine.
+fn joining_src(blob: &[u8]) -> String {
+    let blob_data: String = blob.iter().map(|b| format!("\\x{b:02x}")).collect();
+    let spawn = SpawnRec {
+        grants_ptr: 16384,
+        grants_n: 2,
+        ..SpawnRec::default()
+    };
+    let grand = SpawnRec::default();
+    // One grant record: the name at `at`'s slot `name`, `len` bytes, and the handle `h`.
+    let grant = |i: u32, name: u32, len: u32, h: &str| {
+        let a = 16384 + 16 * i;
+        format!("  g{i}a = i64.const {a}\n  g{i}n = i32.const {name}\n  i32.store g{i}a g{i}n\n  g{i}b = i64.const {}\n  g{i}l = i32.const {len}\n  i32.store g{i}b g{i}l\n  g{i}c = i64.const {}\n  i32.store g{i}c {h}\n  g{i}d = i64.const {}\n  g{i}z = i32.const 0\n  i32.store g{i}d g{i}z\n", a + 4, a + 8, a + 12)
+    };
+    format!(
+        r#"memory 17
+func (i32, i32, i32, i32, i32) -> (i64) {{
+block 0 (vinst: i32, vjit: i32, vbud: i32, vmod: i32, vgmod: i32) {{
+{g0}{g1}  qm = i64.const 17544
+  i32.store qm vmod
+  qb = i64.const 17548
+  i32.store qb vbud
+  q0a0 = i64.const 17536
+  vch = call.cap 6 17 (i64) -> (i32) vinst (q0a0)
+  r_st, r = call.cap 6 1 (i32) -> (i64, i64) vinst (vch)
+  k1000 = i64.const 1000
+  rs1000 = i64.mul r_st k1000
+  out = i64.add rs1000 r
+  return out
+  }}
+}}
+func (i64) -> (i64) {{
+block 0 (vci: i64) {{
+  n0 = i64.const 16484
+  len3 = i64.const 3
+  hj = self.resolve n0 len3
+  n1 = i64.const 16488
+  hg = self.resolve n1 len3
+  gm = i64.const 17672
+  i32.store gm hg
+  nb = i64.const 16496
+  len6 = i64.const 6
+  hb = self.resolve nb len6
+  gb = i64.const 17676
+  i32.store gb hb
+  vinst = i32.wrap_i64 vci
+  gr = i64.const 17664
+  vg = call.cap 6 17 (i64) -> (i32) vinst (gr)
+  vga = i64.const 70008
+  i32.store vga vg
+  vgi = i64.const 70012
+  i32.store vgi vinst
+  vb = i64.const {BLOB_OFF}
+  vl = i64.const {len}
+  vc = call.cap 11 0 (i64, i64) -> (i64) hj (vb, vl)
+  vh = call.cap 11 1 (i64) -> (i64) hj (vc)
+  v100 = i64.const 100
+  vr = i64.add vh v100
+  return vr
+  }}
+}}
+func (i64, i64) -> (i64) {{
+block 0 (vsp: i64, varg: i64) {{
+  vf = i32.const 3
+  vfsp = i64.const 32768
+  vk = cont.new vf vfsp
+  vz = i64.const 0
+  vs, vv = cont.resume vk vz
+  return vv
+  }}
+}}
+func (i64, i64) -> (i64) {{
+block 0 (vsp: i64, varg: i64) {{
+  vga = i64.const 70008
+  vg = i32.load vga
+  vgi = i64.const 70012
+  vinst = i32.load vgi
+  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) vinst (vg)
+  return vj
+  }}
+}}
+func (i64) -> (i64) {{
+block 0 (v0: i64) {{
+  vp = i64.const 70000
+  vw0 = i32.const 0
+  vto = i64.const 1000000000
+  vw = i32.atomic.wait vp vw0 vto
+  v7 = i64.const 7
+  return v7
+  }}
+}}
+data 16484 "jit"
+data 16488 "gcm"
+data 16496 "budget"
+data {BLOB_OFF} "{blob_data}"
+{rec}
+{grec}"#,
+        g0 = grant(0, 16484, 3, "vjit"),
+        g1 = grant(1, 16488, 3, "vgmod"),
+        len = blob.len(),
+        rec = rec::segment(17536, &spawn),
+        grec = rec::segment(17664, &grand),
+    )
+}
+
+/// #3158 — the join of [`joining_src`]. On the JIT the child is a task and the invoke a guarded call
+/// nested in its frames, so the task cannot park there whole: the join fails closed at its own door
+/// (`ThreadFault`) before it parks, and the parent's join reads that trap. Before the door the join
+/// parked the fiber, and the park's hand-up found the task under the invoke's floor and left the
+/// fiber parked mid-join (the hand-up's `debug_assert`, which a debug build fails on). The
+/// tree-walker's invoke child refuses the join (`CapFault`): the invoke divergence #3154 records,
+/// which #3155 removes.
+#[test]
+fn a_join_inside_an_invoke_on_a_pool_task_fails_closed_at_its_door() {
+    let unit = "memory 17\nfunc () -> (i64) {\nblock 0 () {\n  vf = i32.const 2\n  vz = i64.const 0\n  vr = call.dyn (i64, i64) -> (i64) vf (vz, vz)\n  return vr\n  }\n}\n";
+    let b = encode_module(&parse_module(unit).expect("parse unit"));
+    let m = parse_module(&joining_src(&b)).expect("parse");
+    verify_module(&m).expect("verify");
+    let setup = || {
+        let mut host = Host::new();
+        let ih = host.grant_instantiator();
+        let jh = grant_jit(&mut host, &m, 0);
+        let bh = host.grant_budget(-1, 1 << 20, -1);
+        let ch = host.grant_module(&temen_ir::child_image_at(&m, 1).expect("child image"));
+        let gh = host.grant_module(&temen_ir::child_image_at(&m, 4).expect("grandchild image"));
+        (host, [ih, jh, bh, ch, gh])
+    };
+    // The parent answers `status * 1000 + value` of its join of the child.
+    let trapped = |code: i64| code * 1000;
+    let (mut host, h) = setup();
+    let mut fuel = 50_000_000u64;
+    let r = run_with_host(&m, 0, &h.map(Value::I32), &mut fuel, &mut host);
+    assert_eq!(
+        r,
+        Ok(vec![Value::I64(trapped(temen_ir::trap_code::CAP_FAULT))]),
+        "oracle"
+    );
+    let (mut host, h) = setup();
+    let (out, _) = temen_run::jit_cap_run(
+        &m,
+        0,
+        &h.map(i64::from),
+        &MemLayout::image(Vec::new()),
+        DEFAULT_RESERVED_LOG2,
+        0,
+        &mut host,
+        None,
+    )
+    .expect("jit");
+    assert!(
+        matches!(out, JitOutcome::Returned(ref v) if v == &[trapped(temen_ir::trap_code::THREAD_FAULT)]),
+        "jit: the child's join fails closed at its door: {out:?}"
+    );
+}
