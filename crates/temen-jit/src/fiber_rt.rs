@@ -744,7 +744,7 @@ impl FiberSlot {
     /// A durable child's shadow region is seeded per residency by the executor (#1361 step 4).
     pub(crate) fn platform(fiber: Fiber) -> Arc<FiberSlot> {
         let own = Ownership::new_owned_at(0);
-        let slot = FiberSlot::new(own, Some(Stack::bare(fiber)), 0, -1, 0, false);
+        let slot = FiberSlot::new(own, Some(Stack::bare(fiber)), 0, 0, 0, false);
         Arc::new(FiberSlot {
             platform: true,
             ..slot
@@ -2051,11 +2051,17 @@ pub(crate) unsafe fn freeze_drive(rt: *mut FiberRuntime, vm: u64) {
     let table = Arc::clone(&(*rt).table);
     let mut status: i64 = 0;
     (*rt).flattening = true; // #1538: these resumes are placeholder deliveries, not guest claims
+                             // #3166 — and the root has unwound, so no frame of it is left for a root scan to read: one
+                             // driven from the host (a task's, `finish_child`) runs on no platform fiber, and its recorded
+                             // root top would name a stack this one is not. A flattening fiber runs no guest code (its poll
+                             // fires first), so no `gc.roots` comes here; this keeps the scan from depending on that.
+    let root = core::mem::take(&mut (*rt).root_entry_sp);
     for handle in table.runnable_handles() {
         // Resume under the in-progress UNWINDING state word: the fiber flattens itself, returns, and
         // its `Complete` arm records the residue into `rt.frozen`.
         fiber_resume(handle, 0, &mut status as *mut i64, vm);
     }
+    (*rt).root_entry_sp = root;
     (*rt).flattening = false;
     set_current(prev);
 }
@@ -2186,16 +2192,22 @@ unsafe fn scan_words(
 /// task's root (`task`) runs on its platform fiber, the outermost, so both ends lie on that stack;
 /// any other root runs on its OS thread's stack, so neither end lies on a fiber's. Either way
 /// `low <= high`.
-fn root_range_ok(low: usize, high: usize, task: bool, stacks: &[u64]) -> bool {
+fn root_range_ok(
+    low: usize,
+    high: usize,
+    task: bool,
+    mut stacks: impl Iterator<Item = u64>,
+) -> bool {
     let on = |stack_low: u64, addr: usize| {
         let a = addr as u64;
         a > stack_low && a - stack_low <= temen_ir::FIBER_STACK
     };
     low <= high
-        && match (task, stacks.first()) {
-            (true, Some(&root)) => on(root, low) && on(root, high),
-            (true, None) => false,
-            (false, _) => !stacks.iter().any(|&s| on(s, low) || on(s, high)),
+        && match task {
+            true => stacks
+                .next()
+                .is_some_and(|root| on(root, low) && on(root, high)),
+            false => !stacks.any(|s| on(s, low) || on(s, high)),
         }
 }
 
@@ -2214,17 +2226,37 @@ mod root_range_tests {
         let in_fiber = (fiber + 512) as usize;
         let fiber_top = (fiber + STACK) as usize;
         // An OS root: both ends on its own stack, off every fiber's.
-        assert!(root_range_ok(os_low, os_top, false, &[fiber]));
+        assert!(root_range_ok(os_low, os_top, false, [fiber].into_iter()));
         // Inverted.
-        assert!(!root_range_ok(os_top, os_low, false, &[fiber]));
+        assert!(!root_range_ok(os_top, os_low, false, [fiber].into_iter()));
         // Across stacks: from a fiber's stack up to the OS stack's top (the forged slot's scan).
-        assert!(!root_range_ok(in_fiber, os_top, false, &[fiber]));
-        assert!(!root_range_ok(in_fiber, os_top, true, &[fiber]));
+        assert!(!root_range_ok(in_fiber, os_top, false, [fiber].into_iter()));
+        assert!(!root_range_ok(in_fiber, os_top, true, [fiber].into_iter()));
         // A task's root: both ends on its platform fiber's stack, and only there.
-        assert!(root_range_ok(in_fiber, fiber_top, true, &[fiber]));
-        assert!(!root_range_ok(in_fiber, fiber_top, false, &[fiber]));
-        assert!(!root_range_ok(in_fiber, fiber_top, true, &[]));
-        assert!(!root_range_ok(fiber_top, in_fiber, true, &[fiber]));
+        assert!(root_range_ok(
+            in_fiber,
+            fiber_top,
+            true,
+            [fiber].into_iter()
+        ));
+        assert!(!root_range_ok(
+            in_fiber,
+            fiber_top,
+            false,
+            [fiber].into_iter()
+        ));
+        assert!(!root_range_ok(
+            in_fiber,
+            fiber_top,
+            true,
+            std::iter::empty()
+        ));
+        assert!(!root_range_ok(
+            fiber_top,
+            in_fiber,
+            true,
+            [fiber].into_iter()
+        ));
     }
 }
 
@@ -2291,6 +2323,11 @@ pub(crate) unsafe extern "C" fn gc_roots(vm: u64, args: *const GcRootsArgs) -> i
     // The window the buffer is confined to (#826: the **reserved** span bounds it), from the context.
     let w = *crate::VmCtx::at(vm).window();
     let (mem_base, mask, mapped) = (w.base as u64, w.reserved.saturating_sub(1), w.reserved);
+    // #3170 — the heap range is window offsets (GC.md §3): the scan reads raw native stack words,
+    // so the guest's own `heap_hi` alone would let `-1` admit host return addresses and pointers.
+    // Clamped to the window, as no trap: the interpreters scan guest values only and take any
+    // `heap_hi`, and a word past the window is no guest heap pointer.
+    let heap_hi = heap_hi.min(mapped);
     let rt = current();
     if rt.is_null() {
         fault(vm);
@@ -2388,16 +2425,13 @@ pub(crate) unsafe extern "C" fn gc_roots(vm: u64, args: *const GcRootsArgs) -> i
             None => current_sp(),
             Some(&y) => (*y).resumer_sp() as usize,
         };
-        // #3166 — the range is read word by word with no other bound, so it is checked to be one
-        // stack's, the root's, and fails closed otherwise: a wrong answer about which stack is the
-        // root's is a trap, never a read across the host's memory.
+        // #3166 — the range is read word by word with no other bound, so it is checked first, and
+        // fails closed: a task's root range must lie on its platform fiber's stack, and any other
+        // root's must not touch a fiber stack of this resume chain ([`root_range_ok`]). A wrong
+        // answer about which stack is the root's is a trap, never a read across the host's memory.
         // SAFETY: each yielder is live for its resume, as above.
-        let lows: Vec<u64> = rt
-            .yielders
-            .iter()
-            .map(|&y| unsafe { (*y).stack_low() })
-            .collect();
-        if !root_range_ok(root_low, rt.root_entry_sp, rt.runs_task(), &lows) {
+        let lows = rt.yielders.iter().map(|&y| unsafe { (*y).stack_low() });
+        if !root_range_ok(root_low, rt.root_entry_sp, rt.runs_task(), lows) {
             fault(vm);
             return 0;
         }

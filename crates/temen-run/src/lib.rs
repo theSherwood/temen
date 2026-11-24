@@ -3026,8 +3026,9 @@ pub unsafe extern "C" fn grant_child_release(ctx: *mut c_void) {
             g.set_park_hub(0);
             if ended {
                 // #2164 — and the pager its faults called: it can no longer call one.
-                let mut providers = g.live_offer_providers();
-                providers.extend(g.take_jit_pager());
+                let offers = g.live_offer_providers().into_iter();
+                let mut providers: Vec<_> = offers.map(|p| (p, None)).collect();
+                providers.extend(g.take_jit_pager().map(|p| (p, g.jit_paging())));
                 providers
             } else {
                 Vec::new()
@@ -3035,8 +3036,14 @@ pub unsafe extern "C" fn grant_child_release(ctx: *mut c_void) {
         };
         // #1217 — the child's end releases every service domain it was a client of: a serve loop
         // parked in `svc.wait` there answers `0` and can reach its `join` (or its next wait does).
-        for p in providers {
+        // #3166 — its pager's lock also retires the window its page requests' sinks write into,
+        // before the window is freed (its task drops it after this teardown). Every vCPU of the
+        // child has ended by now, so a request still filed is one only its pager can reach.
+        for (p, paging) in providers {
             let mut g = p.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(paging) = paging {
+                paging.retire(&g);
+            }
             g.set_client_gone();
             ring(&g);
         }
@@ -3808,10 +3815,11 @@ unsafe fn park_until_rung(
 ///
 /// A sink writes into the child's window, which goes with the child, so a request the child stops
 /// waiting for (a kill, a teardown, a pager gone) is withdrawn before this returns. The settle and the
-/// withdrawal both run under the pager's lock, so no supply reaches the window once it has.
+/// withdrawal both run under the pager's lock, so no supply reaches the window once it has. A request
+/// whose waiter did not come back for it (#3166) the child's teardown makes harmless: it retires the
+/// window under the same lock ([`grant_child_release`]), and the sink writes nothing after.
 unsafe fn request_page(
     pager: &Mutex<Host>,
-    child: &Mutex<Host>,
     export: u32,
     sink: impl Fn() -> temen_interp::PageSink,
     vm: &temen_jit::VmCtx,
@@ -3827,16 +3835,6 @@ unsafe fn request_page(
             return Some(CAP_REVOKED);
         }
         if let Some(ticket) = guard.request_page(export, sink()) {
-            // #3166 — recorded on the child, under the pager's lock, so its end withdraws the
-            // request whatever becomes of this wait; refused once that end has run.
-            if !child
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .file_page_request(ticket)
-            {
-                guard.abandon_page(ticket);
-                return Some(CAP_REVOKED);
-            }
             break ticket;
         }
         let seen = bell_now(Some(&bell));
@@ -3854,10 +3852,6 @@ unsafe fn request_page(
             .unwrap_or_else(|e| e.into_inner())
             .abandon_page(ticket);
     }
-    child
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .forget_page_request(ticket);
     reply
 }
 
@@ -3885,7 +3879,7 @@ pub unsafe extern "C" fn page_miss(vm: &temen_jit::VmCtx, off: u64, len: u64, fl
     }
     let base = vm.window().base;
     let cell = &*(vm.cap_ctx as *const Mutex<Host>);
-    let (win, mapped, pager) = {
+    let (win, paging, pager) = {
         let mut g = cell.lock().unwrap_or_else(|e| e.into_inner());
         let Some(paging) = g.jit_paging() else {
             return fault();
@@ -3893,8 +3887,9 @@ pub unsafe extern "C" fn page_miss(vm: &temen_jit::VmCtx, off: u64, len: u64, fl
         // The reservation the child's window was built with: the default, raised to the window.
         let reserved = (1u64 << temen_ir::default_reserved_log2()).max(paging.mapped);
         let win = MprotectWindow::of(&mut g, base, paging.mapped, reserved);
-        (win, paging.mapped, g.jit_pager())
+        (win, paging, g.jit_pager())
     };
+    let mapped = paging.mapped;
     let write = flags & temen_jit::PAGE_MISS_WRITE != 0;
     let pageable = flags & temen_jit::PAGE_MISS_FATAL == 0;
     let pg = win.page;
@@ -3908,14 +3903,14 @@ pub unsafe extern "C" fn page_miss(vm: &temen_jit::VmCtx, off: u64, len: u64, fl
                 return fault();
             };
             let sink = || {
-                temen_interp::PageSink::new(
+                paging.sink(
                     Box::new(PagedChild(win.clone())),
                     start,
                     pg.min(mapped - start),
                     off.max(start) - start,
                 )
             };
-            match request_page(pager, cell, *export, sink, vm) {
+            match request_page(pager, *export, sink, vm) {
                 None => return, // the end raised on `vm` unwinds the child
                 Some(r) if r < 0 => return fault(),
                 Some(_) => {} // supplied: check the page again
@@ -3931,13 +3926,15 @@ pub unsafe extern "C" fn page_miss(vm: &temen_jit::VmCtx, _: u64, _: u64, _: u64
 }
 
 /// #2164 — a demand-paged JIT child's window as a page sink writes into it
-/// ([`temen_interp::ChildWindow`]): [`MprotectWindow::supply`].
+/// ([`temen_interp::ChildWindow`]): [`MprotectWindow::supply`], through
+/// [`temen_interp::JitPaging::sink`].
 #[cfg(any(unix, windows))]
 struct PagedChild(MprotectWindow);
 
 // SAFETY: the window's base is only written by `supply`, at a settle of the request this sink was
-// filed with. Its child waits on that request until it is settled or withdrawn ([`request_page`]),
-// both under its pager's lock, so the window is live for every settle that reaches the sink.
+// filed with, under its pager's lock, and only until the child's teardown retires the window
+// under that same lock, before it frees it ([`grant_child_release`], #3166). So every write lands
+// in a live window, whether or not the request's waiter is still there.
 #[cfg(any(unix, windows))]
 unsafe impl Send for PagedChild {}
 
@@ -4471,24 +4468,10 @@ pub unsafe extern "C" fn budget_mem_give(
 pub unsafe extern "C" fn child_ended(child: *mut c_void) -> *mut c_void {
     let child = &*(child as *const Mutex<Host>);
     let mut g = child.lock().unwrap_or_else(|e| e.into_inner());
-    // #3166 — a demand-paged child's page requests still filed go before its window does (its
-    // teardown, after this): a request's sink writes into the window at its settle. Withdrawn with
-    // this lock let go, as `request_page` takes the two in the other order.
-    let pages = g
-        .jit_pager()
-        .map(|(pager, _)| (pager, g.close_page_requests()));
-    let post = match g.release_memory() {
+    match g.release_memory() {
         Some(end) => Box::into_raw(Box::new((end, g.park_hub()))) as *mut c_void,
         None => core::ptr::null_mut(),
-    };
-    drop(g);
-    if let Some((pager, tickets)) = pages {
-        let mut p = pager.lock().unwrap_or_else(|e| e.into_inner());
-        for t in tickets {
-            p.abandon_page(t);
-        }
     }
-    post
 }
 
 /// #2800 — [`temen_jit::ChildEndSignal`]: signal the end post [`child_ended`] answered, and wake its
@@ -4592,10 +4575,7 @@ fn grant_child(
                 })
             })
             .collect();
-        let paging = temen_interp::JitPaging {
-            table: Arc::clone(&table),
-            mapped,
-        };
+        let paging = temen_interp::JitPaging::new(Arc::clone(&table), mapped);
         child.set_jit_pager(spawner, export, paging);
         table.as_ptr()
     });
@@ -10523,22 +10503,38 @@ mod run_view_tests {
 
 #[cfg(test)]
 mod paged_child_end_tests {
-    //! #3166 — a demand-paged JIT child's end withdraws the page requests it still has filed with
-    //! its pager, before its teardown frees the window a request's sink writes into.
+    //! #3166 — a demand-paged JIT child's teardown retires the window its page requests' sinks
+    //! write into, so a request still queued with its pager then writes nothing.
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
 
     /// A child window that records whether a settle reached it.
-    struct Records(Arc<std::sync::atomic::AtomicBool>);
+    struct Records(Arc<AtomicBool>);
 
     impl temen_interp::ChildWindow for Records {
         fn supply(&self, _: u64, _: &[u8]) -> bool {
-            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            self.0.store(true, SeqCst);
             true
         }
     }
 
-    /// A pager with a `{ page: (i64) -> (i64) }` export, and a JIT child paged by it.
-    fn pager_and_child() -> (Arc<Mutex<Host>>, Mutex<Host>) {
+    /// A pager's window, every byte of it 7.
+    struct Sevens;
+
+    impl temen_interp::GuestMem for Sevens {
+        fn read_bytes(&self, _: u64, len: u64) -> Option<Vec<u8>> {
+            Some(vec![7; len as usize])
+        }
+        fn write_bytes(&mut self, _: u64, _: &[u8]) -> Option<()> {
+            None
+        }
+    }
+
+    /// A request still queued when its child is torn down, through the teardown's own release
+    /// ([`grant_child_release`]): the pager's later serve of it, with bytes to copy, writes
+    /// nothing. Before the teardown the same serve writes.
+    #[test]
+    fn a_paged_childs_teardown_retires_its_window_for_requests_still_queued() {
         let m = temen_text::parse_module(
             "type 0 func (i64) -> (i64)
 type 1 interface { page: 0 }
@@ -10559,44 +10555,34 @@ block 0 (va: i64) {
         .expect("parse");
         let pager = Arc::new(Mutex::new(Host::new()));
         pager.lock().unwrap().set_self_module(&Arc::new(m));
-        let mut child = Host::new();
-        let paging = temen_interp::JitPaging {
-            table: Arc::from(vec![]),
-            mapped: 1 << 16,
+        let paging = temen_interp::JitPaging::new(Arc::from(vec![]), 1 << 16);
+        let child = Arc::new(Mutex::new(Host::new()));
+        {
+            let mut c = child.lock().unwrap();
+            c.set_jit_pager(Arc::clone(&pager), 0, paging.clone());
+            c.set_serve_ctx(1); // a child still running: its first release is its end
+        }
+        let reached = Arc::new(AtomicBool::new(false));
+        let request = || {
+            let sink = paging.sink(Box::new(Records(Arc::clone(&reached))), 0, 4096, 0);
+            (pager.lock().unwrap().request_page(0, sink)).expect("the pager takes the request")
         };
-        child.set_jit_pager(Arc::clone(&pager), 0, paging);
-        (pager, Mutex::new(child))
-    }
-
-    /// A request still filed when its child ends (its waiter never came back for it) is withdrawn:
-    /// the pager's later settle of it reaches no sink. A request filed after the end is refused.
-    #[test]
-    fn a_paged_childs_end_withdraws_its_filed_page_requests() {
-        let (pager, child) = pager_and_child();
-        let reached = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let sink =
-            || temen_interp::PageSink::new(Box::new(Records(Arc::clone(&reached))), 0, 4096, 0);
-        // As `request_page` files one: on the pager, then recorded on the child under its lock.
-        let ticket = {
-            let mut p = pager.lock().unwrap();
-            let t = p
-                .request_page(0, sink())
-                .expect("the pager takes the request");
-            assert!(child.lock().unwrap().file_page_request(t));
-            t
-        };
-        // SAFETY: `child` is a live powerbox, as a task's end hands it.
-        let post = unsafe { child_ended(&child as *const Mutex<Host> as *mut c_void) };
-        assert!(post.is_null(), "no end post to signal");
-        // The pager serves it anyway: nothing is left to write through.
-        let value = pager.lock().unwrap().settle_page(ticket, 5, None);
-        assert_eq!(value, 5, "the settle found the request withdrawn");
-        assert!(!reached.load(std::sync::atomic::Ordering::SeqCst));
-        // A request the child files after its end is refused.
-        let mut p = pager.lock().unwrap();
-        let late = p
-            .request_page(0, sink())
-            .expect("the pager takes the request");
-        assert!(!child.lock().unwrap().file_page_request(late));
+        let serve = |ticket| pager.lock().unwrap().settle_page(ticket, 0, Some(&Sevens));
+        // Served while the child lives, the page is written.
+        assert_eq!(serve(request()), 0);
+        assert!(
+            reached.swap(false, SeqCst),
+            "a live child's page is written"
+        );
+        // Filed, then the child is torn down with it still queued.
+        let ticket = request();
+        let ctx = Arc::into_raw(Arc::clone(&child)) as *mut c_void;
+        // SAFETY: `ctx` is one counted ref of the child's powerbox, as its teardown releases it.
+        unsafe { grant_child_release(ctx) };
+        assert_eq!(serve(ticket), 0, "the serve answers as it would have");
+        assert!(
+            !reached.load(SeqCst),
+            "and writes nothing to the retired window"
+        );
     }
 }

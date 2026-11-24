@@ -596,11 +596,12 @@ fn a_fiber_made_from_funcref_minus_one_is_a_guest_fiber() {
 /// #3166 — a fiber made from funcref `-1` scans its roots as any fiber does. The JIT took it for a
 /// task's slot and, with no fiber nested in it, started the root computation's scan at its own stack
 /// pointer, reading every word from the fiber's stack up to the root's OS stack: the process died
-/// with `SIGSEGV`. Here it returns, as `cont.new 3` does, on the JIT.
+/// with `SIGSEGV`. Here it returns, as `cont.new 3` does, on the JIT: the fiber answers whether
+/// the scan's count is a count (not negative), and the root `status * 1000` plus that.
 #[test]
 fn a_fiber_made_from_funcref_minus_one_scans_its_roots_as_any_fiber() {
     let root = "  vs0, vv0 = cont.resume vk vz\n  va = i64.extend_i32_s vs0\n  vk1000 = i64.const 1000\n  vx = i64.mul va vk1000\n  vr = i64.add vx vv0";
-    let body = "  vlo = i64.const 0\n  vhi = i64.const 65536\n  vmask = i64.const -1\n  vbuf = i64.const 16384\n  vcap = i64.const 16\n  vr = gc.roots vlo vhi vmask vbuf vcap";
+    let body = "  vlo = i64.const 0\n  vhi = i64.const 65536\n  vmask = i64.const -1\n  vbuf = i64.const 16384\n  vcap = i64.const 16\n  vn = gc.roots vlo vhi vmask vbuf vcap\n  vz0 = i64.const 0\n  vok = i64.ge_s vn vz0\n  vr = i64.extend_i32_u vok";
     for spawn in [false, true] {
         let run = |funcref| {
             let src = last_slot_fiber(funcref, spawn, root, body);
@@ -608,15 +609,110 @@ fn a_fiber_made_from_funcref_minus_one_scans_its_roots_as_any_fiber() {
             verify_module(&m).unwrap_or_else(|e| panic!("verify: {e:?}\n{src}"));
             compile_and_run(&m, 0, &[]).expect("jit compile/run")
         };
-        // The roots are a conservative superset, which the stacks' other words can grow, so each
-        // run is asked only to return (status 1) with what it found.
+        // The roots are a conservative superset, which the stacks' other words can grow, so the
+        // count itself is not asked for.
         for funcref in [3, -1] {
             let got = run(funcref);
-            assert!(
-                matches!(&got, JitOutcome::Returned(v) if v.len() == 1 && v[0] / 1000 == 1),
-                "funcref {funcref}, spawn {spawn}: {got:?}"
+            assert_eq!(
+                got,
+                JitOutcome::Returned(vec![1001]),
+                "funcref {funcref}, spawn {spawn}"
             );
         }
+    }
+}
+
+/// #3166 — a `thread.join` inside a fiber made from funcref `-1` blocks its vCPU in place, as in
+/// any fiber. The root spawns a vCPU (func 1) that counts to 2,000,000 and returns 5, and makes a
+/// fiber of func 3, the table's last slot, from `funcref`, handing it the handle; the fiber joins
+/// it and returns its value, and the root `status * 1000 + value`: 1005 on the tree-walker and the
+/// JIT, on its own route and the kernel's. The JIT took the `-1` fiber for a pool task's own slot,
+/// so a join that waited event-parked as a task's does and surfaced `FIBER_PARKED` to the root.
+/// (The count keeps the vCPU running when the fiber joins it, so the join waits; a join that found
+/// it done would pass on either.)
+#[test]
+fn a_join_in_a_fiber_from_funcref_minus_one_blocks_its_vcpu() {
+    for funcref in [3, -1] {
+        let src = format!(
+            "memory 16
+func () -> (i64) {{
+block 0 () {{
+  vz = i64.const 0
+  vt = thread.spawn 1 vz vz
+  vt64 = i64.extend_i32_u vt
+  vf = i32.const {funcref}
+  vk = cont.new vf vt64
+  vs0, vv0 = cont.resume vk vz
+  va = i64.extend_i32_s vs0
+  vk1000 = i64.const 1000
+  vx = i64.mul va vk1000
+  vr = i64.add vx vv0
+  return vr
+  }}
+}}
+func (i64, i64) -> (i64) {{
+block 0 (va: i64, vb: i64) {{
+  vz = i64.const 0
+  br 1(vz)
+}}
+block 1 (vi: i64) {{
+  vn = i64.const 2000000
+  vlt = i64.lt_s vi vn
+  br_if vlt 2(vi) 3()
+}}
+block 2 (vj: i64) {{
+  vone = i64.const 1
+  vk = i64.add vj vone
+  br 1(vk)
+}}
+block 3 () {{
+  v5 = i64.const 5
+  return v5
+  }}
+}}
+func (i64, i64) -> (i64) {{
+block 0 (va: i64, vb: i64) {{
+  return va
+  }}
+}}
+func (i64, i64) -> (i64) {{
+block 0 (vsp: i64, varg: i64) {{
+  vh = i32.wrap_i64 vsp
+  vs, vv = thread.join vh
+  return vv
+  }}
+}}
+"
+        );
+        let m = parse_module(&src).unwrap_or_else(|e| panic!("parse: {e:?}\n{src}"));
+        verify_module(&m).unwrap_or_else(|e| panic!("verify: {e:?}\n{src}"));
+        let mut fuel = 10_000_000_000u64;
+        let oracle = run(&m, 0, &[], &mut fuel);
+        assert_eq!(
+            oracle,
+            Ok(vec![Value::I64(1005)]),
+            "the tree-walker, funcref {funcref}"
+        );
+        let jit = compile_and_run(&m, 0, &[]).expect("jit compile/run");
+        assert_eq!(
+            jit,
+            JitOutcome::Returned(vec![1005]),
+            "the JIT, funcref {funcref}"
+        );
+        let kernel = temen_run::jit_kernel::expect_kernel(
+            &m,
+            0,
+            &[],
+            None,
+            u64::MAX,
+            temen_run::jit_kernel::Expect::Kernel { vcpus: 2 },
+        )
+        .expect("the kernel route admits it");
+        assert_eq!(
+            kernel,
+            JitOutcome::Returned(vec![1005]),
+            "the kernel route, funcref {funcref}"
+        );
     }
 }
 

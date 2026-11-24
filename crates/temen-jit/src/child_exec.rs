@@ -53,6 +53,9 @@ use crate::{mem, vcpu_tls, CompiledModule, TrapKind, VmCtx};
 /// low bound rides in as the child's `stack_limit`), so a child that recurses past it traps
 /// `StackOverflow` cleanly instead of relying on the OS guard.
 const TASK_STACK: usize = 1 << 18;
+// #3166 — `gc_roots` takes a task root's stack to be one fiber stack's span
+// (`fiber_rt::root_range_ok`, reading `temen_ir::FIBER_STACK`): the two sizes are one.
+const _: () = assert!(TASK_STACK as u64 == temen_ir::FIBER_STACK);
 
 /// #2722 — process-wide count of child-executor residencies ([`ChildExec::run_once`]): each time a
 /// pool worker resumes a task's fiber. A parked task advances it only when something genuinely
