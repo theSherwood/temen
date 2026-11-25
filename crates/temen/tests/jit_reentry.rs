@@ -97,6 +97,7 @@ fn setup(extra_src: &str) -> (Box<TestCtx>, Box<CompiledModule>) {
         None,
         None,
         0,
+        false,
     )
     .expect("compile parent");
     let mut cm = Box::new(cm);

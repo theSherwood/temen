@@ -188,6 +188,7 @@ fn compile(m: &temen_ir::Module) -> CompiledModule {
         None,
         None,
         0,
+        false,
     )
     .expect("jit compiles");
     assert!(

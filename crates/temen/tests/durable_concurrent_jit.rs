@@ -1709,6 +1709,7 @@ fn a_reused_compile_runs_then_freezes_then_thaws() {
         None,
         None,
         0,
+        false,
     ) {
         Ok(cm) => cm,
         Err(JitError::Unsupported(_)) => return,
@@ -1857,6 +1858,7 @@ fn an_armed_run_s_unrun_deferred_spawn_gives_back_what_it_took() {
         None,
         Some(node.clone()),
         0,
+        false,
     ) {
         Ok(cm) => cm,
         Err(JitError::Unsupported(_)) => return,

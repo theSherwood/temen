@@ -1686,7 +1686,7 @@ impl HeldSite {
             tls: std::sync::atomic::AtomicI64::new(tls),
             ring: Box::new(|| {}),
             served: AtomicU64::new(0),
-            vm: Arc::new(root.vcpu(root.fuel)),
+            vm: Arc::new(root.vcpu(root.fuel())),
             idle: std::cell::UnsafeCell::new(Vec::new()),
             pooled: AtomicUsize::new(0),
             open: std::sync::atomic::AtomicBool::new(true),
@@ -1852,12 +1852,13 @@ impl HeldSite {
             return revoked;
         }
         if self.site.inline_ok(func) {
+            credit_entry(&vm);
             let end = self.site.run_inline_as(&vm, Some(self.tls), func, args);
             // Back to its own caller: a direct call settles nothing in the pool.
             self.site.step_aside();
             if let Some(fuel) = lent {
                 // SAFETY: an outside call's context owns its cell.
-                *fuel = (*vm.fuel).can_burn();
+                *fuel = (*vm.fuel()).can_burn();
             }
             return end.map(Some);
         }
@@ -1886,6 +1887,7 @@ impl HeldSite {
                 return Err(refused);
             }
         };
+        credit_entry(vm);
         // Its end, wherever it ends: here, or in the pool's drain once its carrier is gone. With it,
         // what its cell has left, read while the cell is still the task's.
         let slot: Arc<Mutex<Option<(HandlerEnd, u64)>>> = Arc::new(Mutex::new(None));
@@ -1893,7 +1895,7 @@ impl HeldSite {
             let (slot, vm) = (Arc::clone(&slot), Arc::clone(vm));
             move |end| {
                 // SAFETY: the context `vm` holds its cell's owner (#3000, #3069).
-                let left = unsafe { vm.fuel.as_ref() }.map_or(0, crate::FuelCell::can_burn);
+                let left = unsafe { vm.fuel().as_ref() }.map_or(0, crate::FuelCell::can_burn);
                 *lock(&slot) = Some((end, left));
             }
         }));
@@ -1959,13 +1961,13 @@ unsafe fn activation_ctx(root: &VmCtx, caller: &HeldCaller<'_>) -> VmCtx {
     use crate::fuel::SharedCell;
     let cell = match caller {
         HeldCaller::Outside(lent) => SharedCell::fixed(**lent),
-        HeldCaller::Inside(vm) => match vm.fuel.as_ref() {
+        HeldCaller::Inside(vm) => match vm.fuel().as_ref() {
             None => SharedCell::fixed(u64::MAX),
             Some(c) => {
                 // The caller waits in this call and burns nothing until it returns: what its draw
                 // left goes back to the chain first, so the activation can draw it (the caller's
                 // next safepoint draws again). Kept, it would be fuel neither could reach.
-                crate::FuelCell::settle(vm.fuel);
+                crate::FuelCell::settle(vm.fuel());
                 SharedCell::sibling_of(c)
             }
         },
@@ -1973,6 +1975,22 @@ unsafe fn activation_ctx(root: &VmCtx, caller: &HeldCaller<'_>) -> VmCtx {
     let mut ctx = root.vcpu(cell.get());
     ctx.cell = Some(cell);
     ctx
+}
+
+/// #3138 — an activation's entry costs nothing, as on the tree-walker, which charges a held call
+/// only for what its handler's code runs: seed the activation's fresh cell with the unit its
+/// handler's entry prologue charges, as a spawned vCPU's is ([`crate::FuelCell::seed_entry`]): a
+/// unit none of the chain's, never handed back and never read back ([`crate::FuelCell::can_burn`]),
+/// so whether the prologue spends it or the activation ends first, the call is charged nothing for
+/// its entry. One mechanism for a vCPU's entry and an activation's.
+///
+/// # Safety
+/// `vm` is the activation's own context, whose fresh cell no code charges yet.
+unsafe fn credit_entry(vm: &VmCtx) {
+    let cell = vm.fuel();
+    if !cell.is_null() {
+        crate::FuelCell::seed_entry(cell);
+    }
 }
 
 /// What the pool runs: a §14 child domain's vCPU, or a serve handler's fiber (#2742).
@@ -4087,7 +4105,7 @@ pub(crate) mod tests {
         let root = VmCtx::new(InstanceAddrs::NONE, crate::Window::NONE);
         let owns = |vm: &VmCtx| {
             let own = vm.cell.as_ref().expect("an activation owns its cell");
-            assert_eq!((vm.fuel, Arc::strong_count(own)), (own.get(), 1));
+            assert_eq!((vm.fuel(), Arc::strong_count(own)), (own.get(), 1));
         };
         let mut lent = 1000;
         // SAFETY: no `Inside` caller.
@@ -4096,16 +4114,16 @@ pub(crate) mod tests {
         // SAFETY: `outer` is live.
         let inner = unsafe { activation_ctx(&root, &HeldCaller::Inside(&outer)) };
         owns(&inner);
-        assert_ne!(inner.fuel, outer.fuel, "a cell each, on one allowance");
+        assert_ne!(inner.fuel(), outer.fuel(), "a cell each, on one allowance");
         drop(outer);
         // SAFETY: `inner` owns its cell.
-        assert_eq!(unsafe { (*inner.fuel).can_burn() }, 1000);
+        assert_eq!(unsafe { (*inner.fuel()).can_burn() }, 1000);
         let bare = root.vcpu(core::ptr::null_mut());
         // SAFETY: `bare` is live.
         let a = unsafe { activation_ctx(&root, &HeldCaller::Inside(&bare)) };
         owns(&a);
         // SAFETY: `a` owns its cell.
-        assert_eq!(unsafe { (*a.fuel).can_burn() }, u64::MAX, "unbounded");
+        assert_eq!(unsafe { (*a.fuel()).can_burn() }, u64::MAX, "unbounded");
         let mut run = FuelCell::fixed(7);
         let vcpu = root.vcpu(&mut *run);
         // SAFETY: `vcpu` is live.

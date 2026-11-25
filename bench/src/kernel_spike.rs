@@ -45,6 +45,7 @@ fn today<'a>(m: &'a Module, entry: u32, host: Host, locked: bool) -> Lane<'a> {
     // One compile, reused by every run: a run starts its thread domain fresh (#2953).
     let mut cm = CompiledModule::compile(
         m, entry, thunk, ctx, RESERVED, None, None, None, None, None, 0,
+        false,
     )
     .expect("jit compile");
     Box::new(move |args| {
@@ -64,7 +65,7 @@ fn today<'a>(m: &'a Module, entry: u32, host: Host, locked: bool) -> Lane<'a> {
 fn kernel(m: &Module, entry: u32, host: fn() -> Host) -> Lane<'_> {
     Box::new(move |args| {
         let mut h = host();
-        let admitted = jit_kernel::admit(m, &h, false, u64::MAX).expect("in the kernel's scope");
+        let admitted = jit_kernel::admit(m, &h, false).expect("in the kernel's scope");
         let start = jit_kernel::Start {
             entry,
             args,
@@ -284,7 +285,7 @@ pub fn run(reps: usize) {
         for k in [&crate::ALU, &crate::MEMSUM] {
             let m = parse(k.ir);
             assert_eq!(
-                jit_kernel::admit(&m, &Host::new(), false, u64::MAX).err(),
+                jit_kernel::admit(&m, &Host::new(), false).err(),
                 Some("no §12 op")
             );
             let mut lanes = [("today", today(&m, 0, Host::new(), false))];
@@ -451,8 +452,8 @@ fibers, round-robin over 512 per vCPU (ns per resume):"
 /// #3078 slice 2 — exit rows 1 and 4 on today's lane and the kernel's, interleaved: a fiber's
 /// `suspend`/`cont.resume` round trip with no park, on one spawned vCPU and on four, each resuming a
 /// fiber of its own ([`crate::kernel_spike_ir::FIBER_ROUNDTRIP_IR`]); and a notify with no waiter
-/// beside `k` suspended fibers ([`crate::kernel_spike_ir::NOWAKE_SUSPENDED_IR`]). Unmetered: the
-/// kernel route declines a metered fibered run (`fiber fuel`, #3080).
+/// beside `k` suspended fibers ([`crate::kernel_spike_ir::NOWAKE_SUSPENDED_IR`]). Unmetered, as
+/// every lane of this probe is; since #3080 the kernel route runs a metered fibered run too.
 fn run_fibers(reps: usize) {
     println!(
         "

@@ -70,6 +70,7 @@ fn jit_compile(m: &Module) -> temen_jit::CompiledModule {
         None,
         None,
         0,
+        false,
     )
     .expect("jit compile")
 }

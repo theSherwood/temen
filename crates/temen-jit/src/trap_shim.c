@@ -8,9 +8,10 @@
  * the host instead of crashing it. Anything else chains to the previous disposition.
  *
  * setjmp/sigsetjmp are macros that need the compiler's `returns_twice` handling, so this
- * lives in C (calling them via raw FFI from Rust is unsound). The recovery state is
- * thread-local, so concurrent JIT runs on different threads are independent: the handler
- * runs on the faulting thread and reads that thread's state.
+ * lives in C (calling them via raw FFI from Rust is unsound). The recovery state is a per-thread
+ * chain of scopes, each on the stack whose guarded call opened it (#3167, below), so concurrent JIT
+ * runs on different threads are independent: the handler runs on the faulting thread and reads that
+ * thread's chain.
  */
 /* Feature-test macros must precede every include. `_XOPEN_SOURCE` exposes the (macOS-deprecated)
  * ucontext routines + `ucontext_t` mcontext on Apple SDKs; `_GNU_SOURCE` gates glibc's REG_RIP/REG_RBP
@@ -26,10 +27,44 @@
 #include <ucontext.h>
 #include <unistd.h>
 
-static _Thread_local sigjmp_buf g_buf;
-static _Thread_local volatile int g_armed = 0;
-static _Thread_local volatile uintptr_t g_lo = 0;
-static _Thread_local volatile uintptr_t g_hi = 0;
+/* `noipa` keeps GCC's interprocedural passes from treating an accessor's body as known at the call
+ * site; clang has no such attribute (it warns and ignores it). `noinline` is the load-bearing one, as
+ * `#[inline(never)]` is for `fiber_rt::current`. */
+#if defined(__has_attribute)
+#if __has_attribute(noipa)
+#define TEMEN_TLS_ACCESSOR __attribute__((noinline, noipa))
+#endif
+#endif
+#ifndef TEMEN_TLS_ACCESSOR
+#define TEMEN_TLS_ACCESSOR __attribute__((noinline))
+#endif
+
+/* #3167 — the guarded calls open on this thread, as a chain: each `temen_run_guarded` frame holds its
+ * scope (its recovery point and its window's fault range) and a link to the scope that was innermost
+ * when it was entered, and `g_scope` names the innermost. Null means disarmed. A scope lives on the
+ * stack its call runs on, so nothing is copied: entry links, exit unlinks.
+ *
+ * DESIGN.md rule R2 (#1466; #3167 here): a thread-local's address computed before a possible stack
+ * switch must not be used after it. `fn` may switch stacks, and the compiler may keep `&g_scope` in a
+ * callee-saved register across the call (the probe at bf6d7aa showed `temen_run_guarded` doing
+ * exactly that with `g_buf`), so every access that can follow `fn` goes through the non-inlined
+ * accessors below, which resolve the thread-local inside themselves, on the thread that calls them. The handler runs on the faulting
+ * thread with no switch inside it, so it reads `g_scope` directly. */
+struct temen_scope {
+    sigjmp_buf buf;
+    uintptr_t lo;
+    uintptr_t hi;
+    struct temen_scope *parent;
+};
+static _Thread_local struct temen_scope *g_scope = NULL;
+
+TEMEN_TLS_ACCESSOR static struct temen_scope *temen_scope_top(void) {
+    return g_scope;
+}
+
+TEMEN_TLS_ACCESSOR static void temen_scope_set(struct temen_scope *s) {
+    g_scope = s;
+}
 
 /* The trap-time backtrace capture *state* and the frame-pointer walk live in `trap_capture.c` (shared
  * with the windows VEH and the explicit-trap helper). The signal handler below extracts the faulting
@@ -178,10 +213,10 @@ static void temen_chain(struct sigaction *old, int sig, siginfo_t *info, void *u
 static void temen_handler(int sig, siginfo_t *info, void *uc) {
     uintptr_t addr = (uintptr_t)info->si_addr;
     /* Our own backtrace walk faulted (#1487). This test comes **first**, before the arming and range
-     * tests: by the time the walk runs we have already cleared `g_armed`, so the nested fault would
+     * tests: by the time the walk runs we have already cleared `g_scope`, so the nested fault would
      * otherwise fall through to `temen_chain` → `SIG_DFL` → `raise` and kill the host on what was a
-     * recoverable guest fault. Nor would keeping `g_armed` set across the walk do: that only recovers
-     * a walk fault landing inside `[g_lo, g_hi)`, and it would re-enter `siglongjmp(g_buf)` from a
+     * recoverable guest fault. Nor would keeping `g_scope` set across the walk do: that only recovers
+     * a walk fault landing inside the scope's range, and it would re-enter its `siglongjmp` from a
      * half-written capture. Unwind the walk instead; the guest's original trap is reported below on
      * the way out, with whatever frames the walk had published. */
     if (temen_walk_in_progress())
@@ -198,21 +233,22 @@ static void temen_handler(int sig, siginfo_t *info, void *uc) {
      * illegal instruction inside an armed guarded guest call is always our emitted trap. Recover
      * exactly like a guarded data fault (capture the frame, then siglongjmp out reporting a memory
      * fault). Not armed ⇒ a genuine host illegal instruction: chain to the previous disposition. */
+    struct temen_scope *s = g_scope;
     if (sig == SIGILL) {
-        if (g_armed && !temen_host_fault(sig, uc, (uintptr_t)info->si_addr)) {
-            g_armed = 0;
+        if (s && !temen_host_fault(sig, uc, (uintptr_t)info->si_addr)) {
+            g_scope = NULL; /* disarmed for the capture; the landing re-links the parent */
             g_trying = 0; /* a try open on the frames this abandons goes with them (#2996) */
             temen_capture_frame(uc);
-            siglongjmp(g_buf, 1);
+            siglongjmp(s->buf, 1);
         }
         temen_chain(&g_old_ill, sig, info, uc);
         return;
     }
-    if (g_armed && addr >= g_lo && addr < g_hi && !temen_host_fault(sig, uc, addr)) {
-        g_armed = 0;
+    if (s && addr >= s->lo && addr < s->hi && !temen_host_fault(sig, uc, addr)) {
+        g_scope = NULL; /* as for SIGILL, above */
         g_trying = 0; /* as for SIGILL, above */
         temen_capture_frame(uc); /* stash the faulting frame before the stack unwinds (§5 W3) */
-        siglongjmp(g_buf, 1);  /* back to temen_run_guarded; does not return */
+        siglongjmp(s->buf, 1);  /* back to temen_run_guarded; does not return */
     }
     temen_chain(sig == SIGBUS ? &g_old_bus : &g_old_segv, sig, info, uc);
 }
@@ -252,47 +288,62 @@ void temen_install_trap_handler(void) {
     sigaction(SIGILL, &sa, &g_old_ill);
 }
 
+/* #3167 — a guarded call returned with another scope innermost: some stack switched out from under
+ * its scope with a scope of its own still open, so this thread's recovery point names a frame on a
+ * stack that is not running here (#3158). The yield floor (#3162) is the rule that keeps any stack
+ * from doing so; this is its backstop, in every build. Fatal: no recovery point on this thread can be
+ * trusted. Async-signal-safe, as the host-fault report is. */
+static void temen_scope_open_above(struct temen_scope *found, struct temen_scope *own) {
+    static const char head[] =
+        "temen-jit: a guarded call returned with another recovery scope innermost (a stack switched out under it, #3167): found=";
+    char buf[224];
+    char *p = buf;
+    memcpy(p, head, sizeof head - 1);
+    p += sizeof head - 1;
+    p = temen_hex(p, (uintptr_t)found);
+    memcpy(p, " own=", 5);
+    p += 5;
+    p = temen_hex(p, (uintptr_t)own);
+    *p++ = '\n';
+    ssize_t n = write(2, buf, (size_t)(p - buf));
+    (void)n;
+    abort();
+}
+
 /* Run `fn(a, r, m, t, tc)` (a JIT entry trampoline) with faults in [lo, hi) caught.
  * Returns 0 if it ran to completion, 1 if a guarded fault was caught and unwound.
  *
  * **Re-entrant** (§14 nesting): a guest may run a *child* guest (in its own window) from inside its
- * own guarded call. The recovery state (buf/lo/hi/armed) is saved on this C stack frame and restored
- * on exit, so the child's guard nests cleanly and the parent's recovery point is intact afterwards.
- * A child fault unwinds to *this* (the child's) frame; the parent's frame is untouched. */
+ * own guarded call. This call's scope links to the one innermost at entry and unlinks at exit, so a
+ * child's guard nests cleanly and the parent's recovery point is intact afterwards. A child fault
+ * unwinds to *this* (the child's) frame; the parent's is untouched. */
 int temen_run_guarded(void (*fn)(const long *, long *, unsigned char *, const void *, long *),
                     const long *a, long *r, unsigned char *m, const void *t, long *tc,
                     uintptr_t lo, uintptr_t hi) {
-    /* Save the caller's (possibly-armed parent) recovery state to restore on the way out. */
-    sigjmp_buf saved_buf;
-    memcpy(&saved_buf, &g_buf, sizeof saved_buf);
-    int saved_armed = g_armed;
-    uintptr_t saved_lo = g_lo;
-    uintptr_t saved_hi = g_hi;
-
-    g_lo = lo;
-    g_hi = hi;
+    struct temen_scope scope;
+    scope.lo = lo;
+    scope.hi = hi;
+    scope.parent = temen_scope_top();
     /* #2805 — armed without saving the signal mask: saving it is an `rt_sigprocmask` syscall on
      * every guarded entry (about 120 ns, and a point where a woken peer takes a contended core),
      * and the jump never needs it restored. The handler runs with the mask the fault found
      * (`SA_NODEFER`, an empty `sa_mask`), and it jumps only out of a fault in the armed window range
      * or out of an emitted trap: guest code, which cannot change the mask, or a host thunk touching
      * guest memory, and no host code here changes the thread's mask (a guest's `sigprocmask` is
-     * emulated state). So the mask at the jump is the mask at this entry. */
-    if (sigsetjmp(g_buf, 0)) {
-        /* A guarded fault unwound back here — restore the parent's recovery state and report it. */
-        memcpy(&g_buf, &saved_buf, sizeof g_buf);
-        g_armed = saved_armed;
-        g_lo = saved_lo;
-        g_hi = saved_hi;
+     * emulated state). So the mask at the jump is the mask at this entry.
+     * `scope` is not written between here and the jump, so its fields are well-defined after it. */
+    if (sigsetjmp(scope.buf, 0)) {
+        /* A guarded fault unwound back here: the handler disarmed; link the parent back in. */
+        temen_scope_set(scope.parent);
         return 1;
     }
-    g_armed = 1;
+    temen_scope_set(&scope);
     fn(a, r, m, t, tc);
-    /* Ran to completion — restore the parent's recovery state (re-arming the parent's range). */
-    memcpy(&g_buf, &saved_buf, sizeof g_buf);
-    g_armed = saved_armed;
-    g_lo = saved_lo;
-    g_hi = saved_hi;
+    /* Ran to completion: this call's scope must be the innermost, on whatever thread `fn` returned
+     * on (R2: read here, not through an address taken before `fn`). */
+    struct temen_scope *top = temen_scope_top();
+    if (top != &scope)
+        temen_scope_open_above(top, &scope);
+    temen_scope_set(scope.parent);
     return 0;
 }
-

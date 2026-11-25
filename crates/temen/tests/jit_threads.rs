@@ -119,7 +119,7 @@ fn jit_routes(m: &temen_ir::Module, declined: Option<&'static str>) -> Vec<JitOu
                 0,
                 &[],
                 None,
-                jit_kernel::lane_fuel(m),
+                temen_interp::DEFAULT_FUEL,
                 jit_kernel::Expect::of(declined),
             ),
         })

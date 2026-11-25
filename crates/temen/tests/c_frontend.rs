@@ -3945,7 +3945,7 @@ int run(int n) {
 
 /// #3078 slice 3 — the two stackful-fiber scheduler demos run on the Cranelift JIT's kernel route:
 /// their libc's locks and joins make `memory.wait`s, which a fiber may reach, and a fiber's wait is the
-/// kernel's now. Unmetered; a metered run keeps today's route until #3080 (`fiber fuel`).
+/// kernel's now. Metered or not: a kernel fiber charges the vCPU that runs it (#3080).
 #[test]
 #[cfg(all(unix, target_arch = "x86_64"))]
 fn c_guest_fiber_scheduler_demos_take_the_kernel_route() {
@@ -3965,19 +3965,25 @@ fn c_guest_fiber_scheduler_demos_take_the_kernel_route() {
         let inst = temen_run::instantiate(m).unwrap_or_else(|e| panic!("instantiate: {e}"));
         let mut unmetered = temen_run::RunConfig::default();
         unmetered.limits.fuel = Some(u64::MAX);
-        assert_eq!(inst.kernel_route(&unmetered), Ok(()));
-        let metered = temen_run::RunConfig::default();
-        assert_eq!(inst.kernel_route(&metered), Err("fiber fuel"));
-        // It runs there, and prints the invariant totals the oracle's run prints
-        // (`c_guest_mn_scheduler_demo`, `c_guest_steal_fibers_demo`).
-        let before = temen_run::jit_kernel::kernel_runs();
-        let run = inst
-            .run(temen_run::Backend::Jit, &unmetered)
-            .unwrap_or_else(|e| panic!("the kernel route's run: {e}"));
-        assert!(
-            temen_run::jit_kernel::kernel_runs() > before,
-            "the run took the kernel route"
-        );
-        assert_eq!(run.stdout, want, "{:?}", run.outcome);
+        for cfg in [unmetered, temen_run::RunConfig::default()] {
+            assert_eq!(
+                inst.kernel_route(&cfg),
+                Ok(()),
+                "fuel {:?}",
+                cfg.limits.fuel
+            );
+            // It runs there, and prints the invariant totals the oracle's run prints
+            // (`c_guest_mn_scheduler_demo`, `c_guest_steal_fibers_demo`).
+            let before = temen_run::jit_kernel::kernel_runs();
+            let run = inst
+                .run(temen_run::Backend::Jit, &cfg)
+                .unwrap_or_else(|e| panic!("the kernel route's run: {e}"));
+            assert!(
+                temen_run::jit_kernel::kernel_runs() > before,
+                "the run took the kernel route, fuel {:?}",
+                cfg.limits.fuel
+            );
+            assert_eq!(run.stdout, want, "{:?}", run.outcome);
+        }
     }
 }

@@ -909,10 +909,9 @@ pub(crate) struct Domain {
 /// #2488 — a spawned vCPU's own context ([`crate::VmCtx::vcpu`]) and the fuel cell it charges: the
 /// vCPUs of a domain once shared one cell, and every fuel check stored to its cache line. Boxed,
 /// since compiled code holds the context's address. A fiber the vCPU made runs on a context of its
-/// own (#3133), but that context copies this one's `fuel`, a pointer into `cell`, and charges it
-/// wherever the fiber runs, after the vCPU ends too, until #3080 charges the running vCPU's cell. So
-/// what is still load-bearing is the cell: an ended vCPU's context is kept for the next spawn, not
-/// freed, and the run frees them all when its vCPUs are joined.
+/// own (#3133) and charges the cell of whichever vCPU runs it (#3080), so nothing of an ended vCPU's
+/// is reached through a fiber: an ended vCPU's context is kept for the next spawn only to save its
+/// allocation, and the run frees them all when its vCPUs are joined.
 struct VcpuCtx {
     vm: crate::VmCtx,
     /// `None` when the run is unmetered.
@@ -1271,10 +1270,10 @@ impl Domain {
         }
         let root = env.ctx();
         // SAFETY: a non-null `fuel` is the run's live cell, which outlives the run's vCPUs.
-        let mut cell = unsafe { root.fuel.as_ref() }.map(crate::FuelCell::sibling);
+        let mut cell = unsafe { root.fuel().as_ref() }.map(crate::FuelCell::sibling);
         let fuel = cell
             .as_deref_mut()
-            .map_or(root.fuel, |c| c as *mut crate::FuelCell);
+            .map_or(root.fuel(), |c| c as *mut crate::FuelCell);
         Box::new(VcpuCtx {
             vm: root.vcpu(fuel),
             cell,
@@ -1287,7 +1286,7 @@ impl Domain {
     /// next vCPU on the context starts a window of its own.
     fn put_vcpu_ctx(&self, mut ctx: Box<VcpuCtx>) {
         if let Some(cell) = ctx.cell.as_deref_mut() {
-            // SAFETY: a live cell; a fiber still charging it is `settle`'s documented race.
+            // SAFETY: a live cell, which no code charges once its vCPU ended (#3080).
             unsafe { crate::FuelCell::settle(cell) };
         }
         if let Some(site) = ctx.vm.serve_site.take() {
@@ -2447,7 +2446,7 @@ pub(crate) unsafe extern "C" fn thread_spawn(
     // spawner out of fuel, as the oracle's does, after the durable context is reserved and before
     // any other refusal (its order). A refusal after it keeps the unit paid, as the oracle's does.
     // SAFETY: a non-null `fuel` is the run's live cell, which outlives the run's vCPUs.
-    let paid = unsafe { env.ctx().fuel.as_ref() }.and_then(crate::FuelCell::pay_entry);
+    let paid = unsafe { env.ctx().fuel().as_ref() }.and_then(crate::FuelCell::pay_entry);
     if paid == Some(false) {
         if let Some(dc) = &durable_child {
             if let Some(table) = dom.fiber_table() {
@@ -2625,7 +2624,7 @@ unsafe fn defer_spawn(
 impl Domain {
     /// Run one child's guest entry **inline** on this thread (single-worker, slice 3.3): set up its
     /// fiber execution context (for `cont.*`), arm a **nested** detect-and-kill recovery
-    /// (`run_guarded_range` saves/restores the parent run's recovery state itself, like `invoke_extra`),
+    /// (`run_guarded_range` links its scope under the parent run's and unlinks it, like `invoke_extra`),
     /// call `code(arg0, arg1)` via the shared call-trampoline, and return `(result, trap, faulted)`. The
     /// caller is responsible for the durable control words (state + active shadow-SP) around the call.
     ///

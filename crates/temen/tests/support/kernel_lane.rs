@@ -1,6 +1,6 @@
 //! #3078 — the kernel lane a fiber suite runs beside its engines: the program on the Cranelift JIT's
-//! kernel route (its vCPUs as executor 2's tasks), unmetered, since the route declines a metered
-//! fibered run until #3080 (`fiber fuel`, `jit_kernel::lane_fuel`). A module that spawns no thread
+//! kernel route (its vCPUs as executor 2's tasks), unmetered: the metered runs of fibered programs
+//! on that route are `jit_fuel`'s sweeps (#3080). A module that spawns no thread
 //! keeps its single-vCPU path (`fiber only`), so its function 0 runs inside one `thread.spawn`ed vCPU
 //! instead: a wrapper entry spawns a thread that calls it, and joins it. Either way the run is
 //! asserted to have taken the kernel route. One helper, so a suite's lane is a call, not a copy of

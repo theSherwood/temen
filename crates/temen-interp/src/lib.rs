@@ -21099,6 +21099,15 @@ fn builtin_iface_ops(id: u32) -> Option<&'static [(&'static str, FuncType)]> {
         .find_map(|(bid, ops)| (*bid == id).then_some(&ops[..]))
 }
 
+/// #3080 — whether a guest can implement the interface `type_id` names, so a `call.cap` on it may
+/// land on a guest's offer: a guest-interned id, or a pre-seeded built-in's, which a guest's
+/// declaration of that shape under its canonical names interns to ([`Host::intern_interface`]).
+/// The host's dispatch sentinels (self, an import, a dynamic call) are not interfaces.
+pub fn guest_implementable(type_id: u32) -> bool {
+    (cap_id::GUEST_IMPL_BASE..temen_ir::CAP_DYN_TYPE_ID).contains(&type_id)
+        || builtin_iface_ops(type_id).is_some()
+}
+
 /// Negative-errno values returned by capability ops (§3e D42): `< 0` is `-errno`,
 /// `>= 0` is success. Errors do **not** trap — traps stay reserved for escape/fatal. The standard
 /// errnos come from the one shared table ([`temen_ir::errno`]); the aliases below are temen-interp's own.
@@ -27117,8 +27126,8 @@ pub struct Host {
     jit_table_log2: u8,
     /// Whether guest-submitted `Jit` units in this domain may host §12 **fibers** (`cont.*`) —
     /// DESIGN.md §22 "Concurrency" (renegotiated 2026-07-30). Off by default (a fiber-using unit is
-    /// rejected); a fiber-hosting grant sets it, and the JIT run entry stands up the parent's fiber
-    /// runtime (`CompiledModule::enable_fiber_hosting`) so a submitted unit's `cont.*` resolve. The
+    /// rejected); a fiber-hosting grant sets it, and the JIT compiles a parent that drives `Jit` to
+    /// host fibers (`CompiledModule::compile`'s `hosts_fibers`) so a submitted unit's `cont.*` resolve. The
     /// interpreter's `INVOKE_MODULE` already runs `cont.*` in its eval loop, so it needs no runtime
     /// stand-up — the flag only records the grant for backend parity.
     jit_hosts_fibers: bool,
@@ -33778,8 +33787,8 @@ impl Host {
     }
 
     /// Mark this run's granted `Jit` domain(s) as **fiber-hosting** — a submitted unit may use §12
-    /// fibers (`cont.*`), DESIGN.md §22 "Concurrency". The JIT run entry then stands up the parent's
-    /// fiber runtime (`enable_fiber_hosting`); the interpreter needs no setup. Set before the run.
+    /// fibers (`cont.*`), DESIGN.md §22 "Concurrency". The JIT then compiles a parent that drives
+    /// `Jit` to host them (`hosts_fibers`); the interpreter needs no setup. Set before the run.
     pub fn set_jit_hosts_fibers(&mut self, on: bool) {
         self.jit_hosts_fibers = on;
     }

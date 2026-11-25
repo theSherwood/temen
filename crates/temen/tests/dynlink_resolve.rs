@@ -32,6 +32,7 @@ fn compile_host(src: &str) -> CompiledModule {
         None,
         None,
         0,
+        false,
     )
     .expect("compile host program")
 }

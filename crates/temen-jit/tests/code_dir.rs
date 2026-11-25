@@ -55,6 +55,8 @@ unsafe extern "C" fn forty_one(
 /// Where [`compile_and_run_here`] finds its code directory, and writes what it saw.
 const DIR: &str = "TEMEN_JIT_CODE_DIR";
 const OUT: &str = "TEMEN_JIT_CODE_DIR_OUT";
+/// #3080 — when set (`0` or `1`), the compile is metered and hosts fibers or not.
+const HOSTS: &str = "TEMEN_JIT_CODE_DIR_HOSTS";
 
 /// The half of each test that runs in a process of its own, so no other test's compile counts:
 /// compile [`program`] keeping its code in `$DIR`, run it, and write how many modules the compile
@@ -69,6 +71,9 @@ fn compile_and_run_here() {
     let program = program();
     let m = parse_module(&program).expect("parse");
     temen_verify::verify_module(&m).expect("verify");
+    let hosts = std::env::var(HOSTS).ok().map(|h| h == "1");
+    let mut cell = temen_jit::FuelCell::fixed(1 << 20);
+    let fuel = hosts.map(|_| &mut *cell as *mut temen_jit::FuelCell);
     let before = temen_jit::module_compiles();
     let mut cm = CompiledModule::compile_kept(
         Some((&dir, temen_encode::digest256(program.as_bytes()))),
@@ -79,10 +84,11 @@ fn compile_and_run_here() {
         temen_ir::DEFAULT_RESERVED_LOG2,
         None,
         None,
-        None,
+        fuel,
         None,
         None,
         0,
+        hosts == Some(true),
     )
     .expect("compile");
     let compiled = temen_jit::module_compiles() - before;
@@ -96,13 +102,20 @@ fn compile_and_run_here() {
 /// Run [`compile_and_run_here`] in a process of its own over `dir`: how many modules it compiled,
 /// and what the program answered.
 fn in_a_process(dir: &Path) -> (u64, i64) {
+    in_a_process_hosting(dir, None)
+}
+
+/// [`in_a_process`], the compile metered and hosting fibers or not (`hosts`).
+fn in_a_process_hosting(dir: &Path, hosts: Option<bool>) -> (u64, i64) {
     let out = dir.with_extension("out");
-    let run = std::process::Command::new(std::env::current_exe().expect("this test binary"))
-        .args(["--exact", "compile_and_run_here", "--ignored"])
+    let mut cmd = std::process::Command::new(std::env::current_exe().expect("this test binary"));
+    cmd.args(["--exact", "compile_and_run_here", "--ignored"])
         .env(DIR, dir)
-        .env(OUT, &out)
-        .output()
-        .expect("run this test binary");
+        .env(OUT, &out);
+    if let Some(h) = hosts {
+        cmd.env(HOSTS, if h { "1" } else { "0" });
+    }
+    let run = cmd.output().expect("run this test binary");
     assert!(
         run.status.success(),
         "{}\n{}{}",
@@ -187,5 +200,36 @@ fn code_is_kept_only_where_its_owner_alone_can_write() {
             "{others:o}"
         );
     }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// #3080 — kept code is keyed on how its fuel loads were lowered: a compile that hosts fibers
+/// (`hosts_fibers`, its cell reloaded at every charge) never defines code a compile without it kept,
+/// whose loads keep a cell's address across a `suspend`, and which would then charge the wrong vCPU
+/// once a unit's fiber ran it. Each compile runs in a process of its own; the first number is how
+/// many modules it compiled.
+#[test]
+fn a_compile_that_hosts_fibers_never_defines_code_kept_without_it() {
+    let dir = fresh("hosts");
+    assert_eq!(
+        in_a_process_hosting(&dir, Some(false)),
+        (1, 42),
+        "metered, not hosting fibers: compiled and kept"
+    );
+    assert_eq!(
+        in_a_process_hosting(&dir, Some(true)),
+        (1, 42),
+        "hosting fibers: compiled anew, not the code kept without it"
+    );
+    assert_eq!(
+        in_a_process_hosting(&dir, Some(true)),
+        (0, 42),
+        "and its own code is kept"
+    );
+    assert_eq!(
+        in_a_process_hosting(&dir, Some(false)),
+        (0, 42),
+        "beside the first"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }

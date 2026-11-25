@@ -75,6 +75,7 @@ fn compiled(m: &IrModule) -> CompiledModule {
         None,
         None,
         0,
+        false,
     )
     .expect("compile")
 }

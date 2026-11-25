@@ -55,7 +55,8 @@ fn assert_jit_matches_interp(src: &str) {
 }
 
 /// #3078 — each case whose entry is `() -> (i64)` also runs on the kernel route, inside one
-/// `thread.spawn`ed vCPU (`support/kernel_lane.rs`), and answers as the oracle's run of that program.
+/// `thread.spawn`ed vCPU (`support/kernel_lane.rs`), unmetered, and answers as the oracle's run of
+/// that program. Its metered runs are `jit_fuel`'s sweeps (#3080).
 fn in_a_thread_on_the_kernel_route(src: &str, m: &temen_ir::Module) {
     let entry = &m.funcs[0];
     if !entry.params.is_empty() || entry.results != [temen_ir::ValType::I64] {
@@ -395,6 +396,7 @@ fn fiber_backtrace_walks_a_suspended_fibers_guest_stack() {
         None,
         None,
         0,
+        false,
     )
     .expect("compile");
     // A run takes its parked fibers' backtraces as it ends only when asked (#3020).
@@ -757,6 +759,7 @@ fn fiber_backtrace_reaches_the_last_run_s_fibers_alone() {
         None,
         None,
         0,
+        false,
     )
     .expect("compile");
     let _ = cm.run(&[], None, None).expect("run 1");

@@ -82,6 +82,7 @@ fn run_temen(wasm: &[u8], reps: usize) -> (i64, Duration) {
         None, // fast_resolver
         None,
         0,
+        false,
     )
     .expect("temen jit compile");
     let mut best = Duration::MAX;

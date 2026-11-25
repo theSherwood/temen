@@ -1010,6 +1010,7 @@ fn reused_jit(
             None,
             None,
             0,
+            false,
         )
         .expect("jit compile");
         cm.set_grant_child_hooks(Some(grant_hooks(hp)));
@@ -1258,6 +1259,7 @@ fn a_reused_host_s_later_run_finds_nothing_of_an_earlier_window_s_regions() {
         None,
         None,
         0,
+        false,
     )
     .expect("jit compile");
     cm.set_window_ready(Some((note_window, hp as *mut c_void)));
