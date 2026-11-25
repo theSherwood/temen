@@ -350,6 +350,138 @@ pub(crate) unsafe fn held_call(
 mod tests {
     use super::*;
 
+    /// What a [`decline_case`] module's one function holds.
+    #[derive(Clone, Copy, Default)]
+    struct Holds {
+        cont: bool,
+        gc_roots: bool,
+        jit: bool,
+        guest_call: bool,
+        import: Option<temen_interp::BoundImport>,
+        rebindable: bool,
+        dynamic: bool,
+    }
+
+    /// A module whose function 0 holds the ops `h` names (a `cont.new` over function 1, a
+    /// `gc.roots`, a `call.cap` on `Jit`, one on a guest-interned id, a `call.import` through import
+    /// 0, a `call.import.dyn`), over a host with import 0 bound as `h.import` says. Parsed and
+    /// verified, never run: [`fiber_may_call_in`] reads only the code and the bindings.
+    fn decline_case(h: Holds) -> bool {
+        let mut body = String::new();
+        if h.cont {
+            body += "  vf = i32.const 1\n  vsp = i64.const 4096\n  vk = cont.new vf vsp\n";
+        }
+        if h.gc_roots {
+            body += "  g0 = i64.const 0\n  g1 = i64.const 4096\n  gm = i64.const -1\n  g2 = i64.const 0\n  g3 = i64.const 8\n  vg = gc.roots g0 g1 gm g2 g3\n";
+        }
+        if h.jit {
+            body += "  vjh = i32.const 0\n  vjz = i64.const 0\n  vj = call.cap 11 3 (i64) -> (i64) vjh (vjz)\n";
+        }
+        if h.guest_call {
+            body += "  vqh = i32.const 0\n  vq = call.cap 268435456 0 () -> (i64) vqh ()\n";
+        }
+        if h.import.is_some() {
+            body += "  vi = call.import 0 ()\n";
+        }
+        if h.dynamic {
+            body += "  vdh = i32.const 0\n  vd = call.import.dyn 1.kept vdh ()\n";
+        }
+        let src = format!(
+            "memory 16\ntype 0 func () -> (i64)\ntype 1 interface {{ kept: 0 }}\nimport 0 \"k\" () -> (i64){mode}\nfunc () -> (i64) {{\nblock 0 () {{\n{body}  vr = i64.const 0\n  return vr\n  }}\n}}\nfunc (i64, i64) -> (i64) {{\nblock 0 (vsp: i64, varg: i64) {{\n  return varg\n  }}\n}}\n",
+            mode = if h.rebindable { " rebindable" } else { "" },
+        );
+        let m = temen_text::parse_module(&src).expect("parse");
+        temen_verify::verify_module(&m).expect("verify");
+        let mut host = Host::new();
+        host.set_import_bindings(h.import.into_iter().collect());
+        fiber_may_call_in(&m, &host)
+    }
+
+    /// #3080 (review T1) — [`fiber_may_call_in`]'s truth table, read on the rule itself. `hold` asks
+    /// `jit_proc::serves` first, which declines a rebindable slot and a `call.import.dyn` through the
+    /// same `may_reach` arms, so a `hold` row cannot reach the fiber rule's own arms for them.
+    #[test]
+    fn a_fiber_may_call_in_when_a_fiber_can_exist_and_its_code_may_call_a_guest() {
+        use temen_interp::BoundImport;
+        use temen_ir::cap_id::{GUEST_IMPL_BASE, HOST_PROC};
+        let fibers = Holds {
+            cont: true,
+            ..Holds::default()
+        };
+        let cases = [
+            // H1's arm, its accept side: `gc.roots` stands the runtime up, but no unit can arrive.
+            (
+                "gc.roots, a guest call, no Jit",
+                Holds {
+                    gc_roots: true,
+                    guest_call: true,
+                    ..Holds::default()
+                },
+                false,
+            ),
+            (
+                "gc.roots and Jit",
+                Holds {
+                    gc_roots: true,
+                    jit: true,
+                    ..Holds::default()
+                },
+                true,
+            ),
+            ("cont.*, no Jit, no guest call", fibers, false),
+            (
+                "Jit, no cont.* and no gc.roots, no hosting grant",
+                Holds {
+                    jit: true,
+                    ..Holds::default()
+                },
+                false,
+            ),
+            (
+                "cont.* and a rebindable slot",
+                Holds {
+                    import: Some(BoundImport {
+                        type_id: GUEST_IMPL_BASE,
+                        op: 0,
+                        handle: 0,
+                        bound: false,
+                        rebindable: true,
+                    }),
+                    rebindable: true,
+                    ..fibers
+                },
+                true,
+            ),
+            (
+                "cont.* and a call.import.dyn",
+                Holds {
+                    dynamic: true,
+                    ..fibers
+                },
+                true,
+            ),
+            (
+                "cont.* and an import bound to a guest id",
+                Holds {
+                    import: Some(BoundImport::required(GUEST_IMPL_BASE, 0, 1)),
+                    ..fibers
+                },
+                true,
+            ),
+            (
+                "cont.* and an import bound for good to a host capability",
+                Holds {
+                    import: Some(BoundImport::required(HOST_PROC, 0, 1)),
+                    ..fibers
+                },
+                false,
+            ),
+        ];
+        for (name, holds, declines) in cases {
+            assert_eq!(decline_case(holds), declines, "{name}");
+        }
+    }
+
     /// #2990 — an embedder keeps the `Arc<HeldSite>` past the run, so it may call `activate` after
     /// the run returned and its root's context, window and module are gone. The call is refused, and
     /// reads nothing the run owned: before the fix, the activation's guard read the dead root's end

@@ -2444,8 +2444,8 @@ enum ImportCall {
 
 /// #3080 (review H2) — a held domain whose `outer()` makes a fiber that calls through its import once,
 /// as `how` says, and answers `1e6·status₁ + 1e3·status₂ + value₁` over two resumes (the fiber returns
-/// what the call answered at its first); `kept()` counts 100 down
-/// and answers 42. Its entry takes one handle, which a [`ImportCall::Rebindable`] domain ignores.
+/// what the call answered at its first, and the second resume of the ended fiber answers -9); `kept()` counts 100 down
+/// and answers 42. Its entry attaches a [`ImportCall::Rebindable`] domain's slot.
 fn import_caller(how: ImportCall) -> String {
     let rebindable = matches!(how, ImportCall::Rebindable);
     let attach = if rebindable {
@@ -2465,8 +2465,8 @@ type 1 interface {{ outer: 0, kept: 0 }}
 import 0 "k" () -> (i64){mode}
 export 0 interface "svc" 1 {{ outer: 1, kept: 2 }}
 
-func (i32) -> (i64) {{
-block 0 (vh: i32) {{
+func () -> (i64) {{
+block 0 () {{
 {attach}  vr = i64.const 1
   return vr
   }}
@@ -2559,7 +2559,7 @@ fn import_outer(on: Executor, how: ImportCall) -> (Executor, Reply, u64) {
             },
         };
         host.set_import_bindings(vec![binding]);
-        let started = temen_run::hold(on, m, 0, &[Value::I32(-1)], u64::MAX, host);
+        let started = temen_run::hold(on, m, 0, &[], u64::MAX, host);
         let (d, _) = started.unwrap_or_else(|(t, _)| panic!("the entry ends in {t:?}"));
         let mut fuel = 1_000_000u64;
         let reply = d.call(0, 0, &[], &mut fuel);
@@ -2567,31 +2567,37 @@ fn import_outer(on: Executor, how: ImportCall) -> (Executor, Reply, u64) {
     })
 }
 
-/// #3080 (review H2) — a fiber's import call is read through its binding (`jit_proc::may_reach`): an
-/// import bound to a guest's offer, a rebindable slot and a `call.import.dyn` may each land on a
-/// guest's offer, so `hold` declines them and the tree-walker holds them on both asks, answering
-/// alike. An import bound for good to a host capability cannot, so the JIT holds it, and its reply
-/// and charge are the tree-walker's.
+/// #3080 (review H2, T1, T2) — a fiber's import call, by its binding. Each case's reply is
+/// `1e6·1 + 1e3·(-9 as u32) + value₁`, the call's answer at the first resume:
+/// - bound (not rebindable) to a guest's offer: `hold`'s fiber rule reads the binding's guest id
+///   (`jit_proc::may_reach`) and declines it; the tree-walker answers `kept()`'s 42, charged 2 (the
+///   wired offer's run is not the call's);
+/// - bound for good to a host procedure: nothing declines it, and the JIT holds it with the
+///   tree-walker's answer, the procedure's 7, charged 2;
+/// - a `rebindable` slot and a `call.import.dyn`: `hold` declines both at `jit_proc::serves`, before
+///   the fiber rule, through the same `may_reach` arms (either may reach a serve op), so this row
+///   pins only that the tree-walker holds them. The answer is `kept()`'s 42, charged 102: the
+///   attach took, and the call ran the domain's own `kept()`. The fiber rule's own arms for them are
+///   pinned on the rule itself (`held::tests`).
 #[test]
 fn a_fibers_import_call_is_held_by_what_its_binding_may_reach() {
-    for how in [
-        ImportCall::BoundToAGuestOffer,
-        ImportCall::BoundToAHostCap,
-        ImportCall::Rebindable,
-        ImportCall::Dynamic,
+    let reply =
+        |value: i64| Reply::Results(vec![1_000_000 + 1000 * i64::from(-9i32 as u32) + value]);
+    for (how, held, answer, charged) in [
+        (ImportCall::BoundToAGuestOffer, Executor::TreeWalker, 42, 2),
+        (ImportCall::BoundToAHostCap, Executor::Jit, 7, 2),
+        (ImportCall::Rebindable, Executor::TreeWalker, 42, 102),
+        (ImportCall::Dynamic, Executor::TreeWalker, 42, 102),
     ] {
-        let oracle = import_outer(Executor::TreeWalker, how);
-        let jit = import_outer(Executor::Jit, how);
-        let held = match how {
-            ImportCall::BoundToAHostCap => Executor::Jit,
-            _ => Executor::TreeWalker,
-        };
-        assert_eq!(oracle.0, Executor::TreeWalker, "{how:?}");
-        assert_eq!(jit.0, held, "{how:?}: the executor asked for Jit");
         assert_eq!(
-            (&jit.1, jit.2),
-            (&oracle.1, oracle.2),
-            "{how:?}: reply and charge"
+            import_outer(Executor::TreeWalker, how),
+            (Executor::TreeWalker, reply(answer), charged),
+            "{how:?}, asked for the tree-walker"
+        );
+        assert_eq!(
+            import_outer(Executor::Jit, how),
+            (held, reply(answer), charged),
+            "{how:?}, asked for the JIT"
         );
     }
 }
