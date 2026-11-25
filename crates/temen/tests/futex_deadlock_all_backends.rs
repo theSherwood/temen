@@ -205,15 +205,20 @@ fn an_infinite_wait_inside_a_fiber_faults_on_every_backend() {
     );
     // #3078 slice 3 — and inside one spawned vCPU, which the kernel route admits: its verdict is
     // the rules' (`Stalled`), promptly.
-    let t0 = Instant::now();
-    let (o, _, _) = kernel_lane::on_kernel(FIBER_INFINITE_WAIT);
-    let dt = t0.elapsed();
-    assert_eq!(
-        o,
-        JitOutcome::Trapped(temen_jit::TrapKind::ThreadFault),
-        "the kernel route, in {dt:?}"
-    );
-    assert!(dt < PROMPT, "the kernel route's verdict took {dt:?}");
+    for fuel in kernel_lane::FUELS {
+        let t0 = Instant::now();
+        let (o, _, _) = kernel_lane::on_kernel(FIBER_INFINITE_WAIT, fuel);
+        let dt = t0.elapsed();
+        assert_eq!(
+            o,
+            JitOutcome::Trapped(temen_jit::TrapKind::ThreadFault),
+            "the kernel route, fuel {fuel}, in {dt:?}"
+        );
+        assert!(
+            dt < PROMPT,
+            "the kernel route's verdict took {dt:?}, fuel {fuel}"
+        );
+    }
 }
 
 /// **The control.** The same two shapes with a *finite* timeout must still complete normally

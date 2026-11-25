@@ -48,11 +48,13 @@ fn pin(src: &str, want: i64) {
     assert_eq!(pump, want, "the pump against the oracle\n{src}");
     assert_eq!(par, want, "executor 2 against the oracle\n{src}");
     // #3078 slice 3 — a native fiber's waiter is an entry of the same index, in the same order.
-    assert_eq!(
-        kernel_lane::i64_on_kernel(src),
-        i64_want,
-        "the kernel route against the oracle\n{src}"
-    );
+    for fuel in kernel_lane::FUELS {
+        assert_eq!(
+            kernel_lane::i64_on_kernel(src, fuel),
+            i64_want,
+            "the kernel route against the oracle, fuel {fuel}\n{src}"
+        );
+    }
 }
 
 /// A fiber that waits on `W` once (`waits = 1`) or twice, and returns its last status.

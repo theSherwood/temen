@@ -37,7 +37,13 @@ fn pin_all(src: &str, want: i64) {
         assert_eq!(run_on(src, backend), want, "{backend:?}");
     }
     // #3078 slice 3 — a native fiber's wait is the kernel's.
-    assert_eq!(kernel_lane::i64_on_kernel(src), want, "the kernel route");
+    for fuel in kernel_lane::FUELS {
+        assert_eq!(
+            kernel_lane::i64_on_kernel(src, fuel),
+            want,
+            "the kernel route, fuel {fuel}"
+        );
+    }
 }
 
 /// A poll loop over `cont.resume.block` of a fiber that does a 10 ms timed `atomic.wait` (never
@@ -173,11 +179,13 @@ fn no_loop_blocking_resume_idles_on_all_backends() {
             "{backend:?}: a no-loop cont.resume.block must idle-and-complete, not spin to 300"
         );
     }
-    assert_eq!(
-        kernel_lane::i64_on_kernel(BLOCK_NO_LOOP_TIMED),
-        102,
-        "the kernel route"
-    );
+    for fuel in kernel_lane::FUELS {
+        assert_eq!(
+            kernel_lane::i64_on_kernel(BLOCK_NO_LOOP_TIMED, fuel),
+            102,
+            "the kernel route, fuel {fuel}"
+        );
+    }
 }
 
 /// I48 parity, the **cross-vCPU notify** wake path (the OS-thread case, not just the timer): the
@@ -244,8 +252,10 @@ fn no_loop_blocking_resume_wakes_on_cross_vcpu_notify_all_backends() {
             "{backend:?}: a no-loop blocking resume must idle until the notify and complete (17/117), got {r}"
         );
     }
-    let r = kernel_lane::i64_on_kernel(BLOCK_NO_LOOP_NOTIFY);
-    assert!(r == 17 || r == 117, "the kernel route: {r}");
+    for fuel in kernel_lane::FUELS {
+        let r = kernel_lane::i64_on_kernel(BLOCK_NO_LOOP_NOTIFY, fuel);
+        assert!(r == 17 || r == 117, "the kernel route, fuel {fuel}: {r}");
+    }
 }
 
 /// **#1631 — a vCPU idling on a *timed* fiber wait is a notifier, not a deadlock.**
@@ -369,13 +379,18 @@ fn an_unsatisfiable_fiber_wait_faults_promptly_on_the_oracle_and_the_jit() {
     }
     // #3078 slice 3 — on the kernel route the verdict is the rules' (`Stalled`), as an interpreted
     // fiber's on executor 2: every task asleep, the one fiber's wait untimed.
-    let t0 = std::time::Instant::now();
-    let (o, _, _) = kernel_lane::on_kernel(UNSATISFIABLE_FIBER_WAIT);
-    let dt = t0.elapsed();
-    assert_eq!(
-        o,
-        temen_jit::JitOutcome::Trapped(temen_jit::TrapKind::ThreadFault),
-        "the kernel route, in {dt:?}"
-    );
-    assert!(dt < PROMPT, "the kernel route's verdict took {dt:?}");
+    for fuel in kernel_lane::FUELS {
+        let t0 = std::time::Instant::now();
+        let (o, _, _) = kernel_lane::on_kernel(UNSATISFIABLE_FIBER_WAIT, fuel);
+        let dt = t0.elapsed();
+        assert_eq!(
+            o,
+            temen_jit::JitOutcome::Trapped(temen_jit::TrapKind::ThreadFault),
+            "the kernel route, fuel {fuel}, in {dt:?}"
+        );
+        assert!(
+            dt < PROMPT,
+            "the kernel route's verdict took {dt:?}, fuel {fuel}"
+        );
+    }
 }

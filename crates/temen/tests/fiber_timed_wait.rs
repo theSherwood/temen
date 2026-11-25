@@ -53,7 +53,13 @@ fn pin_all(src: &str, want: i64) {
         assert_eq!(run_on(src, backend), want, "{backend:?}");
     }
     // #3078 slice 3 — a native fiber's wait is the kernel's, its poll the kernel's parked word.
-    assert_eq!(kernel_lane::i64_on_kernel(src), want, "the kernel route");
+    for fuel in kernel_lane::FUELS {
+        assert_eq!(
+            kernel_lane::i64_on_kernel(src, fuel),
+            want,
+            "the kernel route, fuel {fuel}"
+        );
+    }
 }
 
 /// The fiber body every kernel shares: a timed `i32.atomic.wait` on a never-notified zero cell

@@ -62,16 +62,24 @@ fn in_a_thread_on_the_kernel_route(src: &str, m: &temen_ir::Module) {
     if !entry.params.is_empty() || entry.results != [temen_ir::ValType::I64] {
         return;
     }
-    let (kernel, w, entry) = kernel_lane::on_kernel(src);
-    let mut fuel = 10_000_000u64;
-    let interp = run(&w, entry, &[], &mut fuel);
-    match (&interp, &kernel) {
-        (Ok(vals), JitOutcome::Returned(slots)) => {
-            let want: Vec<i64> = vals.iter().map(to_slot).collect();
-            assert_eq!(&want, slots, "interp vs the kernel route\n{src}");
+    // Every case here is one vCPU's fibers, so it has one answer: each run is the oracle's.
+    for lane_fuel in kernel_lane::FUELS {
+        let (kernel, w, entry) = kernel_lane::on_kernel(src, lane_fuel);
+        let mut fuel = 10_000_000u64;
+        let interp = run(&w, entry, &[], &mut fuel);
+        match (&interp, &kernel) {
+            (Ok(vals), JitOutcome::Returned(slots)) => {
+                let want: Vec<i64> = vals.iter().map(to_slot).collect();
+                assert_eq!(
+                    &want, slots,
+                    "interp vs the kernel route, fuel {lane_fuel}\n{src}"
+                );
+            }
+            (Err(t), JitOutcome::Trapped(k)) if trap_matches(t, k) => {}
+            _ => panic!(
+                "interp {interp:?} vs the kernel route {kernel:?} disagree, fuel {lane_fuel}\n{src}"
+            ),
         }
-        (Err(t), JitOutcome::Trapped(k)) if trap_matches(t, k) => {}
-        _ => panic!("interp {interp:?} vs the kernel route {kernel:?} disagree\n{src}"),
     }
 }
 
