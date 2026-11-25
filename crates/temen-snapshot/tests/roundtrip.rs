@@ -2855,3 +2855,46 @@ fn a_dispatch_with_the_wrong_argument_count_rides_a_freeze_and_is_answered_einva
     assert_eq!(thawed, want, "the thaw ends as the uninterrupted run");
     assert_eq!(rhost.svc_result(t), einval, "thawed: answered EINVAL");
 }
+
+/// #3100 — a restore's §13 regions are bounded by the `channel` they are charged at their rebuild
+/// (`region_cost`, past every ceiling: `Fits::Pool`), its windows by `mem`, each against its own
+/// grant. Two one-page regions restore under exactly 8 KiB of `channel` and are refused one page
+/// under, the host as it was; and a cut whose window fills its `mem` grant exactly restores with the
+/// regions beside it.
+#[test]
+fn a_restores_regions_count_with_its_windows() {
+    let inst = instrument(SRC);
+    let mut fhost = Host::new();
+    fhost.grant_shared_region(4096);
+    fhost.grant_shared_region(4096);
+    let mut win = init_durable_window(WINDOW, TEST_ARENA);
+    write_state(&mut win, TEST_ARENA, STATE_UNWINDING);
+    let prots = vec![temen_snapshot::PageProt::Rw; WINDOW / 4096];
+    let art =
+        temen_snapshot::freeze_with_prots(&inst, &win, &prots, SIZE_LOG2, &fhost).expect("freeze");
+    let regions = 2 * 4096u64;
+    let restore = |mem: u64, channel: u64| {
+        let mut h = Host::new();
+        h.set_grant(mem as i64, channel as i64, -1, -1);
+        let fresh = h.restore_footprint();
+        let got = temen_snapshot::restore_layout(&art, &inst, &mut h).map(|_| ());
+        (got, fresh == h.restore_footprint())
+    };
+    let w = WINDOW as u64;
+    assert_eq!(
+        restore(w, regions - 4096),
+        (
+            Err(RestoreError::WindowOverBudget {
+                need: regions,
+                room: regions - 4096
+            }),
+            true
+        ),
+        "a page of channel short"
+    );
+    assert_eq!(
+        restore(w, regions).0,
+        Ok(()),
+        "exactly its mem and its channel"
+    );
+}

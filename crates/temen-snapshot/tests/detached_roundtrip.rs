@@ -677,3 +677,209 @@ fn swap_first_two_sections(art: &[u8], swap: bool) -> Vec<u8> {
     }
     out
 }
+
+/// #3100 — a detached child's window is held against the carried node its `"budget"` names, as the
+/// hook left that node's ceiling: the thaw charges the child's window nothing (it rides the node), so
+/// the restore is where the ceiling meets it. Its 128 KiB window under a node the hook leaves at
+/// exactly 128 KiB restores; at one page less the restore refuses, and the host is as it was.
+#[test]
+fn a_detached_childs_window_is_held_to_its_carried_nodes_ceiling() {
+    use temen_interp::cap_id;
+    let (p, c) = (parent(), child());
+    let (window, mut chost) = frozen_root(&c);
+    let mut host = Host::new();
+    host.set_durable(true);
+    host.grant_durable_module(&c);
+    let root = host.grant_budget(-1, 1 << 20, -1);
+    let paid = host
+        .cap_call(cap_id::BUDGET, 0, root, &[-1, 1 << 18, -1], 1, None)
+        .unwrap()[0] as i32;
+    assert!(host.budget_mem_take(paid, 1 << 17), "the child's window");
+    host.give_child_budget(lease(paid), &mut chost);
+    // As op 17 records it: the child's names, its `"budget"` among them.
+    let mut launch = launch(&c);
+    let cb = chost
+        .resolve_cap_name("budget")
+        .expect("the child's budget");
+    // An empty grant under the name first: the child's `"budget"` is the first that is not one
+    // (`Host::resolve_cap_name`), on its relaunch and on the restore's bound alike.
+    launch
+        .names
+        .push(("budget".to_string(), temen_interp::GRANT_EMPTY as i32));
+    launch.names.push(("budget".to_string(), cb));
+    children(&mut host, vec![1, 1]);
+    host.set_captured_detached(vec![CapturedDetached {
+        parent_task: 0,
+        slot: 1,
+        window,
+        reserved_log2: 17,
+        host: Arc::new(Mutex::new(chost)),
+        module: Arc::new(c.clone()),
+        launch,
+    }]);
+    let mut win = init_durable_window(1 << 17, ARENA);
+    write_state(&mut win, ARENA, STATE_UNWINDING);
+    let art = freeze(&p, &win, &host).expect("freeze the tree");
+
+    // The hook narrows the child's node (the one carried at 256 KiB) to `mem`.
+    let restore = |mem: i64| {
+        let mut rhost = Host::new();
+        rhost.set_durable(true);
+        rhost.grant_durable_module(&c);
+        rhost.set_budget_thaw_hook(Box::new(move |mut b| {
+            if b.mem == 1 << 18 {
+                b.mem = mem;
+            }
+            Some(b)
+        }));
+        let fresh = rhost.restore_footprint();
+        let got = restore_with_prots(&art, &p, &mut rhost).map(|_| ());
+        (got, fresh == rhost.restore_footprint())
+    };
+    assert_eq!(restore(1 << 17), (Ok(()), false), "exactly its window");
+    assert_eq!(
+        restore((1 << 17) - 4096),
+        (
+            Err(RestoreError::WindowOverBudget {
+                need: 1 << 17,
+                room: (1 << 17) - 4096,
+            }),
+            true
+        ),
+        "a page less"
+    );
+}
+
+/// #3100 — a detached child's window is built in its lease's reservation, not the one its artifact
+/// names. On `257f553` a child's thaw built its window in whatever reservation its artifact carried;
+/// one above its lease's is refused, the host as it was.
+#[test]
+fn a_detached_child_reserved_past_its_lease_is_refused() {
+    let (p, c) = (parent(), child());
+    let (window, chost) = frozen_root(&c);
+    let mut host = Host::new();
+    host.set_durable(true);
+    host.grant_durable_module(&c);
+    children(&mut host, vec![1, 1]);
+    host.set_captured_detached(vec![CapturedDetached {
+        parent_task: 0,
+        slot: 1,
+        window,
+        reserved_log2: 40,
+        host: Arc::new(Mutex::new(chost)),
+        module: Arc::new(c.clone()),
+        launch: launch(&c),
+    }]);
+    let mut win = init_durable_window(1 << 17, ARENA);
+    write_state(&mut win, ARENA, STATE_UNWINDING);
+    let art = freeze(&p, &win, &host).expect("a reservation above the default freezes");
+    let mut rhost = Host::new();
+    rhost.set_durable(true);
+    rhost.grant_durable_module(&c);
+    let fresh = rhost.restore_footprint();
+    assert_eq!(
+        restore_with_prots(&art, &p, &mut rhost).map(|_| ()),
+        Err(RestoreError::ReservationRefused {
+            asked: 40,
+            granted: temen_ir::window_reserved_log2(17),
+        })
+    );
+    assert!(fresh == rhost.restore_footprint(), "the host as it was");
+}
+
+/// #3100 — the per-node sum, over a chain of carried nodes: a root node (1 MiB) and under it the
+/// node that paid for a child (512 KiB). The child's window holds a page past its declared memory,
+/// and the child forked a twin, whose window is its parent's copy and is charged to the child's node.
+/// Both windows are summed at the child's node and again at its parent: the cut is refused at the
+/// inner ceiling when the hook lowers it a host page under the sum, and at the outer one when the
+/// hook lowers that instead, and restores at exactly the sum.
+#[test]
+fn a_chain_of_carried_nodes_bounds_a_childs_and_its_twins_windows() {
+    use temen_interp::cap_id;
+    let hp = temen_interp::host_page_size();
+    let (p, c) = (parent(), child());
+    let (mut window, mut chost) = frozen_root(&c);
+    let mut page = vec![0u8; 4096];
+    page[0] = 1;
+    window.hold(1 << 17, PageProt::Rw, Some(page));
+    let mut host = Host::new();
+    host.set_durable(true);
+    host.grant_durable_module(&c);
+    let root = host.grant_budget(-1, 1 << 20, -1);
+    let paid = host
+        .cap_call(cap_id::BUDGET, 0, root, &[-1, 1 << 19, -1], 1, None)
+        .unwrap()[0] as i32;
+    assert!(host.budget_mem_take(paid, 1 << 17), "the child's window");
+    host.give_child_budget(lease(paid), &mut chost);
+    let mut launch = launch(&c);
+    let cb = chost
+        .resolve_cap_name("budget")
+        .expect("the child's budget");
+    launch.names.push(("budget".to_string(), cb));
+    children(&mut host, vec![1, 1]);
+    host.set_captured_detached(vec![CapturedDetached {
+        parent_task: 0,
+        slot: 1,
+        window,
+        reserved_log2: 18,
+        host: Arc::new(Mutex::new(chost)),
+        module: Arc::new(c.clone()),
+        launch,
+    }]);
+    let mut win = init_durable_window(1 << 17, ARENA);
+    write_state(&mut win, ARENA, STATE_UNWINDING);
+    let tree = freeze(&p, &win, &host).expect("freeze the tree");
+    // The child forked a twin of itself.
+    let mut edit = temen_snapshot::decode_residue(&tree).expect("decode");
+    let child_art = edit.live_detached[0].payload.artifact.clone();
+    let mut ce = temen_snapshot::decode_residue(&child_art).expect("decode the child");
+    ce.twins.push(temen_ir::thaw::LiveTwin {
+        pid: 9,
+        entry: 0,
+        ctx: 0,
+        payload: temen_snapshot::TwinRest {
+            servicer: true,
+            names: Vec::new(),
+            artifact: child_art.clone(),
+        },
+    });
+    edit.live_detached[0].payload.artifact =
+        temen_snapshot::encode_residue(&child_art, &ce).expect("encode the child");
+    let art = temen_snapshot::encode_residue(&tree, &edit).expect("encode");
+
+    let sum = 2 * ((1u64 << 17) + hp);
+    // The hook sets the root node's ceiling to `outer` and the child's to `inner`.
+    let restore = |outer: u64, inner: u64| {
+        let mut rhost = Host::new();
+        rhost.set_durable(true);
+        rhost.grant_durable_module(&c);
+        rhost.set_budget_thaw_hook(Box::new(move |mut b| {
+            b.mem = match b.mem {
+                m if m == 1 << 20 => outer as i64,
+                m if m == 1 << 19 => inner as i64,
+                m => m,
+            };
+            Some(b)
+        }));
+        let fresh = rhost.restore_footprint();
+        let got = restore_with_prots(&art, &p, &mut rhost).map(|_| ());
+        (got, fresh == rhost.restore_footprint())
+    };
+    let refused = |room| {
+        (
+            Err(RestoreError::WindowOverBudget { need: sum, room }),
+            true,
+        )
+    };
+    assert_eq!(
+        restore(1 << 20, sum - hp),
+        refused(sum - hp),
+        "the inner ceiling"
+    );
+    assert_eq!(
+        restore(sum - hp, sum),
+        refused(sum - hp),
+        "the outer ceiling"
+    );
+    assert_eq!(restore(sum, sum).0, Ok(()), "exactly the sum");
+}
