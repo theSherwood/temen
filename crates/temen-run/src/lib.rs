@@ -349,8 +349,11 @@ unsafe fn cap_wait(
     match how {
         temen_jit::ParkHere::Fiber => return fiber_cap_wait(comps, id, vm),
         temen_jit::ParkHere::Thread => {}
-        // The answer stays unclaimed for the sweep, as at a run's end.
+        // A host-answered call is withdrawn, as a declined one is: its completer answers nothing
+        // and it stops counting in flight. A pool job's answer stays unclaimed for the sweep, as at
+        // a run's end.
         temen_jit::ParkHere::Refused => {
+            comps.withdraw(id);
             vm.raise(TrapKind::ThreadFault as i64);
             return 0;
         }

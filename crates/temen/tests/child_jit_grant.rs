@@ -498,11 +498,10 @@ fn a_join_inside_an_invoke_on_a_pool_task_fails_closed_at_its_door() {
     );
 }
 
-/// #3158 — the parent runs under a lane cap of 1. It spawns the serving child
-/// [`lane_server`] with its `Jit` and a punting host procedure granted by name, mints an
+/// #3158 — the parent spawns the serving child [`punt_server`] with its `Jit` and a punting host procedure granted by name, mints an
 /// offer over the child's export, calls `run(5)` through it, joins the child, and returns the reply
 /// plus 1000 times the join's status.
-fn lane_parent() -> String {
+fn punt_parent() -> String {
     let spawn = SpawnRec {
         grants_ptr: 16384,
         grants_n: 2,
@@ -558,19 +557,22 @@ data 16488 "prc"
     )
 }
 
-/// The unit [`lane_server`] compiles: it calls the punting procedure whose handle the child stored
-/// at 70000 with 5, answering the job's 105.
-const LANE_UNIT: &str = "memory 17\nfunc () -> (i64) {\nblock 0 () {\n  va = i64.const 70000\n  vh = i32.load va\n  v5 = i64.const 5\n  vr = call.cap 13 0 (i64) -> (i64) vh (v5)\n  return vr\n  }\n}\n";
+/// A unit [`punt_server`] compiles: it calls the punting procedure whose handle the child stored at
+/// 70000 with 5, answering the job's 105.
+const PUNT_UNIT: &str = "memory 17\nfunc () -> (i64) {\nblock 0 () {\n  va = i64.const 70000\n  vh = i32.load va\n  v5 = i64.const 5\n  vr = call.cap 13 0 (i64) -> (i64) vh (v5)\n  return vr\n  }\n}\n";
+
+/// The same call with no result: the unit answers 0.
+const ZERO_RESULT_PUNT_UNIT: &str = "memory 17\nfunc () -> (i64) {\nblock 0 () {\n  va = i64.const 70000\n  vh = i32.load va\n  v5 = i64.const 5\n  call.cap 13 0 (i64) -> () vh (v5)\n  v0 = i64.const 0\n  return v0\n  }\n}\n";
 
 /// #3158 — the serving child. Its entry resolves `"jit"` and `"prc"`, compiles
-/// [`LANE_UNIT`] (the blob at [`BLOB_OFF`]), spawns a notifier vCPU (function 2), and serves one
+/// a unit (the blob at [`BLOB_OFF`]), spawns a notifier vCPU (function 2), and serves one
 /// call. The handler, `run(a)`, waits with no deadline on a word the notifier notifies until a notify
 /// wakes a waiter, so the handler's fiber parks once, however late its wait begins, and a pool
 /// worker resumes it. The notifier sleeps a millisecond on a word of its own between tries: that
 /// only paces it. What makes the park certain is the wait's lack of a deadline and the notifier
 /// trying until one of its notifies wakes a waiter. Then the handler invokes the unit, whose call
-/// the host punts; where that call is answered, the handler answers its 105 plus `a`.
-fn lane_server(blob: &[u8]) -> String {
+/// the host punts; where that call is answered, the handler answers the unit's answer plus `a`.
+fn punt_server(blob: &[u8]) -> String {
     let blob_data: String = blob.iter().map(|b| format!("\\x{b:02x}")).collect();
     format!(
         r#"memory 17
@@ -675,13 +677,13 @@ fn punting_proc() -> temen_interp::HostProcGrant {
 /// resumed by a pool worker, inside a `Jit.invoke`. Main parked a fiber for such a punt; here no
 /// fiber of the code's own can park, the task cannot park under the call, and blocking the worker's
 /// thread could starve what the answer waits on (a punted job may wait on another vCPU or a child
-/// of the run, `cap_park.rs`), under this lane cap of 1 the more so. So the JIT refuses the punt at
+/// of the run, `cap_park.rs`). So the JIT refuses the punt at
 /// its door (`cap_wait`'s `ParkHere::Refused`): the child ends `ThreadFault`, and the parent's call
 /// fails `CAP_REVOKED`. The oracle's invoke child refuses the punt itself (`CapFault`, #3154), which
 /// #3155 removes.
 #[test]
-fn a_punt_from_a_resumed_handler_under_a_lane_cap_of_one_fails_closed_at_its_door() {
-    let (oracle, jit) = lane_run_both();
+fn a_punt_from_a_resumed_handler_below_a_floor_fails_closed_at_its_door() {
+    let (oracle, jit) = punt_run_both(PUNT_UNIT);
     // The parent answers `1000 * the child's join status + the call's reply`; -9 is `CAP_REVOKED`,
     // the call's failure once the callee has ended.
     let ended = |trap: i64| trap * 1000 - 9;
@@ -700,12 +702,22 @@ fn a_punt_from_a_resumed_handler_under_a_lane_cap_of_one_fails_closed_at_its_doo
     );
 }
 
-/// The run of [`lane_parent`] over [`lane_server`] under a lane cap of 1, on the oracle and on the
-/// JIT, each on a thread of its own and bounded in time: a run that does not end fails.
-fn lane_run_both() -> (String, String) {
+/// #3158 — the same shape, the unit's punt with no result. Main never parked a fiber for such a punt
+/// (the locked thunk waits for it outside on the thread, whatever the floor), so it keeps main's
+/// path: the call is answered and the handler answers 0 + 5, as the oracle does. Without the count
+/// carve-out the JIT refuses it as the one-result punt.
+#[test]
+fn a_zero_result_punt_from_a_resumed_handler_below_a_floor_waits_as_on_main() {
+    let (oracle, jit) = punt_run_both(ZERO_RESULT_PUNT_UNIT);
+    assert_eq!(oracle, "Ok([I64(5)])", "oracle: the punt is answered");
+    assert_eq!(jit, "Ok(Returned([5]))", "jit: the punt waits as on main");
+}
+
+/// The run of [`punt_parent`] over [`punt_server`] compiling `unit`, on the oracle and on the JIT,
+/// each on a thread of its own and bounded in time: a run that does not end fails.
+fn punt_run_both(unit: &str) -> (String, String) {
     fn host(server: &temen_ir::Module) -> (Host, [i32; 5]) {
         let mut host = Host::new();
-        host.set_lane_cap(1);
         let ih = host.grant_instantiator();
         let jh = grant_jit(&mut host, server, 0);
         let bh = host.grant_budget(-1, 1 << 20, -1);
@@ -713,10 +725,10 @@ fn lane_run_both() -> (String, String) {
         let ph = host.grant_host_proc(punting_proc());
         (host, [ih, jh, bh, sh, ph])
     }
-    let unit = encode_module(&parse_module(LANE_UNIT).expect("parse unit"));
-    let parent = parse_module(&lane_parent()).expect("parse parent");
+    let unit = encode_module(&parse_module(unit).expect("parse unit"));
+    let parent = parse_module(&punt_parent()).expect("parse parent");
     verify_module(&parent).expect("verify parent");
-    let server = parse_module(&lane_server(&unit)).expect("parse server");
+    let server = parse_module(&punt_server(&unit)).expect("parse server");
     verify_module(&server).expect("verify server");
     let bounded = |run: Box<dyn FnOnce() -> String + Send>, what: &str| {
         let (tx, rx) = std::sync::mpsc::channel();

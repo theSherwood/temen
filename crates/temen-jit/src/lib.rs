@@ -142,7 +142,9 @@ pub fn fiber_active() -> bool {
 pub enum ParkHere {
     /// The running fiber, alone: its resumer sees `FIBER_PARKED`.
     Fiber,
-    /// This OS thread, a vCPU's own: block in place.
+    /// This OS thread: an OS vCPU's own, which blocks in place. A thunk also passes it for the punts
+    /// main never parked as a fiber (a durable run's, or one whose result count is not 1), which
+    /// wait on whatever thread runs the call, a pool worker's included, as on main.
     Thread,
     /// None: a pool task's code below a guarded call's yield floor, which can park neither a fiber
     /// of its own nor the task, and must not block the worker's thread. Fail closed (`ThreadFault`).
