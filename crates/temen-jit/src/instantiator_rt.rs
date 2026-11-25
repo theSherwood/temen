@@ -2340,15 +2340,13 @@ pub(crate) unsafe fn join_named(
     // parks the task, whose lanes the executor gives back; one that answers an outcome already in
     // (#3158) has no wait to give them back for. SAFETY: a nonzero `futex_sched` is the run's live
     // `Domain`, which outlives every child.
-    let held = (task.is_none() && !crate::fiber_rt::in_task())
-        .then(|| unsafe {
-            crate::os_thread_rt::held_lanes(rt.futex_sched as *const crate::os_thread_rt::Domain)
-        })
-        .flatten();
-    let (dom, lane) = match held {
-        Some((d, lane)) => (Some(d), lane),
-        None => (None, Vec::new()),
-    };
+    let dom =
+        (task.is_none() && !crate::fiber_rt::in_task() && rt.futex_sched != 0).then(|| unsafe {
+            crate::os_thread_rt::current_domain(
+                rt.futex_sched as *const crate::os_thread_rt::Domain,
+            )
+        });
+    let lane = dom.map(|d| d.lane_chain()).unwrap_or_default();
     if let Some(d) = dom {
         d.lane_give_back(&lane);
     }

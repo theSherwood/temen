@@ -447,7 +447,8 @@ fn a_join_inside_an_invoke_on_a_pool_task_fails_closed_at_its_door() {
     }
     // The parent answers `status * 1000 + value` of its join of the child.
     let trapped = |code: i64| code * 1000;
-    // On its own thread with a bound in time, so a run that does not end fails rather than hangs.
+    // Each half on its own thread with a bound in time, so a run that does not end fails rather than
+    // hangs.
     let r = {
         let m = m.clone();
         let (tx, rx) = std::sync::mpsc::channel();
@@ -470,25 +471,34 @@ fn a_join_inside_an_invoke_on_a_pool_task_fails_closed_at_its_door() {
         Ok(vec![Value::I64(trapped(temen_ir::trap_code::CAP_FAULT))]),
         "oracle"
     );
-    let (mut host, h) = setup(&m);
-    let (out, _) = temen_run::jit_cap_run(
-        &m,
-        0,
-        &h.map(i64::from),
-        &MemLayout::image(Vec::new()),
-        DEFAULT_RESERVED_LOG2,
-        0,
-        &mut host,
-        None,
-    )
-    .expect("jit");
+    let out = {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let (mut host, h) = setup(&m);
+            let out = temen_run::jit_cap_run(
+                &m,
+                0,
+                &h.map(i64::from),
+                &MemLayout::image(Vec::new()),
+                DEFAULT_RESERVED_LOG2,
+                0,
+                &mut host,
+                None,
+            )
+            .expect("jit")
+            .0;
+            let _ = tx.send(out);
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(60))
+            .expect("the JIT's run ends")
+    };
     assert!(
         matches!(out, JitOutcome::Returned(ref v) if v == &[trapped(temen_ir::trap_code::THREAD_FAULT)]),
         "jit: the child's join fails closed at its door: {out:?}"
     );
 }
 
-/// #3158 review B1 — the parent runs under a lane cap of 1. It spawns the serving child
+/// #3158 — the parent runs under a lane cap of 1. It spawns the serving child
 /// [`lane_server`] with its `Jit` and a punting host procedure granted by name, mints an
 /// offer over the child's export, calls `run(5)` through it, joins the child, and returns the reply
 /// plus 1000 times the join's status.
@@ -552,14 +562,14 @@ data 16488 "prc"
 /// at 70000 with 5, answering the job's 105.
 const LANE_UNIT: &str = "memory 17\nfunc () -> (i64) {\nblock 0 () {\n  va = i64.const 70000\n  vh = i32.load va\n  v5 = i64.const 5\n  vr = call.cap 13 0 (i64) -> (i64) vh (v5)\n  return vr\n  }\n}\n";
 
-/// #3158 review B1 — the serving child. Its entry resolves `"jit"` and `"prc"`, compiles
+/// #3158 — the serving child. Its entry resolves `"jit"` and `"prc"`, compiles
 /// [`LANE_UNIT`] (the blob at [`BLOB_OFF`]), spawns a notifier vCPU (function 2), and serves one
 /// call. The handler, `run(a)`, waits with no deadline on a word the notifier notifies until a notify
 /// wakes a waiter, so the handler's fiber parks once, however late its wait begins, and a pool
 /// worker resumes it. The notifier sleeps a millisecond on a word of its own between tries: that
 /// only paces it. What makes the park certain is the wait's lack of a deadline and the notifier
 /// trying until one of its notifies wakes a waiter. Then the handler invokes the unit, whose call
-/// the host punts, and answers the unit's 105 plus `a`.
+/// the host punts; where that call is answered, the handler answers its 105 plus `a`.
 fn lane_server(blob: &[u8]) -> String {
     let blob_data: String = blob.iter().map(|b| format!("\\x{b:02x}")).collect();
     format!(
@@ -661,42 +671,90 @@ fn punting_proc() -> temen_interp::HostProcGrant {
     )
 }
 
-/// #3158 review B1 — a punted call's wait outside the pool, from a serve handler's shell on a pool
-/// worker. The shell holds no lane, and while it runs the current domain is its serving child's: a
-/// wait that gave back and re-took that domain's lanes re-took a lane the shell never held, and
-/// under a cap of 1 the run then waited for it for good. The wait now gives back and re-takes only
-/// the lanes its context holds as a vCPU (none, in a pool task), and the run answers `5 + 105`.
+/// #3158 — a punt from a pool task's code below a guarded call's floor: here a serve handler's shell,
+/// resumed by a pool worker, inside a `Jit.invoke`. Main parked a fiber for such a punt; here no
+/// fiber of the code's own can park, the task cannot park under the call, and blocking the worker's
+/// thread could starve what the answer waits on (a punted job may wait on another vCPU or a child
+/// of the run, `cap_park.rs`), under this lane cap of 1 the more so. So the JIT refuses the punt at
+/// its door (`cap_wait`'s `ParkHere::Refused`): the child ends `ThreadFault`, and the parent's call
+/// fails `CAP_REVOKED`. The oracle's invoke child refuses the punt itself (`CapFault`, #3154), which
+/// #3155 removes.
 #[test]
-fn a_punt_from_a_resumed_handler_under_a_lane_cap_of_one_completes() {
+fn a_punt_from_a_resumed_handler_under_a_lane_cap_of_one_fails_closed_at_its_door() {
+    let (oracle, jit) = lane_run_both();
+    // The parent answers `1000 * the child's join status + the call's reply`; -9 is `CAP_REVOKED`,
+    // the call's failure once the callee has ended.
+    let ended = |trap: i64| trap * 1000 - 9;
+    assert_eq!(
+        oracle,
+        format!("Ok([I64({})])", ended(temen_ir::trap_code::CAP_FAULT)),
+        "oracle: its invoke child refuses the punt"
+    );
+    assert_eq!(
+        jit,
+        format!(
+            "Ok(Returned([{}]))",
+            ended(temen_ir::trap_code::THREAD_FAULT)
+        ),
+        "jit: the punt is refused at its door"
+    );
+}
+
+/// The run of [`lane_parent`] over [`lane_server`] under a lane cap of 1, on the oracle and on the
+/// JIT, each on a thread of its own and bounded in time: a run that does not end fails.
+fn lane_run_both() -> (String, String) {
+    fn host(server: &temen_ir::Module) -> (Host, [i32; 5]) {
+        let mut host = Host::new();
+        host.set_lane_cap(1);
+        let ih = host.grant_instantiator();
+        let jh = grant_jit(&mut host, server, 0);
+        let bh = host.grant_budget(-1, 1 << 20, -1);
+        let sh = host.grant_module(server);
+        let ph = host.grant_host_proc(punting_proc());
+        (host, [ih, jh, bh, sh, ph])
+    }
     let unit = encode_module(&parse_module(LANE_UNIT).expect("parse unit"));
     let parent = parse_module(&lane_parent()).expect("parse parent");
     verify_module(&parent).expect("verify parent");
     let server = parse_module(&lane_server(&unit)).expect("parse server");
     verify_module(&server).expect("verify server");
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let mut host = Host::new();
-        host.set_lane_cap(1);
-        let ih = host.grant_instantiator();
-        let jh = grant_jit(&mut host, &server, 0);
-        let bh = host.grant_budget(-1, 1 << 20, -1);
-        let sh = host.grant_module(&server);
-        let ph = host.grant_host_proc(punting_proc());
-        let out = temen_run::jit_cap_run(
-            &parent,
-            0,
-            &[ih, jh, bh, sh, ph].map(i64::from),
-            &MemLayout::image(Vec::new()),
-            DEFAULT_RESERVED_LOG2,
-            0,
-            &mut host,
-            None,
-        )
-        .map(|(o, _)| o);
-        let _ = tx.send(format!("{out:?}"));
-    });
-    let out = rx
-        .recv_timeout(std::time::Duration::from_secs(30))
-        .expect("the run completes: it hung waiting for a lane");
-    assert_eq!(out, "Ok(Returned([110]))");
+    let bounded = |run: Box<dyn FnOnce() -> String + Send>, what: &str| {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(run());
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(30))
+            .unwrap_or_else(|_| panic!("the {what} run ends"))
+    };
+    let (p, sv) = (parent.clone(), server.clone());
+    let oracle = bounded(
+        Box::new(move || {
+            let (mut host, h) = host(&sv);
+            let mut fuel = 50_000_000u64;
+            format!(
+                "{:?}",
+                run_with_host(&p, 0, &h.map(Value::I32), &mut fuel, &mut host)
+            )
+        }),
+        "oracle's",
+    );
+    let jit = bounded(
+        Box::new(move || {
+            let (mut host, h) = host(&server);
+            let out = temen_run::jit_cap_run(
+                &parent,
+                0,
+                &h.map(i64::from),
+                &MemLayout::image(Vec::new()),
+                DEFAULT_RESERVED_LOG2,
+                0,
+                &mut host,
+                None,
+            )
+            .map(|(o, _)| o);
+            format!("{out:?}")
+        }),
+        "JIT's",
+    );
+    (oracle, jit)
 }

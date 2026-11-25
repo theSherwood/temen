@@ -129,10 +129,40 @@ pub use os_thread_rt::{
 /// the host thunk's fiber-context probe (the futex thunk's `current_fiber_slot`, public face).
 /// `false` for the root computation, so a root-context punt keeps its inline/blocking wait, and
 /// below a guarded call's yield floor (#3158: a unit `Jit.invoke`d from a fiber, a handler run on
-/// a caller's stack), where no fiber of the running code's own can park: a thunk's wait there blocks
-/// the thread instead, which switches no stack. Whether the code is its vCPU's root is [`at_root`]'s.
+/// a caller's stack), where no fiber of the running code's own can park. How such code may park at
+/// all is [`park_here`]'s; whether it is its vCPU's root, [`at_root`]'s.
 pub fn fiber_active() -> bool {
     fiber_rt::current_fiber_slot().is_some()
+}
+
+/// #3158 — how a park an embedder's thunk makes here, of the running fiber alone, may be made
+/// (`fiber_rt::park_as`, the one answer every park door asks): as the running fiber, on this OS
+/// thread, or not at all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ParkHere {
+    /// The running fiber, alone: its resumer sees `FIBER_PARKED`.
+    Fiber,
+    /// This OS thread, a vCPU's own: block in place.
+    Thread,
+    /// None: a pool task's code below a guarded call's yield floor, which can park neither a fiber
+    /// of its own nor the task, and must not block the worker's thread. Fail closed (`ThreadFault`).
+    Refused,
+}
+
+/// #3158 — [`ParkHere`] for a fiber's park made by the code running on this thread now.
+pub fn park_here() -> ParkHere {
+    #[cfg(fiber_rt)]
+    {
+        match fiber_rt::park_as(os_thread_rt::Parks::Fiber) {
+            fiber_rt::ParkAs::Fiber(_) => ParkHere::Fiber,
+            fiber_rt::ParkAs::Thread => ParkHere::Thread,
+            fiber_rt::ParkAs::Refused => ParkHere::Refused,
+        }
+    }
+    #[cfg(not(fiber_rt))]
+    {
+        ParkHere::Thread
+    }
 }
 
 /// #3158 — whether the running code is its vCPU's root computation: no fiber on this thread's

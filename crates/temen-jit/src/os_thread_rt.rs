@@ -577,11 +577,8 @@ unsafe fn park_host_call_here(
 }
 
 /// #2047 — wait outside the run for a host call's answer (a job punted to the offload pool, which
-/// may wait on the world), as a park waits: the calling context gives back the lanes it holds for
-/// the wait (D66) and takes them again after (`held_lanes`: an OS vCPU's domain chain, a child
-/// task's own chain, none for a handler on a pool worker), and a kill or its domain's end stops the
-/// wait. #3158 — a punted job waits on no pool task: it is a self-contained job on the domain's
-/// offload pool, or a call the embedder answers. It is not counted
+/// may wait on the world), as a park waits: the calling vCPU gives its lane back for the wait (D66)
+/// and takes it again after, and a kill or its domain's end stops the wait. It is not counted
 /// parked: the answer comes from outside, so it may yet end a peer's wait. `wait(stop)` blocks until
 /// the answer (`Some`) or until `stop()` holds (`None`), checking `stop` again whenever `rouse`
 /// wakes it. `None`: the run was killed (its domain now ends with `OutOfFuel`, as a join's does) or
@@ -621,11 +618,8 @@ unsafe fn wait_outside_here<R>(
     rouse: Box<dyn Fn() + Send + Sync>,
     wait: impl FnOnce(&dyn Fn() -> bool) -> Option<R>,
 ) -> Option<R> {
-    let held = held_lanes(vm.sched as *const Domain);
-    let (dom, lane) = match held {
-        Some((d, lane)) => (Some(d), lane),
-        None => (None, Vec::new()),
-    };
+    let dom = (!vm.sched.is_null()).then(|| current_domain(vm.sched as *const Domain));
+    let lane = dom.map(|d| d.lane_chain()).unwrap_or_default();
     if let Some(d) = dom {
         d.lane_give_back(&lane);
     }
@@ -2113,27 +2107,6 @@ pub(crate) fn current_domain_ptr() -> *const Domain {
 pub(crate) unsafe fn current_domain<'a>(sched: *const Domain) -> &'a Domain {
     let cur = CURRENT_DOMAIN.with(|c| c.get());
     &*(if cur.is_null() { sched } else { cur })
-}
-
-/// #3158 — the lanes the running context holds, on the domain that counts them: what a wait that
-/// blocks this thread outside the pool gives back first and re-takes after. An OS vCPU holds its
-/// domain's chain. Code in a residency (a pool task's, or a handler's) holds what the residency
-/// holds ([`crate::child_exec::resident_lanes`] says which, case by case). The current domain is
-/// not the answer there: a handler shell's is its serving vCPU's, whose lanes the shell does not
-/// hold. `None` with no domain (`sched` null) or no lanes.
-///
-/// # Safety
-/// As [`current_domain`], when `sched` is non-null; the answer is used within the call.
-pub(crate) unsafe fn held_lanes<'a>(
-    sched: *const Domain,
-) -> Option<(&'a Domain, Vec<(usize, i64)>)> {
-    if crate::fiber_rt::in_task() {
-        return crate::child_exec::resident_lanes().map(|(d, chain)| (d, chain.to_vec()));
-    }
-    (!sched.is_null()).then(|| {
-        let d = current_domain(sched);
-        (d, d.lane_chain())
-    })
 }
 
 std::thread_local! {

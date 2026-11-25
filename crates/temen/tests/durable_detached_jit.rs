@@ -2288,15 +2288,28 @@ fn a_detached_childs_held_span_thaws_on_the_jit_and_the_tree_walker() {
 }
 
 /// #3158 — the parent [`serving_parent`] spawns a durable serving child ([`serving_child`]) detached,
-/// granting it a durable module as `"gcm"` and its freeze authority as `"freeze"`, mints an offer over the child's export, calls
+/// granting it a durable module as `"gcm"`, its freeze authority as `"freeze"` and a punting host
+/// procedure as `"prc"`, mints an offer over the child's export, calls
 /// `add(40, 2)` through it, joins the child, and returns the reply and the join's status and value.
 const SERVING_PARENT: &str = "memory 18 shadow 16448 65536
 type 0 func (i64, i64) -> (i64)
 type 1 interface { add: 0 }
 data 70000 \"gcm\"
 data 70008 \"freeze\"
-func (i32, i32, i32, i32, i32) -> (i64, i64, i64) {
-block 0 (v0: i32, v1: i32, v2: i32, v3: i32, v4: i32) {
+data 70016 \"prc\"
+func (i32, i32, i32, i32, i32, i32) -> (i64, i64, i64) {
+block 0 (v0: i32, v1: i32, v2: i32, v3: i32, v4: i32, v5: i32) {
+  vp0 = i64.const 70064
+  vpn = i32.const 70016
+  i32.store vp0 vpn
+  vp4 = i64.const 70068
+  vpl = i32.const 3
+  i32.store vp4 vpl
+  vp8 = i64.const 70072
+  i32.store vp8 v5
+  vp12 = i64.const 70076
+  vpz = i32.const 0
+  i32.store vp12 vpz
   vf0 = i64.const 70048
   vfn = i32.const 70008
   i32.store vf0 vfn
@@ -2336,13 +2349,13 @@ block 0 (v0: i32, v1: i32, v2: i32, v3: i32, v4: i32) {
 }
 ";
 
-/// [`SERVING_PARENT`] with its spawn record (its grant list is the two records at 70032),
+/// [`SERVING_PARENT`] with its spawn record (its grant list is the three records at 70032),
 /// instrumented.
 fn serving_parent() -> temen_ir::Module {
     let spawn = SpawnRec {
         size_log2: 17,
         grants_ptr: 70032,
-        grants_n: 2,
+        grants_n: 3,
         ..SpawnRec::default()
     };
     confined(&format!("{SERVING_PARENT}{}", rec::segment(65536, &spawn)))
@@ -2361,6 +2374,7 @@ type 1 interface {{ add: 0 }}
 export 0 interface \"adder\" 1 {{ add: 1 }}
 data 90112 \"gcm\"
 data 90120 \"budget\"
+data 90128 \"prc\"
 func (i64, i64) -> (i64) {{
 block 0 (v0: i64, v1: i64) {{
 {pre}  vz = i32.const 0
@@ -2406,8 +2420,22 @@ fn waiting_handler(expected: i32, timeout_ns: i64) -> String {
 }
 
 /// The parent's answer to [`serving_child`]`(pre, handler)` on the oracle and on the JIT (`None` on a
-/// target without the child executor).
+/// target without the child executor), on a thread of its own and bounded in time: a run that does
+/// not end fails rather than hangs.
 fn serve_on_both(
+    pre: &str,
+    handler: &str,
+) -> (Result<Vec<Value>, temen_interp::Trap>, Option<Vec<i64>>) {
+    let (pre, handler) = (pre.to_owned(), handler.to_owned());
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(serve_on_both_here(&pre, &handler));
+    });
+    rx.recv_timeout(std::time::Duration::from_secs(60))
+        .expect("both runs end")
+}
+
+fn serve_on_both_here(
     pre: &str,
     handler: &str,
 ) -> (Result<Vec<Value>, temen_interp::Trap>, Option<Vec<i64>>) {
@@ -2419,6 +2447,7 @@ fn serve_on_both(
         let (mut host, mut h) = powerbox(&child);
         h.push(i64::from(host.grant_durable_module(&grand)));
         h.push(i64::from(host.grant_freeze_authority()));
+        h.push(i64::from(host.grant_host_proc(punting_proc())));
         (host, h)
     };
     let (mut host, h) = powerbox();
@@ -2543,5 +2572,59 @@ block 2 () {
     );
     if let Some(jit) = jit {
         assert_eq!(jit, want, "jit");
+    }
+}
+
+/// A host procedure whose every call the host punts: its job answers the argument plus 100. Forkable,
+/// so a spawn can re-grant it to a child.
+fn punting_proc() -> temen_interp::HostProcGrant {
+    fn handler() -> temen_interp::ProcHandler {
+        temen_interp::ProcHandler::Offloadable(Box::new(|_op, args, _out| {
+            let a = *args.first().unwrap_or(&0);
+            temen_interp::OffloadOutcome::Offload(Box::new(move || a + 100))
+        }))
+    }
+    temen_interp::HostProcGrant::new(handler(), temen_interp::CapState::Stateless).forkable(
+        std::sync::Arc::new(|_| {
+            Some(temen_interp::ForkedProc {
+                handler: handler(),
+                signal: None,
+                refork: None,
+                exit: None,
+                exec_remap: None,
+                state: temen_interp::CapState::Stateless,
+                abandon: None,
+            })
+        }),
+    )
+}
+
+/// #3158 — punts that never parked a fiber on main keep main's path whatever the floor: a durable
+/// run's, and one whose result count is not 1, wait outside on the thread as they did. Here from a
+/// durable child's handler, below its serve op's guarded call: a punt that answers 5 + 100, and a
+/// zero-result punt. Both answer as on the oracle.
+#[test]
+fn a_durable_childs_handler_punts_answer_as_on_main() {
+    let resolve = "  vpp = i64.const 90128\n  vpl = i64.const 3\n  vph = self.resolve vpp vpl\n  vp5 = i64.const 5\n";
+    for (call, want) in [
+        (
+            "  vh = call.cap 13 0 (i64) -> (i64) vph (vp5)\n",
+            40 + 2 + 105,
+        ),
+        (
+            "  call.cap 13 0 (i64) -> () vph (vp5)\n  vh = i64.const 0\n",
+            40 + 2,
+        ),
+    ] {
+        let (oracle, jit) = serve_on_both("", &format!("{resolve}{call}"));
+        let want = vec![want, 0, 1];
+        assert_eq!(
+            oracle,
+            Ok(want.iter().map(|&v| Value::I64(v)).collect()),
+            "oracle: {call:?}"
+        );
+        if let Some(jit) = jit {
+            assert_eq!(jit, want, "jit: {call:?}");
+        }
     }
 }
