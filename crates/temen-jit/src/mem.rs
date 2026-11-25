@@ -2661,11 +2661,11 @@ mod trap_walk_tests {
     }
 }
 
-/// #3167 — a guarded call's recovery scope opened on a stack that parks on one thread and resumes
-/// on another: the shape the yield floor (#3162) forbids, here forced past it, on a bare
-/// `temen-fiber` fiber with no runtime. Its exit must end in the abort, in every build, and the abort
-/// must have read the running thread's recovery state (R-TLS). Two threads in turn, the first kept
-/// alive until the second is done, so the two share no stack or TLS block.
+/// #3167 — a stack that parks with a guarded call's scope of its own still open: the shape the yield
+/// floor (#3162) forbids, forced past it on a bare `temen-fiber` fiber with no runtime. Each row runs
+/// the shape in a child process (this binary, re-run) and asserts on the child's exit: the guard
+/// must abort with its message, in every build, at the first guarded exit that finds another scope
+/// innermost.
 #[cfg(all(test, fiber_rt, not(loom)))]
 mod moved_scope_tests {
     use super::*;
@@ -2738,14 +2738,46 @@ mod moved_scope_tests {
         c.state
     }
 
-    /// The forbidden shape: the fiber's nested guarded call parks under a residency on thread 1,
-    /// and a residency on thread 2 resumes it, so the nested call returns on thread 2.
-    fn moved() {
+    /// Whether this process is the child that runs row `name`'s forbidden shape.
+    fn is_child(name: &str) -> bool {
+        std::env::var_os(CHILD).is_some_and(|v| v == name)
+    }
+
+    /// Re-run this binary as the child for row `name` and answer the abort's `(found, own)`, asserting
+    /// the child died with the abort's message.
+    fn child_abort(name: &str) -> (String, String) {
+        let path = format!("mem::moved_scope_tests::{name}");
+        let out = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args(["--exact", &path, "--test-threads=1", "--nocapture"])
+            .env(CHILD, name)
+            .output()
+            .expect("re-run the test binary");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !out.status.success(),
+            "the child must not survive:\n{stderr}"
+        );
+        let line = stderr
+            .lines()
+            .find(|l| l.contains("returned with another recovery scope innermost"))
+            .unwrap_or_else(|| panic!("no abort message from the child:\n{stderr}"));
+        let field = |key: &str| {
+            line.split(key)
+                .nth(1)
+                .and_then(|rest| rest.split_whitespace().next())
+                .unwrap_or_else(|| panic!("no {key} in: {line}"))
+                .to_owned()
+        };
+        (field("found="), field("own="))
+    }
+
+    /// A fiber over a fresh window whose body makes one nested guarded call that parks inside.
+    fn parking_fiber() -> (GuestWindow, Fiber) {
         pal::install_guard();
         let win = GuestWindow::try_new(64 << 10, 1 << 20).expect("window");
         let (lo, hi) = win.fault_range();
         let mem = win.base() as usize;
-        let mut fib = Fiber::new(64 << 10, move |y: &Yielder, _| -> u64 {
+        let fib = Fiber::new(64 << 10, move |y: &Yielder, _| -> u64 {
             let yp: *const Yielder = y;
             // SAFETY: an Entry-shaped body over this window's range.
             unsafe {
@@ -2763,61 +2795,78 @@ mod moved_scope_tests {
             7
         })
         .expect("fiber");
-        let s = Shared {
-            fib: &mut fib,
-            mem: mem as *mut u8,
-            lo,
-            hi,
-        };
-        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
-        let (s_tx, s_rx) = std::sync::mpsc::channel::<Shared>();
-        let t1 = std::thread::spawn(move || {
-            pal::install_guard();
-            // SAFETY: the fiber's first residency.
-            let state = unsafe { reside(&s) };
-            assert!(matches!(state, Some(State::Yielded(0))));
-            s_tx.send(s).expect("hand the fiber on");
-            done_rx.recv().expect("thread 2 ends");
-        });
-        let s = s_rx.recv().expect("thread 1 parked the fiber");
-        std::thread::spawn(move || {
-            pal::install_guard();
-            // SAFETY: the fiber's second residency, on another thread: the nested call returns here.
-            let _ = unsafe { reside(&s) };
-        })
-        .join()
-        .expect("thread 2");
-        done_tx.send(()).expect("release thread 1");
-        t1.join().expect("thread 1");
-        unreachable!("the nested call's exit on thread 2 aborts");
+        (win, fib)
     }
 
-    /// A scope that exits on a thread it did not enter on ends the process with the abort's message,
-    /// which names a scope found innermost on the **running** thread (thread 2's residency). An exit
-    /// that read through an address taken on thread 1 would find thread 1's chain empty: `found=0x0`.
+    /// An outer guarded call that exits over a parked stack's open scope aborts, there: the fiber's
+    /// nested call `N` parks inside under the residency `R`, so `R`'s exit finds `N` innermost
+    /// (`found` = `N`, on the fiber's stack; `own` = `R`). The earliest point the abort can see it.
     #[test]
-    fn a_scope_that_exits_on_another_thread_aborts_naming_that_threads_scope() {
-        if std::env::var_os(CHILD).is_some() {
-            moved();
+    fn an_outer_call_that_exits_over_a_parked_stacks_open_scope_aborts() {
+        const NAME: &str = "an_outer_call_that_exits_over_a_parked_stacks_open_scope_aborts";
+        if is_child(NAME) {
+            let (win, mut fib) = parking_fiber();
+            let (lo, hi) = win.fault_range();
+            let s = Shared {
+                fib: &mut fib,
+                mem: win.base(),
+                lo,
+                hi,
+            };
+            // SAFETY: the fiber's one residency; its exit aborts.
+            let _ = unsafe { reside(&s) };
+            unreachable!("the residency's exit aborts");
         }
-        let name = "mem::moved_scope_tests::a_scope_that_exits_on_another_thread_aborts_naming_that_threads_scope";
-        let out = std::process::Command::new(std::env::current_exe().expect("test binary"))
-            .args(["--exact", name, "--test-threads=1", "--nocapture"])
-            .env(CHILD, "1")
-            .output()
-            .expect("re-run the test binary");
-        let stderr = String::from_utf8_lossy(&out.stderr);
+        let (found, own) = child_abort(NAME);
+        assert!(found != own && found != "0x0", "found={found} own={own}");
+    }
+
+    /// R-TLS: a guarded call's exit reads the recovery state of the thread it returns on. Thread 1
+    /// resumes the fiber **bare** (no guarded call of its own), so it parks inside its nested call
+    /// `N` with nothing on thread 1 to exit over it, and thread 1's chain still names `N`. Thread 2
+    /// resumes it under a residency `R2`, so `N`'s exit runs on thread 2: it must read thread 2's
+    /// chain, find `R2` innermost, and abort (`found` = `R2`, `own` = `N`). An exit that read through
+    /// an address taken on thread 1 would find `N` itself there and not abort: the child would then
+    /// survive the exit, and the row fails. Thread 1 stays alive throughout, so the two threads share
+    /// no stack or TLS block.
+    #[test]
+    fn a_scope_that_exits_on_another_thread_reads_that_threads_chain() {
+        const NAME: &str = "a_scope_that_exits_on_another_thread_reads_that_threads_chain";
+        if is_child(NAME) {
+            let (win, mut fib) = parking_fiber();
+            let (lo, hi) = win.fault_range();
+            let s = Shared {
+                fib: &mut fib,
+                mem: win.base(),
+                lo,
+                hi,
+            };
+            let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+            let (s_tx, s_rx) = std::sync::mpsc::channel::<Shared>();
+            let t1 = std::thread::spawn(move || {
+                pal::install_guard();
+                // SAFETY: a bare resume: the fiber parks inside `N`, linked on this thread.
+                let st = unsafe { (*s.fib).resume(0) };
+                assert!(matches!(st, State::Yielded(0)));
+                s_tx.send(s).expect("hand the fiber on");
+                done_rx.recv().expect("thread 2 ends");
+            });
+            let s = s_rx.recv().expect("thread 1 parked the fiber");
+            std::thread::spawn(move || {
+                pal::install_guard();
+                // SAFETY: the fiber's residency on thread 2: `N` returns here, and its exit aborts.
+                let _ = unsafe { reside(&s) };
+            })
+            .join()
+            .expect("thread 2");
+            done_tx.send(()).expect("release thread 1");
+            t1.join().expect("thread 1");
+            unreachable!("N's exit on thread 2 aborts");
+        }
+        let (found, own) = child_abort(NAME);
         assert!(
-            !out.status.success(),
-            "the child must not survive: {stderr}"
-        );
-        let line = stderr
-            .lines()
-            .find(|l| l.contains("returned with another recovery scope innermost"))
-            .unwrap_or_else(|| panic!("no abort message from the child:\n{stderr}"));
-        assert!(
-            !line.contains("found=0x0 ") && !line.contains("found=0x0\n"),
-            "the exit read a recovery state other than the running thread's: {line}"
+            found != own && found != "0x0",
+            "the exit did not read thread 2's chain: found={found} own={own}"
         );
     }
 }
