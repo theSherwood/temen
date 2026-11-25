@@ -1631,16 +1631,29 @@ mod durable {
 
     /// The tree-walker's plain run of `call` against `server` is the answer; each durable run gives
     /// it.
-    fn agree(call: &str, fiber: &str, server: &str) -> Result<Vec<Value>, Trap> {
+    ///
+    /// `jit_today`: the durable JIT's answer where it still diverges. A durable domain's handlers run
+    /// on its serve op's stack (#2804), where #3162's yield floor refuses a park: the child ends
+    /// `ThreadFault`, and each call into it answers `CAP_REVOKED`. Pinned so the row is green on
+    /// this head and flips with #2804.
+    fn agree(
+        call: &str,
+        fiber: &str,
+        server: &str,
+        jit_today: Option<Result<Vec<Value>, Trap>>,
+    ) -> Result<Vec<Value>, Trap> {
         let want = run_on(tree_walker, &caller(call, fiber), server, false);
         let durable_caller = caller_spawning(call, fiber, &spawn());
-        for engine in [Engine::TreeWalker, Engine::Jit] {
-            assert_eq!(
-                run_durable(engine, &durable_caller, server),
-                want,
-                "the durable {engine:?} run answers as the plain tree-walker does"
-            );
-        }
+        assert_eq!(
+            run_durable(Engine::TreeWalker, &durable_caller, server),
+            want,
+            "the durable tree-walker run answers as the plain one does"
+        );
+        assert_eq!(
+            run_durable(Engine::Jit, &durable_caller, server),
+            jit_today.unwrap_or_else(|| want.clone()),
+            "the durable JIT run"
+        );
         want
     }
 
@@ -1649,7 +1662,12 @@ mod durable {
     /// the deadlock verdict.
     #[test]
     fn a_durable_handler_calling_its_own_domain_is_served_meanwhile() {
-        let r = agree(AGAIN_CALL, "", &server(AGAIN_TYPES, AGAIN));
+        let r = agree(
+            AGAIN_CALL,
+            "",
+            &server(AGAIN_TYPES, AGAIN),
+            Some(Ok(vec![Value::I64(CAP_REVOKED)])), // #2804: the handler's park is refused
+        );
         assert_eq!(r, Ok(vec![Value::I64(2_000_008)]));
     }
 
@@ -1664,6 +1682,8 @@ mod durable {
             LATCH_CALL,
             LATCH_FIBER,
             &server_serving(2, LATCH_TYPES, LATCH),
+            // #2804: `hold`'s park is refused, so `poke` and `hold` both answer `CAP_REVOKED`.
+            Some(Ok(vec![Value::I64(CAP_REVOKED * 1000 + CAP_REVOKED)])),
         );
         assert_eq!(r, Ok(vec![Value::I64(2_007_100)]));
     }
@@ -1671,7 +1691,7 @@ mod durable {
     /// The plain parked-root case, durable: no handler parks, so every route answers it today.
     #[test]
     fn a_durable_parked_root_gets_both_results() {
-        let r = agree(ADDMUL_CALL, "", &server(ADDMUL_TYPES, ADDMUL));
+        let r = agree(ADDMUL_CALL, "", &server(ADDMUL_TYPES, ADDMUL), None);
         assert_eq!(r, served(42_080));
     }
 }

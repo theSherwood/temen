@@ -1428,30 +1428,25 @@ mod pal {
         lo: usize,
         hi: usize,
     }
-    /// #3167 — a guarded call's scope, on its `run_guarded` frame: its recovery point and range, and
-    /// the scope that was innermost when it was entered. `GUARD` names the innermost (null: none).
-    struct Scope {
-        frame: Frame,
-        parent: *const Scope,
-    }
-
-    /// The innermost open scope on this thread. R-TLS (#3167): `#[inline(never)]`, as
-    /// `fiber_rt::current` is (#1466), so a read after the guarded call (which may switch stacks)
-    /// resolves the thread-local on the thread running then, not through an address kept from before.
+    /// The innermost open guarded call's frame on this thread (#3167: each `run_guarded` keeps its
+    /// own on its stack and its parent in a local, and links and unlinks it). R-TLS:
+    /// `#[inline(never)]`, as `fiber_rt::current` is (#1466), so a read after the guarded call (which
+    /// may switch stacks) resolves the thread-local on the thread running then, not through an
+    /// address kept from before.
     #[inline(never)]
-    fn guard_top() -> *const Scope {
+    fn guard_top() -> *const Frame {
         GUARD.with(|g| g.get())
     }
 
-    /// Make `s` the innermost open scope on this thread ([`guard_top`]'s rule).
+    /// Make `s` the innermost open guarded call's frame on this thread ([`guard_top`]'s rule).
     #[inline(never)]
-    fn set_guard_top(s: *const Scope) {
+    fn set_guard_top(s: *const Frame) {
         GUARD.with(|g| g.set(s));
     }
 
     thread_local! {
-        // The innermost open guarded call's scope (null ⇒ no guarded call). See [`Scope`].
-        static GUARD: Cell<*const Scope> = const { Cell::new(core::ptr::null()) };
+        // The innermost open guarded call's frame (null ⇒ no guarded call). See [`guard_top`].
+        static GUARD: Cell<*const Frame> = const { Cell::new(core::ptr::null()) };
         // #2996 — the active host access's window range + saved registers (`try_call`).
         static TRY: Cell<Option<Frame>> = const { Cell::new(None) };
         // §5 W3 trap-time backtrace: the faulting `(pc, frame-pointer-chain return addresses)` the VEH
@@ -1550,7 +1545,7 @@ mod pal {
                 return EXCEPTION_CONTINUE_EXECUTION;
             }
             // SAFETY: a non-null `GUARD` is an open scope on this thread's `run_guarded` frames.
-            if let Some(f) = GUARD.with(|g| g.get()).as_ref().map(|s| s.frame) {
+            if let Some(f) = GUARD.with(|g| g.get()).as_ref().copied() {
                 if addr >= f.lo && addr < f.hi && !host_fault(&*ep.ContextRecord, addr) {
                     // §5 W3: capture the trap-time backtrace from the faulting context *before*
                     // `resume_at_landing` below rewrites it.
@@ -1574,7 +1569,7 @@ mod pal {
             if let Some(f) = GUARD
                 .with(|g| g.get())
                 .as_ref()
-                .map(|s| s.frame)
+                .copied()
                 .filter(|_| !host_fault(&*ep.ContextRecord, pc))
             {
                 capture_trap_frame(&*ep.ContextRecord);
@@ -1736,7 +1731,7 @@ mod pal {
     /// innermost, so a stack switched out from under it with a scope of its own open (#3158). The
     /// yield floor (#3162) keeps any stack from doing so; this is its backstop, in every build.
     #[cold]
-    fn scope_open_above(found: *const Scope, own: *const Scope) -> ! {
+    fn scope_open_above(found: *const Frame, own: *const Frame) -> ! {
         use std::io::Write;
         let _ = writeln!(
             std::io::stderr(),
@@ -1774,17 +1769,14 @@ mod pal {
             xmm: [[0; 2]; 10],
         };
         let jb_ptr: *mut JmpBuf = &mut jb;
-        let scope = Scope {
-            frame: Frame { jb: jb_ptr, lo, hi },
-            parent,
-        };
+        let scope = Frame { jb: jb_ptr, lo, hi };
         set_guard_top(&scope);
-        // SAFETY: `f` honours the `Entry` ABI (the caller's contract); `jb` outlives the call, and
-        // the VEH reads it only while this scope is linked.
+        // SAFETY: `f` honours the `Entry` ABI (the caller's contract); `jb` and `scope` outlive the
+        // call, and the VEH reads them only while `scope` is linked.
         let tripped = temen_win_guarded_call(f, a, r, m, t, tc, jb_ptr) != 0;
         if tripped {
             restore_teb_stack_fields(teb); // undo a fiber-side fault's leftover TEB stack fields
-        } else if guard_top() != &scope as *const Scope {
+        } else if !std::ptr::eq(guard_top(), &scope) {
             scope_open_above(guard_top(), &scope);
         }
         set_guard_top(parent); // unlink: the parent's scope is innermost again
@@ -2815,7 +2807,10 @@ mod moved_scope_tests {
             .output()
             .expect("re-run the test binary");
         let stderr = String::from_utf8_lossy(&out.stderr);
-        assert!(!out.status.success(), "the child must not survive: {stderr}");
+        assert!(
+            !out.status.success(),
+            "the child must not survive: {stderr}"
+        );
         let line = stderr
             .lines()
             .find(|l| l.contains("returned with another recovery scope innermost"))
