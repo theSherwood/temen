@@ -37,7 +37,7 @@ use temen_interp::{
 // `WinShmBacking`) the JIT aliases into the window for §13.
 #[cfg(any(unix, windows))]
 use temen_interp::SharedBacking;
-use temen_ir::errno::{EAGAIN, EFAULT, EINVAL, ENOMEM, ENOSPC};
+use temen_ir::errno::{EAGAIN, EEXIST, EFAULT, EINVAL, ENOMEM, ENOSPC};
 /// D37 — the dead-callee errno: what a call through a live offer answers when its callee's serve
 /// loop is gone with the call unserved (death is revocation).
 const CAP_REVOKED: i64 = -9;
@@ -5606,21 +5606,19 @@ impl GuestMem for MprotectWindow {
     /// zero-filled — including **growth** into the reserved tail. The commit/zero/protect span the
     /// page range, not the raw `[offset, len)`, so the zeroing is page-granular and matches the
     /// interpreter's per-page `Mem::map` on any host page size (on a 16 KiB host, `len` may be a
-    /// fraction of a page).
+    /// fraction of a page). A range holding a §13 alias is refused, `-EEXIST`, nothing changed, as
+    /// the interpreter's is (#3173).
     fn map(&mut self, offset: u64, len: u64, prot: i32) -> i64 {
         let pages = match self.prot_pages(offset, len) {
             Ok(p) => p,
             Err(e) => return e,
         };
-        // The runs it changes (#2370), named before an alias it drops leaves the page map.
-        let runs = self.changed_runs(pages.clone(), prot);
-        // A §13 alias in the range is dropped first: the pages are the window's own from here on.
-        // Then zero them (a fresh commit reads zero; dropped rather than written, so they stay
-        // unbacked until touched) and apply the requested protection.
-        let e = self.drop_aliases(pages.clone());
-        if e != 0 {
-            return e;
+        if !self.alias_runs(pages.clone()).is_empty() {
+            return EEXIST;
         }
+        let runs = self.changed_runs(pages.clone(), prot);
+        // Zero them (a fresh commit reads zero; dropped rather than written, so they stay unbacked
+        // until touched) and apply the requested protection.
         self.reprotect(
             &runs,
             |w| w.narrow(pages, prot, |w, page| w.set_prot(page, prot, false)),

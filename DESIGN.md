@@ -1289,7 +1289,7 @@ and the same interface attenuates to window sub-ranges via `sub`. Window-relativ
 page-aligned offsets:
 | op | signature | semantics |
 |---|---|---|
-| 0 | `map(offset, len, prot: i32) -> i64` | commit pages; `prot` = `READ\|WRITE` (no `EXEC` — guest data is never executed as code, §3c) |
+| 0 | `map(offset, len, prot: i32) -> i64` | commit pages; `prot` = `READ\|WRITE` (no `EXEC` — guest data is never executed as code, §3c). A range holding a page a §13 region maps → `-EEXIST`, nothing changed: a heap that grows into a mapping fails there rather than replace it (#3173) |
 | 1 | `unmap(offset, len) -> i64` | decommit |
 | 2 | `protect(offset, len, prot: i32) -> i64` | change perms — backs the D40 read-only const segment |
 | 3 | `page_size() -> i64` | host MMU page granularity (the unit `map`/`unmap`/`protect` round to); lets a guest allocator align to the real host page (§4) |

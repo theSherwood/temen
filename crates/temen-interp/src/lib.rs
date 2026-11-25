@@ -21103,8 +21103,8 @@ fn builtin_iface_ops(id: u32) -> Option<&'static [(&'static str, FuncType)]> {
 /// `>= 0` is success. Errors do **not** trap — traps stay reserved for escape/fatal. The standard
 /// errnos come from the one shared table ([`temen_ir::errno`]); the aliases below are temen-interp's own.
 use temen_ir::errno::{
-    E2BIG, EACCES, EAGAIN, EBADF, EBUSY, ECHILD, EFAULT, EINTR, EINVAL, EMFILE, ENOEXEC, ENOMEM,
-    ENOSPC, EPIPE,
+    E2BIG, EACCES, EAGAIN, EBADF, EBUSY, ECHILD, EEXIST, EFAULT, EINTR, EINVAL, EMFILE, ENOEXEC,
+    ENOMEM, ENOSPC, EPIPE,
 };
 /// §3.6 revocation-unparks completion status (`-EBADF`): the errno a fiber's parked capability
 /// call returns when the handle it was parked through is revoked out from under it. Probeable
@@ -21816,7 +21816,9 @@ pub trait GuestMem {
 
     /// `Memory` capability ops (§3e): (re)commit / decommit / re-protect window pages. `offset`
     /// is page-aligned and `[offset, offset+len)` window-relative; `prot` is `READ|WRITE`. Each
-    /// returns `0` or a negative errno (`-EINVAL`). The default is a success no-op — overridden
+    /// returns `0` or a negative errno (`-EINVAL`). A `map` over a page a §13 region maps is
+    /// refused, `-EEXIST`, and changes nothing (#3173): only `unmap`, a `protect` to nothing or
+    /// the region's own `unmap` end an alias. The default is a success no-op — overridden
     /// by the interpreter's paged [`Mem`] (the reference semantics); a flat-window backend
     /// (e.g. a JIT) wires its own `mprotect`-backed implementation.
     fn map(&mut self, _offset: u64, _len: u64, _prot: i32) -> i64 {
@@ -40209,12 +40211,14 @@ impl GuestMem for Mem {
     /// §3e op 0 `map`: (re)commit pages with `prot`, zero-filling them (a fresh commit). Works
     /// anywhere in the reserved window `[0, reserved)` — including **growth** into the reserved
     /// tail `[mapped, reserved)`, the §1a sparse-address-space capability. Out-of-range /
-    /// misaligned → `-EINVAL`. Over a **growable** backing ([`Region::can_grow`] — a detached
-    /// child's own embedder memory, #1286; a cooperative run's relocatable window, #1312) a `map`
-    /// granting access asks the backing to cover the pages first, which [`Host::page_op`] charged
-    /// (#2407: one flat buffer, so it covers every page below them too); a refusal (the foreign
-    /// memory's `maximum`, or an allocator that cannot serve the buffer) is `-ENOMEM`, probeable,
-    /// before a byte of protection state changes. A `map` to no access commits nothing and grows
+    /// misaligned → `-EINVAL`. A range holding a §13 alias → `-EEXIST`, nothing changed (#3173):
+    /// the page is the region's, not the window's to commit, so a heap that grows into a mapping
+    /// fails there rather than replace it. Over a **growable** backing ([`Region::can_grow`] — a
+    /// detached child's own embedder memory, #1286; a cooperative run's relocatable window,
+    /// #1312) a `map` granting access asks the backing to cover the pages first, which
+    /// [`Host::page_op`] charged (#2407: one flat buffer, so it covers every page below them
+    /// too); a refusal (the foreign memory's `maximum`, or an allocator that cannot serve the
+    /// buffer) is `-ENOMEM`, probeable, before a byte of protection state changes. A `map` to no access commits nothing and grows
     /// nothing. (A **fixed** backing shorter than the reservation keeps its #1153 contract: the op
     /// succeeds and accesses past the backing are dropped/read zero — `region_backing_bound.rs`.
     /// So does a `protect` past a growable one.)
@@ -40223,6 +40227,11 @@ impl GuestMem for Mem {
             Ok(p) => p,
             Err(e) => return e,
         };
+        let aliased = (self.space_read().prot.range(pages.clone()))
+            .any(|(_, p)| matches!(p, PageProt::Backed { .. }));
+        if aliased {
+            return EEXIST;
+        }
         if prot & (PROT_READ | PROT_WRITE) != 0
             && self.back.can_grow()
             && !self.back.grow_to((pages.end() + 1) * self.page)
