@@ -2166,15 +2166,15 @@ fn a_quantum_ending_inside_a_handler_run_inline_on_a_pool_task_does_not_park_it(
 enum FiberCallsIn {
     /// G1: it calls the domain's `strm` export, which has the pre-seeded `Stream` shape and so the
     /// built-in id 0, below `GUEST_IMPL_BASE`.
-    ThroughABuiltinsId,
+    BuiltinsId,
     /// G2: it `Jit.invoke`s [`A_UNIT_THAT_CALLS_KEPT`], whose top level calls the domain's `kept()`;
     /// the domain holds `Jit` with no fiber-hosting grant.
-    ThroughAUnit,
+    InvokedUnit,
     /// H1: the domain makes no fiber. Its function 6 is a `gc.roots` op it never calls, which stands
     /// the JIT's fiber runtime up, so `define_extra` admits a unit's `cont.*` with no fiber-hosting
     /// grant. Its entry installs [`A_UNIT_WITH_A_FIBER_THAT_CALLS_KEPT`], and `outer()` reaches it by
     /// `call.dyn`: the unit's own fiber calls the domain's `kept()`.
-    ThroughAUnitsOwnFiber,
+    InstalledUnitsFiber,
 }
 
 /// #3080 (review H1) — an installed unit whose entry makes a fiber over its own function 1, resumes
@@ -2210,13 +2210,13 @@ fn fiber_offer_caller(how: FiberCallsIn) -> String {
     };
     let fiber_outer = "  vf = i32.const 6\n  vsp = i64.const 40960\n  vk = cont.new vf vsp\n  vz = i64.const 0\n  vs1, vv1 = cont.resume vk vz\n  vs2, vv2 = cont.resume vk vz\n  vs1w = i64.extend_i32_u vs1\n  vs2w = i64.extend_i32_u vs2\n  vm1 = i64.const 1000000\n  vm2 = i64.const 1000\n  va1 = i64.mul vs1w vm1\n  va2 = i64.mul vs2w vm2\n  vsum = i64.add va1 va2\n  vr = i64.add vsum vv2\n  return vr\n";
     let (body, blob, install, outer) = match how {
-        FiberCallsIn::ThroughABuiltinsId => (
+        FiberCallsIn::BuiltinsId => (
             "  va = i64.const 16500\n  vme = i32.load va\n  vz = i64.const 0\n  vr = call.cap 0 1 (i64, i64) -> (i64) vme (vz, vz)\n  return vr\n".to_string(),
             String::new(),
             String::new(),
             fiber_outer.to_string(),
         ),
-        FiberCallsIn::ThroughAUnit => {
+        FiberCallsIn::InvokedUnit => {
             let (blob, len) = unit_blob(A_UNIT_THAT_CALLS_KEPT);
             (
                 format!("  vj = i64.const 16520\n  vjit = i32.load vj\n  vb = i64.const 20480\n  vl = i64.const {len}\n  vu = call.cap 11 0 (i64, i64) -> (i64) vjit (vb, vl)\n  vr = call.cap 11 1 (i64) -> (i64) vjit (vu)\n  return vr\n"),
@@ -2225,7 +2225,7 @@ fn fiber_offer_caller(how: FiberCallsIn) -> String {
                 fiber_outer.to_string(),
             )
         }
-        FiberCallsIn::ThroughAUnitsOwnFiber => {
+        FiberCallsIn::InstalledUnitsFiber => {
             let (blob, len) = unit_blob(A_UNIT_WITH_A_FIBER_THAT_CALLS_KEPT);
             (
                 "  v0 = i64.const 0\n  v1 = i64.const 4096\n  vmask = i64.const -1\n  v2 = i64.const 0\n  v3 = i64.const 8\n  vr = gc.roots v0 v1 vmask v2 v3\n  return vr\n".to_string(),
@@ -2351,13 +2351,13 @@ fn fiber_offer_outer(on: Executor, how: FiberCallsIn) -> (Executor, Reply, u64) 
     bounded(move || {
         let m = module(&fiber_offer_caller(how));
         let give = match how {
-            FiberCallsIn::ThroughABuiltinsId => "strm",
-            FiberCallsIn::ThroughAUnit | FiberCallsIn::ThroughAUnitsOwnFiber => "exec",
+            FiberCallsIn::BuiltinsId => "strm",
+            FiberCallsIn::InvokedUnit | FiberCallsIn::InstalledUnitsFiber => "exec",
         };
         let (mut host, mut args) = child_host(&m, &offer_giver(give));
         args.push(Value::I32(match how {
-            FiberCallsIn::ThroughABuiltinsId => -1,
-            FiberCallsIn::ThroughAUnit | FiberCallsIn::ThroughAUnitsOwnFiber => {
+            FiberCallsIn::BuiltinsId => -1,
+            FiberCallsIn::InvokedUnit | FiberCallsIn::InstalledUnitsFiber => {
                 temen_run::grant_jit(&mut host, &m, 4)
             }
         }));
@@ -2380,7 +2380,7 @@ fn fiber_offer_outer(on: Executor, how: FiberCallsIn) -> (Executor, Reply, u64) 
 fn a_fibers_call_into_its_own_held_domain_through_a_builtins_id_is_held_by_the_tree_walker() {
     for on in [Executor::TreeWalker, Executor::Jit] {
         assert_eq!(
-            fiber_offer_outer(on, FiberCallsIn::ThroughABuiltinsId),
+            fiber_offer_outer(on, FiberCallsIn::BuiltinsId),
             (Executor::TreeWalker, Reply::Results(vec![3_003_000]), 2),
             "asked for {on:?}"
         );
@@ -2399,7 +2399,7 @@ fn a_fibers_call_into_its_own_held_domain_through_a_builtins_id_is_held_by_the_t
 fn a_fibers_unit_that_calls_into_its_own_held_domain_is_held_by_the_tree_walker() {
     for on in [Executor::TreeWalker, Executor::Jit] {
         assert_eq!(
-            fiber_offer_outer(on, FiberCallsIn::ThroughAUnit),
+            fiber_offer_outer(on, FiberCallsIn::InvokedUnit),
             (Executor::TreeWalker, Reply::Failed(CAP_REVOKED), 1),
             "asked for {on:?}"
         );
@@ -2419,7 +2419,7 @@ fn a_fibers_unit_that_calls_into_its_own_held_domain_is_held_by_the_tree_walker(
 fn a_units_own_fiber_that_calls_into_its_held_domain_is_held_by_the_tree_walker() {
     for on in [Executor::TreeWalker, Executor::Jit] {
         assert_eq!(
-            fiber_offer_outer(on, FiberCallsIn::ThroughAUnitsOwnFiber),
+            fiber_offer_outer(on, FiberCallsIn::InstalledUnitsFiber),
             (Executor::TreeWalker, Reply::Results(vec![3_003_000]), 3),
             "asked for {on:?}"
         );
