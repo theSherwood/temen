@@ -1766,3 +1766,107 @@ block 0 (v0: i64, v1: i64) {{
         "JIT: {jit:?}"
     );
 }
+
+/// [`frozen`], its window grown 16 pages past the declared memory and frozen under a 2^20
+/// reservation: a domain whose window has growth, as a flat grown window's freeze writes it.
+fn frozen_grown(inst: &Module) -> Vec<u8> {
+    let mut win = init_durable_window(WINDOW, TEST_ARENA);
+    write_state(&mut win, TEST_ARENA, STATE_UNWINDING);
+    let mut h = Host::new();
+    h.set_durable(true);
+    let mut fuel = 1_000_000u64;
+    let (r, mut snap) =
+        run_capture_reserved_with_host(inst, 0, &[], &mut fuel, &win, SIZE_LOG2, &mut h);
+    assert!(r.is_ok(), "{r:?}");
+    snap.resize(WINDOW + 16 * 4096, 0);
+    snap[WINDOW + 1] = 1;
+    let prots = vec![temen_snapshot::PageProt::Rw; snap.len() / 4096];
+    temen_snapshot::freeze_with_prots(inst, &snap, &prots, 20, &h).expect("freeze")
+}
+
+/// `root` carrying `k` live fork twins, each of whose own artifact is `twin`.
+fn with_twins(root: &[u8], twin: &[u8], k: u64) -> Vec<u8> {
+    bent(root, |r| {
+        for pid in 0..k {
+            r.twins.push(LiveTwin {
+                pid: 5 + pid,
+                entry: 0,
+                ctx: 5,
+                payload: TwinRest {
+                    servicer: true,
+                    names: Vec::new(),
+                    artifact: twin.to_vec(),
+                },
+            });
+        }
+    })
+}
+
+/// #3100 — the two checks apart. The root's declared window is charged past any ceiling at its
+/// activation (INVARIANTS #3), so the room is what the grant has past it. `decode`'s running sum of
+/// nested heads refuses at the head that passes that room (its `need` is the heads so far, not the
+/// cut's), before the rest is decoded; `windows_fit` refuses a cut whose heads fit and whose growth
+/// does not (its `need` is every nested window and every growth). Either leaves the host as it was.
+#[test]
+fn the_head_sum_and_the_whole_cut_refuse_apart() {
+    let inst = instrument(FIBERS);
+    let w = WINDOW as u64;
+    let root = frozen(&inst);
+    let restore = |art: &[u8], grant: u64| {
+        let mut h = Host::new();
+        h.set_mem_grant(grant as i64);
+        let fresh = {
+            let mut f = Host::new();
+            f.set_mem_grant(grant as i64);
+            f.restore_footprint()
+        };
+        let got = temen_snapshot::restore(art, &inst, &mut h).map(|_| ());
+        if got.is_err() {
+            assert!(
+                h.restore_footprint() == fresh,
+                "a refusal leaves the host as it was"
+            );
+        }
+        got
+    };
+    // Eight twins of a plain window: past the root's, the second head passes two windows less a page.
+    assert_eq!(
+        restore(&with_twins(&root, &root, 8), 3 * w - 4096),
+        Err(RestoreError::WindowOverBudget {
+            need: 2 * w,
+            room: 2 * w - 4096
+        }),
+        "the head sum"
+    );
+    // A root and two twins, each grown 64 KiB: room past the root for the two heads and one growth.
+    let grown = frozen_grown(&inst);
+    let growth = 16 * 4096;
+    let grant = 3 * w + growth;
+    assert_eq!(
+        restore(&with_twins(&grown, &grown, 2), grant),
+        Err(RestoreError::WindowOverBudget {
+            need: 2 * w + 3 * growth,
+            room: grant - w
+        }),
+        "the whole cut"
+    );
+    assert_eq!(
+        restore(&with_twins(&grown, &grown, 2), 3 * (w + growth)),
+        Ok(())
+    );
+}
+
+/// #3100 — a fork twin copies its parent's window, reservation and all: a twin reserved above its
+/// parent is refused. On `257f553` its thaw built the window in the reservation its artifact named.
+#[test]
+fn a_twin_reserved_above_its_parent_is_refused() {
+    let inst = instrument(FIBERS);
+    let art = with_twins(&frozen(&inst), &frozen_grown(&inst), 1);
+    assert_eq!(
+        temen_snapshot::restore(&art, &inst, &mut Host::new()).map(|_| ()),
+        Err(RestoreError::ReservationRefused {
+            asked: 20,
+            granted: SIZE_LOG2
+        })
+    );
+}

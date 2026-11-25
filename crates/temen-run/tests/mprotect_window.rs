@@ -21,6 +21,7 @@ use temen_interp::GuestMem;
 use temen_run::MprotectWindow;
 
 const ENOMEM: i64 = -12;
+const EEXIST: i64 = -17;
 const PROT_R: i32 = 1;
 const PROT_RW: i32 = 3;
 
@@ -182,9 +183,11 @@ fn a_refused_protection_change_fails_the_op_and_grants_the_host_nothing() {
     assert_eq!(w.read_bytes(ro, 1), Some(vec![0]));
 }
 
-/// #1707 — an op that ends a §13 alias (a `map` over it, a `protect(none)`) ends it in the hardware
-/// too, as `unmap` does, so the page is the window's own from then on, as on the interpreter: it
-/// reads zero and stops writing through, and the region keeps its bytes for every other mapping.
+/// #1707 — an op that ends a §13 alias (a `protect(none)`, an `unmap`) ends it in the hardware too,
+/// so the page is the window's own from then on, as on the interpreter: a `map` makes it read zero,
+/// it stops writing through, and the region keeps its bytes for every other mapping. A `map` over
+/// the live alias ends nothing: it is refused, `-EEXIST`, and the page still writes the region
+/// (#3173).
 #[test]
 fn ending_an_alias_leaves_the_region_alone() {
     let page = temen_interp::host_page_size() as usize;
@@ -193,7 +196,7 @@ fn ending_an_alias_leaves_the_region_alone() {
     let at = 20 * page;
     // SAFETY: the page at `at` is committed read/write at every access below.
     let p = unsafe { r.base.add(at) };
-    for (how, by_protect) in [("map over it", false), ("protect(none)", true)] {
+    for (how, by_protect) in [("protect(none)", true), ("unmap", false)] {
         let region = temen_run::new_shared_region(page).expect("a region");
         assert_eq!(
             w.map_region(at as u64, 0, page as u64, PROT_RW, 1, region.clone()),
@@ -201,8 +204,17 @@ fn ending_an_alias_leaves_the_region_alone() {
         );
         unsafe { p.write_volatile(0x11) };
         assert_eq!(region.read_byte(0), 0x11, "the alias writes the region");
+        assert_eq!(
+            w.map(at as u64, page as u64, PROT_RW),
+            EEXIST,
+            "a map over the live alias"
+        );
+        unsafe { p.write_volatile(0x33) };
+        assert_eq!(region.read_byte(0), 0x33, "the refused map left the alias");
         if by_protect {
             assert_eq!(w.protect(at as u64, page as u64, 0), 0);
+        } else {
+            assert_eq!(w.unmap(at as u64, page as u64), 0);
         }
         assert_eq!(w.map(at as u64, page as u64, PROT_RW), 0);
         assert_eq!(
@@ -213,7 +225,7 @@ fn ending_an_alias_leaves_the_region_alone() {
         unsafe { p.write_volatile(0x22) };
         assert_eq!(
             region.read_byte(0),
-            0x11,
+            0x33,
             "{how}: the window reached the region"
         );
         assert_eq!(w.unmap(at as u64, page as u64), 0);

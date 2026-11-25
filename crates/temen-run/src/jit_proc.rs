@@ -1173,9 +1173,13 @@ impl SendPtr {
 /// * a pipe **wake** (a write, or the last close of an end) rings the tree: a process blocked on
 ///   the other end may proceed.
 /// * a pipe **park** (a read of an empty pipe, or a write to a full one, with the other end open)
-///   in a vCPU's root context waits for the bell ([`tree_park`]): the other end may be another
-///   process's. A fiber parks alone and re-checks its pipe each time it is resumed, as outside a
-///   tree (#1952).
+///   waits for the bell ([`tree_park`]) where [`temen_jit::park_here`] answers `Thread`: the other
+///   end may be another process's. A fiber parks alone and re-checks its pipe each time it is
+///   resumed, as outside a tree (#1952). Below a guarded call's floor (`Refused`) the park fails
+///   closed, `ThreadFault`, as every refused park does.
+/// * #3158 — the gates below (`execve`, `fork`, `posix_spawn` of self) ask whether the call is the
+///   vCPU's root computation ([`temen_jit::at_root`]: no fiber on the stack, running or with a guarded
+///   call nested in its frames); the parks ask only how to park.
 /// * `execve` — admit and build the image through the one rule every engine shares
 ///   ([`Host::exec_image`]); admitted, park it and unwind the whole run
 ///   ([`temen_jit::HOST_UNWIND_CODE`]) — an image-replace never returns to its caller, so the
@@ -1190,7 +1194,7 @@ impl SendPtr {
 ///   unavailable here.
 /// * `posix_spawn` — start the process the op staged ([`Tree::spawn`]); the call completes with its
 ///   pid.
-/// * a blocking `waitpid` — in a root context, wait for the bell ([`tree_park`]) and run the op
+/// * a blocking `waitpid` — where no fiber can park, wait for the bell ([`tree_park`]) and run the op
 ///   again, which reaps a child that exited or waits on. In a fiber the op's `-ECHILD` stands, as on
 ///   the interpreters.
 /// * anything else — a blocking stdin read — parks as it would outside a tree
@@ -1225,8 +1229,27 @@ pub(crate) unsafe fn serve_request(
     if parks.wake_readers.is_some() || parks.wake_writers.is_some() {
         proc.tree.ring();
     }
-    let root = !temen_jit::fiber_active();
-    if root && (parks.read_park.is_some() || parks.write_park.is_some()) {
+    // #3158 — two questions. The process-tree gates (`exec`, `fork`, `spawn` of self) ask whether the
+    // code is the root computation: no fiber on this vCPU's stack, so not code a fiber's
+    // `Jit.invoke` runs either. The tree's parks ask how the park may be made (`park_here`): an OS
+    // vCPU's blocks its thread on the tree's bell, which another process's write rings; a fiber's
+    // parks alone (`host_park`); a pool task's code below a guarded call's yield floor, a serve
+    // handler's shell included (its context is its serving vCPU's, the process's), fails closed,
+    // since blocking the worker's thread on the bell could starve what would ring it.
+    let root = temen_jit::at_root();
+    let how = temen_jit::park_here();
+    let tree_parks = parks.read_park.is_some()
+        || parks.write_park.is_some()
+        || matches!(
+            parks.request,
+            Some(ParkEvent::TaskExit(_) | ParkEvent::TaskExitAny)
+        );
+    if tree_parks && how == temen_jit::ParkHere::Refused {
+        vm.raise(temen_jit::TrapKind::ThreadFault as i64);
+        return None;
+    }
+    let parks_the_thread = how == temen_jit::ParkHere::Thread;
+    if parks_the_thread && (parks.read_park.is_some() || parks.write_park.is_some()) {
         return tree_park(host, bell, vm, answer);
     }
     match parks.request.take() {
@@ -1276,7 +1299,7 @@ pub(crate) unsafe fn serve_request(
             }
             None
         }
-        Some(ParkEvent::TaskExit(_) | ParkEvent::TaskExitAny) if root => {
+        Some(ParkEvent::TaskExit(_) | ParkEvent::TaskExitAny) if parks_the_thread => {
             tree_park(host, bell, vm, answer)
         }
         _ => crate::host_park(host, &parks, stdin_park, mem_base, results, n_results, vm),

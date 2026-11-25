@@ -1079,6 +1079,9 @@ jobs:
           run_binary "$(cargo test -p temen $asan --test jit_fuel --no-run --message-format=json | exe jit_fuel)" ""
           run_binary "$(cargo test -p temen-run $asan --lib --no-run --message-format=json | exe temen_run)" "held::tests::"
           run_binary "$(cargo test -p temen-jit --features asan -Z build-std --target x86_64-unknown-linux-gnu --lib --no-run --message-format=json | exe temen_jit)" "child_exec::tests::"
+          # #3158 — a yield through a `Jit.invoke` must not park a fiber with the invoke's recovery
+          # scope open on its stack: before the barrier, a later guarded fault jumped there.
+          run_binary "$(cargo test -p temen $asan --test jit_cap --no-run --message-format=json | exe jit_cap)" "invoke_barrier_"
         env:
           # As the asan lane: -Zsanitizer=address replaces the workflow-global `-D warnings`, which
           # -Z build-std's recompiled std would trip.

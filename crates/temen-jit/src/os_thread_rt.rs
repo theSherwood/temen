@@ -405,15 +405,16 @@ pub enum HostPark {
     Ended,
 }
 
-/// #2164 — whose park a host call's is ([`park_host_call`]).
-#[cfg(not(loom))]
+/// #2164 — whose park a host call's is ([`park_host_call`]); #3158 — the kind of park every park
+/// door asks `fiber_rt::park_as` about.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Parks {
     /// The calling fiber's alone: a guest fiber yields `FIBER_PARKED` to its resumer, which runs on
-    /// (#1952). A host call's park, on every engine.
+    /// (#1952). A host call's park, and a futex wait, on every engine.
     Fiber,
-    /// The calling vCPU's, whatever fiber it is in: a demand-paged child's page fault, which blocks
-    /// its whole vCPU on every engine, as a join does (#2322).
+    /// The calling vCPU's, whatever fiber it is in: a demand-paged child's page fault, a join (of a
+    /// thread or a §14 child), a blocking resume of a parked fiber, a pool task's quantum end. It
+    /// blocks the whole vCPU on every engine (#2322); in a pool task, the task.
     Vcpu,
 }
 
@@ -485,7 +486,28 @@ unsafe fn park_host_call_here(
         Parks::Fiber => fiber_rt::ParkOn::Event,
         Parks::Vcpu => fiber_rt::ParkOn::Page,
     };
-    let slot = fiber_rt::current_fiber_slot().filter(|_| !on.blocks_vcpu() || fiber_rt::in_task());
+    let slot = match fiber_rt::park_as(parks) {
+        fiber_rt::ParkAs::Fiber(slot) => Some(slot),
+        fiber_rt::ParkAs::Thread => None,
+        // #3158 — a pool task below a guarded call's floor can park neither a fiber of its own nor
+        // the task: fail closed, before the park, where it would park. One that need not park
+        // answers as the thread's park below does, in its order: a kill or its domain's end (whose
+        // own code stands), an event already in, a landed freeze.
+        fiber_rt::ParkAs::Refused => {
+            if epoch_fired(vm.epoch as usize) || vm.ended().is_some() {
+                return HostPark::Ended;
+            }
+            if !still_parked() {
+                return HostPark::Woken;
+            }
+            if let Some(f) = frozen() {
+                f.mark_reissue();
+                return HostPark::Frozen;
+            }
+            vm.raise(crate::TrapKind::ThreadFault as i64);
+            return HostPark::Ended;
+        }
+    };
     if let Some(slot) = slot {
         let ended = || epoch_fired(vm.epoch as usize) || vm.ended().is_some();
         loop {
@@ -3118,26 +3140,29 @@ pub(crate) unsafe fn join_thread(
     // vCPU: the task root parks the *task* instead (as `fiber_resume_block` does). A guest fiber
     // inside the task fails closed rather than hold a worker the joined vCPU may need. (An
     // `Instantiator` join there parks the task through the fiber's resumers, #2322, a route this
-    // join could share: `ParkOn::Thread` is passed up the same way.)
-    let outcome = if fiber_rt::in_task() {
-        match fiber_rt::current_fiber_slot() {
-            Some(s) if s.is_platform() => task_join(dom, &s, done, vm),
-            _ => {
+    // join could share: `ParkOn::Thread` is passed up the same way.) #3158 — so does the task's code
+    // below a guarded call's yield floor, which cannot park the task whole, unless the outcome is
+    // already in: then there is no park to make.
+    let outcome = match fiber_rt::park_as(Parks::Vcpu) {
+        // An OS vCPU blocks its thread.
+        fiber_rt::ParkAs::Thread => {
+            let outcome = os_join(dom, cur, done, vm);
+            // Back from the park; re-take the lane before the guest runs again.
+            let epoch_addr = dom.env().epoch_addr;
+            if !dom.lane_acquire(&dom.lane_chain(), || {
+                epoch_fired(epoch_addr) || vm.ended().is_some()
+            }) {
                 vm.raise(TrapKind::ThreadFault as i64);
                 return 0;
             }
+            outcome
         }
-    } else {
-        let outcome = os_join(dom, cur, done, vm);
-        // Back from the park; re-take the lane before the guest runs again.
-        let epoch_addr = dom.env().epoch_addr;
-        if !dom.lane_acquire(&dom.lane_chain(), || {
-            epoch_fired(epoch_addr) || vm.ended().is_some()
-        }) {
+        fiber_rt::ParkAs::Fiber(s) if s.is_platform() => task_join(dom, &s, done, vm),
+        fiber_rt::ParkAs::Refused if lock(&done.state).is_some() => *lock(&done.state),
+        _ => {
             vm.raise(TrapKind::ThreadFault as i64);
             return 0;
         }
-        outcome
     };
     let Some((result, trap)) = outcome else {
         return 0; // killed, frozen or the domain ended: the join's trailing guards unwind
@@ -3371,17 +3396,44 @@ unsafe fn thread_wait_here(
     // resumer keeps running and sees `cont.resume` status `FIBER_PARKED`, exactly the tree-walk
     // oracle's fiber-park routing (`temen-interp/tests/fiber_parks.rs`; the timed-wait slice is
     // pinned by `temen/tests/fiber_timed_wait.rs`, the jacl consumer report).
-    if let Some(slot) = fiber_rt::current_fiber_slot() {
-        return fiber_futex_wait(
-            dom,
-            &slot,
-            phys,
-            expected & mask,
-            width,
-            deadline,
-            freeze,
-            vm,
-        );
+    match fiber_rt::park_as(Parks::Fiber) {
+        fiber_rt::ParkAs::Fiber(slot) => {
+            return fiber_futex_wait(
+                dom,
+                &slot,
+                phys,
+                expected & mask,
+                width,
+                deadline,
+                freeze,
+                vm,
+            );
+        }
+        fiber_rt::ParkAs::Thread => {}
+        // #3158 — a pool task below a guarded call's floor parks neither a fiber of its own nor the
+        // task. A wait that need not park answers as [`futex_wait`] does, in its order: a value that
+        // no longer matches, a kill or its domain's end (woken: its trailing guard unwinds, the
+        // kill's own code standing), a landed freeze, a deadline already reached. One that would
+        // park fails closed.
+        fiber_rt::ParkAs::Refused => {
+            return match read_phys(vm, phys, width) {
+                None => {
+                    vm.raise(crate::TrapKind::MemoryFault as i64);
+                    0
+                }
+                Some(v) if v & mask != expected & mask => WAIT_NOT_EQUAL,
+                Some(_) if epoch_fired(dom.env().epoch_addr) || vm.ended().is_some() => WAIT_WOKEN,
+                // SAFETY: a watched window is the run's, live while the run is.
+                Some(_) if freeze.is_some_and(|f| unsafe { f.landed() }) => {
+                    temen_ir::durable_abi::WAIT_FROZEN
+                }
+                Some(_) if deadline.is_some_and(|d| d <= Instant::now()) => WAIT_TIMED_OUT,
+                Some(_) => {
+                    vm.raise(crate::TrapKind::ThreadFault as i64);
+                    0
+                }
+            };
+        }
     }
     // #1904 — a wait that would park runs the deferred children first: the notifier may be one.
     match read_phys(vm, phys, width) {
@@ -3666,22 +3718,23 @@ pub(crate) unsafe extern "C" fn fiber_resume_block(
         // a vCPU of this Domain: its lanes and deadlock count are the task's, which the executor
         // keeps. So the task root parks the *task* on the one event park (counted, unless the
         // fiber waits on the outside, woken by every notify, poisoned at teardown) and re-polls
-        // when woken. A guest fiber inside the task fails closed rather than block a worker.
-        if fiber_rt::in_task() {
-            match fiber_rt::current_fiber_slot() {
-                Some(s) if s.is_platform() => {
-                    let on = if outside {
-                        fiber_rt::ParkOn::Outside
-                    } else {
-                        fiber_rt::ParkOn::Event
-                    };
-                    fiber_rt::fiber_event_park(&s, fiber_rt::park_deadline(handle), on);
-                    continue;
-                }
-                _ => {
-                    vm.raise(TrapKind::ThreadFault as i64);
-                    return value;
-                }
+        // when woken. A guest fiber inside the task, or the task's code below a guarded call's
+        // yield floor (#3158), fails closed rather than block a worker.
+        match fiber_rt::park_as(Parks::Vcpu) {
+            // An OS vCPU idles below.
+            fiber_rt::ParkAs::Thread => {}
+            fiber_rt::ParkAs::Fiber(s) if s.is_platform() => {
+                let on = if outside {
+                    fiber_rt::ParkOn::Outside
+                } else {
+                    fiber_rt::ParkOn::Event
+                };
+                fiber_rt::fiber_event_park(&s, fiber_rt::park_deadline(handle), on);
+                continue;
+            }
+            _ => {
+                vm.raise(TrapKind::ThreadFault as i64);
+                return value;
             }
         }
         // Still event-parked: idle under the run's futex lock until an event might wake the fiber,

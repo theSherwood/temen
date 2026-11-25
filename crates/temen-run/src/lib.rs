@@ -37,7 +37,7 @@ use temen_interp::{
 // `WinShmBacking`) the JIT aliases into the window for §13.
 #[cfg(any(unix, windows))]
 use temen_interp::SharedBacking;
-use temen_ir::errno::{EAGAIN, EFAULT, EINVAL, ENOMEM, ENOSPC};
+use temen_ir::errno::{EAGAIN, EEXIST, EFAULT, EINVAL, ENOMEM, ENOSPC};
 /// D37 — the dead-callee errno: what a call through a live offer answers when its callee's serve
 /// loop is gone with the call unserved (death is revocation).
 const CAP_REVOKED: i64 = -9;
@@ -248,7 +248,7 @@ pub unsafe extern "C" fn cap_thunk(
         }
         if let Some(id) = pending_id {
             let comps = (*(ctx as *mut Host)).completions();
-            let r = cap_wait(&comps, id, temen_jit::fiber_active(), vm);
+            let r = cap_wait(&comps, id, temen_jit::park_here(), vm);
             if vm.ended().is_none() {
                 *results = r;
             }
@@ -321,18 +321,21 @@ impl HostParkReq {
     }
 }
 
-/// F3, #2047 — wait for punted call `id`'s completion as a park. A fiber parks alone
+/// F3, #2047 — wait for punted call `id`'s completion as a park, as `how` says. A fiber parks alone
 /// ([`fiber_cap_wait`]); a vCPU waits outside the run with its lane given back
-/// ([`temen_jit::wait_outside`]). A run that ends meanwhile leaves the answer unclaimed and the
-/// trap cell set, so the caller writes no result.
+/// ([`temen_jit::wait_outside`]). #3158 — a pool task's code below a guarded call's yield floor
+/// fails closed (`ThreadFault`): it can park neither a fiber of its own nor the task, and blocking
+/// the worker's thread could starve the guest progress the answer may wait on (a punted job can
+/// wait on another vCPU or a child of the run). A run that ends meanwhile leaves the answer
+/// unclaimed and the trap cell set, so the caller writes no result.
 ///
 /// # Safety
-/// `vm` is the live call's context; with `fiber`, the call runs in a live fiber
-/// ([`fiber_cap_wait`]'s contract). The caller holds no lock the run's other vCPUs need.
+/// `vm` is the live call's context; with [`temen_jit::ParkHere::Fiber`], the call runs in a live
+/// fiber ([`fiber_cap_wait`]'s contract). The caller holds no lock the run's other vCPUs need.
 unsafe fn cap_wait(
     comps: &std::sync::Arc<temen_interp::Completions>,
     id: u64,
-    fiber: bool,
+    how: temen_jit::ParkHere,
     vm: &temen_jit::VmCtx,
 ) -> i64 {
     // #2958 slice 5 — a kernel vCPU's task parks on the call through its rules, which deliver the
@@ -343,8 +346,17 @@ unsafe fn cap_wait(
         // contract), on the cap thunk's own thread.
         return unsafe { jit_kernel::park_call(vm, park) }.map_or(0, |[r, _]| r);
     }
-    if fiber {
-        return fiber_cap_wait(comps, id, vm);
+    match how {
+        temen_jit::ParkHere::Fiber => return fiber_cap_wait(comps, id, vm),
+        temen_jit::ParkHere::Thread => {}
+        // A host-answered call is withdrawn, as a declined one is: its completer answers nothing
+        // and it stops counting in flight. A pool job's answer stays unclaimed for the sweep, as at
+        // a run's end.
+        temen_jit::ParkHere::Refused => {
+            comps.withdraw(id);
+            vm.raise(TrapKind::ThreadFault as i64);
+            return 0;
+        }
     }
     let roused = std::sync::Arc::clone(comps);
     temen_jit::wait_outside(vm, Box::new(move || roused.rouse()), |stop| {
@@ -949,9 +961,15 @@ pub unsafe extern "C" fn cap_thunk_locked(
             }
             // F3, #2047 — the lock is already released: wait as a park ([`cap_wait`]). A punt
             // inside a FIBER parks the fiber, so its vCPU keeps polling its other fibers; any other
-            // waits as its vCPU, with the vCPU's lane given back.
-            let fiber = n_results == 1 && temen_jit::fiber_active() && !durable;
-            let r = cap_wait(&comps, id, fiber, vm);
+            // waits as its vCPU, with the vCPU's lane given back. #3158 — a durable run's punt, and
+            // one whose result count is not 1, never park a fiber: they wait as main's did, whatever
+            // the floor, so they are decided first.
+            let how = if n_results != 1 || durable {
+                temen_jit::ParkHere::Thread
+            } else {
+                temen_jit::park_here()
+            };
+            let r = cap_wait(&comps, id, how, vm);
             if vm.ended().is_some() {
                 return;
             }
@@ -1797,7 +1815,7 @@ fn relaunch_payload(host: &mut Host, l: temen_interp::LiveDetached) -> temen_jit
         return temen_jit::JitDetached::Dropped;
     };
     // A thawed child's window is always a whole window, never a seed.
-    let temen_jit::WindowRestore { prots, tail } = jit_restore(&window).unwrap_or_default();
+    let restore = jit_restore(&window).unwrap_or_default();
     // A thaw never re-launches a demand-paged child on this engine (#2438).
     let child = grant_child(host, child, 0, 0, None);
     temen_jit::JitDetached::Relaunch(Box::new(temen_jit::CapturedSeed {
@@ -1811,8 +1829,7 @@ fn relaunch_payload(host: &mut Host, l: temen_interp::LiveDetached) -> temen_jit
             .unwrap_or(temen_ir::durable_abi::ShadowArena::EMPTY),
         digest: launch.digest,
         image: window.bytes().to_vec(),
-        prots,
-        tail,
+        restore,
         child,
         window: window_lease.map(|l| (l.budget, l.bytes, l.runs)),
         residue,
@@ -2868,7 +2885,11 @@ fn jit_restore(init: &temen_interp::MemLayout) -> Option<temen_jit::WindowRestor
             bytes: bytes.map(<[u8]>::to_vec),
         })
         .collect();
-    Some(temen_jit::WindowRestore { prots, tail })
+    Some(temen_jit::WindowRestore {
+        prots,
+        tail,
+        held: init.page_map().held_span(),
+    })
 }
 
 /// A captured page's protection as the JIT window re-applies it.
@@ -3022,8 +3043,9 @@ pub unsafe extern "C" fn grant_child_release(ctx: *mut c_void) {
             g.set_park_hub(0);
             if ended {
                 // #2164 — and the pager its faults called: it can no longer call one.
-                let mut providers = g.live_offer_providers();
-                providers.extend(g.take_jit_pager());
+                let offers = g.live_offer_providers().into_iter();
+                let mut providers: Vec<_> = offers.map(|p| (p, None)).collect();
+                providers.extend(g.take_jit_pager().map(|p| (p, g.jit_paging())));
                 providers
             } else {
                 Vec::new()
@@ -3031,8 +3053,14 @@ pub unsafe extern "C" fn grant_child_release(ctx: *mut c_void) {
         };
         // #1217 — the child's end releases every service domain it was a client of: a serve loop
         // parked in `svc.wait` there answers `0` and can reach its `join` (or its next wait does).
-        for p in providers {
+        // #3166 — its pager's lock also retires the window its page requests' sinks write into,
+        // before the window is freed (its task drops it after this teardown). Every vCPU of the
+        // child has ended by now, so a request still filed is one only its pager can reach.
+        for (p, paging) in providers {
             let mut g = p.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(paging) = paging {
+                paging.retire(&g);
+            }
             g.set_client_gone();
             ring(&g);
         }
@@ -3804,7 +3832,9 @@ unsafe fn park_until_rung(
 ///
 /// A sink writes into the child's window, which goes with the child, so a request the child stops
 /// waiting for (a kill, a teardown, a pager gone) is withdrawn before this returns. The settle and the
-/// withdrawal both run under the pager's lock, so no supply reaches the window once it has.
+/// withdrawal both run under the pager's lock, so no supply reaches the window once it has. A request
+/// whose waiter did not come back for it (#3166) the child's teardown makes harmless: it retires the
+/// window under the same lock ([`grant_child_release`]), and the sink writes nothing after.
 unsafe fn request_page(
     pager: &Mutex<Host>,
     export: u32,
@@ -3866,7 +3896,7 @@ pub unsafe extern "C" fn page_miss(vm: &temen_jit::VmCtx, off: u64, len: u64, fl
     }
     let base = vm.window().base;
     let cell = &*(vm.cap_ctx as *const Mutex<Host>);
-    let (win, mapped, pager) = {
+    let (win, paging, pager) = {
         let mut g = cell.lock().unwrap_or_else(|e| e.into_inner());
         let Some(paging) = g.jit_paging() else {
             return fault();
@@ -3874,8 +3904,9 @@ pub unsafe extern "C" fn page_miss(vm: &temen_jit::VmCtx, off: u64, len: u64, fl
         // The reservation the child's window was built with: the default, raised to the window.
         let reserved = (1u64 << temen_ir::default_reserved_log2()).max(paging.mapped);
         let win = MprotectWindow::of(&mut g, base, paging.mapped, reserved);
-        (win, paging.mapped, g.jit_pager())
+        (win, paging, g.jit_pager())
     };
+    let mapped = paging.mapped;
     let write = flags & temen_jit::PAGE_MISS_WRITE != 0;
     let pageable = flags & temen_jit::PAGE_MISS_FATAL == 0;
     let pg = win.page;
@@ -3889,7 +3920,7 @@ pub unsafe extern "C" fn page_miss(vm: &temen_jit::VmCtx, off: u64, len: u64, fl
                 return fault();
             };
             let sink = || {
-                temen_interp::PageSink::new(
+                paging.sink(
                     Box::new(PagedChild(win.clone())),
                     start,
                     pg.min(mapped - start),
@@ -3912,13 +3943,15 @@ pub unsafe extern "C" fn page_miss(vm: &temen_jit::VmCtx, _: u64, _: u64, _: u64
 }
 
 /// #2164 — a demand-paged JIT child's window as a page sink writes into it
-/// ([`temen_interp::ChildWindow`]): [`MprotectWindow::supply`].
+/// ([`temen_interp::ChildWindow`]): [`MprotectWindow::supply`], through
+/// [`temen_interp::JitPaging::sink`].
 #[cfg(any(unix, windows))]
 struct PagedChild(MprotectWindow);
 
 // SAFETY: the window's base is only written by `supply`, at a settle of the request this sink was
-// filed with. Its child waits on that request until it is settled or withdrawn ([`request_page`]),
-// both under its pager's lock, so the window is live for every settle that reaches the sink.
+// filed with, under its pager's lock, and only until the child's teardown retires the window
+// under that same lock, before it frees it ([`grant_child_release`], #3166). So every write lands
+// in a live window, whether or not the request's waiter is still there.
 #[cfg(any(unix, windows))]
 unsafe impl Send for PagedChild {}
 
@@ -4559,10 +4592,7 @@ fn grant_child(
                 })
             })
             .collect();
-        let paging = temen_interp::JitPaging {
-            table: Arc::clone(&table),
-            mapped,
-        };
+        let paging = temen_interp::JitPaging::new(Arc::clone(&table), mapped);
         child.set_jit_pager(spawner, export, paging);
         table.as_ptr()
     });
@@ -5593,21 +5623,19 @@ impl GuestMem for MprotectWindow {
     /// zero-filled — including **growth** into the reserved tail. The commit/zero/protect span the
     /// page range, not the raw `[offset, len)`, so the zeroing is page-granular and matches the
     /// interpreter's per-page `Mem::map` on any host page size (on a 16 KiB host, `len` may be a
-    /// fraction of a page).
+    /// fraction of a page). A range holding a §13 alias is refused, `-EEXIST`, nothing changed, as
+    /// the interpreter's is (#3173).
     fn map(&mut self, offset: u64, len: u64, prot: i32) -> i64 {
         let pages = match self.prot_pages(offset, len) {
             Ok(p) => p,
             Err(e) => return e,
         };
-        // The runs it changes (#2370), named before an alias it drops leaves the page map.
-        let runs = self.changed_runs(pages.clone(), prot);
-        // A §13 alias in the range is dropped first: the pages are the window's own from here on.
-        // Then zero them (a fresh commit reads zero; dropped rather than written, so they stay
-        // unbacked until touched) and apply the requested protection.
-        let e = self.drop_aliases(pages.clone());
-        if e != 0 {
-            return e;
+        if !self.alias_runs(pages.clone()).is_empty() {
+            return EEXIST;
         }
+        let runs = self.changed_runs(pages.clone(), prot);
+        // Zero them (a fresh commit reads zero; dropped rather than written, so they stay unbacked
+        // until touched) and apply the requested protection.
         self.reprotect(
             &runs,
             |w| w.narrow(pages, prot, |w, page| w.set_prot(page, prot, false)),
@@ -10482,5 +10510,91 @@ mod run_view_tests {
         let mut other = Host::new();
         let mut held = run.lease(&mut other, base, 4096, 1 << 16).expect("free");
         assert!(shares(&other, held.window()));
+    }
+}
+
+#[cfg(test)]
+mod paged_child_end_tests {
+    //! #3166 — a demand-paged JIT child's teardown retires the window its page requests' sinks
+    //! write into, so a request still queued with its pager then writes nothing.
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+
+    /// A child window that records whether a settle reached it.
+    struct Records(Arc<AtomicBool>);
+
+    impl temen_interp::ChildWindow for Records {
+        fn supply(&self, _: u64, _: &[u8]) -> bool {
+            self.0.store(true, SeqCst);
+            true
+        }
+    }
+
+    /// A pager's window, every byte of it 7.
+    struct Sevens;
+
+    impl temen_interp::GuestMem for Sevens {
+        fn read_bytes(&self, _: u64, len: u64) -> Option<Vec<u8>> {
+            Some(vec![7; len as usize])
+        }
+        fn write_bytes(&mut self, _: u64, _: &[u8]) -> Option<()> {
+            None
+        }
+    }
+
+    /// A request still queued when its child is torn down, through the teardown's own release
+    /// ([`grant_child_release`]): the pager's later serve of it, with bytes to copy, writes
+    /// nothing. Before the teardown the same serve writes.
+    #[test]
+    fn a_paged_childs_teardown_retires_its_window_for_requests_still_queued() {
+        let m = temen_text::parse_module(
+            "type 0 func (i64) -> (i64)
+type 1 interface { page: 0 }
+export 0 interface \"pager\" 1 { page: 1 }
+func () -> (i64) {
+block 0 () {
+  vz = i64.const 0
+  return vz
+  }
+}
+func (i64) -> (i64) {
+block 0 (va: i64) {
+  return va
+  }
+}
+",
+        )
+        .expect("parse");
+        let pager = Arc::new(Mutex::new(Host::new()));
+        pager.lock().unwrap().set_self_module(&Arc::new(m));
+        let paging = temen_interp::JitPaging::new(Arc::from(vec![]), 1 << 16);
+        let child = Arc::new(Mutex::new(Host::new()));
+        {
+            let mut c = child.lock().unwrap();
+            c.set_jit_pager(Arc::clone(&pager), 0, paging.clone());
+            c.set_serve_ctx(1); // a child still running: its first release is its end
+        }
+        let reached = Arc::new(AtomicBool::new(false));
+        let request = || {
+            let sink = paging.sink(Box::new(Records(Arc::clone(&reached))), 0, 4096, 0);
+            (pager.lock().unwrap().request_page(0, sink)).expect("the pager takes the request")
+        };
+        let serve = |ticket| pager.lock().unwrap().settle_page(ticket, 0, Some(&Sevens));
+        // Served while the child lives, the page is written.
+        assert_eq!(serve(request()), 0);
+        assert!(
+            reached.swap(false, SeqCst),
+            "a live child's page is written"
+        );
+        // Filed, then the child is torn down with it still queued.
+        let ticket = request();
+        let ctx = Arc::into_raw(Arc::clone(&child)) as *mut c_void;
+        // SAFETY: `ctx` is one counted ref of the child's powerbox, as its teardown releases it.
+        unsafe { grant_child_release(ctx) };
+        assert_eq!(serve(ticket), 0, "the serve answers as it would have");
+        assert!(
+            !reached.load(SeqCst),
+            "and writes nothing to the retired window"
+        );
     }
 }

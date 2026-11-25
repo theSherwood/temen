@@ -2153,3 +2153,478 @@ fn a_childs_own_trap_with_a_live_grandchild_refuses_the_freeze() {
 fn a_childs_fiber_that_fails_its_extent_check_ends_the_child() {
     own_trap_rides(&fiber_extent_nest(), 1);
 }
+
+/// [`CHILD`]'s loop, then a load 8 bytes past its declared 128 KiB, and a store and a load 64 KiB
+/// further: pages the child holds only as its artifact's head past the declared window (#3137), the
+/// first listed with a marker, the second unlisted (zero, writable), each in a host page of its own
+/// on any host.
+const SPAN_CHILD: &str = "memory 17 shadow 16448 65536
+func (i64, i64) -> (i64) {
+block 0 (v0: i64, va: i64) {
+  vas = i32.wrap_i64 va
+  vz = i64.const 0
+  vu = call.cap 5 1 (i64, i64) -> (i64) vas (vz, vz)
+  v1 = i64.const 0
+  v2 = i64.const 0
+  br 1(v1, v2)
+}
+block 1 (v3: i64, v4: i64) {
+  v5 = i64.const 100
+  v6 = i64.lt_s v3 v5
+  br_if v6 2(v3, v4) 3(v4)
+}
+block 2 (v7: i64, v8: i64) {
+  v9 = i64.add v8 v7
+  v10 = i64.const 1
+  v11 = i64.add v7 v10
+  br 1(v11, v9)
+}
+block 3 (v12: i64) {
+  vat = i64.const 131080
+  vm = i64.load vat
+  vzp = i64.const 196616
+  vthree = i64.const 3
+  i64.store vzp vthree
+  vz3 = i64.load vzp
+  vs = i64.add v12 vm
+  vr = i64.add vs vz3
+  return vr
+  }
+}
+";
+
+/// #3137 — a live detached child whose artifact's head runs past its declared window: the child,
+/// frozen on the JIT, is captured with a held span of 128 KiB past its declared 128 KiB, the first
+/// carrying a marker. Restored, it re-launches on the JIT (its window committing the span in one run,
+/// `WindowRestore::held` in its `CapturedSeed`) and on the tree-walker, reads the marker and writes and reads the unlisted
+/// page after its loop: 4950 + 7 + 3. Without the span committed in one run, the unlisted page is
+/// not committed (only a listed one is, page by page) and the store faults.
+#[test]
+fn a_detached_childs_held_span_thaws_on_the_jit_and_the_tree_walker() {
+    let parent = parent();
+    let child = confined(SPAN_CHILD);
+    let (mut fhost, fargs) = powerbox(&child);
+    let mut win = init_durable_window(1 << PARENT_LOG2, ARENA);
+    write_state(&mut win, ARENA, STATE_UNWINDING);
+    let froze = temen_run::jit_cap_run(
+        &parent,
+        0,
+        &fargs,
+        &MemLayout::image(win.to_vec()),
+        PARENT_LOG2,
+        0,
+        &mut fhost,
+        None,
+    );
+    let fsnap = match froze {
+        Ok((_, snap)) => snap,
+        Err(JitError::Unsupported(_)) => return, // a target without the child executor
+        Err(e) => panic!("JIT freeze: {e:?}"),
+    };
+    // The child's window, held as a restore of an artifact whose head runs past it holds it.
+    assert_eq!(
+        fhost.captured_detached().len(),
+        1,
+        "the live child was captured"
+    );
+    let c = &fhost.captured_detached()[0];
+    let declared = 1u64 << 17;
+    let mut page = vec![0u8; 4096];
+    page[8] = 7;
+    let mut window = c.window.clone();
+    window.hold_span(declared + 32 * 4096);
+    window.hold(declared, temen_interp::CapturedProt::Rw, Some(page));
+    let captured = temen_interp::CapturedDetached {
+        parent_task: c.parent_task,
+        slot: c.slot,
+        window,
+        reserved_log2: c.reserved_log2,
+        host: std::sync::Arc::clone(&c.host),
+        module: std::sync::Arc::clone(&c.module),
+        launch: c.launch.clone(),
+    };
+    fhost.set_captured_detached(vec![captured]);
+    let art = temen_snapshot::freeze(&parent, fsnap.bytes(), &fhost).expect("serialize");
+
+    let restore = || {
+        let mut h = Host::new();
+        h.set_durable(true);
+        h.grant_durable_module(&child);
+        let mut w = temen_snapshot::restore(&art, &parent, &mut h).expect("restore");
+        begin_thaw(&mut w, ARENA, 0);
+        (h, w)
+    };
+    let (mut thost, twin) = restore();
+    let (tout, _) = temen_run::jit_cap_run(
+        &parent,
+        0,
+        &fargs,
+        &MemLayout::image(twin.to_vec()),
+        PARENT_LOG2,
+        0,
+        &mut thost,
+        None,
+    )
+    .expect("JIT thaw");
+    assert_eq!(returned(tout), vec![4960], "the JIT's child reads its span");
+
+    let (mut ihost, iwin) = restore();
+    let iargs: Vec<Value> = fargs.iter().map(|&a| Value::I32(a as i32)).collect();
+    let mut fuel = 50_000_000u64;
+    let (ir, _) = run_capture_reserved_with_host(
+        &parent,
+        0,
+        &iargs,
+        &mut fuel,
+        &iwin,
+        PARENT_LOG2,
+        &mut ihost,
+    );
+    assert_eq!(
+        ir,
+        Ok(vec![Value::I64(4960)]),
+        "the tree-walker's child reads it"
+    );
+}
+
+/// #3158 — the parent [`serving_parent`] spawns a durable serving child ([`serving_child`]) detached,
+/// granting it a durable module as `"gcm"`, its freeze authority as `"freeze"` and a punting host
+/// procedure as `"prc"`, mints an offer over the child's export, calls
+/// `add(40, 2)` through it, joins the child, and returns the reply and the join's status and value.
+const SERVING_PARENT: &str = "memory 18 shadow 16448 65536
+type 0 func (i64, i64) -> (i64)
+type 1 interface { add: 0 }
+data 70000 \"gcm\"
+data 70008 \"freeze\"
+data 70016 \"prc\"
+func (i32, i32, i32, i32, i32, i32) -> (i64, i64, i64) {
+block 0 (v0: i32, v1: i32, v2: i32, v3: i32, v4: i32, v5: i32) {
+  vp0 = i64.const 70064
+  vpn = i32.const 70016
+  i32.store vp0 vpn
+  vp4 = i64.const 70068
+  vpl = i32.const 3
+  i32.store vp4 vpl
+  vp8 = i64.const 70072
+  i32.store vp8 v5
+  vp12 = i64.const 70076
+  vpz = i32.const 0
+  i32.store vp12 vpz
+  vf0 = i64.const 70048
+  vfn = i32.const 70008
+  i32.store vf0 vfn
+  vf4 = i64.const 70052
+  vfl = i32.const 6
+  i32.store vf4 vfl
+  vf8 = i64.const 70056
+  i32.store vf8 v4
+  vf12 = i64.const 70060
+  vfz = i32.const 0
+  i32.store vf12 vfz
+  vg0 = i64.const 70032
+  vgn = i32.const 70000
+  i32.store vg0 vgn
+  vg4 = i64.const 70036
+  vgl = i32.const 3
+  i32.store vg4 vgl
+  vg8 = i64.const 70040
+  i32.store vg8 v3
+  vg12 = i64.const 70044
+  vgz = i32.const 0
+  i32.store vg12 vgz
+  vrm = i64.const 65544
+  i32.store vrm v1
+  vrb = i64.const 65548
+  i32.store vrb v2
+  vrp = i64.const 65536
+  vc = call.cap 6 17 (i64) -> (i32) v0 (vrp)
+  vz = i64.const 0
+  voff = call.cap 6 14 (i32, i64) -> (i32) v0 (vc, vz)
+  va = i64.const 40
+  vb = i64.const 2
+  vr = call.cap 268435456 0 (i64, i64) -> (i64) voff (va, vb)
+  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) v0 (vc)
+  return vr vj_st vj
+  }
+}
+";
+
+/// [`SERVING_PARENT`] with its spawn record (its grant list is the three records at 70032),
+/// instrumented.
+fn serving_parent() -> temen_ir::Module {
+    let spawn = SpawnRec {
+        size_log2: 17,
+        grants_ptr: 70032,
+        grants_n: 3,
+        ..SpawnRec::default()
+    };
+    confined(&format!("{SERVING_PARENT}{}", rec::segment(65536, &spawn)))
+}
+
+/// #3158 — a durable serving child whose handler `add(a, b)` runs `handler`, which leaves an `i64`
+/// in `vh`, and answers `a + b + vh`. Its entry runs `pre` (which may use `v0`, its `Instantiator`),
+/// serves one call (`svc.wait`), and returns the count, 1. A durable domain runs its handlers on its
+/// serve op's own stack, each in a recovery scope of its own (`temen_jit::invoke_handler`; a handler
+/// fiber cannot ride a freeze yet, #2804).
+fn serving_child(pre: &str, handler: &str) -> temen_ir::Module {
+    confined(&format!(
+        "memory 17 shadow 16448 65536
+type 0 func (i64, i64) -> (i64)
+type 1 interface {{ add: 0 }}
+export 0 interface \"adder\" 1 {{ add: 1 }}
+data 90112 \"gcm\"
+data 90120 \"budget\"
+data 90128 \"prc\"
+func (i64, i64) -> (i64) {{
+block 0 (v0: i64, v1: i64) {{
+{pre}  vz = i32.const 0
+  vn = svc.wait vz
+  return vn
+  }}
+}}
+func (i64, i64) -> (i64) {{
+block 0 (va: i64, vb: i64) {{
+{handler}  vs = i64.add va vb
+  vr = i64.add vs vh
+  return vr
+  }}
+}}
+{rec}",
+        rec = spawn_rec(90240),
+    ))
+}
+
+/// The grandchild a [`serving_child`] may spawn: it returns 7 at once.
+const RETURNS_SEVEN: &str = "memory 17 shadow 16448 65536
+func (i64, i64) -> (i64) {
+block 0 (v0: i64, v1: i64) {
+  v7 = i64.const 7
+  return v7
+  }
+}
+";
+
+/// A handler body that waits on the word at 66000, expecting `expected`, for `timeout_ns`, and
+/// leaves 1000 times the wait's answer in `vh`.
+fn waiting_handler(expected: i32, timeout_ns: i64) -> String {
+    format!(
+        "  vp = i64.const 66000
+  vw0 = i32.const {expected}
+  vto = i64.const {timeout_ns}
+  vw = i32.atomic.wait vp vw0 vto
+  vw64 = i64.extend_i32_s vw
+  vk = i64.const 1000
+  vh = i64.mul vw64 vk
+"
+    )
+}
+
+/// The parent's answer to [`serving_child`]`(pre, handler)` on the oracle and on the JIT (`None` on a
+/// target without the child executor), on a thread of its own and bounded in time: a run that does
+/// not end fails rather than hangs.
+fn serve_on_both(
+    pre: &str,
+    handler: &str,
+) -> (Result<Vec<Value>, temen_interp::Trap>, Option<Vec<i64>>) {
+    let (pre, handler) = (pre.to_owned(), handler.to_owned());
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(serve_on_both_here(&pre, &handler));
+    });
+    rx.recv_timeout(std::time::Duration::from_secs(60))
+        .expect("both runs end")
+}
+
+fn serve_on_both_here(
+    pre: &str,
+    handler: &str,
+) -> (Result<Vec<Value>, temen_interp::Trap>, Option<Vec<i64>>) {
+    let parent = serving_parent();
+    let child = serving_child(pre, handler);
+    let grand = confined(RETURNS_SEVEN);
+    let win = init_durable_window(1 << PARENT_LOG2, ARENA);
+    let powerbox = || {
+        let (mut host, mut h) = powerbox(&child);
+        h.push(i64::from(host.grant_durable_module(&grand)));
+        h.push(i64::from(host.grant_freeze_authority()));
+        h.push(i64::from(host.grant_host_proc(punting_proc())));
+        (host, h)
+    };
+    let (mut host, h) = powerbox();
+    let args: Vec<Value> = h.iter().map(|&v| Value::I32(v as i32)).collect();
+    let mut fuel = 50_000_000u64;
+    let oracle =
+        run_capture_reserved_with_host(&parent, 0, &args, &mut fuel, &win, PARENT_LOG2, &mut host)
+            .0;
+    let (mut host, h) = powerbox();
+    let jit = match temen_run::jit_cap_run(
+        &parent,
+        0,
+        &h,
+        &MemLayout::image(win.to_vec()),
+        PARENT_LOG2,
+        0,
+        &mut host,
+        None,
+    ) {
+        Ok((o, _)) => Some(returned(o)),
+        Err(JitError::Unsupported(_)) => None, // a target without the child executor
+        Err(e) => panic!("JIT run failed: {e:?}"),
+    };
+    (oracle, jit)
+}
+
+/// #3158 — a durable §14 child runs on a pool task, and its handler runs on the serve op's stack, in a
+/// recovery scope nested in the task's frames. A park there would switch the task out with that scope
+/// still open, so the JIT refuses the park: here a wait with no deadline on a word nothing notifies.
+/// Neither engine's answer depends on a clock. The JIT's door decides on the value alone (equal, no
+/// deadline, no freeze): the child ends `ThreadFault`, the parent's call through the offer fails
+/// (`CAP_REVOKED`), and its join reads the trap. The oracle's handler parks, and with the parent
+/// parked in its call every vCPU of the run is blocked: the run's deadlock verdict, `ThreadFault`.
+/// The JIT's half is the stop-gap's divergence (decisions 33 and 35): #2804 gives a durable
+/// domain's handlers fibers of their own, off the serve op's stack, and the JIT then answers as the
+/// oracle does. Without the yield floor the JIT parks the task with the handler's scope open and
+/// reaches the oracle's verdict.
+#[test]
+fn a_durable_childs_handler_that_parks_ends_the_child_on_the_jit() {
+    let (oracle, jit) = serve_on_both("", &waiting_handler(0, -1));
+    assert_eq!(
+        oracle,
+        Err(temen_interp::Trap::ThreadFault),
+        "oracle: the handler parks, and every vCPU of the run is blocked"
+    );
+    if let Some(jit) = jit {
+        let thread_fault = temen_ir::trap_code::THREAD_FAULT;
+        assert_eq!(
+            jit,
+            vec![-9, thread_fault, 0], // -9: the call finds the callee gone (`CAP_REVOKED`)
+            "jit: the call fails, and the join reads the child's ThreadFault"
+        );
+    }
+}
+
+/// #3158 review S5 — the same handler's waits that need not park answer as the oracle's, on the JIT
+/// too: a word that does not hold the expected value (`WAIT_NOT_EQUAL`, 1), and a zero timeout
+/// (`WAIT_TIMED_OUT`, 2). Only a wait that would park is refused.
+#[test]
+fn a_durable_childs_handler_wait_that_need_not_park_answers_as_the_oracle() {
+    for (expected, timeout, answer) in [(5, -1, 1), (0, 0, 2)] {
+        let (oracle, jit) = serve_on_both("", &waiting_handler(expected, timeout));
+        let want = vec![40 + 2 + answer * 1000, 0, 1];
+        assert_eq!(
+            oracle,
+            Ok(want.iter().map(|&v| Value::I64(v)).collect()),
+            "oracle, expecting {expected} for {timeout} ns"
+        );
+        if let Some(jit) = jit {
+            assert_eq!(jit, want, "jit, expecting {expected} for {timeout} ns");
+        }
+    }
+}
+
+/// #3158 review S5 — the same handler's join of a child that has already ended answers its outcome
+/// on the JIT too, with no park to make. The serving child's entry spawns [`RETURNS_SEVEN`] and polls
+/// its status until it has ended; the handler joins it: `(0, 7)`.
+#[test]
+fn a_durable_childs_handler_join_of_an_ended_child_answers_as_the_oracle() {
+    let pre = "  vgp = i64.const 90112
+  vgl = i64.const 3
+  vgm = self.resolve vgp vgl
+  vbp = i64.const 90120
+  vbl = i64.const 6
+  vbg = self.resolve vbp vbl
+  vrm = i64.const 90248
+  i32.store vrm vgm
+  vrb = i64.const 90252
+  i32.store vrb vbg
+  vrp = i64.const 90240
+  vinst = i32.wrap_i64 v0
+  vg = call.cap 6 17 (i64) -> (i32) vinst (vrp)
+  vga = i64.const 66008
+  i32.store vga vg
+  vgi = i64.const 66012
+  i32.store vgi vinst
+  br 1(vinst, vg)
+}
+block 1 (vpi: i32, vpg: i32) {
+  vst = call.cap 6 9 (i32) -> (i32) vpi (vpg)
+  vzz = i32.const 0
+  vrun = i32.eq vst vzz
+  br_if vrun 1(vpi, vpg) 2()
+}
+block 2 () {
+";
+    let handler = "  vga = i64.const 66008
+  vg = i32.load vga
+  vgi = i64.const 66012
+  vinst = i32.load vgi
+  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) vinst (vg)
+  vk = i64.const 1000
+  vjk = i64.mul vj vk
+  vh = i64.add vjk vj_st
+";
+    let (oracle, jit) = serve_on_both(pre, handler);
+    let want = vec![40 + 2 + 7000, 0, 1];
+    assert_eq!(
+        oracle,
+        Ok(want.iter().map(|&v| Value::I64(v)).collect()),
+        "oracle"
+    );
+    if let Some(jit) = jit {
+        assert_eq!(jit, want, "jit");
+    }
+}
+
+/// A host procedure whose every call the host punts: its job answers the argument plus 100. Forkable,
+/// so a spawn can re-grant it to a child.
+fn punting_proc() -> temen_interp::HostProcGrant {
+    fn handler() -> temen_interp::ProcHandler {
+        temen_interp::ProcHandler::Offloadable(Box::new(|_op, args, _out| {
+            let a = *args.first().unwrap_or(&0);
+            temen_interp::OffloadOutcome::Offload(Box::new(move || a + 100))
+        }))
+    }
+    temen_interp::HostProcGrant::new(handler(), temen_interp::CapState::Stateless).forkable(
+        std::sync::Arc::new(|_| {
+            Some(temen_interp::ForkedProc {
+                handler: handler(),
+                signal: None,
+                refork: None,
+                exit: None,
+                exec_remap: None,
+                state: temen_interp::CapState::Stateless,
+                abandon: None,
+            })
+        }),
+    )
+}
+
+/// #3158 — punts that never parked a fiber on main keep main's path whatever the floor: a durable
+/// run's, and one whose result count is not 1, wait outside on the thread as they did. Here from a
+/// durable child's handler, below its serve op's guarded call: a punt that answers 5 + 100, and a
+/// zero-result punt. Both answer as on the oracle.
+#[test]
+fn a_durable_childs_handler_punts_answer_as_on_main() {
+    let resolve = "  vpp = i64.const 90128\n  vpl = i64.const 3\n  vph = self.resolve vpp vpl\n  vp5 = i64.const 5\n";
+    for (call, want) in [
+        (
+            "  vh = call.cap 13 0 (i64) -> (i64) vph (vp5)\n",
+            40 + 2 + 105,
+        ),
+        (
+            "  call.cap 13 0 (i64) -> () vph (vp5)\n  vh = i64.const 0\n",
+            40 + 2,
+        ),
+    ] {
+        let (oracle, jit) = serve_on_both("", &format!("{resolve}{call}"));
+        let want = vec![want, 0, 1];
+        assert_eq!(
+            oracle,
+            Ok(want.iter().map(|&v| Value::I64(v)).collect()),
+            "oracle: {call:?}"
+        );
+        if let Some(jit) = jit {
+            assert_eq!(jit, want, "jit: {call:?}");
+        }
+    }
+}

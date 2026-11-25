@@ -314,20 +314,58 @@ const NOT_RUNNING: u64 = u64::MAX;
 /// it, and nothing will: its slot stays `RUNNING`, so no claim takes it.
 const FAULTED: u64 = u64::MAX - 1;
 
-/// #3020 — how deep this thread's runtime is in resumes: its live resumes and its fibers'
-/// yielders. A guarded call records both as it starts, so a fault's recovery can tell the fibers it
-/// abandoned from those it returns into ([`abandon_after_fault`]).
-pub(crate) fn active_depth() -> (usize, usize) {
-    let rt = current();
-    if rt.is_null() {
-        (0, 0)
-    } else {
-        // SAFETY: `current()` is this thread's live runtime; the read is momentary.
-        unsafe { ((*rt).active_slots.len(), (*rt).yielders.len()) }
+/// #3158 — the yield floor a guarded call holds for its span ([`FiberRuntime::yield_floor`]),
+/// restored as it drops, however the call ends; and the resume depth it began at ([`Self::depth`]).
+pub(crate) struct YieldFloor(*mut FiberRuntime, usize, (usize, usize));
+
+impl YieldFloor {
+    /// #3020 — how deep this thread's runtime was in resumes as the call began: its live resumes and
+    /// its fibers' yielders, so a fault's recovery can tell the fibers it abandoned from those it
+    /// returns into ([`abandon_after_fault`]).
+    pub(crate) fn depth(&self) -> (usize, usize) {
+        self.2
     }
 }
 
-/// #3020 — a guarded call that started at resume depth `depth` ([`active_depth`]) faulted: its
+/// #3158 — raise this thread's runtime's yield floor to its yielders' depth, for a guarded call
+/// starting now. The guard's recovery state lives on the stack it was entered on (`trap_shim.c`),
+/// and only a scope's own exit restores the one it replaced; so no yield may switch a stack out
+/// from under a live scope. A fiber resumed inside the call yields above the floor, back into the
+/// call; a fiber whose frames hold the call is, to the call, the root computation.
+pub(crate) fn raise_yield_floor() -> YieldFloor {
+    let rt = current();
+    if rt.is_null() {
+        return YieldFloor(rt, 0, (0, 0));
+    }
+    // SAFETY: `current()` is this thread's live runtime, and it outlives the guarded call (the
+    // call's recovery assumes the same runtime at its entry and its end, see `mem::guarded`).
+    unsafe {
+        let prev = (*rt).yield_floor;
+        let depth = ((*rt).active_slots.len(), (*rt).yielders.len());
+        (*rt).yield_floor = depth.1;
+        YieldFloor(rt, prev, depth)
+    }
+}
+
+impl Drop for YieldFloor {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            // SAFETY: as at `raise_yield_floor`: the same live runtime, at the call's end.
+            unsafe { (*self.0).yield_floor = self.1 };
+        }
+    }
+}
+
+/// #3158 — the running fiber's yielder, for a yield: the top one, if it is above the yield floor.
+fn take_yielder(rt: &mut FiberRuntime) -> Option<*const Yielder> {
+    if rt.yielders.len() > rt.yield_floor {
+        rt.yielders.pop()
+    } else {
+        None
+    }
+}
+
+/// #3020 — a guarded call that started at resume depth `depth` ([`YieldFloor::depth`]) faulted: its
 /// recovery jumped out of every fiber resumed inside it, past each resume's return and each body's
 /// yielder pop. Mark each abandoned ([`FAULTED`]) and drop it, and its yielder, from this thread's
 /// runtime, so the two stacks stay in step and none names a stack the table's end frees.
@@ -400,6 +438,10 @@ pub(crate) struct FiberSlot {
     /// (a thaw re-creates the fiber from them). Immutable after creation.
     func: i32,
     arg0: i64,
+    /// #3166 — a task's platform slot ([`FiberSlot::platform`]), never a guest fiber's. Its own
+    /// fact, which only that constructor sets: `func` is the guest's `cont.new` operand, so no value
+    /// of it can mark a slot platform.
+    platform: bool,
     /// #1538 — the fiber's last `suspend` value was **consumed** (see `FrozenFiber::consumed`): set at
     /// each park (`!UNWINDING`) and at each guest claim of a suspended fiber (`UNWINDING`: the delivery
     /// is dropped by the freeze unwind); recorded into the freeze residue; restored by `seed_frozen`.
@@ -445,7 +487,7 @@ pub(crate) enum ParkOn {
     /// #2010 — an `Instantiator.join`: the joined child's end re-offers it.
     Child,
     /// #2164 — a demand-paged child's page fault: its own event, as [`ParkOn::Event`], but its
-    /// vCPU's park ([`crate::Parks::Vcpu`]).
+    /// vCPU's park ([`crate::os_thread_rt::Parks::Vcpu`]).
     Page,
     /// #2424 — a host call's answer from outside the run (a job on the embedder's offload pool,
     /// which may wait on the world): never counted blocked, as an OS vCPU waiting outside is not
@@ -740,14 +782,11 @@ impl FiberSlot {
     /// A durable child's shadow region is seeded per residency by the executor (#1361 step 4).
     pub(crate) fn platform(fiber: Fiber) -> Arc<FiberSlot> {
         let own = Ownership::new_owned_at(0);
-        Arc::new(FiberSlot::new(
-            own,
-            Some(Stack::bare(fiber)),
-            0,
-            -1,
-            0,
-            false,
-        ))
+        let slot = FiberSlot::new(own, Some(Stack::bare(fiber)), 0, 0, 0, false);
+        Arc::new(FiberSlot {
+            platform: true,
+            ..slot
+        })
     }
 
     /// A slot holding `fiber` (`None`: a free slot), owned per `own`, its shadow-SP at `shadow_sp`
@@ -768,6 +807,7 @@ impl FiberSlot {
             shadow_sp: AtomicU64::new(shadow_sp),
             func,
             arg0,
+            platform: false,
             consumed: AtomicBool::new(consumed),
             pending: Mutex::new(None),
             event_park: AtomicBool::new(false),
@@ -795,6 +835,7 @@ impl FiberSlot {
             shadow_sp: sp,
             func: fu,
             arg0: a0,
+            platform,
             consumed: c,
             pending,
             event_park,
@@ -806,6 +847,7 @@ impl FiberSlot {
         *f.get_mut().unwrap_or_else(|e| e.into_inner()) = fiber;
         *sp.get_mut() = shadow_sp;
         (*fu, *a0) = (func, arg0);
+        *platform = false;
         *c.get_mut() = consumed;
         *pending.get_mut().unwrap_or_else(|e| e.into_inner()) = None;
         *event_park.get_mut() = false;
@@ -816,7 +858,7 @@ impl FiberSlot {
     /// #1469 — whether this is a task's platform slot rather than a guest fiber's: the running
     /// code is a child root exactly when the innermost live resume is one.
     pub(crate) fn is_platform(&self) -> bool {
-        self.func == -1
+        self.platform
     }
 
     /// D66 — whether the task's last yield was an event park (a futex/join wait inside it), as the
@@ -1050,6 +1092,12 @@ pub(crate) struct FiberRuntime {
     /// returns, on this one OS thread). The futex thunk reads the top to fiber-park the
     /// RUNNING fiber ([`current_fiber_slot`]); empty means the root computation is running.
     active_slots: Vec<Arc<FiberSlot>>,
+    /// #3158 — the depth of `yielders` at the entry of the innermost live guarded call on this
+    /// runtime ([`raise_yield_floor`]). A yield takes only a yielder above it, and only a fiber
+    /// resumed above it is the running one ([`current_fiber_slot`]): a guarded call nested in a
+    /// fiber's frames (`Jit.invoke`, an inline handler) then cannot park that fiber with its
+    /// recovery scope still open on the fiber's stack, where a later fault would jump.
+    yield_floor: usize,
     /// The generated call-trampoline address (filled in after the module is finalized).
     call_tramp: Option<FiberCallTramp>,
     /// The structural type id every fiber entry must have (`(i64, i64) -> i64`), checked at
@@ -1112,6 +1160,7 @@ impl FiberRuntime {
             me,
             yielders: Vec::new(),
             active_slots: Vec::new(),
+            yield_floor: 0,
             call_tramp: None,
             fiber_type_id,
             fn_table_mask,
@@ -1698,10 +1747,20 @@ pub(crate) unsafe extern "C" fn fiber_resume(
             if slot.event_park.load(Ordering::Relaxed) {
                 let on = slot.parked_on();
                 if on.blocks_vcpu() {
-                    if let Some(own) = current_fiber_slot() {
-                        fiber_event_park(&own, slot.took_park_deadline(), on);
-                        arg = 0; // a park's poll delivers nothing (`fiber_event_park`)
-                        continue;
+                    match park_as(crate::os_thread_rt::Parks::Vcpu) {
+                        ParkAs::Fiber(own) => {
+                            fiber_event_park(&own, slot.took_park_deadline(), on);
+                            arg = 0; // a park's poll delivers nothing (`fiber_event_park`)
+                            continue;
+                        }
+                        ParkAs::Thread => {}
+                        // #3158 — unreachable: a whole-vCPU park in a task under a guarded call is
+                        // refused at its own door, before it is made. A backstop that fails closed
+                        // rather than report `FIBER_PARKED` for a park that blocks its vCPU.
+                        ParkAs::Refused => {
+                            debug_assert!(false, "a whole-vCPU park made under a guarded call");
+                            crate::VmCtx::at(vm).raise(TrapKind::ThreadFault as i64);
+                        }
                     }
                 }
             }
@@ -1843,10 +1902,12 @@ pub(crate) unsafe extern "C" fn fiber_suspend(value: i64, vm: u64) -> i64 {
     // switch sees *its* yielder on top.
     let y = {
         let rt = &mut *rt;
-        match rt.yielders.pop() {
+        match take_yielder(rt) {
             Some(y) => y,
             None => {
-                fault(vm); // root computation cannot suspend
+                // The root computation cannot suspend, nor a fiber whose frames hold a guarded
+                // call (#3158): a unit `Jit.invoke`d from it, as on the tree-walker.
+                fault(vm);
                 return 0;
             }
         }
@@ -1972,12 +2033,69 @@ pub(crate) unsafe fn runs_a_fiber(rt: *const FiberRuntime) -> bool {
 }
 
 pub(crate) fn current_fiber_slot() -> Option<Arc<FiberSlot>> {
+    match park_as(crate::os_thread_rt::Parks::Fiber) {
+        ParkAs::Fiber(slot) => Some(slot),
+        ParkAs::Thread | ParkAs::Refused => None,
+    }
+}
+
+/// #3158 — what a park made here may take: the one answer every park door asks, where the park is
+/// made (a wait that would not park asks nothing).
+pub(crate) enum ParkAs {
+    /// A fiber, `slot`: for a fiber's park, the running fiber, resumed above the yield floor; for a
+    /// whole-vCPU park in a task with no guarded call live in its frames, the running one, whose
+    /// park is handed up to the task's own (`fiber_resume`, #2322).
+    Fiber(Arc<FiberSlot>),
+    /// This OS thread: an OS vCPU's own, at its root, below a floor, or parking whole. The park
+    /// blocks it in place.
+    Thread,
+    /// None: a pool task's code below a floor, or a whole-vCPU park in a task with a guarded call
+    /// live in its frames (a fiber above the floor included). The task's root computation is its
+    /// fiber, which cannot park while that call's recovery scope is on its stack, and the worker
+    /// thread is not the vCPU's to block. The park fails closed (`ThreadFault`), before it is made.
+    Refused,
+}
+
+/// #3158 — [`ParkAs`] for a park of the running fiber alone, or of its whole vCPU
+/// ([`Parks::Vcpu`](crate::os_thread_rt::Parks::Vcpu): a page fault, a join, a quantum's end, each
+/// [`ParkOn::blocks_vcpu`]), made by the code running on this thread now.
+pub(crate) fn park_as(park: crate::os_thread_rt::Parks) -> ParkAs {
     let rt = current();
     if rt.is_null() {
-        return None;
+        return ParkAs::Thread;
     }
     // SAFETY: `current()` is this thread's live runtime; the borrow is momentary.
-    unsafe { (*rt).active_slots.last().cloned() }
+    let rt = unsafe { &*rt };
+    let task = rt.runs_task();
+    if park == crate::os_thread_rt::Parks::Vcpu {
+        // A task parks whole by parking itself, which only an empty floor lets it do (its
+        // residency's guard sets 0, below the task's own yielder; a nested guarded call raises it).
+        return match (task, rt.yield_floor, rt.active_slots.last()) {
+            (false, _, _) => ParkAs::Thread,
+            (true, 0, Some(slot)) => ParkAs::Fiber(Arc::clone(slot)),
+            (true, _, _) => ParkAs::Refused,
+        };
+    }
+    if rt.yielders.len() > rt.yield_floor {
+        if let Some(slot) = rt.active_slots.last() {
+            return ParkAs::Fiber(Arc::clone(slot));
+        }
+    }
+    if task {
+        ParkAs::Refused
+    } else {
+        ParkAs::Thread
+    }
+}
+
+/// #3158 — whether the code running here is its vCPU's root computation: no fiber is on this
+/// thread's stack, running or with a guarded call of the code's own nested in its frames. The
+/// process-tree gates ask this (`exec`, `fork`, `spawn` of self), as they asked before the yield
+/// floor. A park asks [`park_as`] instead.
+pub(crate) fn at_root() -> bool {
+    let rt = current();
+    // SAFETY: `current()` is this thread's live runtime; the borrow is momentary.
+    rt.is_null() || unsafe { (*rt).yielders.is_empty() }
 }
 
 /// §3.6 slice 5a — the **event-park yield**: hand control back to the resumer, which observes
@@ -1988,8 +2106,11 @@ pub(crate) fn current_fiber_slot() -> Option<Arc<FiberSlot>> {
 /// countdown stays backend-identical.
 ///
 /// # Safety
-/// Must be called from inside a running fiber, with `slot` = that fiber's own slot (the futex
-/// thunk resolves it via [`current_fiber_slot`]).
+/// Must be called from inside a running fiber, with `slot` = that fiber's own slot. Every caller
+/// takes `slot` from a [`ParkAs::Fiber`] answer of [`park_as`] on this thread with no guarded call
+/// begun since (#3158), so the take below cannot miss: for a fiber's park the answer is a fiber
+/// whose yielder is above the yield floor; for a whole-vCPU park it is a task's running context at
+/// floor 0, and a task's residency pushes the task's yielder above that floor.
 pub(crate) unsafe fn fiber_event_park(
     slot: &Arc<FiberSlot>,
     deadline: Option<Instant>,
@@ -1997,9 +2118,7 @@ pub(crate) unsafe fn fiber_event_park(
 ) {
     let y = {
         let rt = &mut *current();
-        rt.yielders
-            .pop()
-            .expect("event park only inside a running fiber")
+        take_yielder(rt).expect("event park only inside a running fiber")
     };
     slot.event_park.store(true, Ordering::Relaxed);
     // #1631 — published with the park marker and cleared with it, so the executor reading the seam
@@ -2050,11 +2169,17 @@ pub(crate) unsafe fn freeze_drive(rt: *mut FiberRuntime, vm: u64) {
     let table = Arc::clone(&(*rt).table);
     let mut status: i64 = 0;
     (*rt).flattening = true; // #1538: these resumes are placeholder deliveries, not guest claims
+                             // #3166 — and the root has unwound, so no frame of it is left for a root scan to read: one
+                             // driven from the host (a task's, `finish_child`) runs on no platform fiber, and its recorded
+                             // root top would name a stack this one is not. A flattening fiber runs no guest code (its poll
+                             // fires first), so no `gc.roots` comes here; this keeps the scan from depending on that.
+    let root = core::mem::take(&mut (*rt).root_entry_sp);
     for handle in table.runnable_handles() {
         // Resume under the in-progress UNWINDING state word: the fiber flattens itself, returns, and
         // its `Complete` arm records the residue into `rt.frozen`.
         fiber_resume(handle, 0, &mut status as *mut i64, vm);
     }
+    (*rt).root_entry_sp = root;
     (*rt).flattening = false;
     set_current(prev);
 }
@@ -2139,13 +2264,12 @@ pub(crate) unsafe fn seed_frozen_fibers(
     true
 }
 
-/// This frame's stack pointer (approximately): the address of a local, slightly **below** the
-/// caller's frame — a sound *low* bound for scanning the caller's live region upward. `inline(never)`
-/// + `black_box` keep the probe from being optimized away or hoisted.
+/// The stack pointer in this frame, **below** the caller's: a sound *low* bound for scanning the
+/// caller's live region upward ([`crate::stack_check::stack_pointer`], the register, not a local's
+/// address). `inline(never)`, so this frame is its own.
 #[inline(never)]
 fn current_sp() -> usize {
-    let probe = 0usize;
-    std::hint::black_box(&probe as *const usize as usize)
+    crate::stack_check::stack_pointer() as usize
 }
 
 /// Scan raw native-stack words in `[low, high)` (host byte addresses), inserting every 8-byte word
@@ -2177,6 +2301,79 @@ unsafe fn scan_words(
             out.insert(m);
         }
         p += 8;
+    }
+}
+
+/// #3166 — whether `[low, high)` is one stack's, the root computation's, as `gc_roots` scans it:
+/// `stacks` are the low bounds of the fiber stacks of this vCPU's resume chain, outermost first. A
+/// task's root (`task`) runs on its platform fiber, the outermost, so both ends lie on that stack;
+/// any other root runs on its OS thread's stack, so neither end lies on a fiber's. Either way
+/// `low <= high`.
+fn root_range_ok(
+    low: usize,
+    high: usize,
+    task: bool,
+    mut stacks: impl Iterator<Item = u64>,
+) -> bool {
+    let on = |stack_low: u64, addr: usize| {
+        let a = addr as u64;
+        a > stack_low && a - stack_low <= temen_ir::FIBER_STACK
+    };
+    low <= high
+        && match task {
+            true => stacks
+                .next()
+                .is_some_and(|root| on(root, low) && on(root, high)),
+            false => !stacks.any(|s| on(s, low) || on(s, high)),
+        }
+}
+
+#[cfg(test)]
+mod root_range_tests {
+    use super::root_range_ok;
+
+    const STACK: u64 = temen_ir::FIBER_STACK;
+
+    /// #3166 — the root's scan range: one stack's, or refused.
+    #[test]
+    fn a_root_scan_range_off_its_own_stack_is_refused() {
+        // A fiber stack at 1 MiB and an OS stack far above it.
+        let fiber = 1u64 << 20;
+        let (os_low, os_top) = (1usize << 40, (1usize << 40) + 4096);
+        let in_fiber = (fiber + 512) as usize;
+        let fiber_top = (fiber + STACK) as usize;
+        // An OS root: both ends on its own stack, off every fiber's.
+        assert!(root_range_ok(os_low, os_top, false, [fiber].into_iter()));
+        // Inverted.
+        assert!(!root_range_ok(os_top, os_low, false, [fiber].into_iter()));
+        // Across stacks: from a fiber's stack up to the OS stack's top (the forged slot's scan).
+        assert!(!root_range_ok(in_fiber, os_top, false, [fiber].into_iter()));
+        assert!(!root_range_ok(in_fiber, os_top, true, [fiber].into_iter()));
+        // A task's root: both ends on its platform fiber's stack, and only there.
+        assert!(root_range_ok(
+            in_fiber,
+            fiber_top,
+            true,
+            [fiber].into_iter()
+        ));
+        assert!(!root_range_ok(
+            in_fiber,
+            fiber_top,
+            false,
+            [fiber].into_iter()
+        ));
+        assert!(!root_range_ok(
+            in_fiber,
+            fiber_top,
+            true,
+            std::iter::empty()
+        ));
+        assert!(!root_range_ok(
+            fiber_top,
+            in_fiber,
+            true,
+            [fiber].into_iter()
+        ));
     }
 }
 
@@ -2243,6 +2440,14 @@ pub(crate) unsafe extern "C" fn gc_roots(vm: u64, args: *const GcRootsArgs) -> i
     // The window the buffer is confined to (#826: the **reserved** span bounds it), from the context.
     let w = *crate::VmCtx::at(vm).window();
     let (mem_base, mask, mapped) = (w.base as u64, w.reserved.saturating_sub(1), w.reserved);
+    // #3170 — the heap range is window offsets (GC.md §3), so it is clamped to the window: no
+    // reported word is at or above the reservation, as none of a guest heap pointer is. The
+    // interpreters take any `heap_hi`, so a clamp, not a trap. The scan reads raw native stack
+    // words, so this filters by value only: it keeps out every host address above the
+    // reservation, which is all of them where the host maps its image, stacks and heap high (a
+    // PIE build on Linux x86-64), but not one below it (as macOS arm64 can place them). That
+    // residual stays open on #3170.
+    let heap_hi = heap_hi.min(mapped);
     let rt = current();
     if rt.is_null() {
         fault(vm);
@@ -2340,6 +2545,16 @@ pub(crate) unsafe extern "C" fn gc_roots(vm: u64, args: *const GcRootsArgs) -> i
             None => current_sp(),
             Some(&y) => (*y).resumer_sp() as usize,
         };
+        // #3166 — the range is read word by word with no other bound, so it is checked first, and
+        // fails closed: a task's root range must lie on its platform fiber's stack, and any other
+        // root's must not touch a fiber stack of this resume chain ([`root_range_ok`]). A wrong
+        // answer about which stack is the root's is a trap, never a read across the host's memory.
+        // SAFETY: each yielder is live for its resume, as above.
+        let lows = rt.yielders.iter().map(|&y| unsafe { (*y).stack_low() });
+        if !root_range_ok(root_low, rt.root_entry_sp, rt.runs_task(), lows) {
+            fault(vm);
+            return 0;
+        }
         scan_words(
             root_low,
             rt.root_entry_sp,
@@ -2662,6 +2877,117 @@ mod flatten_claim_tests {
             Some(TrapKind::FiberFault as i64),
             "a generation the slot never reached is a forgery"
         );
+        set_current(prev);
+        // SAFETY: `rt` came from `Box::into_raw` above and is no longer published.
+        drop(unsafe { Box::from_raw(rt) });
+    }
+}
+
+/// #3158 — the yield floor's bookkeeping, on a published runtime with stand-in yielders (the floor
+/// only counts them; nothing here switches a stack).
+#[cfg(all(test, not(loom)))]
+mod yield_floor_tests {
+    use super::*;
+    use crate::os_thread_rt::Parks;
+    use temen_ir::durable_abi::ShadowArena;
+
+    /// A yielder the bookkeeping pushes and pops and never dereferences.
+    fn stand_in() -> *const Yielder {
+        core::ptr::NonNull::<Yielder>::dangling().as_ptr()
+    }
+
+    /// A guest fiber's slot (`cont.new`'s), with no stack: nothing resumes it.
+    fn a_guest_slot() -> Arc<FiberSlot> {
+        Arc::new(FiberSlot::new(
+            Ownership::new_owned_at(0),
+            None,
+            0,
+            1,
+            0,
+            false,
+        ))
+    }
+
+    fn a_task_slot() -> Arc<FiberSlot> {
+        // SAFETY: the body never runs: no resume switches into it.
+        let fiber = unsafe { make_task_fiber(64 << 10, |_| {}) }.expect("a stack");
+        FiberSlot::platform(fiber)
+    }
+
+    #[test]
+    fn a_guarded_call_holds_the_floor_for_its_span_and_a_fault_leaves_it_as_it_began() {
+        let fiber = |p| matches!(park_as(p), ParkAs::Fiber(_));
+        let thread = |p| matches!(park_as(p), ParkAs::Thread);
+        let refused = |p| matches!(park_as(p), ParkAs::Refused);
+        let table = Arc::new(SharedFiberTable::new(4, ShadowArena::EMPTY, None));
+        let rt = Box::into_raw(Box::new(FiberRuntime::new(table, 0, 0)));
+        let prev = set_current(rt);
+        // SAFETY: `rt` is published on this thread for the test and touched by nothing else.
+        let rt_ref = || unsafe { &mut *rt };
+        // A vCPU's root on its own thread, no fiber resumed: every park blocks the thread.
+        assert!(thread(Parks::Fiber) && thread(Parks::Vcpu) && at_root());
+        {
+            // Below a guarded call there too (a unit invoked from the root): still the thread's.
+            let _floor = raise_yield_floor();
+            assert!(thread(Parks::Fiber) && thread(Parks::Vcpu) && at_root());
+        }
+        // A guest fiber the vCPU resumed: it parks alone; a whole-vCPU park blocks the thread.
+        rt_ref().push_active(a_guest_slot());
+        rt_ref().yielders.push(stand_in());
+        assert!(fiber(Parks::Fiber) && thread(Parks::Vcpu) && !at_root());
+        rt_ref().active_slots.clear();
+        rt_ref().yielders.clear();
+        // A pool task running: its slot (the residency's resume) and its body's yielder.
+        rt_ref().push_active(a_task_slot());
+        rt_ref().yielders.push(stand_in());
+        assert!(
+            fiber(Parks::Fiber) && fiber(Parks::Vcpu),
+            "the task parks as its fiber"
+        );
+        assert!(!at_root());
+        {
+            // A guarded call nested in the task's frames (a unit `Jit.invoke`d, a handler run inline).
+            let floor = raise_yield_floor();
+            assert_eq!(floor.depth(), (1, 1));
+            assert_eq!(rt_ref().yield_floor, 1);
+            assert!(
+                refused(Parks::Fiber) && refused(Parks::Vcpu),
+                "the task cannot park whole"
+            );
+            assert!(current_fiber_slot().is_none());
+            assert!(
+                take_yielder(rt_ref()).is_none(),
+                "no yield takes the task's yielder"
+            );
+            assert_eq!(rt_ref().yielders.len(), 1);
+            // A fiber resumed inside the call runs above the floor: it may park alone, and yield,
+            // but not park the whole vCPU, which would park the task under the call's scope.
+            rt_ref().push_active(a_task_slot());
+            rt_ref().yielders.push(stand_in());
+            assert!(fiber(Parks::Fiber) && refused(Parks::Vcpu));
+            assert!(take_yielder(rt_ref()).is_some(), "its own yielder");
+            rt_ref().yielders.push(stand_in());
+            // A fault the call's guard catches: everything resumed inside it is dropped.
+            abandon_after_fault(floor.depth());
+            assert_eq!(
+                (rt_ref().active_slots.len(), rt_ref().yielders.len()),
+                (1, 1)
+            );
+        }
+        assert_eq!(
+            rt_ref().yield_floor,
+            0,
+            "the floor is the enclosing call's again"
+        );
+        assert!(fiber(Parks::Fiber) && fiber(Parks::Vcpu));
+        // No runtime of its own (a guarded call on a thread that publishes none): nothing to hold.
+        rt_ref().active_slots.clear();
+        rt_ref().yielders.clear();
+        set_current(core::ptr::null_mut());
+        let floor = raise_yield_floor();
+        assert_eq!(floor.depth(), (0, 0));
+        assert!(thread(Parks::Fiber) && thread(Parks::Vcpu) && at_root());
+        drop(floor);
         set_current(prev);
         // SAFETY: `rt` came from `Box::into_raw` above and is no longer published.
         drop(unsafe { Box::from_raw(rt) });

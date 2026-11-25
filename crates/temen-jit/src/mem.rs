@@ -192,11 +192,24 @@ impl GuestWindow {
         mapped: u64,
         init: &[u8],
         tail: &[crate::TailPage],
+        held: core::ops::Range<u64>,
     ) -> bool {
         if self.mapped == 0 {
             return true;
         }
         let page = crate::DURABLE_SNAPSHOT_PAGE as u64;
+        // #3137 — the held span, committed read-write in one run before its listed pages land on it.
+        let limit = (self.total - trailing_guard()) as u64;
+        let (lo, hi) = (held.start.max(mapped), held.end.min(limit));
+        if lo < hi {
+            let host = pal::page_size();
+            let start = (lo as usize / host) * host;
+            let end = round_up(hi as usize, host);
+            // SAFETY: `[start, end)` lies in the reservation below its guard page (clamped above).
+            if !unsafe { pal::commit_rw(self.base.add(start), end - start) } {
+                return false;
+            }
+        }
         let head = prots.iter().enumerate().map(|(i, &p)| {
             let off = i as u64 * page;
             (off, p, init.get(off as usize..).unwrap_or(&[]))
@@ -414,12 +427,13 @@ pub(crate) unsafe fn run_guarded(
 /// runtime (a spawned vCPU's, a child task's residency) runs under a guard of its own and restores
 /// the runtime on its way out, so a fault inside it is recovered, and its fibers marked, there.
 fn guarded(call: impl FnOnce() -> bool) -> bool {
+    // #3158 — no yield switches a stack out from under this call's recovery scope.
     #[cfg(fiber_rt)]
-    let depth = crate::fiber_rt::active_depth();
+    let floor = crate::fiber_rt::raise_yield_floor();
     let faulted = call();
     #[cfg(fiber_rt)]
     if faulted {
-        crate::fiber_rt::abandon_after_fault(depth);
+        crate::fiber_rt::abandon_after_fault(floor.depth());
     }
     faulted
 }
@@ -2323,10 +2337,10 @@ mod tests {
                 }
                 // A thaw commits the tail page the guest grew inside the inaccessible tail, and
                 // protects a read-only page inside the prefix.
-                if open.apply_prots(&grown, at(16), &[], &[]) {
+                if open.apply_prots(&grown, at(16), &[], &[], 0..0) {
                     wrong |= WRONG_THAW_TAIL;
                 }
-                if open.apply_prots(&ro, at(16), &[], &[]) {
+                if open.apply_prots(&ro, at(16), &[], &[], 0..0) {
                     wrong |= WRONG_THAW_RO;
                 }
                 // Re-opening the closed prefix for a snapshot, or committing past it for one, splits
@@ -2372,7 +2386,7 @@ mod tests {
         // Away from the limit, each one applies.
         assert!(open.protect(at(2), at(1), Prot::Ro));
         assert!(open.seed_null_guard(at(1)));
-        assert!(open.apply_prots(&grown, at(16), &[], &[]));
+        assert!(open.apply_prots(&grown, at(16), &[], &[], 0..0));
         assert!(closed.restore_rw());
         assert_eq!(closed.read_low(20 * page).map(|b| b.len()), Some(20 * page));
     }

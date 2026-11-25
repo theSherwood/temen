@@ -1233,6 +1233,148 @@ fn a_paged_childs_copy_pages_its_source_before_it_checks_its_destination() {
     }
 }
 
+/// #3166 — [`detached_pager_src`] at 20000, its child's body (func 1's, after `v0`) replaced by
+/// `body`, the parent's serve-then-join by `parent`, and `funcs` appended. Run on [`BACKENDS`]: the
+/// bytecode engine declines a child with threads or fibers to the tree-walker.
+fn paged_child_with(body: &str, parent: &str, funcs: &str) -> String {
+    let (serve_join, child_load) = (
+        "  vz = i32.const 0\n  vs = svc.wait vz\n  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) vh (vch)\n",
+        "  va = i64.const 20000\n  vb = i32.load8_u va\n  vbw = i64.extend_i32_u vb\n  return vbw\n",
+    );
+    let src = detached_pager_src(20000);
+    assert!(
+        src.contains(serve_join) && src.contains(child_load),
+        "the rewrites must apply"
+    );
+    src.replace(serve_join, parent).replace(child_load, body) + funcs
+}
+
+/// #3166 — a paged child's root returns while a vCPU it spawned still pages: the child's domain
+/// lives on, so its pager serves each of the vCPU's faults, after its parent has joined the root.
+/// The vCPU reads the first page's 77, then touches a second page. The parent joins the root (42),
+/// then polls until it has served both: `42 + 2 serves * 1000`, on every backend. (It polls: a
+/// `svc.wait` once the child is joined answers `0` while nothing is queued, #1217.) The child's end once withdrew its
+/// requests at the root's return: the vCPU's next request was refused, a `MemoryFault` in place of
+/// its page, and one already filed was dropped without a wake, so the parent polled forever. The
+/// run's fuel ends such a run (`OutOfFuel`), well inside the harness's bound.
+#[test]
+fn a_paged_childs_vcpu_is_served_after_its_root_returns() {
+    let src = paged_child_with(
+        "  vz = i64.const 0\n  vt = thread.spawn 3 vz vz\n  vbw = i64.const 42\n  return vbw\n",
+        "  vj_st0, vj0 = call.cap 6 1 (i32) -> (i64, i64) vh (vch)\n  vn0 = i64.const 0\n  \
+         br 1(vj_st0, vj0, vn0)\n}\nblock 1 (vst1: i64, vj1: i64, vn1: i64) {\n  \
+         vzp = i32.const 0\n  vp = svc.poll vzp\n  vn2 = i64.add vn1 vp\n  vtwo = i64.const 2\n  \
+         vmore = i64.lt_u vn2 vtwo\n  br_if vmore 1(vst1, vj1, vn2) 2(vst1, vj1, vn2)\n}\n\
+         block 2 (vj_st: i64, vj: i64, vs: i64) {\n",
+        "
+func 3 (i64, i64) -> (i64) {
+block 0 (vsp: i64, varg: i64) {
+  va = i64.const 20000
+  vb = i32.load8_u va
+  vk = i32.const 77
+  vok = i32.eq vb vk
+  br_if vok 1() 2()
+}
+block 1 () {
+  va2 = i64.const 60000
+  vb2 = i32.load8_u va2
+  vr = i64.extend_i32_u vb2
+  return vr
+}
+block 2 () {
+  vr2 = i64.const 0
+  return vr2
+  }
+}
+",
+    );
+    let cfg = || RunConfig {
+        limits: temen_run::Limits {
+            fuel: Some(FUEL),
+            ..temen_run::Limits::default()
+        },
+        ..RunConfig::default()
+    };
+    const FUEL: u64 = 200_000_000;
+    for b in BACKENDS {
+        assert_eq!(
+            run_detached_with(b, &src, 1 << 20, cfg()).expect("run"),
+            2042,
+            "{b:?}"
+        );
+    }
+}
+
+/// #3166 — a page fault inside a fiber on a paged child's vCPU blocks that vCPU in place until its
+/// pager serves the page, whatever funcref made the fiber. The vCPU makes a fiber from `funcref`,
+/// 7 or `-1`, both naming func 7, the last slot of the eight-slot table (funcs 4 to 6 fill it),
+/// which reads the page at 20000 (77) and returns it; the
+/// vCPU returns `status * 1000 + value` (1077), which the child's root joins and returns. The parent
+/// serves once: `1077 + 1 serve * 1000`, on every backend. The Cranelift JIT took the `-1` fiber
+/// for a pool task's own slot: its fault event-parked as a task's does, surfaced as
+/// `FIBER_PARKED`, and left its request filed past the child's end, for the parent's later serve to
+/// write into another child's window.
+#[test]
+fn a_page_fault_in_a_fiber_from_funcref_minus_one_blocks_its_vcpu() {
+    for funcref in [7, -1] {
+        let src = paged_child_with(
+            "  vz = i64.const 0\n  vt = thread.spawn 3 vz vz\n  vts, vbw = thread.join vt\n  return vbw\n",
+            "  vz = i32.const 0\n  vs = svc.wait vz\n  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) vh (vch)\n",
+            &format!(
+                "
+func 3 (i64, i64) -> (i64) {{
+block 0 (vsp: i64, varg: i64) {{
+  vz = i64.const 0
+  vf = i32.const {funcref}
+  vk = cont.new vf vz
+  vs, vv = cont.resume vk vz
+  vs64 = i64.extend_i32_s vs
+  vk1000 = i64.const 1000
+  vx = i64.mul vs64 vk1000
+  vr = i64.add vx vv
+  return vr
+  }}
+}}
+
+func 4 (i64, i64) -> (i64) {{
+block 0 (va: i64, vb: i64) {{
+  return va
+  }}
+}}
+
+func 5 (i64, i64) -> (i64) {{
+block 0 (va: i64, vb: i64) {{
+  return va
+  }}
+}}
+
+func 6 (i64, i64) -> (i64) {{
+block 0 (va: i64, vb: i64) {{
+  return va
+  }}
+}}
+
+func 7 (i64, i64) -> (i64) {{
+block 0 (vsp: i64, varg: i64) {{
+  va = i64.const 20000
+  vb = i32.load8_u va
+  vr = i64.extend_i32_u vb
+  return vr
+  }}
+}}
+"
+            ),
+        );
+        for b in BACKENDS {
+            assert_eq!(
+                run_detached(b, &src).expect("run"),
+                2077,
+                "{b:?}, funcref {funcref}"
+            );
+        }
+    }
+}
+
 /// #2164 — an atomic on an unsupplied page is paged in, as a load is, on every driver: the
 /// read-modify-write checks its word's alignment, then pages the word in (the interpreters' order),
 /// then adds to the pager's 77. The child returns the old value.
