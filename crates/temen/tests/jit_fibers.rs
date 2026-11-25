@@ -55,8 +55,8 @@ fn assert_jit_matches_interp(src: &str) {
 }
 
 /// #3078 — each case whose entry is `() -> (i64)` also runs on the kernel route, inside one
-/// `thread.spawn`ed vCPU (`support/kernel_lane.rs`), unmetered, and answers as the oracle's run of
-/// that program. Its metered runs are `jit_fuel`'s sweeps (#3080).
+/// `thread.spawn`ed vCPU (`support/kernel_lane.rs`), metered and unmetered, and answers as the
+/// oracle's run of that program. The fuel it charges is `jit_fuel`'s sweeps' (#3080).
 fn in_a_thread_on_the_kernel_route(src: &str, m: &temen_ir::Module) {
     let entry = &m.funcs[0];
     if !entry.params.is_empty() || entry.results != [temen_ir::ValType::I64] {

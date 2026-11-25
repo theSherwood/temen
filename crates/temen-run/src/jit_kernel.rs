@@ -587,7 +587,8 @@ type CallPayload = Option<CallPark>;
 
 /// #2958 slice 5 — hand `park`, what a call the vCPU on `vm` just made left it to do
 /// ([`temen_interp::bytecode::call_park`]), to its task's rules ([`EmittedCall::park_call`]): `None`
-/// when `vm` is no kernel vCPU's. A call's park in a fiber traps `Malformed` (`fiber parks`).
+/// when `vm` is no kernel vCPU's. A call's park in one of the vCPU's own fibers traps `Malformed`
+/// (`fiber parks` keeps it unreachable), whatever `fiber_rt::park_as` would answer there.
 ///
 /// # Safety
 /// As [`temen_jit::kernel_rt::park_call`]'s: the caller is the cap thunk of code running on `vm`, on

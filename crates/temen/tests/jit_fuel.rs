@@ -1029,6 +1029,11 @@ block 1 (vi: i64) {
 /// version a debug build aborts first on its assertion that a recycled cell is empty, and a release
 /// build under ASan reports nothing, since ASan does not see the JIT's code touch the freed cell. It
 /// pins the run's end alike on the tree-walker and the JIT, with that context in the pool.
+///
+/// #3078 slice 3 — the kernel route admits the program metered (its threads' and its fiber's waits
+/// are the kernel's), so it runs there too and ends as the oracle does. Its charge is not compared,
+/// on any route: B resumes the fiber in an endless loop until the refused spawn's trap ends the
+/// run, so what it burns is the scheduler's timing.
 #[test]
 fn jit_fuel_a_refused_spawn_frees_no_context_a_fiber_charges() {
     let m = parse_module(A_REFUSED_SPAWN_UNDER_A_RUNNING_FIBER).expect("parse");
@@ -1037,13 +1042,35 @@ fn jit_fuel_a_refused_spawn_frees_no_context_a_fiber_charges() {
     assert_eq!(run(&m, 0, &[], &mut tw_left), Err(Trap::ThreadFault));
     let (jit, _) = jit_fuel(A_REFUSED_SPAWN_UNDER_A_RUNNING_FIBER, &[], 1 << 40);
     assert_eq!(jit, JitOutcome::Trapped(TrapKind::ThreadFault));
+    let mut host = temen_interp::Host::new();
+    let admitted = temen_run::jit_kernel::admit(&m, &host, false).expect("in the kernel's scope");
+    let start = temen_run::jit_kernel::Start {
+        entry: 0,
+        args: &[],
+        init_mem: &[],
+        init: None,
+        reserved_log2: temen_ir::DEFAULT_RESERVED_LOG2,
+        fuel: 1 << 40,
+        snapshot_cap: None,
+        kill: None,
+    };
+    let end = temen_run::jit_kernel::run(admitted, start, &mut host).expect("compiles");
+    assert!(
+        end.vcpus >= 1,
+        "it ran on the kernel route, as kernel tasks"
+    );
+    assert_eq!(
+        end.outcome().0,
+        JitOutcome::Trapped(TrapKind::ThreadFault),
+        "the kernel route"
+    );
 }
 
 /// #3080 — where the kernel route stands on fibers: a metered run of a module that uses them is in
 /// its scope (`fiber fuel` is gone, since a fiber charges the vCPU that runs it). Fiber-only modules
-/// keep their single-vCPU path (`fiber only`). Since #3078 slice 3 a fiber's wait is the kernel's
-/// too, so a module whose fibers wait is admitted; only a call that can park in a fiber keeps
-/// today's route (`fiber parks`).
+/// keep their single-vCPU path (`fiber only`). Since #3078 slice 3 a module with fibers whose code
+/// waits is admitted too. (`fiber parks`, now a call that can park in a fiber, is `jit_kernel.rs`'s
+/// clause row's.)
 #[test]
 fn jit_fuel_the_kernel_route_admits_a_metered_fiber_run() {
     use temen_run::jit_kernel;
@@ -1053,7 +1080,7 @@ fn jit_fuel_the_kernel_route_admits_a_metered_fiber_run() {
         jit_kernel::admit(&m, &temen_interp::Host::new(), false).err()
     };
     assert_eq!(declined(A_FIBER_OUTLIVES_ITS_VCPU), None);
-    // Its threads wait forever, which a fiber's wait no longer keeps off the kernel (#3078 slice 3).
+    // A module with fibers that waits (here its threads do): `fiber parks` until #3078 slice 3.
     assert_eq!(declined(A_REFUSED_SPAWN_UNDER_A_RUNNING_FIBER), None);
     assert_eq!(declined(&fibers_suspending(3, 2)), Some("fiber only"));
     assert_eq!(declined(&busy_poll(Some(3))), Some("fiber only"));
@@ -1160,9 +1187,9 @@ fn jit_fuel_a_nested_fiber_that_migrates_charges_its_new_vcpu() {
 }
 
 /// #3078 slice 3 — a fiber that waits, on two vCPUs. The root makes a fiber and resumes it: the
-/// fiber counts 3 back-edges, then waits untimed on 16384, which holds 0, so the root's resume
-/// answers `FIBER_PARKED` (3). A thread stores 1 there, notifies it, and resumes the fiber, which
-/// it claims: the fiber counts 3 more back-edges on the thread and returns 7, which the thread
+/// fiber counts to 3 (two back-edges), then waits untimed on 16384, which holds 0, so the root's
+/// resume answers `FIBER_PARKED` (3). A thread stores 1 there, notifies it, and resumes the fiber,
+/// which it claims: the fiber counts to 3 again on the thread and returns 7, which the thread
 /// returns. The root joins it and returns `status * 100 + value`, 307.
 const A_FIBER_WAITS_AND_IS_CLAIMED_ON_ANOTHER_VCPU: &str = "memory 16
 func () -> (i64) {

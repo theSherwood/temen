@@ -3984,6 +3984,12 @@ fn c_guest_fiber_scheduler_demos_take_the_kernel_route() {
                 cfg.limits.fuel
             );
             assert_eq!(run.stdout, want, "{:?}", run.outcome);
+            assert!(
+                matches!(&run.outcome, temen_run::Outcome::Returned(v)
+                    if v[..] == [temen_interp::Value::I32(0)]),
+                "main returns 0: {:?}",
+                run.outcome
+            );
         }
     }
 }

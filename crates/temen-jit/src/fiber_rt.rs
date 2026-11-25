@@ -3000,6 +3000,17 @@ mod flatten_claim_tests {
     }
 }
 
+/// A test's stand-in for a guest fiber `rt` is running now: a `cont.new` slot (with no stack:
+/// nothing resumes it) as the innermost resume, and its yielder above the floor (one the bookkeeping
+/// never dereferences), as a guest fiber of the vCPU is when it makes an op.
+#[cfg(all(test, not(loom)))]
+pub(crate) fn stand_in_running_guest_fiber(rt: &mut FiberRuntime) {
+    let slot = FiberSlot::new(Ownership::new_owned_at(0), None, 0, 1, 0, false);
+    rt.push_active(Arc::new(slot));
+    rt.yielders
+        .push(core::ptr::NonNull::<Yielder>::dangling().as_ptr());
+}
+
 /// #3158 — the yield floor's bookkeeping, on a published runtime with stand-in yielders (the floor
 /// only counts them; nothing here switches a stack).
 #[cfg(all(test, not(loom)))]

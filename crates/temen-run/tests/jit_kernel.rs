@@ -4928,8 +4928,8 @@ block 0 (va: i64, vb: i64) {{
     }
 
     /// #3078 slice 2 — `cont.resume.block` on the kernel route, state by state, as the oracle answers it:
-    /// it blocks only on a parked target, which no admitted run makes (`fiber parks`), so every other
-    /// state answers as `cont.resume` does. A thread resumes, with `cont.resume.block`, a fiber that is
+    /// it blocks only on a parked target (a fiber's wait, since slice 3, whose rows are
+    /// `kernel_fibers::`'s), so every other state answers as `cont.resume` does. A thread resumes, with `cont.resume.block`, a fiber that is
     /// fresh (it runs and returns 5), finished (`-EBADF`), its own (running on this vCPU: `FiberFault`),
     /// forged (`FiberFault`), or running on another vCPU (`FiberFault`).
     fn blocking_resume_of(state: &str) -> temen_ir::Module {
@@ -5049,9 +5049,7 @@ block 0 (va: i64, vb: i64) {{
     }
 
     /// A threaded fibered program, run on today's route (`compile_and_run`), whose root spawns and
-    /// joins a thread that notifies, and resumes a fiber that does the same: 3 + 5. Its fiber has a
-    /// wait on a branch it never takes, which kept it off the kernel route until a fiber's wait
-    /// became the kernel's (#3078 slice 3); the row does not depend on that now.
+    /// joins a thread that notifies, and resumes a fiber that does the same: 3 + 5.
     const TODAYS: &str = "memory 16
 func () -> (i64) {
 block 0 () {
@@ -5076,18 +5074,6 @@ block 0 (va: i64, vb: i64) {
 }
 func (i64, i64) -> (i64) {
 block 0 (vsp: i64, varg: i64) {
-  vz = i64.const 0
-  vnever = i64.ne vz vz
-  br_if vnever 1() 2()
-}
-block 1 () {
-  vq = i64.const 16400
-  vexp = i32.const 1
-  vz1 = i64.const 0
-  vw = i32.atomic.wait vq vexp vz1
-  br 2()
-}
-block 2 () {
   vz = i64.const 0
   vt = thread.spawn 1 vz vz
   vts, vtv = thread.join vt

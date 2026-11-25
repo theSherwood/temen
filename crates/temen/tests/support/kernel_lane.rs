@@ -1,6 +1,7 @@
 //! #3078 — the kernel lane a fiber suite runs beside its engines: the program on the Cranelift JIT's
-//! kernel route (its vCPUs as executor 2's tasks), unmetered: the metered runs of fibered programs
-//! on that route are `jit_fuel`'s sweeps (#3080). A module that spawns no thread
+//! kernel route (its vCPUs as executor 2's tasks), metered (`DEFAULT_FUEL`, the product's default,
+//! since #3080) and unmetered, the two compiles' answers asserted equal. The exact fuel a fibered
+//! run charges is `jit_fuel`'s sweeps'. A module that spawns no thread
 //! keeps its single-vCPU path (`fiber only`), so its function 0 runs inside one `thread.spawn`ed vCPU
 //! instead: a wrapper entry spawns a thread that calls it, and joins it. Either way the run is
 //! asserted to have taken the kernel route. One helper, so a suite's lane is a call, not a copy of
@@ -54,16 +55,21 @@ block 0 () {{
             (w, (n + 1) as u32, 2)
         }
     };
-    let o = jit_kernel::expect_kernel(
-        &m,
-        entry,
-        &[],
-        None,
-        u64::MAX,
-        jit_kernel::Expect::Kernel { vcpus },
-    )
-    .expect("the kernel route admits it");
-    (o, m, entry)
+    let on = |fuel| {
+        jit_kernel::expect_kernel(
+            &m,
+            entry,
+            &[],
+            None,
+            fuel,
+            jit_kernel::Expect::Kernel { vcpus },
+        )
+        .expect("the kernel route admits it")
+    };
+    let metered = on(temen_interp::DEFAULT_FUEL);
+    let unmetered = on(u64::MAX);
+    assert_eq!(metered, unmetered, "metered against unmetered\n{src}");
+    (metered, m, entry)
 }
 
 /// [`on_kernel`]'s one `i64` result, or a panic naming what it did instead.
