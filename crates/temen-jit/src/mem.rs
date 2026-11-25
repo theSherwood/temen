@@ -1428,9 +1428,30 @@ mod pal {
         lo: usize,
         hi: usize,
     }
+    /// #3167 — a guarded call's scope, on its `run_guarded` frame: its recovery point and range, and
+    /// the scope that was innermost when it was entered. `GUARD` names the innermost (null: none).
+    struct Scope {
+        frame: Frame,
+        parent: *const Scope,
+    }
+
+    /// The innermost open scope on this thread. R-TLS (#3167): `#[inline(never)]`, as
+    /// `fiber_rt::current` is (#1466), so a read after the guarded call (which may switch stacks)
+    /// resolves the thread-local on the thread running then, not through an address kept from before.
+    #[inline(never)]
+    fn guard_top() -> *const Scope {
+        GUARD.with(|g| g.get())
+    }
+
+    /// Make `s` the innermost open scope on this thread ([`guard_top`]'s rule).
+    #[inline(never)]
+    fn set_guard_top(s: *const Scope) {
+        GUARD.with(|g| g.set(s));
+    }
+
     thread_local! {
-        // The active guarded call's window range + saved registers (None ⇒ no guarded call).
-        static GUARD: Cell<Option<Frame>> = const { Cell::new(None) };
+        // The innermost open guarded call's scope (null ⇒ no guarded call). See [`Scope`].
+        static GUARD: Cell<*const Scope> = const { Cell::new(core::ptr::null()) };
         // #2996 — the active host access's window range + saved registers (`try_call`).
         static TRY: Cell<Option<Frame>> = const { Cell::new(None) };
         // §5 W3 trap-time backtrace: the faulting `(pc, frame-pointer-chain return addresses)` the VEH
@@ -1528,7 +1549,8 @@ mod pal {
                 resume_at_landing(&mut *ep.ContextRecord, &*f.jb);
                 return EXCEPTION_CONTINUE_EXECUTION;
             }
-            if let Some(f) = GUARD.with(|g| g.get()) {
+            // SAFETY: a non-null `GUARD` is an open scope on this thread's `run_guarded` frames.
+            if let Some(f) = GUARD.with(|g| g.get()).as_ref().map(|s| s.frame) {
                 if addr >= f.lo && addr < f.hi && !host_fault(&*ep.ContextRecord, addr) {
                     // §5 W3: capture the trap-time backtrace from the faulting context *before*
                     // `resume_at_landing` below rewrites it.
@@ -1548,8 +1570,11 @@ mod pal {
             // an illegal instruction inside an armed guarded guest call is our emitted memory-fault
             // trap. Recover exactly like a guarded access violation (unwind to `run_guarded`).
             let pc = (*ep.ContextRecord).Rip as usize;
+            // SAFETY: as for an access violation, above.
             if let Some(f) = GUARD
                 .with(|g| g.get())
+                .as_ref()
+                .map(|s| s.frame)
                 .filter(|_| !host_fault(&*ep.ContextRecord, pc))
             {
                 capture_trap_frame(&*ep.ContextRecord);
@@ -1707,6 +1732,19 @@ mod pal {
     #[cfg(not(target_arch = "x86_64"))]
     unsafe fn restore_teb_stack_fields(_fields: ()) {}
 
+    /// #3167 — the unix shim's `temen_scope_open_above`: a guarded call returned with another scope
+    /// innermost, so a stack switched out from under it with a scope of its own open (#3158). The
+    /// yield floor (#3162) keeps any stack from doing so; this is its backstop, in every build.
+    #[cold]
+    fn scope_open_above(found: *const Scope, own: *const Scope) -> ! {
+        use std::io::Write;
+        let _ = writeln!(
+            std::io::stderr(),
+            "temen-jit: a guarded call returned with another recovery scope innermost (a stack switched out under it, #3167): found={found:p} own={own:p}"
+        );
+        std::process::abort()
+    }
+
     /// Run `f` under the handler; `true` if an in-`[lo,hi)` access violation was caught.
     ///
     /// # Safety
@@ -1722,10 +1760,10 @@ mod pal {
         lo: usize,
         hi: usize,
     ) -> bool {
-        // Save the caller's (possibly-armed parent) guard frame to restore on exit — re-entrant so a
-        // §14 child guest can run (in its own window) inside the parent's guarded call. A child fault
-        // resumes at the child's landing pad; the parent's frame is restored afterwards intact.
-        let prev = GUARD.with(|g| g.replace(None));
+        // Link this call's scope in front of the innermost at entry, and unlink it at the end —
+        // re-entrant, so a §14 child guest can run (in its own window) inside the parent's guarded
+        // call. A child fault resumes at the child's landing pad; the parent's scope is untouched.
+        let parent = guard_top();
         // Snapshot the TEB stack fields: a fiber-side fault resumes at the landing pad without the
         // fiber switch-back, and the context rewrite leaves the fiber's TEB values in place (see
         // `teb_stack_fields`) — restore them on the tripped path.
@@ -1736,14 +1774,20 @@ mod pal {
             xmm: [[0; 2]; 10],
         };
         let jb_ptr: *mut JmpBuf = &mut jb;
-        GUARD.with(|g| g.set(Some(Frame { jb: jb_ptr, lo, hi })));
+        let scope = Scope {
+            frame: Frame { jb: jb_ptr, lo, hi },
+            parent,
+        };
+        set_guard_top(&scope);
         // SAFETY: `f` honours the `Entry` ABI (the caller's contract); `jb` outlives the call, and
-        // the VEH reads it only while this frame is armed.
+        // the VEH reads it only while this scope is linked.
         let tripped = temen_win_guarded_call(f, a, r, m, t, tc, jb_ptr) != 0;
         if tripped {
             restore_teb_stack_fields(teb); // undo a fiber-side fault's leftover TEB stack fields
+        } else if guard_top() != &scope as *const Scope {
+            scope_open_above(guard_top(), &scope);
         }
-        GUARD.with(|g| g.set(prev)); // restore the parent's frame
+        set_guard_top(parent); // unlink: the parent's scope is innermost again
         tripped
     }
 }
@@ -2626,17 +2670,17 @@ mod trap_walk_tests {
 }
 
 /// #3167 — a guarded call's recovery scope opened on a stack that parks on one thread and resumes
-/// on another: the shape a pool task's residency gives a nested guarded call (`invoke_handler`,
-/// `run_inline_as`) that its task parks under. Forced: no pool, no timing; two threads in turn, the
-/// first kept alive until the second is done, so the two never share a stack or a TLS block.
-#[cfg(all(test, unix, fiber_rt, not(loom)))]
+/// on another: the shape the yield floor (#3162) forbids, here forced past it, on a bare
+/// `temen-fiber` fiber with no runtime. Its exit must end in the abort, in every build, and the abort
+/// must have read the running thread's recovery state (R-TLS). Two threads in turn, the first kept
+/// alive until the second is done, so the two share no stack or TLS block.
+#[cfg(all(test, fiber_rt, not(loom)))]
 mod moved_scope_tests {
     use super::*;
     use temen_fiber::{Fiber, State, Yielder};
 
-    extern "C" {
-        fn temen_guard_armed() -> i32;
-    }
+    /// The variable that makes this binary the child that runs the forbidden shape.
+    const CHILD: &str = "TEMEN_MOVED_SCOPE_CHILD";
 
     /// What a residency-shaped entry resumes, and what the resume answered.
     struct ResumeCall {
@@ -2659,16 +2703,7 @@ mod moved_scope_tests {
         }
     }
 
-    /// What the nested guarded call does: park its stack (suspend through the yielder), then fault
-    /// in the window's tail if `fault` is set.
-    #[repr(C)]
-    struct Nested {
-        y: *const Yielder,
-        mem: *mut u8,
-        fault: bool,
-    }
-
-    /// The nested guarded call's body (its page is in the code table, so its fault is the guest's).
+    /// The nested guarded call's body: park its stack through the yielder `a` points at.
     extern "C" fn park_inside(
         a: *const i64,
         _r: *mut i64,
@@ -2676,22 +2711,9 @@ mod moved_scope_tests {
         _t: *const c_void,
         _tc: *mut i64,
     ) {
-        // SAFETY: `a` is the fiber's `Nested`, live for the call; the read is meant to fault.
+        // SAFETY: `a` points at the running fiber's yielder.
         unsafe {
-            let n = &*(a as *const Nested);
-            let _ = (*n.y).suspend(0);
-            if n.fault {
-                let _ = core::ptr::read_volatile(n.mem.add(512 << 10));
-            }
-        }
-    }
-
-    /// A guest access in the window's tail after the nested call returned (code-table page too).
-    #[inline(never)]
-    extern "C" fn fault_in_tail(mem: *mut u8) {
-        // SAFETY: the read is meant to fault in the guarded range.
-        unsafe {
-            let _ = core::ptr::read_volatile(mem.add(512 << 10));
+            let _ = (**(a as *const *const Yielder)).suspend(0);
         }
     }
 
@@ -2705,7 +2727,7 @@ mod moved_scope_tests {
     unsafe impl Send for Shared {}
 
     /// A residency: one guarded call on this thread that resumes the fiber once.
-    unsafe fn reside(s: &Shared) -> (bool, Option<State>) {
+    unsafe fn reside(s: &Shared) -> Option<State> {
         let mut c = ResumeCall {
             fib: s.fib,
             state: None,
@@ -2720,37 +2742,24 @@ mod moved_scope_tests {
             s.lo,
             s.hi,
         );
-        (faulted, c.state)
+        assert!(!faulted);
+        c.state
     }
 
-    /// What the two residencies saw, and whether thread 1's guard was armed once its residency had
-    /// returned and thread 2 was done.
-    struct Seen {
-        second: (bool, Option<State>),
-        first_left_armed: bool,
-    }
-
-    /// The fiber makes a nested guarded call that parks inside, under a residency on thread 1; a
-    /// residency on thread 2 resumes it. With `fault_inside` the nested call faults after the move;
-    /// else it returns, and the fiber faults after it (under thread 2's residency only).
-    fn moved(fault_inside: bool) -> Seen {
+    /// The forbidden shape: the fiber's nested guarded call parks under a residency on thread 1,
+    /// and a residency on thread 2 resumes it, so the nested call returns on thread 2.
+    fn moved() {
         pal::install_guard();
         let win = GuestWindow::try_new(64 << 10, 1 << 20).expect("window");
-        let _code = crate::code_ranges::test_code(park_inside as *const () as usize);
-        let _code2 = crate::code_ranges::test_code(fault_in_tail as *const () as usize);
         let (lo, hi) = win.fault_range();
         let mem = win.base() as usize;
         let mut fib = Fiber::new(64 << 10, move |y: &Yielder, _| -> u64 {
-            let n = Nested {
-                y,
-                mem: mem as *mut u8,
-                fault: fault_inside,
-            };
-            // SAFETY: an Entry-shaped probe over this window's range.
-            let nested_faulted = unsafe {
+            let yp: *const Yielder = y;
+            // SAFETY: an Entry-shaped body over this window's range.
+            unsafe {
                 run_guarded_range(
                     park_inside as *const u8,
-                    &n as *const Nested as *const i64,
+                    &yp as *const *const Yielder as *const i64,
                     std::ptr::null_mut(),
                     mem as *mut u8,
                     std::ptr::null(),
@@ -2759,10 +2768,6 @@ mod moved_scope_tests {
                     hi,
                 )
             };
-            if nested_faulted {
-                return 1; // the nested call's own recovery took the fault
-            }
-            fault_in_tail(mem as *mut u8);
             7
         })
         .expect("fiber");
@@ -2777,58 +2782,47 @@ mod moved_scope_tests {
         let t1 = std::thread::spawn(move || {
             pal::install_guard();
             // SAFETY: the fiber's first residency.
-            let (faulted, state) = unsafe { reside(&s) };
-            assert!(!faulted && matches!(state, Some(State::Yielded(0))));
+            let state = unsafe { reside(&s) };
+            assert!(matches!(state, Some(State::Yielded(0))));
             s_tx.send(s).expect("hand the fiber on");
             done_rx.recv().expect("thread 2 ends");
-            // SAFETY: reads this thread's guard state.
-            unsafe { temen_guard_armed() != 0 }
         });
         let s = s_rx.recv().expect("thread 1 parked the fiber");
-        let second = std::thread::spawn(move || {
+        std::thread::spawn(move || {
             pal::install_guard();
-            // SAFETY: the fiber's second residency, on another thread.
-            unsafe { reside(&s) }
+            // SAFETY: the fiber's second residency, on another thread: the nested call returns here.
+            let _ = unsafe { reside(&s) };
         })
         .join()
         .expect("thread 2");
         done_tx.send(()).expect("release thread 1");
-        let first_left_armed = t1.join().expect("thread 1");
-        if !matches!(second.1, Some(State::Complete(_))) {
-            std::mem::forget(fib); // abandoned mid-body: its stack is not unwound
-        }
-        Seen {
-            second,
-            first_left_armed,
-        }
+        t1.join().expect("thread 1");
+        unreachable!("the nested call's exit on thread 2 aborts");
     }
 
-    /// A fault inside a scope that has moved threads ends exactly that scope: the nested call
-    /// returns `true` on the fiber, which then returns, and thread 2's residency sees no fault.
+    /// A scope that exits on a thread it did not enter on ends the process with the abort's message,
+    /// which names a scope found innermost on the **running** thread (thread 2's residency). An exit
+    /// that read through an address taken on thread 1 would find thread 1's chain empty: `found=0x0`.
     #[test]
-    fn a_fault_inside_a_scope_that_moved_threads_ends_that_scope() {
-        let seen = moved(true);
+    fn a_scope_that_exits_on_another_thread_aborts_naming_that_threads_scope() {
+        if std::env::var_os(CHILD).is_some() {
+            moved();
+        }
+        let name = "mem::moved_scope_tests::a_scope_that_exits_on_another_thread_aborts_naming_that_threads_scope";
+        let out = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args(["--exact", name, "--test-threads=1", "--nocapture"])
+            .env(CHILD, "1")
+            .output()
+            .expect("re-run the test binary");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "the child must not survive: {stderr}");
+        let line = stderr
+            .lines()
+            .find(|l| l.contains("returned with another recovery scope innermost"))
+            .unwrap_or_else(|| panic!("no abort message from the child:\n{stderr}"));
         assert!(
-            matches!(seen.second, (false, Some(State::Complete(1)))),
-            "the moved scope's own recovery takes its fault: residency 2 saw {:?}",
-            (seen.second.0, seen.second.1.map(|s| format!("{s:?}")))
-        );
-        assert!(!seen.first_left_armed, "thread 1 is in no guarded call");
-    }
-
-    /// A scope that exits on another thread restores that thread's recovery point and leaves the
-    /// thread it entered on alone: the fiber's fault after it lands in thread 2's residency, and
-    /// thread 1, in no guarded call, is not armed.
-    #[test]
-    fn a_scope_that_exits_on_another_thread_leaves_the_entering_thread_disarmed() {
-        let seen = moved(false);
-        assert!(
-            matches!(seen.second, (true, None)),
-            "the fault ends thread 2's residency"
-        );
-        assert!(
-            !seen.first_left_armed,
-            "thread 1 is in no guarded call, but its guard was left armed with its dead residency's recovery point"
+            !line.contains("found=0x0 ") && !line.contains("found=0x0\n"),
+            "the exit read a recovery state other than the running thread's: {line}"
         );
     }
 }
