@@ -1743,3 +1743,157 @@ block 0 (vh: i32) {{
         )
     });
 }
+
+// #3158 — a yield of a fiber across a `Jit.invoke`. On the JIT the invoked unit runs under a guarded
+// call nested in its caller's frames; a yield that switched the caller's fiber out would leave that
+// call's recovery scope live on the parked stack, where a later guarded fault on the thread jumps.
+// The tree-walker's invoke child has no fiber of its own, so such a yield is a `FiberFault` there,
+// and the JIT now answers the same.
+
+/// A unit whose top level suspends 5, with no fiber of its own running, and answers what the resume
+/// handed it plus 1000.
+const SUSPENDS_AT_ITS_TOP: &str = "memory 16\nfunc () -> (i64) {\nblock 0 () {\n  v5 = i64.const 5\n  vx = suspend v5\n  v1 = i64.const 1000\n  vr = i64.add vx v1\n  return vr\n  }\n}\n";
+
+/// A parent whose fiber F (function 1, resumed with the jit handle) compiles the blob at 20480 and
+/// invokes it, answering what it returned plus 100; the root resumes F once, then runs `tail` (which
+/// sees `vk`, F's handle, and `vs1`/`vv1`, the first resume's status and value).
+fn invoking_fiber(tail: &str, len: usize) -> String {
+    with_len(&format!("memory 16\nfunc (i32) -> (i64) {{\nblock 0 (vj: i32) {{\n  vf = i32.const 1\n  vsp = i64.const 40960\n  vk = cont.new vf vsp\n  vj64 = i64.extend_i32_u vj\n  vs1, vv1 = cont.resume vk vj64\n{tail}  }}\n}}\nfunc (i64, i64) -> (i64) {{\nblock 0 (vsp: i64, varg: i64) {{\n  vj = i32.wrap_i64 varg\n  vb = i64.const 20480\n  vl = i64.const BLOBLEN\n  vu = call.cap 11 0 (i64, i64) -> (i64) vj (vb, vl)\n  vh = call.cap 11 1 (i64) -> (i64) vj (vu)\n  vc = i64.const 100\n  vr = i64.add vh vc\n  return vr\n  }}\n}}\n"), len)
+}
+
+/// #3158 — the unit's `suspend` faults on both engines, whatever the root's code after it. That
+/// `FiberFault` ends the run, so with the barrier the tails never run (the punt row pins a later
+/// fault's clean recovery); before it, the JIT parked F inside the invoke and the root's NULL fault
+/// recovered onto F's stack: heap corruption, or a jump to a bad address.
+#[test]
+fn invoke_barrier_a_units_top_level_suspend_faults_whatever_follows() {
+    let b = blob(SUSPENDS_AT_ITS_TOP);
+    for tail in [
+        "  return vv1\n",
+        "  vnull = i64.const 8\n  vq = i64.load vnull\n  vr = i64.add vq vv1\n  return vr\n",
+        "  vnine = i64.const 9\n  vs2, vv2 = cont.resume vk vnine\n  return vv2\n",
+    ] {
+        let (out, _) = diff_run_fibers(&invoking_fiber(tail, b.len()), &b, &[]);
+        assert!(
+            matches!(out, JitOutcome::Trapped(TrapKind::FiberFault)),
+            "{tail:?}: {out:?}"
+        );
+    }
+}
+
+/// #3158 — a fiber the invoked unit starts itself suspends and resumes inside the invoke, under a
+/// caller that is itself a fiber: its yields are above the barrier. The unit makes a fiber over its
+/// parent's function 2 (a raw funcref, new to old), which suspends what it was handed and then
+/// answers what the second resume handed it plus 100; the unit resumes it with 10, then 7, and
+/// answers 107, and F answers that plus 100.
+#[test]
+fn invoke_barrier_a_units_own_fiber_inside_an_invoke_from_a_fiber_runs() {
+    let b = blob("memory 16\nfunc () -> (i64) {\nblock 0 () {\n  vf = i32.const 2\n  vsp = i64.const 32768\n  vk = cont.new vf vsp\n  v3 = i64.const 10\n  vs1, vv1 = cont.resume vk v3\n  v6 = i64.const 7\n  vs2, vv2 = cont.resume vk v6\n  return vv2\n  }\n}\n");
+    let guest = format!(
+        "{}func (i64, i64) -> (i64) {{\nblock 0 (vsp: i64, varg: i64) {{\n  vx = suspend varg\n  v100 = i64.const 100\n  vr = i64.add vx v100\n  return vr\n  }}\n}}\n",
+        invoking_fiber("  return vv1\n", b.len())
+    );
+    let (out, _) = diff_run_fibers(&guest, &b, &[]);
+    assert!(
+        matches!(out, JitOutcome::Returned(ref s) if s == &[207]),
+        "F answers the unit's 107 plus 100: {out:?}"
+    );
+}
+
+/// #3158 — nested invokes. F invokes an outer unit, which makes a fiber G over the parent's function
+/// 2 and resumes it; G compiles and invokes an inner unit whose top level suspends. The inner
+/// invoke's barrier sits above G, so the suspend faults on both engines rather than parking G with
+/// the inner invoke's scope open.
+#[test]
+fn invoke_barrier_holds_for_nested_invokes() {
+    let inner = blob(SUSPENDS_AT_ITS_TOP);
+    // The outer unit, `(jit) -> i64`: G over parent slot 2, resumed with the jit handle.
+    let outer = blob("memory 16\nfunc (i64) -> (i64) {\nblock 0 (vj: i64) {\n  vf = i32.const 2\n  vsp = i64.const 32768\n  vk = cont.new vf vsp\n  vs, vv = cont.resume vk vj\n  return vv\n  }\n}\n");
+    const INNER_AT: usize = 24576;
+    // F (function 1) invokes the outer unit with the jit handle; G (function 2) compiles the inner
+    // blob and invokes it.
+    let guest = format!(
+        "memory 16\nfunc (i32) -> (i64) {{\nblock 0 (vj: i32) {{\n  vf = i32.const 1\n  vsp = i64.const 40960\n  vk = cont.new vf vsp\n  vj64 = i64.extend_i32_u vj\n  vs1, vv1 = cont.resume vk vj64\n  return vv1\n  }}\n}}\nfunc (i64, i64) -> (i64) {{\nblock 0 (vsp: i64, varg: i64) {{\n  vj = i32.wrap_i64 varg\n  vb = i64.const 20480\n  vl = i64.const {}\n  vu = call.cap 11 0 (i64, i64) -> (i64) vj (vb, vl)\n  vh = call.cap 11 1 (i64, i64) -> (i64) vj (vu, varg)\n  return vh\n  }}\n}}\nfunc (i64, i64) -> (i64) {{\nblock 0 (vsp: i64, varg: i64) {{\n  vj = i32.wrap_i64 varg\n  vb = i64.const {INNER_AT}\n  vl = i64.const {}\n  vu = call.cap 11 0 (i64, i64) -> (i64) vj (vb, vl)\n  vh = call.cap 11 1 (i64) -> (i64) vj (vu)\n  return vh\n  }}\n}}\n",
+        outer.len(),
+        inner.len()
+    );
+    let mut blobs = outer.clone();
+    blobs.resize(INNER_AT - BLOB_OFF, 0);
+    blobs.extend_from_slice(&inner);
+    let (out, _) = diff_run_fibers(&guest, &blobs, &[]);
+    assert!(
+        matches!(out, JitOutcome::Trapped(TrapKind::FiberFault)),
+        "{out:?}"
+    );
+}
+
+/// The host-procedure handle [`grant_punting_and_jit_fibers`] grants first, on a fresh host.
+const PUNTING_PROC: i32 = 1024;
+
+/// Grant a host procedure that punts every call (its job answers the argument plus 100), at
+/// [`PUNTING_PROC`], and then `Jit` with fiber hosting, whose handle this answers.
+fn grant_punting_and_jit_fibers(host: &mut Host, m: &temen_ir::Module, log2: u8) -> i32 {
+    let proc = host.grant_host_proc(temen_interp::HostProcGrant::new(
+        temen_interp::ProcHandler::Offloadable(Box::new(|_op, args, _out| {
+            let a = *args.first().unwrap_or(&0);
+            temen_interp::OffloadOutcome::Offload(Box::new(move || a + 100))
+        })),
+        temen_interp::CapState::Stateless,
+    ));
+    assert_eq!(proc, PUNTING_PROC, "the procedure's handle");
+    grant_jit_fibers(host, m, log2)
+}
+
+/// #3158 — the host-made yield through an invoke: a unit invoked from fiber F makes a call the host
+/// punts. A punt inside a fiber parks the fiber (`fiber_cap_wait`); below the barrier there is no
+/// fiber of the unit's own, so on the JIT the call waits on the thread as an invoke from the root
+/// does, and F's one resume returns: status 1, F's 5 + 100 + 100. Before the barrier the JIT
+/// event-parked F inside the invoke, with its scope open, and the resume answered `FIBER_PARKED`.
+/// The tree-walker refuses a punt in an invoke child at all (`CapFault`), from a fiber or the root:
+/// the invoke divergence #3154 records, which #3155 removes.
+#[test]
+fn invoke_barrier_a_punt_from_an_invoked_unit_waits_as_the_root() {
+    let b = blob(&format!("memory 16\nfunc () -> (i64) {{\nblock 0 () {{\n  vh = i32.const {PUNTING_PROC}\n  vfive = i64.const 5\n  vr = call.cap 13 0 (i64) -> (i64) vh (vfive)\n  return vr\n  }}\n}}\n"));
+    let tail = "  vs64 = i64.extend_i32_u vs1\n  vk1000 = i64.const 1000\n  vsk = i64.mul vs64 vk1000\n  vr = i64.add vsk vv1\n  return vr\n";
+    let guest = invoking_fiber(tail, b.len());
+    let (ires, _, jout, _) = run_both(&guest, &b, &[], grant_punting_and_jit_fibers, 0);
+    assert!(
+        matches!(ires, Err(temen_interp::Trap::CapFault)),
+        "{ires:?}"
+    );
+    assert!(
+        matches!(jout, JitOutcome::Returned(ref s) if s == &[1205]),
+        "{jout:?}"
+    );
+    // The invoke has returned, so the root's next guarded fault (a NULL-guard load) is recovered on
+    // the root's own scope: a clean `MemoryFault`.
+    let faults =
+        "  vnull = i64.const 8\n  vq = i64.load vnull\n  vr = i64.add vq vv1\n  return vr\n";
+    let guest = invoking_fiber(faults, b.len());
+    let (_, _, jout, _) = run_both(&guest, &b, &[], grant_punting_and_jit_fibers, 0);
+    assert!(
+        matches!(jout, JitOutcome::Trapped(TrapKind::MemoryFault)),
+        "{jout:?}"
+    );
+}
+
+/// #3158 — the fault path: a guarded fault inside a fiber the invoked unit started, inside the
+/// invoke, under a caller fiber. The invoke's guard catches it, drops the fibers resumed inside it
+/// and their yielders back to its entry depth (`abandon_after_fault`), and restores the yield floor
+/// as it returns; the trap is the domain's (`MemoryFault`), on both engines, and nothing runs on a
+/// stack the recovery left. A trap in invoked code is terminal for the domain (DESIGN.md §22), so
+/// the caller does not go on: what this pins is that the recovery is clean, not a later suspend.
+#[test]
+fn invoke_barrier_a_fault_in_a_units_own_fiber_is_recovered_cleanly() {
+    // The unit makes a fiber over its parent's function 2, which loads from the NULL guard.
+    let b = blob("memory 16\nfunc () -> (i64) {\nblock 0 () {\n  vf = i32.const 2\n  vsp = i64.const 32768\n  vk = cont.new vf vsp\n  vz = i64.const 0\n  vs, vv = cont.resume vk vz\n  return vv\n  }\n}\n");
+    let guest = format!(
+        "{}func (i64, i64) -> (i64) {{\nblock 0 (vsp: i64, varg: i64) {{\n  vnull = i64.const 8\n  vq = i64.load vnull\n  return vq\n  }}\n}}\n",
+        invoking_fiber("  return vv1\n", b.len())
+    );
+    let (out, _) = diff_run_fibers(&guest, &b, &[]);
+    assert!(
+        matches!(out, JitOutcome::Trapped(TrapKind::MemoryFault)),
+        "{out:?}"
+    );
+}

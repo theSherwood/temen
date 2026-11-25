@@ -127,9 +127,58 @@ pub use os_thread_rt::{
 
 /// F3 (FIBER_PARK.md): whether a guest fiber is the current continuation on this OS thread —
 /// the host thunk's fiber-context probe (the futex thunk's `current_fiber_slot`, public face).
-/// `false` for the root computation, so a root-context punt keeps its inline/blocking wait.
+/// `false` for the root computation, so a root-context punt keeps its inline/blocking wait, and
+/// below a guarded call's yield floor (#3158: a unit `Jit.invoke`d from a fiber, a handler run on
+/// a caller's stack), where no fiber of the running code's own can park. How such code may park at
+/// all is [`park_here`]'s; whether it is its vCPU's root, [`at_root`]'s.
 pub fn fiber_active() -> bool {
     fiber_rt::current_fiber_slot().is_some()
+}
+
+/// #3158 — how a park an embedder's thunk makes here, of the running fiber alone, may be made
+/// (`fiber_rt::park_as`, the one answer every park door asks): as the running fiber, on this OS
+/// thread, or not at all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ParkHere {
+    /// The running fiber, alone: its resumer sees `FIBER_PARKED`.
+    Fiber,
+    /// This OS thread: an OS vCPU's own, which blocks in place. A thunk also passes it for the punts
+    /// main never parked as a fiber (a durable run's, or one whose result count is not 1), which
+    /// wait on whatever thread runs the call, a pool worker's included, as on main.
+    Thread,
+    /// None: a pool task's code below a guarded call's yield floor, which can park neither a fiber
+    /// of its own nor the task, and must not block the worker's thread. Fail closed (`ThreadFault`).
+    Refused,
+}
+
+/// #3158 — [`ParkHere`] for a fiber's park made by the code running on this thread now.
+pub fn park_here() -> ParkHere {
+    #[cfg(fiber_rt)]
+    {
+        match fiber_rt::park_as(os_thread_rt::Parks::Fiber) {
+            fiber_rt::ParkAs::Fiber(_) => ParkHere::Fiber,
+            fiber_rt::ParkAs::Thread => ParkHere::Thread,
+            fiber_rt::ParkAs::Refused => ParkHere::Refused,
+        }
+    }
+    #[cfg(not(fiber_rt))]
+    {
+        ParkHere::Thread
+    }
+}
+
+/// #3158 — whether the running code is its vCPU's root computation: no fiber on this thread's
+/// stack, whether running or holding a guarded call the code runs under (a `Jit.invoke` from a
+/// fiber is not the root). The process-tree gates' question.
+pub fn at_root() -> bool {
+    #[cfg(fiber_rt)]
+    {
+        fiber_rt::at_root()
+    }
+    #[cfg(not(fiber_rt))]
+    {
+        true
+    }
 }
 
 /// #1166 — whether this OS thread runs a `thread.spawn`ed vCPU, which only a concurrent guest has.
@@ -192,8 +241,8 @@ pub unsafe fn fiber_park_outside() {
 mod vcpu_tls;
 #[cfg(fiber_rt)]
 pub use child_exec::{
-    handler_steps_aside, handler_steps_back, Claim, GateAside, HandlerDone, HandlerEnd, HeldCaller,
-    HeldSite, Ran, ServeRefused, ServeSite,
+    handler_steps_aside, handler_steps_back, quantum_ends_held, Claim, GateAside, HandlerDone,
+    HandlerEnd, HeldCaller, HeldSite, Ran, ServeRefused, ServeSite,
 };
 
 /// #1952, #2742 — whether the running code is in a guest fiber (`cont.*`): a park there yields
@@ -5710,10 +5759,9 @@ impl CompiledModule {
         {
             // The OS-thread stack pointer in *this* (`run_inner`) frame — above the guarded guest
             // call below and every guest root frame it pushes — is the high bound for `gc.roots`'
-            // scan of the root computation's frames. Captured via a local's address here (not a
-            // sub-call) so it provably dominates the guest's frames.
-            let entry_probe = 0u8;
-            let entry_sp = std::hint::black_box(&entry_probe as *const u8 as usize);
+            // scan of the root computation's frames. Read in this frame (`stack_pointer` is always
+            // inlined), so it dominates the guest's frames.
+            let entry_sp = crate::stack_check::stack_pointer() as usize;
             let t = &mut *this;
             let durable = t.durable;
             // Durable **thaw** (slice 3.3.3): re-create the frozen fibers in the run-shared table
@@ -13058,12 +13106,38 @@ pub(crate) mod stack_check {
                 v
             })
         });
-        let here = 0u8;
-        let sp = &here as *const u8 as u64;
+        let sp = stack_pointer();
         if low != 0 && sp > low && sp <= high {
             return low + (high - low) / 4;
         }
         crate::fiber_rt::running_stack_low(sp).unwrap_or(0)
+    }
+
+    /// The machine stack pointer in the calling frame (always inlined, so it is that frame's): every
+    /// frame the caller pushes afterwards lies below it. Read from the register, since a local's
+    /// address is not always on the stack. Under ASan's use-after-return detection an address-taken
+    /// local lives on its fake stack, a heap block on neither the thread's stack nor a fiber's: with
+    /// it, [`thread_limit`] answered 0, every check against it (the direct handoff's room, #3158) saw
+    /// no stack at all, and `gc.roots`' scan bounds were heap addresses.
+    #[inline(always)]
+    pub(crate) fn stack_pointer() -> u64 {
+        let sp: u64;
+        // SAFETY: reads the stack pointer register into a general register; no memory is touched.
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            core::arch::asm!("mov {}, rsp", out(reg) sp, options(nomem, nostack, preserves_flags));
+        }
+        // SAFETY: as above.
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            core::arch::asm!("mov {}, sp", out(reg) sp, options(nomem, nostack, preserves_flags));
+        }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        {
+            let here = 0u8;
+            sp = core::hint::black_box(&here as *const u8 as u64);
+        }
+        sp
     }
 
     /// The calling thread's stack as `(low, high)`, or `(0, 0)` where the platform can't say.

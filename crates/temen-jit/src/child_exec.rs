@@ -598,8 +598,7 @@ const HANDOFF_ROOM: u64 = TASK_STACK as u64 / 2;
 /// #2742 — whether this stack has room for a handler run on it ([`HANDOFF_ROOM`]).
 fn handoff_room() -> bool {
     let limit = crate::stack_check::thread_limit();
-    let here = 0u8;
-    let sp = &here as *const u8 as u64;
+    let sp = crate::stack_check::stack_pointer();
     limit != 0 && sp.saturating_sub(limit) >= HANDOFF_ROOM
 }
 
@@ -2256,6 +2255,18 @@ fn cores() -> usize {
     })
 }
 
+/// #3158 — the parks a pool task's quantum end would have made (a full pool, a task queued) and did
+/// not, because a guarded call nested in its frames was live ([`quantum_end`]): what a test reads
+/// to see that the task did not park with that call's recovery scope open on its stack.
+/// Process-wide; a reader takes a difference.
+static QUANTUM_ENDS_HELD: AtomicU64 = AtomicU64::new(0);
+
+/// #3158 — [`QUANTUM_ENDS_HELD`]: a statistic for tests, not an interface.
+#[doc(hidden)]
+pub fn quantum_ends_held() -> u64 {
+    QUANTUM_ENDS_HELD.load(Ordering::Relaxed)
+}
+
 /// #1991 — a pool task's quantum has ended: a chunk of its fuel ran out (`fuel::fuel_refill`). The
 /// pool's due wakes run first ([`ChildExec::due`]). Then the task at the head of the queue, if one
 /// waits, gets a worker ([`ChildExec::find_worker`]): a free one, or a new one up to the pool's cap.
@@ -2280,10 +2291,20 @@ pub(crate) fn quantum_end() {
             return;
         }
     }
-    if let Some(slot) = fiber_rt::current_fiber_slot() {
+    // A full pool: the task gives its worker up, a whole-vCPU park. #3158 — not while a guarded call
+    // nested in its frames is live (a handler run inline, a unit `Jit.invoke`d): the task cannot
+    // park whole there, so it keeps its worker to that call's end. The due wakes and the worker
+    // hand-out above ran all the same.
+    match fiber_rt::park_as(crate::os_thread_rt::Parks::Vcpu) {
         // SAFETY: inside the task's residency, on one of its fibers; the park hands the worker back
         // and returns when a worker resumes the task.
-        unsafe { fiber_rt::fiber_event_park(&slot, None, fiber_rt::ParkOn::Yield) };
+        fiber_rt::ParkAs::Fiber(slot) => unsafe {
+            fiber_rt::fiber_event_park(&slot, None, fiber_rt::ParkOn::Yield)
+        },
+        fiber_rt::ParkAs::Refused => {
+            QUANTUM_ENDS_HELD.fetch_add(1, Ordering::Relaxed);
+        }
+        fiber_rt::ParkAs::Thread => {}
     }
 }
 

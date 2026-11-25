@@ -248,7 +248,7 @@ pub unsafe extern "C" fn cap_thunk(
         }
         if let Some(id) = pending_id {
             let comps = (*(ctx as *mut Host)).completions();
-            let r = cap_wait(&comps, id, temen_jit::fiber_active(), vm);
+            let r = cap_wait(&comps, id, temen_jit::park_here(), vm);
             if vm.ended().is_none() {
                 *results = r;
             }
@@ -321,18 +321,21 @@ impl HostParkReq {
     }
 }
 
-/// F3, #2047 — wait for punted call `id`'s completion as a park. A fiber parks alone
+/// F3, #2047 — wait for punted call `id`'s completion as a park, as `how` says. A fiber parks alone
 /// ([`fiber_cap_wait`]); a vCPU waits outside the run with its lane given back
-/// ([`temen_jit::wait_outside`]). A run that ends meanwhile leaves the answer unclaimed and the
-/// trap cell set, so the caller writes no result.
+/// ([`temen_jit::wait_outside`]). #3158 — a pool task's code below a guarded call's yield floor
+/// fails closed (`ThreadFault`): it can park neither a fiber of its own nor the task, and blocking
+/// the worker's thread could starve the guest progress the answer may wait on (a punted job can
+/// wait on another vCPU or a child of the run). A run that ends meanwhile leaves the answer
+/// unclaimed and the trap cell set, so the caller writes no result.
 ///
 /// # Safety
-/// `vm` is the live call's context; with `fiber`, the call runs in a live fiber
-/// ([`fiber_cap_wait`]'s contract). The caller holds no lock the run's other vCPUs need.
+/// `vm` is the live call's context; with [`temen_jit::ParkHere::Fiber`], the call runs in a live
+/// fiber ([`fiber_cap_wait`]'s contract). The caller holds no lock the run's other vCPUs need.
 unsafe fn cap_wait(
     comps: &std::sync::Arc<temen_interp::Completions>,
     id: u64,
-    fiber: bool,
+    how: temen_jit::ParkHere,
     vm: &temen_jit::VmCtx,
 ) -> i64 {
     // #2958 slice 5 — a kernel vCPU's task parks on the call through its rules, which deliver the
@@ -343,8 +346,17 @@ unsafe fn cap_wait(
         // contract), on the cap thunk's own thread.
         return unsafe { jit_kernel::park_call(vm, park) }.map_or(0, |[r, _]| r);
     }
-    if fiber {
-        return fiber_cap_wait(comps, id, vm);
+    match how {
+        temen_jit::ParkHere::Fiber => return fiber_cap_wait(comps, id, vm),
+        temen_jit::ParkHere::Thread => {}
+        // A host-answered call is withdrawn, as a declined one is: its completer answers nothing
+        // and it stops counting in flight. A pool job's answer stays unclaimed for the sweep, as at
+        // a run's end.
+        temen_jit::ParkHere::Refused => {
+            comps.withdraw(id);
+            vm.raise(TrapKind::ThreadFault as i64);
+            return 0;
+        }
     }
     let roused = std::sync::Arc::clone(comps);
     temen_jit::wait_outside(vm, Box::new(move || roused.rouse()), |stop| {
@@ -949,9 +961,15 @@ pub unsafe extern "C" fn cap_thunk_locked(
             }
             // F3, #2047 — the lock is already released: wait as a park ([`cap_wait`]). A punt
             // inside a FIBER parks the fiber, so its vCPU keeps polling its other fibers; any other
-            // waits as its vCPU, with the vCPU's lane given back.
-            let fiber = n_results == 1 && temen_jit::fiber_active() && !durable;
-            let r = cap_wait(&comps, id, fiber, vm);
+            // waits as its vCPU, with the vCPU's lane given back. #3158 — a durable run's punt, and
+            // one whose result count is not 1, never park a fiber: they wait as main's did, whatever
+            // the floor, so they are decided first.
+            let how = if n_results != 1 || durable {
+                temen_jit::ParkHere::Thread
+            } else {
+                temen_jit::park_here()
+            };
+            let r = cap_wait(&comps, id, how, vm);
             if vm.ended().is_some() {
                 return;
             }
