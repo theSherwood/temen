@@ -119,6 +119,15 @@ pub(crate) fn hosts_fibers(m: &Module, host: &Host) -> bool {
     host.jit_hosts_fibers() && drives_jit(&host_calls(m), host)
 }
 
+/// #3080 (review H1) — whether a unit `m` submits under `host` may make fibers: `m` can reach `Jit`,
+/// and its compile stands a fiber runtime up, which is what `define_extra` admits a unit's `cont.*`
+/// on (`CompiledModule`'s `fibers`). The compile reads it from the same two facts: `m`'s own code
+/// (`CodeFacts::uses_fibers`: a `cont.*` or a `gc.roots`), or the hosting grant ([`hosts_fibers`]).
+pub(crate) fn units_make_fibers(m: &Module, host: &Host) -> bool {
+    hosts_fibers(m, host)
+        || temen_ir::thaw::CodeFacts::of(m).uses_fibers() && drives_jit(&host_calls(m), host)
+}
+
 /// #2695 — whether a program making `calls` can serve its offers in a serve loop over `host`: reach
 /// `svc.poll` or `svc.wait` ([`temen_ir::durable_abi::is_serve_op`]).
 pub(crate) fn serves(calls: &BTreeSet<(u32, u32)>, host: &Host) -> bool {

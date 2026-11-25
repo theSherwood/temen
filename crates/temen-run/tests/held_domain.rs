@@ -2170,6 +2170,25 @@ enum FiberCallsIn {
     /// G2: it `Jit.invoke`s [`A_UNIT_THAT_CALLS_KEPT`], whose top level calls the domain's `kept()`;
     /// the domain holds `Jit` with no fiber-hosting grant.
     ThroughAUnit,
+    /// H1: the domain makes no fiber. Its function 6 is a `gc.roots` op it never calls, which stands
+    /// the JIT's fiber runtime up, so `define_extra` admits a unit's `cont.*` with no fiber-hosting
+    /// grant. Its entry installs [`A_UNIT_WITH_A_FIBER_THAT_CALLS_KEPT`], and `outer()` reaches it by
+    /// `call.dyn`: the unit's own fiber calls the domain's `kept()`.
+    ThroughAUnitsOwnFiber,
+}
+
+/// #3080 (review H1) — an installed unit whose entry makes a fiber over its own function 1, resumes
+/// it twice and answers `1e6·status₁ + 1e3·status₂ + value₂`; the fiber calls `kept()` (op 3) on the
+/// offer the domain stored at 16500.
+const A_UNIT_WITH_A_FIBER_THAT_CALLS_KEPT: &str = "memory 17\nfunc () -> (i64) {\nblock 0 () {\n  vf = ref.func 1\n  vsp = i64.const 49152\n  vk = cont.new vf vsp\n  vz = i64.const 0\n  vs1, vv1 = cont.resume vk vz\n  vs2, vv2 = cont.resume vk vz\n  vs1w = i64.extend_i32_u vs1\n  vs2w = i64.extend_i32_u vs2\n  vm1 = i64.const 1000000\n  vm2 = i64.const 1000\n  va1 = i64.mul vs1w vm1\n  va2 = i64.mul vs2w vm2\n  vsum = i64.add va1 va2\n  vr = i64.add vsum vv2\n  return vr\n  }\n}\nfunc (i64, i64) -> (i64) {\nblock 0 (vsp: i64, varg: i64) {\n  va = i64.const 16500\n  vme = i32.load va\n  vr = call.cap 268435456 3 () -> (i64) vme ()\n  return vr\n  }\n}\n";
+
+/// A unit's text, verified and encoded: the `data` segment laying it at 20480, and its length.
+fn unit_blob(src: &str) -> (String, usize) {
+    let unit = temen_text::parse_module(src).expect("parse the unit");
+    temen_verify::verify_module(&unit).expect("verify the unit");
+    let blob = temen_encode::encode_module(&unit);
+    let escaped: String = blob.iter().map(|b| format!("\\x{b:02x}")).collect();
+    (format!("data 20480 \"{escaped}\"\n"), blob.len())
 }
 
 /// #3080 (review G2) — a unit whose top level calls `kept()` (op 3) on the offer the domain stored at
@@ -2189,19 +2208,30 @@ fn fiber_offer_caller(how: FiberCallsIn) -> String {
         grants_n: 2,
         ..SpawnRec::default()
     };
-    let (body, blob) = match how {
+    let fiber_outer = "  vf = i32.const 6\n  vsp = i64.const 40960\n  vk = cont.new vf vsp\n  vz = i64.const 0\n  vs1, vv1 = cont.resume vk vz\n  vs2, vv2 = cont.resume vk vz\n  vs1w = i64.extend_i32_u vs1\n  vs2w = i64.extend_i32_u vs2\n  vm1 = i64.const 1000000\n  vm2 = i64.const 1000\n  va1 = i64.mul vs1w vm1\n  va2 = i64.mul vs2w vm2\n  vsum = i64.add va1 va2\n  vr = i64.add vsum vv2\n  return vr\n";
+    let (body, blob, install, outer) = match how {
         FiberCallsIn::ThroughABuiltinsId => (
             "  va = i64.const 16500\n  vme = i32.load va\n  vz = i64.const 0\n  vr = call.cap 0 1 (i64, i64) -> (i64) vme (vz, vz)\n  return vr\n".to_string(),
             String::new(),
+            String::new(),
+            fiber_outer.to_string(),
         ),
         FiberCallsIn::ThroughAUnit => {
-            let unit = temen_text::parse_module(A_UNIT_THAT_CALLS_KEPT).expect("parse the unit");
-            temen_verify::verify_module(&unit).expect("verify the unit");
-            let blob = temen_encode::encode_module(&unit);
-            let escaped: String = blob.iter().map(|b| format!("\\x{b:02x}")).collect();
+            let (blob, len) = unit_blob(A_UNIT_THAT_CALLS_KEPT);
             (
-                format!("  vj = i64.const 16520\n  vjit = i32.load vj\n  vb = i64.const 20480\n  vl = i64.const {}\n  vu = call.cap 11 0 (i64, i64) -> (i64) vjit (vb, vl)\n  vr = call.cap 11 1 (i64) -> (i64) vjit (vu)\n  return vr\n", blob.len()),
-                format!("data 20480 \"{escaped}\"\n"),
+                format!("  vj = i64.const 16520\n  vjit = i32.load vj\n  vb = i64.const 20480\n  vl = i64.const {len}\n  vu = call.cap 11 0 (i64, i64) -> (i64) vjit (vb, vl)\n  vr = call.cap 11 1 (i64) -> (i64) vjit (vu)\n  return vr\n"),
+                blob,
+                String::new(),
+                fiber_outer.to_string(),
+            )
+        }
+        FiberCallsIn::ThroughAUnitsOwnFiber => {
+            let (blob, len) = unit_blob(A_UNIT_WITH_A_FIBER_THAT_CALLS_KEPT);
+            (
+                "  v0 = i64.const 0\n  v1 = i64.const 4096\n  vmask = i64.const -1\n  v2 = i64.const 0\n  v3 = i64.const 8\n  vr = gc.roots v0 v1 vmask v2 v3\n  return vr\n".to_string(),
+                blob,
+                format!("  vub = i64.const 20480\n  vul = i64.const {len}\n  vu = call.cap 11 0 (i64, i64) -> (i64) vjit (vub, vul)\n  vslot = call.cap 11 3 (i64) -> (i64) vjit (vu)\n  vsa = i64.const 16528\n  i64.store vsa vslot\n"),
+                "  va = i64.const 16528\n  vslot = i64.load va\n  vs = i32.wrap_i64 vslot\n  vr = call.dyn () -> (i64) vs ()\n  return vr\n".to_string(),
             )
         }
     };
@@ -2226,7 +2256,7 @@ block 0 (vi: i32, vm: i32, vb: i32, vjit: i32) {{
   i32.store vsi vi
   vsj = i64.const 16520
   i32.store vsj vjit
-  vma = i64.const {module_at}
+{install}  vma = i64.const {module_at}
   i32.store vma vm
   vba = i64.const {budget_at}
   i32.store vba vb
@@ -2252,22 +2282,7 @@ block 0 (vme: cap) {{
 
 func () -> (i64) {{
 block 0 () {{
-  vf = i32.const 6
-  vsp = i64.const 40960
-  vk = cont.new vf vsp
-  vz = i64.const 0
-  vs1, vv1 = cont.resume vk vz
-  vs2, vv2 = cont.resume vk vz
-  vs1w = i64.extend_i32_u vs1
-  vs2w = i64.extend_i32_u vs2
-  vm1 = i64.const 1000000
-  vm2 = i64.const 1000
-  va1 = i64.mul vs1w vm1
-  va2 = i64.mul vs2w vm2
-  vsum = i64.add va1 va2
-  vr = i64.add vsum vv2
-  return vr
-  }}
+{outer}  }}
 }}
 
 func () -> (i64) {{
@@ -2337,12 +2352,14 @@ fn fiber_offer_outer(on: Executor, how: FiberCallsIn) -> (Executor, Reply, u64) 
         let m = module(&fiber_offer_caller(how));
         let give = match how {
             FiberCallsIn::ThroughABuiltinsId => "strm",
-            FiberCallsIn::ThroughAUnit => "exec",
+            FiberCallsIn::ThroughAUnit | FiberCallsIn::ThroughAUnitsOwnFiber => "exec",
         };
         let (mut host, mut args) = child_host(&m, &offer_giver(give));
         args.push(Value::I32(match how {
             FiberCallsIn::ThroughABuiltinsId => -1,
-            FiberCallsIn::ThroughAUnit => temen_run::grant_jit(&mut host, &m, 4),
+            FiberCallsIn::ThroughAUnit | FiberCallsIn::ThroughAUnitsOwnFiber => {
+                temen_run::grant_jit(&mut host, &m, 4)
+            }
         }));
         let started = temen_run::hold(on, m, 0, &args, u64::MAX, host);
         let (d, _) = started.unwrap_or_else(|(t, _)| panic!("the entry ends in {t:?}"));
@@ -2373,8 +2390,9 @@ fn a_fibers_call_into_its_own_held_domain_through_a_builtins_id_is_held_by_the_t
 /// #3080 (review G2), #3164 — a fiber of a held domain that holds `Jit` without the fiber-hosting
 /// grant `Jit.invoke`s a unit whose top level calls the domain's own `kept()`. No static read of the
 /// module sees that call. The tree-walker's invoke child refuses it, which ends the domain
-/// (`CAP_REVOKED`, charged 1; #3154). Held on the JIT (before `hold` counted a unit as code that can
-/// run in a fiber), the nested activation ran at once, so F returned 42 at its first resume and the
+/// (`CAP_REVOKED`, charged 1): #3154's refusal, which #3155 removes. Held on the JIT (before `hold`
+/// counted a unit as code that can run in a fiber), the nested activation ran at once, since below
+/// the invoke's yield floor nothing parks (#3162), so F returned 42 at its first resume and the
 /// second answered -9: `4294968287000`, charged 102. So `hold` declines a fiber-making module that can
 /// reach `Jit`, and the tree-walker holds it on both.
 #[test]
@@ -2384,6 +2402,196 @@ fn a_fibers_unit_that_calls_into_its_own_held_domain_is_held_by_the_tree_walker(
             fiber_offer_outer(on, FiberCallsIn::ThroughAUnit),
             (Executor::TreeWalker, Reply::Failed(CAP_REVOKED), 1),
             "asked for {on:?}"
+        );
+    }
+}
+
+/// #3080 (review H1), #3164 — a held domain that makes no fiber but has a `gc.roots` op, under a
+/// plain `Jit` grant: its compile stands the JIT's fiber runtime up, so an installed unit's own fiber
+/// runs, and its call into the domain's own offer is a fiber's call into its held domain. The
+/// tree-walker keeps the nested activation out while `outer()` runs, so the unit's fiber is still
+/// parked at its second resume: `3003000`, charged 3. Held on the JIT (before `hold` read a unit's
+/// fibers from the compile's own facts), the nested activation ran under the caller's gate between
+/// the two resumes: `3001042`, charged 102. So `hold` declines it, and the tree-walker holds it on
+/// both. The unit is installed and reached by `call.dyn`, so the tree-walker's answer is the gate's
+/// (#3164's), not its invoke child's refusal (#3154).
+#[test]
+fn a_units_own_fiber_that_calls_into_its_held_domain_is_held_by_the_tree_walker() {
+    for on in [Executor::TreeWalker, Executor::Jit] {
+        assert_eq!(
+            fiber_offer_outer(on, FiberCallsIn::ThroughAUnitsOwnFiber),
+            (Executor::TreeWalker, Reply::Results(vec![3_003_000]), 3),
+            "asked for {on:?}"
+        );
+    }
+}
+
+/// How [`import_caller`]'s fiber calls `kept()`, and what the import it calls through is bound to.
+#[derive(Clone, Copy, Debug)]
+enum ImportCall {
+    /// `call.import 0`, bound (not rebindable) to an offer the host wires over the domain's own
+    /// `kept()`: a guest-interned id. A host cannot hold an offer over a domain before it runs, so
+    /// the wired offer stands in for the domain's own.
+    BoundToAGuestOffer,
+    /// `call.import 0`, bound (not rebindable) to a host procedure that answers 7.
+    BoundToAHostCap,
+    /// `call.import 0` through a `rebindable` slot, which the entry attaches to the domain's own
+    /// offer (`export.handle 0`): what it reaches is not fixed when `hold` reads it.
+    Rebindable,
+    /// `call.import.dyn` on the domain's own offer: its interface is interned as it runs.
+    Dynamic,
+}
+
+/// #3080 (review H2) — a held domain whose `outer()` makes a fiber that calls through its import once,
+/// as `how` says, and answers `1e6·status₁ + 1e3·status₂ + value₁` over two resumes (the fiber returns
+/// what the call answered at its first); `kept()` counts 100 down
+/// and answers 42. Its entry takes one handle, which a [`ImportCall::Rebindable`] domain ignores.
+fn import_caller(how: ImportCall) -> String {
+    let rebindable = matches!(how, ImportCall::Rebindable);
+    let attach = if rebindable {
+        "  vme = export.handle 0\n  vst = import.attach 0 vme\n"
+    } else {
+        ""
+    };
+    let call = if matches!(how, ImportCall::Dynamic) {
+        "  vme = export.handle 0\n  vr = call.import.dyn 1.kept vme ()\n"
+    } else {
+        "  vr = call.import 0 ()\n"
+    };
+    format!(
+        r#"memory 17
+type 0 func () -> (i64)
+type 1 interface {{ outer: 0, kept: 0 }}
+import 0 "k" () -> (i64){mode}
+export 0 interface "svc" 1 {{ outer: 1, kept: 2 }}
+
+func (i32) -> (i64) {{
+block 0 (vh: i32) {{
+{attach}  vr = i64.const 1
+  return vr
+  }}
+}}
+
+func () -> (i64) {{
+block 0 () {{
+  vf = i32.const 3
+  vsp = i64.const 40960
+  vk = cont.new vf vsp
+  vz = i64.const 0
+  vs1, vv1 = cont.resume vk vz
+  vs2, vv2 = cont.resume vk vz
+  vs1w = i64.extend_i32_u vs1
+  vs2w = i64.extend_i32_u vs2
+  vm1 = i64.const 1000000
+  vm2 = i64.const 1000
+  va1 = i64.mul vs1w vm1
+  va2 = i64.mul vs2w vm2
+  vsum = i64.add va1 va2
+  vr = i64.add vsum vv1
+  return vr
+  }}
+}}
+
+func () -> (i64) {{
+block 0 () {{
+  vn = i64.const 100
+  br 1(vn)
+}}
+block 1 (vi: i64) {{
+  vone = i64.const 1
+  vj = i64.sub vi vone
+  vd = i64.eqz vj
+  br_if vd 2(vj) 1(vj)
+}}
+block 2 (vr: i64) {{
+  vk = i64.const 42
+  return vk
+  }}
+}}
+
+func (i64, i64) -> (i64) {{
+block 0 (vsp: i64, varg: i64) {{
+{call}  return vr
+  }}
+}}
+"#,
+        mode = if rebindable { " rebindable" } else { "" },
+    )
+}
+
+/// `outer()` of [`import_caller`] asked for on `on`: the executor that held it, its reply and what
+/// the call was charged.
+fn import_outer(on: Executor, how: ImportCall) -> (Executor, Reply, u64) {
+    bounded(move || {
+        let m = module(&import_caller(how));
+        let mut host = Host::new();
+        host.set_self_module(&m);
+        let kept = temen_ir::FuncType {
+            params: vec![],
+            results: vec![temen_ir::ValType::I64],
+        };
+        let binding = match how {
+            ImportCall::BoundToAGuestOffer => {
+                let funcs: Arc<[temen_ir::Func]> = m.funcs.clone().into();
+                let types: Arc<[temen_ir::TypeEntry]> = m.types.clone().into();
+                let h = host
+                    .wire_offer_func(&funcs, &types, &[2])
+                    .expect("wire kept()");
+                let id = host.intern_interface(&[], std::slice::from_ref(&kept));
+                assert!(temen_interp::guest_implementable(id), "a guest id");
+                temen_interp::BoundImport::required(id, 0, h)
+            }
+            ImportCall::BoundToAHostCap => {
+                let h = host.grant_host_proc(temen_interp::HostProcGrant::new(
+                    temen_interp::ProcHandler::Sync(Box::new(|_op, _args, out, _mem, _minter| {
+                        temen_interp::put_results(out, &[7])
+                    })),
+                    temen_interp::CapState::Stateless,
+                ));
+                temen_interp::BoundImport::required(temen_ir::cap_id::HOST_PROC, 0, h)
+            }
+            ImportCall::Rebindable | ImportCall::Dynamic => temen_interp::BoundImport {
+                type_id: temen_ir::cap_id::GUEST_IMPL_BASE,
+                op: 1,
+                handle: 0,
+                bound: false,
+                rebindable: matches!(how, ImportCall::Rebindable),
+            },
+        };
+        host.set_import_bindings(vec![binding]);
+        let started = temen_run::hold(on, m, 0, &[Value::I32(-1)], u64::MAX, host);
+        let (d, _) = started.unwrap_or_else(|(t, _)| panic!("the entry ends in {t:?}"));
+        let mut fuel = 1_000_000u64;
+        let reply = d.call(0, 0, &[], &mut fuel);
+        (d.executor(), reply, 1_000_000 - fuel)
+    })
+}
+
+/// #3080 (review H2) — a fiber's import call is read through its binding (`jit_proc::may_reach`): an
+/// import bound to a guest's offer, a rebindable slot and a `call.import.dyn` may each land on a
+/// guest's offer, so `hold` declines them and the tree-walker holds them on both asks, answering
+/// alike. An import bound for good to a host capability cannot, so the JIT holds it, and its reply
+/// and charge are the tree-walker's.
+#[test]
+fn a_fibers_import_call_is_held_by_what_its_binding_may_reach() {
+    for how in [
+        ImportCall::BoundToAGuestOffer,
+        ImportCall::BoundToAHostCap,
+        ImportCall::Rebindable,
+        ImportCall::Dynamic,
+    ] {
+        let oracle = import_outer(Executor::TreeWalker, how);
+        let jit = import_outer(Executor::Jit, how);
+        let held = match how {
+            ImportCall::BoundToAHostCap => Executor::Jit,
+            _ => Executor::TreeWalker,
+        };
+        assert_eq!(oracle.0, Executor::TreeWalker, "{how:?}");
+        assert_eq!(jit.0, held, "{how:?}: the executor asked for Jit");
+        assert_eq!(
+            (&jit.1, jit.2),
+            (&oracle.1, oracle.2),
+            "{how:?}: reply and charge"
         );
     }
 }
