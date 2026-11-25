@@ -783,8 +783,12 @@ whatever its body needs. A library's heap callbacks (`unir_host_alloc`) are such
 other imports are capabilities, which the program's manifest asks the host for; `stream_write` and
 its siblings bind to each edge's streams, as the libc's do. Unlike the libc, which serves only the
 leaves `LIBC_SERVED` lists, a library serves every function it exports: its export table is the
-list. `temen-link` takes a library as a `.temeno` input, which is how nimony passes the file a
-`{.link.}` pragma names, so a nim library can name its C library itself.
+list. Libraries call each other, too (#3178): a function another library imports is exported under
+its C name as well, so the link binds the call as it binds any import, and a name two libraries
+export that a third imports fails the link. A JACL program and its runtime are two such libraries:
+the nim program calls the JACL program's entry, which calls its runtime (theSherwood/jacl_impl#290).
+`temen-link` takes a library as a `.temeno` input, which is how nimony passes the file a `{.link.}`
+pragma names, so a nim library can name its C library itself.
 
 **Two paths to the near-term milestone (run one real program):**
 

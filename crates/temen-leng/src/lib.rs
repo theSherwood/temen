@@ -1986,10 +1986,11 @@ impl Edge<'_> {
 ///
 /// `libs` are **C libraries** the program links beside the libc (#2294): encoded `.temeno` link
 /// units, such as a host's C ABI that a nim library wraps. Each serves the program's `importc` procs
-/// whose C names it exports ([`library_unit`]). Their functions take the on-ramp's ABI, the
-/// data-stack pointer first, in both directions: a call to one passes `$sp`, and an `exportc` proc
-/// whose C name a library imports takes one, as the library's callback (its heap, say). A library's
-/// other imports are the host's, in the program's manifest.
+/// whose C names it exports ([`library_unit`]), and the other libraries' imports of those names
+/// (#3178). Their functions take the on-ramp's ABI, the data-stack pointer first, in both
+/// directions: a call to one passes `$sp`, and an `exportc` proc whose C name a library imports
+/// takes one, as the library's callback (its heap, say). A library's other imports are the host's,
+/// in the program's manifest.
 ///
 /// `build` says how to build it ([`Build`]).
 pub fn link_nim(
@@ -2011,7 +2012,31 @@ pub fn link_nim(
         runtime.extend(libc_units(libc, units)?);
     }
     let leaves = importc_leaves_of(units)?;
-    runtime.extend(libs.into_iter().map(|l| library_unit(l, &leaves, |_| true)));
+    // A library's function is exported under its C name too where another library imports that
+    // name, so that libraries call each other (#3178): a JACL program calls its runtime, say, and
+    // its `extern`s an application's C units. The link binds the name as it binds any import, and
+    // two libraries that both export a name another imports fail it.
+    let imported: Vec<Vec<String>> = libs
+        .iter()
+        .map(|l| l.imports.iter().map(|i| i.name.clone()).collect())
+        .collect();
+    runtime.extend(libs.into_iter().enumerate().map(|(k, l)| {
+        let mut unit = library_unit(l, &leaves, |_| true);
+        let called = unit
+            .module
+            .exports
+            .iter()
+            .filter(|e| {
+                imported
+                    .iter()
+                    .enumerate()
+                    .any(|(j, names)| j != k && names.contains(&e.name))
+            })
+            .map(|e| (e.name.clone(), e.func))
+            .collect::<Vec<_>>();
+        unit.exports.extend(called);
+        unit
+    }));
     let mut m = link_lowered(&program, &runtime, true, true)?;
     if !build.debug {
         m.debug_info = None;
