@@ -512,6 +512,10 @@ pub(crate) struct Window {
     /// serve handler's join keeps the gate, as on the oracle it blocks the serving vCPU
     /// ([`Task::keep_lanes`]), but an activation is no serving vCPU's.
     held: bool,
+    /// #3157 — its vCPU has ended ([`ServeSite::revoke`]): set under the pool's lock, where it is
+    /// read, so a handler of it the pool's scan missed (held out of its entry by a residency, or not
+    /// yet admitted) answers `CAP_REVOKED` as it is filed back ([`ChildExec::take_revoked`]).
+    revoked: std::sync::atomic::AtomicBool,
     /// #2695 — where a thread outside the run waits for a held domain's gate ([`Window::wait_take_outside`]):
     /// an embedder's, whose wait is no park of the run, as its call is no task of it.
     outside: Mutex<()>,
@@ -1153,6 +1157,7 @@ impl ServeSite {
             gate_waiters: AtomicUsize::new(0),
             self_calls: AtomicUsize::new(0),
             held: false,
+            revoked: std::sync::atomic::AtomicBool::new(false),
             outside: Mutex::new(()),
             outside_cv: Condvar::new(),
         });
@@ -1264,9 +1269,9 @@ impl ServeSite {
     /// oracle answers a dead vCPU's parked handlers. Their fibers unwind once their domain has no
     /// vCPU left ([`ChildExec::drain`]).
     pub(crate) fn revoke(&self) {
-        if self.window.pooled.load(Ordering::Acquire) != 0 {
-            self.exec.revoke_window(&self.window);
-        }
+        // #3157 — always, under the pool's lock: a handler promoted after a lock-free look at
+        // `pooled` would be missed, as would one a residency holds out of its entry.
+        self.exec.revoke_window(&self.window);
     }
 
     /// The dispatches this window's handlers served since the last count, which the serve op adds to
@@ -1694,6 +1699,7 @@ impl HeldSite {
             gate_waiters: AtomicUsize::new(0),
             self_calls: AtomicUsize::new(0),
             held: true,
+            revoked: std::sync::atomic::AtomicBool::new(false),
             outside: Mutex::new(()),
             outside_cv: Condvar::new(),
         });
@@ -2529,8 +2535,11 @@ impl ChildExec {
         let mut g = lock(&self.state);
         let id = self.admit(&mut g, h);
         g.tasks.get_mut(&id).expect("admitted").task = Some(task);
+        let revoked = Self::take_revoked(&mut g, id);
         g.runnable.push_back(id);
         self.offer(&mut g, id);
+        drop(g);
+        Self::answer_revoked(revoked);
     }
 
     /// #2742 — handler `h` joins the pool's tasks, under its lock (`g`), one of its window's handlers
@@ -2662,9 +2671,12 @@ impl ChildExec {
         } else if let Some(Task::Handler(h)) = e.task.as_deref_mut() {
             h.carrier = None;
         }
+        let revoked = Self::take_revoked(&mut g, id);
         if g.runnable.contains(&id) {
             self.find_worker(&mut g, id);
         }
+        drop(g);
+        Self::answer_revoked(revoked);
     }
 
     /// #2695 — enlist handler `h`, a held domain's activation its caller carries, before its first
@@ -3257,7 +3269,9 @@ impl ChildExec {
         if !worker && g.runnable.len() > queued {
             self.offer(&mut g, id);
         }
+        let revoked = Self::take_revoked(&mut g, id);
         drop(g);
+        Self::answer_revoked(revoked);
         task
     }
 
@@ -3474,9 +3488,14 @@ impl ChildExec {
     /// answers its call `CAP_REVOKED`, and keeps its fiber parked, shut out of the window, until its
     /// domain drains it. Its `done` is run outside the pool's lock, as a handler's end runs it, and
     /// the window's bell rings for the callers.
+    ///
+    /// #3157 — the window is marked revoked under the same lock first. A handler this scan cannot
+    /// reach, because a residency holds its task out of its entry or it is admitted after, answers
+    /// as it is filed back ([`Self::take_revoked`]), so none is missed.
     fn revoke_window(&self, window: &Arc<Window>) {
         let dones: Vec<HandlerDone> = {
             let mut g = lock(&self.state);
+            window.revoked.store(true, Ordering::Relaxed);
             g.tasks
                 .values_mut()
                 .filter_map(|e| match e.task.as_deref_mut() {
@@ -3492,6 +3511,27 @@ impl ChildExec {
             done(HandlerEnd::Trapped(crate::DOMAIN_DONE_CODE as i64));
         }
         (window.ring)();
+    }
+
+    /// #3157 — task `id`, just filed back into its entry under the pool's lock (`g`): if it is a
+    /// handler of a window whose vCPU has ended ([`Self::revoke_window`]) and its call is still
+    /// unanswered, its `done` and window, for [`Self::answer_revoked`] once the lock is let go.
+    fn take_revoked(g: &mut ExecState, id: u64) -> Option<(HandlerDone, Arc<Window>)> {
+        match g.tasks.get_mut(&id)?.task.as_deref_mut() {
+            Some(Task::Handler(h)) if h.window.revoked.load(Ordering::Relaxed) => {
+                Some((h.done.take()?, Arc::clone(&h.window)))
+            }
+            _ => None,
+        }
+    }
+
+    /// #3157 — answer a revoked handler's call [`Self::take_revoked`] found, as
+    /// [`Self::revoke_window`] answers the ones it reached: outside the pool's lock.
+    fn answer_revoked(revoked: Option<(HandlerDone, Arc<Window>)>) {
+        if let Some((done, window)) = revoked {
+            done(HandlerEnd::Trapped(crate::DOMAIN_DONE_CODE as i64));
+            (window.ring)();
+        }
     }
 
     /// #2742 — domain `domain` has ended, every vCPU of it, with handlers of its serve loops still
@@ -3835,6 +3875,7 @@ pub(crate) mod tests {
             gate_waiters: std::sync::atomic::AtomicUsize::new(0),
             self_calls: std::sync::atomic::AtomicUsize::new(0),
             held: false,
+            revoked: std::sync::atomic::AtomicBool::new(false),
             outside: std::sync::Mutex::new(()),
             outside_cv: std::sync::Condvar::new(),
         });
@@ -3859,6 +3900,85 @@ pub(crate) mod tests {
         }));
         super::lock(&exec.state).enter(e);
         (site, exec)
+    }
+
+    /// #3157 — a handler task of `site`'s window, over a fiber its residencies would run (none
+    /// does here), whose `done` notes how its call was answered in `answered`.
+    fn a_handler_of(
+        site: &ServeSite,
+        answered: &Arc<std::sync::Mutex<Option<String>>>,
+    ) -> super::HandlerTask {
+        let job = Box::new(super::JobCell(std::cell::UnsafeCell::new(None)));
+        let cell = &*job as *const super::JobCell as *const ();
+        // SAFETY: the fiber is never resumed: no residency runs in this test.
+        let fiber =
+            unsafe { crate::fiber_rt::make_handler_fiber(super::TASK_STACK, cell, super::run_job) }
+                .expect("a stack");
+        let slot = crate::fiber_rt::FiberSlot::platform(fiber);
+        let fib = slot.fiber_ptr().expect("a platform slot holds its fiber");
+        let note = Arc::clone(answered);
+        super::HandlerTask {
+            shell: super::Shell {
+                slot,
+                fib,
+                rt: Box::new(crate::fiber_rt::FiberRuntime::new(
+                    Arc::clone(&site.table),
+                    0,
+                    0,
+                )),
+                job,
+                args: Vec::new(),
+                results: Vec::new(),
+            },
+            fault: (0, 0),
+            window: Arc::clone(&site.window),
+            vm: Arc::clone(&site.window.vm),
+            tls: None,
+            carrier: None,
+            serve_handlers: 0,
+            holds_lanes: false,
+            domain: core::ptr::null(),
+            n_results: 0,
+            reusable: false,
+            done: Some(Box::new(move |end| {
+                *note.lock().unwrap() = Some(format!("{end:?}"));
+            })),
+        }
+    }
+
+    /// #3157 — a handler of a window whose vCPU ends while a residency holds it out of its entry
+    /// (taken by a worker, or admitted and not yet filed) is answered `CAP_REVOKED` as it is filed
+    /// back, not left to wait for ever. The pool's scan at the vCPU's end cannot see a task that is
+    /// out of its entry: it once missed it, and the handler's caller waited on a call nothing would
+    /// answer (`live_offer_reply::a_fibers_serve_op_is_the_running_vcpus`, 1 run in about 400 under
+    /// load, and every forced run). Here the handler is admitted (its entry holds no task, as a
+    /// worker's residency leaves it), its vCPU ends, and the residency files it back, parked.
+    #[test]
+    fn a_handler_out_of_its_entry_when_its_vcpu_ends_is_answered_as_it_is_filed_back() {
+        let (site, exec) = parked_site();
+        let answered = Arc::new(std::sync::Mutex::new(None));
+        let h = a_handler_of(&site, &answered);
+        let id = {
+            let mut g = super::lock(&exec.state);
+            exec.admit(&mut g, &h)
+        };
+        site.revoke();
+        assert_eq!(
+            *answered.lock().unwrap(),
+            None,
+            "out of its entry, the scan missed it"
+        );
+        let task = Box::new(super::Task::Handler(h));
+        let back = exec.file(id, task, super::Outcome::Parked { deadline: None }, false);
+        assert!(back.is_none(), "filed back, parked");
+        assert_eq!(
+            answered.lock().unwrap().as_deref(),
+            Some(format!("Trapped({})", crate::DOMAIN_DONE_CODE).as_str()),
+            "its call is answered as it is filed back"
+        );
+        let mut g = super::lock(&exec.state);
+        g.tasks.clear();
+        g.runnable.clear();
     }
 
     /// The parked task of [`parked_site`]'s pool: still parked (nothing was offered), or not.
