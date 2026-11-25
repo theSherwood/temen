@@ -1418,8 +1418,8 @@ pub fn grant_module_loader(host: &mut Host) -> i32 {
 }
 
 /// Like [`grant_jit`], but the granted domain may host §12 **fibers** (`cont.*`) in submitted units
-/// (DESIGN.md §22 "Concurrency", renegotiated 2026-07-30): [`jit_cap_run`] stands up the parent's
-/// fiber runtime (`CompiledModule::enable_fiber_hosting`) so a unit's `cont.*` resolve, and the
+/// (DESIGN.md §22 "Concurrency", renegotiated 2026-07-30): [`jit_cap_run`] compiles a parent that
+/// drives `Jit` with `hosts_fibers`, which stands its fiber runtime up so a unit's `cont.*` resolve, and the
 /// interpreter runs them in its eval loop — so the backends stay in differential lockstep.
 /// **Threads/futex** in a submitted unit are admitted at compile (CONSOLIDATION.md §11); `invoke`
 /// still refuses them at runtime (seam-free), `install` + dispatch runs them. Same handle value +
@@ -1525,7 +1525,7 @@ pub fn jit_cap_run(
     // A fresh window: its page map is `init`'s, none from an earlier run (see `reset_cap_pages`).
     host.reset_cap_pages(init.page_map());
     // #2958 — a program `jit_kernel::admit` admits runs its vCPUs as executor 2's tasks.
-    if let Ok(admitted) = jit_kernel::admit(m, host, false, temen_interp::DEFAULT_FUEL) {
+    if let Ok(admitted) = jit_kernel::admit(m, host, false) {
         let start = jit_kernel::Start {
             entry,
             args,
@@ -1560,7 +1560,7 @@ pub fn jit_cap_run(
     let durable = host.is_durable();
     // Fiber-hosting grant (`grant_jit_fibers`): the parent must stand up its fiber runtime so a
     // submitted unit's `cont.*` resolve (DESIGN.md §22 "Concurrency"). Read before any `mem::take`.
-    let hosts_fibers = host.jit_hosts_fibers();
+    let hosts_fibers = jit_proc::hosts_fibers(m, host);
     // Thread-hosting grant (`grant_jit_threads`, CONSOLIDATION.md §11): the parent stands up its
     // thread scheduler so an installed unit's `thread.*` / futex resolve. A hosted unit spawns real
     // vCPU threads that make **concurrent** `call.cap`s, so — like a top-level concurrent module — it
@@ -1599,6 +1599,7 @@ pub fn jit_cap_run(
             None, // fast_resolver
             node,
             table_reserve_log2,
+            hosts_fibers, // #3080 — lowered for, and standing up, the fiber hosting
         )?;
         // The granted §14 spawns (named, separate-module, detached) — the hooks the CLI path installs
         // (`jit_proc::run_image`); without them a granted spawn here was an inert `CapFault`.
@@ -1609,9 +1610,6 @@ pub fn jit_cap_run(
         cm.set_window_ready(Some(cc.window_ready()));
         cm.set_restore(restore);
         cm.set_freeze_controller(freeze);
-        if hosts_fibers {
-            cm.enable_fiber_hosting()?;
-        }
         if hosts_threads {
             cm.enable_thread_hosting()?;
         }
@@ -1661,6 +1659,7 @@ pub fn jit_cap_run(
         None, // fast_resolver
         run_node(host),
         table_reserve_log2,
+        hosts_fibers, // #3080 — lowered for, and standing up, the fiber hosting
     )?;
     // The granted §14 spawns, as in the locked branch above.
     cm.set_grant_child_hooks(Some(production_grant_hooks(cc)));
@@ -1670,9 +1669,6 @@ pub fn jit_cap_run(
     cm.set_window_ready(Some(cc.window_ready()));
     cm.set_restore(restore);
     cm.set_freeze_controller(freeze);
-    if hosts_fibers {
-        cm.enable_fiber_hosting()?;
-    }
     let cm_ptr: *mut CompiledModule = &mut cm;
     host.set_jit_native_ctx(cm_ptr as usize);
     host.set_park_hub(cm.park_hub());
@@ -2125,6 +2121,7 @@ pub fn recompact_jit(
         None, // fast_resolver
         run_node(host),
         table_reserve_log2,
+        old.reloads_fuel_cell(), // #3080 — lowered as the old code was
     )?;
     fresh.set_window_ready(Some(CapCtx::Raw(host).window_ready()));
     recompact_into(&mut fresh, host, domain, old)?;
@@ -2335,6 +2332,7 @@ impl JitSession {
             None, // fast_resolver
             node,
             table_reserve_log2,
+            false,
         )?;
         cm.set_window_ready(Some(CapCtx::Locked(&*host).window_ready()));
         Ok(JitSession {
@@ -2414,6 +2412,7 @@ impl JitSession {
             None, // fast_resolver
             node,
             self.table_reserve_log2,
+            self.cm.reloads_fuel_cell(), // #3080 — lowered as the old code was
         )?;
         fresh.set_window_ready(Some(CapCtx::Locked(&*self.host).window_ready()));
         {
@@ -6760,18 +6759,15 @@ impl PowerboxProgram {
                 // node's tree lives as long as the code, and holds the default grant.
                 run_node(&host),
                 CLI_JIT_TABLE_LOG2,
+                jit_proc::hosts_fibers(&inst.module, &host), // #3080 — stands up hosting
             )
             .map_err(|e| format!("JIT compile failed: {e:?}"))?,
         );
-        // Mirror `jit_proc::compile_image`'s unlocked shape: stand up the fiber runtime if the
-        // powerbox grant hosts fibers (so a submitted-unit `cont.*` resolves), install the production
-        // granted-child hooks + budget taker. Done once — the run-many path reuses this `cm`. Thread
-        // hosting is *not* enabled: that is the locked (concurrent) arm's job, and `uses_concurrency`
-        // modules — the only ones that could reach it — are refused above.
-        if host.jit_hosts_fibers() {
-            cm.enable_fiber_hosting()
-                .map_err(|e| format!("JIT fiber-hosting setup failed: {e:?}"))?;
-        }
+        // Mirror `jit_proc::compile_image`'s unlocked shape (the compile stood up fiber hosting if
+        // the program hosts fibers, `jit_proc::hosts_fibers`): install the production granted-child
+        // hooks + budget taker. Done once — the run-many path reuses this `cm`. Thread hosting is
+        // *not* enabled: that is the locked (concurrent) arm's job, and `uses_concurrency` modules —
+        // the only ones that could reach it — are refused above.
         cm.set_grant_child_hooks(Some(production_grant_hooks(cc)));
         cm.set_window_ready(Some(cc.window_ready()));
         Ok(PowerboxProgram {
@@ -7009,8 +7005,8 @@ fn grant_powerbox_prefix(h: &mut Host, win: u64) -> [i32; 7] {
     // The powerbox `Jit` grant hosts §12 **fibers** (`cont.*`) in submitted units (DESIGN.md §22
     // "Concurrency"): the maximal CLI grant admits a unit running its own cooperative scheduler —
     // e.g. `[interpret …]` of concurrent JACL source (spawn/await), whose in-guest entry runs the
-    // program body on a scheduler root fiber. `jit_proc::compile_image` reads this to `enable_fiber_hosting`
-    // on the top-level module so a submitted unit's `cont.*` resolve even when the top-level program
+    // program body on a scheduler root fiber. `jit_proc::compile_image` reads this to compile a top-level module
+    // that drives `Jit` with `hosts_fibers` so a submitted unit's `cont.*` resolve even when the top-level program
     // uses no fibers of its own. Threads/futex in a submitted unit stay rejected (they would outlive
     // the synchronous `call.cap`). In-domain stack switches, not an escape vector.
     h.set_jit_hosts_fibers(true);
@@ -8026,7 +8022,7 @@ fn jit_run(
     // level meters nothing, and the run's code compiles without fuel checks.
     limits.grant(host);
     // #2958 — a program `jit_kernel::admit` admits runs its vCPUs as executor 2's tasks.
-    if let Ok(admitted) = jit_kernel::admit(m, host, code.is_some(), limits.fuel()) {
+    if let Ok(admitted) = jit_kernel::admit(m, host, code.is_some()) {
         let mut end = with_deadline(limits.deadline, |kill| {
             let start = jit_kernel::Start {
                 entry: func,
@@ -9496,7 +9492,7 @@ impl Instance {
         let owned = self.window_override(config);
         let m = owned.as_ref().unwrap_or(&self.module);
         let host = self.diff_host(config, m.memory.map_or(0, |mc| 1u64 << mc.size_log2));
-        jit_kernel::admit(m, &host, config.jit_code.is_some(), config.limits.fuel()).map(|_| ())
+        jit_kernel::admit(m, &host, config.jit_code.is_some()).map(|_| ())
     }
 
     pub fn run_diff(&self, config: &RunConfig) -> Result<Run, String> {

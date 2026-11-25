@@ -61,6 +61,7 @@ fn main() {
         None,
         None,
         0,
+        false,
     )
     .expect("jit compiles");
 

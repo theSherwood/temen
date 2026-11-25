@@ -62,6 +62,7 @@ fn jit_compile(m: &Module) -> (temen_jit::CompiledModule, usize) {
         None, // fast_resolver
         None,
         0,
+        false,
     )
     .expect("jit compile");
     let bytes = cm.code_byte_count();

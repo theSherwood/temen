@@ -73,10 +73,16 @@ fn is_fork_op(type_id: u32, op: u32) -> bool {
 /// reaches its slot's binding — or anything, when `import.attach` may retarget the slot; a
 /// dynamic-mode call's interface is interned at run time, so it may reach anything.
 ///
-/// Read where a program's reading over a powerbox is made ([`ForkPlan::of`], [`drives_jit`]), over
+/// Read where a program's reading over a powerbox is made ([`ForkPlan::of`], [`drives_jit`], a held
+/// domain's decline, `held::fiber_may_call_in`), over
 /// bindings that cannot change afterwards except through a rebindable slot (counted as reaching
 /// anything).
-fn may_reach(type_id: u32, op: u32, host: &Host, pred: impl Fn(u32, u32) -> bool) -> bool {
+pub(crate) fn may_reach(
+    type_id: u32,
+    op: u32,
+    host: &Host,
+    pred: impl Fn(u32, u32) -> bool,
+) -> bool {
     match type_id {
         temen_ir::CAP_IMPORT_TYPE_ID => {
             host.import_rebindable(op & 0xFFFF)
@@ -103,6 +109,23 @@ pub(crate) fn drives_jit(calls: &BTreeSet<(u32, u32)>, host: &Host) -> bool {
     calls
         .iter()
         .any(|&(t, o)| may_reach(t, o, host, |t, _| t == cap_id::JIT))
+}
+
+/// #3080 — whether `m`'s compile under `host` hosts fibers (`CompiledModule::compile`'s
+/// `hosts_fibers`): its host lets submitted units host them, and `m` can reach `Jit` to submit one.
+/// A program that cannot reach `Jit` hosts no unit, so its code is lowered as before. The one rule
+/// for every JIT entry that compiles a root over a powerbox.
+pub(crate) fn hosts_fibers(m: &Module, host: &Host) -> bool {
+    host.jit_hosts_fibers() && drives_jit(&host_calls(m), host)
+}
+
+/// #3080 (review H1) — whether a unit `m` submits under `host` may make fibers: `m` can reach `Jit`,
+/// and its compile stands a fiber runtime up, which is what `define_extra` admits a unit's `cont.*`
+/// on (`CompiledModule`'s `fibers`). The compile reads it from the same two facts: `m`'s own code
+/// (`CodeFacts::uses_fibers`: a `cont.*` or a `gc.roots`), or the hosting grant ([`hosts_fibers`]).
+pub(crate) fn units_make_fibers(m: &Module, host: &Host) -> bool {
+    hosts_fibers(m, host)
+        || temen_ir::thaw::CodeFacts::of(m).uses_fibers() && drives_jit(&host_calls(m), host)
 }
 
 /// #2695 — whether a program making `calls` can serve its offers in a serve loop over `host`: reach
@@ -1048,6 +1071,8 @@ pub(crate) unsafe fn compile_image(
         CapCtx::Raw(_) => (module_resolver, Some(fast_cap_resolver)),
         CapCtx::Locked(_) => (module_resolver_locked, None),
     };
+    let (fibers, threads) = cc.with_host(|h| (h.jit_hosts_fibers(), h.jit_hosts_threads()));
+    let fibers = jit && fibers; // #3080 — [`hosts_fibers`] with the caller's `drives_jit`
     let mut cm = CompiledModule::compile_kept(
         kept,
         module,
@@ -1061,11 +1086,8 @@ pub(crate) unsafe fn compile_image(
         fast,
         cc.with_host(|h| crate::run_node(h)), // #2113 — what its vCPUs, fibers and processes charge
         CLI_JIT_TABLE_LOG2,
+        fibers, // #3080 — stands up hosting over code lowered for it
     )?;
-    let (fibers, threads) = cc.with_host(|h| (h.jit_hosts_fibers(), h.jit_hosts_threads()));
-    if jit && fibers {
-        cm.enable_fiber_hosting()?;
-    }
     if jit && threads && cc.is_locked() {
         cm.enable_thread_hosting()?;
     }

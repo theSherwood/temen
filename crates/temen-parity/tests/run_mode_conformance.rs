@@ -305,13 +305,12 @@ fn the_cranelift_runner_runs_the_threaded_probe_on_the_kernel_route() {
     let m = module(&(probe.src)());
     let host = temen_interp::Host::new();
     assert_eq!(
-        temen_run::jit_kernel::admit(&m, &host, false, temen_run::jit_kernel::lane_fuel(&m)).err(),
+        temen_run::jit_kernel::admit(&m, &host, false).err(),
         None,
         "the threaded probe runs on the kernel route"
     );
-    let (o, vcpus) =
-        temen_run::jit_kernel::run_fresh(&m, 0, &[], None, temen_run::jit_kernel::lane_fuel(&m))
-            .expect("in scope");
+    let (o, vcpus) = temen_run::jit_kernel::run_fresh(&m, 0, &[], None, temen_interp::DEFAULT_FUEL)
+        .expect("in scope");
     assert_eq!(o, temen_jit::JitOutcome::Returned(vec![probe.want]));
     assert_eq!(vcpus, 3, "its root and two threads ran as kernel tasks");
 }

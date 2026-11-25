@@ -384,6 +384,7 @@ fn generated_fiber_programs_agree_on_interp_and_jit() {
             None,
             temen_run::run_node(&jhost),
             0,
+            false,
         ) {
             Ok(cm) => cm,
             Err(JitError::Unsupported(_)) => continue, // off a fiber_rt target / an unlowered op
@@ -603,7 +604,7 @@ fn generated_migration_schedules_agree_on_interp_and_jit() {
         });
         // JIT — the real cross-thread stack switches; must match exactly, on both of its routes
         // while both exist (#2958): today's thread runtime, and the kernel's, which runs every
-        // worker as a kernel task (#3078 slice 2), unmetered (`fiber fuel`, #3080).
+        // worker as a kernel task (#3078 slice 2), metered since #3080.
         for (route, jit) in Route::BOTH
             .map(|r| match r {
                 Route::Today => compile_and_run(&m, 0, &[]).expect("jit compile/run"),
@@ -612,7 +613,7 @@ fn generated_migration_schedules_agree_on_interp_and_jit() {
                     0,
                     &[],
                     None,
-                    jit_kernel::lane_fuel(&m),
+                    temen_interp::DEFAULT_FUEL,
                     jit_kernel::Expect::of(None),
                 )
                 .expect("the kernel route admits it"),

@@ -31,11 +31,14 @@ use crate::{jit_proc, CAP_REVOKED};
 /// takes its calls first, which the JIT's do not reach yet (#2895), so the tree-walker holds it
 /// (INVARIANTS #9).
 ///
-/// #3133, #3080 — the JIT also declines a module that can make a fiber: one with a fiber op, or one
-/// whose host lets its submitted units host fibers. A fiber runs on a context of its own, but it
-/// charges the fuel of the code that made it: a fiber made in one call would burn that call's
-/// leftover loan in every later call, where the tree-walker charges the call that resumes it. The
-/// tree-walker holds such a domain until a fiber charges the vCPU running it (#3080).
+/// #3080 — a module that makes fibers is held on the JIT too: a fiber made in one call charges the
+/// call that resumes it, as on the tree-walker, since each resume names the running activation's
+/// cell (`VmCtx::fiber_switched_in`). Except where a fiber could call into a held domain
+/// ([`fiber_may_call_in`]): the tree-walker holds those until #3164. So the JIT holds a domain where a
+/// fiber can exist only when none of its code calls an interface a guest can implement and it cannot
+/// reach `Jit`. Those interfaces include the built-in `Stream` and `Exit`, whose shape a guest's offer
+/// can carry: a fiber-making module that prints or exits through its powerbox is the tree-walker's
+/// until #3164.
 pub fn hold(
     on: Executor,
     m: Arc<Module>,
@@ -44,16 +47,42 @@ pub fn hold(
     fuel: u64,
     host: Host,
 ) -> Result<(HeldDomain, Vec<Value>), (Trap, Box<Host>)> {
-    let fibers = host.jit_hosts_fibers() || m.funcs.iter().any(temen_ir::Func::uses_fibers);
     let jit = on == Executor::Jit
-        && !fibers
         && !crate::folds_to_oracle(&m)
-        && !jit_proc::serves(&jit_proc::host_calls(&m), &host);
+        && !jit_proc::serves(&jit_proc::host_calls(&m), &host)
+        && !fiber_may_call_in(&m, &host);
     if jit {
         hold_jit(m, entry, args, fuel, host)
     } else {
         HeldDomain::start(on, m, entry, args, fuel, host)
     }
+}
+
+/// #3080 (review B2, G1, G2, H1) — whether a guest fiber of the domain could call through an
+/// interface a guest can implement, so into a held domain, its own included: on the JIT such a call
+/// runs under the calling activation's gate and then gives it away, where the tree-walker keeps it
+/// out until that activation parks or ends (#3164). It could when **a fiber can exist** (the module
+/// makes one, or a unit it submits may, [`jit_proc::units_make_fibers`]: the compile stands a fiber
+/// runtime up, by its own `cont.*` or `gc.roots` or by the hosting grant) **and code that can run in
+/// one may make such a call**:
+/// - the module's own code, through a `call.cap` on an interface a guest can implement
+///   ([`temen_interp::guest_implementable`]: a guest-interned id, or a pre-seeded built-in shape,
+///   `Stream` or `Exit`, which a guest's offer can carry), or through a bound import or a dynamic call
+///   that may land on one ([`jit_proc::may_reach`]);
+/// - any unit, when it can reach `Jit` ([`jit_proc::drives_jit`]): a unit `Jit.invoke`d from a fiber,
+///   or one whose own fiber runs, is code not there to read before it arrives, and its `call.cap`
+///   dispatches into the domain's powerbox.
+fn fiber_may_call_in(m: &Module, host: &Host) -> bool {
+    let calls = jit_proc::host_calls(m);
+    let units = jit_proc::drives_jit(&calls, host);
+    let fiber =
+        m.funcs.iter().any(temen_ir::Func::uses_fibers) || jit_proc::units_make_fibers(m, host);
+    let calls_a_guest = || {
+        (calls.iter()).any(|&(t, o)| {
+            jit_proc::may_reach(t, o, host, |t, _| temen_interp::guest_implementable(t))
+        })
+    };
+    fiber && (units || calls_a_guest())
 }
 
 /// The domain's main thread: what its run answers, and its powerbox back.
@@ -320,6 +349,138 @@ pub(crate) unsafe fn held_call(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What a [`decline_case`] module's one function holds.
+    #[derive(Clone, Copy, Default)]
+    struct Holds {
+        cont: bool,
+        gc_roots: bool,
+        jit: bool,
+        guest_call: bool,
+        import: Option<temen_interp::BoundImport>,
+        rebindable: bool,
+        dynamic: bool,
+    }
+
+    /// A module whose function 0 holds the ops `h` names (a `cont.new` over function 1, a
+    /// `gc.roots`, a `call.cap` on `Jit`, one on a guest-interned id, a `call.import` through import
+    /// 0, a `call.import.dyn`), over a host with import 0 bound as `h.import` says. Parsed and
+    /// verified, never run: [`fiber_may_call_in`] reads only the code and the bindings.
+    fn decline_case(h: Holds) -> bool {
+        let mut body = String::new();
+        if h.cont {
+            body += "  vf = i32.const 1\n  vsp = i64.const 4096\n  vk = cont.new vf vsp\n";
+        }
+        if h.gc_roots {
+            body += "  g0 = i64.const 0\n  g1 = i64.const 4096\n  gm = i64.const -1\n  g2 = i64.const 0\n  g3 = i64.const 8\n  vg = gc.roots g0 g1 gm g2 g3\n";
+        }
+        if h.jit {
+            body += "  vjh = i32.const 0\n  vjz = i64.const 0\n  vj = call.cap 11 3 (i64) -> (i64) vjh (vjz)\n";
+        }
+        if h.guest_call {
+            body += "  vqh = i32.const 0\n  vq = call.cap 268435456 0 () -> (i64) vqh ()\n";
+        }
+        if h.import.is_some() {
+            body += "  vi = call.import 0 ()\n";
+        }
+        if h.dynamic {
+            body += "  vdh = i32.const 0\n  vd = call.import.dyn 1.kept vdh ()\n";
+        }
+        let src = format!(
+            "memory 16\ntype 0 func () -> (i64)\ntype 1 interface {{ kept: 0 }}\nimport 0 \"k\" () -> (i64){mode}\nfunc () -> (i64) {{\nblock 0 () {{\n{body}  vr = i64.const 0\n  return vr\n  }}\n}}\nfunc (i64, i64) -> (i64) {{\nblock 0 (vsp: i64, varg: i64) {{\n  return varg\n  }}\n}}\n",
+            mode = if h.rebindable { " rebindable" } else { "" },
+        );
+        let m = temen_text::parse_module(&src).expect("parse");
+        temen_verify::verify_module(&m).expect("verify");
+        let mut host = Host::new();
+        host.set_import_bindings(h.import.into_iter().collect());
+        fiber_may_call_in(&m, &host)
+    }
+
+    /// #3080 (review T1) — [`fiber_may_call_in`]'s truth table, read on the rule itself. `hold` asks
+    /// `jit_proc::serves` first, which declines a rebindable slot and a `call.import.dyn` through the
+    /// same `may_reach` arms, so a `hold` row cannot reach the fiber rule's own arms for them.
+    #[test]
+    fn a_fiber_may_call_in_when_a_fiber_can_exist_and_its_code_may_call_a_guest() {
+        use temen_interp::BoundImport;
+        use temen_ir::cap_id::{GUEST_IMPL_BASE, HOST_PROC};
+        let fibers = Holds {
+            cont: true,
+            ..Holds::default()
+        };
+        let cases = [
+            // H1's arm, its accept side: `gc.roots` stands the runtime up, but no unit can arrive.
+            (
+                "gc.roots, a guest call, no Jit",
+                Holds {
+                    gc_roots: true,
+                    guest_call: true,
+                    ..Holds::default()
+                },
+                false,
+            ),
+            (
+                "gc.roots and Jit",
+                Holds {
+                    gc_roots: true,
+                    jit: true,
+                    ..Holds::default()
+                },
+                true,
+            ),
+            ("cont.*, no Jit, no guest call", fibers, false),
+            (
+                "Jit, no cont.* and no gc.roots, no hosting grant",
+                Holds {
+                    jit: true,
+                    ..Holds::default()
+                },
+                false,
+            ),
+            (
+                "cont.* and a rebindable slot",
+                Holds {
+                    import: Some(BoundImport {
+                        type_id: GUEST_IMPL_BASE,
+                        op: 0,
+                        handle: 0,
+                        bound: false,
+                        rebindable: true,
+                    }),
+                    rebindable: true,
+                    ..fibers
+                },
+                true,
+            ),
+            (
+                "cont.* and a call.import.dyn",
+                Holds {
+                    dynamic: true,
+                    ..fibers
+                },
+                true,
+            ),
+            (
+                "cont.* and an import bound to a guest id",
+                Holds {
+                    import: Some(BoundImport::required(GUEST_IMPL_BASE, 0, 1)),
+                    ..fibers
+                },
+                true,
+            ),
+            (
+                "cont.* and an import bound for good to a host capability",
+                Holds {
+                    import: Some(BoundImport::required(HOST_PROC, 0, 1)),
+                    ..fibers
+                },
+                false,
+            ),
+        ];
+        for (name, holds, declines) in cases {
+            assert_eq!(decline_case(holds), declines, "{name}");
+        }
+    }
 
     /// #2990 — an embedder keeps the `Arc<HeldSite>` past the run, so it may call `activate` after
     /// the run returned and its root's context, window and module are gone. The call is refused, and

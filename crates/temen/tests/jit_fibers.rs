@@ -53,15 +53,15 @@ fn assert_jit_matches_interp(src: &str) {
 
 /// #3078 slice 2 — a fiber-only module keeps its single-vCPU path (`fiber only`), so each case whose
 /// entry is `() -> (i64)` also runs inside one `thread.spawn`ed vCPU, which the kernel route admits:
-/// a wrapper entry spawns a thread that calls the case's entry, and joins it. That run, unmetered
-/// (`fiber fuel`, #3080), answers as the oracle's run of it.
+/// a wrapper entry spawns a thread that calls the case's entry, and joins it. That run, metered
+/// (since #3080), answers as the oracle's run of it.
 fn in_a_thread_on_the_kernel_route(src: &str, m: &temen_ir::Module) {
     use temen_run::jit_kernel;
     let entry = &m.funcs[0];
     if !entry.params.is_empty() || entry.results != [temen_ir::ValType::I64] {
         return;
     }
-    let declined = jit_kernel::admit(m, &temen_interp::Host::new(), false, u64::MAX).err();
+    let declined = jit_kernel::admit(m, &temen_interp::Host::new(), false).err();
     assert_eq!(declined, Some("fiber only"), "{src}");
     let n = m.funcs.len();
     let wrapped = format!(
@@ -427,6 +427,7 @@ fn fiber_backtrace_walks_a_suspended_fibers_guest_stack() {
         None,
         None,
         0,
+        false,
     )
     .expect("compile");
     // A run takes its parked fibers' backtraces as it ends only when asked (#3020).
@@ -789,6 +790,7 @@ fn fiber_backtrace_reaches_the_last_run_s_fibers_alone() {
         None,
         None,
         0,
+        false,
     )
     .expect("compile");
     let _ = cm.run(&[], None, None).expect("run 1");

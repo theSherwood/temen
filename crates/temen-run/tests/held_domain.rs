@@ -781,49 +781,139 @@ block 1 (vi: i64) {
 }
 "#;
 
-/// #3133 (stop-gap) — a domain that can make a fiber is held by the tree-walker when it is asked
-/// for on the JIT. A fiber made in an activation keeps that activation's context and fuel cell, which
-/// end with the call, so on the JIT a later resume ran on freed memory: a fiber that never started
-/// wrote its start refund into the freed cell, and one that suspended in its first call read its
-/// freed context once resumed in the next. Here each fiber is made in one call and resumed by the
-/// later ones, either never started in its first call or started and suspended there, each call on
-/// a loan and on none, and the domain answers as the oracle does. The context per fiber (#3080) lets the JIT hold it again,
-/// and these rows then assert the JIT.
+/// #3133, #3080 — a domain that makes fibers is held on the JIT, and each call there answers and
+/// leaves the fuel the tree-walker's does. A fiber made in an activation runs on a context of its own,
+/// which outlives the call, and each resume names the cell of the activation that runs it, so the
+/// call that resumes a fiber is the call that pays for it, as on the tree-walker. (Until #3080 the
+/// JIT declined it: its fiber charged the call that made it, and on the JIT a later resume ran on
+/// that call's freed context and cell, #3133.) Each fiber is made in one call and resumed by the
+/// later ones, never started in its first call or started and suspended there, each call on a loan
+/// and on none.
 #[test]
-fn a_domain_that_makes_fibers_is_held_by_the_tree_walker_on_the_jit() {
+fn a_domain_that_makes_fibers_is_held_on_the_jit_and_charges_as_the_tree_walker() {
     bounded(|| {
         for start in [0, 1] {
             for loan in [u64::MAX, 1_000_000] {
-                let m = module(FIBER_MAKER);
-                let mut host = Host::new();
-                host.set_self_module(&m);
-                let started = temen_run::hold(Executor::Jit, m, 0, &[], u64::MAX, host);
-                let (d, results) =
-                    started.unwrap_or_else(|(t, _)| panic!("the entry ends in {t:?}"));
-                assert_eq!(
-                    d.executor(),
-                    Executor::TreeWalker,
-                    "start {start}, loan {loan}"
-                );
-                assert_eq!(results, vec![Value::I64(1)]);
-                let mut fuel = loan;
-                assert_eq!(
-                    d.call(0, 0, &[start], &mut fuel),
-                    Reply::Results(vec![0]),
-                    "the fiber's handle"
-                );
-                for n in 0..3 {
+                let on = |on: Executor| {
+                    let m = module(FIBER_MAKER);
+                    let mut host = Host::new();
+                    host.set_self_module(&m);
+                    let started = temen_run::hold(on, m, 0, &[], u64::MAX, host);
+                    let (d, results) =
+                        started.unwrap_or_else(|(t, _)| panic!("the entry ends in {t:?}"));
+                    assert_eq!(d.executor(), on, "start {start}, loan {loan}");
+                    assert_eq!(results, vec![Value::I64(1)]);
+                    let mut calls = Vec::new();
                     let mut fuel = loan;
+                    calls.push((d.call(0, 0, &[start], &mut fuel), fuel));
+                    for _ in 0..3 {
+                        let mut fuel = loan;
+                        calls.push((d.call(0, 1, &[0], &mut fuel), fuel));
+                    }
+                    let (_host, trap) = d.end();
+                    assert_eq!(trap, None);
+                    calls
+                };
+                let oracle = on(Executor::TreeWalker);
+                let replies: Vec<&Reply> = oracle.iter().map(|(r, _)| r).collect();
+                let want: Vec<Reply> = [0, 42 + start, 43 + start, 44 + start]
+                    .map(|v| Reply::Results(vec![v]))
+                    .to_vec();
+                assert_eq!(
+                    replies,
+                    want.iter().collect::<Vec<_>>(),
+                    "the fiber's handle, then its counts"
+                );
+                // On no loan (`u64::MAX`) the JIT runs a call unmetered and reports none burned,
+                // where the tree-walker counts down from it (#3146): the replies are compared there.
+                let jit = on(Executor::Jit);
+                if loan == u64::MAX {
+                    let jit: Vec<&Reply> = jit.iter().map(|(r, _)| r).collect();
+                    assert_eq!(jit, replies, "start {start}, no loan: each call's reply");
+                } else {
                     assert_eq!(
-                        d.call(0, 1, &[0], &mut fuel),
-                        Reply::Results(vec![42 + start + n]),
-                        "start {start}, loan {loan}: resume {n} in a later call"
+                        jit, oracle,
+                        "start {start}, loan {loan}: each call's reply and fuel left"
                     );
                 }
-                let (_host, trap) = d.end();
-                assert_eq!(trap, None);
             }
         }
+    });
+}
+
+/// #3080 — `mk()` makes a fiber that runs 10,000 back-edges and returns 7, and answers its handle;
+/// `go(h)` resumes it to its end and answers what it returned.
+const A_LONG_FIBER: &str = r#"memory 16
+type 0 func (i64) -> (i64)
+type 1 interface { mk: 0, go: 0 }
+export 0 interface "svc" 1 { mk: 1, go: 2 }
+func () -> (i64) {
+block 0 () {
+  vr = i64.const 1
+  return vr
+  }
+}
+func (i64) -> (i64) {
+block 0 (va: i64) {
+  vf = ref.func 3
+  vz = i64.const 0
+  vk = cont.new vf vz
+  return vk
+  }
+}
+func (i64) -> (i64) {
+block 0 (vh: i64) {
+  vz = i64.const 0
+  vs, vv = cont.resume vh vz
+  return vv
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, varg: i64) {
+  vz = i64.const 0
+  br 1(vz)
+}
+block 1 (vi: i64) {
+  vone = i64.const 1
+  vj = i64.add vi vone
+  vn = i64.const 10000
+  vmore = i64.lt_u vj vn
+  br_if vmore 1(vj) 2()
+}
+block 2 () {
+  vr = i64.const 7
+  return vr
+  }
+}
+"#;
+
+/// #3080 — the call that resumes a fiber is the one it charges: a fiber made in a call lent plenty
+/// runs out of fuel in a later call lent 100, which ends the domain, on the JIT as on the
+/// tree-walker. (Until #3080 the JIT charged the first call's leftover loan and completed.)
+#[test]
+fn a_fiber_made_in_one_call_runs_out_in_the_call_that_resumes_it() {
+    bounded(|| {
+        let on = |on: Executor| {
+            let m = module(A_LONG_FIBER);
+            let mut host = Host::new();
+            host.set_self_module(&m);
+            let (d, _) = temen_run::hold(on, m, 0, &[], u64::MAX, host)
+                .unwrap_or_else(|(t, _)| panic!("the entry ends in {t:?}"));
+            assert_eq!(d.executor(), on);
+            let mut fuel = 1_000_000;
+            let made = (d.call(0, 0, &[0], &mut fuel), fuel);
+            let mut fuel = 100;
+            let resumed = (d.call(0, 1, &[0], &mut fuel), fuel);
+            let (_host, trap) = d.end();
+            (made, resumed, trap)
+        };
+        let oracle = on(Executor::TreeWalker);
+        assert_eq!(
+            oracle.2,
+            Some(Trap::OutOfFuel),
+            "the second call ends the domain"
+        );
+        assert_eq!(on(Executor::Jit), oracle);
     });
 }
 
@@ -846,22 +936,30 @@ block 0 () {
 }
 "#;
 
-/// #3133 (stop-gap) — the same for a domain with no fiber op whose host lets its submitted units host
-/// fibers: such a unit's `cont.new` in an activation would keep the activation's context alike. The
-/// same domain without the grant is the JIT's, so the grant is what declines it.
+/// #3080 — a domain whose host lets submitted units host fibers, but which cannot reach `Jit`, runs
+/// no unit, so the grant alone keeps it off the JIT no longer (until #3080 it did); a plain call
+/// there costs what it costs on the tree-walker: its handler's entry is free on both (#3138: the
+/// JIT charged it). One that can reach `Jit` is the tree-walker's (#3164, below).
 #[test]
-fn a_domain_whose_units_may_host_fibers_is_held_by_the_tree_walker_on_the_jit() {
+fn a_domain_whose_units_may_host_fibers_is_held_on_the_jit() {
     bounded(|| {
-        for (hosts, held_on) in [(false, Executor::Jit), (true, Executor::TreeWalker)] {
-            let m = module(SEVEN);
-            let mut host = Host::new();
-            host.set_self_module(&m);
-            host.set_jit_hosts_fibers(hosts);
-            let started = temen_run::hold(Executor::Jit, m, 0, &[], u64::MAX, host);
-            let (d, results) = started.unwrap_or_else(|(t, _)| panic!("the entry ends in {t:?}"));
-            assert_eq!(d.executor(), held_on, "hosting fibers: {hosts}");
-            assert_eq!(results, vec![Value::I64(1)]);
-            assert_eq!(call(&d, 0, &[]), Reply::Results(vec![7]));
+        for hosts in [false, true] {
+            let on = |on: Executor| {
+                let m = module(SEVEN);
+                let mut host = Host::new();
+                host.set_self_module(&m);
+                host.set_jit_hosts_fibers(hosts);
+                let started = temen_run::hold(on, m, 0, &[], u64::MAX, host);
+                let (d, results) =
+                    started.unwrap_or_else(|(t, _)| panic!("the entry ends in {t:?}"));
+                assert_eq!(d.executor(), on, "hosting fibers: {hosts}");
+                assert_eq!(results, vec![Value::I64(1)]);
+                let mut fuel = 1_000_000;
+                (d.call(0, 0, &[], &mut fuel), fuel)
+            };
+            let oracle = on(Executor::TreeWalker);
+            assert_eq!(oracle, (Reply::Results(vec![7]), 1_000_000));
+            assert_eq!(on(Executor::Jit), oracle, "hosting fibers: {hosts}");
         }
     });
 }
@@ -1679,8 +1777,8 @@ fn nested_outer(on: Executor, loan: u64) -> (Reply, u64) {
 /// #3069 — a nested activation on a loan can burn all of it: the waiting caller hands back what its
 /// draw left before the call, as it cannot run meanwhile. Each activation draws a cell of its own
 /// from the loan, so a kept draw stranded half the loan, and the least loan was twice the cost.
-/// The JIT alone: the interpreters charge an activation no entry and the nested call nothing to the
-/// outer loan, so their least loan here is not the JIT's (#3093).
+/// The JIT alone: the interpreters charge the nested call nothing to the outer loan, so their least
+/// loan here is not the JIT's (#3093). An activation's entry is free on every engine (#3138).
 ///
 /// The read-back is ordered: `outer()` can call in, so it is carried (it may leave the caller's
 /// thread), and its end reads its cell's `can_burn` (`HeldSite::carry`'s `done`). `kept()` never
@@ -1691,7 +1789,10 @@ fn nested_outer(on: Executor, loan: u64) -> (Reply, u64) {
 fn a_nested_activation_on_the_jit_can_burn_its_whole_loan() {
     let (done, cost) = nested_outer(Executor::Jit, 1_000_000);
     assert_eq!(done, Reply::Results(vec![42]));
-    assert_eq!(cost, 101, "two entries and the inner loop's 99 back-edges");
+    assert_eq!(
+        cost, 99,
+        "the inner loop's 99 back-edges: an activation's entry is free (#3138)"
+    );
     assert_eq!(
         nested_outer(Executor::Jit, cost),
         (Reply::Results(vec![42]), cost)
@@ -1700,6 +1801,205 @@ fn a_nested_activation_on_the_jit_can_burn_its_whole_loan() {
         nested_outer(Executor::Jit, cost - 1),
         (Reply::Failed(CAP_REVOKED), cost - 1)
     );
+}
+
+/// #3080 (review F8a) — the unit a [`A_UNIT_FIBER_CROSSES_CALLS`] domain installs. Its entry, given
+/// mode 0, makes a fiber over its own function 1, resumes it to its first suspend and answers its
+/// handle; given mode 1 it resumes the fiber `h` and answers what it returned. The fiber's body calls
+/// its parent's function 3 (slot 3, new to old) with the unit's suspender (function 2), so the
+/// parent's code is on the fiber's stack when it suspends.
+const A_UNIT_THAT_RUNS_A_PARENT_FIBER: &str = "memory 16
+func (i64, i64) -> (i64) {
+block 0 (vmode: i64, vh: i64) {
+  vz = i64.const 0
+  vresume = i64.ne vmode vz
+  br_if vresume 2(vh) 1()
+}
+block 1 () {
+  vf = ref.func 1
+  vsp = i64.const 32768
+  vk = cont.new vf vsp
+  vz1 = i64.const 0
+  vs, vv = cont.resume vk vz1
+  return vk
+}
+block 2 (vk2: i64) {
+  vz2 = i64.const 0
+  vs2, vv2 = cont.resume vk2 vz2
+  return vv2
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, varg: i64) {
+  vsus = ref.func 2
+  vparent = i32.const 3
+  vr = call.dyn (i32) -> (i64) vparent (vsus)
+  return vr
+  }
+}
+func (i64) -> (i64) {
+block 0 (vx: i64) {
+  vy = suspend vx
+  return vy
+  }
+}
+";
+
+/// #3080 (review F8a) — a held domain that drives `Jit` and has no fiber op of its own. Its entry
+/// compiles [`A_UNIT_THAT_RUNS_A_PARENT_FIBER`] (laid in its window at 20480, `LEN` bytes), installs
+/// it and answers the slot. `mk()` dispatches the unit to make a fiber; the fiber's body calls
+/// function 3, which runs 1,000 back-edges and calls the unit's suspender, so it suspends with
+/// function 3's frame on its stack, a frame that read `mk()`'s cell. `go(h)` dispatches the unit
+/// again to resume it, on another call's cell, and function 3 runs 1,000 more and returns 7. The
+/// parent has no fiber op, so only the grant (`hosts_fibers`) lowers function 3 to reload its cell.
+const A_UNIT_FIBER_CROSSES_CALLS: &str = r#"memory 16
+type 0 func () -> (i64)
+type 1 func (i64) -> (i64)
+type 2 interface { mk: 0, go: 1 }
+export 0 interface "svc" 2 { mk: 1, go: 2 }
+func (i32) -> (i64) {
+block 0 (vjit: i32) {
+  vblob = i64.const 20480
+  vlen = i64.const LEN
+  vu = call.cap 11 0 (i64, i64) -> (i64) vjit (vblob, vlen)
+  vslot = call.cap 11 3 (i64) -> (i64) vjit (vu)
+  vat = i64.const 16384
+  i64.store vat vslot
+  return vslot
+  }
+}
+func () -> (i64) {
+block 0 () {
+  vat = i64.const 16384
+  vslot = i64.load vat
+  vs = i32.wrap_i64 vslot
+  vz = i64.const 0
+  vh = call.dyn (i64, i64) -> (i64) vs (vz, vz)
+  return vh
+  }
+}
+func (i64) -> (i64) {
+block 0 (vh: i64) {
+  vat = i64.const 16384
+  vslot = i64.load vat
+  vs = i32.wrap_i64 vslot
+  vone = i64.const 1
+  vr = call.dyn (i64, i64) -> (i64) vs (vone, vh)
+  return vr
+  }
+}
+func (i32) -> (i64) {
+block 0 (vsus: i32) {
+  vz = i64.const 0
+  br 1(vz, vsus)
+}
+block 1 (vi: i64, vs1: i32) {
+  vone = i64.const 1
+  vj = i64.add vi vone
+  vn = i64.const 1000
+  vmore = i64.lt_u vj vn
+  br_if vmore 1(vj, vs1) 2(vs1)
+}
+block 2 (vs2: i32) {
+  vz1 = i64.const 0
+  vx = call.dyn (i64) -> (i64) vs2 (vz1)
+  vz2 = i64.const 0
+  br 3(vz2)
+}
+block 3 (vi2: i64) {
+  vone2 = i64.const 1
+  vj2 = i64.add vi2 vone2
+  vn2 = i64.const 1000
+  vmore2 = i64.lt_u vj2 vn2
+  br_if vmore2 3(vj2) 4()
+}
+block 4 () {
+  v7 = i64.const 7
+  return v7
+  }
+}
+"#;
+
+/// #3080 (review B2) — a held domain that drives `Jit` under a fiber-hosting grant, whose installed
+/// unit's fiber runs the domain's own code across two calls, is held by the tree-walker, whichever
+/// executor is asked for: a unit's fiber could call into the domain (#3164), and its code is not
+/// there to read before it arrives. Both runs are the tree-walker's, so the second pins only the
+/// decline. That the JIT lowers such a domain's code to reload its cell (`hosts_fibers`) is pinned on the
+/// route that runs it, `jit_fuel`'s `jit_fuel_an_installed_units_fiber_charges_the_vcpu_that_resumes_it`.
+#[test]
+fn a_domain_whose_units_may_host_fibers_and_that_drives_jit_is_held_by_the_tree_walker() {
+    let unit = temen_text::parse_module(A_UNIT_THAT_RUNS_A_PARENT_FIBER).expect("parse the unit");
+    temen_verify::verify_module(&unit).expect("verify the unit");
+    let blob = temen_encode::encode_module(&unit);
+    let escaped: String = blob.iter().map(|b| format!("\\x{b:02x}")).collect();
+    let src = format!(
+        "{}data 20480 \"{escaped}\"\n",
+        A_UNIT_FIBER_CROSSES_CALLS.replace("LEN", &blob.len().to_string())
+    );
+    let on = |on: Executor| {
+        let src = src.clone();
+        bounded(move || {
+            let m = module(&src);
+            let mut host = Host::new();
+            host.set_self_module(&m);
+            let jit = temen_run::grant_jit_fibers(&mut host, &m, 4);
+            let started = temen_run::hold(on, m, 0, &[Value::I32(jit)], u64::MAX, host);
+            let (d, _) = started.unwrap_or_else(|(t, _)| panic!("the entry ends in {t:?}"));
+            assert_eq!(d.executor(), Executor::TreeWalker, "asked for {on:?}");
+            let mut fuel = 1_000_000;
+            let made = (d.call(0, 0, &[], &mut fuel), fuel);
+            let handle = match &made.0 {
+                Reply::Results(r) => r[0],
+                other => panic!("mk(): {other:?}"),
+            };
+            let mut fuel = 1_000_000;
+            let resumed = (d.call(0, 1, &[handle], &mut fuel), fuel);
+            (made, resumed)
+        })
+    };
+    let oracle = on(Executor::TreeWalker);
+    assert_eq!(oracle.1 .0, Reply::Results(vec![7]), "the fiber returned 7");
+    assert_eq!(on(Executor::Jit), oracle);
+}
+
+/// #3080 (review B2) — [`nested_counter`] with `outer()` making a fiber F over a new function 8,
+/// which calls `kept()` through the domain's own offer; `outer()` resumes F twice and answers
+/// `1e6·status₁ + 1e3·status₂ + value₂`.
+fn fiber_self_caller() -> String {
+    let s = nested_counter();
+    let outer = "  va = i64.const 16500\n  vme = i32.load va\n  vr = call.cap 268435456 6 () -> (i64) vme ()\n  return vr\n";
+    assert!(s.contains(outer), "outer()");
+    let fiber_outer = "  vf = i32.const 8\n  vsp = i64.const 40960\n  vk = cont.new vf vsp\n  vz = i64.const 0\n  vs1, vv1 = cont.resume vk vz\n  vs2, vv2 = cont.resume vk vz\n  vs1w = i64.extend_i32_u vs1\n  vs2w = i64.extend_i32_u vs2\n  vm1 = i64.const 1000000\n  vm2 = i64.const 1000\n  va1 = i64.mul vs1w vm1\n  va2 = i64.mul vs2w vm2\n  vb = i64.add va1 va2\n  vr = i64.add vb vv2\n  return vr\n";
+    let s = s.replacen(outer, fiber_outer, 1);
+    format!("{s}\nfunc (i64, i64) -> (i64) {{\nblock 0 (vsp: i64, varg: i64) {{\n  va = i64.const 16500\n  vme = i32.load va\n  vr = call.cap 268435456 6 () -> (i64) vme ()\n  return vr\n  }}\n}}\n")
+}
+
+/// #3080 (review B2), #3164 — a guest fiber's call into its own held domain. The tree-walker keeps
+/// the nested activation out while the calling one runs: F is still parked at `outer()`'s second
+/// resume, `3003000`, and the call is charged 2. On the JIT the nested activation ran under the
+/// caller's gate between the two resumes and then gave the gate away (`3001042`, 101), so `hold`
+/// declines a fiber-making module that makes a guest-interface call, and the tree-walker holds it,
+/// until #3164 carries such a call on the pool.
+#[test]
+fn a_fibers_call_into_its_own_held_domain_is_held_by_the_tree_walker() {
+    for on in [Executor::TreeWalker, Executor::Jit] {
+        let (reply, charged, executor) = bounded(move || {
+            let m = module(&fiber_self_caller());
+            let (host, args) = child_host(&m, GIVER);
+            let started = temen_run::hold(on, m, 0, &args, u64::MAX, host);
+            let (d, _) = started.unwrap_or_else(|(t, _)| panic!("the entry ends in {t:?}"));
+            assert_eq!(call(&d, 5, &[]), Reply::Results(vec![1]), "the child gave");
+            let mut fuel = 1_000_000u64;
+            let reply = d.call(0, 2, &[], &mut fuel);
+            (reply, 1_000_000 - fuel, d.executor())
+        });
+        assert_eq!(executor, Executor::TreeWalker, "asked for {on:?}");
+        assert_eq!(
+            (reply, charged),
+            (Reply::Results(vec![3_003_000]), 2),
+            "asked for {on:?}"
+        );
+    }
 }
 
 /// #3158 — the back-edges of [`qh_held`]'s `spin()`: many quanta of a pool task's fuel.
@@ -1859,4 +2159,445 @@ fn a_quantum_ending_inside_a_handler_run_inline_on_a_pool_task_does_not_park_it(
         temen_jit::quantum_ends_held() > held,
         "the handler's quanta ended under its inline scope with the pool full, and the task kept its worker"
     );
+}
+
+/// What [`fiber_offer_caller`]'s fiber does with the offer over its own domain the child hands back.
+#[derive(Clone, Copy)]
+enum FiberCallsIn {
+    /// G1: it calls the domain's `strm` export, which has the pre-seeded `Stream` shape and so the
+    /// built-in id 0, below `GUEST_IMPL_BASE`.
+    BuiltinsId,
+    /// G2: it `Jit.invoke`s [`A_UNIT_THAT_CALLS_KEPT`], whose top level calls the domain's `kept()`;
+    /// the domain holds `Jit` with no fiber-hosting grant.
+    InvokedUnit,
+    /// H1: the domain makes no fiber. Its function 6 is a `gc.roots` op it never calls, which stands
+    /// the JIT's fiber runtime up, so `define_extra` admits a unit's `cont.*` with no fiber-hosting
+    /// grant. Its entry installs [`A_UNIT_WITH_A_FIBER_THAT_CALLS_KEPT`], and `outer()` reaches it by
+    /// `call.dyn`: the unit's own fiber calls the domain's `kept()`.
+    InstalledUnitsFiber,
+}
+
+/// #3080 (review H1) — an installed unit whose entry makes a fiber over its own function 1, resumes
+/// it twice and answers `1e6·status₁ + 1e3·status₂ + value₂`; the fiber calls `kept()` (op 3) on the
+/// offer the domain stored at 16500.
+const A_UNIT_WITH_A_FIBER_THAT_CALLS_KEPT: &str = "memory 17\nfunc () -> (i64) {\nblock 0 () {\n  vf = ref.func 1\n  vsp = i64.const 49152\n  vk = cont.new vf vsp\n  vz = i64.const 0\n  vs1, vv1 = cont.resume vk vz\n  vs2, vv2 = cont.resume vk vz\n  vs1w = i64.extend_i32_u vs1\n  vs2w = i64.extend_i32_u vs2\n  vm1 = i64.const 1000000\n  vm2 = i64.const 1000\n  va1 = i64.mul vs1w vm1\n  va2 = i64.mul vs2w vm2\n  vsum = i64.add va1 va2\n  vr = i64.add vsum vv2\n  return vr\n  }\n}\nfunc (i64, i64) -> (i64) {\nblock 0 (vsp: i64, varg: i64) {\n  va = i64.const 16500\n  vme = i32.load va\n  vr = call.cap 268435456 3 () -> (i64) vme ()\n  return vr\n  }\n}\n";
+
+/// A unit's text, verified and encoded: the `data` segment laying it at 20480, and its length.
+fn unit_blob(src: &str) -> (String, usize) {
+    let unit = temen_text::parse_module(src).expect("parse the unit");
+    temen_verify::verify_module(&unit).expect("verify the unit");
+    let blob = temen_encode::encode_module(&unit);
+    let escaped: String = blob.iter().map(|b| format!("\\x{b:02x}")).collect();
+    (format!("data 20480 \"{escaped}\"\n"), blob.len())
+}
+
+/// #3080 (review G2) — a unit whose top level calls `kept()` (op 3) on the offer the domain stored at
+/// 16500. A unit shares the domain's window and dispatches into its powerbox.
+const A_UNIT_THAT_CALLS_KEPT: &str = "memory 17\nfunc () -> (i64) {\nblock 0 () {\n  va = i64.const 16500\n  vme = i32.load va\n  vr = call.cap 268435456 3 () -> (i64) vme ()\n  return vr\n  }\n}\n";
+
+/// #3080 (review G1, G2) — a held domain with two exports, `svc { keep, outer, join_child, kept }`
+/// and `strm`, `Stream`'s canonical shape (`read`, `write`, `close`). Its entry spawns
+/// [`offer_giver`] with a live grant of each (`"exec"`, `"strm"`); the child hands one back through
+/// `keep()`. `outer()` makes a fiber F over function 6, resumes it twice and answers
+/// `1e6·status₁ + 1e3·status₂ + value₂`, as [`fiber_self_caller`]. `kept()` and `strm`'s `read` and
+/// `write` count 100 down and answer 42. F calls into the domain as `how` says. Its entry takes the
+/// `Instantiator`, the child's module, its budget and a `Jit` handle (unused by G1's).
+fn fiber_offer_caller(how: FiberCallsIn) -> String {
+    let child = SpawnRec {
+        grants_ptr: 16640,
+        grants_n: 2,
+        ..SpawnRec::default()
+    };
+    let fiber_outer = "  vf = i32.const 6\n  vsp = i64.const 40960\n  vk = cont.new vf vsp\n  vz = i64.const 0\n  vs1, vv1 = cont.resume vk vz\n  vs2, vv2 = cont.resume vk vz\n  vs1w = i64.extend_i32_u vs1\n  vs2w = i64.extend_i32_u vs2\n  vm1 = i64.const 1000000\n  vm2 = i64.const 1000\n  va1 = i64.mul vs1w vm1\n  va2 = i64.mul vs2w vm2\n  vsum = i64.add va1 va2\n  vr = i64.add vsum vv2\n  return vr\n";
+    let (body, blob, install, outer) = match how {
+        FiberCallsIn::BuiltinsId => (
+            "  va = i64.const 16500\n  vme = i32.load va\n  vz = i64.const 0\n  vr = call.cap 0 1 (i64, i64) -> (i64) vme (vz, vz)\n  return vr\n".to_string(),
+            String::new(),
+            String::new(),
+            fiber_outer.to_string(),
+        ),
+        FiberCallsIn::InvokedUnit => {
+            let (blob, len) = unit_blob(A_UNIT_THAT_CALLS_KEPT);
+            (
+                format!("  vj = i64.const 16520\n  vjit = i32.load vj\n  vb = i64.const 20480\n  vl = i64.const {len}\n  vu = call.cap 11 0 (i64, i64) -> (i64) vjit (vb, vl)\n  vr = call.cap 11 1 (i64) -> (i64) vjit (vu)\n  return vr\n"),
+                blob,
+                String::new(),
+                fiber_outer.to_string(),
+            )
+        }
+        FiberCallsIn::InstalledUnitsFiber => {
+            let (blob, len) = unit_blob(A_UNIT_WITH_A_FIBER_THAT_CALLS_KEPT);
+            (
+                "  v0 = i64.const 0\n  v1 = i64.const 4096\n  vmask = i64.const -1\n  v2 = i64.const 0\n  v3 = i64.const 8\n  vr = gc.roots v0 v1 vmask v2 v3\n  return vr\n".to_string(),
+                blob,
+                format!("  vub = i64.const 20480\n  vul = i64.const {len}\n  vu = call.cap 11 0 (i64, i64) -> (i64) vjit (vub, vul)\n  vslot = call.cap 11 3 (i64) -> (i64) vjit (vu)\n  vsa = i64.const 16528\n  i64.store vsa vslot\n"),
+                "  va = i64.const 16528\n  vslot = i64.load va\n  vs = i32.wrap_i64 vslot\n  vr = call.dyn () -> (i64) vs ()\n  return vr\n".to_string(),
+            )
+        }
+    };
+    let counts = "block 0 () {\n  vn = i64.const 100\n  br 1(vn)\n}\nblock 1 (vi: i64) {\n  vone = i64.const 1\n  vj = i64.sub vi vone\n  vd = i64.eqz vj\n  br_if vd 2(vj) 1(vj)\n}\nblock 2 (vr: i64) {\n  vk = i64.const 42\n  return vk\n  }\n}\n";
+    let counts_rw = counts.replacen("block 0 () {", "block 0 (va: i64, vb: i64) {", 1);
+    format!(
+        r#"memory 17
+data 16684 "exec"
+data 16690 "strm"
+{rec}{blob}type 0 func () -> (i64)
+type 1 func (cap) -> (i64)
+type 2 func () -> ()
+type 3 func (i64, i64) -> (i64)
+type 4 interface {{ keep: 1, outer: 0, join_child: 0, kept: 0 }}
+type 5 interface {{ read: 3, write: 3, close: 2 }}
+export 0 interface "svc" 4 {{ keep: 1, outer: 2, join_child: 3, kept: 7 }}
+export 1 interface "strm" 5 {{ read: 4, write: 4, close: 5 }}
+
+func (i32, i32, i32, i32) -> (i64) {{
+block 0 (vi: i32, vm: i32, vb: i32, vjit: i32) {{
+  vsi = i64.const 16444
+  i32.store vsi vi
+  vsj = i64.const 16520
+  i32.store vsj vjit
+{install}  vma = i64.const {module_at}
+  i32.store vma vm
+  vba = i64.const {budget_at}
+  i32.store vba vb
+  vgh = i32.const {tag}
+{grant}  vgs = i32.const {tag_strm}
+{grant_strm}  vrp = i64.const 17408
+  vch = call.cap 6 17 (i64) -> (i32) vi (vrp)
+  vsc = i64.const 16440
+  i32.store vsc vch
+  vr = i64.const 1
+  return vr
+  }}
+}}
+
+func (cap) -> (i64) {{
+block 0 (vme: cap) {{
+  va = i64.const 16500
+  i32.store va vme
+  vr = i64.const 1
+  return vr
+  }}
+}}
+
+func () -> (i64) {{
+block 0 () {{
+{outer}  }}
+}}
+
+func () -> (i64) {{
+block 0 () {{
+  vsi = i64.const 16444
+  vi = i32.load vsi
+  vsc = i64.const 16440
+  vch = i32.load vsc
+  vst, vv = call.cap 6 1 (i32) -> (i64, i64) vi (vch)
+  return vv
+  }}
+}}
+
+func (i64, i64) -> (i64) {{
+{counts_rw}
+func () -> () {{
+block 0 () {{
+  return
+  }}
+}}
+
+func (i64, i64) -> (i64) {{
+block 0 (vsp: i64, varg: i64) {{
+{body}  }}
+}}
+
+func () -> (i64) {{
+{counts}"#,
+        rec = rec::segment(17408, &child),
+        grant = rec::grant("ge", 16640, 16684, 4, "vgh"),
+        grant_strm = rec::grant("gs", 16656, 16690, 4, "vgs"),
+        module_at = 17408 + SpawnRec::MODULE_AT,
+        budget_at = 17408 + SpawnRec::BUDGET_AT,
+        tag = GRANT_SERVE_LIVE_TAG as i32,
+        tag_strm = (GRANT_SERVE_LIVE_TAG | 1) as i32,
+    )
+}
+
+/// The child [`fiber_offer_caller`] spawns: it resolves the live grant `name` and hands it to its
+/// parent, `keep(name)`, through the grant `"exec"`.
+fn offer_giver(name: &str) -> String {
+    format!(
+        r#"memory 15
+data 16384 "exec"
+data 16392 "{name}"
+func (i64) -> (i64) {{
+block 0 (v0: i64) {{
+  vnp = i64.const 16384
+  vl = i64.const 4
+  vexec = self.resolve vnp vl
+  vgp = i64.const 16392
+  vgl = i64.const {len}
+  vg = self.resolve vgp vgl
+  vr = call.cap 268435456 0 (cap) -> (i64) vexec (vg)
+  return vr
+  }}
+}}
+"#,
+        len = name.len()
+    )
+}
+
+/// `outer()` of [`fiber_offer_caller`] asked for on `on`: the executor that held it, its reply and
+/// what the call was charged.
+fn fiber_offer_outer(on: Executor, how: FiberCallsIn) -> (Executor, Reply, u64) {
+    bounded(move || {
+        let m = module(&fiber_offer_caller(how));
+        let give = match how {
+            FiberCallsIn::BuiltinsId => "strm",
+            FiberCallsIn::InvokedUnit | FiberCallsIn::InstalledUnitsFiber => "exec",
+        };
+        let (mut host, mut args) = child_host(&m, &offer_giver(give));
+        args.push(Value::I32(match how {
+            FiberCallsIn::BuiltinsId => -1,
+            FiberCallsIn::InvokedUnit | FiberCallsIn::InstalledUnitsFiber => {
+                temen_run::grant_jit(&mut host, &m, 4)
+            }
+        }));
+        let started = temen_run::hold(on, m, 0, &args, u64::MAX, host);
+        let (d, _) = started.unwrap_or_else(|(t, _)| panic!("the entry ends in {t:?}"));
+        assert_eq!(call(&d, 2, &[]), Reply::Results(vec![1]), "the child gave");
+        let mut fuel = 1_000_000u64;
+        let reply = d.call(0, 1, &[], &mut fuel);
+        (d.executor(), reply, 1_000_000 - fuel)
+    })
+}
+
+/// #3080 (review G1), #3164 — a guest fiber's call into its own held domain through an offer whose
+/// interface is a pre-seeded built-in shape (`Stream`, id 0, below `GUEST_IMPL_BASE`). The tree-walker
+/// keeps the nested activation out while `outer()` runs, so F is still parked at its second resume:
+/// `3003000`, charged 2. Held on the JIT (before `hold` read the built-in's id as one a guest can
+/// implement), the nested activation ran under the caller's gate between the two resumes: `3001042`,
+/// charged 101. So `hold` declines it, and the tree-walker holds it on both.
+#[test]
+fn a_fibers_call_into_its_own_held_domain_through_a_builtins_id_is_held_by_the_tree_walker() {
+    for on in [Executor::TreeWalker, Executor::Jit] {
+        assert_eq!(
+            fiber_offer_outer(on, FiberCallsIn::BuiltinsId),
+            (Executor::TreeWalker, Reply::Results(vec![3_003_000]), 2),
+            "asked for {on:?}"
+        );
+    }
+}
+
+/// #3080 (review G2), #3164 — a fiber of a held domain that holds `Jit` without the fiber-hosting
+/// grant `Jit.invoke`s a unit whose top level calls the domain's own `kept()`. No static read of the
+/// module sees that call. The tree-walker's invoke child refuses it, which ends the domain
+/// (`CAP_REVOKED`, charged 1): #3154's refusal, which #3155 removes. Held on the JIT (before `hold`
+/// counted a unit as code that can run in a fiber), the nested activation ran at once, since below
+/// the invoke's yield floor nothing parks (#3162), so F returned 42 at its first resume and the
+/// second answered -9: `4294968287000`, charged 102. So `hold` declines a fiber-making module that can
+/// reach `Jit`, and the tree-walker holds it on both.
+#[test]
+fn a_fibers_unit_that_calls_into_its_own_held_domain_is_held_by_the_tree_walker() {
+    for on in [Executor::TreeWalker, Executor::Jit] {
+        assert_eq!(
+            fiber_offer_outer(on, FiberCallsIn::InvokedUnit),
+            (Executor::TreeWalker, Reply::Failed(CAP_REVOKED), 1),
+            "asked for {on:?}"
+        );
+    }
+}
+
+/// #3080 (review H1), #3164 — a held domain that makes no fiber but has a `gc.roots` op, under a
+/// plain `Jit` grant: its compile stands the JIT's fiber runtime up, so an installed unit's own fiber
+/// runs, and its call into the domain's own offer is a fiber's call into its held domain. The
+/// tree-walker keeps the nested activation out while `outer()` runs, so the unit's fiber is still
+/// parked at its second resume: `3003000`, charged 3. Held on the JIT (before `hold` read a unit's
+/// fibers from the compile's own facts), the nested activation ran under the caller's gate between
+/// the two resumes: `3001042`, charged 102. So `hold` declines it, and the tree-walker holds it on
+/// both. The unit is installed and reached by `call.dyn`, so the tree-walker's answer is the gate's
+/// (#3164's), not its invoke child's refusal (#3154).
+#[test]
+fn a_units_own_fiber_that_calls_into_its_held_domain_is_held_by_the_tree_walker() {
+    for on in [Executor::TreeWalker, Executor::Jit] {
+        assert_eq!(
+            fiber_offer_outer(on, FiberCallsIn::InstalledUnitsFiber),
+            (Executor::TreeWalker, Reply::Results(vec![3_003_000]), 3),
+            "asked for {on:?}"
+        );
+    }
+}
+
+/// How [`import_caller`]'s fiber calls `kept()`, and what the import it calls through is bound to.
+#[derive(Clone, Copy, Debug)]
+enum ImportCall {
+    /// `call.import 0`, bound (not rebindable) to an offer the host wires over the domain's own
+    /// `kept()`: a guest-interned id. A host cannot hold an offer over a domain before it runs, so
+    /// the wired offer stands in for the domain's own.
+    BoundToAGuestOffer,
+    /// `call.import 0`, bound (not rebindable) to a host procedure that answers 7.
+    BoundToAHostCap,
+    /// `call.import 0` through a `rebindable` slot, which the entry attaches to the domain's own
+    /// offer (`export.handle 0`): what it reaches is not fixed when `hold` reads it.
+    Rebindable,
+    /// `call.import.dyn` on the domain's own offer: its interface is interned as it runs.
+    Dynamic,
+}
+
+/// #3080 (review H2) — a held domain whose `outer()` makes a fiber that calls through its import once,
+/// as `how` says, and answers `1e6·status₁ + 1e3·status₂ + value₁` over two resumes (the fiber returns
+/// what the call answered at its first, and the second resume of the ended fiber answers -9); `kept()` counts 100 down
+/// and answers 42. Its entry attaches a [`ImportCall::Rebindable`] domain's slot.
+fn import_caller(how: ImportCall) -> String {
+    let rebindable = matches!(how, ImportCall::Rebindable);
+    let attach = if rebindable {
+        "  vme = export.handle 0\n  vst = import.attach 0 vme\n"
+    } else {
+        ""
+    };
+    let call = if matches!(how, ImportCall::Dynamic) {
+        "  vme = export.handle 0\n  vr = call.import.dyn 1.kept vme ()\n"
+    } else {
+        "  vr = call.import 0 ()\n"
+    };
+    format!(
+        r#"memory 17
+type 0 func () -> (i64)
+type 1 interface {{ outer: 0, kept: 0 }}
+import 0 "k" () -> (i64){mode}
+export 0 interface "svc" 1 {{ outer: 1, kept: 2 }}
+
+func () -> (i64) {{
+block 0 () {{
+{attach}  vr = i64.const 1
+  return vr
+  }}
+}}
+
+func () -> (i64) {{
+block 0 () {{
+  vf = i32.const 3
+  vsp = i64.const 40960
+  vk = cont.new vf vsp
+  vz = i64.const 0
+  vs1, vv1 = cont.resume vk vz
+  vs2, vv2 = cont.resume vk vz
+  vs1w = i64.extend_i32_u vs1
+  vs2w = i64.extend_i32_u vs2
+  vm1 = i64.const 1000000
+  vm2 = i64.const 1000
+  va1 = i64.mul vs1w vm1
+  va2 = i64.mul vs2w vm2
+  vsum = i64.add va1 va2
+  vr = i64.add vsum vv1
+  return vr
+  }}
+}}
+
+func () -> (i64) {{
+block 0 () {{
+  vn = i64.const 100
+  br 1(vn)
+}}
+block 1 (vi: i64) {{
+  vone = i64.const 1
+  vj = i64.sub vi vone
+  vd = i64.eqz vj
+  br_if vd 2(vj) 1(vj)
+}}
+block 2 (vr: i64) {{
+  vk = i64.const 42
+  return vk
+  }}
+}}
+
+func (i64, i64) -> (i64) {{
+block 0 (vsp: i64, varg: i64) {{
+{call}  return vr
+  }}
+}}
+"#,
+        mode = if rebindable { " rebindable" } else { "" },
+    )
+}
+
+/// `outer()` of [`import_caller`] asked for on `on`: the executor that held it, its reply and what
+/// the call was charged.
+fn import_outer(on: Executor, how: ImportCall) -> (Executor, Reply, u64) {
+    bounded(move || {
+        let m = module(&import_caller(how));
+        let mut host = Host::new();
+        host.set_self_module(&m);
+        let kept = temen_ir::FuncType {
+            params: vec![],
+            results: vec![temen_ir::ValType::I64],
+        };
+        let binding = match how {
+            ImportCall::BoundToAGuestOffer => {
+                let funcs: Arc<[temen_ir::Func]> = m.funcs.clone().into();
+                let types: Arc<[temen_ir::TypeEntry]> = m.types.clone().into();
+                let h = host
+                    .wire_offer_func(&funcs, &types, &[2])
+                    .expect("wire kept()");
+                let id = host.intern_interface(&[], std::slice::from_ref(&kept));
+                assert!(temen_interp::guest_implementable(id), "a guest id");
+                temen_interp::BoundImport::required(id, 0, h)
+            }
+            ImportCall::BoundToAHostCap => {
+                let h = host.grant_host_proc(temen_interp::HostProcGrant::new(
+                    temen_interp::ProcHandler::Sync(Box::new(|_op, _args, out, _mem, _minter| {
+                        temen_interp::put_results(out, &[7])
+                    })),
+                    temen_interp::CapState::Stateless,
+                ));
+                temen_interp::BoundImport::required(temen_ir::cap_id::HOST_PROC, 0, h)
+            }
+            ImportCall::Rebindable | ImportCall::Dynamic => temen_interp::BoundImport {
+                type_id: temen_ir::cap_id::GUEST_IMPL_BASE,
+                op: 1,
+                handle: 0,
+                bound: false,
+                rebindable: matches!(how, ImportCall::Rebindable),
+            },
+        };
+        host.set_import_bindings(vec![binding]);
+        let started = temen_run::hold(on, m, 0, &[], u64::MAX, host);
+        let (d, _) = started.unwrap_or_else(|(t, _)| panic!("the entry ends in {t:?}"));
+        let mut fuel = 1_000_000u64;
+        let reply = d.call(0, 0, &[], &mut fuel);
+        (d.executor(), reply, 1_000_000 - fuel)
+    })
+}
+
+/// #3080 (review H2, T1, T2) — a fiber's import call, by its binding. Each case's reply is
+/// `1e6·1 + 1e3·(-9 as u32) + value₁`, the call's answer at the first resume:
+/// - bound (not rebindable) to a guest's offer: `hold`'s fiber rule reads the binding's guest id
+///   (`jit_proc::may_reach`) and declines it; the tree-walker answers `kept()`'s 42, charged 2 (the
+///   wired offer's run is not the call's);
+/// - bound for good to a host procedure: nothing declines it, and the JIT holds it with the
+///   tree-walker's answer, the procedure's 7, charged 2;
+/// - a `rebindable` slot and a `call.import.dyn`: `hold` declines both at `jit_proc::serves`, before
+///   the fiber rule, through the same `may_reach` arms (either may reach a serve op), so this row
+///   pins only that the tree-walker holds them. The answer is `kept()`'s 42, charged 102: the
+///   attach took, and the call ran the domain's own `kept()`. The fiber rule's own arms for them are
+///   pinned on the rule itself (`held::tests`).
+#[test]
+fn a_fibers_import_call_is_held_by_what_its_binding_may_reach() {
+    let reply =
+        |value: i64| Reply::Results(vec![1_000_000 + 1000 * i64::from(-9i32 as u32) + value]);
+    for (how, held, answer, charged) in [
+        (ImportCall::BoundToAGuestOffer, Executor::TreeWalker, 42, 2),
+        (ImportCall::BoundToAHostCap, Executor::Jit, 7, 2),
+        (ImportCall::Rebindable, Executor::TreeWalker, 42, 102),
+        (ImportCall::Dynamic, Executor::TreeWalker, 42, 102),
+    ] {
+        assert_eq!(
+            import_outer(Executor::TreeWalker, how),
+            (Executor::TreeWalker, reply(answer), charged),
+            "{how:?}, asked for the tree-walker"
+        );
+        assert_eq!(
+            import_outer(Executor::Jit, how),
+            (held, reply(answer), charged),
+            "{how:?}, asked for the JIT"
+        );
+    }
 }

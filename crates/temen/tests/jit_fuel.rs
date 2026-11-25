@@ -194,15 +194,7 @@ enum Ended {
 fn on_all_three(src: &str, budget: u64) -> [(Ended, u64); 3] {
     let m = parse_module(src).expect("parse");
     verify_module(&m).expect("verify");
-    let mut tw_left = budget;
-    let tw = match run(&m, 0, &[], &mut tw_left) {
-        Ok(v) => match v.as_slice() {
-            [Value::I64(x)] => Ended::Returned(*x),
-            other => panic!("TreeWalk returned {other:?}"),
-        },
-        Err(Trap::OutOfFuel) => Ended::OutOfFuel,
-        Err(t) => panic!("TreeWalk trapped {t:?}"),
-    };
+    let tw = on_the_oracle(src, budget);
     let mut bc_left = budget;
     let bc = match bytecode::compile_and_run(&m, 0, &[] as &[Value], &mut bc_left)
         .expect("the kernel is in the bytecode engine's subset")
@@ -214,8 +206,29 @@ fn on_all_three(src: &str, budget: u64) -> [(Ended, u64); 3] {
         Err(Trap::OutOfFuel) => Ended::OutOfFuel,
         Err(t) => panic!("Bytecode trapped {t:?}"),
     };
-    let (jo, jit_left) = jit_fuel(src, &[], budget);
-    let jit = match jo {
+    [tw, (bc, budget - bc_left), on_the_jit(src, budget)]
+}
+
+/// How the tree-walker ends `src` on `budget`, and the fuel it charged.
+fn on_the_oracle(src: &str, budget: u64) -> (Ended, u64) {
+    let m = parse_module(src).expect("parse");
+    verify_module(&m).expect("verify");
+    let mut left = budget;
+    let ended = match run(&m, 0, &[], &mut left) {
+        Ok(v) => match v.as_slice() {
+            [Value::I64(x)] => Ended::Returned(*x),
+            other => panic!("TreeWalk returned {other:?}"),
+        },
+        Err(Trap::OutOfFuel) => Ended::OutOfFuel,
+        Err(t) => panic!("TreeWalk trapped {t:?}"),
+    };
+    (ended, budget - left)
+}
+
+/// How the JIT ends `src` on `budget` on today's route, and the fuel it charged.
+fn on_the_jit(src: &str, budget: u64) -> (Ended, u64) {
+    let (jo, left) = jit_fuel(src, &[], budget);
+    let ended = match jo {
         JitOutcome::Returned(v) => match v.as_slice() {
             [x] => Ended::Returned(*x),
             other => panic!("JIT returned {other:?}"),
@@ -223,11 +236,7 @@ fn on_all_three(src: &str, budget: u64) -> [(Ended, u64); 3] {
         JitOutcome::Trapped(TrapKind::OutOfFuel) => Ended::OutOfFuel,
         other => panic!("JIT ended {other:?}"),
     };
-    [
-        (tw, budget - tw_left),
-        (bc, budget - bc_left),
-        (jit, budget - jit_left),
-    ]
+    (ended, budget - left)
 }
 
 /// Assert the bytecode engine and the JIT end `src` exactly as the oracle does **and charge exactly
@@ -565,7 +574,7 @@ fn on_the_kernel_route(src: &str, budget: u64) -> (Ended, u64) {
     let m = parse_module(src).expect("parse");
     verify_module(&m).expect("verify");
     let mut host = temen_interp::Host::new();
-    let admitted = jit_kernel::admit(&m, &host, false, budget).expect("in the kernel's scope");
+    let admitted = jit_kernel::admit(&m, &host, false).expect("in the kernel's scope");
     let start = jit_kernel::Start {
         entry: 0,
         args: &[],
@@ -779,9 +788,63 @@ fn jit_fuel_a_parked_thread_holds_none_of_the_roots_fuel() {
     );
 }
 
+/// #3080 — the root makes [`A_FIBER_OUTLIVES_ITS_VCPU`]'s fiber and resumes it once (it suspends
+/// after 3 back-edges, its frame holding the cell it charged); a thread resumes it to its end and
+/// returns what it yielded and returned, and the root joins it. The fiber's frame spans the suspend
+/// and goes on on another vCPU, so its next charge must reload the cell its resume names: compiled
+/// with the `FUEL` load `readonly`, it keeps charging the root's.
+const A_FIBER_MIGRATES: &str = "memory 16
+func () -> (i64) {
+block 0 () {
+  vz = i64.const 0
+  vf = ref.func 2
+  vk = cont.new vf vz
+  vs1, vv1 = cont.resume vk vz
+  vc = thread.spawn 1 vk vz
+  vcs, vcv = thread.join vc
+  vr = i64.add vv1 vcv
+  return vr
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vk: i64, vb: i64) {
+  vz = i64.const 0
+  vs2, vv2 = cont.resume vk vz
+  vs3, vv3 = cont.resume vk vz
+  vr = i64.add vv2 vv3
+  return vr
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, varg: i64) {
+  vz = i64.const 0
+  br 1(vz, vz)
+}
+block 1 (vi: i64, vround: i64) {
+  vone = i64.const 1
+  vj = i64.add vi vone
+  vthree = i64.const 3
+  vat = i64.rem_u vj vthree
+  vpause = i64.eqz vat
+  br_if vpause 2(vj, vround) 1(vj, vround)
+}
+block 2 (vj2: i64, vr: i64) {
+  vx = suspend vj2
+  vone2 = i64.const 1
+  vr2 = i64.add vr vone2
+  vtwo = i64.const 2
+  vdone = i64.eq vr2 vtwo
+  br_if vdone 3(vj2) 1(vj2, vr2)
+}
+block 3 (vend: i64) {
+  return vend
+  }
+}
+";
+
 /// Thread A makes a fiber that counts back-edges and suspends after each 3, and returns its handle.
-/// The root joins A, resumes the fiber once (it charges A's cell, wherever it runs, and refills it
-/// after A ended), spawns a thread that only returns and joins it, then resumes the fiber to its end.
+/// The root joins A, resumes the fiber once (after A ended, so on the root's cell), spawns a thread
+/// C that only returns and joins it, then resumes the fiber to its end.
 const A_FIBER_OUTLIVES_ITS_VCPU: &str = "memory 16
 func () -> (i64) {
 block 0 () {
@@ -839,17 +902,14 @@ block 0 (va: i64, vb: i64) {
 }
 ";
 
-/// **A spawn's entry throws away nothing a recycled cell held** (PR #3091's review). The spawned
-/// thread takes the context A left, whose cell A's fiber refilled after A ended. Seeding its paid
-/// entry hands what that cell held back to the chain first, then holds the unit, so nothing the
-/// chain was charged for is thrown away, and
-/// every engine charges alike, the root's entry, A's, the thread's, the fiber's three resumes and its
-/// five taken back-edges. The first version of #3081's payment assumed the cell empty: a debug
-/// build aborted in `thread_spawn`, and a release build dropped the fiber's draw.
+/// A fiber that outlives the vCPU that made it costs the same on all three engines: the root's
+/// entry, A's, C's, the fiber's three resumes and its five taken back-edges. (PR #3091's review
+/// wrote this row for a recycled cell that A's fiber had refilled after A ended; since #3080 a fiber
+/// charges only the vCPU running it, a recycled cell is settled, and `seed_entry` asserts it. The
+/// sweep, `jit_fuel_a_fiber_charges_the_vcpu_that_runs_it`, checks every budget on the JIT's routes;
+/// this row adds the bytecode engine at the cost.)
 #[test]
-fn jit_fuel_a_spawn_keeps_what_a_fiber_left_in_a_recycled_cell() {
-    // With slack: near the limit the JIT's fiber draws from its creator's cell, not the resumer's
-    // (#3080), so where the run runs out there follows which cell holds a draw, not this fix.
+fn jit_fuel_a_fiber_outliving_its_vcpu_costs_the_same_on_every_engine() {
     assert_eq!(
         assert_three_way(A_FIBER_OUTLIVES_ITS_VCPU, 1 << 40),
         (Ended::Returned(3 + 6 + 6 + 7), 11)
@@ -979,21 +1039,19 @@ fn jit_fuel_a_refused_spawn_frees_no_context_a_fiber_charges() {
     assert_eq!(jit, JitOutcome::Trapped(TrapKind::ThreadFault));
 }
 
-/// #3078 slice 2 — where the kernel route stands on a fiber's fuel. A fiber charges its creator
-/// vCPU's cell wherever it runs (#3080), so a fiber resumed on another vCPU can lose charges to its
-/// creator's at once: the kernel route declines every metered run of a module that uses fibers
-/// (`fiber fuel`) rather than diverge (INVARIANTS #9). Fiber-only modules keep their single-vCPU path
-/// (`fiber only`), and fibers that wait keep today's route (`fiber parks`). #3080's fix gives each
-/// row here its metered kernel lane.
+/// #3080 — where the kernel route stands on fibers: a metered run of a module that uses them is in
+/// its scope (`fiber fuel` is gone, since a fiber charges the vCPU that runs it). Fiber-only modules
+/// keep their single-vCPU path (`fiber only`), and fibers that wait keep today's route (`fiber
+/// parks`).
 #[test]
-fn jit_fuel_the_kernel_route_declines_every_metered_fiber_run() {
+fn jit_fuel_the_kernel_route_admits_a_metered_fiber_run() {
     use temen_run::jit_kernel;
     let declined = |src: &str| {
         let m = parse_module(src).expect("parse");
         verify_module(&m).expect("verify");
-        jit_kernel::admit(&m, &temen_interp::Host::new(), false, 1 << 40).err()
+        jit_kernel::admit(&m, &temen_interp::Host::new(), false).err()
     };
-    assert_eq!(declined(A_FIBER_OUTLIVES_ITS_VCPU), Some("fiber fuel"));
+    assert_eq!(declined(A_FIBER_OUTLIVES_ITS_VCPU), None);
     assert_eq!(
         declined(A_REFUSED_SPAWN_UNDER_A_RUNNING_FIBER),
         Some("fiber parks")
@@ -1002,23 +1060,295 @@ fn jit_fuel_the_kernel_route_declines_every_metered_fiber_run() {
     assert_eq!(declined(&busy_poll(Some(3))), Some("fiber only"));
 }
 
-/// #3078 slice 2 — finding 0a: a fiber thread A made runs on A's context after A has ended, so a
-/// kernel run keeps every vCPU's context until it ends. Unmetered (`fiber fuel`), the kernel route
-/// answers the oracle's result. Without the run's pool the fiber reads freed heap: the ASan lane
-/// (`asan-held`, which runs `temen-run`'s `jit_kernel` fiber rows) reports it.
+/// **#3080 — a fiber charges the vCPU that runs it**, metered, with one vCPU running at a time. A
+/// makes the fiber and ends; the root resumes it (it suspends after 3 back-edges), spawns and joins
+/// C, and resumes it twice more. Every charge the fiber makes runs on the root's thread after A has
+/// ended, so the tree-walker charges the root's hand; the JIT charged A's cell, which its end had
+/// settled, so it drew afresh and stranded the root's chunk (main traps `OutOfFuel` with budget to
+/// spare). Both JIT routes now end and charge as the tree-walker does at the exact cost, one below
+/// it, and every budget from 1 to three times the cost. A kernel vCPU's context is a local of its
+/// `run_vcpu` and its cell a box of its `tier_run` now (no pool): the fiber reaches neither once its
+/// vCPU ended (the `asan-held` job runs this binary).
 #[test]
-fn jit_fuel_a_fiber_outliving_its_vcpu_runs_on_the_kernel_route_unmetered() {
-    use temen_run::jit_kernel;
-    let m = parse_module(A_FIBER_OUTLIVES_ITS_VCPU).expect("parse");
+fn jit_fuel_a_fiber_charges_the_vcpu_that_runs_it() {
+    let (ended, _) = on_the_oracle(A_FIBER_OUTLIVES_ITS_VCPU, 1 << 40);
+    assert_eq!(ended, Ended::Returned(3 + 6 + 6 + 7));
+    assert_jit_routes_sweep_as_the_oracle(A_FIBER_OUTLIVES_ITS_VCPU);
+}
+
+/// #3080 — and a fiber that suspends on one vCPU and goes on on another charges the second from its
+/// next safepoint ([`A_FIBER_MIGRATES`]): this is the row that pins the `FUEL` load's flag.
+#[test]
+fn jit_fuel_a_migrated_fiber_charges_its_new_vcpu() {
+    let (ended, _) = on_the_oracle(A_FIBER_MIGRATES, 1 << 40);
+    assert_eq!(ended, Ended::Returned(3 + 6 + 6));
+    assert_jit_routes_sweep_as_the_oracle(A_FIBER_MIGRATES);
+}
+
+/// #3080 (review F8b) — a nested resume that migrates: the root resumes F1, which makes F2 and
+/// resumes it (F2 suspends 3 inside a loop), and F1 suspends that 3 to the root; a thread resumes
+/// F1, which resumes F2 again (it loops 3 more and returns 7), and returns 3 + 7. F2's frame spans its
+/// suspend under F1's on the root and goes on under F1's on the thread, so both fibers must charge
+/// the thread from their next safepoint: a fiber resumed by a fiber names the vCPU under both.
+const A_NESTED_FIBER_MIGRATES: &str = "memory 16
+func () -> (i64) {
+block 0 () {
+  vz = i64.const 0
+  vf = ref.func 2
+  vk = cont.new vf vz
+  vs1, vv1 = cont.resume vk vz
+  vc = thread.spawn 1 vk vz
+  vcs, vcv = thread.join vc
+  vr = i64.add vv1 vcv
+  return vr
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vk: i64, vb: i64) {
+  vz = i64.const 0
+  vs, vv = cont.resume vk vz
+  return vv
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, varg: i64) {
+  vf = ref.func 3
+  vz = i64.const 0
+  vk2 = cont.new vf vz
+  vs, vv = cont.resume vk2 vz
+  vx = suspend vv
+  vs2, vv2 = cont.resume vk2 vz
+  vr = i64.add vv vv2
+  return vr
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, varg: i64) {
+  vz = i64.const 0
+  br 1(vz)
+}
+block 1 (vi: i64) {
+  vone = i64.const 1
+  vj = i64.add vi vone
+  vthree = i64.const 3
+  vlt = i64.lt_u vj vthree
+  br_if vlt 1(vj) 2(vj)
+}
+block 2 (vk: i64) {
+  vx = suspend vk
+  vz2 = i64.const 0
+  br 3(vz2)
+}
+block 3 (vi2: i64) {
+  vone2 = i64.const 1
+  vj2 = i64.add vi2 vone2
+  vthree2 = i64.const 3
+  vlt2 = i64.lt_u vj2 vthree2
+  br_if vlt2 3(vj2) 4()
+}
+block 4 () {
+  v7 = i64.const 7
+  return v7
+  }
+}
+";
+
+#[test]
+fn jit_fuel_a_nested_fiber_that_migrates_charges_its_new_vcpu() {
+    let (ended, _) = on_the_oracle(A_NESTED_FIBER_MIGRATES, 1 << 40);
+    assert_eq!(ended, Ended::Returned(3 + 3 + 7));
+    assert_jit_routes_sweep_as_the_oracle(A_NESTED_FIBER_MIGRATES);
+}
+
+/// Both JIT routes end `src` and charge as the tree-walker does on every budget from 1 to three
+/// times its cost.
+fn assert_jit_routes_sweep_as_the_oracle(src: &str) {
+    let (_, cost) = on_the_oracle(src, 1 << 40);
+    let wrong: Vec<String> = (1..=3 * cost)
+        .filter_map(|budget| {
+            let oracle = on_the_oracle(src, budget);
+            let jit = on_the_jit(src, budget);
+            let kernel = on_the_kernel_route(src, budget);
+            (jit != oracle || kernel != oracle)
+                .then(|| format!("{budget}: oracle {oracle:?}, JIT {jit:?}, kernel {kernel:?}"))
+        })
+        .collect();
+    assert!(wrong.is_empty(), "cost {cost}: {wrong:#?}");
+}
+
+/// #3080 (review F8a) — the unit [`AN_INSTALLED_UNITS_FIBER_OUTLIVES_ITS_THREAD`] installs. Given
+/// mode 0 its entry makes a fiber over its own function 1, resumes it to its first suspend and
+/// answers its handle; given mode 1 it resumes the fiber `h` and answers what it returned. The
+/// fiber's body calls its parent's function 2 (slot 2, new to old) with the unit's suspender
+/// (function 2), so the parent's code is on the fiber's stack when it suspends.
+const A_UNIT_WHOSE_FIBER_RUNS_ITS_PARENT: &str = "memory 16
+func (i64, i64) -> (i64) {
+block 0 (vmode: i64, vh: i64) {
+  vz = i64.const 0
+  vresume = i64.ne vmode vz
+  br_if vresume 2(vh) 1()
+}
+block 1 () {
+  vf = ref.func 1
+  vsp = i64.const 32768
+  vk = cont.new vf vsp
+  vz1 = i64.const 0
+  vs, vv = cont.resume vk vz1
+  return vk
+}
+block 2 (vk2: i64) {
+  vz2 = i64.const 0
+  vs2, vv2 = cont.resume vk2 vz2
+  return vv2
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, varg: i64) {
+  vsus = ref.func 2
+  vparent = i32.const 2
+  vr = call.dyn (i32) -> (i64) vparent (vsus)
+  return vr
+  }
+}
+func (i64) -> (i64) {
+block 0 (vx: i64) {
+  vy = suspend vx
+  return vy
+  }
+}
+";
+
+/// #3080 (review F8a) — a program that drives `Jit` and has no fiber op of its own. It compiles
+/// [`A_UNIT_WHOSE_FIBER_RUNS_ITS_PARENT`] (at 20480, `LEN` bytes) and installs it. A spawned thread
+/// dispatches the unit to make a fiber, whose body runs the parent's function 2: 1,000 back-edges,
+/// then a suspend through the unit, with function 2's frame on the fiber's stack, which read the
+/// thread's cell. The thread ends. The root resumes the fiber through the unit, and function 2 runs
+/// 1,000 more back-edges on the root's vCPU and returns 7. The root answers `1000·spent + 7`, where
+/// `spent` is what its `fuel.remaining` fell by from its start to its end: the domain's whole
+/// charge as its root sees it.
+const AN_INSTALLED_UNITS_FIBER_OUTLIVES_ITS_THREAD: &str = "memory 16
+func (i32) -> (i64) {
+block 0 (vj: i32) {
+  vself = i32.const 0
+  vbefore = call.cap 4294967295 13 () -> (i64) vself ()
+  vb = i64.const 20480
+  vl = i64.const LEN
+  vu = call.cap 11 0 (i64, i64) -> (i64) vj (vb, vl)
+  vs = call.cap 11 3 (i64) -> (i64) vj (vu)
+  vz = i64.const 0
+  vt = thread.spawn 1 vs vz
+  vst, vk = thread.join vt
+  vs32 = i32.wrap_i64 vs
+  vone = i64.const 1
+  vr = call.dyn (i64, i64) -> (i64) vs32 (vone, vk)
+  vself2 = i32.const 0
+  vafter = call.cap 4294967295 13 () -> (i64) vself2 ()
+  vspent = i64.sub vbefore vafter
+  vk1000 = i64.const 1000
+  vspentk = i64.mul vspent vk1000
+  vans = i64.add vspentk vr
+  return vans
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vs: i64, varg: i64) {
+  vs32 = i32.wrap_i64 vs
+  vz = i64.const 0
+  vk = call.dyn (i64, i64) -> (i64) vs32 (vz, vz)
+  return vk
+  }
+}
+func (i32) -> (i64) {
+block 0 (vsus: i32) {
+  vz = i64.const 0
+  br 1(vz, vsus)
+}
+block 1 (vi: i64, vs1: i32) {
+  vone = i64.const 1
+  vj = i64.add vi vone
+  vn = i64.const 1000
+  vmore = i64.lt_u vj vn
+  br_if vmore 1(vj, vs1) 2(vs1)
+}
+block 2 (vs2: i32) {
+  vz1 = i64.const 0
+  vx = call.dyn (i64) -> (i64) vs2 (vz1)
+  vz2 = i64.const 0
+  br 3(vz2)
+}
+block 3 (vi2: i64) {
+  vone2 = i64.const 1
+  vj2 = i64.add vi2 vone2
+  vn2 = i64.const 1000
+  vmore2 = i64.lt_u vj2 vn2
+  br_if vmore2 3(vj2) 4()
+}
+block 4 () {
+  v7 = i64.const 7
+  return v7
+  }
+}
+";
+
+/// #3080 (review F8a) — an installed unit's fiber that runs its parent's code charges the vCPU that
+/// resumes it, on the JIT's own route as on the tree-walker: the answer and the whole charge agree.
+/// The parent has no fiber op, so only its fiber-hosting compile (`hosts_fibers`) lowers its code
+/// to reload its cell. Without that, function 2's frame goes on charging the cell it read on the
+/// thread, which ended before the root resumed the fiber: that cell (a recycled thread context's)
+/// draws for it from the run's chain while the root's own cell sits unspent, so what the root sees
+/// spent differs from the oracle's.
+#[test]
+fn jit_fuel_an_installed_units_fiber_charges_the_vcpu_that_resumes_it() {
+    let unit = parse_module(A_UNIT_WHOSE_FIBER_RUNS_ITS_PARENT).expect("parse the unit");
+    verify_module(&unit).expect("verify the unit");
+    let blob = temen_encode::encode_module(&unit);
+    let src = AN_INSTALLED_UNITS_FIBER_OUTLIVES_ITS_THREAD.replace("LEN", &blob.len().to_string());
+    let m = parse_module(&src).expect("parse");
     verify_module(&m).expect("verify");
-    let got = jit_kernel::expect_kernel(
+    let mut init = vec![0u8; 20480 + blob.len()];
+    init[20480..].copy_from_slice(&blob);
+    // The tree-walker: its answer and what it charged.
+    let mut host = temen_interp::Host::new();
+    let jit = temen_run::grant_jit_fibers(&mut host, &m, 4);
+    let budget = 50_000_000u64;
+    let mut left = budget;
+    let oracle = temen_interp::run_capture_reserved_with_host(
         &m,
         0,
-        &[],
-        None,
-        u64::MAX,
-        jit_kernel::Expect::Kernel { vcpus: 3 },
+        &[Value::I32(jit)],
+        &mut left,
+        &init,
+        temen_ir::DEFAULT_RESERVED_LOG2,
+        &mut host,
     )
-    .expect("in scope");
-    assert_eq!(got, JitOutcome::Returned(vec![3 + 6 + 6 + 7]));
+    .0
+    .expect("the tree-walker runs it");
+    let [Value::I64(answer)] = oracle[..] else {
+        panic!("the tree-walker answered {oracle:?}");
+    };
+    assert_eq!(answer % 1000, 7, "the fiber returned 7");
+    let oracle_charge = budget - left;
+    // The JIT's own route (`jit_cap_run`, which meters the run on its host's node).
+    let mut host = temen_interp::Host::new();
+    let jit = temen_run::grant_jit_fibers(&mut host, &m, 4);
+    let (out, _) = temen_run::jit_cap_run(
+        &m,
+        0,
+        &[jit as i64],
+        &temen_interp::MemLayout::image(init),
+        temen_ir::DEFAULT_RESERVED_LOG2,
+        4,
+        &mut host,
+        None,
+    )
+    .expect("the JIT compiles it");
+    assert!(
+        matches!(out, JitOutcome::Returned(ref v) if v == &[answer]),
+        "{out:?}: what the root saw spent, and the fiber's 7, as the oracle's {answer}"
+    );
+    assert_eq!(
+        temen_interp::DEFAULT_FUEL - host.fuel_left(),
+        oracle_charge,
+        "the JIT charges what the oracle charges"
+    );
 }

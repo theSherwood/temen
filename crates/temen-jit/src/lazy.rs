@@ -90,6 +90,7 @@ pub(crate) struct Code {
     pub(crate) guard_offset: u64,
     pub(crate) epoch: bool,
     pub(crate) fuel: bool,
+    pub(crate) fuel_moves: bool,
     pub(crate) domain_poll: bool,
     pub(crate) fn_table_mask: u64,
     pub(crate) window: Option<validate::WindowLayout>,
@@ -135,6 +136,7 @@ impl Code {
             guard_offset: self.guard_offset,
             epoch: self.epoch,
             fuel: self.fuel,
+            fuel_moves: self.fuel_moves,
             domain_poll: self.domain_poll,
             fn_table_mask: self.fn_table_mask,
             slots: FuncSlots::Own { words },
@@ -550,6 +552,13 @@ pub(crate) struct Service {
 }
 
 impl Service {
+    /// #3080 — the [`crate::Lower::fuel_moves`] every function of this module is lowered with
+    /// ([`Code::plan`]), for a test.
+    #[cfg(test)]
+    pub(crate) fn fuel_moves(&self) -> bool {
+        self.lazy.code.fuel_moves
+    }
+
     /// Start the service of `code`, whose functions' records are `records` and whose lazy entries
     /// are at `entries` (an address and the function it runs, in any order). Nothing is compiled
     /// until a guest enters a function.
@@ -890,6 +899,7 @@ mod tests {
             None,
             None,
             0,
+            false,
         );
         FAULT.with(|f| f.set(None));
         Some(cm.expect("compile")).filter(CompiledModule::compiles_lazily)

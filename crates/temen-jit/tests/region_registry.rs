@@ -81,6 +81,7 @@ block 0 (v: i64) {
         None,
         None,
         0,
+        false,
     )
     .expect("jit compile");
     cm.set_window_ready(Some((record_a_page, std::ptr::null_mut())));

@@ -3945,7 +3945,7 @@ int run(int n) {
 
 /// #3078 slice 2 — the two stackful-fiber scheduler demos keep today's route on the Cranelift JIT:
 /// their libc's locks and joins make `memory.wait`s, which a fiber may reach, so `fiber parks`
-/// declines them on an unmetered run as on a metered one (`fiber fuel` comes after it). Slice 3,
+/// declines them on an unmetered run as on a metered one. Slice 3,
 /// which moves a fiber's wait to the kernel's rules, flips this row to the kernel route.
 #[test]
 #[cfg(all(unix, target_arch = "x86_64"))]

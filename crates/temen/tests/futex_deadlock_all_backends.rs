@@ -88,7 +88,7 @@ fn run_on(
             0,
             &[],
             None,
-            jit_kernel::lane_fuel(&module),
+            temen_interp::DEFAULT_FUEL,
             jit_kernel::Expect::of(declined),
         )?),
     };

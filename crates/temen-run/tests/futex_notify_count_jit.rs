@@ -65,7 +65,7 @@ fn both(m: &temen_ir::Module, declined: Option<&'static str>) -> (i64, i64) {
             0,
             &[],
             None,
-            jit_kernel::lane_fuel(m),
+            temen_interp::DEFAULT_FUEL,
             jit_kernel::Expect::of(declined),
         )
         .map(first),

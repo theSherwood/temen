@@ -29,6 +29,7 @@ fn compile_host(src: &str) -> CompiledModule {
         None,
         None,
         0,
+        false,
     )
     .expect("compile host program")
 }
@@ -106,6 +107,7 @@ fn loaded_client_links_to_a_newly_installed_service_by_name() {
         None,
         None,
         4,
+        false,
     )
     .expect("compile host");
 

@@ -36,7 +36,7 @@ fn jit_unarmed(m: &temen_ir::Module) -> Vec<Result<temen_jit::JitOutcome, String
                 0,
                 &[],
                 None,
-                jit_kernel::lane_fuel(m),
+                temen_interp::DEFAULT_FUEL,
                 jit_kernel::Expect::of(None),
             )
             .map(Ok),

@@ -72,6 +72,7 @@ fn compile_jit(m: &Module) -> CompiledModule {
         None,
         None,
         0,
+        false,
     )
     .expect("jit compiles")
 }

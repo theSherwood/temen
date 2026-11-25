@@ -702,6 +702,7 @@ block 2 (v7: i64) {{
         None,
         None,
         0,
+        false,
     )
     .expect("compile");
     // The first run's window, captured whole, is the second's: the token is in the buffer.
