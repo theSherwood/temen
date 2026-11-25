@@ -1429,7 +1429,7 @@ mod pal {
         hi: usize,
     }
     /// The innermost open guarded call's frame on this thread (#3167: each `run_guarded` keeps its
-    /// own on its stack and its parent in a local, and links and unlinks it). R-TLS:
+    /// own on its stack and its parent in a local, and links and unlinks it). DESIGN.md rule R2:
     /// `#[inline(never)]`, as `fiber_rt::current` is (#1466), so a read after the guarded call (which
     /// may switch stacks) resolves the thread-local on the thread running then, not through an
     /// address kept from before.
@@ -2584,8 +2584,8 @@ mod trap_walk_tests {
 
     /// **The ordering.** `temen_walk_in_progress()` is checked *before* the armed-range test, and
     /// this is what says so: the wall the walk faults on is inside the guarded `[lo, hi)`, which is
-    /// #1487's observed shape (its gdb trace has both faults at exactly `g_lo`, the window's null
-    /// guard). A detector that tested the range first would treat the walk's own fault as a fresh
+    /// #1487's observed shape (its gdb trace has both faults at exactly the range's low bound, the
+    /// window's null guard). A detector that tested the range first would treat the walk's own fault as a fresh
     /// guest window fault — reporting a `MemoryFault` the guest never took, and on unix re-entering
     /// the capture from a half-written one.
     ///
@@ -2757,6 +2757,11 @@ mod moved_scope_tests {
             !out.status.success(),
             "the child must not survive:\n{stderr}"
         );
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            assert_eq!(out.status.signal(), Some(libc::SIGABRT), "{stderr}");
+        }
         let line = stderr
             .lines()
             .find(|l| l.contains("returned with another recovery scope innermost"))
@@ -2821,7 +2826,7 @@ mod moved_scope_tests {
         assert!(found != own && found != "0x0", "found={found} own={own}");
     }
 
-    /// R-TLS: a guarded call's exit reads the recovery state of the thread it returns on. Thread 1
+    /// R2 (DESIGN.md): a guarded call's exit reads the recovery state of the thread it returns on. Thread 1
     /// resumes the fiber **bare** (no guarded call of its own), so it parks inside its nested call
     /// `N` with nothing on thread 1 to exit over it, and thread 1's chain still names `N`. Thread 2
     /// resumes it under a residency `R2`, so `N`'s exit runs on thread 2: it must read thread 2's

@@ -8,9 +8,10 @@
  * the host instead of crashing it. Anything else chains to the previous disposition.
  *
  * setjmp/sigsetjmp are macros that need the compiler's `returns_twice` handling, so this
- * lives in C (calling them via raw FFI from Rust is unsound). The recovery state is
- * thread-local, so concurrent JIT runs on different threads are independent: the handler
- * runs on the faulting thread and reads that thread's state.
+ * lives in C (calling them via raw FFI from Rust is unsound). The recovery state is a per-thread
+ * chain of scopes, each on the stack whose guarded call opened it (#3167, below), so concurrent JIT
+ * runs on different threads are independent: the handler runs on the faulting thread and reads that
+ * thread's chain.
  */
 /* Feature-test macros must precede every include. `_XOPEN_SOURCE` exposes the (macOS-deprecated)
  * ucontext routines + `ucontext_t` mcontext on Apple SDKs; `_GNU_SOURCE` gates glibc's REG_RIP/REG_RBP
@@ -26,16 +27,28 @@
 #include <ucontext.h>
 #include <unistd.h>
 
+/* `noipa` keeps GCC's interprocedural passes from treating an accessor's body as known at the call
+ * site; clang has no such attribute (it warns and ignores it). `noinline` is the load-bearing one, as
+ * `#[inline(never)]` is for `fiber_rt::current`. */
+#if defined(__has_attribute)
+#if __has_attribute(noipa)
+#define TEMEN_TLS_ACCESSOR __attribute__((noinline, noipa))
+#endif
+#endif
+#ifndef TEMEN_TLS_ACCESSOR
+#define TEMEN_TLS_ACCESSOR __attribute__((noinline))
+#endif
+
 /* #3167 — the guarded calls open on this thread, as a chain: each `temen_run_guarded` frame holds its
  * scope (its recovery point and its window's fault range) and a link to the scope that was innermost
  * when it was entered, and `g_scope` names the innermost. Null means disarmed. A scope lives on the
  * stack its call runs on, so nothing is copied: entry links, exit unlinks.
  *
- * R-TLS (#3167): a thread-local's address computed before a possible stack switch must not be used
- * after it. `fn` may switch stacks, and the compiler may keep `&g_scope` in a callee-saved register
- * across the call (the probe at bf6d7aa showed `temen_run_guarded` doing exactly that with `g_buf`),
- * so every access that can follow `fn` goes through the `noipa` accessors below, which resolve the
- * thread-local inside themselves, on the thread that calls them. The handler runs on the faulting
+ * DESIGN.md rule R2 (#1466; #3167 here): a thread-local's address computed before a possible stack
+ * switch must not be used after it. `fn` may switch stacks, and the compiler may keep `&g_scope` in a
+ * callee-saved register across the call (the probe at bf6d7aa showed `temen_run_guarded` doing
+ * exactly that with `g_buf`), so every access that can follow `fn` goes through the non-inlined
+ * accessors below, which resolve the thread-local inside themselves, on the thread that calls them. The handler runs on the faulting
  * thread with no switch inside it, so it reads `g_scope` directly. */
 struct temen_scope {
     sigjmp_buf buf;
@@ -45,11 +58,11 @@ struct temen_scope {
 };
 static _Thread_local struct temen_scope *g_scope = NULL;
 
-__attribute__((noinline, noipa)) static struct temen_scope *temen_scope_top(void) {
+TEMEN_TLS_ACCESSOR static struct temen_scope *temen_scope_top(void) {
     return g_scope;
 }
 
-__attribute__((noinline, noipa)) static void temen_scope_set(struct temen_scope *s) {
+TEMEN_TLS_ACCESSOR static void temen_scope_set(struct temen_scope *s) {
     g_scope = s;
 }
 
@@ -327,7 +340,7 @@ int temen_run_guarded(void (*fn)(const long *, long *, unsigned char *, const vo
     temen_scope_set(&scope);
     fn(a, r, m, t, tc);
     /* Ran to completion: this call's scope must be the innermost, on whatever thread `fn` returned
-     * on (R-TLS: read here, not through an address taken before `fn`). */
+     * on (R2: read here, not through an address taken before `fn`). */
     struct temen_scope *top = temen_scope_top();
     if (top != &scope)
         temen_scope_open_above(top, &scope);

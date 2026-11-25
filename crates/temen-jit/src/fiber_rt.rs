@@ -50,7 +50,9 @@
 //! a value or address carried across a suspension point. The exposure is specifically code that can
 //! execute on a fiber's own stack ([`fiber_suspend`], [`fiber_event_park`], the [`make_fiber`] body,
 //! and [`fiber_resume`] when a fiber resumes a fiber) — a vCPU-stack frame such as the §5
-//! `run_guarded` bracket never migrates and is unaffected.
+//! `run_guarded` bracket never migrates and is unaffected. A guarded call opened on a fiber's own
+//! stack (an inline handler, an invoke) could, which is why the shim's accessors follow the same rule
+//! (`trap_shim.c`, #3167) and the yield floor keeps such a stack from parking (#3162).
 //! This composition (verified protocol + real switch) cannot be model-checked — it is covered by
 //! the **empirical net**: the randomized-migration interp↔JIT differential (`fiber_fuzz`), a
 //! runtime single-owner assert at the resume seam ([`FiberSlot::running_on`]), guard-paged stacks,
