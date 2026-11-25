@@ -34,7 +34,9 @@ use crate::{jit_proc, CAP_REVOKED};
 /// #3080 — a module that makes fibers is held on the JIT too: a fiber made in one call charges the
 /// call that resumes it, as on the tree-walker, since each resume names the running activation's
 /// cell (`VmCtx::fiber_switched_in`). Except where a fiber could call into a held domain
-/// ([`fiber_may_call_in`]): the tree-walker holds those until #3164.
+/// ([`fiber_may_call_in`]): the tree-walker holds those until #3164. So the JIT holds a fiber-making
+/// domain only when none of its code calls an interface a guest can implement and it cannot reach
+/// `Jit`.
 pub fn hold(
     on: Executor,
     m: Arc<Module>,
@@ -54,27 +56,29 @@ pub fn hold(
     }
 }
 
-/// #3080 (review B2) — whether a guest fiber of the domain could call through a guest interface, so
-/// into a held domain, its own included: on the JIT such a call runs under the calling activation's
-/// gate and then gives it away, where the tree-walker keeps it out until that activation parks or
-/// ends (#3164). Decided from what can run: the module's own code, when it makes fibers and makes a
-/// guest-interface call (a `call.cap` on a guest interface's id, or one dispatched by a handle or a
-/// bound import, whose interface is known only as it runs); and the units it may run, which no one
-/// can read before they arrive, when its host lets them host fibers and it can reach `Jit`
-/// ([`jit_proc::hosts_fibers`]), as every fiber-hosting domain was declined before #3080.
+/// #3080 (review B2, G1, G2) — whether a guest fiber of the domain could call through an interface a
+/// guest can implement, so into a held domain, its own included: on the JIT such a call runs under
+/// the calling activation's gate and then gives it away, where the tree-walker keeps it out until
+/// that activation parks or ends (#3164). It could when **a fiber can exist** (the module makes
+/// fibers, or its host lets the units it submits host them, [`jit_proc::hosts_fibers`]) **and code
+/// that can run in one may make such a call**:
+/// - the module's own code, through a `call.cap` on an interface a guest can implement
+///   ([`temen_interp::guest_implementable`]: a guest-interned id, or a pre-seeded built-in shape such
+///   as `Stream`, which a guest's offer can carry), or through a bound import or a dynamic call that
+///   may land on one ([`jit_proc::may_reach`]);
+/// - any unit, when it can reach `Jit` ([`jit_proc::drives_jit`]): a unit `Jit.invoke`d from a fiber
+///   runs in it, its code is not there to read before it arrives, and its `call.cap` dispatches into
+///   the domain's powerbox.
 fn fiber_may_call_in(m: &Module, host: &Host) -> bool {
-    use temen_ir::{cap_id::GUEST_IMPL_BASE, Inst, CAP_SELF_TYPE_ID};
+    let calls = jit_proc::host_calls(m);
+    let units = jit_proc::drives_jit(&calls, host);
+    let fiber = m.funcs.iter().any(temen_ir::Func::uses_fibers) || host.jit_hosts_fibers() && units;
     let calls_a_guest = || {
-        (m.funcs.iter().flat_map(|f| &f.blocks))
-            .flat_map(|b| &b.insts)
-            .any(|i| match i {
-                Inst::CapCall(c) => c.type_id >= GUEST_IMPL_BASE && c.type_id != CAP_SELF_TYPE_ID,
-                Inst::CallImport(_) | Inst::CallSym(_) | Inst::CallImportDyn(_) => true,
-                _ => false,
-            })
+        (calls.iter()).any(|&(t, o)| {
+            jit_proc::may_reach(t, o, host, |t, _| temen_interp::guest_implementable(t))
+        })
     };
-    jit_proc::hosts_fibers(m, host)
-        || m.funcs.iter().any(temen_ir::Func::uses_fibers) && calls_a_guest()
+    fiber && (units || calls_a_guest())
 }
 
 /// The domain's main thread: what its run answers, and its powerbox back.

@@ -73,10 +73,16 @@ fn is_fork_op(type_id: u32, op: u32) -> bool {
 /// reaches its slot's binding — or anything, when `import.attach` may retarget the slot; a
 /// dynamic-mode call's interface is interned at run time, so it may reach anything.
 ///
-/// Read where a program's reading over a powerbox is made ([`ForkPlan::of`], [`drives_jit`]), over
+/// Read where a program's reading over a powerbox is made ([`ForkPlan::of`], [`drives_jit`], a held
+/// domain's decline, `held::fiber_may_call_in`), over
 /// bindings that cannot change afterwards except through a rebindable slot (counted as reaching
 /// anything).
-fn may_reach(type_id: u32, op: u32, host: &Host, pred: impl Fn(u32, u32) -> bool) -> bool {
+pub(crate) fn may_reach(
+    type_id: u32,
+    op: u32,
+    host: &Host,
+    pred: impl Fn(u32, u32) -> bool,
+) -> bool {
     match type_id {
         temen_ir::CAP_IMPORT_TYPE_ID => {
             host.import_rebindable(op & 0xFFFF)

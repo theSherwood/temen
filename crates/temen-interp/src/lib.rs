@@ -21099,6 +21099,15 @@ fn builtin_iface_ops(id: u32) -> Option<&'static [(&'static str, FuncType)]> {
         .find_map(|(bid, ops)| (*bid == id).then_some(&ops[..]))
 }
 
+/// #3080 — whether a guest can implement the interface `type_id` names, so a `call.cap` on it may
+/// land on a guest's offer: a guest-interned id, or a pre-seeded built-in's, which a guest's
+/// declaration of that shape under its canonical names interns to ([`Host::intern_interface`]).
+/// The host's dispatch sentinels (self, an import, a dynamic call) are not interfaces.
+pub fn guest_implementable(type_id: u32) -> bool {
+    (cap_id::GUEST_IMPL_BASE..temen_ir::CAP_DYN_TYPE_ID).contains(&type_id)
+        || builtin_iface_ops(type_id).is_some()
+}
+
 /// Negative-errno values returned by capability ops (§3e D42): `< 0` is `-errno`,
 /// `>= 0` is success. Errors do **not** trap — traps stay reserved for escape/fatal. The standard
 /// errnos come from the one shared table ([`temen_ir::errno`]); the aliases below are temen-interp's own.
