@@ -162,3 +162,118 @@ fn temen_link_takes_a_library_as_a_temeno_input() {
         "temen-link wrote the module link_nim links"
     );
 }
+
+/// **#3178: a library calls another under its C name.** The program reaches `lib_twice` in one
+/// library through `importc`, and `lib_twice` calls `lib_add` in a second library, which only the
+/// first imports: it is exported under its C name for that call, and the program never names it.
+const PROG_TWO: &str = "\
+(stmts
+ (proc :lib_twice.0. (params (param :x.0 . (i +64))) (i +64) (pragmas (importc \"lib_twice\")) (stmts .))
+ (proc :lib_quit.0. (params (param :code.0 . (i +64))) . (pragmas (importc \"lib_quit\")) (stmts .))
+ (proc :main.0.
+  (params
+   (param :argc.0 . (i +32))
+   (param :argv.0 . (ptr (ptr (c +8))))
+   (param :envp.0 . (ptr (ptr (c +8)))))
+  (i +32)
+  (pragmas (exportc \"main\"))
+  (stmts .
+   (call lib_quit.0. (call lib_twice.0. 21))
+   (ret 0))))";
+
+/// The first library: `lib_twice(x)` is `lib_add(x, x)`, which it imports by its C name and calls
+/// with `$sp` first, as the on-ramp calls any C function.
+const LIB_CALLER: &str = "\
+import 0 \"lib_add\" (i64, i64, i64) -> (i64)
+import 1 \"exit\" (i32) -> ()
+export 0 func \"lib_twice\" 0
+export 1 func \"lib_quit\" 1
+
+func (i64, i64) -> (i64) {
+block 0 (v0: i64, v1: i64) {
+  v2 = call.import 0 (v0, v1, v1)
+  return v2
+  }
+}
+
+func (i64, i64) -> () {
+block 0 (v0: i64, v1: i64) {
+  v2 = i32.wrap_i64 v1
+  call.import 1 (v2)
+  return
+  }
+}";
+
+/// The second library: `lib_add(a, b)`.
+const LIB_CALLEE: &str = "\
+export 0 func \"lib_add\" 0
+
+func (i64, i64, i64) -> (i64) {
+block 0 (v0: i64, v1: i64, v2: i64) {
+  v3 = i64.add v1 v2
+  return v3
+  }
+}";
+
+fn encoded(text: &str) -> Vec<u8> {
+    temen_encode::encode_unit(&temen_text::parse_module(text).expect("parse the library"))
+}
+
+fn link_libs(libs: &[&str]) -> Result<temen_ir::Module, temen_leng::LengError> {
+    let units = [
+        WholeModule {
+            stem: "sysvstub",
+            src: SYSTEM,
+        },
+        WholeModule {
+            stem: "prog",
+            src: PROG_TWO,
+        },
+    ];
+    let libs: Vec<Vec<u8>> = libs.iter().map(|l| encoded(l)).collect();
+    let libs: Vec<&[u8]> = libs.iter().map(Vec::as_slice).collect();
+    temen_leng::link_nim(
+        &units,
+        Edge::Caps,
+        None,
+        &libs,
+        temen_leng::Build::default(),
+    )
+}
+
+#[test]
+fn a_library_calls_another_under_its_c_name_on_every_engine() {
+    let m = link_libs(&[LIB_CALLER, LIB_CALLEE]).unwrap_or_else(|e| panic!("link: {e}"));
+    temen_verify::verify_module(&m).unwrap_or_else(|e| panic!("verify: {e:?}"));
+    let imports: Vec<&str> = m.imports.iter().map(|i| i.name.as_str()).collect();
+    assert!(
+        !imports.iter().any(|i| i.contains("lib_add")) && imports.contains(&"exit"),
+        "`lib_add` is bound between the libraries, and their capability is the host's: {imports:?}"
+    );
+    for engine in [
+        temen_run::Backend::TreeWalk,
+        temen_run::Backend::Bytecode,
+        temen_run::Backend::Jit,
+    ] {
+        let run = temen_run::instantiate(m.clone())
+            .and_then(|i| i.run(engine, &temen_run::RunConfig::default()))
+            .unwrap_or_else(|e| panic!("{engine:?}: {e}"));
+        assert!(
+            matches!(run.outcome, temen_run::Outcome::Exited(42)),
+            "{engine:?}: lib_quit(lib_twice(21)) exits 42 through the second library, got {:?}",
+            run.outcome
+        );
+    }
+}
+
+/// Two libraries that both export a name a third imports leave the link no choice: it fails, and
+/// says which name.
+#[test]
+fn two_libraries_exporting_a_name_another_imports_fail_the_link() {
+    let e = link_libs(&[LIB_CALLER, LIB_CALLEE, LIB_CALLEE])
+        .expect_err("an ambiguous name fails the link");
+    assert!(
+        format!("{e}").contains("lib_add"),
+        "the failure names the ambiguous symbol: {e}"
+    );
+}
