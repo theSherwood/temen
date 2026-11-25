@@ -2625,7 +2625,7 @@ unsafe fn defer_spawn(
 impl Domain {
     /// Run one child's guest entry **inline** on this thread (single-worker, slice 3.3): set up its
     /// fiber execution context (for `cont.*`), arm a **nested** detect-and-kill recovery
-    /// (`run_guarded_range` saves/restores the parent run's recovery state itself, like `invoke_extra`),
+    /// (`run_guarded_range` links its scope under the parent run's and unlinks it, like `invoke_extra`),
     /// call `code(arg0, arg1)` via the shared call-trampoline, and return `(result, trap, faulted)`. The
     /// caller is responsible for the durable control words (state + active shadow-SP) around the call.
     ///

@@ -1428,9 +1428,25 @@ mod pal {
         lo: usize,
         hi: usize,
     }
+    /// The innermost open guarded call's frame on this thread (#3167: each `run_guarded` keeps its
+    /// own on its stack and its parent in a local, and links and unlinks it). DESIGN.md rule R2:
+    /// `#[inline(never)]`, as `fiber_rt::current` is (#1466), so a read after the guarded call (which
+    /// may switch stacks) resolves the thread-local on the thread running then, not through an
+    /// address kept from before.
+    #[inline(never)]
+    fn guard_top() -> *const Frame {
+        GUARD.with(|g| g.get())
+    }
+
+    /// Make `s` the innermost open guarded call's frame on this thread ([`guard_top`]'s rule).
+    #[inline(never)]
+    fn set_guard_top(s: *const Frame) {
+        GUARD.with(|g| g.set(s));
+    }
+
     thread_local! {
-        // The active guarded call's window range + saved registers (None ⇒ no guarded call).
-        static GUARD: Cell<Option<Frame>> = const { Cell::new(None) };
+        // The innermost open guarded call's frame (null ⇒ no guarded call). See [`guard_top`].
+        static GUARD: Cell<*const Frame> = const { Cell::new(core::ptr::null()) };
         // #2996 — the active host access's window range + saved registers (`try_call`).
         static TRY: Cell<Option<Frame>> = const { Cell::new(None) };
         // §5 W3 trap-time backtrace: the faulting `(pc, frame-pointer-chain return addresses)` the VEH
@@ -1528,7 +1544,8 @@ mod pal {
                 resume_at_landing(&mut *ep.ContextRecord, &*f.jb);
                 return EXCEPTION_CONTINUE_EXECUTION;
             }
-            if let Some(f) = GUARD.with(|g| g.get()) {
+            // SAFETY: a non-null `GUARD` is an open scope on this thread's `run_guarded` frames.
+            if let Some(f) = GUARD.with(|g| g.get()).as_ref().copied() {
                 if addr >= f.lo && addr < f.hi && !host_fault(&*ep.ContextRecord, addr) {
                     // §5 W3: capture the trap-time backtrace from the faulting context *before*
                     // `resume_at_landing` below rewrites it.
@@ -1548,8 +1565,11 @@ mod pal {
             // an illegal instruction inside an armed guarded guest call is our emitted memory-fault
             // trap. Recover exactly like a guarded access violation (unwind to `run_guarded`).
             let pc = (*ep.ContextRecord).Rip as usize;
+            // SAFETY: as for an access violation, above.
             if let Some(f) = GUARD
                 .with(|g| g.get())
+                .as_ref()
+                .copied()
                 .filter(|_| !host_fault(&*ep.ContextRecord, pc))
             {
                 capture_trap_frame(&*ep.ContextRecord);
@@ -1707,6 +1727,19 @@ mod pal {
     #[cfg(not(target_arch = "x86_64"))]
     unsafe fn restore_teb_stack_fields(_fields: ()) {}
 
+    /// #3167 — the unix shim's `temen_scope_open_above`: a guarded call returned with another scope
+    /// innermost, so a stack switched out from under it with a scope of its own open (#3158). The
+    /// yield floor (#3162) keeps any stack from doing so; this is its backstop, in every build.
+    #[cold]
+    fn scope_open_above(found: *const Frame, own: *const Frame) -> ! {
+        use std::io::Write;
+        let _ = writeln!(
+            std::io::stderr(),
+            "temen-jit: a guarded call returned with another recovery scope innermost (a stack switched out under it, #3167): found={found:p} own={own:p}"
+        );
+        std::process::abort()
+    }
+
     /// Run `f` under the handler; `true` if an in-`[lo,hi)` access violation was caught.
     ///
     /// # Safety
@@ -1722,10 +1755,10 @@ mod pal {
         lo: usize,
         hi: usize,
     ) -> bool {
-        // Save the caller's (possibly-armed parent) guard frame to restore on exit — re-entrant so a
-        // §14 child guest can run (in its own window) inside the parent's guarded call. A child fault
-        // resumes at the child's landing pad; the parent's frame is restored afterwards intact.
-        let prev = GUARD.with(|g| g.replace(None));
+        // Link this call's scope in front of the innermost at entry, and unlink it at the end —
+        // re-entrant, so a §14 child guest can run (in its own window) inside the parent's guarded
+        // call. A child fault resumes at the child's landing pad; the parent's scope is untouched.
+        let parent = guard_top();
         // Snapshot the TEB stack fields: a fiber-side fault resumes at the landing pad without the
         // fiber switch-back, and the context rewrite leaves the fiber's TEB values in place (see
         // `teb_stack_fields`) — restore them on the tripped path.
@@ -1736,14 +1769,17 @@ mod pal {
             xmm: [[0; 2]; 10],
         };
         let jb_ptr: *mut JmpBuf = &mut jb;
-        GUARD.with(|g| g.set(Some(Frame { jb: jb_ptr, lo, hi })));
-        // SAFETY: `f` honours the `Entry` ABI (the caller's contract); `jb` outlives the call, and
-        // the VEH reads it only while this frame is armed.
+        let scope = Frame { jb: jb_ptr, lo, hi };
+        set_guard_top(&scope);
+        // SAFETY: `f` honours the `Entry` ABI (the caller's contract); `jb` and `scope` outlive the
+        // call, and the VEH reads them only while `scope` is linked.
         let tripped = temen_win_guarded_call(f, a, r, m, t, tc, jb_ptr) != 0;
         if tripped {
             restore_teb_stack_fields(teb); // undo a fiber-side fault's leftover TEB stack fields
+        } else if !std::ptr::eq(guard_top(), &scope) {
+            scope_open_above(guard_top(), &scope);
         }
-        GUARD.with(|g| g.set(prev)); // restore the parent's frame
+        set_guard_top(parent); // unlink: the parent's scope is innermost again
         tripped
     }
 }
@@ -2548,8 +2584,8 @@ mod trap_walk_tests {
 
     /// **The ordering.** `temen_walk_in_progress()` is checked *before* the armed-range test, and
     /// this is what says so: the wall the walk faults on is inside the guarded `[lo, hi)`, which is
-    /// #1487's observed shape (its gdb trace has both faults at exactly `g_lo`, the window's null
-    /// guard). A detector that tested the range first would treat the walk's own fault as a fresh
+    /// #1487's observed shape (its gdb trace has both faults at exactly the range's low bound, the
+    /// window's null guard). A detector that tested the range first would treat the walk's own fault as a fresh
     /// guest window fault — reporting a `MemoryFault` the guest never took, and on unix re-entering
     /// the capture from a half-written one.
     ///
@@ -2622,5 +2658,220 @@ mod trap_walk_tests {
         assert_eq!(rets.len(), 3, "{rets:x?}");
         assert_eq!(rets[1], 0xbeef_0001);
         assert_eq!(rets[2], 0xbeef_0002);
+    }
+}
+
+/// #3167 — a stack that parks with a guarded call's scope of its own still open: the shape the yield
+/// floor (#3162) forbids, forced past it on a bare `temen-fiber` fiber with no runtime. Each row runs
+/// the shape in a child process (this binary, re-run) and asserts on the child's exit: the guard
+/// must abort with its message, in every build, at the first guarded exit that finds another scope
+/// innermost.
+#[cfg(all(test, fiber_rt, not(loom)))]
+mod moved_scope_tests {
+    use super::*;
+    use temen_fiber::{Fiber, State, Yielder};
+
+    /// The variable that makes this binary the child that runs the forbidden shape.
+    const CHILD: &str = "TEMEN_MOVED_SCOPE_CHILD";
+
+    /// What a residency-shaped entry resumes, and what the resume answered.
+    struct ResumeCall {
+        fib: *mut Fiber,
+        state: Option<State>,
+    }
+
+    /// As `child_exec::resume_shim`: resume the fiber once, under the caller's guarded call.
+    extern "C" fn resume_once(
+        a: *const i64,
+        _r: *mut i64,
+        _m: *mut u8,
+        _t: *const c_void,
+        _tc: *mut i64,
+    ) {
+        // SAFETY: `a` is the caller's `ResumeCall`, live for the call.
+        unsafe {
+            let c = a as *mut ResumeCall;
+            (*c).state = Some((*(*c).fib).resume(0));
+        }
+    }
+
+    /// The nested guarded call's body: park its stack through the yielder `a` points at.
+    extern "C" fn park_inside(
+        a: *const i64,
+        _r: *mut i64,
+        _m: *mut u8,
+        _t: *const c_void,
+        _tc: *mut i64,
+    ) {
+        // SAFETY: `a` points at the running fiber's yielder.
+        unsafe {
+            let _ = (**(a as *const *const Yielder)).suspend(0);
+        }
+    }
+
+    struct Shared {
+        fib: *mut Fiber,
+        mem: *mut u8,
+        lo: usize,
+        hi: usize,
+    }
+    // SAFETY: the threads below take turns; one at a time touches the fiber.
+    unsafe impl Send for Shared {}
+
+    /// A residency: one guarded call on this thread that resumes the fiber once.
+    unsafe fn reside(s: &Shared) -> Option<State> {
+        let mut c = ResumeCall {
+            fib: s.fib,
+            state: None,
+        };
+        let faulted = run_guarded_range(
+            resume_once as *const u8,
+            &mut c as *mut ResumeCall as *const i64,
+            std::ptr::null_mut(),
+            s.mem,
+            std::ptr::null(),
+            std::ptr::null(),
+            s.lo,
+            s.hi,
+        );
+        assert!(!faulted);
+        c.state
+    }
+
+    /// Whether this process is the child that runs row `name`'s forbidden shape.
+    fn is_child(name: &str) -> bool {
+        std::env::var_os(CHILD).is_some_and(|v| v == name)
+    }
+
+    /// Re-run this binary as the child for row `name` and answer the abort's `(found, own)`, asserting
+    /// the child died with the abort's message.
+    fn child_abort(name: &str) -> (String, String) {
+        let path = format!("mem::moved_scope_tests::{name}");
+        let out = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args(["--exact", &path, "--test-threads=1", "--nocapture"])
+            .env(CHILD, name)
+            .output()
+            .expect("re-run the test binary");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !out.status.success(),
+            "the child must not survive:\n{stderr}"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            assert_eq!(out.status.signal(), Some(libc::SIGABRT), "{stderr}");
+        }
+        let line = stderr
+            .lines()
+            .find(|l| l.contains("returned with another recovery scope innermost"))
+            .unwrap_or_else(|| panic!("no abort message from the child:\n{stderr}"));
+        let field = |key: &str| {
+            line.split(key)
+                .nth(1)
+                .and_then(|rest| rest.split_whitespace().next())
+                .unwrap_or_else(|| panic!("no {key} in: {line}"))
+                .to_owned()
+        };
+        (field("found="), field("own="))
+    }
+
+    /// A fiber over a fresh window whose body makes one nested guarded call that parks inside.
+    fn parking_fiber() -> (GuestWindow, Fiber) {
+        pal::install_guard();
+        let win = GuestWindow::try_new(64 << 10, 1 << 20).expect("window");
+        let (lo, hi) = win.fault_range();
+        let mem = win.base() as usize;
+        let fib = Fiber::new(64 << 10, move |y: &Yielder, _| -> u64 {
+            let yp: *const Yielder = y;
+            // SAFETY: an Entry-shaped body over this window's range.
+            unsafe {
+                run_guarded_range(
+                    park_inside as *const u8,
+                    &yp as *const *const Yielder as *const i64,
+                    std::ptr::null_mut(),
+                    mem as *mut u8,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    lo,
+                    hi,
+                )
+            };
+            7
+        })
+        .expect("fiber");
+        (win, fib)
+    }
+
+    /// An outer guarded call that exits over a parked stack's open scope aborts, there: the fiber's
+    /// nested call `N` parks inside under the residency `R`, so `R`'s exit finds `N` innermost
+    /// (`found` = `N`, on the fiber's stack; `own` = `R`). The earliest point the abort can see it.
+    #[test]
+    fn an_outer_call_that_exits_over_a_parked_stacks_open_scope_aborts() {
+        const NAME: &str = "an_outer_call_that_exits_over_a_parked_stacks_open_scope_aborts";
+        if is_child(NAME) {
+            let (win, mut fib) = parking_fiber();
+            let (lo, hi) = win.fault_range();
+            let s = Shared {
+                fib: &mut fib,
+                mem: win.base(),
+                lo,
+                hi,
+            };
+            // SAFETY: the fiber's one residency; its exit aborts.
+            let _ = unsafe { reside(&s) };
+            unreachable!("the residency's exit aborts");
+        }
+        let (found, own) = child_abort(NAME);
+        assert!(found != own && found != "0x0", "found={found} own={own}");
+    }
+
+    /// R2 (DESIGN.md): a guarded call's exit reads the recovery state of the thread it returns on. Thread 1
+    /// resumes the fiber **bare** (no guarded call of its own), so it parks inside its nested call
+    /// `N` with nothing on thread 1 to exit over it, and thread 1's chain still names `N`. Thread 2
+    /// resumes it under a residency `R2`, so `N`'s exit runs on thread 2: it must read thread 2's
+    /// chain, find `R2` innermost, and abort (`found` = `R2`, `own` = `N`). An exit that read through
+    /// an address taken on thread 1 would find `N` itself there and not abort: the child would then
+    /// survive the exit, and the row fails. Thread 1 stays alive throughout, so the two threads share
+    /// no stack or TLS block.
+    #[test]
+    fn a_scope_that_exits_on_another_thread_reads_that_threads_chain() {
+        const NAME: &str = "a_scope_that_exits_on_another_thread_reads_that_threads_chain";
+        if is_child(NAME) {
+            let (win, mut fib) = parking_fiber();
+            let (lo, hi) = win.fault_range();
+            let s = Shared {
+                fib: &mut fib,
+                mem: win.base(),
+                lo,
+                hi,
+            };
+            let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+            let (s_tx, s_rx) = std::sync::mpsc::channel::<Shared>();
+            let t1 = std::thread::spawn(move || {
+                pal::install_guard();
+                // SAFETY: a bare resume: the fiber parks inside `N`, linked on this thread.
+                let st = unsafe { (*s.fib).resume(0) };
+                assert!(matches!(st, State::Yielded(0)));
+                s_tx.send(s).expect("hand the fiber on");
+                done_rx.recv().expect("thread 2 ends");
+            });
+            let s = s_rx.recv().expect("thread 1 parked the fiber");
+            std::thread::spawn(move || {
+                pal::install_guard();
+                // SAFETY: the fiber's residency on thread 2: `N` returns here, and its exit aborts.
+                let _ = unsafe { reside(&s) };
+            })
+            .join()
+            .expect("thread 2");
+            done_tx.send(()).expect("release thread 1");
+            t1.join().expect("thread 1");
+            unreachable!("N's exit on thread 2 aborts");
+        }
+        let (found, own) = child_abort(NAME);
+        assert!(
+            found != own && found != "0x0",
+            "the exit did not read thread 2's chain: found={found} own={own}"
+        );
     }
 }
