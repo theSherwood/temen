@@ -308,3 +308,465 @@ fn a_childs_uninstall_leaves_the_parents_slot_mirror_alone() {
         "the root's mirror still names its own unit at slot 2"
     );
 }
+
+/// #3158 — a whole-vCPU park made inside a `Jit.invoke`, on a pool task. The child [`joining_src`]
+/// spawns a grandchild (function 4's image), then compiles a unit and invokes it. The unit
+/// `call.dyn`s the child's function 2 (new→old), which makes a fiber over function 3 and resumes it,
+/// and that fiber joins the grandchild. A join blocks the child's vCPU on every engine. The
+/// grandchild waits with no deadline on a word nothing notifies. On the JIT a task cannot decide the
+/// deadlock verdict: an OS vCPU's park decides it once the run is quiescent
+/// (`ChildExec::wake_vcpus_if_quiescent`), and the run is not while the child runs to its join. So
+/// the grandchild is live at the join, however slow the run, with no clock and no fuel in it. On
+/// the oracle it reaches its verdict, which the oracle's answer does not read: the oracle's invoke
+/// child refuses the join itself.
+fn joining_src(blob: &[u8]) -> String {
+    let blob_data: String = blob.iter().map(|b| format!("\\x{b:02x}")).collect();
+    let spawn = SpawnRec {
+        grants_ptr: 16384,
+        grants_n: 2,
+        ..SpawnRec::default()
+    };
+    let grand = SpawnRec::default();
+    // One grant record: the name at `at`'s slot `name`, `len` bytes, and the handle `h`.
+    let grant = |i: u32, name: u32, len: u32, h: &str| {
+        let a = 16384 + 16 * i;
+        format!("  g{i}a = i64.const {a}\n  g{i}n = i32.const {name}\n  i32.store g{i}a g{i}n\n  g{i}b = i64.const {}\n  g{i}l = i32.const {len}\n  i32.store g{i}b g{i}l\n  g{i}c = i64.const {}\n  i32.store g{i}c {h}\n  g{i}d = i64.const {}\n  g{i}z = i32.const 0\n  i32.store g{i}d g{i}z\n", a + 4, a + 8, a + 12)
+    };
+    format!(
+        r#"memory 17
+func (i32, i32, i32, i32, i32) -> (i64) {{
+block 0 (vinst: i32, vjit: i32, vbud: i32, vmod: i32, vgmod: i32) {{
+{g0}{g1}  qm = i64.const 17544
+  i32.store qm vmod
+  qb = i64.const 17548
+  i32.store qb vbud
+  q0a0 = i64.const 17536
+  vch = call.cap 6 17 (i64) -> (i32) vinst (q0a0)
+  r_st, r = call.cap 6 1 (i32) -> (i64, i64) vinst (vch)
+  k1000 = i64.const 1000
+  rs1000 = i64.mul r_st k1000
+  out = i64.add rs1000 r
+  return out
+  }}
+}}
+func (i64) -> (i64) {{
+block 0 (vci: i64) {{
+  n0 = i64.const 16484
+  len3 = i64.const 3
+  hj = self.resolve n0 len3
+  n1 = i64.const 16488
+  hg = self.resolve n1 len3
+  gm = i64.const 17672
+  i32.store gm hg
+  nb = i64.const 16496
+  len6 = i64.const 6
+  hb = self.resolve nb len6
+  gb = i64.const 17676
+  i32.store gb hb
+  vinst = i32.wrap_i64 vci
+  gr = i64.const 17664
+  vg = call.cap 6 17 (i64) -> (i32) vinst (gr)
+  vga = i64.const 70008
+  i32.store vga vg
+  vgi = i64.const 70012
+  i32.store vgi vinst
+  vb = i64.const {BLOB_OFF}
+  vl = i64.const {len}
+  vc = call.cap 11 0 (i64, i64) -> (i64) hj (vb, vl)
+  vh = call.cap 11 1 (i64) -> (i64) hj (vc)
+  v100 = i64.const 100
+  vr = i64.add vh v100
+  return vr
+  }}
+}}
+func (i64, i64) -> (i64) {{
+block 0 (vsp: i64, varg: i64) {{
+  vf = i32.const 3
+  vfsp = i64.const 32768
+  vk = cont.new vf vfsp
+  vz = i64.const 0
+  vs, vv = cont.resume vk vz
+  return vv
+  }}
+}}
+func (i64, i64) -> (i64) {{
+block 0 (vsp: i64, varg: i64) {{
+  vga = i64.const 70008
+  vg = i32.load vga
+  vgi = i64.const 70012
+  vinst = i32.load vgi
+  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) vinst (vg)
+  return vj
+  }}
+}}
+func (i64) -> (i64) {{
+block 0 (v0: i64) {{
+  vp = i64.const 70000
+  vw0 = i32.const 0
+  vto = i64.const -1
+  vw = i32.atomic.wait vp vw0 vto
+  v7 = i64.const 7
+  return v7
+  }}
+}}
+data 16484 "jit"
+data 16488 "gcm"
+data 16496 "budget"
+data {BLOB_OFF} "{blob_data}"
+{rec}
+{grec}"#,
+        g0 = grant(0, 16484, 3, "vjit"),
+        g1 = grant(1, 16488, 3, "vgmod"),
+        len = blob.len(),
+        rec = rec::segment(17536, &spawn),
+        grec = rec::segment(17664, &grand),
+    )
+}
+
+/// #3158 — the join of [`joining_src`]. On the JIT the child is a task and the invoke a guarded call
+/// nested in its frames, so the task cannot park there whole: the join fails closed at its own door
+/// (`ThreadFault`) before it parks, and the parent's join reads that trap. Before the door the join
+/// parked the fiber, and the park's hand-up found the task under the invoke's floor and left the
+/// fiber parked mid-join (the hand-up's `debug_assert`, which a debug build fails on). The
+/// tree-walker's invoke child refuses the join (`CapFault`): the invoke divergence #3154 records,
+/// which #3155 removes.
+#[test]
+fn a_join_inside_an_invoke_on_a_pool_task_fails_closed_at_its_door() {
+    let unit = "memory 17\nfunc () -> (i64) {\nblock 0 () {\n  vf = i32.const 2\n  vz = i64.const 0\n  vr = call.dyn (i64, i64) -> (i64) vf (vz, vz)\n  return vr\n  }\n}\n";
+    let b = encode_module(&parse_module(unit).expect("parse unit"));
+    let m = parse_module(&joining_src(&b)).expect("parse");
+    verify_module(&m).expect("verify");
+    fn setup(m: &temen_ir::Module) -> (Host, [i32; 5]) {
+        let mut host = Host::new();
+        let ih = host.grant_instantiator();
+        let jh = grant_jit(&mut host, m, 0);
+        let bh = host.grant_budget(-1, 1 << 20, -1);
+        let ch = host.grant_module(&temen_ir::child_image_at(m, 1).expect("child image"));
+        let gh = host.grant_module(&temen_ir::child_image_at(m, 4).expect("grandchild image"));
+        (host, [ih, jh, bh, ch, gh])
+    }
+    // The parent answers `status * 1000 + value` of its join of the child.
+    let trapped = |code: i64| code * 1000;
+    // Each half on its own thread with a bound in time, so a run that does not end fails rather than
+    // hangs.
+    let r = {
+        let m = m.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let (mut host, h) = setup(&m);
+            let mut fuel = 50_000_000u64;
+            let _ = tx.send(run_with_host(
+                &m,
+                0,
+                &h.map(Value::I32),
+                &mut fuel,
+                &mut host,
+            ));
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(60))
+            .expect("the oracle's run ends")
+    };
+    assert_eq!(
+        r,
+        Ok(vec![Value::I64(trapped(temen_ir::trap_code::CAP_FAULT))]),
+        "oracle"
+    );
+    let out = {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let (mut host, h) = setup(&m);
+            let out = temen_run::jit_cap_run(
+                &m,
+                0,
+                &h.map(i64::from),
+                &MemLayout::image(Vec::new()),
+                DEFAULT_RESERVED_LOG2,
+                0,
+                &mut host,
+                None,
+            )
+            .expect("jit")
+            .0;
+            let _ = tx.send(out);
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(60))
+            .expect("the JIT's run ends")
+    };
+    assert!(
+        matches!(out, JitOutcome::Returned(ref v) if v == &[trapped(temen_ir::trap_code::THREAD_FAULT)]),
+        "jit: the child's join fails closed at its door: {out:?}"
+    );
+}
+
+/// #3158 — the parent spawns the serving child [`punt_server`] with its `Jit` and a punting host procedure granted by name, mints an
+/// offer over the child's export, calls `run(5)` through it, joins the child, and returns the reply
+/// plus 1000 times the join's status.
+fn punt_parent() -> String {
+    let spawn = SpawnRec {
+        grants_ptr: 16384,
+        grants_n: 2,
+        ..SpawnRec::default()
+    };
+    format!(
+        r#"memory 17
+type 0 func (i64) -> (i64)
+type 1 interface {{ run: 0 }}
+func (i32, i32, i32, i32, i32) -> (i64) {{
+block 0 (vinst: i32, vjit: i32, vbud: i32, vmod: i32, vproc: i32) {{
+  a0 = i64.const 16384
+  n0 = i32.const 16484
+  i32.store a0 n0
+  a4 = i64.const 16388
+  l3 = i32.const 3
+  i32.store a4 l3
+  a8 = i64.const 16392
+  i32.store a8 vjit
+  a12 = i64.const 16396
+  z0 = i32.const 0
+  i32.store a12 z0
+  b0 = i64.const 16400
+  n1 = i32.const 16488
+  i32.store b0 n1
+  b4 = i64.const 16404
+  i32.store b4 l3
+  b8 = i64.const 16408
+  i32.store b8 vproc
+  b12 = i64.const 16412
+  i32.store b12 z0
+  qm = i64.const 17544
+  i32.store qm vmod
+  qb = i64.const 17548
+  i32.store qb vbud
+  q0a0 = i64.const 17536
+  vch = call.cap 6 17 (i64) -> (i32) vinst (q0a0)
+  vz = i64.const 0
+  voff = call.cap 6 14 (i32, i64) -> (i32) vinst (vch, vz)
+  v5 = i64.const 5
+  vr = call.cap 268435456 0 (i64) -> (i64) voff (v5)
+  r_st, r = call.cap 6 1 (i32) -> (i64, i64) vinst (vch)
+  k1000 = i64.const 1000
+  rs1000 = i64.mul r_st k1000
+  out = i64.add rs1000 vr
+  return out
+  }}
+}}
+data 16484 "jit"
+data 16488 "prc"
+{rec}"#,
+        rec = rec::segment(17536, &spawn),
+    )
+}
+
+/// A unit [`punt_server`] compiles: it calls the punting procedure whose handle the child stored at
+/// 70000 with 5, answering the job's 105.
+const PUNT_UNIT: &str = "memory 17\nfunc () -> (i64) {\nblock 0 () {\n  va = i64.const 70000\n  vh = i32.load va\n  v5 = i64.const 5\n  vr = call.cap 13 0 (i64) -> (i64) vh (v5)\n  return vr\n  }\n}\n";
+
+/// The same call with no result: the unit answers 0.
+const ZERO_RESULT_PUNT_UNIT: &str = "memory 17\nfunc () -> (i64) {\nblock 0 () {\n  va = i64.const 70000\n  vh = i32.load va\n  v5 = i64.const 5\n  call.cap 13 0 (i64) -> () vh (v5)\n  v0 = i64.const 0\n  return v0\n  }\n}\n";
+
+/// #3158 — the serving child. Its entry resolves `"jit"` and `"prc"`, compiles
+/// a unit (the blob at [`BLOB_OFF`]), spawns a notifier vCPU (function 2), and serves one
+/// call. The handler, `run(a)`, waits with no deadline on a word the notifier notifies until a notify
+/// wakes a waiter, so the handler's fiber parks once, however late its wait begins, and a pool
+/// worker resumes it. The notifier sleeps a millisecond on a word of its own between tries: that
+/// only paces it. What makes the park certain is the wait's lack of a deadline and the notifier
+/// trying until one of its notifies wakes a waiter. Then the handler invokes the unit, whose call
+/// the host punts; where that call is answered, the handler answers the unit's answer plus `a`.
+fn punt_server(blob: &[u8]) -> String {
+    let blob_data: String = blob.iter().map(|b| format!("\\x{b:02x}")).collect();
+    format!(
+        r#"memory 17
+type 0 func (i64) -> (i64)
+type 1 interface {{ run: 0 }}
+export 0 interface "svc" 1 {{ run: 1 }}
+func (i64) -> (i64) {{
+block 0 (vci: i64) {{
+  n0 = i64.const 16484
+  l3 = i64.const 3
+  hj = self.resolve n0 l3
+  n1 = i64.const 16488
+  hp = self.resolve n1 l3
+  ap = i64.const 70000
+  i32.store ap hp
+  aj = i64.const 70004
+  i32.store aj hj
+  vb = i64.const {BLOB_OFF}
+  vl = i64.const {len}
+  vc = call.cap 11 0 (i64, i64) -> (i64) hj (vb, vl)
+  ac = i64.const 70008
+  i64.store ac vc
+  vnz = i64.const 0
+  vnt = thread.spawn 2 vnz vnz
+  vz = i32.const 0
+  vn = svc.wait vz
+  return vn
+  }}
+}}
+func (i64) -> (i64) {{
+block 0 (va: i64) {{
+  vp = i64.const 70100
+  vw0 = i32.const 0
+  vto = i64.const -1
+  vw = i32.atomic.wait vp vw0 vto
+  aj = i64.const 70004
+  hj = i32.load aj
+  ac = i64.const 70008
+  vc = i64.load ac
+  vh = call.cap 11 1 (i64) -> (i64) hj (vc)
+  vr = i64.add vh va
+  return vr
+  }}
+}}
+func (i64, i64) -> (i64) {{
+block 0 (vsp: i64, varg: i64) {{
+  br 1()
+}}
+block 1 () {{
+  vp = i64.const 70100
+  vone = i32.const 1
+  vn = atomic.notify vp vone
+  vz = i32.const 0
+  vnone = i32.eq vn vz
+  br_if vnone 2() 3(vn)
+}}
+block 2 () {{
+  vq = i64.const 70200
+  vq0 = i32.const 0
+  vqt = i64.const 1000000
+  vqw = i32.atomic.wait vq vq0 vqt
+  br 1()
+}}
+block 3 (vwoke: i32) {{
+  vr = i64.extend_i32_s vwoke
+  return vr
+  }}
+}}
+data 16484 "jit"
+data 16488 "prc"
+data {BLOB_OFF} "{blob_data}"
+"#,
+        len = blob.len(),
+    )
+}
+
+/// A host procedure whose every call the host punts: its job answers the argument plus 100. Forkable,
+/// so a spawn can re-grant it to a child.
+fn punting_proc() -> temen_interp::HostProcGrant {
+    fn handler() -> temen_interp::ProcHandler {
+        temen_interp::ProcHandler::Offloadable(Box::new(|_op, args, _out| {
+            let a = *args.first().unwrap_or(&0);
+            temen_interp::OffloadOutcome::Offload(Box::new(move || a + 100))
+        }))
+    }
+    temen_interp::HostProcGrant::new(handler(), temen_interp::CapState::Stateless).forkable(
+        std::sync::Arc::new(|_| {
+            Some(temen_interp::ForkedProc {
+                handler: handler(),
+                signal: None,
+                refork: None,
+                exit: None,
+                exec_remap: None,
+                state: temen_interp::CapState::Stateless,
+                abandon: None,
+            })
+        }),
+    )
+}
+
+/// #3158 — a punt from a pool task's code below a guarded call's floor: here a serve handler's shell,
+/// resumed by a pool worker, inside a `Jit.invoke`. Main parked a fiber for such a punt; here no
+/// fiber of the code's own can park, the task cannot park under the call, and blocking the worker's
+/// thread could starve what the answer waits on (a punted job may wait on another vCPU or a child
+/// of the run, `cap_park.rs`). So the JIT refuses the punt at
+/// its door (`cap_wait`'s `ParkHere::Refused`): the child ends `ThreadFault`, and the parent's call
+/// fails `CAP_REVOKED`. The oracle's invoke child refuses the punt itself (`CapFault`, #3154), which
+/// #3155 removes.
+#[test]
+fn a_punt_from_a_resumed_handler_below_a_floor_fails_closed_at_its_door() {
+    let (oracle, jit) = punt_run_both(PUNT_UNIT);
+    // The parent answers `1000 * the child's join status + the call's reply`; -9 is `CAP_REVOKED`,
+    // the call's failure once the callee has ended.
+    let ended = |trap: i64| trap * 1000 - 9;
+    assert_eq!(
+        oracle,
+        format!("Ok([I64({})])", ended(temen_ir::trap_code::CAP_FAULT)),
+        "oracle: its invoke child refuses the punt"
+    );
+    assert_eq!(
+        jit,
+        format!(
+            "Ok(Returned([{}]))",
+            ended(temen_ir::trap_code::THREAD_FAULT)
+        ),
+        "jit: the punt is refused at its door"
+    );
+}
+
+/// #3158 — the same shape, the unit's punt with no result. Main never parked a fiber for such a punt
+/// (the locked thunk waits for it outside on the thread, whatever the floor), so it keeps main's
+/// path: the call is answered and the handler answers 0 + 5, as the oracle does. Without the count
+/// carve-out the JIT refuses it as the one-result punt.
+#[test]
+fn a_zero_result_punt_from_a_resumed_handler_below_a_floor_waits_as_on_main() {
+    let (oracle, jit) = punt_run_both(ZERO_RESULT_PUNT_UNIT);
+    assert_eq!(oracle, "Ok([I64(5)])", "oracle: the punt is answered");
+    assert_eq!(jit, "Ok(Returned([5]))", "jit: the punt waits as on main");
+}
+
+/// The run of [`punt_parent`] over [`punt_server`] compiling `unit`, on the oracle and on the JIT,
+/// each on a thread of its own and bounded in time: a run that does not end fails.
+fn punt_run_both(unit: &str) -> (String, String) {
+    fn host(server: &temen_ir::Module) -> (Host, [i32; 5]) {
+        let mut host = Host::new();
+        let ih = host.grant_instantiator();
+        let jh = grant_jit(&mut host, server, 0);
+        let bh = host.grant_budget(-1, 1 << 20, -1);
+        let sh = host.grant_module(server);
+        let ph = host.grant_host_proc(punting_proc());
+        (host, [ih, jh, bh, sh, ph])
+    }
+    let unit = encode_module(&parse_module(unit).expect("parse unit"));
+    let parent = parse_module(&punt_parent()).expect("parse parent");
+    verify_module(&parent).expect("verify parent");
+    let server = parse_module(&punt_server(&unit)).expect("parse server");
+    verify_module(&server).expect("verify server");
+    let bounded = |run: Box<dyn FnOnce() -> String + Send>, what: &str| {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(run());
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(30))
+            .unwrap_or_else(|_| panic!("the {what} run ends"))
+    };
+    let (p, sv) = (parent.clone(), server.clone());
+    let oracle = bounded(
+        Box::new(move || {
+            let (mut host, h) = host(&sv);
+            let mut fuel = 50_000_000u64;
+            format!(
+                "{:?}",
+                run_with_host(&p, 0, &h.map(Value::I32), &mut fuel, &mut host)
+            )
+        }),
+        "oracle's",
+    );
+    let jit = bounded(
+        Box::new(move || {
+            let (mut host, h) = host(&server);
+            let out = temen_run::jit_cap_run(
+                &parent,
+                0,
+                &h.map(i64::from),
+                &MemLayout::image(Vec::new()),
+                DEFAULT_RESERVED_LOG2,
+                0,
+                &mut host,
+                None,
+            )
+            .map(|(o, _)| o);
+            format!("{out:?}")
+        }),
+        "JIT's",
+    );
+    (oracle, jit)
+}

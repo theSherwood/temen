@@ -1341,11 +1341,12 @@ fn jit_cap_shared_region_aliases_differential() {
 
 /// #1707 — an op that ends a §13 alias ends it on the JIT as on the interpreter: the page is the
 /// window's own from then on, and the region keeps its bytes for every other mapping of it. The guest
-/// aliases the region at A and B, then ends A's alias each way there is — a `Memory.map` over it, a
-/// `Memory.protect(none)` (then a `map`), a `Memory.unmap`, a `SharedRegion.unmap` — after storing a
-/// value through A, and writing through A again where it can. B, which still aliases the region,
-/// must read the value stored before each end, and A must read zero right after the `map`. The JIT
-/// used to zero the region through A (`unmap` until #2139, `map` until now) and keep writing it.
+/// aliases the region at A and B. A `Memory.map` over A first ends nothing: it is refused, `-EEXIST`,
+/// and A still writes the region (#3173). Then the guest ends A's alias each way there is — a
+/// `Memory.protect(none)` (then a `map`), a `Memory.unmap`, a `SharedRegion.unmap` — after storing
+/// a value through A, and writing through A again where it can. B, which still aliases the region,
+/// must read the value stored before each end. The JIT used to zero the region through A (`unmap`
+/// until #2139, `map` until #1707) and keep writing it.
 #[cfg(any(unix, windows))]
 #[test]
 fn jit_cap_ending_an_alias_leaves_the_region_alone_differential() {
@@ -1354,9 +1355,10 @@ fn jit_cap_ending_an_alias_leaves_the_region_alone_differential() {
     use temen_jit::compile_and_run_capture_reserved_with_host;
 
     const MARKER: i64 = 0x0123_4567_89ab_cdefu64 as i64;
+    const EEXIST: i64 = -17;
     let src = format!(
         "memory 18\n\
-         func (i32, i32) -> (i64, i64, i64, i64, i64) {{\n\
+         func (i32, i32) -> (i64, i64, i64, i64, i64, i64, i64) {{\n\
          block 0 (vr: i32, vm: i32) {{\n\
          \x20 vg = call.cap 4 3 () -> (i64) vr ()\n\
          \x20 v0 = i64.const 0\n\
@@ -1373,7 +1375,6 @@ fn jit_cap_ending_an_alias_leaves_the_region_alone_differential() {
          \x20 vx = i64.const 17\n\
          \x20 i64.store va vx\n\
          \x20 r2 = i64.load vb\n\
-         \x20 m4 = call.cap 4 0 (i64, i64, i64, i32) -> (i64) vr (va, v0, vg, vrw)\n\
          \x20 m5 = call.cap 5 2 (i64, i64, i32) -> (i64) vm (va, vg, vnone)\n\
          \x20 m6 = call.cap 5 0 (i64, i64, i32) -> (i64) vm (va, vg, vrw)\n\
          \x20 vy = i64.const 34\n\
@@ -1389,7 +1390,7 @@ fn jit_cap_ending_an_alias_leaves_the_region_alone_differential() {
          \x20 i64.store va vk3\n\
          \x20 m10 = call.cap 4 1 (i64, i64) -> (i64) vr (va, vg)\n\
          \x20 r5 = i64.load vb\n\
-         \x20 return r1 r2 r3 r4 r5\n\
+         \x20 return m3 r1 r2 r3 r4 r5 m6\n\
            }}\n\
          }}\n"
     );
@@ -1421,15 +1422,17 @@ fn jit_cap_ending_an_alias_leaves_the_region_alone_differential() {
     )
     .expect("jit compiles");
 
-    let want = [0, MARKER, MARKER, 51, 68];
+    // The refused map, A still the region's (17 seen at B, and kept there past the protect),
+    // then each end, and the map after the protect.
+    let want = [EEXIST, MARKER, 17, 17, 51, 68, 0];
     assert_eq!(
         interp.expect("interp runs"),
         want.map(Value::I64).to_vec(),
-        "interp: a fresh page at A, and B keeps the region's bytes"
+        "interp: a map over the alias is refused, and B keeps the region's bytes"
     );
     assert!(
         matches!(jit, JitOutcome::Returned(ref s) if s == &want),
-        "jit: a fresh page at A, and B keeps the region's bytes: {jit:?}"
+        "jit: a map over the alias is refused, and B keeps the region's bytes: {jit:?}"
     );
     assert_eq!(imem, jmem, "interp/JIT windows diverge");
 }

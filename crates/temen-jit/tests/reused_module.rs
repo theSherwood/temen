@@ -644,6 +644,7 @@ fn read_only_at_16384() -> temen_jit::WindowRestore {
     temen_jit::WindowRestore {
         prots,
         tail: Vec::new(),
+        held: 0..0,
     }
 }
 
