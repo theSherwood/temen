@@ -1223,11 +1223,24 @@ pub(crate) unsafe fn serve_request(
     }
     // #3158 — two questions. The process-tree gates (`exec`, `fork`, `spawn` of self) ask whether the
     // code is the root computation: no fiber on this vCPU's stack, so not code a fiber's
-    // `Jit.invoke` runs either. The tree's parks ask whether the park blocks the thread rather than
-    // a fiber of the running code's own (below a yield floor no such fiber can park), and then take
-    // the tree's bell, which another process's write rings.
+    // `Jit.invoke` runs either. The tree's parks ask how the park may be made (`park_here`): an OS
+    // vCPU's blocks its thread on the tree's bell, which another process's write rings; a fiber's
+    // parks alone (`host_park`); a pool task's code below a guarded call's yield floor, a serve
+    // handler's shell included (its context is its serving vCPU's, the process's), fails closed,
+    // since blocking the worker's thread on the bell could starve what would ring it.
     let root = temen_jit::at_root();
-    let parks_the_thread = !temen_jit::fiber_active();
+    let how = temen_jit::park_here();
+    let tree_parks = parks.read_park.is_some()
+        || parks.write_park.is_some()
+        || matches!(
+            parks.request,
+            Some(ParkEvent::TaskExit(_) | ParkEvent::TaskExitAny)
+        );
+    if tree_parks && how == temen_jit::ParkHere::Refused {
+        vm.raise(temen_jit::TrapKind::ThreadFault as i64);
+        return None;
+    }
+    let parks_the_thread = how == temen_jit::ParkHere::Thread;
     if parks_the_thread && (parks.read_park.is_some() || parks.write_park.is_some()) {
         return tree_park(host, bell, vm, answer);
     }
