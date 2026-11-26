@@ -323,15 +323,22 @@ block 0 (vi: i64, vj: i64) {
 }
 "#;
 
-/// One side of [`always_ir`]'s pingpong, as function text: `func (n, w)` takes `n` turns on the turn
+/// One side of [`always_ir_of`]'s pingpong, as function text: `func (n, w)` takes `n` turns on the turn
 /// word, each when the word reads `me`: `w` steps of a dependent multiply-add (the work, kept live
 /// through a store), then the word set to `next` and a notify. `head` opens its block 0, which must
-/// branch to block 1 with `(vn, vw, vh, vi, vx)`; `end` is its block 7 `(vh9, vx9)`.
-fn always_side(me: u32, next: u32, head: &str, end: &str, notify: bool) -> String {
+/// branch to block 1 with `(vn, vw, vh, vi, vx)`; `end` is its block 7 `(vh9, vx9)`. `fiber`: the
+/// side's wait is made in a fiber of its own, function [`ALWAYS_FIBER`], which it `cont.resume.block`s
+/// (#3078 slice 3, exit row 2).
+fn always_side(me: u32, next: u32, head: &str, end: &str, notify: bool, fiber: bool) -> String {
     let notify = if notify {
         "  vc6 = i32.const 1\n  vwk6 = atomic.notify vt6 vc6\n"
     } else {
         ""
+    };
+    let wait = if fiber {
+        "  vcur643 = i64.extend_i32_u vcur3\n  vf3 = ref.func 2\n  vk3 = cont.new vf3 vcur643\n  vz3 = i64.const 0\n  vs3, vv3 = cont.resume.block vk3 vz3\n"
+    } else {
+        "  vt3 = i64.const 16400\n  vinf3 = i64.const -1\n  vs3 = i32.atomic.wait vt3 vcur3 vinf3\n"
     };
     format!(
         r#"func (i64, i64) -> (i64) {{
@@ -348,10 +355,7 @@ block 2 (vn2: i64, vw2: i64, vh2: i32, vi2: i64, vx2: i64) {{
   br_if veq2 4(vn2, vw2, vh2, vi2, vx2, vw2) 3(vn2, vw2, vh2, vi2, vx2, vcur2)
 }}
 block 3 (vn3: i64, vw3: i64, vh3: i32, vi3: i64, vx3: i64, vcur3: i32) {{
-  vt3 = i64.const 16400
-  vinf3 = i64.const -1
-  vs3 = i32.atomic.wait vt3 vcur3 vinf3
-  br 2(vn3, vw3, vh3, vi3, vx3)
+{wait}  br 2(vn3, vw3, vh3, vi3, vx3)
 }}
 block 4 (vn4: i64, vw4: i64, vh4: i32, vi4: i64, vx4: i64, vk4: i64) {{
   vz4 = i64.const 0
@@ -386,13 +390,18 @@ block 6 (vn6: i64, vw6: i64, vh6: i32, vi6: i64, vx6: i64) {{
 /// its partner (`func 1`) and the two take `n` turns each on one word, each turn `w` steps of work
 /// before its store and notify. With the work far longer than a sleep takes to reach, the waiter is
 /// asleep before every notify: each hand-off blocks.
-pub fn always_ir() -> String {
+///
+/// #3078 slice 3, exit row 2 — `fiber`: the root's waits are made in a fiber: each turn it makes one
+/// that waits on the turn word and `cont.resume.block`s it, so the wake reaches a task idling on a
+/// parked fiber.
+pub fn always_ir_of(fiber: bool) -> String {
     let root = always_side(
         0,
         1,
         "block 0 (vn: i64, vw: i64) {\n  vh = thread.spawn 1 vn vw\n  vz = i64.const 0\n  br 1(vn, vw, vh, vz, vz)\n}",
         "block 7 (vh9: i32, vx9: i64) {\n  vst9, vr9 = thread.join vh9\n  return vx9\n}",
         true,
+        fiber,
     );
     let partner = always_side(
         1,
@@ -400,11 +409,27 @@ pub fn always_ir() -> String {
         "block 0 (vn: i64, vw: i64) {\n  vh = i32.const 0\n  vz = i64.const 0\n  br 1(vn, vw, vh, vz, vz)\n}",
         "block 7 (vh9: i32, vx9: i64) {\n  return vx9\n}",
         true,
+        false,
     );
-    format!("memory 16\n{root}{partner}")
+    let waits = if fiber { ALWAYS_FIBER } else { "" };
+    format!("memory 16\n{root}{partner}{waits}")
 }
 
-/// #2985 — [`always_ir`]'s work alone, to take out of its hand-off: `func 0 (n, w)` joins one trivial
+/// #3078 slice 3 — [`always_ir_of`]'s fiber, function 2: it waits on the turn word for it to leave the
+/// value its maker passed (`vexp`), with no deadline, and returns.
+const ALWAYS_FIBER: &str = "func (i64, i64) -> (i64) {
+block 0 (vexp: i64, varg: i64) {
+  vt = i64.const 16400
+  ve = i32.wrap_i64 vexp
+  vinf = i64.const -1
+  vs = i32.atomic.wait vt ve vinf
+  vr = i64.const 0
+  return vr
+  }
+}
+";
+
+/// #2985 — [`always_ir_of`]'s work alone, to take out of its hand-off: `func 0 (n, w)` joins one trivial
 /// thread (so every lane runs it as it runs the pingpong), then takes `n` turns of `w` steps each,
 /// with the same stores and no notify: what is left of a hand-off once this is taken out is the
 /// stops, the park and the wake.
@@ -414,6 +439,7 @@ pub fn always_work_ir() -> String {
         0,
         "block 0 (vn: i64, vw: i64) {\n  vz0 = i64.const 0\n  vh = thread.spawn 1 vz0 vz0\n  vst0, vr0 = thread.join vh\n  vz = i64.const 0\n  br 1(vn, vw, vh, vz, vz)\n}",
         "block 7 (vh9: i32, vx9: i64) {\n  return vx9\n}",
+        false,
         false,
     );
     let idle = "func (i64, i64) -> (i64) {\nblock 0 (va: i64, vb: i64) {\n  return va\n  }\n}\n";
@@ -531,11 +557,11 @@ block 0 (vw: i64, varg: i64) {
 }
 "#;
 
-/// #3078 slice 2 — exit row 1: `w` threads, each resuming a fiber of its own `n` times, the fiber
-/// `suspend`ing each time; the root joins them all. Entry `(n, w)`; answers `w * n`. No fiber parks,
-/// so the kernel route admits it unmetered.
-pub const FIBER_ROUNDTRIP_IR: &str = r#"memory 16
-func (i64, i64) -> (i64) {
+/// The root [`FIBER_ROUNDTRIP_IR`] and [`POLL_PARKED_IR`] share: `func 0 (n, w)` spawns `w` threads
+/// of function 1, the `i`th with `(n, i)`, and joins them all, answering the sum of their values.
+macro_rules! w_threads_root {
+    () => {
+        r#"func (i64, i64) -> (i64) {
 block 0 (vn: i64, vw: i64) {
   vz = i64.const 0
   br 1(vn, vw, vz)
@@ -546,7 +572,7 @@ block 1 (vn1: i64, vw1: i64, vi1: i64) {
 }
 block 2 (vn2: i64, vw2: i64, vi2: i64) {
   vz2 = i64.const 0
-  vh2 = thread.spawn 1 vn2 vz2
+  vh2 = thread.spawn 1 vn2 vi2
   veight2 = i64.const 8
   voff2 = i64.mul vi2 veight2
   vbase2 = i64.const 16384
@@ -582,7 +608,17 @@ block 6 (vr6: i64) {
   return vr6
   }
 }
-func (i64, i64) -> (i64) {
+"#
+    };
+}
+
+/// #3078 slice 2 — exit row 1: `w` threads, each resuming a fiber of its own `n` times, the fiber
+/// `suspend`ing each time; the root joins them all. Entry `(n, w)`; answers `w * n`. No fiber parks,
+/// so the kernel route admits it unmetered.
+pub const FIBER_ROUNDTRIP_IR: &str = concat!(
+    "memory 16\n",
+    w_threads_root!(),
+    r#"func (i64, i64) -> (i64) {
 block 0 (vn: i64, vb: i64) {
   vf = ref.func 2
   vz = i64.const 0
@@ -614,7 +650,82 @@ block 1 () {
   br 1()
   }
 }
-"#;
+"#
+);
+
+/// #3078 slice 3 (review Q2) — many fibers round-robin, `mn_sched`-shaped: each of `w` threads makes
+/// 512 fibers that suspend in a loop, keeps their handles in memory, and resumes them in turn, `n`
+/// resumes in all, so every resume reaches a slot (and its parked word) the last 511 did not. Entry
+/// `(n, w)`; answers 0.
+pub const ROUND_ROBIN_IR: &str = concat!(
+    "memory 16\n",
+    w_threads_root!(),
+    r#"func (i64, i64) -> (i64) {
+block 0 (vn: i64, vi: i64) {
+  vf = ref.func 2
+  vk4096 = i64.const 4096
+  voff = i64.mul vi vk4096
+  vbase0 = i64.const 32768
+  vbase = i64.add vbase0 voff
+  vz = i64.const 0
+  br 1(vn, vbase, vz)
+}
+block 1 (vn1: i64, vb1: i64, vj1: i64) {
+  vfibers1 = i64.const 512
+  vmore1 = i64.lt_u vj1 vfibers1
+  br_if vmore1 2(vn1, vb1, vj1) 3(vn1, vb1)
+}
+block 2 (vn2: i64, vb2: i64, vj2: i64) {
+  vf2 = ref.func 2
+  vz2 = i64.const 0
+  vk2 = cont.new vf2 vz2
+  veight2 = i64.const 8
+  vo2 = i64.mul vj2 veight2
+  vat2 = i64.add vb2 vo2
+  i64.store vat2 vk2
+  vone2 = i64.const 1
+  vnext2 = i64.add vj2 vone2
+  br 1(vn2, vb2, vnext2)
+}
+block 3 (vn3: i64, vb3: i64) {
+  vz3 = i64.const 0
+  br 4(vn3, vb3, vz3, vz3)
+}
+block 4 (vn4: i64, vb4: i64, vi4: i64, vx4: i64) {
+  vmore4 = i64.lt_u vi4 vn4
+  br_if vmore4 5(vn4, vb4, vi4, vx4) 6()
+}
+block 5 (vn5: i64, vb5: i64, vi5: i64, vx5: i64) {
+  veight5 = i64.const 8
+  vo5 = i64.mul vx5 veight5
+  vat5 = i64.add vb5 vo5
+  vk5 = i64.load vat5
+  vz5 = i64.const 0
+  vs5, vv5 = cont.resume vk5 vz5
+  vone5 = i64.const 1
+  vnext5 = i64.add vi5 vone5
+  vx15 = i64.add vx5 vone5
+  vmask5 = i64.const 511
+  vnx5 = i64.and vx15 vmask5
+  br 4(vn5, vb5, vnext5, vnx5)
+}
+block 6 () {
+  vz6 = i64.const 0
+  return vz6
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, varg: i64) {
+  br 1()
+}
+block 1 () {
+  vz = i64.const 0
+  vx = suspend vz
+  br 1()
+  }
+}
+"#
+);
 
 /// #3078 slice 2 — exit row 4: a thread makes `k` fibers and leaves each suspended, then makes `n`
 /// `memory.notify`s on a word nothing waits on; the root joins it. Entry `(n, k)`; answers 0.
@@ -674,3 +785,81 @@ block 0 (vsp: i64, varg: i64) {
   }
 }
 "#;
+
+/// #3078 slice 3 — exit row 3: `w` threads (entry `(n, w)`, [`w_threads_root`]), the `i`th of which
+/// makes a fiber that waits for good on a word of its own (32768 + 64i, a line apart), resumes it once
+/// so it parks, then polls it `n` times with `cont.resume`: each poll of a still-parked fiber.
+pub const POLL_PARKED_IR: &str = concat!(
+    "memory 16\n",
+    w_threads_root!(),
+    r#"func (i64, i64) -> (i64) {
+block 0 (vn: i64, vi: i64) {
+  vbase = i64.const 32768
+  vsz = i64.const 64
+  voff = i64.mul vi vsz
+  vat = i64.add vbase voff
+  vf = ref.func 2
+  vk = cont.new vf vat
+  vz = i64.const 0
+  vs0, vv0 = cont.resume vk vz
+  br 1(vn, vk, vz)
+}
+block 1 (vn1: i64, vk1: i64, vi1: i64) {
+  vmore1 = i64.lt_u vi1 vn1
+  br_if vmore1 2(vn1, vk1, vi1) 3(vn1)
+}
+block 2 (vn2: i64, vk2: i64, vi2: i64) {
+  vz2 = i64.const 0
+  vs2, vv2 = cont.resume vk2 vz2
+  vone2 = i64.const 1
+  vnext2 = i64.add vi2 vone2
+  br 1(vn2, vk2, vnext2)
+}
+block 3 (vr3: i64) {
+  return vr3
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vat: i64, varg: i64) {
+  vz = i32.const 0
+  vinf = i64.const -1
+  vw = i32.atomic.wait vat vz vinf
+  vr = i64.const 0
+  return vr
+  }
+}
+"#
+);
+
+/// #3078 slice 3 — exit row 4 on the kernel route: [`NOWAKE_FIBERS_IR`]'s program run by one spawned
+/// thread, since the kernel keeps a run with no spawn off its route (`fiber only`). Its entry is the
+/// returned function, `(n, k, m, s)`: it stores `m` and `s` at 24000 and 24008, spawns a thread that
+/// reads them and calls function 0 with `(n, k, m, s)`, and joins it.
+pub fn nowake_fibers_in_a_thread_ir() -> (String, u32) {
+    let n = NOWAKE_FIBERS_IR.matches("\nfunc ").count() as u32;
+    let ir = format!(
+        "{NOWAKE_FIBERS_IR}func (i64, i64) -> (i64) {{
+block 0 (vn: i64, vk: i64) {{
+  vam = i64.const 24000
+  vm = i64.load vam
+  vas = i64.const 24008
+  vs = i64.load vas
+  vr = call 0(vn, vk, vm, vs)
+  return vr
+  }}
+}}
+func (i64, i64, i64, i64) -> (i64) {{
+block 0 (vn: i64, vk: i64, vm: i64, vs: i64) {{
+  vam = i64.const 24000
+  i64.store vam vm
+  vas = i64.const 24008
+  i64.store vas vs
+  vt = thread.spawn {n} vn vk
+  vst, vv = thread.join vt
+  return vv
+  }}
+}}
+"
+    );
+    (ir, n + 1)
+}

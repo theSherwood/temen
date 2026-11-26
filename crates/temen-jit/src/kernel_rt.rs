@@ -27,8 +27,10 @@
 //! [`KernelRun::run_vcpu`] publishes the record for its guarded call, and one guard restores the
 //! thread's earlier record on every exit, so a nested kernel run hands the outer vCPU its record
 //! back. For a module with fibers it publishes the vCPU's fiber runtime (`fiber_rt`'s `CURRENT_RT`)
-//! too, and restores that as well. The record names that runtime: whether a park is a fiber's is
-//! asked of the run's own, never of the thread's `CURRENT_RT`, which may be another run's.
+//! too, and restores that as well. The record names that runtime: whether a park is made in a fiber
+//! is asked of the run's own ([`in_fiber`]), never of the thread's `CURRENT_RT` alone, which may be
+//! another run's. A fiber's park then asks `CURRENT_RT` how it parks (`fiber_rt::park_as`, #3158),
+//! only once it has checked that runtime is the record's ([`own_fiber_park`]).
 //!
 //! **The borrow.** A thunk takes the hook `&mut` for one [`KernelPark`] call, marking the record
 //! borrowed meanwhile. During it the thread runs no guest code: the kernel parks the thread in place
@@ -50,6 +52,12 @@ pub use temen_ir::seams::NativeStop;
 pub trait KernelPark {
     fn park(&mut self, stop: NativeStop) -> Result<[i64; 2], i64>;
 
+    /// #3078 slice 3 — file `wait`, the futex wait a fiber of this vCPU made before it switched out
+    /// to the code now running, as the fiber's park (`file_park`): applied as [`Self::park`]'s stops
+    /// are, without parking the thread. Kept apart from [`NativeStop`], which carries no `Arc`, so
+    /// every other §12 op's stop stays `Copy`.
+    fn park_fiber(&mut self, wait: temen_ir::seams::FiberWait) -> Result<[i64; 2], i64>;
+
     /// #2958 slice 5 — the park a capability call left its vCPU to take (a pipe or stdin read, a
     /// punted call, a region post's wake), from the embedder's `call.cap` thunk rather than the
     /// emitted code: `call` is the embedder's own decision, a value this crate cannot name, handed
@@ -68,10 +76,22 @@ struct Record {
     /// check that what it hands back is this record's own hook, not another vCPU's of the run.
     lent: Cell<bool>,
     /// The vCPU's own fiber runtime (`fiber_rt::FiberRuntime`), null for a run whose module has no
-    /// fiber op: whether a park is a fiber's is asked of it, never of the thread's `CURRENT_RT`, which
-    /// may be another run's (a fiber of a run that called the host procedure this run is in).
+    /// fiber op: whether a park is made in a fiber is asked of it ([`in_fiber`]), never of the
+    /// thread's `CURRENT_RT` alone, which may be another run's (a fiber of a run that called the
+    /// host procedure this run is in). `CURRENT_RT` is asked how the fiber parks only once it is
+    /// checked to be this one ([`own_fiber_park`]).
     fibers: Cell<*const core::ffi::c_void>,
+    /// #3078 slice 3 — the futex wait a fiber of this vCPU made, from the fiber's own stack, for its
+    /// resumer to file once the fiber has switched out to it, on this same thread ([`file_park`]).
+    /// Set only between the two, so a record a guard publishes or restores never carries one.
+    #[cfg(fiber_rt)]
+    req: Cell<Option<WaitReq>>,
 }
+
+/// #3078 slice 3 — a fiber's futex wait as its thunk made it: `(addr, expected, wide, timeout)`,
+/// [`NativeStop::Wait`]'s operands.
+#[cfg(fiber_rt)]
+type WaitReq = (u64, u64, bool, i64);
 
 /// What [`set_record`] writes and answers: the record's three cells.
 #[derive(Clone, Copy)]
@@ -89,6 +109,8 @@ thread_local! {
             hook: Cell::new(None),
             lent: Cell::new(false),
             fibers: Cell::new(std::ptr::null()),
+            #[cfg(fiber_rt)]
+            req: Cell::new(None),
         }
     };
 }
@@ -161,6 +183,13 @@ fn set_record(f: Fields) -> Fields {
     })
 }
 
+/// #3078 slice 3 — leave `req` in this thread's record for the fiber's resumer, or take what is there.
+#[cfg(fiber_rt)]
+#[inline(never)]
+fn swap_req(req: Option<WaitReq>) -> Option<WaitReq> {
+    RECORD.with(|r| r.req.replace(req))
+}
+
 /// Whether this thread's record names the run of end word `end` and its vCPU is inside one of its
 /// own fibers now.
 #[inline(never)]
@@ -177,33 +206,252 @@ fn in_own_fiber(end: *const AtomicI64) -> bool {
     })
 }
 
-/// Whether code running on `vm` runs as a kernel vCPU **inside a fiber**: a park there is a fiber's,
-/// which the kernel does not take yet (`native_scope`'s `fiber parks`; #3078 slices 3 and 4).
+/// Whether code running on `vm` runs as a kernel vCPU **inside one of its own fibers**: a park
+/// there is the fiber's, on the slot [`own_fiber_park`] finds (`fiber_rt::park_as`, #3158), or
+/// fails closed. A futex wait there is the kernel's fiber park ([`routed`]); a call's park is not
+/// the kernel's yet (`native_scope`'s `fiber parks`, #3078 slice 4).
 pub fn in_fiber(vm: &VmCtx) -> bool {
     vm.kernel && in_own_fiber(vm.domain_key() as *const AtomicI64)
 }
 
+/// #3158 — the slot a park made in one of this vCPU's own fibers ([`in_fiber`]) takes, as every
+/// park door asks it ([`crate::fiber_rt::park_as`]): the running fiber's, as a pointer (no
+/// reference crosses the park's yield; the run's table holds the slot). `None` once it failed
+/// closed, `Malformed`, when `park_as` answers anything but that fiber:
+/// - the thread's `CURRENT_RT` is not the vCPU's own runtime, which a nested run restores before
+///   it returns;
+/// - the code runs below a raised yield floor (a guarded call nested in the fiber's frames). No
+///   admitted run makes one there: every such call is declined (`jit cap`, `serving`, `§14
+///   children`) or is another run's, with its own record. A later slice that admits one designs
+///   that park, with its oracle row; until then it is a loud trap;
+/// - it refuses, which no kernel vCPU (never a pool task) is answered.
+#[cfg(fiber_rt)]
+fn own_fiber_park(vm: &VmCtx) -> Option<*const crate::fiber_rt::FiberSlot> {
+    use crate::fiber_rt::ParkAs;
+    // SAFETY: the record names this vCPU's own runtime while it is published (`Published`).
+    let own = unsafe { crate::fiber_rt::running_slot_of(own_runtime().cast()) };
+    match (
+        own,
+        crate::fiber_rt::park_as(crate::os_thread_rt::Parks::Fiber),
+    ) {
+        // `own` is the slot `park_as` names: both are the innermost resume of one runtime.
+        (Some(own), ParkAs::Fiber(_)) => Some(own),
+        _ => {
+            vm.raise(temen_ir::trap_code::MALFORMED);
+            None
+        }
+    }
+}
+
 /// Route a §12 thunk's op to the kernel, if `vm` is a kernel run's context: `None` otherwise, and the
-/// thunk goes on as the OS-thread runtime. A trap is raised on `vm`, whose next
-/// check unwinds. A wait made in a fiber is a fiber's park, which `fiber parks` declines: reaching
-/// one fails closed.
+/// thunk goes on as the OS-thread runtime. A trap is raised on `vm`, whose next check unwinds. A
+/// wait made in a fiber is the fiber's park ([`fiber_wait`]), on the slot [`own_fiber_park`] finds,
+/// or fails closed.
 #[cfg(fiber_rt)]
 #[inline(always)]
 pub(crate) fn routed(vm: &VmCtx, stop: NativeStop) -> Option<[i64; 2]> {
-    if matches!(stop, NativeStop::Wait { .. }) && in_fiber(vm) {
-        vm.raise(temen_ir::trap_code::MALFORMED);
-        return Some([0, 0]);
+    if let NativeStop::Wait {
+        addr,
+        expected,
+        wide,
+        timeout,
+    } = stop
+    {
+        if in_fiber(vm) {
+            return Some(match own_fiber_park(vm) {
+                Some(slot) => fiber_wait(vm, (addr, expected, wide, timeout), slot),
+                None => [0, 0],
+            });
+        }
     }
     // SAFETY: a §12 thunk runs on the vCPU's own thread, inside the guarded call `run_vcpu`
     // published the record for (the module docs).
     unsafe { through_hook(vm, |hook| hook.park(stop)) }
 }
 
+/// #3078 slice 3 — **P0**, on the fiber's own stack: a kernel vCPU's fiber makes futex wait `req`.
+/// The request is left in this thread's record, and the fiber yields to its resumer (the event-park
+/// yield), which files it with the rules on this same thread once the fiber is switched out
+/// ([`file_park`]); the fiber is resumed only by the rules' claim, which delivers the wait's status,
+/// on whichever vCPU claims it. No hook is borrowed here, so no borrow spans the switch, and the
+/// fiber's frames hold no reference across it: its slot is reached through a raw pointer the run's
+/// table keeps alive (the slot stays `RUNNING`, so the table never reuses it meanwhile), so a fiber
+/// still parked as its run ends, whose stack is freed without unwinding, leaks nothing.
+///
+/// `slot` is the running fiber's, as [`own_fiber_park`] found it: the record's own runtime runs it,
+/// that runtime is the thread's `CURRENT_RT`, which the yield goes through, and the fiber is resumed
+/// above the yield floor (#3158), so the yield cannot miss.
+#[cfg(fiber_rt)]
+fn fiber_wait(vm: &VmCtx, req: WaitReq, slot: *const crate::fiber_rt::FiberSlot) -> [i64; 2] {
+    if swap_req(Some(req)).is_some() {
+        // One fiber wait at a time per thread: its resumer takes it before anything else runs here.
+        // Neither request is filed, so the record is left with none, and this thread's next fiber
+        // wait is judged on its own.
+        swap_req(None);
+        vm.raise(temen_ir::trap_code::MALFORMED);
+        return [0, 0];
+    }
+    // SAFETY: inside the running fiber whose slot this is; the table holds the slot for the run.
+    let status =
+        unsafe { crate::fiber_rt::fiber_event_park(&*slot, None, crate::fiber_rt::ParkOn::Event) };
+    [status as i64, 0]
+}
+
+/// #3078 slice 3 — this thread's record's own fiber runtime (null for a run with none).
+#[cfg(fiber_rt)]
+#[inline(never)]
+fn own_runtime() -> *const core::ffi::c_void {
+    RECORD.with(|r| r.fibers.get())
+}
+
+/// #3078 slice 3 — **P1–P3**, on the resumer's stack: fiber `k` (`slot`) of a kernel vCPU switched
+/// out on an event park, and `vm` (the resumer's context, of a kernel run) files it with the rules
+/// through this thread's hook: the wait the fiber left in the record, its record and its entry in the
+/// wait index, and its word, all in one hold of the run lock. The slot is not published: it stays
+/// `RUNNING` with its seam clear, so only the rules' claim of the park hands it on. Answers the
+/// resume's status, `FIBER_PARKED`.
+///
+/// An event park with no wait in the record is not a kernel park: a park of the JIT's own runtime,
+/// made by code of another run on this vCPU's stack (#3130 item 3: a today's-route run that a host
+/// procedure started inside a kernel fiber event-parks the fiber it runs on). It fails closed,
+/// `Malformed`, and the fiber, never published, is never resumed; the run's table frees it.
+///
+/// # Safety
+/// `vm` is a live kernel context, the resumer's, on this thread.
+#[cfg(fiber_rt)]
+pub(crate) unsafe fn file_park(
+    vm: u64,
+    k: usize,
+    slot: &std::sync::Arc<crate::fiber_rt::FiberSlot>,
+) -> i64 {
+    // SAFETY: the caller's contract.
+    let vm = unsafe { VmCtx::at(vm) };
+    slot.rest_in_kernel();
+    // No debug assertion here: this runs inside `fiber_resume`, an `extern "C"` thunk, where a panic
+    // aborts the process rather than fail the run.
+    let Some((addr, expected, wide, timeout)) = swap_req(None) else {
+        vm.raise(temen_ir::trap_code::MALFORMED);
+        return FIBER_PARKED;
+    };
+    let wait = temen_ir::seams::FiberWait {
+        slot: k as u32,
+        gen: crate::fiber_rt::slot_incarnation(slot) as u32,
+        addr,
+        expected,
+        wide,
+        timeout,
+        site: std::sync::Arc::clone(slot) as temen_ir::seams::ParkRef,
+    };
+    // SAFETY: a resume thunk on the resumer's own thread, inside its vCPU's guarded call.
+    unsafe { through_hook(vm, |hook| hook.park_fiber(wait)) };
+    FIBER_PARKED
+}
+
+/// [`file_park`]'s and a poll's answer: `cont.resume`'s `FIBER_PARKED` status.
+#[cfg(fiber_rt)]
+use crate::fiber_rt::FIBER_PARKED;
+
+/// #3078 slice 3 — what a `cont.resume` of `handle` does with a kernel park ([`poll_parked`]).
+#[cfg(fiber_rt)]
+pub(crate) enum Polled {
+    /// No park of `handle`'s incarnation is filed: the slot's own claim decides.
+    Own,
+    /// The resume answers this status at once, with no switch: `FIBER_PARKED`, or a trap's.
+    Answer(i64),
+    /// The rules' claim took the park: the resume switches into the fiber with this status.
+    Claimed(i64),
+}
+
+/// #3078 slice 3 — a `cont.resume` (on `vm`, the resumer's context) of `handle`, whose slot `k` is
+/// `slot`: its parked word, read without the run lock, says whether a kernel park of `handle`'s
+/// incarnation is filed and can be claimed. One load on every route; only a park that can be claimed
+/// takes the run lock, to claim it through the rules.
+///
+/// # Safety
+/// `vm` is a live context on this thread.
+#[cfg(fiber_rt)]
+pub(crate) unsafe fn poll_parked(
+    vm: u64,
+    k: usize,
+    slot: &crate::fiber_rt::FiberSlot,
+    handle: i64,
+) -> Polled {
+    use temen_ir::seams::{ParkPoll, FIBER_CLAIMED, FIBER_NOT_PARKED, FIBER_STILL_PARKED};
+    let gen = crate::fiber_rt::fiber_handle_generation(handle);
+    match slot.kpark.poll(gen, temen_ir::seams::wall_now) {
+        ParkPoll::Idle => Polled::Own,
+        ParkPoll::Parked => Polled::Answer(FIBER_PARKED),
+        ParkPoll::Claim => {
+            // SAFETY: the caller's contract.
+            let vm = unsafe { VmCtx::at(vm) };
+            let stop = NativeStop::FiberClaim {
+                slot: k as u32,
+                gen: gen as u32,
+            };
+            // SAFETY: a resume thunk on its vCPU's own thread, inside its guarded call.
+            let answer = unsafe { through_hook(vm, |hook| hook.park(stop)) };
+            // A hook that failed raised its trap on `vm` and answered `[0, 0]`: the resume ends with
+            // the trap, whatever the cell reads. Asked first, so `[0, 0]` is never read as parked.
+            if vm.ended().is_some() {
+                return Polled::Answer(1);
+            }
+            match answer {
+                Some([status, FIBER_CLAIMED]) => Polled::Claimed(status),
+                Some([_, FIBER_STILL_PARKED]) => Polled::Answer(FIBER_PARKED),
+                Some([_, FIBER_NOT_PARKED]) => Polled::Own,
+                // No hook answers anything else, and a context of no kernel run never reaches here
+                // (its word is idle): fail closed.
+                Some(_) | None => {
+                    vm.raise(temen_ir::trap_code::MALFORMED);
+                    Polled::Answer(1)
+                }
+            }
+        }
+    }
+}
+
+/// #3078 slice 3 — `cont.resume.block` on a kernel vCPU (`vm`): resume `handle` as `cont.resume`
+/// does, and while it answers `FIBER_PARKED`, idle the task on the fiber through the rules
+/// ([`NativeStop::FiberBlock`]) until it can be claimed, then resume it again. The block re-checks
+/// under the run lock the fiber's wake takes, so a wake since the poll is never slept through; it
+/// answers at once for a park another claimed, or a stale handle, whose next resume answers as
+/// `cont.resume` does. Every other state answers as `cont.resume`, as on the oracle, which blocks
+/// only on a parked target.
+///
+/// # Safety
+/// As `fiber_rt::fiber_resume`: `status_out` is a live cell, `vm` the running kernel context.
+#[cfg(fiber_rt)]
+pub(crate) unsafe fn resume_block(vm: &VmCtx, handle: i64, arg: i64, status_out: *mut i64) -> i64 {
+    loop {
+        // SAFETY: the caller's contract.
+        let value = unsafe {
+            crate::fiber_rt::fiber_resume(handle, arg, status_out, vm as *const _ as u64)
+        };
+        // SAFETY: the caller's contract.
+        if unsafe { *status_out } != FIBER_PARKED || vm.ended().is_some() {
+            return value;
+        }
+        let Some(k) = crate::fiber_rt::resolve_slot(handle) else {
+            return value;
+        };
+        let stop = NativeStop::FiberBlock {
+            slot: k as u32,
+            gen: crate::fiber_rt::fiber_handle_generation(handle) as u32,
+        };
+        // SAFETY: a resume thunk on its vCPU's own thread, inside its guarded call.
+        unsafe { through_hook(vm, |hook| hook.park(stop)) };
+        if vm.ended().is_some() {
+            return value;
+        }
+    }
+}
+
 /// #2958 slice 5 — hand a capability call's park to the kernel, if `vm` is a kernel vCPU's context
 /// ([`KernelPark::park_call`]): `None` otherwise. `parks`: whether the call parks its caller (a
 /// rewound pipe or stdin park, a punted call), not only wakes another's (a region post's `signal`). A
-/// trap is raised on `vm`, whose next check unwinds. A park made in a fiber is the fiber's, which
-/// `fiber parks` declines: reaching one fails closed.
+/// trap is raised on `vm`, whose next check unwinds. A park made in one of the vCPU's own fibers
+/// ([`in_fiber`]) is the fiber's, which `fiber parks` declines: reaching one fails closed, whatever
+/// [`crate::fiber_rt::park_as`] would answer (below a raised floor no admitted run parks either).
 ///
 /// # Safety
 /// The caller is the embedder's `call.cap` thunk of code running on `vm`, on this thread, and holds
@@ -692,7 +940,7 @@ extern "C" fn thread_entry(
 #[cfg(all(test, fiber_rt))]
 mod tests {
     use super::*;
-    use crate::fiber_rt::{FiberRuntime, SharedFiberTable};
+    use crate::fiber_rt::{FiberRuntime, FiberSlot, SharedFiberTable};
     use crate::vmctx::{InstanceAddrs, Window};
     use std::sync::atomic::Ordering;
     use std::sync::Arc;
@@ -704,6 +952,9 @@ mod tests {
     impl<F: FnMut() -> Option<[i64; 2]>> KernelPark for Then<F> {
         fn park(&mut self, _: NativeStop) -> Result<[i64; 2], i64> {
             Ok((self.0)().unwrap_or([7, 7]))
+        }
+        fn park_fiber(&mut self, _: temen_ir::seams::FiberWait) -> Result<[i64; 2], i64> {
+            Ok([0, 0])
         }
         fn park_call(&mut self, _: &mut dyn std::any::Any) -> Result<[i64; 2], i64> {
             self.1 += 1;
@@ -719,8 +970,10 @@ mod tests {
         unsafe { root.vcpu_ending(end, std::ptr::null_mut()) }
     }
 
-    /// A vCPU runtime over a fresh table, running one fiber now (its slot the innermost resume), as
-    /// the vCPU's own code is when a fiber of it makes an op.
+    /// A vCPU runtime over a fresh table, running one guest fiber now (its `cont.new` slot the
+    /// innermost resume, its yielder above the floor), as the vCPU's own code is when a fiber of it
+    /// makes an op: `park_as` answers it `Fiber`. A platform slot would read as a pool task's, which
+    /// a kernel vCPU never is, and `park_as` would refuse it.
     fn in_a_fiber() -> Box<FiberRuntime> {
         let table = Arc::new(SharedFiberTable::new(
             4,
@@ -728,9 +981,7 @@ mod tests {
             None,
         ));
         let mut rt = Box::new(FiberRuntime::new(table, 0, 0));
-        // SAFETY: the fiber's body never runs: it only stands for the one running.
-        let fiber = unsafe { crate::fiber_rt::make_task_fiber(64 << 10, |_| {}) }.expect("a stack");
-        rt.push_active(crate::fiber_rt::FiberSlot::platform(fiber));
+        crate::fiber_rt::stand_in_running_guest_fiber(&mut rt);
         rt
     }
 
@@ -795,9 +1046,12 @@ mod tests {
         assert_eq!(stray.ended(), Some(temen_ir::trap_code::MALFORMED));
     }
 
-    /// #3078 slice 2 (review B3) — the two park backstops `fiber parks` keeps unreachable, in any
-    /// build: a futex wait and a call park made by a vCPU inside one of its own fibers trap the
-    /// domain `Malformed`, and never reach the hook. A notify there is the task's stop, as anywhere.
+    /// #3078 slice 2 (review B3) — the call park backstop `fiber parks` keeps unreachable, in any
+    /// build: a call park made by a vCPU inside one of its own fibers traps the domain `Malformed`,
+    /// and never reaches the hook. The fiber here is a guest's above the floor, the one `park_as`
+    /// answers `Fiber` ([`in_a_fiber`]), so the row takes `park_call`'s `parks && in_fiber` arm, as a
+    /// real fiber's call park does. A notify there is the task's stop, as anywhere. (A futex wait
+    /// there is the kernel's fiber park since slice 3, its rows in `temen-run`'s `kernel_fibers::`.)
     #[test]
     fn a_park_made_in_a_fiber_meets_its_backstop() {
         let end = AtomicI64::new(0);
@@ -814,6 +1068,13 @@ mod tests {
         // SAFETY: `hook` outlives the guard.
         let published = unsafe { Published::new(&end, &mut hook, Some(in_a_fiber())) };
         assert!(in_fiber(&vm), "the vCPU's own runtime runs a fiber");
+        assert!(
+            matches!(
+                crate::fiber_rt::park_as(crate::os_thread_rt::Parks::Fiber),
+                crate::fiber_rt::ParkAs::Fiber(_)
+            ),
+            "and it is a guest fiber above the floor"
+        );
         // A region post's wake (not a park) reaches the hook; a call park does not. Each on a context
         // of its own over the run's end, which nothing has ended yet.
         let wake = context(&end, true);
@@ -839,12 +1100,6 @@ mod tests {
             "a notify is the task's stop"
         );
         assert_eq!(vm.ended(), None);
-        assert_eq!(routed(&vm, WAIT), Some([0, 0]));
-        assert_eq!(
-            vm.ended(),
-            Some(temen_ir::trap_code::MALFORMED),
-            "the wait's backstop"
-        );
         drop(published);
         // SAFETY: the guard is gone; nothing else holds the hook.
         let call_parks = unsafe { (*hook_at).1 };
@@ -991,11 +1246,213 @@ block 0 (va: i64, vb: i64) {
         ));
     }
 
-    /// #3078 slice 2 (review B3) — `cont.resume.block` of a target its resume finds event-parked
-    /// (`FIBER_PARKED`), which no fiber on an admitted run can be (`fiber parks`), fails closed on a
-    /// kernel vCPU instead of idling on the compile's dormant thread domain.
+    /// #3078 slice 3 — [`poll_parked`] answers each state of the slot's parked word, and each answer
+    /// of the rules' claim, as its arms say: an idle word is the slot's own claim's (`Own`) and a
+    /// pending park answers `FIBER_PARKED`, neither asking the hook; a park that can be claimed asks
+    /// it, and its `FIBER_CLAIMED`, `FIBER_STILL_PARKED` and `FIBER_NOT_PARKED` are a switch-in with
+    /// the status, `FIBER_PARKED` and `Own`; any other answer fails closed (`Malformed`), and a hook
+    /// that raised a trap ends the resume with it, whatever it answered.
     #[test]
-    fn a_blocking_resume_of_a_parked_fiber_meets_its_backstop_on_a_kernel_vcpu() {
+    fn a_poll_of_a_parked_word_answers_each_arm() {
+        use temen_ir::seams::{FIBER_CLAIMED, FIBER_NOT_PARKED, FIBER_STILL_PARKED};
+        // SAFETY: the fiber's body never runs: the slot only carries the word.
+        let fiber = unsafe { crate::fiber_rt::make_task_fiber(64 << 10, |_| {}) }.expect("a stack");
+        let slot = crate::fiber_rt::FiberSlot::platform(fiber);
+        let handle = 5i64;
+        let gen = crate::fiber_rt::fiber_handle_generation(handle);
+        let poll = |word: Option<bool>, answer: Option<[i64; 2]>, raise: bool| {
+            let end = AtomicI64::new(0);
+            let vm = context(&end, true);
+            let vm_at = &vm as *const VmCtx;
+            match word {
+                None => slot.kpark.idle(),
+                Some(woken) => slot.kpark.park(gen, woken, None),
+            }
+            let asked = std::cell::Cell::new(0);
+            let mut hook = Then(
+                || {
+                    asked.set(asked.get() + 1);
+                    if raise {
+                        // SAFETY: `vm` outlives the hook.
+                        unsafe { &*vm_at }.raise(temen_ir::trap_code::MEMORY_FAULT);
+                    }
+                    answer
+                },
+                0,
+            );
+            // SAFETY: `hook` outlives the guard.
+            let published = unsafe { Published::new(&end, &mut hook, None) };
+            // SAFETY: `vm` is a live context on this thread, with its record published.
+            let polled = unsafe { poll_parked(&vm as *const VmCtx as u64, 0, &slot, handle) };
+            drop(published);
+            slot.kpark.idle();
+            let polled = match polled {
+                Polled::Own => "own",
+                Polled::Answer(FIBER_PARKED) => "parked",
+                Polled::Answer(1) => "ended",
+                Polled::Answer(_) => "answer",
+                Polled::Claimed(42) => "claimed 42",
+                Polled::Claimed(_) => "claimed",
+            };
+            (polled, asked.get(), vm.ended())
+        };
+        let malformed = Some(temen_ir::trap_code::MALFORMED);
+        let fault = Some(temen_ir::trap_code::MEMORY_FAULT);
+        for (what, word, answer, raise, want) in [
+            ("idle", None, None, false, ("own", 0, None)),
+            ("pending", Some(false), None, false, ("parked", 0, None)),
+            (
+                "claimed",
+                Some(true),
+                Some([42, FIBER_CLAIMED]),
+                false,
+                ("claimed 42", 1, None),
+            ),
+            (
+                "still parked",
+                Some(true),
+                Some([0, FIBER_STILL_PARKED]),
+                false,
+                ("parked", 1, None),
+            ),
+            (
+                "not parked",
+                Some(true),
+                Some([0, FIBER_NOT_PARKED]),
+                false,
+                ("own", 1, None),
+            ),
+            (
+                "anything else",
+                Some(true),
+                Some([0, 7]),
+                false,
+                ("ended", 1, malformed),
+            ),
+            (
+                "a trap",
+                Some(true),
+                Some([0, 0]),
+                true,
+                ("ended", 1, fault),
+            ),
+        ] {
+            assert_eq!(poll(word, answer, raise), want, "{what}");
+        }
+    }
+
+    /// #3078 slice 3 (review A1) — a fiber's kernel wait holds no reference to its slot across the
+    /// yield: a fiber left parked as its run ends, whose stack is freed without unwinding, keeps no
+    /// slot alive. The fiber notes a `Weak` of its slot, then waits through `routed` (P0); its
+    /// resumer files the park with a hook that drops it, as the run's end drops the record. Once
+    /// the table has ended and the runtime gone, nothing holds the slot.
+    #[test]
+    fn a_fiber_parked_at_its_runs_end_leaves_no_hold_on_its_slot() {
+        let end = AtomicI64::new(0);
+        let vm = context(&end, true);
+        let vm_at = &vm as *const VmCtx as usize;
+        let table = Arc::new(SharedFiberTable::new(
+            4,
+            temen_ir::durable_abi::ShadowArena::EMPTY,
+            None,
+        ));
+        let noted = Arc::new(std::sync::Mutex::new(None::<std::sync::Weak<FiberSlot>>));
+        let note = Arc::clone(&noted);
+        // SAFETY: the body runs under the resume below, with this thread's runtime published.
+        let fiber = unsafe {
+            crate::fiber_rt::make_task_fiber(64 << 10, move |_| {
+                let slot = crate::fiber_rt::current_fiber_slot().expect("running in its slot");
+                *note.lock().unwrap() = Some(Arc::downgrade(&slot));
+                drop(slot);
+                // The context outlives the fiber's run (the enclosing block's contract).
+                routed(&*(vm_at as *const VmCtx), WAIT);
+            })
+        }
+        .expect("a stack");
+        let handle = table.create_for_test(fiber).expect("a slot");
+        let rt = Box::new(FiberRuntime::new(Arc::clone(&table), 0, 0));
+        let mut hook = Then(|| None, 0);
+        // SAFETY: `hook` outlives the guard.
+        let published = unsafe { Published::new(&end, &mut hook, Some(rt)) };
+        let mut status = 0i64;
+        // SAFETY: `vm` is a live context and `status` a live cell; this thread's runtime is published.
+        unsafe { crate::fiber_rt::fiber_resume(handle, 0, &mut status, vm_at as u64) };
+        drop(published);
+        assert_eq!(status, FIBER_PARKED, "the fiber parked in the kernel");
+        assert_eq!(vm.ended(), None, "and its park was filed");
+        table.end();
+        drop(table);
+        let weak = noted
+            .lock()
+            .unwrap()
+            .take()
+            .expect("the fiber noted its slot");
+        assert!(
+            weak.upgrade().is_none(),
+            "something still holds the parked fiber's slot"
+        );
+    }
+
+    /// #3158 — a kernel fiber's wait made below a raised yield floor (a guarded call nested in the
+    /// fiber's frames, whose recovery scope is on its stack) fails closed: no admitted run makes
+    /// one, and the park there is designed, with its oracle row, by the slice that admits one. The
+    /// wait raises `Malformed` on its context and never reaches the hook, and the fiber is never
+    /// switched out: it runs on to its return. Taken as the fiber's park, its yield found no
+    /// yielder above the floor and aborted.
+    #[test]
+    fn a_kernel_fibers_wait_below_a_raised_floor_fails_closed() {
+        let end = AtomicI64::new(0);
+        let vm = context(&end, true);
+        let vm_at = &vm as *const VmCtx as usize;
+        let table = Arc::new(SharedFiberTable::new(
+            4,
+            temen_ir::durable_abi::ShadowArena::EMPTY,
+            None,
+        ));
+        let got = Arc::new(std::sync::Mutex::new(None::<Option<[i64; 2]>>));
+        let put = Arc::clone(&got);
+        // SAFETY: the body runs under the resume below, with this thread's runtime published.
+        let fiber = unsafe {
+            crate::fiber_rt::make_task_fiber(64 << 10, move |_| {
+                let floor = crate::fiber_rt::raise_yield_floor();
+                // The context outlives the fiber's run (the enclosing block's contract).
+                *put.lock().unwrap() = Some(routed(&*(vm_at as *const VmCtx), WAIT));
+                drop(floor);
+            })
+        }
+        .expect("a stack");
+        let handle = table.create_for_test(fiber).expect("a slot");
+        let rt = Box::new(FiberRuntime::new(Arc::clone(&table), 0, 0));
+        let parks = std::cell::Cell::new(0);
+        let mut hook = Then(
+            || {
+                parks.set(parks.get() + 1);
+                Some([9, 0])
+            },
+            0,
+        );
+        // SAFETY: `hook` outlives the guard.
+        let published = unsafe { Published::new(&end, &mut hook, Some(rt)) };
+        let mut status = 0i64;
+        // SAFETY: `vm` is a live context and `status` a live cell; this thread's runtime is published.
+        unsafe { crate::fiber_rt::fiber_resume(handle, 0, &mut status, vm_at as u64) };
+        drop(published);
+        assert_ne!(status, FIBER_PARKED, "the fiber was not switched out");
+        assert_eq!(vm.ended(), Some(temen_ir::trap_code::MALFORMED));
+        assert_eq!(
+            (*got.lock().unwrap(), parks.get()),
+            (Some(Some([0, 0])), 0),
+            "the wait failed closed, and never reached the hook"
+        );
+        table.end();
+    }
+
+    /// #3078 slice 3 (#3130 item 3) — on a kernel vCPU, an event park with no kernel wait behind it
+    /// (one of the JIT's own runtime, made by another run's code on the fiber's stack) fails closed:
+    /// the resumer finds no wait to file, raises `Malformed`, and leaves the fiber unpublished, never
+    /// to run again, rather than hand the guest a `FIBER_PARKED` it never waited for.
+    #[test]
+    fn an_event_park_with_no_kernel_wait_fails_closed_on_a_kernel_vcpu() {
         let end = AtomicI64::new(0);
         let vm = context(&end, true);
         let table = Arc::new(SharedFiberTable::new(

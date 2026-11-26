@@ -40,6 +40,9 @@ libm = "0.2"
 # from its dependency graph — see `host_page_size`.
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 page_size = "0.6"
+# #3078 slice 3 — the wall clock a fiber's real deadline is on, shared with the Cranelift JIT's poll
+# of a kernel-parked fiber (`temen_ir::seams::wall_now`). Wasm keeps its poll-tick clock.
+temen-ir = { workspace = true, features = ["clock"] }
 
 # Test-only: parse Temen text kernels for the parallel-driver Miri check (THREADS.md step 4c). Pure
 # parser (only depends on `temen-ir`), so it keeps the test crate Miri-buildable — unlike the `temen`
@@ -59,7 +62,9 @@ temen-encode.workspace = true
 
 # #2958 slice 2 — the futex count's model (`src/futex_count.rs`, `loom_tests`), run as
 # `RUSTFLAGS="--cfg loom" cargo test -p temen-interp --lib loom`. Its atomics are loom's only in this
-# crate's own test build, so a `--cfg loom` build of a dependent (temen-jit's loom lane) is unchanged.
+# crate's own test build. Not so `temen-ir`'s: #3078 slice 3's parked word (`seams::ParkWord`, for
+# `bytecode::native_park_loom`) takes loom's atomics in every `--cfg loom` build, temen-jit's loom
+# lane's `FiberSlot`s included.
 [target.'cfg(loom)'.dev-dependencies]
 loom = "0.7"
 

@@ -3642,11 +3642,6 @@ fn wait_deregister(
     true
 }
 
-/// [`fiber_rt::fiber_resume`]'s `FIBER_PARKED` status (the fiber hit an event park, not a guest
-/// `suspend`/return). Kept in sync with `fiber_rt::FIBER_PARKED`; the differential harness pins the
-/// numeric value across backends.
-const FIBER_PARKED_STATUS: i64 = 3;
-
 /// I48 — the **blocking** fiber resume (`cont.resume.block`). Like [`fiber_rt::fiber_resume`], but
 /// when the resumed fiber is still event-parked (`FIBER_PARKED`) it **idles this vCPU's OS thread**
 /// instead of returning the poll status to the guest, then re-resumes: on the fiber's futex wait
@@ -3678,15 +3673,10 @@ pub(crate) unsafe extern "C" fn fiber_resume_block(
     arg: i64,
     status_out: *mut i64,
 ) -> i64 {
-    // #3078 slice 2 — on a kernel vCPU every target answers as a `cont.resume` does, as on the
-    // oracle, which blocks only on a parked one: and no fiber parks on a run the kernel admits
-    // (`fiber parks`), so reaching one is a bug in that predicate, and it fails closed.
+    // #3078 slice 3 — on a kernel vCPU it is the kernel's: a parked target idles the task in the
+    // rules until it can be claimed.
     if vm.on_kernel() {
-        let value = fiber_rt::fiber_resume(handle, arg, status_out, vm as *const _ as u64);
-        if *status_out == FIBER_PARKED_STATUS {
-            vm.raise(temen_ir::trap_code::MALFORMED);
-        }
-        return value;
+        return crate::kernel_rt::resume_block(vm, handle, arg, status_out);
     }
     let dom = current_domain(vm.sched as *const Domain);
     let hub = dom.hub();
@@ -3701,7 +3691,7 @@ pub(crate) unsafe extern "C" fn fiber_resume_block(
         let value = fiber_rt::fiber_resume(handle, arg, status_out, vm as *const _ as u64);
         // Done (guest suspend / return), a trap in flight, or not event-parked: hand back to the
         // guest exactly as `cont.resume` would (its `status_out`/value are already set).
-        if *status_out != FIBER_PARKED_STATUS || vm.ended().is_some() {
+        if *status_out != fiber_rt::FIBER_PARKED || vm.ended().is_some() {
             return value;
         }
         // #2757 — a kill ends the idle too: the fiber's own park may not see it (an outside

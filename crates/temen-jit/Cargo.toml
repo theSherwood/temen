@@ -57,7 +57,9 @@ cranelift-frontend = "0.132.0"
 cranelift-jit = "0.132.0"
 cranelift-module = "0.132.0"
 cranelift-native = "0.132.0"
-temen-ir.workspace = true
+# #3078 slice 3 — `clock`: the one wall clock a kernel fiber park's deadline is on, which the
+# bytecode engine's rules write and this crate's poll of a parked fiber reads (`seams::wall_now`).
+temen-ir = { workspace = true, features = ["clock"] }
 # #2534 — `Window::span_checked`, the one definition of the span-OOB arithmetic, which the host
 # functions that touch the window on the code's behalf confine through.
 temen-mask.workspace = true

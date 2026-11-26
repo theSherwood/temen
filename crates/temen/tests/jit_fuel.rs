@@ -1029,6 +1029,11 @@ block 1 (vi: i64) {
 /// version a debug build aborts first on its assertion that a recycled cell is empty, and a release
 /// build under ASan reports nothing, since ASan does not see the JIT's code touch the freed cell. It
 /// pins the run's end alike on the tree-walker and the JIT, with that context in the pool.
+///
+/// #3078 slice 3 — the kernel route admits the program metered (its threads' and its fiber's waits
+/// are the kernel's), so it runs there too and ends as the oracle does. Its charge is not compared,
+/// on any route: B resumes the fiber in an endless loop until the refused spawn's trap ends the
+/// run, so what it burns is the scheduler's timing.
 #[test]
 fn jit_fuel_a_refused_spawn_frees_no_context_a_fiber_charges() {
     let m = parse_module(A_REFUSED_SPAWN_UNDER_A_RUNNING_FIBER).expect("parse");
@@ -1037,12 +1042,35 @@ fn jit_fuel_a_refused_spawn_frees_no_context_a_fiber_charges() {
     assert_eq!(run(&m, 0, &[], &mut tw_left), Err(Trap::ThreadFault));
     let (jit, _) = jit_fuel(A_REFUSED_SPAWN_UNDER_A_RUNNING_FIBER, &[], 1 << 40);
     assert_eq!(jit, JitOutcome::Trapped(TrapKind::ThreadFault));
+    let mut host = temen_interp::Host::new();
+    let admitted = temen_run::jit_kernel::admit(&m, &host, false).expect("in the kernel's scope");
+    let start = temen_run::jit_kernel::Start {
+        entry: 0,
+        args: &[],
+        init_mem: &[],
+        init: None,
+        reserved_log2: temen_ir::DEFAULT_RESERVED_LOG2,
+        fuel: 1 << 40,
+        snapshot_cap: None,
+        kill: None,
+    };
+    let end = temen_run::jit_kernel::run(admitted, start, &mut host).expect("compiles");
+    assert!(
+        end.vcpus >= 1,
+        "it ran on the kernel route, as kernel tasks"
+    );
+    assert_eq!(
+        end.outcome().0,
+        JitOutcome::Trapped(TrapKind::ThreadFault),
+        "the kernel route"
+    );
 }
 
 /// #3080 — where the kernel route stands on fibers: a metered run of a module that uses them is in
 /// its scope (`fiber fuel` is gone, since a fiber charges the vCPU that runs it). Fiber-only modules
-/// keep their single-vCPU path (`fiber only`), and fibers that wait keep today's route (`fiber
-/// parks`).
+/// keep their single-vCPU path (`fiber only`). Since #3078 slice 3 a module with fibers whose code
+/// waits is admitted too. (`fiber parks`, now a call that can park in a fiber, is `jit_kernel.rs`'s
+/// clause row's.)
 #[test]
 fn jit_fuel_the_kernel_route_admits_a_metered_fiber_run() {
     use temen_run::jit_kernel;
@@ -1052,10 +1080,8 @@ fn jit_fuel_the_kernel_route_admits_a_metered_fiber_run() {
         jit_kernel::admit(&m, &temen_interp::Host::new(), false).err()
     };
     assert_eq!(declined(A_FIBER_OUTLIVES_ITS_VCPU), None);
-    assert_eq!(
-        declined(A_REFUSED_SPAWN_UNDER_A_RUNNING_FIBER),
-        Some("fiber parks")
-    );
+    // A module with fibers that waits (here its threads do): `fiber parks` until #3078 slice 3.
+    assert_eq!(declined(A_REFUSED_SPAWN_UNDER_A_RUNNING_FIBER), None);
     assert_eq!(declined(&fibers_suspending(3, 2)), Some("fiber only"));
     assert_eq!(declined(&busy_poll(Some(3))), Some("fiber only"));
 }
@@ -1158,6 +1184,91 @@ fn jit_fuel_a_nested_fiber_that_migrates_charges_its_new_vcpu() {
     let (ended, _) = on_the_oracle(A_NESTED_FIBER_MIGRATES, 1 << 40);
     assert_eq!(ended, Ended::Returned(3 + 3 + 7));
     assert_jit_routes_sweep_as_the_oracle(A_NESTED_FIBER_MIGRATES);
+}
+
+/// #3078 slice 3 — a fiber that waits, on two vCPUs. The root makes a fiber and resumes it: the
+/// fiber counts to 3 (two back-edges), then waits untimed on 16384, which holds 0, so the root's
+/// resume answers `FIBER_PARKED` (3). A thread stores 1 there, notifies it, and resumes the fiber,
+/// which it claims: the fiber counts to 3 again on the thread and returns 7, which the thread
+/// returns. The root joins it and returns `status * 100 + value`, 307.
+const A_FIBER_WAITS_AND_IS_CLAIMED_ON_ANOTHER_VCPU: &str = "memory 16
+func () -> (i64) {
+block 0 () {
+  vz = i64.const 0
+  vf = ref.func 2
+  vk = cont.new vf vz
+  vs, vv = cont.resume vk vz
+  vt = thread.spawn 1 vk vz
+  vts, vtv = thread.join vt
+  vs64 = i64.extend_i32_s vs
+  vk100 = i64.const 100
+  vx = i64.mul vs64 vk100
+  vr = i64.add vx vtv
+  return vr
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vk: i64, vb: i64) {
+  vaddr = i64.const 16384
+  vone = i32.const 1
+  i32.atomic.store vaddr vone
+  vn = atomic.notify vaddr vone
+  vz = i64.const 0
+  vs, vv = cont.resume vk vz
+  return vv
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, varg: i64) {
+  vz = i64.const 0
+  br 1(vz)
+}
+block 1 (vi: i64) {
+  vone = i64.const 1
+  vj = i64.add vi vone
+  vthree = i64.const 3
+  vmore = i64.lt_u vj vthree
+  br_if vmore 1(vj) 2()
+}
+block 2 () {
+  vaddr = i64.const 16384
+  vexp = i32.const 0
+  vinf = i64.const -1
+  vw = i32.atomic.wait vaddr vexp vinf
+  vz2 = i64.const 0
+  br 3(vz2)
+}
+block 3 (vi3: i64) {
+  vone3 = i64.const 1
+  vj3 = i64.add vi3 vone3
+  vthree3 = i64.const 3
+  vmore3 = i64.lt_u vj3 vthree3
+  br_if vmore3 3(vj3) 4()
+}
+block 4 () {
+  vseven = i64.const 7
+  return vseven
+  }
+}
+";
+
+/// #3078 slice 3 — **the metered sweep of a fiber that waits**: the kernel route admits a metered
+/// run whose fiber waits (its wait is the kernel's, and since #3080 the fiber charges the vCPU that
+/// runs it), and [`A_FIBER_WAITS_AND_IS_CLAIMED_ON_ANOTHER_VCPU`] ends and charges as the
+/// tree-walker does on both JIT routes, on every budget from 1 to three times its cost: the fiber's
+/// charges before its park land on the root's vCPU, those after its claim on the thread's.
+#[test]
+fn jit_fuel_a_fiber_that_waits_and_is_claimed_elsewhere_sweeps_as_the_oracle() {
+    let m = parse_module(A_FIBER_WAITS_AND_IS_CLAIMED_ON_ANOTHER_VCPU).expect("parse");
+    verify_module(&m).expect("verify");
+    let declined = temen_run::jit_kernel::admit(&m, &temen_interp::Host::new(), false).err();
+    assert_eq!(
+        declined, None,
+        "a metered run whose fiber waits is the kernel's"
+    );
+    let (ended, _) = on_the_oracle(A_FIBER_WAITS_AND_IS_CLAIMED_ON_ANOTHER_VCPU, 1 << 40);
+    assert_eq!(ended, Ended::Returned(307));
+    assert_jit_routes_sweep_as_the_oracle(A_FIBER_WAITS_AND_IS_CLAIMED_ON_ANOTHER_VCPU);
 }
 
 /// Both JIT routes end `src` and charge as the tree-walker does on every budget from 1 to three

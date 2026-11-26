@@ -39,6 +39,9 @@
 use std::time::{Duration, Instant};
 use temen_jit::JitOutcome;
 use temen_run::jit_kernel::{self, Route};
+#[path = "support/kernel_lane.rs"]
+mod kernel_lane;
+
 use temen_run::{instantiate, Backend, RunConfig};
 
 /// Where a case runs: a backend through the embedder's entry (`Instance::run`, whose JIT picks its
@@ -200,6 +203,22 @@ fn an_infinite_wait_inside_a_fiber_faults_on_every_backend() {
         "an unsatisfiable infinite wait inside a fiber",
         Some("fiber only"),
     );
+    // #3078 slice 3 — and inside one spawned vCPU, which the kernel route admits: its verdict is
+    // the rules' (`Stalled`), promptly.
+    for fuel in kernel_lane::FUELS {
+        let t0 = Instant::now();
+        let (o, _, _) = kernel_lane::on_kernel(FIBER_INFINITE_WAIT, fuel);
+        let dt = t0.elapsed();
+        assert_eq!(
+            o,
+            JitOutcome::Trapped(temen_jit::TrapKind::ThreadFault),
+            "the kernel route, fuel {fuel}, in {dt:?}"
+        );
+        assert!(
+            dt < PROMPT,
+            "the kernel route's verdict took {dt:?}, fuel {fuel}"
+        );
+    }
 }
 
 /// **The control.** The same two shapes with a *finite* timeout must still complete normally
@@ -402,6 +421,7 @@ fn a_vcpu_driving_a_just_notified_fiber_is_not_counted_blocked() {
         NOTIFY_A_BLOCK_DRIVEN_FIBER_THEN_WAIT,
         "I64(300)",
         "notify a block-driven fiber, then wait for its reply",
-        Some("fiber parks"),
+        // #3078 slice 3 — a native fiber's wait is the kernel's: admitted.
+        None,
     );
 }

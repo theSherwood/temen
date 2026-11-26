@@ -11,3 +11,14 @@ publish = false
 # (`par`, #2596). Without it the crate is `no_std` and runs that work in order, as the in-sandbox
 # builds of the crates over it need.
 std = []
+# #3078 slice 3 — the one wall clock a kernel fiber park's deadline is on (`seams::wall_now`), which
+# the bytecode engine and the Cranelift JIT both read. It needs the host's clock, so it is opt-in.
+clock = []
+
+# #3078 slice 3 — `seams::ParkWord`'s atomics are loom's under `--cfg loom`, so temen-interp's model
+# of a native fiber's park runs the real word. A target-cfg dependency: no product build sees it.
+[target.'cfg(loom)'.dependencies]
+loom = "0.7"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
