@@ -512,10 +512,12 @@ pub(crate) struct Window {
     /// serve handler's join keeps the gate, as on the oracle it blocks the serving vCPU
     /// ([`Task::keep_lanes`]), but an activation is no serving vCPU's.
     held: bool,
-    /// #3157 — its vCPU has ended ([`ServeSite::revoke`]): set under the pool's lock, where it is
-    /// read, so a handler of it the pool's scan missed (held out of its entry by a residency, or not
-    /// yet admitted) answers `CAP_REVOKED` as it is filed back ([`ChildExec::take_revoked`]).
-    revoked: std::sync::atomic::AtomicBool,
+    /// #3157 — how many times its vCPU's end has revoked it ([`ServeSite::revoke`]), counted under
+    /// the pool's lock, where it is read. A handler started before the latest of those ends
+    /// ([`HandlerTask::started`]) that the pool's scan missed (held out of its entry by a residency,
+    /// or not yet admitted) answers `CAP_REVOKED` as it is filed back ([`ChildExec::take_revoked`]).
+    /// One started after it, by a serve op taken up again on another vCPU, is not that end's.
+    ends: AtomicU64,
     /// #2695 — where a thread outside the run waits for a held domain's gate ([`Window::wait_take_outside`]):
     /// an embedder's, whose wait is no park of the run, as its call is no task of it.
     outside: Mutex<()>,
@@ -990,6 +992,8 @@ pub(crate) struct HandlerTask {
     reusable: bool,
     /// What its end tells the callee.
     done: Option<HandlerDone>,
+    /// #3157 — its window's [`Window::ends`] as it started: an end after it revokes its call.
+    started: u64,
 }
 
 // SAFETY: as `ChildTask`'s — the raw pointers a handler task holds (its window, its domain) are the
@@ -1157,7 +1161,7 @@ impl ServeSite {
             gate_waiters: AtomicUsize::new(0),
             self_calls: AtomicUsize::new(0),
             held: false,
-            revoked: std::sync::atomic::AtomicBool::new(false),
+            ends: AtomicU64::new(0),
             outside: Mutex::new(()),
             outside_cv: Condvar::new(),
         });
@@ -1445,6 +1449,7 @@ impl ServeSite {
             n_results,
             reusable: false,
             done: None,
+            started: self.window.ends.load(Ordering::Relaxed),
         })
     }
 }
@@ -1699,7 +1704,7 @@ impl HeldSite {
             gate_waiters: AtomicUsize::new(0),
             self_calls: AtomicUsize::new(0),
             held: true,
-            revoked: std::sync::atomic::AtomicBool::new(false),
+            ends: AtomicU64::new(0),
             outside: Mutex::new(()),
             outside_cv: Condvar::new(),
         });
@@ -2671,12 +2676,9 @@ impl ChildExec {
         } else if let Some(Task::Handler(h)) = e.task.as_deref_mut() {
             h.carrier = None;
         }
-        let revoked = Self::take_revoked(&mut g, id);
         if g.runnable.contains(&id) {
             self.find_worker(&mut g, id);
         }
-        drop(g);
-        Self::answer_revoked(revoked);
     }
 
     /// #2695 — enlist handler `h`, a held domain's activation its caller carries, before its first
@@ -3489,13 +3491,18 @@ impl ChildExec {
     /// domain drains it. Its `done` is run outside the pool's lock, as a handler's end runs it, and
     /// the window's bell rings for the callers.
     ///
-    /// #3157 — the window is marked revoked under the same lock first. A handler this scan cannot
-    /// reach, because a residency holds its task out of its entry or it is admitted after, answers
-    /// as it is filed back ([`Self::take_revoked`]), so none is missed.
+    /// #3157 — the end is counted under the same lock first ([`Window::ends`]). A handler started
+    /// before it that this scan cannot reach, because a residency holds its task out of its entry
+    /// or it is admitted after, is answered as it is filed back ([`Self::take_revoked`]): so every
+    /// such call is answered, though not always before the run's deadlock verdict reads its caller
+    /// parked (#3185).
     fn revoke_window(&self, window: &Arc<Window>) {
         let dones: Vec<HandlerDone> = {
             let mut g = lock(&self.state);
-            window.revoked.store(true, Ordering::Relaxed);
+            window.ends.fetch_add(1, Ordering::Relaxed);
+            if !g.windows.contains_key(&window.key()) {
+                return; // no handler of it is pooled: the scan would find none
+            }
             g.tasks
                 .values_mut()
                 .filter_map(|e| match e.task.as_deref_mut() {
@@ -3514,11 +3521,15 @@ impl ChildExec {
     }
 
     /// #3157 — task `id`, just filed back into its entry under the pool's lock (`g`): if it is a
-    /// handler of a window whose vCPU has ended ([`Self::revoke_window`]) and its call is still
-    /// unanswered, its `done` and window, for [`Self::answer_revoked`] once the lock is let go.
+    /// handler started before its window's vCPU last ended ([`Self::revoke_window`]) and its call is
+    /// still unanswered, its `done` and window, for [`Self::answer_revoked`] once the lock is let go.
+    /// Asked where a residency files a handler back (`file`) and where one is first admitted
+    /// (`promote`). `uncarry` needs no such check: only a held domain's activations are carried, and
+    /// a held window is never revoked (`revoke` is reached only through a serve op's site,
+    /// [`ServeSite::of`], which is never a held one).
     fn take_revoked(g: &mut ExecState, id: u64) -> Option<(HandlerDone, Arc<Window>)> {
         match g.tasks.get_mut(&id)?.task.as_deref_mut() {
-            Some(Task::Handler(h)) if h.window.revoked.load(Ordering::Relaxed) => {
+            Some(Task::Handler(h)) if h.started < h.window.ends.load(Ordering::Relaxed) => {
                 Some((h.done.take()?, Arc::clone(&h.window)))
             }
             _ => None,
@@ -3875,7 +3886,7 @@ pub(crate) mod tests {
             gate_waiters: std::sync::atomic::AtomicUsize::new(0),
             self_calls: std::sync::atomic::AtomicUsize::new(0),
             held: false,
-            revoked: std::sync::atomic::AtomicBool::new(false),
+            ends: std::sync::atomic::AtomicU64::new(0),
             outside: std::sync::Mutex::new(()),
             outside_cv: std::sync::Condvar::new(),
         });
@@ -3943,6 +3954,7 @@ pub(crate) mod tests {
             done: Some(Box::new(move |end| {
                 *note.lock().unwrap() = Some(format!("{end:?}"));
             })),
+            started: site.window.ends.load(std::sync::atomic::Ordering::Relaxed),
         }
     }
 
@@ -3979,6 +3991,35 @@ pub(crate) mod tests {
         let mut g = super::lock(&exec.state);
         g.tasks.clear();
         g.runnable.clear();
+    }
+
+    /// #3157 — a handler first filed with the pool after its window's vCPU ended (it parked on a
+    /// caller's thread while the vCPU's end ran) is answered `CAP_REVOKED` as it is admitted, and
+    /// one started after that end (by a serve op taken up again on another vCPU) is not that end's:
+    /// it stays unanswered, parked. The vCPU's end counts itself whatever it finds pooled, which
+    /// the first handler needs: before, it looked at the window's pooled count without the pool's
+    /// lock, saw none, and did nothing.
+    #[test]
+    fn a_handler_promoted_after_its_vcpus_end_is_answered_and_a_later_one_is_not() {
+        let (site, exec) = parked_site();
+        let before = Arc::new(std::sync::Mutex::new(None));
+        let h = a_handler_of(&site, &before);
+        site.revoke();
+        let after = Arc::new(std::sync::Mutex::new(None));
+        let later = a_handler_of(&site, &after);
+        exec.promote(Box::new(super::Task::Handler(h)));
+        exec.promote(Box::new(super::Task::Handler(later)));
+        assert_eq!(
+            before.lock().unwrap().as_deref(),
+            Some(format!("Trapped({})", crate::DOMAIN_DONE_CODE).as_str()),
+            "a call in flight at the vCPU's end is answered as its handler is filed"
+        );
+        assert_eq!(
+            *after.lock().unwrap(),
+            None,
+            "a handler started after the end is not that end's"
+        );
+        join_bounded(&exec);
     }
 
     /// The parked task of [`parked_site`]'s pool: still parked (nothing was offered), or not.
