@@ -512,11 +512,19 @@ pub(crate) struct Window {
     /// serve handler's join keeps the gate, as on the oracle it blocks the serving vCPU
     /// ([`Task::keep_lanes`]), but an activation is no serving vCPU's.
     held: bool,
-    /// #3157 — how many times its vCPU's end has revoked it ([`ServeSite::revoke`]), counted under
-    /// the pool's lock, where it is read. A handler started before the latest of those ends
+    /// #3157 — the ends of its vCPU that revoked it ([`ServeSite::revoke`]): 0 or 1 today, since a
+    /// site lives in one context and only that context's end reaches `revoke` (a vCPU that takes a
+    /// fiber-run serve op up again holds no reference to the site). A count, so the rule reads the
+    /// same if a site ever sees a second end. A handler started before an end
     /// ([`HandlerTask::started`]) that the pool's scan missed (held out of its entry by a residency,
-    /// or not yet admitted) answers `CAP_REVOKED` as it is filed back ([`ChildExec::take_revoked`]).
-    /// One started after it, by a serve op taken up again on another vCPU, is not that end's.
+    /// or not yet admitted) answers `CAP_REVOKED` as it is filed back ([`ChildExec::take_revoked`]);
+    /// one started after it is not that end's.
+    ///
+    /// Counted only under the pool's lock, and read there by `take_revoked`; read without it once,
+    /// as a handler is built ([`ServeSite::handler`]). That load is sound because the count only
+    /// grows, under the lock. A load that sees the new value was made after the end was counted, so
+    /// the handler is not that end's. One that sees the old value gives `started < ends` at every
+    /// later check under the lock, so it is. No dispatch needs the pool's lock for it.
     ends: AtomicU64,
     /// #2695 — where a thread outside the run waits for a held domain's gate ([`Window::wait_take_outside`]):
     /// an embedder's, whose wait is no park of the run, as its call is no task of it.
@@ -992,7 +1000,8 @@ pub(crate) struct HandlerTask {
     reusable: bool,
     /// What its end tells the callee.
     done: Option<HandlerDone>,
-    /// #3157 — its window's [`Window::ends`] as it started: an end after it revokes its call.
+    /// #3157 — its window's [`Window::ends`] as it was built (read without the pool's lock; the field
+    /// says why that is sound): an end counted after it revokes its call.
     started: u64,
 }
 
@@ -3921,7 +3930,11 @@ pub(crate) mod tests {
     ) -> super::HandlerTask {
         let job = Box::new(super::JobCell(std::cell::UnsafeCell::new(None)));
         let cell = &*job as *const super::JobCell as *const ();
-        // SAFETY: the fiber is never resumed: no residency runs in this test.
+        // SAFETY: the fiber is never resumed. Where a test hands the handler to the pool (`promote`),
+        // no worker can pick it: `parked_site`'s window is shut, and `admit` copies that into the
+        // pool's count of it; `holds_lanes: false` below makes `pick` refuse it; and `join_bounded`
+        // clears `tasks` and `runnable` in the one lock section that sets `shutdown`. (With
+        // `holds_lanes: true`, a worker could resume this fiber over an empty job cell.)
         let fiber =
             unsafe { crate::fiber_rt::make_handler_fiber(super::TASK_STACK, cell, super::run_job) }
                 .expect("a stack");
@@ -3996,7 +4009,7 @@ pub(crate) mod tests {
     /// #3157 — a handler first filed with the pool after its window's vCPU ended (it parked on a
     /// caller's thread while the vCPU's end ran) is answered `CAP_REVOKED` as it is admitted, and
     /// one started after that end (by a serve op taken up again on another vCPU) is not that end's:
-    /// it stays unanswered, parked. The vCPU's end counts itself whatever it finds pooled, which
+    /// its call stays unanswered. The vCPU's end counts itself whatever it finds pooled, which
     /// the first handler needs: before, it looked at the window's pooled count without the pool's
     /// lock, saw none, and did nothing.
     #[test]
