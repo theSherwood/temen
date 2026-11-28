@@ -1,5 +1,6 @@
 //! End-to-end and differential tests for `temen-runtime` (`Engine::Bytecode` on Cooperative &
-//! Parallel Carriers) against `temen-interp` (`#3187` / `#3196`).
+//! Parallel Carriers AND `Engine::Cranelift` on native OS threads + `temen-fiber`) against
+//! `temen-interp` (`#3187` / `#3196` / `#3197`).
 
 use std::sync::Arc;
 use temen_interp::Value;
@@ -8,6 +9,9 @@ use temen_kernel::{CapOutcome, ContextExit, ContextId, DomainId, Limits, Trap};
 use temen_mem::Region;
 use temen_runtime::{run_module, CapHandler, RunConfig, RunMode};
 use temen_text::parse_module;
+
+#[cfg(all(feature = "cranelift", not(target_arch = "wasm32")))]
+use temen_runtime::{compile_cranelift_with_mode, run, run_cranelift};
 
 fn parse(src: &str) -> Module {
     parse_module(src).unwrap_or_else(|e| panic!("parse failed: {e:?}\n{src}"))
@@ -21,6 +25,31 @@ fn value_as_i64(v: &Value) -> i64 {
         Value::F64(f) => f.to_bits() as i64,
         Value::Ref(x) => x as i64,
         Value::V128(_) => panic!("unexpected v128 in scalar helper"),
+    }
+}
+
+fn assert_matches_oracle(
+    label: &str,
+    oracle: &Result<Vec<Value>, temen_interp::Trap>,
+    oracle_used: u64,
+    out: &temen_runtime::RunOutput,
+    want_fuel_match: bool,
+) {
+    match (oracle, &out.exit) {
+        (Ok(ov), ContextExit::Returned(rv)) => {
+            let o_i64: Vec<i64> = ov.iter().map(value_as_i64).collect();
+            assert_eq!(&o_i64, rv, "result mismatch in {label}");
+            if want_fuel_match {
+                assert_eq!(
+                    oracle_used, out.fuel_used,
+                    "exact IR safepoint fuel mismatch in {label}"
+                );
+            }
+        }
+        (Err(ot), ContextExit::Trapped(rt)) => {
+            assert_eq!(ot.name(), rt.name(), "trap mismatch in {label}");
+        }
+        other => panic!("oracle vs runtime diverged in {label}: {other:?}"),
     }
 }
 
@@ -54,23 +83,59 @@ fn diff_against_interp(src: &str, args: &[i64], want_fuel_match: bool) {
             },
             ..RunConfig::default()
         };
-        let out = run_module(&m, 0, args, cfg).expect("compile & run");
-        match (&oracle, &out.exit) {
-            (Ok(ov), ContextExit::Returned(rv)) => {
-                let o_i64: Vec<i64> = ov.iter().map(value_as_i64).collect();
-                assert_eq!(&o_i64, rv, "result mismatch in {mode:?}");
-                if want_fuel_match {
-                    assert_eq!(
-                        oracle_used, out.fuel_used,
-                        "exact IR safepoint fuel mismatch in {mode:?}"
-                    );
-                }
-            }
-            (Err(ot), ContextExit::Trapped(rt)) => {
-                assert_eq!(ot.name(), rt.name(), "trap mismatch in {mode:?}");
-            }
-            other => panic!("oracle vs runtime diverged in {mode:?}: {other:?}"),
+        let out = run_module(&m, 0, args, cfg).expect("compile & run bytecode");
+        assert_matches_oracle(
+            &format!("Bytecode({mode:?})"),
+            &oracle,
+            oracle_used,
+            &out,
+            want_fuel_match,
+        );
+    }
+
+    #[cfg(all(feature = "cranelift", not(target_arch = "wasm32")))]
+    {
+        for bmode in [
+            temen_jit::kernel_engine::BoundMode::DynamicVmCtx,
+            temen_jit::kernel_engine::BoundMode::BakedImmediate,
+        ] {
+            let eng = compile_cranelift_with_mode(&m, bmode).expect("compile cranelift");
+            let cfg = RunConfig {
+                mode: RunMode::Parallel,
+                limits: Limits {
+                    fuel: 100_000,
+                    ..Limits::default()
+                },
+                ..RunConfig::default()
+            };
+            let out = run(eng, 0, args, cfg);
+            assert_matches_oracle(
+                &format!("Cranelift({bmode:?})"),
+                &oracle,
+                oracle_used,
+                &out,
+                want_fuel_match,
+            );
         }
+    }
+}
+
+/// Run `m` across Bytecode(Cooperative), Bytecode(Parallel), and Cranelift (when enabled),
+/// asserting `check` on every engine's `RunOutput`.
+fn run_all_engines(
+    m: &Module,
+    args: &[i64],
+    make_cfg: impl Fn(RunMode) -> RunConfig,
+    check: impl Fn(&str, &temen_runtime::RunOutput),
+) {
+    for mode in [RunMode::Cooperative, RunMode::Parallel] {
+        let out = run_module(m, 0, args, make_cfg(mode)).expect("run bytecode");
+        check(&format!("Bytecode({mode:?})"), &out);
+    }
+    #[cfg(all(feature = "cranelift", not(target_arch = "wasm32")))]
+    {
+        let out = run_cranelift(m, 0, args, make_cfg(RunMode::Parallel)).expect("run cranelift");
+        check("Cranelift", &out);
     }
 }
 
@@ -159,6 +224,119 @@ block 0 () {
 }
 
 #[test]
+fn diff_arithmetic_conversion_indirect_and_tail_calls() {
+    // DivByZero
+    let div0 = r#"
+func (i64) -> (i64) {
+block 0 (vx: i64) {
+  vz = i64.const 0
+  vr = i64.div_s vx vz
+  return vr
+}
+}
+"#;
+    diff_against_interp(div0, &[42], false);
+
+    // IntOverflow (i64::MIN / -1)
+    let div_ov = r#"
+func () -> (i64) {
+block 0 () {
+  vmin = i64.const -9223372036854775808
+  vm1 = i64.const -1
+  vr = i64.div_s vmin vm1
+  return vr
+}
+}
+"#;
+    diff_against_interp(div_ov, &[], false);
+
+    // BadConversion (NaN -> i64 trap)
+    let bad_conv = r#"
+func () -> (i64) {
+block 0 () {
+  vz = f64.const 0.0
+  vnan = f64.div vz vz
+  vr = i64.trunc_f64_s vnan
+  return vr
+}
+}
+"#;
+    diff_against_interp(bad_conv, &[], false);
+
+    // Indirect call (`call.dyn`) + tail call (`return_call` / `return_call.dyn`) + canonical
+    // 64-bit `TypeId` mismatch -> `IndirectCallType`.
+    let call_src = r#"
+func (i32, i64) -> (i64) {
+block 0 (vidx: i32, vx: i64) {
+  vr = call.dyn (i64) -> (i64) vidx (vx)
+  return vr
+}
+}
+func (i64) -> (i64) {
+block 0 (vx: i64) {
+  v2 = i64.const 2
+  vy = i64.mul vx v2
+  return_call 2 (vy)
+}
+}
+func (i64) -> (i64) {
+block 0 (vx: i64) {
+  v7 = i64.const 7
+  vr = i64.add vx v7
+  return vr
+}
+}
+func (i64) -> (i64) {
+block 0 (vx: i64) {
+  vfn = ref.func 2
+  return_call.dyn (i64) -> (i64) vfn (vx)
+}
+}
+"#;
+    // Valid indirect call -> func 1 tail-calls func 2 => 10 * 2 + 7 = 27.
+    diff_against_interp(call_src, &[1, 10], true);
+    // Valid indirect call -> func 3 indirect-tail-calls func 2 => 10 + 7 = 17.
+    diff_against_interp(call_src, &[3, 10], true);
+    // Calling func 0 through `(i64) -> (i64)` (wrong signature!) traps IndirectCallType.
+    diff_against_interp(call_src, &[0, 10], false);
+}
+
+#[test]
+fn diff_out_of_fuel_traps_identically() {
+    let spin_src = r#"
+func () -> (i64) {
+block 0 () {
+  vz = i64.const 0
+  br 1 (vz)
+}
+block 1 (vi: i64) {
+  v1 = i64.const 1
+  vi1 = i64.add vi v1
+  br 1 (vi1)
+}
+}
+"#;
+    let m = parse(spin_src);
+    run_all_engines(
+        &m,
+        &[],
+        |mode| RunConfig {
+            mode,
+            limits: Limits {
+                fuel: 50,
+                ..Limits::default()
+            },
+            fuel_chunk: 16,
+            ..RunConfig::default()
+        },
+        |label, out| {
+            assert_eq!(out.exit, ContextExit::Trapped(Trap::OutOfFuel), "{label}");
+            assert_eq!(out.fuel_used, 50, "exact fuel consumed in {label}");
+        },
+    );
+}
+
+#[test]
 fn diff_guest_fibers_generator_and_spent_handle_ebadf() {
     // Fiber yields (arg0 + arg1), then yields (resumed_val * 2), then returns (resumed_val + 5).
     // Root resumes 3 times, then resumes spent handle -> (-9, 0), and tests Invariant 11 tagged handle.
@@ -209,7 +387,57 @@ block 0 (va0: i64, va1: i64) {
 }
 
 #[test]
-fn threads_futex_ping_pong_and_tls_on_cooperative_and_parallel() {
+fn diff_forged_fiber_and_thread_handles_trap() {
+    let forged_fiber = parse(
+        r#"
+func () -> (i64) {
+block 0 () {
+  vbad = i64.const 123456
+  vz = i64.const 0
+  vs, vr = cont.resume vbad vz
+  return vr
+}
+}
+"#,
+    );
+    run_all_engines(
+        &forged_fiber,
+        &[],
+        |mode| RunConfig {
+            mode,
+            ..RunConfig::default()
+        },
+        |label, out| {
+            assert_eq!(out.exit, ContextExit::Trapped(Trap::FiberFault), "{label}");
+        },
+    );
+
+    let forged_thread = parse(
+        r#"
+func () -> (i64) {
+block 0 () {
+  vbad = i32.const 999999
+  vst, vval = thread.join vbad
+  return vval
+}
+}
+"#,
+    );
+    run_all_engines(
+        &forged_thread,
+        &[],
+        |mode| RunConfig {
+            mode,
+            ..RunConfig::default()
+        },
+        |label, out| {
+            assert_eq!(out.exit, ContextExit::Trapped(Trap::ThreadFault), "{label}");
+        },
+    );
+}
+
+#[test]
+fn threads_futex_ping_pong_and_tls_on_all_engines() {
     // Root spawns worker thread (func 1).
     // Worker stores 1 at [16384], notifies [16384], waits for [16392] == 0 to become 2, checks its
     // TLS != root TLS, and returns 100 + arg0 + arg1 + tls.
@@ -264,19 +492,17 @@ block 0 (va0: i64, va1: i64) {
     let m = parse(src);
     // Worker dense TLS starts at 1; worker returns 20+22+100+1 = 143.
     // Root TLS is 777; vj_st = 0; vj2_st = -9 => 143 + 777 + 0 - 9 = 911.
-    for mode in [RunMode::Cooperative, RunMode::Parallel] {
-        let out = run_module(
-            &m,
-            0,
-            &[],
-            RunConfig {
-                mode,
-                ..RunConfig::default()
-            },
-        )
-        .expect("run");
-        assert_eq!(out.exit, ContextExit::Returned(vec![911]), "mode={mode:?}");
-    }
+    run_all_engines(
+        &m,
+        &[],
+        |mode| RunConfig {
+            mode,
+            ..RunConfig::default()
+        },
+        |label, out| {
+            assert_eq!(out.exit, ContextExit::Returned(vec![911]), "{label}");
+        },
+    );
 }
 
 #[test]
@@ -285,7 +511,8 @@ fn guest_fiber_parks_non_blockingly_and_migrates_across_carriers() {
     // Root resumes it -> receives FIBER_PARKED (status 3) immediately without blocking!
     // Root spawns a worker thread (func 1), passing the fiber handle as arg0.
     // Worker stores 1 at [16384], calls `atomic.notify`, then ITSELF resumes the migrated fiber
-    // (on a different Carrier OS thread in Parallel mode!) and returns (status * 1000 + fiber_val).
+    // (on a different Carrier OS thread in Parallel & Cranelift modes!) and returns
+    // (status * 1000 + fiber_val).
     let src = r#"
 memory 16
 func () -> (i64) {
@@ -337,23 +564,17 @@ block 0 (va0: i64, va1: i64) {
     // Root gets vs = 3 (FIBER_PARKED).
     // Worker wakes fiber, migrates & resumes it; fiber sees worker's TLS = 2 and returns 40 + 2 = 42
     // with vs = 1 (FIBER_RETURNED) => worker returns 1042 => root returns 30000 + 1042 = 31042!
-    for mode in [RunMode::Cooperative, RunMode::Parallel] {
-        let out = run_module(
-            &m,
-            0,
-            &[],
-            RunConfig {
-                mode,
-                ..RunConfig::default()
-            },
-        )
-        .expect("run");
-        assert_eq!(
-            out.exit,
-            ContextExit::Returned(vec![31042]),
-            "mode={mode:?}"
-        );
-    }
+    run_all_engines(
+        &m,
+        &[],
+        |mode| RunConfig {
+            mode,
+            ..RunConfig::default()
+        },
+        |label, out| {
+            assert_eq!(out.exit, ContextExit::Returned(vec![31042]), "{label}");
+        },
+    );
 }
 
 #[test]
@@ -386,21 +607,22 @@ block 0 () {
     .expect("run");
     assert_eq!(out.exit, ContextExit::Trapped(Trap::ThreadFault));
 
-    // Memory ceiling smaller than declared 64 KiB window traps MemoryFault.
-    let out_mem = run_module(
+    // Memory ceiling smaller than declared 64 KiB window traps MemoryFault on ALL engines.
+    run_all_engines(
         &deadlock,
-        0,
         &[],
-        RunConfig {
+        |mode| RunConfig {
+            mode,
             limits: Limits {
                 mem: 4096,
                 ..Limits::default()
             },
             ..RunConfig::default()
         },
-    )
-    .expect("run");
-    assert_eq!(out_mem.exit, ContextExit::Trapped(Trap::MemoryFault));
+        |label, out| {
+            assert_eq!(out.exit, ContextExit::Trapped(Trap::MemoryFault), "{label}");
+        },
+    );
 }
 
 #[test]
@@ -428,23 +650,17 @@ block 0 (va: i64, vb: i64) {
 }
 "#;
     let m = parse(src);
-    for mode in [RunMode::Cooperative, RunMode::Parallel] {
-        let out = run_module(
-            &m,
-            0,
-            &[],
-            RunConfig {
-                mode,
-                ..RunConfig::default()
-            },
-        )
-        .expect("run");
-        assert_eq!(
-            out.exit,
-            ContextExit::Trapped(Trap::Unreachable),
-            "mode={mode:?}"
-        );
-    }
+    run_all_engines(
+        &m,
+        &[],
+        |mode| RunConfig {
+            mode,
+            ..RunConfig::default()
+        },
+        |label, out| {
+            assert_eq!(out.exit, ContextExit::Trapped(Trap::Unreachable), "{label}");
+        },
+    );
 }
 
 struct EchoCap;
@@ -479,29 +695,31 @@ block 0 (vh: i32, vx: i64) {
 }
 "#;
     let m = parse(src);
-    let ok = run_module(
+    run_all_engines(
         &m,
-        0,
         &[1, 23],
-        RunConfig {
+        |mode| RunConfig {
+            mode,
             caps: Arc::new(EchoCap),
             ..RunConfig::default()
         },
-    )
-    .expect("run");
-    assert_eq!(ok.exit, ContextExit::Returned(vec![123]));
+        |label, out| {
+            assert_eq!(out.exit, ContextExit::Returned(vec![123]), "{label}");
+        },
+    );
 
-    let forged = run_module(
+    run_all_engines(
         &m,
-        0,
         &[99, 23],
-        RunConfig {
+        |mode| RunConfig {
+            mode,
             caps: Arc::new(EchoCap),
             ..RunConfig::default()
         },
-    )
-    .expect("run");
-    assert_eq!(forged.exit, ContextExit::Trapped(Trap::CapFault));
+        |label, out| {
+            assert_eq!(out.exit, ContextExit::Trapped(Trap::CapFault), "{label}");
+        },
+    );
 }
 
 #[test]
@@ -548,17 +766,121 @@ block 0 (va0: i64, va1: i64) {
 }
 "#;
     let m = parse(src);
-    for mode in [RunMode::Cooperative, RunMode::Parallel] {
-        let out = run_module(
+    run_all_engines(
+        &m,
+        &[],
+        |mode| RunConfig {
+            mode,
+            ..RunConfig::default()
+        },
+        |label, out| {
+            assert_eq!(out.exit, ContextExit::Returned(vec![1057]), "{label}");
+        },
+    );
+}
+
+#[test]
+fn guest_fiber_hardware_fault_cleans_up_and_traps_memory_fault() {
+    // Fiber dereferences NULL inside [0, POWERBOX_NULL_GUARD) -> SIGSEGV inside native `temen-fiber`
+    // stack unwinds cleanly back to Carrier's outermost `run_guarded` with zero leaked TLS state.
+    let src = r#"
+memory 16
+func () -> (i64) {
+block 0 () {
+  vf = ref.func 1
+  vz = i64.const 0
+  vk = cont.new vf vz
+  vs, vr = cont.resume vk vz
+  return vr
+}
+}
+func (i64, i64) -> (i64) {
+block 0 (va0: i64, va1: i64) {
+  vp = i64.const 64
+  vx = i64.load vp
+  return vx
+}
+}
+"#;
+    let m = parse(src);
+    // Run twice sequentially on the same thread to prove TLS fiber stacks were cleanly restored.
+    for _ in 0..2 {
+        run_all_engines(
             &m,
-            0,
             &[],
-            RunConfig {
+            |mode| RunConfig {
                 mode,
                 ..RunConfig::default()
             },
-        )
-        .expect("run");
-        assert_eq!(out.exit, ContextExit::Returned(vec![1057]), "mode={mode:?}");
+            |label, out| {
+                assert_eq!(out.exit, ContextExit::Trapped(Trap::MemoryFault), "{label}");
+            },
+        );
     }
+}
+
+#[test]
+fn guest_fiber_parks_on_thread_join_and_resumes_cleanly() {
+    // Root spawns a worker thread that waits on [16384] == 0 before returning 88.
+    // Root creates a fiber that calls `thread.join` on that worker -> parks non-blockingly
+    // (`FIBER_PARKED` = 3)! Root then notifies [16384] and resumes with `cont.resume.block`,
+    // getting `(FIBER_RETURNED = 1, 88)`!
+    let src = r#"
+memory 16
+func () -> (i64) {
+block 0 () {
+  vz = i64.const 0
+  vth = thread.spawn 1 vz vz
+  vth64 = i64.extend_i32_u vth
+  vf = ref.func 2
+  vk = cont.new vf vth64
+  vs1, vr1 = cont.resume vk vz
+  vp0 = i64.const 16384
+  vone = i32.const 1
+  i32.atomic.store vp0 vone
+  vn = atomic.notify vp0 vone
+  vs2, vr2 = cont.resume.block vk vz
+  vs1_64 = i64.extend_i32_s vs1
+  vs2_64 = i64.extend_i32_s vs2
+  vm1 = i64.const 10000
+  vm2 = i64.const 1000
+  va = i64.mul vs1_64 vm1
+  vb = i64.mul vs2_64 vm2
+  vc = i64.add va vb
+  vout = i64.add vc vr2
+  return vout
+}
+}
+func (i64, i64) -> (i64) {
+block 0 (va: i64, vb: i64) {
+  vp0 = i64.const 16384
+  vz = i32.const 0
+  vinf = i64.const -1
+  vw = i32.atomic.wait vp0 vz vinf
+  v88 = i64.const 88
+  return v88
+}
+}
+func (i64, i64) -> (i64) {
+block 0 (vth64: i64, vunused: i64) {
+  vth = i32.wrap_i64 vth64
+  vst, vval = thread.join vth
+  vret = i64.add vst vval
+  return vret
+}
+}
+"#;
+    let m = parse(src);
+    // vs1 = 3 (FIBER_PARKED), vs2 = 1 (FIBER_RETURNED), vr2 = 0 + 88 = 88 => 31088.
+    run_all_engines(
+        &m,
+        &[],
+        |mode| RunConfig {
+            mode,
+            ..RunConfig::default()
+        },
+        |label, out| {
+            assert_eq!(out.exit, ContextExit::Returned(vec![31088]), "{label}");
+        },
+    );
 }

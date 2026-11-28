@@ -521,6 +521,30 @@ pub(crate) unsafe fn run_guarded_range(
     })
 }
 
+/// Stage 1d (#3197): run a `kernel_engine` trampoline under the OS hardware guard (`pal::run_guarded`)
+/// without coupling to legacy `VmCtx`, `fiber_rt`, or `setjmp_rt`. Returns `true` if a hardware
+/// memory fault in `[lo, hi)` was caught and unwound (`Trap::MemoryFault`).
+///
+/// # Safety
+/// `code` must have the `Entry` ABI (`(args, results, mem_base, fn_table, vmctx)`), and pointers
+/// must remain valid for the duration of the call.
+#[cfg(not(loom))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn run_guarded_kernel(
+    window: &GuestWindow,
+    code: *const u8,
+    args: *const i64,
+    results: *mut i64,
+    mem_base: *mut u8,
+    fn_table: *const c_void,
+    vmctx: *mut i64,
+) -> bool {
+    pal::install_guard();
+    let f: Entry = std::mem::transmute(code);
+    let (lo, hi) = window.fault_range();
+    pal::run_guarded(f, args, results, mem_base, fn_table, vmctx, lo, hi)
+}
+
 /// The trap code a caught guard fault reports.
 pub(crate) const FAULT_TRAP: i64 = TrapKind::MemoryFault as i64;
 

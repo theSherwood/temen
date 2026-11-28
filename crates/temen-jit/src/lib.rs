@@ -113,6 +113,9 @@ mod os_thread_rt;
 // #2958: a program's vCPUs as tasks of executor 2's scheduling core, for what
 // `temen_interp::bytecode::native_scope` admits. Off `fiber_rt` the JIT lowers no §12 op, so no
 // program reaches it ([`KernelRun::new`] refuses).
+/// Stage 1d (`#3197`): Lean Cranelift backend targeting `temen-kernel` + `temen-runtime`.
+#[cfg(not(loom))]
+pub mod kernel_engine;
 pub mod kernel_rt;
 // PROCESS.md S1b/S1c: the canonical-key futex region registry — `temen-run` records a §13 `map`'s pages
 // (so the JIT futex thunks canonicalize `Backed` addresses); a window forgets them as it is released

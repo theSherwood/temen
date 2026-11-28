@@ -774,9 +774,18 @@ dependencies = [
  "temen-encode",
  "temen-fiber",
  "temen-ir",
+ "temen-kernel",
  "temen-mask",
  "temen-verify",
  "windows-sys 0.59.0",
+]
+
+[[package]]
+name = "temen-kernel"
+version = "0.0.0"
+dependencies = [
+ "loom",
+ "temen-ir",
 ]
 
 [[package]]
