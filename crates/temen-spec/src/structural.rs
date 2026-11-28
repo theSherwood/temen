@@ -539,21 +539,6 @@ pub fn struct_rows() -> Vec<StructRow> {
         Inst::LongJmp { buf: 0, val: 1 },
         true,
     ));
-    // A non-constant `mask` (a block param) is unconstrained by the verifier (the
-    // top-byte-strip rule fires only on a *constant* fold-down mask).
-    rows.push(inst_row(
-        "gc.roots",
-        Enc::Byte(0xEA),
-        vec![i64t, i64t, i64t, i64t, i64t],
-        Inst::GcRoots {
-            heap_lo: 0,
-            heap_hi: 1,
-            mask: 2,
-            buf: 3,
-            cap: 4,
-        },
-        true,
-    ));
     rows.push(inst_row(
         "vcpu.tls.get",
         Enc::Byte(0xEB),
@@ -811,7 +796,6 @@ pub fn row_home(inst: &Inst) -> RowHome {
         | Inst::MemoryNotify { .. }
         | Inst::SetJmp { .. }
         | Inst::LongJmp { .. }
-        | Inst::GcRoots { .. }
         | Inst::VcpuTlsGet
         | Inst::VcpuTlsSet { .. }
         | Inst::DurableShadowBase => RowHome::Structural,
@@ -825,7 +809,7 @@ mod tests {
     #[test]
     fn structural_row_tally() {
         let rows = struct_rows();
-        assert_eq!(rows.len(), 40, "structural row count (update on new ops)");
+        assert_eq!(rows.len(), 39, "structural row count (update on new ops)");
         let mut ids: Vec<&str> = rows.iter().map(|r| r.id.as_str()).collect();
         ids.sort_unstable();
         ids.dedup();

@@ -295,13 +295,6 @@ impl Ownership {
         state_of(self.word.load(Ordering::Relaxed))
     }
 
-    /// Whether a worker is currently executing this fiber's native stack (`RUNNING`) — for the
-    /// `gc.roots` walker (`fiber_rt`) to pick a parked vs. running stack-scan extent (relaxed read;
-    /// the scan happens at a safepoint with the chain quiescent / stop-the-world).
-    pub(crate) fn is_running(&self) -> bool {
-        state_of(self.word.load(Ordering::Relaxed)) == RUNNING
-    }
-
     /// Whether the slot is `FREE` (its fiber returned) — #1684's freeze residue.
     pub(crate) fn is_free(&self) -> bool {
         state_of(self.word.load(Ordering::Relaxed)) == FREE

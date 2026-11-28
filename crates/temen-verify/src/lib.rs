@@ -164,12 +164,6 @@ pub enum VerifyError {
     /// immutable-per-instance by construction — that immutability is what makes them always legal
     /// to devirtualize — so attaching to one is fail-closed here, statically.
     AttachNotRebindable { func: u32, block: u32, import: u32 },
-    /// A `gc.roots` carried a **constant** payload mask that clears more than the top byte (its
-    /// low 56 bits are not all-ones). Such a mask could fold a canonical host pointer down into the
-    /// guest window and leak host-address bits past the range filter (GC.md §3, §6). Only
-    /// top-byte-strip masks (`mask | 0xFF00_0000_0000_0000 == !0`) are allowed; the runtime also
-    /// rejects a non-constant mask that violates this at execution.
-    GcRootsMaskUnsafe { func: u32, block: u32, mask: u64 },
     /// A named [`Module::exports`] entry points at a funcidx past the end of `funcs`.
     ExportFuncOutOfRange { export: u32, func: u32 },
     /// Two [`Module::exports`] entries share a name — exports must be uniquely addressable.
@@ -589,23 +583,6 @@ fn verify_func(
         }
 
         for inst in &b.insts {
-            // §GC security: a constant `gc.roots` payload mask may only clear the top byte — a
-            // fold-down mask is rejected statically here (a non-constant mask is enforced at runtime
-            // on both backends). This is the one check that needs *block* context (tracing the mask
-            // operand to its defining `i64.const`), so it stays out of `type_inst`. `mask | 0xFF00..
-            // == !0` ⇔ the low 56 bits are all 1.
-            if let Inst::GcRoots { mask, .. } = inst {
-                if let Some(m) = const_i64_in_block(b, &s.fn_results, type_section, *mask) {
-                    if (m as u64) | 0xFF00_0000_0000_0000 != u64::MAX {
-                        return Err(VerifyError::GcRootsMaskUnsafe {
-                            func: fi,
-                            block: bi,
-                            mask: m as u64,
-                        });
-                    }
-                }
-            }
-
             // The single per-instruction dispatch (#895): check operands + append result types.
             let before = s.types.len();
             type_inst(
@@ -819,32 +796,6 @@ fn row_or_none(ft: Option<&temen_ir::FuncType>) -> InstResults<'_> {
 /// Check one instruction's operands against the running type vector and return the
 /// result type to append (`None` for `Store`). Operands must reference
 /// strictly-earlier indices.
-/// The constant `i64` an operand resolves to, if it's defined by an `i64.const` **earlier in this
-/// block**. Returns `None` for a block parameter, a capture (a constant another block defines is
-/// not traced: every engine checks a mask it cannot see as a constant at run time), or any
-/// non-constant definition. Mirrors the value
-/// numbering of `verify_func`: params and captures occupy `0..inputs()`, then each instruction owns
-/// its `result_count` consecutive indices.
-fn const_i64_in_block(
-    b: &temen_ir::Block,
-    fn_results: &[usize],
-    type_section: &[temen_ir::TypeEntry],
-    v: ValIdx,
-) -> Option<i64> {
-    let mut idx = b.inputs() as u32;
-    for inst in &b.insts {
-        let n = inst.result_count(fn_results, type_section) as u32;
-        if v >= idx && v < idx + n {
-            return match inst {
-                Inst::ConstI64(c) => Some(*c),
-                _ => None,
-            };
-        }
-        idx += n;
-    }
-    None
-}
-
 /// The **one** per-instruction dispatch (#895): check an instruction's operands against the running
 /// SSA type vector and return the result types it appends. Every opcode lives in exactly one arm —
 /// the whole-module-dependent ops (`call`/`call.dyn`/`call.cap`/the import & iface calls,
@@ -1342,31 +1293,6 @@ fn type_inst<'a>(
         }
         Inst::Suspend { value } => {
             cx.expect(*value, ValType::I64)?;
-            ValType::I64
-        }
-        // §GC conservative root enumeration: i64 heap_lo, heap_hi, buf, cap ⇒ i64 count. Writes the
-        // candidate words into guest memory at `buf`, so it requires a declared window.
-        Inst::GcRoots {
-            heap_lo,
-            heap_hi,
-            mask,
-            buf,
-            cap,
-        } => {
-            if !has_memory {
-                return Err(VerifyError::MemoryNotDeclared {
-                    func: fi,
-                    block: bi,
-                });
-            }
-            cx.expect(*heap_lo, ValType::I64)?;
-            cx.expect(*heap_hi, ValType::I64)?;
-            cx.expect(*mask, ValType::I64)?;
-            cx.expect(*buf, ValType::I64)?;
-            cx.expect(*cap, ValType::I64)?;
-            // The top-byte-strip constraint on a *constant* `mask` is checked in `verify_func`'s
-            // block loop (which can trace the operand to its defining `i64.const`); a non-constant
-            // mask is enforced defensively at runtime on both backends.
             ValType::I64
         }
         // §12 futex wait: i64 addr, `ty` expected value, i64 timeout ⇒ i32 status. Touches memory.

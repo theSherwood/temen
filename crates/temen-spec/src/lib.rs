@@ -1810,7 +1810,7 @@ pub fn coverage(inst: &Inst) -> Class {
 
         // Slice 7 — typing/encoding rows only (semantics out of scope, SPEC.md).
         Inst::Call { .. } | Inst::CallIndirect(_) | Inst::RefFunc { .. } => Class::Control,
-        Inst::SetJmp { .. } | Inst::LongJmp { .. } | Inst::GcRoots { .. } => Class::Control,
+        Inst::SetJmp { .. } | Inst::LongJmp { .. } => Class::Control,
         Inst::VcpuTlsGet | Inst::VcpuTlsSet { .. } | Inst::DurableShadowBase => Class::Control,
         Inst::CapCall(_)
         | Inst::CallImport(_)

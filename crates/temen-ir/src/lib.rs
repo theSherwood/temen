@@ -2815,41 +2815,6 @@ pub enum Inst {
         buf: ValIdx,
         val: ValIdx,
     },
-    /// §GC (`GC.md`) **conservative root enumeration** (`gc.roots`): scan every fiber of the
-    /// domain — parked fibers, resume-chain ancestors, and the calling computation's own live
-    /// frames (the op is **call-clobbering**, so the caller's roots are already spilled to its
-    /// control stack, exactly like `cont.resume`/`suspend`) — for candidate pointer words that
-    /// — after masking each scanned word `w` with `mask` (`m = w & mask`) — fall in the half-open
-    /// guest-window range `[heap_lo, heap_hi)` (`i64` window offsets). The **masked** value `m` is
-    /// what's tested and emitted, letting a guest with **tagged** pointers (e.g. a tag in the high
-    /// byte, `(tag << 56) | offset`) recover the bare offset; `mask = !0` reproduces the untagged
-    /// behavior. Writes up to `cap` **distinct (deduplicated)** `i64`-width candidate words,
-    /// ascending, into guest memory at byte offset `buf`, and yields the **total** number found
-    /// (`i64`); if that exceeds `cap` the guest retries with a larger buffer (only the first `cap`
-    /// are written). An **ambient introspection op** — authority-neutral like `cap.self` reflection:
-    /// every candidate is an in-window word the guest's own heap already encodes, while
-    /// out-of-window words (host return addresses, frame pointers, host pointers) are filtered
-    /// *inside* the VM and never cross the boundary, so no host layout leaks (GC.md §3, §6).
-    /// **Security — `mask` may only clear the top byte** (the low 56 bits must be all-ones:
-    /// `mask | 0xFF00_0000_0000_0000 == !0`): a mask that cleared lower bits could fold a host
-    /// pointer (canonical, `< 2^56`) down into the guest window and leak host-address bits past the
-    /// range filter (ASLR). The constraint keeps any host word large → excluded; it's enforced
-    /// statically by the verifier (constant masks) and defensively at runtime on both backends.
-    /// Implemented on **both backends**: the interpreter scans its reified `Value` frames; the JIT
-    /// conservatively walks the live native control stacks of its fibers (parked fibers' saved
-    /// extents `[ctx, top)`, the running resume chain, and the root computation's frames). The two
-    /// over-approximate differently (a sound superset of the live roots, not a matching set —
-    /// GC.md §3.2). Where the stack-switch substrate is absent the JIT bails `Unsupported` and the
-    /// interpreter covers it.
-    GcRoots {
-        heap_lo: ValIdx,
-        heap_hi: ValIdx,
-        /// `i64` payload mask AND-ed with each scanned word before the range test (and emitted).
-        /// Constrained to top-byte-strip only (`mask | 0xFF00_0000_0000_0000 == !0`); see above.
-        mask: ValIdx,
-        buf: ValIdx,
-        cap: ValIdx,
-    },
     /// §12 thread spawn (`thread.spawn`): start a new vCPU — **one real OS thread** (1:1; the VM
     /// provides the thread + futex as *primitives*, not a scheduler — any M:N model is built by the
     /// guest runtime over `thread.spawn` + `cont.*`, D22) — running `funcs[func](arg0, arg1)` over the
@@ -3418,19 +3383,6 @@ macro_rules! inst_operands {
                 $f(expected);
                 $f(timeout);
             }
-            Inst::GcRoots {
-                heap_lo,
-                heap_hi,
-                mask,
-                buf,
-                cap,
-            } => {
-                $f(heap_lo);
-                $f(heap_hi);
-                $f(mask);
-                $f(buf);
-                $f(cap);
-            }
 
             // Variable-length operand lists.
             Inst::Call { args, .. } => {
@@ -3704,10 +3656,6 @@ impl Inst {
             Inst::LongJmp { .. } => fx(true, true, false, true), // reads the jmp_buf; noreturn unwind
             Inst::ThreadSpawn { .. } => fx(false, true, true, true), // shares memory with the new vCPU
             Inst::ThreadJoin { .. } => fx(true, true, true, true), // blocks; joined writes + trap propagate
-
-            // §GC root enumeration: scans window words, writes the candidate buffer, can fault on an
-            // out-of-window buffer.
-            Inst::GcRoots { .. } => fx(true, true, true, true),
 
             // ---- Ambient runtime-state intrinsics (`vcpu.tls`, durable shadow base). Authority-neutral
             // and read-only over guest memory, but they touch mutable runtime state (the per-vCPU TLS
@@ -4139,15 +4087,6 @@ impl Func {
                 .iter()
                 .any(|i| matches!(i, Inst::SetJmp { .. } | Inst::LongJmp { .. }))
         })
-    }
-
-    /// Whether this function contains a [`Inst::GcRoots`] op. It walks the fiber runtime's live
-    /// stacks, so a module holding one needs that runtime stood up even if it never explicitly
-    /// creates a fiber — the JIT's fiber-runtime gate unions this with [`uses_fibers`](Func::uses_fibers).
-    pub fn uses_gc_roots(&self) -> bool {
-        self.blocks
-            .iter()
-            .any(|b| b.insts.iter().any(|i| matches!(i, Inst::GcRoots { .. })))
     }
 }
 
@@ -8934,13 +8873,6 @@ mod effects_tests {
                 block: false,
             },
             Inst::ThreadJoin { handle: 0 },
-            Inst::GcRoots {
-                heap_lo: 0,
-                heap_hi: 1,
-                mask: 2,
-                buf: 3,
-                cap: 4,
-            },
         ] {
             let e = inst.effects();
             assert!(e.side_effect, "{inst:?} must be a barrier: {e:?}");

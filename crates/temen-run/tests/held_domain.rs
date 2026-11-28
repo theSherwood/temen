@@ -2170,17 +2170,7 @@ enum FiberCallsIn {
     /// G2: it `Jit.invoke`s [`A_UNIT_THAT_CALLS_KEPT`], whose top level calls the domain's `kept()`;
     /// the domain holds `Jit` with no fiber-hosting grant.
     InvokedUnit,
-    /// H1: the domain makes no fiber. Its function 6 is a `gc.roots` op it never calls, which stands
-    /// the JIT's fiber runtime up, so `define_extra` admits a unit's `cont.*` with no fiber-hosting
-    /// grant. Its entry installs [`A_UNIT_WITH_A_FIBER_THAT_CALLS_KEPT`], and `outer()` reaches it by
-    /// `call.dyn`: the unit's own fiber calls the domain's `kept()`.
-    InstalledUnitsFiber,
 }
-
-/// #3080 (review H1) — an installed unit whose entry makes a fiber over its own function 1, resumes
-/// it twice and answers `1e6·status₁ + 1e3·status₂ + value₂`; the fiber calls `kept()` (op 3) on the
-/// offer the domain stored at 16500.
-const A_UNIT_WITH_A_FIBER_THAT_CALLS_KEPT: &str = "memory 17\nfunc () -> (i64) {\nblock 0 () {\n  vf = ref.func 1\n  vsp = i64.const 49152\n  vk = cont.new vf vsp\n  vz = i64.const 0\n  vs1, vv1 = cont.resume vk vz\n  vs2, vv2 = cont.resume vk vz\n  vs1w = i64.extend_i32_u vs1\n  vs2w = i64.extend_i32_u vs2\n  vm1 = i64.const 1000000\n  vm2 = i64.const 1000\n  va1 = i64.mul vs1w vm1\n  va2 = i64.mul vs2w vm2\n  vsum = i64.add va1 va2\n  vr = i64.add vsum vv2\n  return vr\n  }\n}\nfunc (i64, i64) -> (i64) {\nblock 0 (vsp: i64, varg: i64) {\n  va = i64.const 16500\n  vme = i32.load va\n  vr = call.cap 268435456 3 () -> (i64) vme ()\n  return vr\n  }\n}\n";
 
 /// A unit's text, verified and encoded: the `data` segment laying it at 20480, and its length.
 fn unit_blob(src: &str) -> (String, usize) {
@@ -2223,15 +2213,6 @@ fn fiber_offer_caller(how: FiberCallsIn) -> String {
                 blob,
                 String::new(),
                 fiber_outer.to_string(),
-            )
-        }
-        FiberCallsIn::InstalledUnitsFiber => {
-            let (blob, len) = unit_blob(A_UNIT_WITH_A_FIBER_THAT_CALLS_KEPT);
-            (
-                "  v0 = i64.const 0\n  v1 = i64.const 4096\n  vmask = i64.const -1\n  v2 = i64.const 0\n  v3 = i64.const 8\n  vr = gc.roots v0 v1 vmask v2 v3\n  return vr\n".to_string(),
-                blob,
-                format!("  vub = i64.const 20480\n  vul = i64.const {len}\n  vu = call.cap 11 0 (i64, i64) -> (i64) vjit (vub, vul)\n  vslot = call.cap 11 3 (i64) -> (i64) vjit (vu)\n  vsa = i64.const 16528\n  i64.store vsa vslot\n"),
-                "  va = i64.const 16528\n  vslot = i64.load va\n  vs = i32.wrap_i64 vslot\n  vr = call.dyn () -> (i64) vs ()\n  return vr\n".to_string(),
             )
         }
     };
@@ -2352,14 +2333,12 @@ fn fiber_offer_outer(on: Executor, how: FiberCallsIn) -> (Executor, Reply, u64) 
         let m = module(&fiber_offer_caller(how));
         let give = match how {
             FiberCallsIn::BuiltinsId => "strm",
-            FiberCallsIn::InvokedUnit | FiberCallsIn::InstalledUnitsFiber => "exec",
+            FiberCallsIn::InvokedUnit => "exec",
         };
         let (mut host, mut args) = child_host(&m, &offer_giver(give));
         args.push(Value::I32(match how {
             FiberCallsIn::BuiltinsId => -1,
-            FiberCallsIn::InvokedUnit | FiberCallsIn::InstalledUnitsFiber => {
-                temen_run::grant_jit(&mut host, &m, 4)
-            }
+            FiberCallsIn::InvokedUnit => temen_run::grant_jit(&mut host, &m, 4),
         }));
         let started = temen_run::hold(on, m, 0, &args, u64::MAX, host);
         let (d, _) = started.unwrap_or_else(|(t, _)| panic!("the entry ends in {t:?}"));
@@ -2401,26 +2380,6 @@ fn a_fibers_unit_that_calls_into_its_own_held_domain_is_held_by_the_tree_walker(
         assert_eq!(
             fiber_offer_outer(on, FiberCallsIn::InvokedUnit),
             (Executor::TreeWalker, Reply::Failed(CAP_REVOKED), 1),
-            "asked for {on:?}"
-        );
-    }
-}
-
-/// #3080 (review H1), #3164 — a held domain that makes no fiber but has a `gc.roots` op, under a
-/// plain `Jit` grant: its compile stands the JIT's fiber runtime up, so an installed unit's own fiber
-/// runs, and its call into the domain's own offer is a fiber's call into its held domain. The
-/// tree-walker keeps the nested activation out while `outer()` runs, so the unit's fiber is still
-/// parked at its second resume: `3003000`, charged 3. Held on the JIT (before `hold` read a unit's
-/// fibers from the compile's own facts), the nested activation ran under the caller's gate between
-/// the two resumes: `3001042`, charged 102. So `hold` declines it, and the tree-walker holds it on
-/// both. The unit is installed and reached by `call.dyn`, so the tree-walker's answer is the gate's
-/// (#3164's), not its invoke child's refusal (#3154).
-#[test]
-fn a_units_own_fiber_that_calls_into_its_held_domain_is_held_by_the_tree_walker() {
-    for on in [Executor::TreeWalker, Executor::Jit] {
-        assert_eq!(
-            fiber_offer_outer(on, FiberCallsIn::InstalledUnitsFiber),
-            (Executor::TreeWalker, Reply::Results(vec![3_003_000]), 3),
             "asked for {on:?}"
         );
     }

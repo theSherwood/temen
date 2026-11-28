@@ -134,7 +134,6 @@ fn verify_func(
         Some(entry) if entry.params == f.params => {}
         _ => return Err("entry block params != function params (or no blocks)".into()),
     }
-    let fn_results: Vec<usize> = funcs.iter().map(|f| f.results.len()).collect();
     // The dominance certificate (#2454): the entry names no parent, every other block an earlier
     // one. Rule 1 is checked on each edge, rule 2 on each capture.
     for (bi, b) in f.blocks.iter().enumerate() {
@@ -171,17 +170,7 @@ fn verify_func(
             types.push(*t);
         }
         for inst in &b.insts {
-            check_inst(
-                inst,
-                &mut types,
-                funcs,
-                imports,
-                tsec,
-                n_impl,
-                has_memory,
-                b,
-                &fn_results,
-            )?;
+            check_inst(inst, &mut types, funcs, imports, tsec, n_impl, has_memory)?;
         }
         check_term(&b.term, &types, f, funcs, tsec, &|t| {
             // Rule 1: a non-entry target's parent is this block or an ancestor of it.
@@ -259,7 +248,6 @@ fn need_memory(has_memory: bool) -> R {
 /// One instruction: check operands, append result type(s). Exhaustive over `Inst`, so
 /// a new instruction forces a rule decision here (the same forcing function as
 /// [`crate::coverage`]).
-#[allow(clippy::too_many_arguments)]
 fn check_inst(
     inst: &Inst,
     types: &mut Vec<ValType>,
@@ -268,8 +256,6 @@ fn check_inst(
     tsec: &[temen_ir::TypeEntry],
     n_impl: usize,
     has_memory: bool,
-    block: &Block,
-    fn_results: &[usize],
 ) -> R {
     use ValType as V;
     let w = |v: ValIdx, t: V| want(types, v, t);
@@ -683,27 +669,6 @@ fn check_inst(
             vec![]
         }
 
-        // ----- GC root enumeration (GC.md): writes into the window; a *constant*
-        // payload mask may only clear the top byte -----
-        Inst::GcRoots {
-            heap_lo,
-            heap_hi,
-            mask,
-            buf,
-            cap,
-        } => {
-            need_memory(has_memory)?;
-            for v in [heap_lo, heap_hi, mask, buf, cap] {
-                w(*v, V::I64)?;
-            }
-            if let Some(m) = const_i64(block, fn_results, tsec, *mask) {
-                if (m as u64) | 0xFF00_0000_0000_0000 != u64::MAX {
-                    return Err(format!("gc.roots constant mask {m:#x} clears low bits"));
-                }
-            }
-            vec![V::I64]
-        }
-
         // ----- SIMD (§17/D58): total lane typing -----
         Inst::ConstV128(_) => vec![V::V128],
         Inst::V128Load { addr, .. } => {
@@ -979,27 +944,4 @@ fn check_term(
         }
         Terminator::Unreachable => Ok(()),
     }
-}
-
-/// The constant an operand resolves to when its defining instruction is an earlier
-/// `i64.const` in this block (params and non-consts give `None`). Value numbering:
-/// params take `0..params.len()`, then each instruction its `result_count` indices.
-fn const_i64(
-    b: &Block,
-    fn_results: &[usize],
-    tsec: &[temen_ir::TypeEntry],
-    v: ValIdx,
-) -> Option<i64> {
-    let mut idx = (b.params.len() + b.captures.len()) as u32;
-    for inst in &b.insts {
-        let n = inst.result_count(fn_results, tsec) as u32;
-        if v >= idx && v < idx + n {
-            return match inst {
-                Inst::ConstI64(c) => Some(*c),
-                _ => None,
-            };
-        }
-        idx += n;
-    }
-    None
 }

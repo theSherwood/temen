@@ -14,7 +14,6 @@ pub struct Seams {
     pub has_fiber: bool,
     pub has_thread: bool,
     pub has_instantiate: bool,
-    pub has_gc: bool,
     pub has_svc: bool,
     pub has_park_seam: bool,
     /// I38's **timed** `svc.wait`: the scheduler's deadline machinery, oracle-only (it is a
@@ -53,7 +52,6 @@ impl Seams {
                 || self.has_fiber
                 || self.has_thread
                 || self.has_instantiate
-                || self.has_gc
                 || self.has_fork)
     }
 }
@@ -149,7 +147,6 @@ pub fn scan_seams<'a>(funcs: impl IntoIterator<Item = &'a Func>) -> Seams {
                     Inst::CapCall(c) if (c.type_id, c.op) == (cap_id::SHARED_REGION, 7) => {
                         s.has_thread = true
                     }
-                    Inst::GcRoots { .. } => s.has_gc = true,
                     Inst::CallIndirect(_) | Inst::CallImportDyn(_) => s.has_opaque_call = true,
                     Inst::CapCall(c) if !iface_never_parks(c.type_id) => s.has_opaque_call = true,
                     _ => {}
@@ -162,7 +159,7 @@ pub fn scan_seams<'a>(funcs: impl IntoIterator<Item = &'a Func>) -> Seams {
 
 /// #2742 — whether serve handler `func` of `funcs` can never park, whatever runs it: nothing it
 /// reaches ([`crate::reachable_in`]) holds a park seam, a spawn or join, a call whose callee is
-/// unknown until it runs, a fiber or thread op, gc roots, a service point or a fork primitive. It
+/// unknown until it runs, a fiber or thread op, a service point or a fork primitive. It
 /// runs to completion or traps. The JIT runs a direct handoff of such a handler on the caller's
 /// own stack. An out-of-range `func` answers `false`, the safe answer.
 pub fn handler_never_parks(funcs: &[Func], func: FuncIdx) -> bool {
@@ -175,7 +172,6 @@ pub fn handler_never_parks(funcs: &[Func], func: FuncIdx) -> bool {
         || s.has_opaque_call
         || s.has_fiber
         || s.has_thread
-        || s.has_gc
         || s.has_svc
         || s.has_fork)
 }

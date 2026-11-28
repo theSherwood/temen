@@ -464,7 +464,6 @@ mod tests {
                     | Inst::MemoryNotify { .. }
                     | Inst::SetJmp { .. }
                     | Inst::LongJmp { .. }
-                    | Inst::GcRoots { .. }
                     // Calls clobber conservatively; the callee's own ops carry the hooks.
                     // (`self.resolve`/`label` are now `call.cap CAP_SELF`, covered by `CapCall`.)
                     | Inst::Call { .. }
@@ -561,13 +560,6 @@ mod tests {
             Inst::MemoryNotify { addr: 0, count: 1 },
             Inst::SetJmp { buf: 0 },
             Inst::LongJmp { buf: 0, val: 1 },
-            Inst::GcRoots {
-                heap_lo: 0,
-                heap_hi: 1,
-                mask: 2,
-                buf: 3,
-                cap: 4,
-            },
             // `self.resolve`/`label` (guest-memory-touching reflection) are now `call.cap
             // CAP_SELF` — represented by the generic `CapCall` in the excluded list.
             Inst::CapCall(Box::new(temen_ir::CapCall {

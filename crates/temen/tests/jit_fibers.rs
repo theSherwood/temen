@@ -571,35 +571,6 @@ fn a_fiber_made_from_funcref_minus_one_is_a_guest_fiber() {
     }
 }
 
-/// #3166 — a fiber made from funcref `-1` scans its roots as any fiber does. The JIT took it for a
-/// task's slot and, with no fiber nested in it, started the root computation's scan at its own stack
-/// pointer, reading every word from the fiber's stack up to the root's OS stack: the process died
-/// with `SIGSEGV`. Here it returns, as `cont.new 3` does, on the JIT: the fiber answers whether
-/// the scan's count is a count (not negative), and the root `status * 1000` plus that.
-#[test]
-fn a_fiber_made_from_funcref_minus_one_scans_its_roots_as_any_fiber() {
-    let root = "  vs0, vv0 = cont.resume vk vz\n  va = i64.extend_i32_s vs0\n  vk1000 = i64.const 1000\n  vx = i64.mul va vk1000\n  vr = i64.add vx vv0";
-    let body = "  vlo = i64.const 0\n  vhi = i64.const 65536\n  vmask = i64.const -1\n  vbuf = i64.const 16384\n  vcap = i64.const 16\n  vn = gc.roots vlo vhi vmask vbuf vcap\n  vz0 = i64.const 0\n  vok = i64.ge_s vn vz0\n  vr = i64.extend_i32_u vok";
-    for spawn in [false, true] {
-        let run = |funcref| {
-            let src = last_slot_fiber(funcref, spawn, root, body);
-            let m = parse_module(&src).unwrap_or_else(|e| panic!("parse: {e:?}\n{src}"));
-            verify_module(&m).unwrap_or_else(|e| panic!("verify: {e:?}\n{src}"));
-            compile_and_run(&m, 0, &[]).expect("jit compile/run")
-        };
-        // The roots are a conservative superset, which the stacks' other words can grow, so the
-        // count itself is not asked for.
-        for funcref in [3, -1] {
-            let got = run(funcref);
-            assert_eq!(
-                got,
-                JitOutcome::Returned(vec![1001]),
-                "funcref {funcref}, spawn {spawn}"
-            );
-        }
-    }
-}
-
 /// #3166 — a `thread.join` inside a fiber made from funcref `-1` blocks its vCPU in place, as in
 /// any fiber. The root spawns a vCPU (func 1) that counts to 2,000,000 and returns 5, and makes a
 /// fiber of func 3, the table's last slot, from `funcref`, handing it the handle; the fiber joins

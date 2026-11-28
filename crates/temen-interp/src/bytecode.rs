@@ -619,20 +619,6 @@ enum Op {
     /// expected signature (the `call.cap` sig minus the leading code-handle param), used to marshal
     /// args/results through the i64-slot ABI.
     JitInvoke(Box<JitInvokeOp>),
-    /// §GC `gc.roots(heap_lo, heap_hi, mask, buf, cap)`: conservative root enumeration. Escapes to
-    /// the driver, which scans every live activation of the vCPU's continuation (the active window,
-    /// its call stack, its resume-chain ancestors, parked fibers, and coroutines) for words that —
-    /// masked — land in `[lo, hi)`, writes the first `cap` (ascending, deduplicated) to guest memory
-    /// at `buf`, and writes the total found to `dst`. Sound (a superset of the genuine roots), not
-    /// bit-identical to the tree-walker — the backends over-approximate differently (GC.md §3.2).
-    GcRoots {
-        lo: u32,
-        hi: u32,
-        mask: u32,
-        buf: u32,
-        cap: u32,
-        dst: u32,
-    },
     /// `leave` (on this op and the two tail calls): the function takes `setjmp` checkpoints, so its
     /// exit drops this activation's (#2877, [`Vm::leave_setjmps`]). Static, so no other exit pays.
     Ret {
@@ -780,7 +766,6 @@ macro_rules! cold_ops {
             | Op::JitInstall { .. }
             | Op::JitUninstall { .. }
             | Op::JitInvoke(..)
-            | Op::GcRoots { .. }
             | Op::Unreachable
             | Op::CapFault
             | Op::Eval { .. }
@@ -1793,7 +1778,7 @@ fn jit_uninstall_from(
 /// only) to bound the blast radius vs. the general serve+spawn case, which stays folded. A fork
 /// handler that *also* parked (e.g. joined) is out of this shape and is not admitted here.
 fn bytecode_serves_fork(s: &Seams) -> bool {
-    s.has_svc && s.has_fork && !s.has_park_seam && !s.has_fiber && !s.has_thread && !s.has_gc
+    s.has_svc && s.has_fork && !s.has_park_seam && !s.has_fiber && !s.has_thread
 }
 
 /// #744 — the **serve-children escape**: a serving module that spawns ([`Seams::svc_park_veto`] folds
@@ -1804,14 +1789,13 @@ fn bytecode_serves_fork(s: &Seams) -> bool {
 /// impl-export op reaches ([`temen_ir::reachable_funcs`]) may hold a park seam, a spawn or join, or
 /// a call whose callee is unknown until it runs. The rest of the module may park: a root joining its
 /// children, a child parked on a call into its parent, a blocking import. Like
-/// [`bytecode_serves_fork`] the shape is bounded module-wide: no fibers, threads, coroutines
-/// or gc roots, no fork (its own escape) and no timed `svc.wait` (oracle-only).
+/// [`bytecode_serves_fork`] the shape is bounded module-wide: no fibers, threads, or coroutines,
+/// no fork (its own escape) and no timed `svc.wait` (oracle-only).
 fn bytecode_serves_children(m: &Module) -> bool {
     let s = scan_seams(&m.funcs);
     if !(s.has_svc && s.has_instantiate)
         || s.has_fiber
         || s.has_thread
-        || s.has_gc
         || s.has_fork
         || s.has_timed_wait
     {
@@ -3264,20 +3248,6 @@ fn compile_inst(
         // §GC conservative root enumeration — driven by the scheduler (it scans the whole vCPU
         // continuation). `call.import` must already be resolved to a `call.cap`, so it never reaches
         // a backend (a leftover is a fall-back).
-        Inst::GcRoots {
-            heap_lo,
-            heap_hi,
-            mask,
-            buf,
-            cap,
-        } => Op::GcRoots {
-            lo: g(*heap_lo),
-            hi: g(*heap_hi),
-            mask: g(*mask),
-            buf: g(*buf),
-            cap: g(*cap),
-            dst,
-        },
         // §7 executable named import (IMPORTS.md phase 1): lower to the **generic** cap dispatch
         // with the reserved [`temen_ir::CAP_IMPORT_TYPE_ID`] and the import index as the op — the
         // host's dispatch translates it through the instantiation-time binding table, exactly as
@@ -6671,32 +6641,6 @@ fn service_advance(
             Outcome::JitInstall { .. }
             | Outcome::JitUninstall { .. }
             | Outcome::JitInvoke { .. } => return Serviced::Declined,
-
-            // §GC root scan: walks the live fiber stacks via the fiber runtime.
-            // §GC `gc.roots` (#1563): scanned, not declined. A decline here is not a skip — `drive`
-            // turns it into `SchedStop::Declined` without ticking the clock, so a guest that
-            // collects could not be stepped past its first collection, i.e. a GC'd language runtime
-            // was undebuggable. Everything the op needs is already in hand: the same continuation
-            // `step_vcpu` scans (this task's `vt`, the run's `fibers`) and the window every other
-            // seam here selects the same way. The scan itself is [`gc_scan`], shared with
-            // production, so the debug tier reports the same roots rather than a second answer
-            // (INVARIANTS #9's observability corollary).
-            Outcome::GcRoots {
-                lo,
-                hi,
-                mask,
-                buf,
-                cap,
-                dst,
-            } => {
-                *turn += 1;
-                let e = &mut domains[tasks[ti].domain];
-                let roots = gc_scan(&tasks[ti].vm.vt, &e.fibers.fibers, source, lo, hi, mask);
-                match gc_write(&mut e.mem, buf, cap, roots) {
-                    Ok(total) => tasks[ti].deliver(dst, Reg::from_i64(total)),
-                    Err(t) => complete(tasks, domains, ti, Err(t)),
-                }
-            }
         },
     }
     Serviced::Ran
@@ -6846,7 +6790,7 @@ fn dbg_jit_step_into(
 /// `dst…` slots are filled through the i64-slot ABI and control returns to the caller.
 fn step_active_invoke(
     vt: &mut VTask,
-    fibers: &FiberTables,
+    _fibers: &FiberTables,
     source: &ModuleSource,
     table: &SharedSlots,
     fuel: &mut Fuel,
@@ -6870,7 +6814,6 @@ fn step_active_invoke(
         &mut HostCell::Excl(host),
         &mut unit_fibers.cell(None),
         None,
-        Some(&Beneath::task(vt, FiberRegRef::Owned(&fibers.fibers))),
         true,
     );
     match stepped {
@@ -9125,9 +9068,6 @@ pub fn native_scope(m: &Module, host: &Host) -> Result<(), &'static str> {
             return Err("fiber parks");
         }
     }
-    if m.funcs.iter().any(temen_ir::Func::uses_gc_roots) {
-        return Err("gc.roots");
-    }
     if host.signal_arm_pair().is_some() {
         return Err("signals");
     }
@@ -9312,7 +9252,6 @@ fn kernel_inst(host: &Host, i: &Inst, mints: bool) -> Result<CallParks, &'static
         | Inst::Suspend { .. }
         | Inst::SetJmp { .. }
         | Inst::LongJmp { .. }
-        | Inst::GcRoots { .. }
         | Inst::ThreadSpawn { .. }
         | Inst::ThreadJoin { .. }
         | Inst::MemoryWait { .. }
@@ -10271,17 +10210,6 @@ enum Outcome {
         params: Box<[ValType]>,
         results: Box<[ValType]>,
     },
-    /// §GC `gc.roots`: operands already resolved + the `mask` validated. The driver does the scan
-    /// (it owns the resume chain / fiber registry / coroutines), writes the buffer, and delivers the
-    /// total to `dst`.
-    GcRoots {
-        lo: u64,
-        hi: u64,
-        mask: u64,
-        buf: u64,
-        cap: usize,
-        dst: u32,
-    },
     /// **Blocking stdin park**: a `Stream{In}` `read` found the buffer exhausted under
     /// [`Host::set_stdin_blocking`]. The read did not complete and `pc` was *not* advanced, so the
     /// driver re-issues it after more input arrives. Only a host that opts into blocking stdin sees
@@ -10651,14 +10579,6 @@ impl FiberCell<'_> {
         }
     }
 
-    /// This registry as a `gc.roots` view holds it ([`FiberRegRef`]).
-    fn view(&self) -> FiberRegRef<'_> {
-        match self {
-            FiberCell::Excl { fibers, .. } => FiberRegRef::Owned(fibers),
-            FiberCell::Core(m, env) => FiberRegRef::Core(m, *env),
-        }
-    }
-
     /// [`shadow_switch`] through the cell. Only a `durable` run keeps shadow-SP words, so a
     /// non-durable one never takes a shared registry's lock for a switch.
     #[inline]
@@ -10675,16 +10595,6 @@ impl FiberCell<'_> {
             self.with(|_, sp, _| shadow_switch(mem, sp, root, true, out_ctx, in_ctx));
         }
     }
-}
-
-/// A fiber registry as a `gc.roots` view ([`Beneath`]) holds it: borrowed tables, or executor 2's
-/// registry locked only while the scan reads it — so a drive paused beneath a nested one never
-/// holds the lock across the nested one's execution.
-#[derive(Clone, Copy)]
-enum FiberRegRef<'a> {
-    Owned(&'a [FiberState]),
-    /// A registry inside executor 2's core ([`FiberCell::Core`]).
-    Core(&'a std::sync::Mutex<Threads>, usize),
 }
 
 /// What a `cont.resume` claim ([`claim_fiber`]) decided under the registry lock; the driver acts on
@@ -12312,171 +12222,6 @@ fn freeze_drive(
     Ok(frozen)
 }
 
-/// Scan every live activation of `vm`'s continuation — the active window plus each suspended caller
-/// on the call stack — for §GC `gc.roots` candidate words, feeding each 64-bit half (`lo`/`hi`, so a
-/// `v128` contributes both) to `consider`. Each activation occupies `regs[base .. base + nslots)` of
-/// the function-wide register file (the window model), so this covers exactly that function's live
-/// slots — a **sound superset** of the tree-walker's per-block `frame.vals` (it also retains
-/// already-dead values from other blocks of the same function, a conservative over-approximation, as
-/// the JIT's native-stack scan does — the backends legitimately differ, GC.md §3.2). The register
-/// file only ever holds guest words (or default `0`), so `consider`'s mask+range filter keeps any
-/// host data out by construction.
-fn scan_vm_roots(vm: &Vm, source: &ModuleSource, consider: &mut impl FnMut(u64)) {
-    let frames = std::iter::once((vm.module, vm.cur, vm.base))
-        .chain(vm.stack.iter().map(|&(m, p, b, ..)| (m, p, b)));
-    for (module, prog, base) in frames {
-        let Some(c) = source.get(module) else {
-            continue;
-        };
-        let n = c.prog(prog).nslots as usize;
-        let end = (base + n).min(vm.regs.len());
-        for r in &vm.regs[base..end] {
-            consider(r.lo);
-            consider(r.hi);
-        }
-    }
-}
-
-/// Emit a §GC `gc.roots` result: write the first `cap` roots (ascending, already deduplicated by the
-/// `BTreeSet`) as little-endian `i64`s into guest memory at `buf` — reusing the confined buffer-write
-/// path (a forged/unmapped/RO buffer is a `MemoryFault`) — and return the **total** found.
-/// §GC — the candidate root set of one vCPU: its active `Vm` and call stack, every resume-chain
-/// ancestor, and every parked fiber in the run's registry, masked and range-filtered to
-/// `[lo, hi)`. The **one** definition of "what `gc.roots` scans on this engine", shared by the
-/// production drivers (`step_vcpu`) and the debug scheduler (`service_advance`, #1563) — the scope
-/// is a property of the op (GC.md §3.1's coverage invariant), not of who is driving, and two copies
-/// of it would be two answers to the same question (INVARIANTS #15).
-fn gc_scan(
-    vt: &VTask,
-    fibers: &[FiberState],
-    source: &ModuleSource,
-    lo: u64,
-    hi: u64,
-    mask: u64,
-) -> std::collections::BTreeSet<u64> {
-    gc_scan_beneath(
-        &Beneath::task(vt, FiberRegRef::Owned(fibers)),
-        source,
-        lo,
-        hi,
-        mask,
-    )
-}
-
-/// #1660 — the live computations a `gc.roots` must cover, gathered from wherever they are held: the
-/// Vms (a task's active one and its parked resumers, a nested drive's own) and the fiber registries,
-/// outermost first. A nested drive ([`drive_nested`]) is handed the view of what is paused beneath
-/// it; a drive handed none cannot see everything live below it (a bounce out of emitted wasm, whose
-/// frames are opaque until they spill — #1627), so a `gc.roots` there fails closed.
-#[derive(Default)]
-struct Beneath<'a> {
-    vms: Vec<&'a Vm>,
-    fibers: Vec<FiberRegRef<'a>>,
-    /// Raw candidate words: an emitted wasm region's **spill stack** (#1627) — every integer an
-    /// emitted frame held live across the host-reaching call that led here, stored before the call.
-    words: Vec<&'a [u64]>,
-}
-
-impl<'a> Beneath<'a> {
-    /// A task continuation `vt` and the registry `fibers` it runs over.
-    fn task(vt: &'a VTask, fibers: FiberRegRef<'a>) -> Self {
-        let mut vms = vec![&vt.active];
-        vms.extend(vt.chain.iter().map(|(_, vm, _)| vm));
-        Beneath {
-            vms,
-            fibers: vec![fibers],
-            words: Vec::new(),
-        }
-    }
-
-    /// This view plus a nested drive's own `active` Vm, resumer `chain` and `fibers` registry — the
-    /// view beneath anything that drive enters, and what a `gc.roots` inside it scans.
-    fn with_drive<'b>(
-        &self,
-        active: &'b Vm,
-        chain: &'b [(usize, Vm, u32)],
-        fibers: FiberRegRef<'b>,
-    ) -> Beneath<'b>
-    where
-        'a: 'b,
-    {
-        let mut vms: Vec<&'b Vm> = self.vms.clone();
-        vms.push(active);
-        vms.extend(chain.iter().map(|(_, vm, _)| vm));
-        let mut regs: Vec<FiberRegRef<'b>> = self.fibers.clone();
-        regs.push(fibers);
-        Beneath {
-            vms,
-            fibers: regs,
-            words: self.words.clone(),
-        }
-    }
-}
-
-/// §GC — the candidate root set over everything in `view`: every Vm's frames, and every parked
-/// fiber in every registry, masked and range-filtered to `[lo, hi)`. The **one** definition of "what
-/// `gc.roots` scans on this engine", shared by the production drivers (`step_vcpu`), the debug
-/// scheduler (`service_advance`, #1563) and nested drives (#1660) — the scope is a property of the
-/// op (GC.md §3.1's coverage invariant), not of who is driving (INVARIANTS #15).
-fn gc_scan_beneath(
-    view: &Beneath<'_>,
-    source: &ModuleSource,
-    lo: u64,
-    hi: u64,
-    mask: u64,
-) -> std::collections::BTreeSet<u64> {
-    let mut roots = std::collections::BTreeSet::new();
-    {
-        let mut consider = |w: u64| {
-            let m = w & mask;
-            if m >= lo && m < hi {
-                roots.insert(m);
-            }
-        };
-        for vm in &view.vms {
-            scan_vm_roots(vm, source, &mut consider);
-        }
-        for &w in view.words.iter().flat_map(|ws| ws.iter()) {
-            consider(w);
-        }
-        // §3.6 slice 5a / F2: an event-parked fiber (`WaitParked` futex, `CapParked` punt
-        // completion) holds live frames exactly like a suspended one — scan all three, or a
-        // root held across a fiber's blocking point would be missed (unsound for GC.md §3.2).
-        let mut scan = |fibers: &[FiberState]| {
-            for vm in fibers.iter().filter_map(FiberState::parked_vm) {
-                scan_vm_roots(vm, source, &mut consider);
-            }
-        };
-        for r in &view.fibers {
-            match *r {
-                FiberRegRef::Owned(f) => scan(f),
-                FiberRegRef::Core(m, env) => {
-                    let g = m.lock_unpoisoned();
-                    scan(&g.core.domains[env].fibers.fibers)
-                }
-            }
-        }
-    }
-    roots
-}
-
-fn gc_write(
-    mem: &mut Option<Mem>,
-    buf: u64,
-    cap: usize,
-    roots: std::collections::BTreeSet<u64>,
-) -> Result<i64, Trap> {
-    let total = roots.len() as i64;
-    let mut bytes = Vec::with_capacity(roots.len().min(cap) * 8);
-    for w in roots.into_iter().take(cap) {
-        bytes.extend_from_slice(&w.to_le_bytes());
-    }
-    super::SoleMem(mem.as_mut().ok_or(Trap::Malformed)?)
-        .write_bytes(buf, &bytes)
-        .ok_or(Trap::MemoryFault)?;
-    Ok(total)
-}
-
 /// Run an invoked §22 unit (`Jit.invoke`) synchronously: a fresh `Vm` for `module`'s entry (func 0)
 /// over the shared window/powerbox and the **shared** dispatch table (so the unit's `call.dyn`
 /// reaches installed units), to completion. An invoked unit is threads-/seam-free — spawning,
@@ -12498,7 +12243,6 @@ fn run_invoke(
     fuel: &mut Fuel,
     mem: &mut Option<Mem>,
     host: &mut HostCell,
-    beneath: Option<&Beneath<'_>>,
 ) -> Result<Vec<Value>, Trap> {
     // The interpreted invoke completes synchronously, so its fiber registry is loop-local.
     drive_nested(
@@ -12510,7 +12254,6 @@ fn run_invoke(
         host,
         &mut FiberTables::default().cell(None),
         None,
-        beneath,
         false,
     )
     .map(Nested::done)
@@ -12601,9 +12344,6 @@ fn drive_nested(
     // call inline would register them, through the same transitions as `step_vcpu`). The
     // interpreted invoke path passes `None` (invoke-confined registry).
     mut run_meta: Option<BounceRunCtx<'_>>,
-    // #1660 — everything paused beneath this drive, for a `gc.roots` inside it; `None` when that is
-    // not fully in view (a bounce out of emitted wasm), which fails the op closed.
-    beneath: Option<&Beneath<'_>>,
     step: bool,
 ) -> Result<Nested, Trap> {
     // `vt.active` is the entry or a fiber it resumed, its resumers in `vt.chain`. A nested drive is
@@ -12756,34 +12496,9 @@ fn drive_nested(
             } => {
                 let unit = host.with(|p| p.resolve_jit_unit(h, code));
                 let (umod, args) = jit_invoke_unit(unit, source, table, &argv, &params, &results)?;
-                // #1660: this drive is paused beneath the unit — hand it on, if our own view is whole.
-                let view = beneath.map(|b| b.with_drive(&vt.active, &vt.chain, fibers.view()));
-                let vals = run_invoke(source, table, umod, &args, fuel, mem, host, view.as_ref())?;
+                let vals = run_invoke(source, table, umod, &args, fuel, mem, host)?;
                 let slots = vals.into_iter().map(val_to_slot);
                 set_slot_results(&mut vt.active, dst, &results, slots);
-            }
-            // §GC `gc.roots` inside a nested drive (#1660): scan what this drive holds — its active
-            // Vm, its resumer chain, the registry it runs over — and everything paused beneath it.
-            // With no `beneath`, something live below is out of view: fail closed rather than
-            // under-report (GC.md §3.2 licenses over-approximation only).
-            Outcome::GcRoots {
-                lo,
-                hi,
-                mask,
-                buf,
-                cap,
-                dst,
-            } => {
-                let roots = {
-                    let view = beneath.ok_or(Trap::CapFault)?.with_drive(
-                        &vt.active,
-                        &vt.chain,
-                        fibers.view(),
-                    );
-                    gc_scan_beneath(&view, source, lo, hi, mask)
-                };
-                let total = gc_write(mem, buf, cap, roots)?;
-                vt.active.set(dst, Reg::from_i64(total));
             }
             // #1578 — DESIGN §22: an **invoked** unit (`run_meta` `None`) is a seam-free leaf, so the
             // whole `Instantiator` is unavailable inside it — named here rather than left to the
@@ -13138,7 +12853,6 @@ impl Outcome {
             | Outcome::ContNew { .. }
             | Outcome::ContResume { .. }
             | Outcome::FiberSuspend { .. }
-            | Outcome::GcRoots { .. }
             | Outcome::Serve { .. }) => return Err(o),
         })
     }
@@ -13322,22 +13036,6 @@ fn step_vcpu(
                 if let Some(stop) = serve(vt, fibers, &unit, mem, host, ctx.durable, dst, wait)? {
                     return Ok(stop);
                 }
-            }
-            // §GC `gc.roots`: scan the whole vCPU continuation — the active window, its call stack
-            // (covered by `scan_vm_roots`), every resume-chain ancestor, every parked fiber, and every
-            // suspended coroutine — for words that (masked) land in `[lo, hi)`. A **sound superset**
-            // of the genuine roots, kept in-window by the range filter (GC.md §3.2).
-            Outcome::GcRoots {
-                lo,
-                hi,
-                mask,
-                buf,
-                cap,
-                dst,
-            } => {
-                let roots = fibers.with(|f, _, _| gc_scan(vt, f, source, lo, hi, mask));
-                let total = gc_write(ctx.mem, buf, cap, roots)?;
-                vt.active.set(dst, Reg::from_i64(total));
             }
             // Every other outcome is a stop for the executor's rules.
             o => return o.into_stop().map_err(|_| Trap::Malformed),
@@ -17080,7 +16778,6 @@ impl CoopSched {
                     &mut ctx.host,
                     &mut fcell,
                     Some(meta),
-                    None,
                     false,
                 )
                 .map(Nested::done);
@@ -18414,7 +18111,7 @@ impl SchedCore {
                     fibers,
                     ..
                 } = &mut domains[env];
-                let parked = FiberRegRef::Owned(&fibers.fibers);
+                let _ = fibers;
                 let ran = jit_invoke_unit(unit, source, table, &argv, &params, &results).and_then(
                     |(umod, args)| {
                         run_invoke(
@@ -18425,7 +18122,6 @@ impl SchedCore {
                             fuel,
                             mem,
                             &mut HostCell::Shared(host),
-                            Some(&Beneath::task(&tasks[ti].vm.vt, parked)),
                         )
                     },
                 );
@@ -19836,13 +19532,7 @@ impl CoopRun {
                 }),
             )
         };
-        // #1627: the view beneath this bounce — the paused task's Vms and the spilled words. The
-        // run's fiber registry is the bounce's own (`bounce_fibers`), which the drive scans itself.
-        let beneath = spill.filter(|_| !in_invoke).map(|words| {
-            let mut b = Beneath::task(&tasks.slots[ti].vm.vt, FiberRegRef::Owned(&[]));
-            b.words.push(words);
-            b
-        });
+        let _ = (spill, in_invoke);
         let mut cell = HostCell::Shared(&e.host);
         let n = coop_bounce(
             source,
@@ -19854,9 +19544,7 @@ impl CoopRun {
             bounce_meta,
             target,
             io,
-            beneath.as_ref(),
         )?;
-        drop(beneath);
         let Some((vm, stop)) = parked else {
             return Ok(Some(n));
         };
@@ -19939,7 +19627,6 @@ fn coop_bounce(
     fiber_meta: Option<BounceRunCtx<'_>>,
     target: u32,
     io: &mut [i64],
-    beneath: Option<&Beneath<'_>>,
 ) -> Result<usize, Trap> {
     step(fuel, None)?; // fuel unification: the dispatch-site safepoint
     let slot = (target as usize) & (table.len() - 1);
@@ -19971,7 +19658,6 @@ fn coop_bounce(
         Some(host.with(|h| h.own_node())),
     )?;
     vm.module = ts.module as usize;
-    // #1660/#1627: `beneath` is `Some` only when the emitted frames under this bounce have spilled.
     let vals = drive_nested(
         source,
         table,
@@ -19981,7 +19667,6 @@ fn coop_bounce(
         host,
         fibers,
         fiber_meta,
-        beneath,
         false,
     )?
     .done();
@@ -20926,13 +20611,8 @@ fn futex_window<'a>(
 impl TaskSeam for CallSeam<'_, '_, '_> {
     fn bounce(&mut self, target: u32, io: &mut [i64], pushed: usize) -> Result<usize, Trap> {
         let host = self.host;
-        // A tier that does not spill, or a count past its stack, leaves `gc.roots` refused: a scan
-        // that cannot see the emitted frames' words would miss roots.
-        let words = (!self.spill.is_empty())
-            .then(|| self.spill.get(..pushed))
-            .flatten();
+        let _ = (pushed, self.spill);
         let mut parked = None;
-        let first = self.task.as_ref().zip(words).map(|(t, w)| t.beneath(w));
         let mut ran = coop_bounce(
             &self.run.source,
             self.table,
@@ -20945,9 +20625,7 @@ impl TaskSeam for CallSeam<'_, '_, '_> {
             }),
             target,
             io,
-            first.as_ref(),
         );
-        drop(first);
         // #2443 — the call stopped for its task's scheduler: the task stops with it, and the call
         // runs on once the task can, until it returns.
         while let Some((mut cont, stop)) = parked.take() {
@@ -20963,7 +20641,6 @@ impl TaskSeam for CallSeam<'_, '_, '_> {
                 }
                 None => task.park(cont, stop)?,
             };
-            let under = self.task.as_ref().zip(words).map(|(t, w)| t.beneath(w));
             ran = drive_nested(
                 &self.run.source,
                 self.table,
@@ -20975,7 +20652,6 @@ impl TaskSeam for CallSeam<'_, '_, '_> {
                 Some(BounceRunCtx {
                     park: Some(&mut parked),
                 }),
-                under.as_ref(),
                 false,
             )
             .map(|ran| {
@@ -21537,14 +21213,6 @@ struct BounceTask<'a> {
 }
 
 impl BounceTask<'_> {
-    /// What a `gc.roots` in the task's bounce scans beneath it (#1627): the task's paused VMs, and
-    /// the `words` its emitted frames pushed to the thread's spill stack.
-    fn beneath<'b>(&'b self, words: &'b [u64]) -> Beneath<'b> {
-        let mut b = Beneath::task(&self.vm.vt, FiberRegRef::Owned(&[]));
-        b.words.push(words);
-        b
-    }
-
     /// #2443 — the call the task's bounce made stopped for its scheduler: a thread, futex or child op
     /// ([`BounceRunCtx::park`]). The task stops with it. Its VM goes back to the table with the
     /// call's continuation ([`TaskVm::suspended`]), where the rules write a parked task's registers,
@@ -26029,39 +25697,6 @@ impl Vm {
                         dst,
                         params,
                         results,
-                    });
-                }
-                Op::GcRoots {
-                    lo,
-                    hi,
-                    mask,
-                    buf,
-                    cap,
-                    dst,
-                } => {
-                    let lo = r!(*lo).i64() as u64;
-                    let hi = r!(*hi).i64() as u64;
-                    let mask = r!(*mask).i64() as u64;
-                    // Security (GC.md §3/§6): the payload mask may only clear the top byte, else a host
-                    // word could be folded into the guest window past the range filter. (The verifier
-                    // rejects a constant fold-down mask; this defends an unverified / non-constant mask.)
-                    if mask | 0xFF00_0000_0000_0000 != u64::MAX {
-                        return Err(Trap::Malformed);
-                    }
-                    let buf = r!(*buf).i64() as u64;
-                    let cap = r!(*cap).i64().max(0) as usize;
-                    let dst = *dst;
-                    self.module = module;
-                    self.cur = cur;
-                    self.base = base;
-                    self.pc = pc + 1;
-                    return Ok(Outcome::GcRoots {
-                        lo,
-                        hi,
-                        mask,
-                        buf,
-                        cap,
-                        dst,
                     });
                 }
                 Op::Unreachable => {

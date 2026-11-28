@@ -71,9 +71,7 @@ pub(crate) fn admits(
     funcs: &[temen_ir::Func],
     serves: bool,
 ) -> Result<(), crate::JitError> {
-    let beside = |f: &temen_ir::Func| {
-        f.uses_fibers() || f.uses_gc_roots() || f.uses_threads() || f.uses_futex()
-    };
+    let beside = |f: &temen_ir::Func| f.uses_fibers() || f.uses_threads() || f.uses_futex();
     if setjmp && (serves || funcs.iter().any(beside)) {
         return Err(crate::JitError::Unsupported(
             "setjmp/longjmp combined with fibers, threads or a served interface is not supported on the JIT yet",

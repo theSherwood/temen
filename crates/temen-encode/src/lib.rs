@@ -194,8 +194,7 @@ mod op {
     pub const ATOMIC_NOTIFY: u8 = 0xE8; // addr, count -> i32 woken
     pub const ATOMIC_FENCE: u8 = 0xE9; // order byte
 
-    // §GC (GC.md) conservative root enumeration.
-    pub const GC_ROOTS: u8 = 0xEA; // heap_lo, heap_hi, mask, buf, cap -> i64 count
+    // 0xEA reserved: retired `gc.roots` (#3188); decodes as `BadOpcode`.
     pub const VCPU_TLS_GET: u8 = 0xEB; // §12 per-vCPU TLS register: () -> i64
     pub const VCPU_TLS_SET: u8 = 0xEC; // §12 per-vCPU TLS register: val -> ()
     pub const DURABLE_SHADOW_BASE: u8 = 0xED; // durable-internal: () -> i64 (current ctx shadow base)
@@ -1281,20 +1280,6 @@ fn encode_inst(out: &mut Vec<u8>, inst: &Inst, object: bool) {
             out.push(op::LONGJMP);
             write_uleb(out, *buf as u64);
             write_uleb(out, *val as u64);
-        }
-        Inst::GcRoots {
-            heap_lo,
-            heap_hi,
-            mask,
-            buf,
-            cap,
-        } => {
-            out.push(op::GC_ROOTS);
-            write_uleb(out, *heap_lo as u64);
-            write_uleb(out, *heap_hi as u64);
-            write_uleb(out, *mask as u64);
-            write_uleb(out, *buf as u64);
-            write_uleb(out, *cap as u64);
         }
         Inst::ThreadSpawn { func, arg0, arg1 } => {
             out.push(op::THREAD_SPAWN);
@@ -2846,13 +2831,6 @@ fn decode_inst(c: &mut Cursor, object: bool) -> Result<Inst, DecodeError> {
         op::LONGJMP => Inst::LongJmp {
             buf: c.idx()?,
             val: c.idx()?,
-        },
-        op::GC_ROOTS => Inst::GcRoots {
-            heap_lo: c.idx()?,
-            heap_hi: c.idx()?,
-            mask: c.idx()?,
-            buf: c.idx()?,
-            cap: c.idx()?,
         },
 
         op::THREAD_SPAWN => Inst::ThreadSpawn {
@@ -4456,5 +4434,18 @@ mod body_length_tests {
             "large enough for threads"
         );
         assert_eq!(decode_module(&encode_module(&m)), Ok(m));
+    }
+
+    /// #3188: opcode 0xEA (`gc.roots`) is retired and reserved so no other opcode shifts; any
+    /// legacy stream carrying it fails closed as `BadOpcode(0xEA)`.
+    #[test]
+    fn retired_gc_roots_opcode_is_bad_opcode() {
+        let mut b = Vec::new();
+        // Function body: 0 params, 0 results, 1 block (parent 0, 0 captures, 0 params, 1 inst).
+        b.extend([0, 0, 1, 0, 0, 0, 1, 0xEA]);
+        assert_eq!(
+            decode_funcs(&[&b], false, 1),
+            Err(DecodeError::BadOpcode(0xEA))
+        );
     }
 }

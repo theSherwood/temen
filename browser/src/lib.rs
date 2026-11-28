@@ -9878,38 +9878,6 @@ block 0 () {
     }
 }
 
-/// Self-contained GC-roots probe (`wasmtime --invoke run_gcroots`): a `gc.roots` scan over an
-/// activation holding the in-range constants `{4096, 5000}` (one duplicated, one out of range)
-/// returns the root count `2`. Returns `-1` on any mismatch.
-#[no_mangle]
-pub extern "C" fn run_gcroots() -> i64 {
-    const G: &str = r#"memory 16
-func () -> (i64) {
-block 0 () {
-  va = i64.const 4096
-  vb = i64.const 5000
-  vc = i64.const 5000
-  vd = i64.const 9000
-  vlo = i64.const 4096
-  vhi = i64.const 8192
-  vmask = i64.const -1
-  vbuf = i64.const 0
-  vcap = i64.const 64
-  vt = gc.roots vlo vhi vmask vbuf vcap
-  return vt
-  }
-}
-"#;
-    let Ok(m) = temen_text::parse_module(G) else {
-        return -1;
-    };
-    let init = [0u8; 4096];
-    match capture_exec(&m, &init, 0) {
-        out if out.status == STATUS_OK => out.value,
-        _ => -1,
-    }
-}
-
 /// Self-contained tail-call probe (`wasmtime --invoke run_tailcall`): a tail-recursive factorial via
 /// `return_call` (O(1) window reuse) returns `5! = 120`. Returns `-1` on any mismatch.
 #[no_mangle]
@@ -10721,9 +10689,7 @@ fn emit_regions(
     let paged = all_shimmable
         && (m.data.iter().any(|d| d.readonly)
             || temen_wasm_jit::module_uses_addr_space_page_ops(&m));
-    // #1627: a collecting guest emits over the shared table in spill mode instead of not at all.
-    // The local-table fallback has no spill path, so it keeps #1546's veto.
-    let spill = all_shimmable && m.funcs.iter().any(temen_ir::Func::uses_gc_roots);
+    let spill = false;
     // #2443: `parks` — the run's bounces can wait for their task (executor 2's), so a function that
     // spawns, joins or waits can sit beneath one.
     let host = temen_wasm_jit::BounceHost { spill, parks };

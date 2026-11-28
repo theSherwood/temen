@@ -1,6 +1,13 @@
 # GC.md — temen ⇄ guest GC support contract (conservative, non-moving)
 
-> Status: draft RFC, converged between the temen and JACL sides. Expect iteration.
+> **Status: RETIRED (2026-11-27, #3187 / #3188).** `gc.roots` (opcode `0xEA`, now reserved) has been
+> removed from the IR, verifier, and all backends (closing `#3170` and removing the native stack
+> scanner and browser `wasm-JIT` module veto). Guests needing a garbage collector (such as `jacl`)
+> should maintain an explicit in-window guest shadow root stack (Henderson / LLVM `gcroot` pattern),
+> which requires zero VM primitive and runs at full speed across all backends including browser
+> `wasm-JIT` tier-up. The text below is preserved as historical context.
+>
+> Original status: draft RFC, converged between the temen and JACL sides.
 > Scope: what temen provides so a **guest** can run its own garbage collector. temen
 > implements **no GC and no object model** — only fiber **root enumeration**.
 > Cross-refs are to `DESIGN.md` sections (§).

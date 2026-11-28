@@ -13487,26 +13487,6 @@ fn lower_vm_builtin(
             ctx.bind_dest(&c.dest, r); // the next resume's arg
             Ok(true)
         }
-        // ---- §GC conservative root enumeration (`gc.roots`) ----
-        "__vm_gc_roots" => {
-            let heap_lo = ctx.operand_i64(vm_arg(c, 0)?)?;
-            let heap_hi = ctx.operand_i64(vm_arg(c, 1)?)?;
-            // §GC tagged-pointer payload mask: each scanned word is AND-ed with this before the range
-            // test (and emitted), so a tag in the high byte is stripped to the bare offset. The VM
-            // constrains it to top-byte-strip only (no host-address leak); `~0UL` is the untagged case.
-            let mask = ctx.operand_i64(vm_arg(c, 2)?)?;
-            let buf = ctx.operand_i64(vm_arg(c, 3)?)?;
-            let cap = ctx.operand_i64(vm_arg(c, 4)?)?;
-            let r = ctx.push(Inst::GcRoots {
-                heap_lo,
-                heap_hi,
-                mask,
-                buf,
-                cap,
-            });
-            ctx.bind_dest(&c.dest, r); // total candidate count (i64)
-            Ok(true)
-        }
         // ---- §12 threads ----
         "__vm_thread_spawn" => {
             // This frontend's convention: the first entry argument is the thread's data-stack base.

@@ -4628,10 +4628,7 @@ fn access_of(inst: &Inst, vals: &[Reg], mem: &Option<Mem>) -> MemAccess {
     // adversarial concurrency explorer, which should still order it against every fiber op).
     if matches!(
         inst,
-        Inst::ContNew { .. }
-            | Inst::ContResume { .. }
-            | Inst::Suspend { .. }
-            | Inst::GcRoots { .. }
+        Inst::ContNew { .. } | Inst::ContResume { .. } | Inst::Suspend { .. }
     ) {
         return MemAccess::Fiber;
     }
@@ -5388,11 +5385,6 @@ struct Vals {
 }
 
 impl Vals {
-    /// Every value the frame holds, its ancestors' included: what a root scan reads.
-    fn all(&self) -> impl Iterator<Item = &Reg> {
-        self.cur.iter().chain(&self.above)
-    }
-
     #[inline]
     fn push(&mut self, r: Reg) {
         self.cur.push(r);
@@ -13609,7 +13601,6 @@ fn child_domains(children: &Mutex<Children>) -> Vec<ChildKill> {
 struct Paused {
     frames: Vec<Frame>,
     root_parked: Option<Vec<Frame>>,
-    registry: Arc<FiberRegistry>,
 }
 
 /// A domain (PROCESS.md §3) as the tree-walker runs it: its code, powerbox, dispatch table, fiber
@@ -14604,9 +14595,6 @@ fn is_visible(inst: &Inst) -> bool {
             | Inst::ContNew { .. }
             | Inst::ContResume { .. }
             | Inst::Suspend { .. }
-            // §GC `gc.roots` reads every fiber's registry frames and writes guest memory, so it is
-            // observable to another vCPU — a scheduling decision point like the fiber ops.
-            | Inst::GcRoots { .. }
     )
 }
 
@@ -16514,7 +16502,6 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     beneath.push(Paused {
                         frames: std::mem::take(frames),
                         root_parked: root_parked.take(),
-                        registry: Arc::clone(registry),
                     });
                     child.below = beneath;
                     let out = run_inner(&mut child, u64::MAX);
@@ -18686,62 +18673,6 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     f.vals[point.result_idx] = Reg::from_i32(resume);
                     continue 'frames;
                 }
-                // §GC conservative root enumeration (`gc.roots`): collect the deduplicated set of
-                // candidate words in `[heap_lo, heap_hi)` across **every** fiber of the domain —
-                // this computation's own live `frames` (the caller; the op is call-clobbering, so
-                // its roots are already in `frames`), the parked root computation (`root_parked`),
-                // and every registry fiber that holds frames: `Parked` (suspended) and
-                // `Running(Some)` (a resume-chain ancestor). The currently-running fiber's slot is
-                // `Running(None)` (its frames are `frames`, scanned above) so nothing double-counts.
-                // Write the first `cap` candidates (ascending) into guest memory at `buf`, yield the
-                // total found. Ambient + authority-neutral (GC.md §3): every candidate is in-window
-                // guest data the heap already encodes; nothing host-side can appear in a `Value`.
-                Inst::GcRoots {
-                    heap_lo,
-                    heap_hi,
-                    mask,
-                    buf,
-                    cap,
-                } => {
-                    let lo = get_i64(&frames[top].vals, *heap_lo)? as u64;
-                    let hi = get_i64(&frames[top].vals, *heap_hi)? as u64;
-                    let mask = get_i64(&frames[top].vals, *mask)? as u64;
-                    // Security: the payload mask may only clear the top byte (low 56 bits all-ones),
-                    // else a host pointer could be folded into the guest window and leak host-address
-                    // bits past the range filter (GC.md §3, §6). The verifier rejects a constant
-                    // fold-down mask statically; this defends an unverified module / non-constant mask.
-                    if mask | 0xFF00_0000_0000_0000 != u64::MAX {
-                        return Err(Trap::Malformed);
-                    }
-                    let dst = get_i64(&frames[top].vals, *buf)? as u64;
-                    let cap = get_i64(&frames[top].vals, *cap)?.max(0) as usize;
-                    let mut roots = std::collections::BTreeSet::new();
-                    gc_scan_frames(frames, lo, hi, mask, &mut roots);
-                    if let Some(rp) = root_parked.as_ref() {
-                        gc_scan_frames(rp, lo, hi, mask, &mut roots);
-                    }
-                    gc_scan_registry(registry, lo, hi, mask, &mut roots);
-                    // #1660: and every computation paused beneath this one (a `Jit.invoke`'s
-                    // invokers) — the same three parts, scanned the same way.
-                    for p in below.iter() {
-                        gc_scan_frames(&p.frames, lo, hi, mask, &mut roots);
-                        if let Some(rp) = p.root_parked.as_ref() {
-                            gc_scan_frames(rp, lo, hi, mask, &mut roots);
-                        }
-                        gc_scan_registry(&p.registry, lo, hi, mask, &mut roots);
-                    }
-                    let total = roots.len();
-                    let mut bytes = Vec::with_capacity(total.min(cap) * 8);
-                    for w in roots.into_iter().take(cap) {
-                        bytes.extend_from_slice(&w.to_le_bytes());
-                    }
-                    // Reuse the §7 cap-buffer write path: confines `buf` to committed, writable
-                    // window pages (a forged/unmapped buffer ⇒ `MemoryFault`), exactly like a host
-                    // capability writing its result buffer.
-                    let m = mem.as_mut().ok_or(Trap::Malformed)?;
-                    m.write_bytes_impl(dst, &bytes).ok_or(Trap::MemoryFault)?;
-                    frames[top].vals.push(Reg::from_i64(total as i64));
-                }
                 // §12 thread spawn: enqueue a new vCPU (green thread) running `funcs[func](arg)` over
                 // the *shared* memory (the `Arc<Region>` bytes + §13 `Arc` regions; the child snapshots
                 // the page-protection map). The executor runs it on a pooled worker. The child **shares
@@ -19937,7 +19868,6 @@ fn eval_inst(inst: &Inst, vals: &[Reg], mem: &mut Option<Mem>) -> Result<Option<
         | Inst::Suspend { .. }
         | Inst::SetJmp { .. }
         | Inst::LongJmp { .. }
-        | Inst::GcRoots { .. }
         | Inst::ThreadSpawn { .. }
         | Inst::ThreadJoin { .. }
         | Inst::MemoryWait { .. }
@@ -40526,61 +40456,6 @@ fn decode_loaded(rty: ValType, width: u32, signed: bool, raw: u64) -> Value {
                 ValType::Ref => Value::Ref(ext), // opaque, stored/loaded as an i64-width word
                 _ => Value::I64(ext as i64),
             }
-        }
-    }
-}
-
-/// `gc.roots` over a fiber registry: every fiber that holds frames — `Parked` (suspended),
-/// `ParkedOn` (event-parked) and `Running(Some)` (a resume-chain ancestor). The running fiber's own
-/// slot is `Running(None)`; its frames are scanned by the caller, so nothing double-counts.
-fn gc_scan_registry(
-    registry: &FiberRegistry,
-    lo: u64,
-    hi: u64,
-    mask: u64,
-    roots: &mut std::collections::BTreeSet<u64>,
-) {
-    for fib in registry.lock().fibers.iter() {
-        if let RegFiber::Parked(f)
-        | RegFiber::Running(Some(f))
-        | RegFiber::ParkedOn { frames: f, .. } = fib
-        {
-            gc_scan_frames(f, lo, hi, mask, roots);
-        }
-    }
-}
-
-/// Scan a fiber's frames for candidate root words in `[lo, hi)` and insert them into `out` (§GC
-/// `gc.roots`). Each word is first masked (`m = w & mask`); the **masked** value is what's range-
-/// tested and inserted, so a guest with tagged pointers (tag in the top byte) recovers the bare
-/// offset (`mask = !0` is the untagged case). Conservative: every SSA value whose masked bits land
-/// in range is a candidate — the interpreter scans typed `Value`s (the JIT scans raw control-stack
-/// words; both are sound over-approximations that may differ in false positives, GC.md §3.2).
-/// `v128` contributes both of its 64-bit halves. `mask` is caller-validated to top-byte-strip only,
-/// so a host pointer stays large and is excluded by the range test.
-fn gc_scan_frames(
-    frames: &[Frame],
-    lo: u64,
-    hi: u64,
-    mask: u64,
-    out: &mut std::collections::BTreeSet<u64>,
-) {
-    let mut consider = |w: u64| {
-        let m = w & mask;
-        if m >= lo && m < hi {
-            out.insert(m);
-        }
-    };
-    for f in frames {
-        // An ancestor block's values (#2454) are live while a block below it may capture them.
-        for v in f.vals.all() {
-            // Untyped raw slots: scan both 64-bit words, like the JIT scans raw control-stack
-            // words (a `v128` contributes both halves; a scalar's high half is 0, which the GC
-            // heap range never contains, so `consider` filters it out). An `i32` slot is
-            // sign-extended in `lo` — exactly the JIT slot ABI — so the two backends' candidate
-            // words now align (still sound over-approximations, GC.md §3.2).
-            consider(v.lo);
-            consider(v.hi);
         }
     }
 }
