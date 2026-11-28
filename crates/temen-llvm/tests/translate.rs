@@ -8118,42 +8118,6 @@ int main(void) {
     );
 }
 
-// ---- §GC conservative roots: `__vm_gc_roots` → `gc.roots` --------------------------------------
-
-/// Conservative root enumeration scans the calling computation's live frames for candidate window
-/// pointers in `[lo, hi)`, writing them into a buffer and returning the total found. The precise set
-/// is a backend-specific over-approximation (GC.md §3.2), so this asserts the *contract*: the op
-/// lowers to `Inst::GcRoots`, runs without trapping, and returns a count within `[0, cap]` (here it
-/// scans the whole window, so any live in-range root the frame holds is counted). Interpreter-only.
-#[test]
-#[cfg(unix)]
-fn vm_gc_roots_smoke() {
-    let src = r#"
-long __vm_gc_roots(long heap_lo, long heap_hi, long mask, void *buf, long cap);
-static long out[64];
-int f(void) {
-  /* a live, in-range candidate pointer (into `out` itself) the conservative scan may see */
-  volatile long *root = out;
-  /* mask = ~0 is the untagged (identity) case: every scanned word is tested as-is. */
-  long n = __vm_gc_roots(0, 1 << 20, ~0L, out, 64);
-  (void)root;
-  /* `n` is the total candidates found (may exceed cap=64; a tiny frame stays well under 1024) —
-     the assertion is that the op ran, returned a sane non-negative count, and didn't trap. */
-  return (n >= 0 && n <= 1024) ? 1 : 0;
-}
-"#;
-    let Some((m, _)) = translate_verified("vm_gc", src) else {
-        return;
-    };
-    assert!(
-        module_has_inst(&m, |i| matches!(i, temen_ir::Inst::GcRoots { .. })),
-        "expected a gc.roots instruction"
-    );
-    if let Some(r) = run_interp("vm_gc", src, &[]) {
-        assert_eq!(r, vec![Value::I32(1)], "gc.roots count out of [0, cap]");
-    }
-}
-
 // ---- §12 per-vCPU TLS register: `__vm_vcpu_tls_get` / `__vm_vcpu_tls_set` -----------------------
 
 /// The per-vCPU TLS register lowers from the `<temen.h>` builtins and round-trips a written value:

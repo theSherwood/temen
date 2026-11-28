@@ -354,7 +354,6 @@ mod tests {
     #[derive(Clone, Copy, Default)]
     struct Holds {
         cont: bool,
-        gc_roots: bool,
         jit: bool,
         guest_call: bool,
         import: Option<temen_interp::BoundImport>,
@@ -362,17 +361,14 @@ mod tests {
         dynamic: bool,
     }
 
-    /// A module whose function 0 holds the ops `h` names (a `cont.new` over function 1, a
-    /// `gc.roots`, a `call.cap` on `Jit`, one on a guest-interned id, a `call.import` through import
+    /// A module whose function 0 holds the ops `h` names (a `cont.new` over function 1,
+    /// a `call.cap` on `Jit`, one on a guest-interned id, a `call.import` through import
     /// 0, a `call.import.dyn`), over a host with import 0 bound as `h.import` says. Parsed and
     /// verified, never run: [`fiber_may_call_in`] reads only the code and the bindings.
     fn decline_case(h: Holds) -> bool {
         let mut body = String::new();
         if h.cont {
             body += "  vf = i32.const 1\n  vsp = i64.const 4096\n  vk = cont.new vf vsp\n";
-        }
-        if h.gc_roots {
-            body += "  g0 = i64.const 0\n  g1 = i64.const 4096\n  gm = i64.const -1\n  g2 = i64.const 0\n  g3 = i64.const 8\n  vg = gc.roots g0 g1 gm g2 g3\n";
         }
         if h.jit {
             body += "  vjh = i32.const 0\n  vjz = i64.const 0\n  vj = call.cap 11 3 (i64) -> (i64) vjh (vjz)\n";
@@ -409,28 +405,9 @@ mod tests {
             ..Holds::default()
         };
         let cases = [
-            // H1's arm, its accept side: `gc.roots` stands the runtime up, but no unit can arrive.
-            (
-                "gc.roots, a guest call, no Jit",
-                Holds {
-                    gc_roots: true,
-                    guest_call: true,
-                    ..Holds::default()
-                },
-                false,
-            ),
-            (
-                "gc.roots and Jit",
-                Holds {
-                    gc_roots: true,
-                    jit: true,
-                    ..Holds::default()
-                },
-                true,
-            ),
             ("cont.*, no Jit, no guest call", fibers, false),
             (
-                "Jit, no cont.* and no gc.roots, no hosting grant",
+                "Jit, no cont.*, no hosting grant",
                 Holds {
                     jit: true,
                     ..Holds::default()

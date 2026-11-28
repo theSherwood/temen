@@ -1974,47 +1974,6 @@ block 0 (v0: i64) {
 }
 "#;
 
-// ---- §GC conservative root enumeration (`gc.roots`) --------------------------------------------
-// Lifted from `crates/temen/tests/bytecode_gc_roots.rs`. `gc.roots vlo vhi vmask vbuf vcap` scans the
-// activation for in-range words, writes them (ascending, deduped) to `vbuf`, returns the count. Run
-// via the capture path (seed a 4 KiB window, snapshot it back). wasm vs native is the *same* bytecode
-// engine, so it is byte-identical here (the soundness-vs-tree-walker caveat doesn't apply).
-
-// In-range constants (one duplicated, one out of range) → roots {4096, 5000}, total 2.
-const GC_BASELINE: &str = r#"memory 16
-func () -> (i64) {
-block 0 () {
-  va = i64.const 4096
-  vb = i64.const 5000
-  vc = i64.const 5000
-  vd = i64.const 9000
-  vlo = i64.const 4096
-  vhi = i64.const 8192
-  vmask = i64.const -1
-  vbuf = i64.const 0
-  vcap = i64.const 64
-  vt = gc.roots vlo vhi vmask vbuf vcap
-  return vt
-  }
-}
-"#;
-
-// Tagged pointer: a tag in the top byte; `vmask` strips it so the bare offset 5000 is in range.
-const GC_TAGGED: &str = r#"memory 16
-func () -> (i64) {
-block 0 () {
-  va = i64.const 9151314442816852872
-  vlo = i64.const 4096
-  vhi = i64.const 8192
-  vmask = i64.const 72057594037927935
-  vbuf = i64.const 0
-  vcap = i64.const 64
-  vt = gc.roots vlo vhi vmask vbuf vcap
-  return vt
-  }
-}
-"#;
-
 /// Lowercase-hex encode (corpus.json carries stdin/stdout/stderr as hex to stay escaping-free).
 fn hex(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
@@ -2247,24 +2206,6 @@ fn main() {
             out.value,
             hex(&out.snapshot),
             if k + 1 == cap_args.len() { "\n" } else { ",\n" },
-        ));
-    }
-    // GC-roots corpus — capture path with a 4 KiB zero window; the guest writes the roots it finds to
-    // offset 0 and returns the count, so the snapshot+value is the ground truth (byte-identical here).
-    let gcroots = [("gc_baseline", GC_BASELINE), ("gc_tagged", GC_TAGGED)];
-    let gc_init = vec![0u8; 4096];
-    json.push_str("],\n\"gcroots\":[\n");
-    for (i, (name, src)) in gcroots.iter().enumerate() {
-        let (m, file) = emit(name, src);
-        let out = capture_exec(&m, &gc_init, 0);
-        json.push_str(&format!(
-            "  {{\"name\":\"{name}\",\"file\":\"{file}\",\"init\":\"{}\",\"arg\":\"0\",\
-             \"status\":{},\"value\":\"{}\",\"snapshot\":\"{}\"}}{}",
-            hex(&gc_init),
-            out.status,
-            out.value,
-            hex(&out.snapshot),
-            if i + 1 == gcroots.len() { "\n" } else { ",\n" },
         ));
     }
     // Nested-child corpus — each runs func 0 with an Instantiator and a budget (`instantiate_exec`);
@@ -2518,13 +2459,6 @@ fn main() {
     let mem = Host::new().grant_powerbox_prefix(1 << 17)[3];
     emit("threads_paged", &threads_paged(mem, false));
     emit("threads_paged_trap", &threads_paged(mem, true));
-    // #1414 B6-3b-4c — a collecting guest whose regions spill: each of its 5 tasks' emitted leaf
-    // pushes the words it holds across its call to the collector to its thread's spill stack, and the
-    // collector counts them (55). The native suite runs the same fixture (`thread_platform.rs`).
-    emit(
-        "threads_gc_spill",
-        include_str!("../../crates/temen-interp/tests/fixtures/threads_gc_spill.temt"),
-    );
     // wasm-JIT **tier-up** across Workers (BROWSER.md § "wasm-JIT tier", per-Worker JIT) — the 4000
     // kernel whose workers run on emitted wasm with their compute leaf (#2608: their atomic add
     // emits). Ground truth (4000, and 1200000 for the contended atomics) asserted in JS.

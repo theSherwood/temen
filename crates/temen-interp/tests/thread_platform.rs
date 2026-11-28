@@ -999,57 +999,6 @@ fn a_bounce_that_moves_the_page_map_rebuilds_the_calls_table() {
     );
 }
 
-/// A collecting guest: the root spawns 4 threads, and each task calls function 1 with `0x9100`. It
-/// derives `0x9108`, which never leaves it, calls the collector (function 2: `gc.roots` over
-/// `[0x9000, 0xA000)`), and returns the count plus 8. The tasks' results are summed.
-const GC_FROM_THREADS: &str = include_str!("fixtures/threads_gc_spill.temt");
-
-/// Emitted code for function 1 that spills what it holds live across its call to the collector, its
-/// argument and the word it derived, then makes that call through its bounce.
-fn spill_then_collect(call: &mut EmittedCall<'_>) -> Result<(), Trap> {
-    let (base, words) = call
-        .spill()
-        .expect("a spilling tier gives each thread a spill stack");
-    assert!(words >= 2);
-    let v0 = call.argv[0];
-    // SAFETY: the thread's spill stack holds `words` words, and nothing else writes it meanwhile.
-    unsafe {
-        base.write(v0 as u64);
-        base.add(1).write(v0 as u64 + 8);
-    }
-    let mut io = [0i64; 8];
-    call.bounce(2, &mut io, 2)?;
-    call.results = vec![io[0] + 8];
-    Ok(())
-}
-
-#[test]
-fn a_collector_under_each_threads_emitted_frame_sees_its_spilled_words() {
-    let m = module(GC_FROM_THREADS);
-    let interpreted = run_over(&m, ThreadPlatform::OS, flat_window());
-    assert_eq!(
-        interpreted,
-        Ok(vec![Value::I64(55)]),
-        "5 tasks, each counting 3 roots, plus 8"
-    );
-    let spilling = ThreadPlatform {
-        tier: Some(ThreadTier {
-            root: ProgramEmit {
-                eligible: Arc::from([false, true, false, false]),
-                page_checked: false,
-                ..Default::default()
-            },
-            spill: 64,
-            leaf: None,
-            modules: None,
-            run: spill_then_collect,
-            native: None,
-        }),
-        ..ThreadPlatform::OS
-    };
-    assert_eq!(run_over(&m, spilling, flat_window()), interpreted);
-}
-
 // ----- a detached child's window in its host's memory, on either executor (#1414 B6-3c, 5d) -----
 
 /// The root spawns the granted module's entry 0, detached in its declared window, by the spawn record

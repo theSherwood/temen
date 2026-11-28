@@ -11,7 +11,7 @@ Backends (DESIGN.md §3): the tree-walk interpreter is the **oracle** (defines o
 - 🚧 **Not yet (parity not achieved)** — a real gap this backend could close but hasn't.
 - 🔶 **Conditional** — Full where a build/target cfg holds, Declines elsewhere (the note names the condition).
 
-**513 ops.** Across the two JIT columns: 959 ✅ Full · 53 ⛔ Declines · 3 🚧 Not-yet · 11 🔶 Conditional.
+**512 ops.** Across the two JIT columns: 959 ✅ Full · 52 ⛔ Declines · 3 🚧 Not-yet · 10 🔶 Conditional.
 
 ## scalar integer
 
@@ -565,7 +565,6 @@ Backends (DESIGN.md §3): the tree-walk interpreter is the **oracle** (defines o
 | `suspend` | ✅ | ✅ | 🔶 | ⛔ | Full on unix x86-64 / unix aarch64 / Windows x86-64 (fiber_rt); Declines to the interp elsewhere; leaf accelerator: folds to the bytecode interp underneath (DESIGN §3) |
 | `thread.spawn` | ✅ | ✅ | 🔶 | ⛔ | Full on unix x86-64 / unix aarch64 / Windows x86-64 (fiber_rt); Declines to the interp elsewhere; leaf accelerator: folds to the bytecode interp underneath (DESIGN §3) |
 | `thread.join` | ✅ | ✅ | 🔶 | ⛔ | Full on unix x86-64 / unix aarch64 / Windows x86-64 (fiber_rt); Declines to the interp elsewhere; leaf accelerator: folds to the bytecode interp underneath (DESIGN §3) |
-| `gc.roots` | ✅ | ✅ | 🔶 | ⛔ | Full on unix x86-64 / unix aarch64 / Windows x86-64 (fiber_rt); Declines to the interp elsewhere; module-granular: a module that can reach it emits nothing (#1546), since an emitted frame's roots are invisible to the scan; serviced on the debug engine too (#1563) |
 | `setjmp` | ✅ | ✅ | 🔶 | ⛔ | Full on unix x86-64 / unix aarch64 (setjmp_rt); Declines to the interp elsewhere; leaf accelerator: folds to the bytecode interp underneath (DESIGN §3) |
 | `longjmp` | ✅ | ✅ | 🔶 | ⛔ | Full on unix x86-64 / unix aarch64 (setjmp_rt); Declines to the interp elsewhere; leaf accelerator: folds to the bytecode interp underneath (DESIGN §3) |
 

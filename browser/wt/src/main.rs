@@ -245,8 +245,6 @@ fn main() {
     };
     println!("[capture]");
     run_capture_like(&mut vm, &mut sc, "capture");
-    println!("[gc.roots]");
-    run_capture_like(&mut vm, &mut sc, "gcroots");
 
     // ---- durability: temen_run_durable + snapshot ---------------------------------------------
     println!("[durability]");

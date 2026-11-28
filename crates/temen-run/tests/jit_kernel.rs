@@ -2127,13 +2127,6 @@ block 0 (va: i64) {
         jit_kernel::admit(&fiber, &Host::new(), false).err(),
         Some("fiber only")
     );
-    let roots = rooted(
-        "  vlo = i64.const 0\n  vhi = i64.const -1\n  vmask = i64.const -1\n  vbuf = i64.const 32768\n  vcap = i64.const 8\n  vr = gc.roots vlo vhi vmask vbuf vcap",
-    );
-    assert_eq!(
-        jit_kernel::admit(&roots, &Host::new(), false).err(),
-        Some("gc.roots")
-    );
     // An armed external-wake bell (`outside bell`): a park nothing in the run can end would wait for
     // it on the kernel, where today's route answers `ThreadFault`. The same program is admitted on a
     // host without it (below).

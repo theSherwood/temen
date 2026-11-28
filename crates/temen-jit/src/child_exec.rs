@@ -293,9 +293,6 @@ impl ChildTask {
         let Some(fiber) = fiber else {
             return Err(teardown);
         };
-        // The child root's frames live on the task stack: its top is the high bound of the
-        // `gc.roots` root-frame scan, as the OS-thread entry SP is a root's.
-        rt.set_root_entry_sp(fiber.stack_top() as usize);
         // #2031 — a durable child's fiber switches swap shadow-SPs and mark consumed parks over its
         // own window, as a run's root's do (`run_inner`).
         rt.set_durable_env(base as u64, done.durable.is_some());

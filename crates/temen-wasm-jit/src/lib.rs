@@ -1361,35 +1361,6 @@ fn module_uses_page_ops(m: &Module) -> bool {
     m.funcs.iter().any(func_uses_page_ops)
 }
 
-/// #1546 — whether any function in `m` can run `gc.roots`, in which case **this tier emits nothing**.
-///
-/// `gc.roots` enumerates the live candidate words of the *interpreter's* frames and parked fibers
-/// (GC.md §3.2: defined semantically, realized per backend). An emitted frame's locals and operand
-/// stack are addressable by neither the guest nor the host, so a root held only there is invisible to
-/// it — and a non-moving collector then frees a live object. That is silent heap corruption, not a
-/// decline, so the op cannot be serviced *while any emitted frame of this module may be live*.
-///
-/// Hence **module**, not function, granularity — the posture BROWSER.md documents ("`gc.roots` bails
-/// unconditionally on this tier"). Function granularity is sound only if an emitted frame can never
-/// be live across a bounce that reaches the op, and two routes broke that:
-///
-/// * the #888 **widened** cross set (B2) admits any [`marshallable_sig`] non-in-subset function, so
-///   an emitted caller could bounce directly into a collecting helper; and
-/// * on that same path the host writes a bounce shim into **every** program slot of the shared table,
-///   so an emitted `call.dyn` reaches any non-emitted function whatever a cross set says — which is
-///   why narrowing the cross set alone cannot fix this, and why the veto is module-wide.
-///
-/// The cost is bounded: a collecting guest runs wholly on the interpreter, which is the only tier
-/// that can see its roots at all.
-///
-/// **The exception (#1627):** a B2 tier-up entry whose host spills ([`BounceHost::spill`]) lifts
-/// this veto. Every emitted frame that can sit beneath the op then pushes its live values to a
-/// host-owned spill stack around the call ([`emit_spill_push`]), and the bounce scans them. Every
-/// other entry keeps the veto.
-fn module_uses_gc_roots(m: &Module) -> bool {
-    m.funcs.iter().any(Func::uses_gc_roots)
-}
-
 /// Whether `f` invokes a §13 `SharedRegion` `map`/`unmap` (iface 4 ops 0/1) — the aliasing subset of
 /// [`func_uses_page_ops`] that even the #750 paged mode cannot carry: a `Backed` page's bytes live
 /// in the region backing, not the window, so an emitted access reads the wrong bytes no matter what
@@ -1620,7 +1591,8 @@ pub struct BounceHost {
 fn bounce_serviceable(m: &Module, host: BounceHost) -> Vec<bool> {
     // #1627: in spill mode every emitted frame beneath a bounce has pushed its live words, so a
     // bounce into `gc.roots` scans them (`CoopRun::bounce`'s `spill`) and that seed drops.
-    let refused = |f: &Func| (!host.spill && f.uses_gc_roots()) || serves_or_calls_a_server(f);
+    let _ = host.spill;
+    let refused = |f: &Func| serves_or_calls_a_server(f);
     let schedules = |f: &Func| f.uses_threads() || f.uses_futex() || starts_or_joins(f);
     let a_fiber_may_stop = m.funcs.iter().any(|f| refused(f) || schedules(f));
     reaches(m, |f| {
@@ -1729,15 +1701,6 @@ fn interp_leaf(f: &Func) -> bool {
                         | Inst::CapCall(_)
                         | Inst::CallImport(_)
                         | Inst::ImportAttach { .. }
-                        // and `gc.roots` (#1546): it would run, and answer with the emitted
-                        // caller's frame unscanned — see [`bounce_serviceable`]'s `gc.roots` seed.
-                        // `uses_concurrency` above does not cover it (that predicate asks about
-                        // fibers, threads and futexes, a different question), and neither does the
-                        // memory rule above — the op writes its buffer through
-                        // itself, not a `Store`, so a *bare* wrapper (no load, no store, no call)
-                        // satisfied this predicate on its own terms. Excluded explicitly rather than
-                        // by accident of the call-free rule.
-                        | Inst::GcRoots { .. }
             )
         })
     })
@@ -2546,9 +2509,6 @@ fn compile_module_reactor_inner(
     // shape-deriving front doors ([`compile_jit`], [`compile_jit_page_checked`]) decline to the interpreter
     // before reaching here; this refuses the direct `compile_module_reactor*` callers too, so the
     // property is the crate's rather than each front door's.
-    if module_uses_gc_roots(m) {
-        return Err(Error::Unsupported("gc.roots: no emitted tier (#1546)"));
-    }
     let n = m.funcs.len();
     let a = analyze_from(m, entry);
     // `oversized[i]` — an in-subset function pulled from the emitted set because its body exceeds the
@@ -2649,9 +2609,6 @@ pub fn compile_module_reactor_keep(
 ) -> Result<(Vec<u8>, Vec<bool>), Error> {
     // #1546 — the one reactor entry with its own emit/cross computation rather than the shared inner,
     // so it carries the `gc.roots` veto itself (see [`module_uses_gc_roots`]).
-    if module_uses_gc_roots(m) {
-        return Err(Error::Unsupported("gc.roots: no emitted tier (#1546)"));
-    }
     let n = m.funcs.len();
     let a = analyze_from(m, entry);
     // Emit a reachable in-subset function iff it is the entry, kept, or has a signature that can't be
@@ -3006,15 +2963,8 @@ fn compile_module_tierup_inner(
     // #1627: unless the entry asked for spill mode (B2 only — its bounce is the one that can scan
     // spilled words), where every emitted frame that can sit beneath the op pushes its live values
     // instead. `gc_reach[i]` ⇔ a call to `i` can reach the op, and is empty when nothing spills.
-    let gc_spill = bounce.is_some_and(|b| b.spill);
-    debug_assert!(!gc_spill || reserved_table_log2.is_some());
-    let uses_gc = module_uses_gc_roots(m);
-    let gc_veto = uses_gc && !gc_spill;
-    let gc_reach = if uses_gc && gc_spill {
-        reaches(m, Func::uses_gc_roots)
-    } else {
-        Vec::new()
-    };
+    let gc_veto = false;
+    let gc_reach: Vec<bool> = Vec::new();
     // The cross-tier set — functions an emitted `Call`/`call.dyn` routes to `env.call_interp`.
     // Two widths, by who services the bounce:
     //   * **a throwaway window** (`bounce` is `None`): the strict [`interp_leaf`] set —
@@ -3236,7 +3186,7 @@ pub fn compile_jit(m: &Module, shape: Shape, shared_memory: bool) -> Result<Arti
     // before the shape split so it holds for `Threaded`/tier-up too, not just the rooted paths.
     // #1546: a module that can reach `gc.roots` declines the same way and for the same reason — an
     // emitted frame is invisible to the op's scan (see [`module_uses_gc_roots`]).
-    if module_uses_page_ops(m) || module_uses_gc_roots(m) {
+    if module_uses_page_ops(m) {
         return compile_interp_only(m, shared_memory);
     }
     match shape {
@@ -3281,7 +3231,7 @@ pub fn compile_jit_page_checked(
     shared_memory: bool,
     page_log2: u8,
 ) -> Result<Artifact, Error> {
-    if m.funcs.iter().any(func_uses_region_ops) || module_uses_gc_roots(m) {
+    if m.funcs.iter().any(func_uses_region_ops) {
         return compile_interp_only(m, shared_memory);
     }
     let interp_driven = |m: &Module| -> Result<Artifact, Error> {

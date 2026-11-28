@@ -532,65 +532,6 @@ export 0 func "_start" 0
 `), (p, n) => ex.temen_coop_open(p, n, 0, 0, 1, 0, 0, COOP_LEAF_ROOT));
 if (huge !== -2) fail(`a 4 GiB window's open must fail with STATUS_UNSUPPORTED (-2): ${huge}`);
 
-// 6d. A collector (#1627). f1 tiers up and holds `vroot`, in the scanned range, across its call to the
-// collector, which stays interpreted: the emitted frame spills `vroot` before it bounces, and the
-// bounce copies the spilled words out of the root's memory to where `gc.roots` scans them. The scan
-// counts the collector's own `vlo` and `vroot`, as it does on the oracle, where f1's frame holds it.
-const GC_SRC = String.raw`memory 16
-data ro 40960 "stdout"
-func () -> (i64) {
-block 0 () {
-  vp = i64.const 137120
-  vr = call 1 (vp)
-  vsl = i64.const 34816
-  i64.store vsl vr
-  vnp = i64.const 40960
-  vnl = i64.const 6
-  vout = self.resolve vnp vnl
-  vlen8 = i64.const 8
-  vw = call.cap 0 1 (i64, i64) -> (i64) vout (vsl, vlen8)
-  return vr
-  }
-}
-func (i64) -> (i64) {
-block 0 (vp: i64) {
-  vk = i64.const 100000
-  vroot = i64.sub vp vk
-  vres = call 2 ()
-  vd = i64.sub vroot vroot
-  vnine = i64.const 9
-  vs = i64.add vres vnine
-  vt = i64.add vs vd
-  return vt
-  }
-}
-func () -> (i64) {
-block 0 () {
-  vlo = i64.const 36864
-  vhi = i64.const 40960
-  vmask = i64.const -1
-  vbuf = i64.const 45056
-  vcap = i64.const 64
-  vt = gc.roots vlo vhi vmask vbuf vcap
-  return vt
-  }
-}
-export 0 func "_start" 0
-`;
-const gcGuest = parse(GC_SRC);
-const gcWant = oracle(gcGuest);
-const gc = await coop(gcGuest, 0);
-if (gcWant.status !== 0 || gcWant.out !== 11n) fail(`gc oracle sanity: ${show(gcWant)}`);
-if (gc.opened !== 0) {
-  fail(`the collecting root's open refused: ${gc.opened}`);
-} else {
-  if (gc.tierups < 1 || gc.spill < 1) {
-    fail(`f1 must run emitted and spill across its bounce: ${gc.tierups} tier-up(s), ${gc.spill} word(s)`);
-  }
-  if (!own(gc)) fail(`the collecting root's events must name one memory of its own: ${show([...gc.mems])}`);
-  if (!same(gc, gcWant)) fail(`the collector's roots: ${show(gc.got)}, oracle ${show(gcWant)}`);
-}
-
 // 6e. Section 5's child, its emit page-checked (the module has read-only data) and its f3 mapping
 // 16 KiB at 300 MiB for f2 to store through: the child's page-state table, one byte per 4 KiB page,
 // is longer than the 60 KiB its header held before #1414 5d. The `"budget"` it is paid from is
@@ -664,5 +605,5 @@ if (process.exitCode) process.exit(process.exitCode);
 console.log(`${growOk()}; a child image tiers up as program `
   + `${show([...new Set(childPrograms)])} over memories ${show([...new Set(childMems)])}; `
   + `a root grown past 256 MiB in a memory of its own (the engine's grew ${big.grew} bytes), a map past a `
-  + `64 MiB grant refused (${capped.got?.out}), a 4 GiB window refused, a collector's spilled roots `
-  + `found (${gc.got?.out}), and a page-checked child grown past 240 MiB (a ${pagedTable}-byte page-state table)`);
+  + `64 MiB grant refused (${capped.got?.out}), a 4 GiB window refused, and a page-checked child `
+  + `grown past 240 MiB (a ${pagedTable}-byte page-state table)`);

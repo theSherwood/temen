@@ -120,20 +120,6 @@ fn bulk_ops_onto_an_absent_page_fault() {
     faults_everywhere("a copy", program(&copy, ""));
 }
 
-/// `gc.roots` into a buffer that is not there.
-#[test]
-fn gc_roots_into_an_absent_buffer_faults() {
-    let body = format!(
-        "  vlo = i64.const 0
-  vhi = i64.const -1
-  vmask = i64.const -1
-  vbuf = i64.const {TAIL}
-  vcap = i64.const 8
-  vn = gc.roots vlo vhi vmask vbuf vcap"
-    );
-    faults_everywhere("gc.roots", program(&body, ""));
-}
-
 // The guest's own faults, where its code runs on a stack the root did not start with. Each must
 // still be the guest's `MemoryFault`: the code faulting is emitted code, in its module's arena.
 

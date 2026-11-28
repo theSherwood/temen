@@ -1222,16 +1222,6 @@ fn fibers_threads(ops: &mut Vec<Op>) {
             },
         ),
         ("thread.join", Inst::ThreadJoin { handle: 0 }),
-        (
-            "gc.roots",
-            Inst::GcRoots {
-                heap_lo: 0,
-                heap_hi: 1,
-                mask: 2,
-                buf: 3,
-                cap: 4,
-            },
-        ),
         ("setjmp", Inst::SetJmp { buf: 0 }),
         ("longjmp", Inst::LongJmp { buf: 0, val: 1 }),
     ] {

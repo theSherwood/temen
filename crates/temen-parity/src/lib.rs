@@ -141,10 +141,7 @@ const fn row(cranelift: Cell, wasm_jit: Cell) -> [Cell; 4] {
 const LEAF: &str = "leaf accelerator: folds to the bytecode interp underneath (DESIGN §3)";
 const HOST_OP: &str = "host cap/handle op — serviced by the oracle, not emitted";
 /// The `fiber_rt` target set, from `temen-jit/build.rs`: unix x86-64, unix aarch64 and Windows
-/// x86-64. Each needs two pieces of per-ABI naked asm — `temen-fiber`'s stack switch, and (for
-/// `gc.roots`) the `temen_gc_roots_flush` register-flush trampoline, since the scan walks memory
-/// and would miss a root parked in a callee-saved register. Elsewhere the JIT declines and the
-/// interpreters cover the op.
+/// x86-64 (`temen-fiber`'s stack switch). Elsewhere the JIT declines and the interpreters cover the op.
 const FIBER_RT: &str =
     "Full on unix x86-64 / unix aarch64 / Windows x86-64 (fiber_rt); Declines to the interp \
      elsewhere";
@@ -153,13 +150,6 @@ const FIBER_RT: &str =
 /// follow-on), so the JIT keeps declining there.
 const SETJMP_RT: &str =
     "Full on unix x86-64 / unix aarch64 (setjmp_rt); Declines to the interp elsewhere";
-/// #1546 — the wasm tier's `gc.roots` posture is **module**-granular, not the family's leaf fold: an
-/// emitted frame's locals are unscannable, so a module that can reach the op emits nothing at all
-/// (`module_uses_gc_roots`, every entry in `temen-wasm-jit`). #1563 — and the debug tier services it,
-/// sharing production's scan rather than declining.
-const GC_ROOTS_WASM: &str =
-    "module-granular: a module that can reach it emits nothing (#1546), since an emitted frame's \
-     roots are invisible to the scan; serviced on the debug engine too (#1563)";
 const NO_WASM_OP: &str = "no core-wasm opcode (relaxed-SIMD / scalar-fma only)";
 const SERVE: &str =
     "native serve-loop core (svc.poll/svc.wait) for a serve-qualified module; else folds to the oracle";
@@ -368,12 +358,6 @@ pub fn parity(inst: &Inst) -> [Cell; 4] {
         | Inst::MemoryNotify { .. } => row(
             cell(Status::Conditional, FIBER_RT),
             cell(Status::Declines, LEAF),
-        ),
-        // §GC `gc.roots`: Cranelift as the family, but the wasm tier's decline is its own posture —
-        // module-granular, and for a different reason than the leaf fold (see [`GC_ROOTS_WASM`]).
-        Inst::GcRoots { .. } => row(
-            cell(Status::Conditional, FIBER_RT),
-            cell(Status::Declines, GC_ROOTS_WASM),
         ),
         // setjmp/longjmp: Cranelift on the setjmp_rt targets; the wasm-JIT leaf folds them.
         Inst::SetJmp { .. } | Inst::LongJmp { .. } => row(

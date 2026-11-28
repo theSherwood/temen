@@ -516,7 +516,7 @@ impl CodeFacts {
         let mut makes = Makes::default();
         let (mut uses_fibers, mut uses_threads) = (false, false);
         for f in code.funcs {
-            uses_fibers |= f.uses_fibers() || f.uses_gc_roots();
+            uses_fibers |= f.uses_fibers();
             uses_threads |= f.uses_threads() || f.uses_futex();
             for i in f.blocks.iter().flat_map(|b| &b.insts) {
                 match i {

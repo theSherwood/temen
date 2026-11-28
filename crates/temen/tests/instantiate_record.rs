@@ -1423,43 +1423,6 @@ fn a_paged_childs_v128_load_is_paged_in() {
     }
 }
 
-/// #2164 — `gc.roots` writing into an unsupplied page faults, fatally, on every backend: every engine
-/// writes the roots from the host, through its checked buffer write, which pages nothing in. The
-/// range takes every masked word, so the scan finds a root to write.
-#[test]
-fn a_paged_childs_gc_roots_into_an_unsupplied_page_is_fatal() {
-    let src = detached_pager_src(20000).replace(
-        "  vb = i32.load8_u va\n",
-        "  vlo = i64.const 0\n  vhi = i64.const 72057594037927935\n  \
-         vmask = i64.const 72057594037927935\n  vcap = i64.const 4\n  \
-         vn = gc.roots vlo vhi vmask va vcap\n  vb = i32.wrap_i64 vn\n",
-    );
-    assert!(src.contains("gc.roots vlo"), "the rewrite must apply");
-    let faulted = temen_ir::trap_code::MEMORY_FAULT as i32 * 1_000_000;
-    for b in BACKENDS {
-        assert_eq!(run_detached(b, &src).expect("run"), faulted, "{b:?}");
-    }
-}
-
-/// #2164 — `gc.roots` into a page its pager has supplied writes the roots, on every backend: the
-/// child first reads 20000 (the pager's 77), then scans into it. On the JIT the host's buffer check
-/// reads the access table, so the supply must have reached it. The scan's count is each engine's own
-/// (GC.md §3.2): the child returns `77 + 100` when it found any.
-#[test]
-fn a_paged_childs_gc_roots_into_a_supplied_page_writes() {
-    let src = detached_pager_src(20000).replace(
-        "  vb = i32.load8_u va\n",
-        "  vb0 = i32.load8_u va\n  vlo = i64.const 0\n  vhi = i64.const 72057594037927935\n  \
-         vmask = i64.const 72057594037927935\n  vcap = i64.const 4\n  \
-         vn = gc.roots vlo vhi vmask va vcap\n  vz0 = i64.const 0\n  vany = i64.ne vn vz0\n  \
-         vh = i32.const 100\n  vhit = i32.mul vany vh\n  vb = i32.add vb0 vhit\n",
-    );
-    assert!(src.contains("gc.roots vlo"), "the rewrite must apply");
-    for b in BACKENDS {
-        assert_eq!(run_detached(b, &src).expect("run"), 1177, "{b:?}");
-    }
-}
-
 /// #2164 — a page the child unmaps itself is paged in again at its next touch, on every driver: the
 /// pager supplies the child's declared pages, whatever took one away. The child reads 20000 (77),
 /// unmaps the 16 KiB around it through its own AddressSpace, and reads it again (77). The parent

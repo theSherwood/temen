@@ -730,14 +730,6 @@ fn print_inst(inst: &Inst, m: &Module, prev_const0: Option<u32>) -> String {
         Inst::Suspend { value } => format!("suspend v{value}"),
         Inst::SetJmp { buf } => format!("setjmp v{buf}"),
         Inst::LongJmp { buf, val } => format!("longjmp v{buf} v{val}"),
-        // §GC conservative root enumeration.
-        Inst::GcRoots {
-            heap_lo,
-            heap_hi,
-            mask,
-            buf,
-            cap,
-        } => format!("gc.roots v{heap_lo} v{heap_hi} v{mask} v{buf} v{cap}"),
         // §12 real threads (OS-thread vCPUs over shared memory).
         Inst::ThreadSpawn { func, arg0, arg1 } => format!("thread.spawn {func} v{arg0} v{arg1}"),
         Inst::ThreadJoin { handle } => format!("thread.join v{handle}"),
@@ -3175,20 +3167,6 @@ impl<'a> Parser<'a> {
             let buf = self.value(names)?;
             let val = self.value(names)?;
             return Ok(Inst::LongJmp { buf, val });
-        }
-        if op == "gc.roots" {
-            let heap_lo = self.value(names)?;
-            let heap_hi = self.value(names)?;
-            let mask = self.value(names)?;
-            let buf = self.value(names)?;
-            let cap = self.value(names)?;
-            return Ok(Inst::GcRoots {
-                heap_lo,
-                heap_hi,
-                mask,
-                buf,
-                cap,
-            });
         }
         // §12 real threads.
         if op == "thread.spawn" {

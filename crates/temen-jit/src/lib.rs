@@ -5786,11 +5786,6 @@ impl CompiledModule {
         // thread-local for the duration of the entry; spawned vCPUs publish their own.
         #[cfg(fiber_rt)]
         {
-            // The OS-thread stack pointer in *this* (`run_inner`) frame — above the guarded guest
-            // call below and every guest root frame it pushes — is the high bound for `gc.roots`'
-            // scan of the root computation's frames. Read in this frame (`stack_pointer` is always
-            // inlined), so it dominates the guest's frames.
-            let entry_sp = crate::stack_check::stack_pointer() as usize;
             let t = &mut *this;
             let durable = t.durable;
             // Durable **thaw** (slice 3.3.3): re-create the frozen fibers in the run-shared table
@@ -5798,7 +5793,6 @@ impl CompiledModule {
             // them. Done before `set_current` (and the run), while the window/table/trap cell are set.
             if let Some(f) = run_fibers.as_mut() {
                 if let Some(rt) = f.root.as_mut() {
-                    rt.set_root_entry_sp(entry_sp);
                     // Arm the durable fiber-switch swap for the root vCPU (DURABILITY.md §12.8): the
                     // window base is known now. (Spawned vCPUs are multi-vCPU durability, Phase 3.2.)
                     rt.set_durable_env(mem_base as u64, durable);
@@ -7010,8 +7004,6 @@ enum HostFn {
     /// I48 — `cont.resume.block`'s thunk.
     FiberResumeBlock,
     FiberSuspend,
-    /// The `gc.roots` register-flush trampoline.
-    GcRoots,
     ThreadSpawn,
     ThreadJoin,
     ThreadWait,
@@ -7056,7 +7048,7 @@ enum HostFn {
 
 impl HostFn {
     /// Every host function, for [`new_jit_module`] to bind.
-    const ALL: [HostFn; 33] = [
+    const ALL: [HostFn; 32] = [
         HostFn::CapThunk,
         HostFn::SigTake,
         HostFn::SigReturn,
@@ -7064,7 +7056,6 @@ impl HostFn {
         HostFn::FiberResume,
         HostFn::FiberResumeBlock,
         HostFn::FiberSuspend,
-        HostFn::GcRoots,
         HostFn::ThreadSpawn,
         HostFn::ThreadJoin,
         HostFn::ThreadWait,
@@ -7117,7 +7108,6 @@ impl HostFn {
             HostFn::FiberResume => "temen.fiber_resume",
             HostFn::FiberResumeBlock => "temen.fiber_resume_block",
             HostFn::FiberSuspend => "temen.fiber_suspend",
-            HostFn::GcRoots => "temen.gc_roots",
             HostFn::ThreadSpawn => "temen.thread_spawn",
             HostFn::ThreadJoin => "temen.thread_join",
             HostFn::ThreadWait => "temen.thread_wait",
@@ -7216,15 +7206,6 @@ impl HostFn {
             ],
             // vmctx
             HostFn::SigReturn => &[Vmctx],
-            // vmctx, args_ptr — the five operands the host only reads (the roots it collects go to
-            // the guest-memory `buf` named inside them, never back into this frame).
-            HostFn::GcRoots => &[
-                Vmctx,
-                StackSlot {
-                    len: 40,
-                    write: false,
-                },
-            ],
             _ => &[],
         }
     }
@@ -7267,8 +7248,6 @@ impl HostFn {
             FiberResumeBlock => (&[I64, I64, I64, I64], &[I64]),
             // (value, vmctx) -> value
             FiberSuspend => (&[I64, I64], &[I64]),
-            // (vmctx, args) -> the candidates found
-            GcRoots => (&[I64, I64], &[I64]),
             // (vmctx, func, arg0, arg1) -> handle
             ThreadSpawn => (&[I64, I32, I64, I64], &[I32]),
             // (vmctx, handle, status_out) -> value
@@ -7327,10 +7306,6 @@ impl HostFn {
             HostFn::FiberResumeBlock => os_thread_rt::fiber_resume_block as *const (),
             #[cfg(fiber_rt)]
             HostFn::FiberSuspend => fiber_rt::fiber_suspend as *const (),
-            // The register-flush trampoline, not `gc_roots` itself: it spills the callee-saved
-            // registers before the scan, so a guest root parked in one is captured.
-            #[cfg(fiber_rt)]
-            HostFn::GcRoots => fiber_rt::temen_gc_roots_flush as *const (),
             #[cfg(fiber_rt)]
             HostFn::ThreadSpawn => os_thread_rt::thread_spawn as *const (),
             #[cfg(fiber_rt)]
@@ -8182,17 +8157,6 @@ mod arg_contract_tests {
                 }
             ]
         );
-        // vmctx in rdi, the 40-byte operand struct in rsi (idx 1), read-only.
-        assert_eq!(
-            HostFn::GcRoots.arg_contract(),
-            &[
-                Vmctx,
-                StackSlot {
-                    len: 40,
-                    write: false
-                }
-            ]
-        );
         // vmctx in rdi, the call's 256-byte argument and result buffer in rsi (idx 1).
         assert_eq!(
             HostFn::CapThunk.arg_contract(),
@@ -8214,7 +8178,6 @@ mod arg_contract_tests {
             HostFn::InstJoin.arg_contract()
         );
         assert_eq!(host_args("temen.sig_take"), HostFn::SigTake.arg_contract());
-        assert_eq!(host_args("temen.gc_roots"), HostFn::GcRoots.arg_contract());
     }
 
     /// #2534 — every host function that acts on the window or a runtime object takes the context
@@ -8229,7 +8192,6 @@ mod arg_contract_tests {
         for h in [
             FiberNew,
             FiberResumeBlock,
-            GcRoots,
             ThreadSpawn,
             ThreadJoin,
             ThreadWait,
@@ -8427,7 +8389,6 @@ block 0 (vh: i32, vi: i32, vx: i64) {
   vm = i64.const -1
   vbuf = i64.const 128
   vcap = i64.const 4
-  vr = gc.roots vlo vhi vm vbuf vcap
   vtls = vcpu.tls.get
   vcpu.tls.set vtls
   vsb = durable.shadow_base
@@ -9133,9 +9094,9 @@ fn compile_child_windowed(
     // equality across the child's program and its units (DESIGN.md §22).
     let mut distinct = distinct_types(funcs);
     intern_unit_sigs(&mut distinct, funcs, types)?;
-    // A task child using `cont.*` or `gc.roots` gets the fiber thunks, as a root does
+    // A task child using `cont.*` gets the fiber thunks, as a root does
     // (`compile_with_signal`); the fiber-entry signature is interned the same way.
-    let uses_fibers = funcs.iter().any(|f| f.uses_fibers() || f.uses_gc_roots());
+    let uses_fibers = funcs.iter().any(|f| f.uses_fibers());
     // Thread ops passed the check above only in a task that can host them.
     let uses_threads = funcs.iter().any(|f| f.uses_threads());
     #[cfg(fiber_rt)]
@@ -9867,10 +9828,6 @@ fn ensure_supported(f: &Func, type_section: &[temen_ir::TypeEntry]) -> Result<()
                 | Inst::ThreadJoin { .. }
                 | Inst::MemoryWait { .. }
                 | Inst::MemoryNotify { .. }
-                // §GC `gc.roots`: scans the live fiber stacks via the fiber runtime — supported only
-                // where the stack-switch substrate exists (else it bails like the other fiber ops and
-                // the interpreter covers it).
-                | Inst::GcRoots { .. }
                     if cfg!(fiber_rt) => {}
                 // `setjmp`/`longjmp` (LLVM.md §"JIT `longjmp`", Option B): libc `_setjmp`/`_longjmp`
                 // called inline from JITted code with a host-side `jmp_buf` table. Supported on the
@@ -11640,50 +11597,6 @@ fn lower_block(
         if let Inst::VcpuTlsSet { val } = inst {
             let v = get(&vals, *val)?;
             call_host(lower.callees, b, HostFn::VcpuTlsSet, &[v])?;
-            continue;
-        }
-        if let Inst::GcRoots {
-            heap_lo,
-            heap_hi,
-            mask,
-            buf,
-            cap,
-        } = inst
-        {
-            // gc_roots(vmctx, args) -> i64 count, `args` the five operands. The thunk walks the live
-            // fiber stacks (runtime via the thread-local), masks each word with `payload_mask` (§GC
-            // tagged pointers; distinct from the window-confinement mask), filters the masked value
-            // to `[heap_lo, heap_hi)`, and writes the first `cap` deduped words to guest `buf` —
-            // confining/bounds-checking it against `vmctx`'s window (#2534) with the same mask/bound
-            // as `mask_addr`, so a forged buffer faults. #826: the bound is the **reserved** mask
-            // domain (not the compile-time `mapped`), so a roots buffer in a legitimately
-            // `map`-grown tail page is admitted where the interpreter's live page map admits it;
-            // committed-ness and write-protection are the hardware's to enforce — a write into an
-            // uncommitted or `Ro` page faults through the SIGSEGV shim to `MemoryFault`, exactly like
-            // a guest store. A demand-paged child's thunk checks its access table first (#2164).
-            let lo = get(&vals, *heap_lo)?;
-            let hi = get(&vals, *heap_hi)?;
-            let payload_mask = get(&vals, *mask)?;
-            let dst = get(&vals, *buf)?;
-            let cap_v = get(&vals, *cap)?;
-            let vmctx = b.use_var(lower.vmctx_var);
-            // Marshal the five operands into one 8-byte-aligned stack slot (matching `GcRootsArgs`'s
-            // `#[repr(C)]` field order) and pass its address beside `vmctx`. The thunk is the
-            // register-flush trampoline, which spills the callee-saved registers before the scan; two
-            // register arguments on every ABI let it do so with no per-argument reshuffle (see
-            // `fiber_rt::temen_gc_roots_flush`).
-            let slot = b.create_sized_stack_slot(StackSlotData::new(
-                StackSlotKind::ExplicitSlot,
-                40, // 5 × 8 bytes
-                3,  // 8-byte aligned
-            ));
-            for (i, v) in [lo, hi, payload_mask, dst, cap_v].into_iter().enumerate() {
-                b.ins().stack_store(v, slot, (i * 8) as i32);
-            }
-            let args_ptr = b.ins().stack_addr(I64, slot, 0);
-            let call = call_host(lower.callees, b, HostFn::GcRoots, &[vmctx, args_ptr])?;
-            emit_trap_propagate(b, lower, Callee::Host);
-            vals.push(b.inst_results(call)[0]);
             continue;
         }
         // §12 threads: lower `thread.spawn`/`thread.join` to calls to the host scheduler thunks

@@ -532,30 +532,6 @@ fn directed_rule_rejects() {
         matches!(e, VerifyError::UnresolvedImport { .. })
     });
 
-    // GC.md: a constant gc.roots mask may only clear the top byte.
-    let mut m = module(vec![func(
-        vec![V::I64],
-        vec![V::I64],
-        vec![
-            Inst::ConstI64(0), // a fold-down mask (clears low bits) — unsafe
-            Inst::GcRoots {
-                heap_lo: 0,
-                heap_hi: 0,
-                mask: 1,
-                buf: 0,
-                cap: 0,
-            },
-        ],
-        T::Return(vec![2]),
-    )]);
-    m.memory = Some(Memory {
-        size_log2: 12,
-        shadow: None,
-    });
-    reject(&m, "gc.roots unsafe mask", |e| {
-        matches!(e, VerifyError::GcRootsMaskUnsafe { .. })
-    });
-
     // Exports: real targets, unique names.
     let mut m = module(vec![func(vec![], vec![], vec![], T::Return(vec![]))]);
     m.exports.push(Export {
