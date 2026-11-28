@@ -605,5 +605,5 @@ if (process.exitCode) process.exit(process.exitCode);
 console.log(`${growOk()}; a child image tiers up as program `
   + `${show([...new Set(childPrograms)])} over memories ${show([...new Set(childMems)])}; `
   + `a root grown past 256 MiB in a memory of its own (the engine's grew ${big.grew} bytes), a map past a `
-  + `64 MiB grant refused (${capped.got?.out}), a 4 GiB window refused, a collector's spilled roots `
-  + `found (${gc.got?.out}), and a page-checked child grown past 240 MiB (a ${pagedTable}-byte page-state table)`);
+  + `64 MiB grant refused (${capped.got?.out}), a 4 GiB window refused, and a page-checked child `
+  + `grown past 240 MiB (a ${pagedTable}-byte page-state table)`);
