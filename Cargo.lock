@@ -782,6 +782,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "temen-bytecode"
+version = "0.0.0"
+dependencies = [
+ "libm",
+ "temen-ir",
+ "temen-kernel",
+ "temen-mask",
+ "temen-mem",
+]
+
+[[package]]
 name = "temen-capi"
 version = "0.0.0"
 dependencies = [
@@ -899,6 +910,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "temen-kernel"
+version = "0.0.0"
+dependencies = [
+ "loom",
+ "temen-ir",
+]
+
+[[package]]
 name = "temen-leng"
 version = "0.0.0"
 dependencies = [
@@ -1007,6 +1026,20 @@ dependencies = [
  "temen-text",
  "temen-verify",
  "windows-sys 0.59.0",
+]
+
+[[package]]
+name = "temen-runtime"
+version = "0.0.0"
+dependencies = [
+ "temen-bytecode",
+ "temen-interp",
+ "temen-ir",
+ "temen-kernel",
+ "temen-mask",
+ "temen-mem",
+ "temen-text",
+ "temen-verify",
 ]
 
 [[package]]

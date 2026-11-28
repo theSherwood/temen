@@ -133,7 +133,7 @@ if [ "${TEMEN_GATE_SKIP_LOOM:-0}" = "1" ]; then
   echo "local-gate: SKIP loom compile check (TEMEN_GATE_SKIP_LOOM=1)"
 else
   RUSTFLAGS="--cfg loom" CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$repo_root/target}/loom" \
-    cargo_pinned check -p temen-jit -p temen-interp --lib --profile test
+    cargo_pinned check -p temen-kernel -p temen-jit -p temen-interp --lib --profile test
 fi
 
 # --- cross-checks -----------------------------------------------------------------------------

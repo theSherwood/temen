@@ -28,6 +28,9 @@ members = [
     "crates/temen-capi",
     "crates/temen-parity",
     "crates/temen-gpu",
+    "crates/temen-kernel",
+    "crates/temen-bytecode",
+    "crates/temen-runtime",
 ]
 # `fuzz/` is a cargo-fuzz crate (nightly + libfuzzer-sys); `bench/` pulls in Wasmtime for
 # the comparison harness; `crates/temen-llvm` is the AOT LLVM→IR on-ramp (D54 — an opt-in,
@@ -65,6 +68,8 @@ temen-jit = { path = "crates/temen-jit" }
 temen-spec = { path = "crates/temen-spec" }
 temen-wasm-jit = { path = "crates/temen-wasm-jit" }
 temen-parity = { path = "crates/temen-parity" }
+temen-kernel = { path = "crates/temen-kernel" }
+temen-bytecode = { path = "crates/temen-bytecode" }
 
 # Changing any profile below? Bump `RUST_CACHE_EPOCH` in `.github/workflows/ci.yml` in the same
 # change. CI's dependency caches are not keyed on this file, so without the bump every job keeps

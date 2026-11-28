@@ -1,0 +1,22 @@
+[package]
+name = "temen-kernel"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+# The passive, engine-agnostic runtime kernel (#3187 / #3194):
+# `#![forbid(unsafe_code)]`, zero execution-engine dependencies, Miri + Loom + wasm64 clean.
+# Owns Domain, Context, WaitIndex, Budget, LifecycleHooks, DomainControl, and the KernelOps / Step
+# seam shared by stackless engines (temen-bytecode, OpOracle) and native engines (temen-jit).
+
+[dependencies]
+temen-ir.workspace = true
+
+[target.'cfg(loom)'.dependencies]
+loom = "0.7"
+
+[lints.rust]
+# `--cfg loom` is set manually for loom model-checking runs; tell rustc it's expected.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
