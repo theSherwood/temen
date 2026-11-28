@@ -504,11 +504,29 @@ pub fn transpile(wasm: &[u8]) -> Result<Transpiled, Error> {
         }
     }
 
+    // Checked layout helpers (#3177): untrusted wasm bytes (especially memory64 / huge table
+    // limits) must fail closed with an Error, never panic on overflow or OOM.
+    let overflow =
+        || Error::Unsupported("module linear memory / table layout exceeds window limits".into());
+    let align_up = |v: u64, align: u64| -> Result<u64, Error> {
+        let rem = v % align;
+        if rem == 0 {
+            Ok(v)
+        } else {
+            v.checked_add(align - rem).ok_or_else(overflow)
+        }
+    };
+
     // Linear-memory layout. The linear memory sits at window offset 0 (so wasm address `a` is window
     // address `a`); the page count it may occupy is its initial size, or — when `memory.grow` is used —
     // up to its declared `maximum` (a default cap for unbounded memory, bounded by `MAX_GROW_PAGES`).
     // The window must hold that whole span (it is eagerly committed), so a grown page is reachable;
     // an access past the window traps under Temen's trap-confinement (matching wasm's OOB trap).
+    if let Some(m) = &mem {
+        if m.maximum.is_some_and(|max| max < m.initial) {
+            return Err(Error::Parse("memory maximum smaller than initial".into()));
+        }
+    }
     let initial_pages = mem.as_ref().map(|m| m.initial).unwrap_or(0);
     let max_pages = if uses_grow {
         mem.as_ref()
@@ -519,7 +537,7 @@ pub fn transpile(wasm: &[u8]) -> Result<Transpiled, Error> {
         initial_pages
     };
     let mem_span_pages = if mem.is_some() { max_pages.max(1) } else { 0 };
-    let mem_bytes = mem_span_pages.saturating_mul(WASM_PAGE);
+    let mem_bytes = mem_span_pages.checked_mul(WASM_PAGE).ok_or_else(overflow)?;
 
     // Runtime current-size cell (pages), an 8-byte slot just above the linear-memory span — present
     // only when `grow` is used; `memory.size`/`grow` load/store it, initialized to the initial page
@@ -531,7 +549,7 @@ pub fn transpile(wasm: &[u8]) -> Result<Transpiled, Error> {
             readonly: false,
             bytes: initial_pages.to_le_bytes().to_vec(),
         });
-        size_cell_off + 8
+        size_cell_off.checked_add(8).ok_or_else(overflow)?
     } else {
         mem_bytes
     };
@@ -553,22 +571,32 @@ pub fn transpile(wasm: &[u8]) -> Result<Transpiled, Error> {
     // table-only dispatch module) keeps its table reachable. Any module that declares memory has
     // `after_mem >= 64 KiB > guard`, so this is byte-identical there.
     let reserved_floor = after_mem.max(temen_ir::POWERBOX_NULL_GUARD);
-    let globals_base = reserved_floor.div_ceil(8) * 8; // 8-byte aligned, just past the linear memory + cell
+    let globals_base = align_up(reserved_floor, 8)?; // 8-byte aligned, just past the linear memory + cell
     let globals_types: Vec<ValType> = globals.iter().map(|(t, _)| *t).collect();
     for (g, (_, bytes)) in globals.iter().enumerate() {
+        let g_off = (g as u64)
+            .checked_mul(8)
+            .and_then(|o| globals_base.checked_add(o))
+            .ok_or_else(overflow)?;
         data.push(temen_ir::Data {
-            offset: globals_base + g as u64 * 8,
+            offset: g_off,
             readonly: false,
             bytes: bytes.clone(),
         });
     }
-    let globals_end = globals_base + globals.len() as u64 * 8;
+    let globals_bytes = (globals.len() as u64).checked_mul(8).ok_or_else(overflow)?;
+    let globals_end = globals_base
+        .checked_add(globals_bytes)
+        .ok_or_else(overflow)?;
 
     // The wasm function table → an in-window array of i32 function indices (each `funcref` is our
     // §3c funcref index = the function index). `call_indirect` loads the entry and feeds it to our
     // `CallIndirect`, whose `table_lookup` does the type-id check. Empty slots get a sentinel that
     // fails that check (≈ wasm's null-funcref trap). Element segments fill the live slots.
     let tsize = table_size.unwrap_or(0);
+    if table_max.is_some_and(|max| max < tsize) {
+        return Err(Error::Parse("table maximum smaller than initial".into()));
+    }
     // When `table.grow` is used the table region must span its growable maximum — the declared table
     // `maximum`, or a default cap for an unbounded table, bounded by `MAX_GROW_SLOTS` — so a grown slot
     // is reachable (eagerly committed, exactly the memory.grow span argument). A non-growing
@@ -580,19 +608,33 @@ pub fn transpile(wasm: &[u8]) -> Result<Transpiled, Error> {
     } else {
         tsize
     };
-    let table_base = globals_end.div_ceil(4) * 4;
+    let table_base = align_up(globals_end, 4)?;
     let table_span_slots = if uses_table_grow {
         table_max_slots
     } else {
         tsize
     };
+    // Cap eagerly materialized table bytes (1M slots = 4 MiB) so an untrusted table initial size
+    // cannot OOM the transpiler (#3177).
+    const MAX_MATERIALIZED_TABLE_SLOTS: u64 = 1 << 20;
+    if table_span_slots > MAX_MATERIALIZED_TABLE_SLOTS {
+        return Err(Error::Unsupported(format!(
+            "table span {table_span_slots} slots exceeds transpiler limit ({MAX_MATERIALIZED_TABLE_SLOTS})"
+        )));
+    }
+    let table_bytes = table_span_slots.checked_mul(4).ok_or_else(overflow)?;
     if table_span_slots > 0 {
-        let mut bytes = vec![0xFFu8; table_span_slots as usize * 4]; // sentinel = no/bad funcref
+        let mut bytes = vec![0xFFu8; table_bytes as usize]; // sentinel = no/bad funcref
         for (off, fns) in &elements {
             for (k, &f) in fns.iter().enumerate() {
-                let slot = (*off as usize + k) * 4;
-                if slot + 4 <= bytes.len() {
-                    bytes[slot..slot + 4].copy_from_slice(&f.to_le_bytes());
+                if let Some(slot) = off
+                    .checked_add(k as u64)
+                    .and_then(|i| i.checked_mul(4))
+                    .and_then(|b| usize::try_from(b).ok())
+                {
+                    if slot.checked_add(4).is_some_and(|end| end <= bytes.len()) {
+                        bytes[slot..slot + 4].copy_from_slice(&f.to_le_bytes());
+                    }
                 }
             }
         }
@@ -602,7 +644,7 @@ pub fn transpile(wasm: &[u8]) -> Result<Transpiled, Error> {
             bytes,
         });
     }
-    let table_data_end = table_base + table_span_slots * 4;
+    let table_data_end = table_base.checked_add(table_bytes).ok_or_else(overflow)?;
     // Runtime current-size cell (slots), a 4-byte slot just past the table span — present only when
     // `table.grow` is used. `table.size`/`grow` load/store it, initialized to the initial slot count
     // via a `data` segment. (Without growth there is no cell and `table.size` is the constant `tsize`.)
@@ -613,13 +655,13 @@ pub fn transpile(wasm: &[u8]) -> Result<Transpiled, Error> {
             readonly: false,
             bytes: (tsize as u32).to_le_bytes().to_vec(),
         });
-        table_size_cell_off + 4
+        table_size_cell_off.checked_add(4).ok_or_else(overflow)?
     } else {
         table_data_end
     };
     // §12 wasm threads: a 4-byte reserved unique-tid counter just past the function table (a fresh
     // window reads 0, so the first spawned tid is 1). Only consumed when `wasi:thread/spawn` is used.
-    let tid_slot = table_end.div_ceil(4) * 4;
+    let tid_slot = align_up(table_end, 4)?;
 
     // §12 wasm threads validation + the spawn shim's IR index (it is appended right after the defined
     // functions, so its index is `bodies.len()`). The shim adapts Temen's thread-entry ABI to the
@@ -757,18 +799,27 @@ pub fn transpile(wasm: &[u8]) -> Result<Transpiled, Error> {
     // regions. Both wasm and Temen bounds-check-and-trap on an out-of-range access; the residual
     // difference is only that an OOB linear-memory access landing in this window's globals/table region
     // stays reachable here (co-located) rather than trapping. Globals/table-only modules still need a window.
+    let tid_end = if spawn_import.is_some() {
+        // the reserved unique-tid counter
+        tid_slot.checked_add(4).ok_or_else(overflow)?
+    } else {
+        0
+    };
     let needed = table_end
         .max(globals_end)
         .max(after_mem)
         .max(mem_bytes)
-        .max(if spawn_import.is_some() {
-            // the reserved unique-tid counter
-            tid_slot + 4
-        } else {
-            0
-        });
+        .max(tid_end);
     let memory = if mem.is_some() || !globals.is_empty() || tsize > 0 {
-        let size_log2 = needed.max(1).next_power_of_two().trailing_zeros().max(16) as u8;
+        let pow2 = needed
+            .max(1)
+            .checked_next_power_of_two()
+            .ok_or_else(overflow)?;
+        let size_log2 = pow2.trailing_zeros().max(16) as u8;
+        // INVARIANTS #11: top byte belongs to the guest tag, capping windows at 2^56 bytes.
+        if size_log2 > 56 {
+            return Err(overflow());
+        }
         Some(temen_ir::Memory {
             size_log2,
             shadow: None,

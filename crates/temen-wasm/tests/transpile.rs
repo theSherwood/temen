@@ -1229,3 +1229,52 @@ fn gc_struct_type_is_unsupported_not_panic() {
         }
     }
 }
+
+/// Regression (#3177, nightly fuzz `wasm_transpile`): a memory64 declaration with a huge minimum
+/// page count used to saturate `mem_bytes = u64::MAX` and then panic in `div_ceil(8) * 8`.
+/// Untrusted wasm bytes must always fail closed with an `Err`, never panic or OOM.
+#[test]
+fn huge_memory64_and_table_limits_return_err_not_panic() {
+    // Exact 20-byte fuzz input from #3177: memory64 with huge LEB128 minimum.
+    let fuzz_3177: &[u8] = &[
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x05, 0x0a, 0x01, 0x04, 0xfa, 0xfe, 0xff,
+        0xff, 0xed, 0xff, 0xa7, 0x00,
+    ];
+    assert!(
+        matches!(
+            temen_wasm::transpile(fuzz_3177),
+            Err(temen_wasm::Error::Unsupported(_))
+        ),
+        "exact #3177 input must fail closed with Unsupported"
+    );
+
+    // memory64 whose byte size fits in u64 (1 << 57 bytes = 1 << 41 pages) but exceeds the 2^56
+    // window cap (Invariant 11) / `next_power_of_two` ceiling.
+    let huge_mem64_wat = "(module (memory i64 2199023255552))";
+    let huge_mem64 = wat::parse_str(huge_mem64_wat).unwrap();
+    assert!(
+        matches!(
+            temen_wasm::transpile(&huge_mem64),
+            Err(temen_wasm::Error::Unsupported(_))
+        ),
+        "memory64 > 2^56 bytes must fail closed with Unsupported"
+    );
+
+    // Huge initial table (10_000_000 slots = 40 MiB eager allocation) must fail closed rather than
+    // OOMing or overflowing.
+    let huge_table_wat = "(module (table 10000000 funcref))";
+    let huge_table = wat::parse_str(huge_table_wat).unwrap();
+    assert!(
+        matches!(
+            temen_wasm::transpile(&huge_table),
+            Err(temen_wasm::Error::Unsupported(_))
+        ),
+        "huge initial table must fail closed with Unsupported"
+    );
+
+    // Valid wasm32 max (65536 pages = 4 GiB) still transpiles cleanly without overflow.
+    let wasm32_max_wat = "(module (memory 1 65536))";
+    let wasm32_max = wat::parse_str(wasm32_max_wat).unwrap();
+    let t = temen_wasm::transpile(&wasm32_max).expect("valid wasm32 memory must transpile");
+    temen_verify::verify_module(&t.module).expect("valid wasm32 memory module must verify");
+}
