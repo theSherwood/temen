@@ -45,23 +45,25 @@ const fn unpack_thread_handle(handle: i32) -> (u16, u16) {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-type Deadline = Instant;
+pub(crate) type Deadline = Instant;
 #[cfg(target_arch = "wasm32")]
-type Deadline = u64;
+pub(crate) type Deadline = u64;
 
-struct FiberRecord {
-    handle: i64,
-    exec: Option<ExecState>,
-    started: bool,
-    parked: Option<FiberParkInfo>,
+pub(crate) struct FiberRecord {
+    pub(crate) handle: i64,
+    pub(crate) exec: Option<ExecState>,
+    #[cfg(all(feature = "cranelift", not(target_arch = "wasm32")))]
+    pub(crate) kfiber: Option<temen_jit::kernel_engine::KernelFiber>,
+    pub(crate) started: bool,
+    pub(crate) parked: Option<FiberParkInfo>,
 }
 
-struct FiberParkInfo {
-    key: WaitKey,
-    slot: Arc<WaitSlot>,
-    deadline: Option<Deadline>,
-    ctx: ContextId,
-    reexec_on_wake: bool,
+pub(crate) struct FiberParkInfo {
+    pub(crate) key: WaitKey,
+    pub(crate) slot: Arc<WaitSlot>,
+    pub(crate) deadline: Option<Deadline>,
+    pub(crate) ctx: ContextId,
+    pub(crate) reexec_on_wake: bool,
 }
 
 struct ThreadRecord {
@@ -71,7 +73,7 @@ struct ThreadRecord {
     joined: bool,
 }
 
-struct ThreadTable {
+pub(crate) struct ThreadTable {
     slots: Vec<ThreadRecord>,
     issued_gen: Vec<u16>,
     next_gen: u16,
@@ -86,7 +88,7 @@ impl ThreadTable {
         }
     }
 
-    fn alloc(&mut self, waitable: WaitableId) -> (i32, u16) {
+    pub(crate) fn alloc(&mut self, waitable: WaitableId) -> (i32, u16) {
         let gen = self.next_gen;
         self.next_gen = self.next_gen.wrapping_add(1).max(1);
         let slot = self.slots.len() as u16;
@@ -101,7 +103,7 @@ impl ThreadTable {
     }
 }
 
-enum ThreadJoinLookup {
+pub(crate) enum ThreadJoinLookup {
     Finished(ContextExit),
     Running(WaitableId),
     Spent,
@@ -114,66 +116,94 @@ pub struct DomainWorld {
     pub waits: Arc<WaitIndex>,
     pub budgets: Arc<BudgetTree>,
     pub ctl: DomainControl,
-    engine: Engine,
-    region: Option<Arc<Region>>,
+    pub(crate) engine: Engine,
+    pub(crate) region: Option<Arc<Region>>,
+    #[cfg(all(feature = "cranelift", not(target_arch = "wasm32")))]
+    pub(crate) kernel_mem: Option<Arc<temen_jit::kernel_engine::KernelMemory>>,
     window: Option<Window>,
     readonly_ranges: Vec<(u64, u64)>,
     null_guard: u64,
-    mem_space: MemSpaceId,
-    caps: Arc<dyn CapHandler>,
+    pub(crate) mem_space: MemSpaceId,
+    pub(crate) caps: Arc<dyn CapHandler>,
     fuel_chunk: u64,
     quantum: u32,
-    metered: bool,
-    next_carrier: AtomicU32,
+    pub(crate) metered: bool,
+    pub(crate) next_carrier: AtomicU32,
     next_waitable: AtomicU64,
-    fibers: Mutex<HashMap<ContextId, FiberRecord>>,
-    threads: Mutex<ThreadTable>,
+    pub(crate) fibers: Mutex<HashMap<ContextId, FiberRecord>>,
+    pub(crate) threads: Mutex<ThreadTable>,
     #[cfg(not(target_arch = "wasm32"))]
-    os_threads: Mutex<Vec<std::thread::JoinHandle<()>>>,
+    pub(crate) os_threads: Mutex<Vec<std::thread::JoinHandle<()>>>,
 }
 
 impl DomainWorld {
     /// Instantiate a fresh [`DomainWorld`] for `engine` under `cfg`.
     pub fn new(engine: Engine, cfg: RunConfig) -> Result<Arc<DomainWorld>, Trap> {
-        let Engine::Bytecode(ref code) = engine;
         let metered = cfg.limits.fuel != u64::MAX;
         let budgets = Arc::new(BudgetTree::new(cfg.limits));
 
         // Charge initial linear memory window + root task against the 3-dimension BudgetTree.
-        let (region, window, readonly_ranges, null_guard) =
-            if let Some(size_log2) = code.memory_size_log2 {
-                let bytes = 1u64
-                    .checked_shl(u32::from(size_log2))
-                    .ok_or(Trap::MemoryFault)?;
-                if !budgets.charge_mem(BudgetId::ROOT, bytes) {
-                    return Err(Trap::MemoryFault);
-                }
-                let reg = Arc::new(Region::new(bytes, 4096));
-                let mut ro = Vec::new();
-                for d in &code.initial_data {
-                    if d.offset
-                        .checked_add(d.bytes.len() as u64)
-                        .is_none_or(|end| end > bytes)
-                    {
+        let mut region = None;
+        let mut window = None;
+        let mut readonly_ranges = Vec::new();
+        let mut null_guard = 0u64;
+        #[cfg(all(feature = "cranelift", not(target_arch = "wasm32")))]
+        let mut kernel_mem = None;
+
+        match &engine {
+            Engine::Bytecode(code) => {
+                if let Some(size_log2) = code.memory_size_log2 {
+                    let bytes = 1u64
+                        .checked_shl(u32::from(size_log2))
+                        .ok_or(Trap::MemoryFault)?;
+                    if !budgets.charge_mem(BudgetId::ROOT, bytes) {
                         return Err(Trap::MemoryFault);
                     }
-                    reg.write_from(d.offset, &d.bytes);
-                    if d.readonly && !d.bytes.is_empty() {
-                        ro.push((d.offset, d.offset + d.bytes.len() as u64));
+                    let reg = Arc::new(Region::new(bytes, 4096));
+                    for d in &code.initial_data {
+                        if d.offset
+                            .checked_add(d.bytes.len() as u64)
+                            .is_none_or(|end| end > bytes)
+                        {
+                            return Err(Trap::MemoryFault);
+                        }
+                        reg.write_from(d.offset, &d.bytes);
+                        if d.readonly && !d.bytes.is_empty() {
+                            readonly_ranges.push((d.offset, d.offset + d.bytes.len() as u64));
+                        }
                     }
+                    // Invariant 13 (#1094): unconditionally guard [0, POWERBOX_NULL_GUARD) when
+                    // the window is at least that large, matching `Mem::seed_null_guard`.
+                    let guard = temen_ir::module_null_guard();
+                    null_guard = if guard > 0 && guard <= bytes {
+                        guard
+                    } else {
+                        0
+                    };
+                    region = Some(reg);
+                    window = Some(Window::new(size_log2));
                 }
-                // Invariant 13 (#1094): unconditionally guard [0, POWERBOX_NULL_GUARD) when the
-                // window is at least that large, matching `Mem::seed_null_guard`.
-                let guard = temen_ir::module_null_guard();
-                let null_guard = if guard > 0 && guard <= bytes {
-                    guard
+            }
+            #[cfg(all(feature = "cranelift", not(target_arch = "wasm32")))]
+            Engine::Cranelift(compiled) => {
+                if let Some(size_log2) = compiled.memory_size_log2 {
+                    let bytes = 1u64
+                        .checked_shl(u32::from(size_log2))
+                        .ok_or(Trap::MemoryFault)?;
+                    if !budgets.charge_mem(BudgetId::ROOT, bytes) {
+                        return Err(Trap::MemoryFault);
+                    }
+                    let kmem = temen_jit::kernel_engine::KernelMemory::try_new(
+                        size_log2,
+                        &compiled.initial_data,
+                    )
+                    .ok_or(Trap::MemoryFault)?;
+                    kernel_mem = Some(kmem);
                 } else {
-                    0
-                };
-                (Some(reg), Some(Window::new(size_log2)), ro, null_guard)
-            } else {
-                (None, None, Vec::new(), 0)
-            };
+                    kernel_mem = Some(temen_jit::kernel_engine::KernelMemory::empty());
+                }
+            }
+        }
 
         if !budgets.charge_tasks(BudgetId::ROOT, 1) {
             return Err(Trap::ThreadFault);
@@ -199,6 +229,8 @@ impl DomainWorld {
             ctl,
             engine,
             region,
+            #[cfg(all(feature = "cranelift", not(target_arch = "wasm32")))]
+            kernel_mem,
             window,
             readonly_ranges,
             null_guard,
@@ -218,8 +250,11 @@ impl DomainWorld {
 
     #[inline]
     fn code(&self) -> &Arc<Code> {
-        let Engine::Bytecode(ref code) = self.engine;
-        code
+        match self.engine {
+            Engine::Bytecode(ref code) => code,
+            #[cfg(all(feature = "cranelift", not(target_arch = "wasm32")))]
+            Engine::Cranelift(_) => unreachable!("code() called on Engine::Cranelift"),
+        }
     }
 
     #[inline]
@@ -232,11 +267,11 @@ impl DomainWorld {
         }
     }
 
-    fn alloc_waitable(&self) -> WaitableId {
+    pub(crate) fn alloc_waitable(&self) -> WaitableId {
         WaitableId(self.next_waitable.fetch_add(1, Ordering::Relaxed))
     }
 
-    fn draw_fuel(&self, cell: &mut FuelCell) -> bool {
+    pub(crate) fn draw_fuel(&self, cell: &mut FuelCell) -> bool {
         if !self.metered {
             return true;
         }
@@ -248,14 +283,14 @@ impl DomainWorld {
         true
     }
 
-    fn refund_fuel(&self, cell: &mut FuelCell) {
+    pub(crate) fn refund_fuel(&self, cell: &mut FuelCell) {
         if self.metered {
             let left = cell.take_remaining();
             self.budgets.refund_fuel(self.domain.budget, left);
         }
     }
 
-    fn make_fuel_cell(&self) -> FuelCell {
+    pub(crate) fn make_fuel_cell(&self) -> FuelCell {
         if self.metered {
             let got = self.budgets.draw_fuel(self.domain.budget, self.fuel_chunk);
             FuelCell::metered(got)
@@ -264,21 +299,32 @@ impl DomainWorld {
         }
     }
 
-    fn check_futex_eq(&self, addr: u64, expected: i64, width64: bool) -> bool {
+    pub(crate) fn check_futex_eq(&self, addr: u64, expected: i64, width64: bool) -> bool {
         if !self.domain.poll_flags().is_empty() {
             return false;
         }
-        let Some(ref reg) = self.region else {
-            return false;
-        };
-        if width64 {
-            reg.atomic_load(addr, 8) == expected as u64
-        } else {
-            (reg.atomic_load(addr, 4) as u32) == (expected as u32)
+        if let Some(ref reg) = self.region {
+            return if width64 {
+                reg.atomic_load(addr, 8) == expected as u64
+            } else {
+                (reg.atomic_load(addr, 4) as u32) == (expected as u32)
+            };
         }
+        #[cfg(all(feature = "cranelift", not(target_arch = "wasm32")))]
+        if let Some(ref kmem) = self.kernel_mem {
+            let Some(got) = kmem.atomic_load(addr, width64) else {
+                return false;
+            };
+            return if width64 {
+                got == expected as u64
+            } else {
+                (got as u32) == (expected as u32)
+            };
+        }
+        false
     }
 
-    fn lookup_thread_join(&self, handle: i32) -> ThreadJoinLookup {
+    pub(crate) fn lookup_thread_join(&self, handle: i32) -> ThreadJoinLookup {
         let (slot, gen) = unpack_thread_handle(handle);
         if gen == 0 {
             return ThreadJoinLookup::Fault;
@@ -302,7 +348,7 @@ impl DomainWorld {
         }
     }
 
-    fn finish_thread(&self, slot: u16, exit: ContextExit) {
+    pub(crate) fn finish_thread(&self, slot: u16, exit: ContextExit) {
         let waitable = {
             let mut tbl = self.threads.lock().unwrap_or_else(|e| e.into_inner());
             let rec = &mut tbl.slots[slot as usize];
@@ -318,7 +364,7 @@ impl DomainWorld {
         }
     }
 
-    fn expire_fiber_if_timed_out(&self, handle: i64) {
+    pub(crate) fn expire_fiber_if_timed_out(&self, handle: i64) {
         #[cfg(not(target_arch = "wasm32"))]
         {
             let info = {
@@ -345,7 +391,7 @@ impl DomainWorld {
         let _ = handle;
     }
 
-    fn fiber_park_slot(
+    pub(crate) fn fiber_park_slot(
         &self,
         handle: i64,
     ) -> Option<(WaitKey, Arc<WaitSlot>, Option<Deadline>, ContextId)> {
@@ -359,6 +405,17 @@ impl DomainWorld {
             }
         }
         None
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn join_all_os_threads(&self) {
+        let handles: Vec<_> = {
+            let mut g = self.os_threads.lock().unwrap_or_else(|e| e.into_inner());
+            std::mem::take(&mut *g)
+        };
+        for h in handles {
+            let _ = h.join();
+        }
     }
 }
 
@@ -432,7 +489,7 @@ impl CarrierTask {
     }
 }
 
-fn wake_to_futex_status(reason: WakeReason) -> Result<i32, Trap> {
+pub(crate) fn wake_to_futex_status(reason: WakeReason) -> Result<i32, Trap> {
     match reason {
         WakeReason::Ready => Ok(WAIT_OK),
         WakeReason::Timeout => Ok(WAIT_TIMED_OUT),
@@ -636,6 +693,8 @@ fn step_carrier_once(
                         FiberRecord {
                             handle,
                             exec: fiber_exec.ok(),
+                            #[cfg(all(feature = "cranelift", not(target_arch = "wasm32")))]
+                            kfiber: None,
                             started: false,
                             parked: None,
                         },
@@ -1226,35 +1285,35 @@ pub fn run_entry(engine: Engine, entry_func: u32, args: &[i64], cfg: RunConfig) 
             };
         }
     };
-    let root_exec = match ExecState::new_entry(world.code(), entry_func, args) {
-        Ok(e) => e,
-        Err(t) => {
-            return RunOutput {
-                exit: ContextExit::Trapped(t),
-                fuel_used: 0,
-                memory: world.region.clone(),
-            };
-        }
-    };
 
-    let exit = match mode {
-        RunMode::Cooperative => drive_cooperative(&world, root_exec),
-        #[cfg(not(target_arch = "wasm32"))]
-        RunMode::Parallel => {
-            let root_exit =
-                drive_parallel_task(&world, CarrierId(0), CarrierTask::new_root(root_exec));
-            // Invariant 6: root completion ends the domain and joins all spawned sibling OS threads
-            // before returning, so zero background threads outlive the run.
-            world.ctl.end(root_exit.clone());
-            let handles: Vec<_> = {
-                let mut g = world.os_threads.lock().unwrap_or_else(|e| e.into_inner());
-                std::mem::take(&mut *g)
+    let exit = match &world.engine {
+        Engine::Bytecode(_) => {
+            let root_exec = match ExecState::new_entry(world.code(), entry_func, args) {
+                Ok(e) => e,
+                Err(t) => {
+                    return RunOutput {
+                        exit: ContextExit::Trapped(t),
+                        fuel_used: 0,
+                        memory: world.region.clone(),
+                    };
+                }
             };
-            for h in handles {
-                let _ = h.join();
+            match mode {
+                RunMode::Cooperative => drive_cooperative(&world, root_exec),
+                #[cfg(not(target_arch = "wasm32"))]
+                RunMode::Parallel => {
+                    let root_exit =
+                        drive_parallel_task(&world, CarrierId(0), CarrierTask::new_root(root_exec));
+                    // Invariant 6: root completion ends the domain and joins all spawned sibling OS
+                    // threads before returning, so zero background threads outlive the run.
+                    world.ctl.end(root_exit.clone());
+                    world.join_all_os_threads();
+                    world.domain.terminal_exit().unwrap_or(root_exit)
+                }
             }
-            world.domain.terminal_exit().unwrap_or(root_exit)
         }
+        #[cfg(all(feature = "cranelift", not(target_arch = "wasm32")))]
+        Engine::Cranelift(_) => crate::cranelift::run_cranelift_entry(&world, entry_func, args),
     };
 
     let fuel_used = world

@@ -13,6 +13,8 @@
 
 #![forbid(unsafe_code)]
 
+#[cfg(all(feature = "cranelift", not(target_arch = "wasm32")))]
+mod cranelift;
 pub mod driver;
 
 use std::sync::Arc;
@@ -28,12 +30,11 @@ pub use driver::{DomainWorld, RunOutput};
 pub use temen_kernel;
 
 /// Closed set of execution engines (Decision 5).
-///
-/// Stage 1c wires `Engine::Bytecode`; Stage 1d (`#3197`) adds `#[cfg(feature = "cranelift")]
-/// Cranelift(...)` on this same enum and `DomainWorld`.
 #[derive(Clone)]
 pub enum Engine {
     Bytecode(Arc<Code>),
+    #[cfg(all(feature = "cranelift", not(target_arch = "wasm32")))]
+    Cranelift(Arc<temen_jit::kernel_engine::CompiledKernelModule>),
 }
 
 /// How Carriers execute concurrent contexts in a domain.
@@ -113,6 +114,8 @@ impl Default for RunConfig {
 pub enum BuildError {
     Verify(VerifyError),
     Compile(CompileError),
+    #[cfg(all(feature = "cranelift", not(target_arch = "wasm32")))]
+    Cranelift(temen_jit::kernel_engine::KernelCompileError),
 }
 
 impl std::fmt::Display for BuildError {
@@ -120,6 +123,8 @@ impl std::fmt::Display for BuildError {
         match self {
             BuildError::Verify(e) => write!(f, "verify error: {e:?}"),
             BuildError::Compile(e) => write!(f, "compile error: {e}"),
+            #[cfg(all(feature = "cranelift", not(target_arch = "wasm32")))]
+            BuildError::Cranelift(e) => write!(f, "cranelift compile error: {e}"),
         }
     }
 }
@@ -131,6 +136,25 @@ pub fn compile_bytecode(module: &Module) -> Result<Engine, BuildError> {
     verify_module(module).map_err(BuildError::Verify)?;
     let code = compile_module(module).map_err(BuildError::Compile)?;
     Ok(Engine::Bytecode(Arc::new(code)))
+}
+
+/// Verify `module` and compile it to `Engine::Cranelift` with default entry-hoisted
+/// `BoundMode::DynamicVmCtx` (Stage 1d `#3197`, Stage 4 PIC-ready).
+#[cfg(all(feature = "cranelift", not(target_arch = "wasm32")))]
+pub fn compile_cranelift(module: &Module) -> Result<Engine, BuildError> {
+    compile_cranelift_with_mode(module, temen_jit::kernel_engine::BoundMode::DynamicVmCtx)
+}
+
+/// Verify `module` and compile it to `Engine::Cranelift` with an explicit [`BoundMode`].
+#[cfg(all(feature = "cranelift", not(target_arch = "wasm32")))]
+pub fn compile_cranelift_with_mode(
+    module: &Module,
+    mode: temen_jit::kernel_engine::BoundMode,
+) -> Result<Engine, BuildError> {
+    verify_module(module).map_err(BuildError::Verify)?;
+    let compiled = temen_jit::kernel_engine::compile_kernel_module(module, mode)
+        .map_err(BuildError::Cranelift)?;
+    Ok(Engine::Cranelift(Arc::new(compiled)))
 }
 
 /// Run `engine`'s function `entry_func` with `args` under `cfg` and return its [`RunOutput`].
@@ -146,6 +170,18 @@ pub fn run_module(
     cfg: RunConfig,
 ) -> Result<RunOutput, BuildError> {
     let engine = compile_bytecode(module)?;
+    Ok(run(engine, entry_func, args, cfg))
+}
+
+/// Verify, compile to `Engine::Cranelift`, and run `entry_func(args)` with `cfg`.
+#[cfg(all(feature = "cranelift", not(target_arch = "wasm32")))]
+pub fn run_cranelift(
+    module: &Module,
+    entry_func: u32,
+    args: &[i64],
+    cfg: RunConfig,
+) -> Result<RunOutput, BuildError> {
+    let engine = compile_cranelift(module)?;
     Ok(run(engine, entry_func, args, cfg))
 }
 
