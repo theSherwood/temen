@@ -18,19 +18,22 @@
 #                                                            gating check job builds without the
 #                                                            feature, so nothing else compiles it)
 #   * `scripts/ci/check-excluded.sh`                        (excluded-crates job)
+#   * `RUSTFLAGS="--cfg loom" cargo check -p temen-jit -p temen-interp --lib --profile test`
+#                                                           (loom job, check-only — #3061)
 #   * the same two under `--target x86_64-pc-windows-gnu`   (check + fiber-scaling cross-checks)
 #   * the workspace's clippy under `--target aarch64-linux-android`, through
 #     `scripts/ci/android.sh`                               (android job)
 #
-# It deliberately does NOT cover: the test matrix, miri/asan/tsan/loom, fuzz, the differential and
-# browser jobs, or anything needing a real Windows/macOS runtime. Those stay CI's. This is the
-# "did I break the build or the lints" gate, which is what actually costs round-trips.
+# It deliberately does NOT cover: the test matrix, miri/asan/tsan/loom execution, fuzz, the
+# differential and browser jobs, or anything needing a real Windows/macOS runtime. Those stay CI's.
+# This is the "did I break the build or the lints" gate, which is what actually costs round-trips.
 #
 # Usage:
 #   scripts/ci/local-gate.sh              # run the gates
 #   scripts/ci/local-gate.sh --print-toolchain   # just echo the rust version CI pins
 #   TEMEN_GATE_INSTALL=1 …                # install the pinned toolchain/components/target if missing
 #                                         # (otherwise a missing one fails with the exact command)
+#   TEMEN_GATE_SKIP_LOOM=1 …              # skip the `--cfg loom` compile-only check
 #   TEMEN_GATE_SKIP_CROSS=1 …             # skip the windows-gnu and Android cross-checks
 #
 # The pre-push hook (`.githooks/pre-push`) calls this, so the hook and a manual run are the same
@@ -117,6 +120,21 @@ cargo_pinned clippy -p temen-jit --features stack-check --all-targets -- -D warn
 # The four crates the root manifest `exclude`s are invisible to every `--workspace` command above.
 # Same script CI runs; it reads the exclude list from `Cargo.toml`, so it cannot miss a crate.
 TEMEN_CHECK_TOOLCHAIN="$toolchain" run bash scripts/ci/check-excluded.sh
+
+# --- loom compile check (#3061) ---------------------------------------------------------------
+# CI's `loom` job builds `temen-jit` and `temen-interp` under `RUSTFLAGS="--cfg loom"`, where
+# synchronization primitives swap to `loom::sync::*`. Without checking that cfg locally, loom-only
+# type mismatches reach CI unseen. `--lib --profile test` type-checks both `(lib)` and `(lib test)`
+# (all `#[cfg(all(test, loom))]` models) without `[profile.test]`'s `opt-level = 2` codegen/link,
+# and uses CI's exact `RUSTFLAGS` (no `-D warnings`: `#[cfg(not(loom))]` stubs leave real-only
+# helpers unused under loom). Runs in a separate target dir so it never invalidates the normal
+# build; skippable with `TEMEN_GATE_SKIP_LOOM=1`.
+if [ "${TEMEN_GATE_SKIP_LOOM:-0}" = "1" ]; then
+  echo "local-gate: SKIP loom compile check (TEMEN_GATE_SKIP_LOOM=1)"
+else
+  RUSTFLAGS="--cfg loom" CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$repo_root/target}/loom" \
+    cargo_pinned check -p temen-jit -p temen-interp --lib --profile test
+fi
 
 # --- cross-checks -----------------------------------------------------------------------------
 # Compile-only gates for platforms without a runner here: each runs anywhere its rustup target and a C
