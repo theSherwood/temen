@@ -1,0 +1,30 @@
+[package]
+name = "temen-runtime"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+# Thin assembly crate over `temen-kernel` + closed `enum Engine` (`#3187` / `#3196`).
+# Owns the Cooperative and Parallel `Carrier` drivers, uniform `Context` execution for
+# Root / Thread / GuestFiber / ServeHandler, and one `KernelOps` implementation shared
+# across every engine (Invariant 15).
+
+[features]
+default = []
+cranelift = []
+wasm-jit = []
+op-oracle = []
+
+[dependencies]
+temen-ir.workspace = true
+temen-verify.workspace = true
+temen-mask.workspace = true
+temen-mem.workspace = true
+temen-kernel.workspace = true
+temen-bytecode.workspace = true
+
+[dev-dependencies]
+temen-text.workspace = true
+temen-interp.workspace = true
